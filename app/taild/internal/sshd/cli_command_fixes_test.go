@@ -16,7 +16,7 @@ import (
 func TestCLIYesFalseOpenSSHNative(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
-	s, caller, registry := nativeService(t, ctx, "yes-parser", "user:7")
+	s, caller, registry := nativeService(t, "yes-parser", "user:7")
 	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
 	address := terminalSSHServer(t, s, caller)
 	for _, line := range []string{
@@ -56,7 +56,7 @@ func TestCLIYesFalseOpenSSHNative(t *testing.T) {
 func TestCLILogDefaultsActualSerialFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "logs-default", "user:7")
+	s, caller, _ := nativeService(t, "logs-default", "user:7")
 	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
 	view, err := s.Show(ctx, caller.Peer, "devbox")
 	if err != nil {

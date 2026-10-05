@@ -20,13 +20,11 @@ import (
 
 	"github.com/creack/pty"
 	gliderssh "github.com/tailscale/gliderssh"
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
-	"github.com/vandycknick/silo/app/taild/internal/jobs"
-	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 	"golang.org/x/crypto/ssh"
 )
@@ -103,18 +101,7 @@ const lobbyPrompt = "\x1b[?2004hsilo> "
 
 func openTerminalClient(t *testing.T, address, command string) *terminalClient {
 	t.Helper()
-	path, e := exec.LookPath("ssh")
-	if e != nil {
-		testfixture.Unavailable(t, "OpenSSH ssh is required")
-	}
-	host, port, e := net.SplitHostPort(address)
-	if e != nil {
-		t.Fatal(e)
-	}
-	args := []string{"-F", "/dev/null", "-tt", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "PreferredAuthentications=none", "-o", "ConnectTimeout=5", "-p", port, "domain-test@" + host}
-	if command != "" {
-		args = append(args, command)
-	}
+	path, args := testfixture.OpenSSH(t, address, true, command)
 	cmd := exec.Command(path, args...)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 	master, e := pty.StartWithSize(cmd, &pty.Winsize{Rows: 30, Cols: 120})
@@ -470,25 +457,14 @@ func TestTerminalReadWriteErrorsAndCancellation(t *testing.T) {
 
 func sshPipeCommand(t *testing.T, address, command string, stdin []byte, terminal bool) ([]byte, []byte, int) {
 	t.Helper()
-	path, e := exec.LookPath("ssh")
-	if e != nil {
-		testfixture.Unavailable(t, "OpenSSH ssh is required")
-	}
-	host, port, e := net.SplitHostPort(address)
-	if e != nil {
-		t.Fatal(e)
-	}
+	path, args := testfixture.OpenSSH(t, address, terminal, command)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	mode := "-T"
-	if terminal {
-		mode = "-tt"
-	}
-	cmd := exec.CommandContext(ctx, path, "-F", "/dev/null", mode, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "PreferredAuthentications=none", "-p", port, "domain-test@"+host, command)
+	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	var out, diagnostic bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &diagnostic
-	e = cmd.Run()
+	e := cmd.Run()
 	code := 0
 	if e != nil {
 		var exit *exec.ExitError
@@ -541,51 +517,13 @@ func sshPTYLobbyInput(t *testing.T, address string, input []byte) {
 func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	rootfs := testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true)
 	registry := testfixture.OCIRegistry(t, rootfs)
-	cfg := config.Defaults()
-	cfg.Home = t.TempDir()
-	cfg.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	cfg.VM.Defaults = config.Resources{CPUs: 1, Memory: 256 << 20, Disk: 1 << 30}
-	cfg.VM.DefaultImage = registry.Reference
-	cfg.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	cfg := daemon.Config(t, registry)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	r, e := runtime.Open(ctx, cfg, "terminal-native")
-	if e != nil {
-		t.Fatal(e)
-	}
-	audit, e := state.OpenAudit(cfg.Home, 1<<20, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
-	svc := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(ctx, 8), Config: cfg}
-	defer func() {
-		cleanup, done := context.WithTimeout(context.Background(), 30*time.Second)
-		defer done()
-		cancel()
-		if e := svc.Jobs.Wait(cleanup); e != nil {
-			t.Error(e)
-		}
-		entries, e := r.SDK.Inventory(cleanup)
-		if e != nil {
-			t.Error(e)
-		}
-		for _, entry := range entries {
-			m, e := r.SDK.Machine(cleanup, entry.ID)
-			if e != nil {
-				t.Error(e)
-				continue
-			}
-			_, _ = m.StopWith(cleanup, silo.StopOptions{Force: true, Timeout: time.Second})
-			_ = m.Remove(cleanup)
-			_ = m.Close()
-		}
-		if e := r.Close(); e != nil {
-			t.Error(e)
-		}
-	}()
-	limits := cfg.Limits()
-	peer := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "explicit-domain-native-terminal", ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
+	n := daemon.Open(t, cfg, "terminal-native", 8)
+	r := n.Runtime
+	svc := &service.Service{Runtime: r, Audit: n.Audit, Jobs: n.Jobs, Config: cfg}
+	peer := daemon.Peer(cfg, "explicit-domain-native-terminal", "user:7")
 	caller := service.Caller{Peer: peer, Resolve: func(ctx context.Context) (identity.Peer, error) { return peer, ctx.Err() }}
 	address := terminalSSHServer(t, svc, caller)
 	var diagnostic bytes.Buffer

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -46,16 +45,10 @@ type removalClient struct {
 
 func openRemovalClient(t *testing.T, ctx context.Context, address, command string) *removalClient {
 	t.Helper()
-	path, e := exec.LookPath("ssh")
-	if e != nil {
-		testfixture.Unavailable(t, "OpenSSH ssh is required")
-	}
-	host, port, e := net.SplitHostPort(address)
-	if e != nil {
-		t.Fatal(e)
-	}
+	path, args := testfixture.OpenSSH(t, address, false, command)
 	c := &removalClient{done: make(chan error, 1)}
-	c.cmd = exec.CommandContext(ctx, path, "-F", "/dev/null", "-T", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "PreferredAuthentications=none", "-p", port, "explicit-domain@"+host, command)
+	c.cmd = exec.CommandContext(ctx, path, args...)
+	var e error
 	c.stdin, e = c.cmd.StdinPipe()
 	if e != nil {
 		t.Fatal(e)
@@ -133,7 +126,7 @@ func removalDispatch(t *testing.T, ctx context.Context, s *service.Service, call
 func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "removal-decisions", "user:7")
+	s, caller, _ := nativeService(t, "removal-decisions", "user:7")
 	address := terminalSSHServer(t, s, caller)
 	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
 	before := len(s.Jobs.List(caller.Peer))
@@ -219,7 +212,7 @@ func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
 func TestRemovalOpenSSHNativePreflightAndIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "removal-preflight", "user:7")
+	s, caller, _ := nativeService(t, "removal-preflight", "user:7")
 	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
 	var revoked atomic.Bool
 	peer := caller.Peer
@@ -288,7 +281,7 @@ func TestRemovalOpenSSHNativePreflightAndIdentity(t *testing.T) {
 func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "removal-pin", "user:7")
+	s, caller, _ := nativeService(t, "removal-pin", "user:7")
 	address := terminalSSHServer(t, s, caller)
 	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
 	original, e := s.Show(ctx, caller.Peer, "devbox")
@@ -341,7 +334,7 @@ func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 func TestRemovalOpenSSHNativePTY(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "removal-pty", "user:7")
+	s, caller, _ := nativeService(t, "removal-pty", "user:7")
 	address := terminalSSHServer(t, s, caller)
 	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
 	for _, answer := range []string{"\x03", "\x04", "no\r"} {
@@ -378,10 +371,10 @@ func TestRemovalOpenSSHNativeRunningForce(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "removal-running", "user:7")
+	s, caller, _ := nativeService(t, "removal-running", "user:7")
 	registry := testfixture.OCIRegistry(t, testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true))
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	var stopRevoked atomic.Bool
 	peer := caller.Peer
 	caller.Resolve = func(ctx context.Context) (identity.Peer, error) {

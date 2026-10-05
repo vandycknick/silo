@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
@@ -22,7 +23,7 @@ func TestNativeRemoveDiscardsNodeStateLocally(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			s := actualService(t)
 			ctx := context.Background()
-			c := domainCaller(t, s, "user:123")
+			c := domainCaller(s, "user:123")
 			disk := filepath.Join(s.Config.Home, "input.raw")
 			if err := os.WriteFile(disk, []byte("stopped fixture"), 0600); err != nil {
 				t.Fatal(err)
@@ -89,14 +90,14 @@ func TestNativeRemoveDiscardsNodeStateLocally(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			blocked := waitOperation(t, s, c, op)
+			blocked := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 			if blocked.Error == nil {
 				t.Fatal("active lease did not block removal")
 			}
 			lease.Close()
 			op, err = s.Remove(ctx, c, d.Name, RemoveRequest{})
-			succeeded(t, s, c, op, err)
-			result := waitOperation(t, s, c, op)
+			daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+			result := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 			for _, line := range result.Progress {
 				if strings.Contains(line, "device_") || strings.Contains(line, "tailscale") {
 					t.Fatal("unexpected cloud cleanup", line)

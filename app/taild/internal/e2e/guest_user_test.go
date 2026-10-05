@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -99,12 +99,8 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				}
 			}
 			registry := testfixture.OCIRegistry(t, rootfs)
-			c := config.Defaults()
-			c.Home = t.TempDir()
-			c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-			c.VM.Defaults = config.Resources{CPUs: 1, Memory: 1 << 30, Disk: 1 << 30}
-			c.VM.DefaultImage = registry.Reference
-			c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+			c := daemon.Config(t, registry)
+			c.VM.Defaults.Memory = 1 << 30
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
 			r, err := runtime.Open(ctx, c, "guest-user-kvm")
@@ -130,10 +126,10 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				}
 				_ = s.Runtime.Close()
 			}()
-			caller := principal(t, c, "user:7")
+			caller := principal(c, "user:7")
 			op, err := s.Create(ctx, caller, service.CreateRequest{Name: variant, GuestUser: user, NoStart: variant == "uid-conflict" || variant == "no-shell" || variant == "no-sh-stored"})
 			if variant == "no-shell" || variant == "no-sh-stored" {
-				success(t, s, caller, op, err)
+				daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
 				m, err := r.SDK.Machine(ctx, variant)
 				if err != nil {
 					t.Fatal(err)
@@ -170,7 +166,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				return
 			}
 			if variant == "uid-conflict" {
-				success(t, s, caller, op, err)
+				daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
 				m, err := r.SDK.Machine(ctx, variant)
 				if err != nil {
 					t.Fatal(err)
@@ -199,7 +195,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				}
 				return
 			}
-			success(t, s, caller, op, err)
+			daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
 			m, err := r.SDK.Machine(ctx, variant)
 			if err != nil {
 				t.Fatal(err)
@@ -263,7 +259,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				}
 			}
 			op, err = s.Restart(ctx, caller, variant)
-			success(t, s, caller, op, err)
+			daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
 			if err := r.Close(); err != nil {
 				t.Fatal(err)
 			}

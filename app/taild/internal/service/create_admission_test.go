@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +9,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -17,8 +17,8 @@ func TestCreateAdmissionFinalizerWithActualHome(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
-	c := domainCaller(t, s, "user:1")
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
+	c := domainCaller(s, "user:1")
 	checkReleased := func(name string) {
 		t.Helper()
 		s.createMu.Lock()
@@ -54,7 +54,7 @@ func TestCreateAdmissionFinalizerWithActualHome(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		finished := waitOperation(t, s, c, op)
+		finished := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 		if finished.Error == nil {
 			t.Fatal("cancelled create succeeded", finished)
 		}
@@ -72,8 +72,8 @@ func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
-	c := domainCaller(t, s, "user:1")
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
+	c := domainCaller(s, "user:1")
 	entered, hold := make(chan struct{}), make(chan struct{})
 	var once, releaseOnce sync.Once
 	releasePull := func() { releaseOnce.Do(func() { close(hold) }) }
@@ -95,7 +95,7 @@ func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 	}
 	defer m.Close()
 	releasePull()
-	finished := waitOperation(t, s, c, op)
+	finished := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 	if finished.VM != op.VM || finished.Error == nil || finished.Error.Exit != 5 {
 		t.Fatal("published proposal renamed or race hidden", finished)
 	}
@@ -113,5 +113,5 @@ func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 		t.Fatal(err)
 	}
 	op, err = s.Create(t.Context(), c, CreateRequest{Name: op.VM, NoStart: true})
-	succeeded(t, s, c, op, err)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 }

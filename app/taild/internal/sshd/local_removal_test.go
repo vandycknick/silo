@@ -17,7 +17,7 @@ import (
 func TestRemovalOpenSSHLocalTailscaleAndStoppedShow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "local-removal", "user:7")
+	s, caller, _ := nativeService(t, "local-removal", "user:7")
 	caller.Peer.Login = "owner@example.test"
 	// Keep the fresh identity resolver consistent with this explicit test input.
 	peer := caller.Peer

@@ -2,25 +2,25 @@ package service
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 )
 
 func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 	s := actualService(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Config.Enrollment.Mode = "interactive"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Registry: enroll.NewRegistry(), Pin: state.NodePin{Tailnet: "fixture", Suffix: "tail.test"}}
-	c := domainCaller(t, s, "user:7")
-	tagged := domainCaller(t, s, "tag:creator")
+	c := domainCaller(s, "user:7")
+	tagged := domainCaller(s, "tag:creator")
 	if _, err := s.ValidateCreate(tagged.Peer, CreateRequest{Tailscale: true, Tags: []string{"tag:delegated"}}); err != nil {
 		t.Fatal("taild tried to replace Tailscale tagOwners", err)
 	}
@@ -28,7 +28,7 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 		t.Fatal("tag without tailscale accepted")
 	}
 	op, err := s.Create(t.Context(), c, CreateRequest{Name: "tagged", Tailscale: true, Tags: []string{"tag:Dev", "tag:testing", "tag:dev"}, NoStart: true})
-	succeeded(t, s, c, op, err)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	m, err := s.Runtime.SDK.Machine(t.Context(), "tagged")
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 	if err = json.Unmarshal([]byte(policy.Metadata["io.silo.taild.node"]), &expected); err != nil || expected.Owner != "user:7" || expected.Bootstrap != "interactive" || len(expected.Tags) != 2 {
 		t.Fatal(expected, err)
 	}
-	if _, err = s.Show(t.Context(), domainCaller(t, s, "tag:dev").Peer, "tagged"); err == nil {
+	if _, err = s.Show(t.Context(), domainCaller(s, "tag:dev").Peer, "tagged"); err == nil {
 		t.Fatal("tag membership conferred management ownership")
 	}
 	if err = m.Remove(t.Context()); err != nil {

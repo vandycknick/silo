@@ -39,6 +39,12 @@ type Registry struct {
 	BeforeManifest func()
 }
 
+// Allowed is the registry prefix the fixture image lives under.
+func (r *Registry) Allowed() string {
+	host, _, _ := strings.Cut(r.Reference, "/")
+	return host + "/fixture"
+}
+
 func OCIRegistry(t *testing.T, rootfs string) *Registry {
 	t.Helper()
 	var archive bytes.Buffer

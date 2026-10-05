@@ -191,7 +191,7 @@ func TestCLIHelpWithoutNativeBridge(t *testing.T) {
 func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
-	s, caller, registry := nativeService(t, ctx, "cli-ux", "user:7")
+	s, caller, registry := nativeService(t, "cli-ux", "user:7")
 	address := terminalSSHServer(t, s, caller)
 	for _, tty := range []bool{false, true} {
 		for _, tc := range []struct {

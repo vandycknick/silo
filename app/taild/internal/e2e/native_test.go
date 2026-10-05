@@ -26,42 +26,13 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/sshd"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
-func wait(t *testing.T, s *service.Service, c service.Caller, op jobs.Operation, e error) jobs.Operation {
-	t.Helper()
-	if e != nil {
-		t.Fatal(e)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-	defer cancel()
-	for {
-		v, ch, e := s.Jobs.Observe(c.Peer, op.ID)
-		if e != nil {
-			t.Fatal(e)
-		}
-		if v.Finished != nil {
-			return v
-		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			t.Fatal("operation timeout")
-		}
-	}
-}
-func success(t *testing.T, s *service.Service, c service.Caller, op jobs.Operation, e error) {
-	t.Helper()
-	v := wait(t, s, c, op, e)
-	if v.Error != nil || v.State != "succeeded" {
-		t.Fatalf("%+v error %+v", v, v.Error)
-	}
-}
-func principal(t *testing.T, c config.Config, owner identity.Principal) service.Caller {
-	t.Helper()
-	limits := c.Limits()
-	peer := identity.Peer{Principals: []identity.Principal{owner}, NodeID: "explicit-native-input-" + string(owner), ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
+// principal is explicit domain identity below WhoIs, never a tailnet peer.
+func principal(c config.Config, owner identity.Principal) service.Caller {
+	peer := daemon.Peer(c, "explicit-native-input-"+string(owner), owner)
 	return service.Caller{Peer: peer, Resolve: func(ctx context.Context) (identity.Peer, error) { return peer, ctx.Err() }}
 }
 func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
@@ -75,12 +46,8 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	}
 	_ = kvm.Close()
 	registry := testfixture.OCIRegistry(t, rootfs)
-	c := config.Defaults()
-	c.Home = t.TempDir()
-	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 1 << 30, Disk: 1 << 30}
-	c.VM.DefaultImage = registry.Reference
-	c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	c := daemon.Config(t, registry)
+	c.VM.Defaults.Memory = 1 << 30
 	audit, e := state.OpenAudit(c.Home, 1<<20, 2)
 	if e != nil {
 		t.Fatal(e)
@@ -111,7 +78,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 		}
 		_ = s.Runtime.Close()
 	}()
-	one, two := principal(t, c, "user:11"), principal(t, c, "user:22")
+	one, two := principal(c, "user:11"), principal(c, "user:22")
 	ctx := context.Background()
 	entered, release := make(chan struct{}), make(chan struct{})
 	var first sync.Once
@@ -144,9 +111,9 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 		t.Fatal("operation observer did not detach")
 	}
 	close(release)
-	success(t, s, one, op, nil)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, nil)
 	op, e = s.Create(ctx, two, service.CreateRequest{Name: "native-two", NoStart: true})
-	success(t, s, two, op, e)
+	daemon.Succeeded(t, s.Jobs, two.Peer, op, e)
 	for _, caller := range []service.Caller{one, two} {
 		v, e := s.List(ctx, caller.Peer)
 		if e != nil || len(v) != 1 {
@@ -161,11 +128,11 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	if e != nil || len(who.Peer.Principals) != 1 || who.Peer.Principals[0] != "user:11" {
 		t.Fatal(who, e)
 	}
-	ci := principal(t, c, "tag:ci")
+	ci := principal(c, "tag:ci")
 	ci.Peer.Permissions.Actions = []identity.Action{identity.Create, identity.Read, identity.Exec}
 	ci.Resolve = func(ctx context.Context) (identity.Peer, error) { return ci.Peer, ctx.Err() }
 	op, e = s.Create(ctx, ci, service.CreateRequest{Name: "native-ci"})
-	success(t, s, ci, op, e)
+	daemon.Succeeded(t, s.Jobs, ci.Peer, op, e)
 	if code, e := s.Shell(ctx, ci, "native-ci", "", service.IO{Stdout: io.Discard, Stderr: io.Discard, Terminal: service.Terminal{Present: true, Window: service.Window{Rows: 24, Columns: 80}}}); code != 4 || service.Categorize(e).Exit != 4 {
 		t.Fatal("create/read/exec-only principal got shell", code, e)
 	}
@@ -174,7 +141,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	}
 	ci.Peer.Permissions.Actions = append(ci.Peer.Permissions.Actions, identity.Delete, identity.Stop)
 	op, e = s.Remove(ctx, ci, "native-ci", service.RemoveRequest{Force: true})
-	success(t, s, ci, op, e)
+	daemon.Succeeded(t, s.Jobs, ci.Peer, op, e)
 	if _, e = s.Show(ctx, two.Peer, "native-one"); service.Categorize(e).Exit != 3 {
 		t.Fatal("positive-user isolation failed", e)
 	}
@@ -206,7 +173,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	probeSDKLazyStdin(t, s, "native-one")
 	probeStreamAuthorization(t, s, one, "native-one")
 	op, e = s.Remove(ctx, one, "native-one", service.RemoveRequest{})
-	v := wait(t, s, one, op, e)
+	v := daemon.WaitOperation(t, s.Jobs, one.Peer, op, e)
 	if v.Error == nil || v.Error.Exit != 5 {
 		t.Fatal("running rm accepted", v)
 	}
@@ -270,20 +237,20 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	}
 	probeLostExecution(t, s, one, "native-one")
 	op, e = s.Stop(ctx, one, "native-one", service.StopRequest{Force: true, Timeout: time.Second})
-	success(t, s, one, op, e)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	name := "native-renamed"
 	memory := silo.Mebibytes(768)
 	disk := silo.Gibibytes(2)
 	op, e = s.Set(ctx, one, "native-one", service.SetRequest{Name: &name, Memory: &memory, Disk: &disk})
-	success(t, s, one, op, e)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	show, e := s.Show(ctx, one.Peer, name)
 	if e != nil || show.Memory != memory.Bytes() || show.Disk != disk.Bytes() {
 		t.Fatal(show, e)
 	}
 	op, e = s.Start(ctx, one, name)
-	success(t, s, one, op, e)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	op, e = s.Restart(ctx, one, name)
-	success(t, s, one, op, e)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	// Actual grammar, JSON envelope and guest -- delimiter on the same native service.
 	var jsonOut, human bytes.Buffer
 	if code = sshd.DispatchSession(ctx, s, one, "show "+name+" --json", service.IO{Stdout: &jsonOut, Stderr: &human}); code != 0 || !strings.Contains(jsonOut.String(), `"ok":true`) {
@@ -295,7 +262,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 		t.Fatal(code, out.String(), errout.String())
 	}
 	op, e = s.Remove(ctx, one, name, service.RemoveRequest{Force: true})
-	success(t, s, one, op, e)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	if code := sshd.DispatchSession(ctx, s, two, "--yes rm native-two", service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 0 {
 		t.Fatal("global --yes unattended remove", code)
 	}
@@ -564,7 +531,7 @@ func probeLostExecution(t *testing.T, s *service.Service, c service.Caller, ref 
 	}()
 	guestOutput(t, &out, "READY")
 	op, e := s.Stop(ctx, c, ref, service.StopRequest{Force: true, Timeout: time.Second})
-	success(t, s, c, op, e)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, e)
 	select {
 	case result := <-done:
 		if result.code != 255 || result.err == nil {
@@ -574,7 +541,7 @@ func probeLostExecution(t *testing.T, s *service.Service, c service.Caller, ref 
 		t.Fatal("lost execution did not finish")
 	}
 	op, e = s.Start(ctx, c, ref)
-	success(t, s, c, op, e)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, e)
 }
 
 func probeSDKLazyStdin(t *testing.T, s *service.Service, ref string) {

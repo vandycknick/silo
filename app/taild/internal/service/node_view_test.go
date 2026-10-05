@@ -109,7 +109,7 @@ func TestStoppedNodeUsesConfigurationAndHistoricalExpiry(t *testing.T) {
 
 func TestShowOwnerLoginUsesVerifiedOwner(t *testing.T) {
 	s := actualService(t)
-	c := domainCaller(t, s, "user:7")
+	c := domainCaller(s, "user:7")
 	c.Peer.Login = "current@example.test"
 	disk := filepath.Join(s.Config.Home, "input.raw")
 	if err := os.WriteFile(disk, []byte("fixture"), 0600); err != nil {

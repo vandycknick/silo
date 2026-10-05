@@ -16,13 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/jobs"
-	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/sshd"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -32,43 +29,14 @@ func TestNativeKVMTemplatesPolicyAndMissingSecrets(t *testing.T) {
 	}
 	rootfs := testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true)
 	registry := testfixture.OCIRegistry(t, rootfs)
-	c := config.Defaults()
-	c.Home = t.TempDir()
-	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c.TemplatesDir = t.TempDir()
-	c.PoliciesDir = t.TempDir()
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 1 << 30, Disk: 1 << 30}
-	c.VM.DefaultImage = registry.Reference
-	c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	c := daemon.Config(t, registry)
+	c.VM.Defaults.Memory = 1 << 30
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
-	audit, e := state.OpenAudit(c.Home, 1<<20, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
-	r, e := runtime.Open(ctx, c, "native-phase12")
-	if e != nil {
-		t.Fatal(e)
-	}
-	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(ctx, 8), Config: c, VMNodesEnabled: true}
-	defer func() {
-		cancel()
-		drain, done := context.WithTimeout(context.Background(), 30*time.Second)
-		defer done()
-		_ = s.Jobs.Wait(drain)
-		entries, _ := r.SDK.Inventory(drain)
-		for _, entry := range entries {
-			m, e := r.SDK.Machine(drain, entry.ID)
-			if e == nil {
-				_, _ = m.StopWith(drain, silo.StopOptions{Force: true, Timeout: time.Second})
-				_ = m.Remove(drain)
-				_ = m.Close()
-			}
-		}
-		_ = r.Close()
-	}()
-	one, two := principal(t, c, "user:12"), principal(t, c, "user:24")
+	n := daemon.Open(t, c, "native-phase12", 8)
+	r := n.Runtime
+	s := &service.Service{Runtime: r, Audit: n.Audit, Jobs: n.Jobs, Config: c, VMNodesEnabled: true}
+	one, two := principal(c, "user:12"), principal(c, "user:24")
 	run := func(caller service.Caller, line, input string, want int) string {
 		t.Helper()
 		var out, err bytes.Buffer
@@ -105,7 +73,7 @@ rule "allow-local-http" {
 	run(one, "policy create local --json", policy, 0)
 	template := fmt.Sprintf("version: '1'\nimage: %s\nresources: {cpus: 1, memory: 1GiB}\ndisk_size: 1GiB\nvsock: true\nnetwork: {kind: private, policy_ref: local, publish: [8080]}\nlabels: {team: phase12}\nuserdata: |\n  #!/bin/sh\n  /bin/echo phase12-userdata\n", registry.Reference)
 	run(one, "template create dev --json", template, 0)
-	if e = os.WriteFile(filepath.Join(c.TemplatesDir, "operator.yaml"), []byte("version: '1'"), 0644); e != nil {
+	if e := os.WriteFile(filepath.Join(c.TemplatesDir, "operator.yaml"), []byte("version: '1'"), 0644); e != nil {
 		t.Fatal(e)
 	}
 	listed := run(one, "template ls --json", "", 0)

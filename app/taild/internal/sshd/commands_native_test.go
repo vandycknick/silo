@@ -14,7 +14,7 @@ import (
 func TestActualSDKCRLFCommandRemovalConfirmation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, ctx, "crlf-native", "user:7")
+	s, caller, _ := nativeService(t, "crlf-native", "user:7")
 	p := caller.Peer
 	var diagnostic bytes.Buffer
 	if code := DispatchSession(ctx, s, caller, "create --name crlf-vm --no-start", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {

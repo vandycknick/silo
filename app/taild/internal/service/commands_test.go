@@ -13,84 +13,28 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
-func domainCaller(t *testing.T, s *Service, owner identity.Principal) Caller {
-	t.Helper()
-	limits := s.Config.Limits()
-	p := identity.Peer{Principals: []identity.Principal{owner}, NodeID: "explicit-domain-" + string(owner), ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
+// domainCaller is explicit principal input at the domain boundary, below WhoIs.
+func domainCaller(s *Service, owner identity.Principal) Caller {
+	p := daemon.Peer(s.Config, "explicit-domain-"+string(owner), owner)
 	return Caller{Peer: p, Resolve: func(ctx context.Context) (identity.Peer, error) { return p, ctx.Err() }}
 }
 func actualService(t *testing.T) *Service {
 	t.Helper()
-	c := config.Defaults()
-	c.Home = t.TempDir()
-	c.TemplatesDir = t.TempDir()
-	c.PoliciesDir = t.TempDir()
-	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 256 << 20, Disk: 1 << 30}
-	r, e := runtime.Open(context.Background(), c, "native-service")
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { _ = r.Close() })
-	audit, e := state.OpenAudit(c.Home, 1<<20, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { _ = audit.Close() })
-	ctx, cancel := context.WithCancel(context.Background())
-	reg := jobs.New(ctx, 32)
-	reg.Metrics = r.Metrics
-	t.Cleanup(func() {
-		cancel()
-		drain, done := context.WithTimeout(context.Background(), 10*time.Second)
-		defer done()
-		if e := reg.Wait(drain); e != nil {
-			t.Error(e)
-		}
-	})
-	return &Service{Runtime: r, Audit: audit, Config: c, Jobs: reg}
-}
-func waitOperation(t *testing.T, s *Service, c Caller, op jobs.Operation) jobs.Operation {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	for {
-		v, ch, e := s.Jobs.Observe(c.Peer, op.ID)
-		if e != nil {
-			t.Fatal(e)
-		}
-		if v.Finished != nil {
-			return v
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("operation deadline")
-		case <-ch:
-		}
-	}
-}
-func succeeded(t *testing.T, s *Service, c Caller, op jobs.Operation, e error) {
-	t.Helper()
-	if e != nil {
-		t.Fatal(e)
-	}
-	v := waitOperation(t, s, c, op)
-	if v.State != "succeeded" {
-		t.Fatalf("operation %+v error %+v", v, v.Error)
-	}
+	c := daemon.Config(t, nil)
+	n := daemon.Open(t, c, "native-service", 32)
+	return &Service{Runtime: n.Runtime, Audit: n.Audit, Config: c, Jobs: n.Jobs}
 }
 func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 	s := actualService(t)
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	for _, tt := range []struct {
 		name   string
 		change func(*CreateRequest)
@@ -134,10 +78,10 @@ func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.Ceilings.VMs = 1
-	one, two := domainCaller(t, s, "user:1"), domainCaller(t, s, "user:2")
+	one, two := domainCaller(s, "user:1"), domainCaller(s, "user:2")
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
@@ -153,7 +97,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(15 * time.Second):
-		v := waitOperation(t, s, one, op)
+		v := daemon.WaitOperation(t, s.Jobs, one.Peer, op, nil)
 		t.Fatalf("native registry manifest not reached: %+v %+v", v, v.Error)
 	}
 	cancel()
@@ -169,12 +113,12 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 		t.Fatal("collision must reject before publication", collision, e)
 	}
 	releasePull()
-	succeeded(t, s, one, op, nil)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, nil)
 	if registry.Requests.Load() < 3 {
 		t.Fatal("native OCI did not use real registry")
 	}
 	op, e = s.Create(context.Background(), two, CreateRequest{Name: "two", NoStart: true})
-	succeeded(t, s, two, op, e)
+	daemon.Succeeded(t, s.Jobs, two.Peer, op, e)
 	for _, c := range []Caller{one, two} {
 		v, e := s.List(context.Background(), c.Peer)
 		if e != nil || len(v) != 1 {
@@ -186,7 +130,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	}
 	name := "renamed"
 	op, e = s.Set(context.Background(), one, "one", SetRequest{Name: &name})
-	succeeded(t, s, one, op, e)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	v, e := s.Show(context.Background(), one.Peer, name)
 	if e != nil || v.Name != name || v.State != "stopped" {
 		t.Fatal(v, e)
@@ -228,29 +172,29 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 		t.Fatal(e)
 	}
 	close(hold)
-	succeeded(t, s, one, block, nil)
-	if got := waitOperation(t, s, one, op); got.Error == nil || got.Error.Exit != 4 {
+	daemon.Succeeded(t, s.Jobs, one.Peer, block, nil)
+	if got := daemon.WaitOperation(t, s.Jobs, one.Peer, op, nil); got.Error == nil || got.Error.Exit != 4 {
 		t.Fatal("queued revoked mutation ran", got)
 	}
 	op, e = s.Remove(context.Background(), one, name, RemoveRequest{})
-	succeeded(t, s, one, op, e)
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	op, e = s.Create(context.Background(), one, CreateRequest{Name: "one", NoStart: true})
-	succeeded(t, s, one, op, e)
-	third := domainCaller(t, s, "user:3")
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
+	third := domainCaller(s, "user:3")
 	failed, e := s.Create(context.Background(), third, CreateRequest{Name: "retry", Image: strings.Split(registry.Reference, "/fixture/")[0] + "/fixture/missing:latest", NoStart: true})
 	if e != nil {
 		t.Fatal(e)
 	}
-	if got := waitOperation(t, s, third, failed); got.Error == nil || got.Error.Exit != 7 {
+	if got := daemon.WaitOperation(t, s.Jobs, third.Peer, failed, nil); got.Error == nil || got.Error.Exit != 7 {
 		t.Fatal("failed OCI pull did not report category 7", got)
 	}
 	op, e = s.Create(context.Background(), third, CreateRequest{Name: "retry", NoStart: true})
-	succeeded(t, s, third, op, e)
-	tagged := domainCaller(t, s, "tag:team")
+	daemon.Succeeded(t, s.Jobs, third.Peer, op, e)
+	tagged := domainCaller(s, "tag:team")
 	tagged.Peer.Principals = []identity.Principal{"tag:team", "tag:ci"}
 	tagged.Resolve = func(context.Context) (identity.Peer, error) { return tagged.Peer, nil }
 	op, e = s.Create(context.Background(), tagged, CreateRequest{Name: "tagged", Owner: "tag:ci", NoStart: true})
-	succeeded(t, s, tagged, op, e)
+	daemon.Succeeded(t, s.Jobs, tagged.Peer, op, e)
 	op, e = s.Create(context.Background(), tagged, CreateRequest{Name: "tagged-over", Owner: "tag:ci", NoStart: true})
 	if e == nil || Categorize(e).Exit != 6 || op.ID != "" {
 		t.Fatal("selected tag quota bypass", op, e)
@@ -261,11 +205,11 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s.Jobs = jobs.New(ctx, 4)
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	persisted := make(chan struct{})
 	calls := 0
 	c.Resolve = func(ctx context.Context) (identity.Peer, error) {
@@ -287,7 +231,7 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 		t.Fatal("durable create not reached")
 	}
 	cancel()
-	v := waitOperation(t, s, c, op)
+	v := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 	if v.State != "failed" {
 		t.Fatal(v)
 	}
@@ -319,8 +263,8 @@ func TestCreateCountRevokedDuringActualPull(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
-	caller := domainCaller(t, s, "user:1")
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
+	caller := domainCaller(s, "user:1")
 	var current atomic.Pointer[identity.Peer]
 	peer := caller.Peer
 	current.Store(&peer)
@@ -341,7 +285,7 @@ func TestCreateCountRevokedDuringActualPull(t *testing.T) {
 	revoked.Permissions.Limits.VMs = 0
 	current.Store(&revoked)
 	close(release)
-	if got := waitOperation(t, s, caller, op); got.Error == nil || got.Error.Exit != 6 {
+	if got := daemon.WaitOperation(t, s.Jobs, caller.Peer, op, nil); got.Error == nil || got.Error.Exit != 6 {
 		t.Fatal("stale reserved quota was used at materialization", got)
 	}
 	if v, e := s.List(context.Background(), peer); e != nil || len(v) != 0 {
@@ -358,10 +302,10 @@ func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
-	c := domainCaller(t, s, "user:1")
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
+	c := domainCaller(s, "user:1")
 	op, e := s.Create(context.Background(), c, CreateRequest{Name: "logs", NoStart: true})
-	succeeded(t, s, c, op, e)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, e)
 	v, e := s.Show(context.Background(), c.Peer, "logs")
 	if e != nil {
 		t.Fatal(e)
@@ -405,7 +349,7 @@ func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if got := waitOperation(t, s, c, op); got.Error == nil || got.Error.Exit != 5 {
+	if got := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil); got.Error == nil || got.Error.Exit != 5 {
 		t.Fatal("pending tailscale declaration renamed", got)
 	}
 }
