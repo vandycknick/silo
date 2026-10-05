@@ -11,7 +11,7 @@ func TestStrictConfig(t *testing.T) {
 	for _, tt := range []struct {
 		body  string
 		valid bool
-	}{{"{}", true}, {"tailnet:\n  hostname: silo-test", true}, {"tailnet:\n  misspelled: true", false}, {"{}\n---\n{}", false}, {"home: relative", false}, {"tailnet:\n  hostname: trailing-", false}, {"vm:\n  defaults: {cpus: 99}", false}, {"tailnet: {hostname: a, hostname: b}", false}, {strings.Repeat(" ", 65537), false}} {
+	}{{"{}", true}, {"tailnet:\n  hostname: silo-test", true}, {"tailnet:\n  misspelled: true", false}, {"{}\n---\n{}", false}, {"home: relative", false}, {"tailnet:\n  hostname: trailing-", false}, {"vm:\n  defaults: {cpus: 99}", false}, {"vm:\n  defaults: {memory: 1.5GiB}", false}, {"vm:\n  defaults: {memory: 512MiB}", true}, {"shutdown:\n  stop_budget: 4", false}, {"shutdown:\n  stop_budget: 2s", true}, {"disk_reserve: 2GB", true}, {"tailnet: {hostname: a, hostname: b}", false}, {strings.Repeat(" ", 65537), false}} {
 		path := filepath.Join(t.TempDir(), "config.yaml")
 		if e := os.WriteFile(path, []byte(tt.body), 0600); e != nil {
 			t.Fatal(e)

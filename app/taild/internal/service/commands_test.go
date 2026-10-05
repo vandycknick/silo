@@ -24,10 +24,7 @@ import (
 
 func domainCaller(t *testing.T, s *Service, owner identity.Principal) Caller {
 	t.Helper()
-	limits, e := s.Config.Limits()
-	if e != nil {
-		t.Fatal(e)
-	}
+	limits := s.Config.Limits()
 	p := identity.Peer{Principals: []identity.Principal{owner}, NodeID: "explicit-domain-" + string(owner), ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
 	return Caller{Peer: p, Resolve: func(ctx context.Context) (identity.Peer, error) { return p, ctx.Err() }}
 }
@@ -38,7 +35,7 @@ func actualService(t *testing.T) *Service {
 	c.TemplatesDir = t.TempDir()
 	c.PoliciesDir = t.TempDir()
 	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: "256MiB", Disk: "1GiB"}
+	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 256 << 20, Disk: 1 << 30}
 	r, e := runtime.Open(context.Background(), c, "native-service")
 	if e != nil {
 		t.Fatal(e)

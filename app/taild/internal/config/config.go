@@ -17,21 +17,27 @@ import (
 )
 
 type Resources struct {
-	CPUs   uint64 `yaml:"cpus"`
-	Memory string `yaml:"memory"`
-	Disk   string `yaml:"disk"`
+	CPUs   uint64     `yaml:"cpus"`
+	Memory units.Size `yaml:"memory"`
+	Disk   units.Size `yaml:"disk"`
+}
+
+// Ceilings bound every principal; capability grants can only lower them.
+type Ceilings struct {
+	Resources `yaml:",inline"`
+	VMs       uint64 `yaml:"vms_per_principal"`
 }
 type Config struct {
-	TemplatesDir   string `yaml:"templates_dir"`
-	PoliciesDir    string `yaml:"policies_dir"`
-	Home           string `yaml:"home"`
-	RuntimeRoot    string `yaml:"runtime_root"`
-	InstallRoot    string `yaml:"install_root"`
-	RuntimeArchive string `yaml:"runtime_archive"`
-	DiskReserve    string `yaml:"disk_reserve"`
+	TemplatesDir   string     `yaml:"templates_dir"`
+	PoliciesDir    string     `yaml:"policies_dir"`
+	Home           string     `yaml:"home"`
+	RuntimeRoot    string     `yaml:"runtime_root"`
+	InstallRoot    string     `yaml:"install_root"`
+	RuntimeArchive string     `yaml:"runtime_archive"`
+	DiskReserve    units.Size `yaml:"disk_reserve"`
 	Shutdown       struct {
-		StopBudget string `yaml:"stop_budget"`
-		Margin     string `yaml:"margin"`
+		StopBudget units.Duration `yaml:"stop_budget"`
+		Margin     units.Duration `yaml:"margin"`
 	} `yaml:"shutdown"`
 	SecretsDir string `yaml:"secrets_dir"`
 	Tailnet    struct {
@@ -48,12 +54,7 @@ type Config struct {
 		DefaultImage      string    `yaml:"default_image"`
 		AllowedRegistries []string  `yaml:"allowed_registries"`
 		Defaults          Resources `yaml:"defaults"`
-		Ceilings          struct {
-			CPUs   uint64 `yaml:"cpus"`
-			Memory string `yaml:"memory"`
-			Disk   string `yaml:"disk"`
-			VMs    uint64 `yaml:"vms_per_principal"`
-		} `yaml:"ceilings"`
+		Ceilings          Ceilings  `yaml:"ceilings"`
 	} `yaml:"vm"`
 	Sessions struct {
 		Global  int `yaml:"global"`
@@ -69,9 +70,9 @@ type Secrets struct {
 func Defaults() Config {
 	var c Config
 	c.Home = "/var/lib/silo-taild"
-	c.DiskReserve = "1GiB"
-	c.Shutdown.StopBudget = "4s"
-	c.Shutdown.Margin = "250ms"
+	c.DiskReserve = 1 << 30
+	c.Shutdown.StopBudget = units.Duration{Duration: 4 * time.Second}
+	c.Shutdown.Margin = units.Duration{Duration: 250 * time.Millisecond}
 	c.SecretsDir = "/etc/silo-taild/secrets"
 	c.TemplatesDir = "/etc/silo-taild/templates"
 	c.PoliciesDir = "/etc/silo-taild/policies"
@@ -81,11 +82,8 @@ func Defaults() Config {
 	c.Enrollment.Mode = "oauth-app"
 	c.VM.DefaultImage = "ghcr.io/vandycknick/silo/devbox:latest"
 	c.VM.AllowedRegistries = []string{"ghcr.io/vandycknick"}
-	c.VM.Defaults = Resources{2, "4GiB", "20GiB"}
-	c.VM.Ceilings.CPUs = 8
-	c.VM.Ceilings.Memory = "32GiB"
-	c.VM.Ceilings.Disk = "200GiB"
-	c.VM.Ceilings.VMs = 5
+	c.VM.Defaults = Resources{CPUs: 2, Memory: 4 << 30, Disk: 20 << 30}
+	c.VM.Ceilings = Ceilings{Resources: Resources{CPUs: 8, Memory: 32 << 30, Disk: 200 << 30}, VMs: 5}
 	c.Sessions.Global = 64
 	c.Sessions.PerPeer = 8
 	return c
@@ -121,24 +119,15 @@ func Load(path string) (Config, error) {
 	}
 	return c, c.Validate()
 }
-func (c Config) Limits() (identity.Limits, error) {
-	mem, e := units.Bytes(c.VM.Ceilings.Memory)
-	if e != nil {
-		return identity.Limits{}, e
-	}
-	disk, e := units.Bytes(c.VM.Ceilings.Disk)
-	if e != nil {
-		return identity.Limits{}, e
-	}
-	return identity.Limits{VMs: c.VM.Ceilings.VMs, CPUs: c.VM.Ceilings.CPUs, Memory: mem, Disk: disk}, nil
+
+// Limits is the operator ceiling as a capability grant, the shape every
+// per-peer grant is intersected with.
+func (c Config) Limits() identity.Limits {
+	return identity.Limits{VMs: c.VM.Ceilings.VMs, CPUs: c.VM.Ceilings.CPUs, Memory: uint64(c.VM.Ceilings.Memory), Disk: uint64(c.VM.Ceilings.Disk)}
 }
 func (c Config) Validate() error {
-	if _, e := units.Bytes(c.DiskReserve); e != nil {
-		return errors.New("invalid disk_reserve")
-	}
-	budget, e := time.ParseDuration(c.Shutdown.StopBudget)
-	margin, me := time.ParseDuration(c.Shutdown.Margin)
-	if e != nil || me != nil || budget <= 0 || budget > time.Minute || margin <= 0 || margin > time.Second {
+	budget, margin := c.Shutdown.StopBudget.Duration, c.Shutdown.Margin.Duration
+	if budget <= 0 || budget > time.Minute || margin <= 0 || margin > time.Second {
 		return errors.New("invalid shutdown stop_budget or margin")
 	}
 	for _, p := range []string{c.InstallRoot, c.RuntimeArchive} {
@@ -162,25 +151,14 @@ func (c Config) Validate() error {
 	}
 	for _, p := range []string{c.Home, c.SecretsDir, c.TemplatesDir, c.PoliciesDir} {
 		if !filepath.IsAbs(p) {
-			return errors.New("home and secrets_dir must be absolute")
+			return errors.New("home, secrets_dir, templates_dir and policies_dir must be absolute")
 		}
 	}
 	if c.RuntimeRoot != "" && !filepath.IsAbs(c.RuntimeRoot) {
 		return errors.New("runtime_root must be absolute")
 	}
-	l, e := c.Limits()
-	if e != nil {
-		return e
-	}
-	m, e := units.Bytes(c.VM.Defaults.Memory)
-	if e != nil {
-		return e
-	}
-	disk, e := units.Bytes(c.VM.Defaults.Disk)
-	if e != nil {
-		return e
-	}
-	if l.VMs == 0 || l.CPUs == 0 || l.CPUs > 255 || l.Memory == 0 || l.Disk == 0 || c.VM.Defaults.CPUs == 0 || c.VM.Defaults.CPUs > l.CPUs || m == 0 || m > l.Memory || disk == 0 || disk > l.Disk {
+	l, d := c.Limits(), c.VM.Defaults
+	if l.VMs == 0 || l.CPUs == 0 || l.CPUs > 255 || l.Memory == 0 || l.Disk == 0 || d.CPUs == 0 || d.CPUs > l.CPUs || d.Memory == 0 || uint64(d.Memory) > l.Memory || d.Disk == 0 || uint64(d.Disk) > l.Disk {
 		return errors.New("invalid resource defaults or ceilings")
 	}
 	if c.Sessions.Global < 1 || c.Sessions.PerPeer < 1 || c.Sessions.PerPeer > c.Sessions.Global {

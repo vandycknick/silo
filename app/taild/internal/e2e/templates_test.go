@@ -37,7 +37,7 @@ func TestNativeKVMTemplatesPolicyAndMissingSecrets(t *testing.T) {
 	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
 	c.TemplatesDir = t.TempDir()
 	c.PoliciesDir = t.TempDir()
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: "1GiB", Disk: "1GiB"}
+	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 1 << 30, Disk: 1 << 30}
 	c.VM.DefaultImage = registry.Reference
 	c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)

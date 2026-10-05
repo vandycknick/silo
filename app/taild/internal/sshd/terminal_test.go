@@ -544,7 +544,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Home = t.TempDir()
 	cfg.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	cfg.VM.Defaults = config.Resources{CPUs: 1, Memory: "256MiB", Disk: "1GiB"}
+	cfg.VM.Defaults = config.Resources{CPUs: 1, Memory: 256 << 20, Disk: 1 << 30}
 	cfg.VM.DefaultImage = registry.Reference
 	cfg.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -584,10 +584,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 			t.Error(e)
 		}
 	}()
-	limits, e := cfg.Limits()
-	if e != nil {
-		t.Fatal(e)
-	}
+	limits := cfg.Limits()
 	peer := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "explicit-domain-native-terminal", ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
 	caller := service.Caller{Peer: peer, Resolve: func(ctx context.Context) (identity.Peer, error) { return peer, ctx.Err() }}
 	address := terminalSSHServer(t, svc, caller)

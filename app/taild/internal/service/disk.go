@@ -4,7 +4,6 @@ import (
 	"math"
 	"sync"
 
-	"github.com/vandycknick/silo/app/taild/internal/units"
 	"golang.org/x/sys/unix"
 )
 
@@ -12,19 +11,15 @@ import (
 // disks consume allocated blocks. statfs Bavail counts blocks usable by this UID,
 // excluding filesystem/root reserves; existing allocation is already reflected.
 func (s *Service) diskAdmissionLocked(add uint64) error {
-	floor, err := units.Bytes(s.Config.DiskReserve)
-	if err != nil {
-		return failure("unavailable", "disk reserve configuration unavailable", 9)
-	}
 	var stat unix.Statfs_t
-	if err = unix.Statfs(s.Config.Home, &stat); err != nil {
+	if err := unix.Statfs(s.Config.Home, &stat); err != nil {
 		return failure("unavailable", "disk availability unavailable", 9)
 	}
 	if stat.Bsize <= 0 || stat.Bavail > math.MaxUint64/uint64(stat.Bsize) {
 		return failure("unavailable", "disk availability invalid", 9)
 	}
 	available := stat.Bavail * uint64(stat.Bsize)
-	needed := floor
+	needed := uint64(s.Config.DiskReserve)
 	for _, size := range s.diskPending {
 		if size > math.MaxUint64-needed {
 			return failure("limit", "disk reserve admission exceeded", 6)

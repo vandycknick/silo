@@ -12,6 +12,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/state"
+	"github.com/vandycknick/silo/app/taild/internal/units"
 	"golang.org/x/sys/unix"
 )
 
@@ -52,7 +53,7 @@ func TestReceiptDeadlineAndMemorySealWhileStartupHelperRecoveryBlocked(t *testin
 	defer cancel()
 	c := config.Defaults()
 	c.Home = t.TempDir()
-	c.Shutdown.StopBudget = "100ms"
+	c.Shutdown.StopBudget = units.Duration{Duration: 100 * time.Millisecond}
 	fd, err := state.LockShutdownHelper(c.Home)
 	if err != nil {
 		t.Fatal(err)

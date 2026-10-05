@@ -18,7 +18,6 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/state"
-	"github.com/vandycknick/silo/app/taild/internal/units"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -338,7 +337,6 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	if q.CPUs == 0 {
 		q.CPUs = s.Config.VM.Defaults.CPUs
 	}
-	var e error
 	if q.MemoryText != "" {
 		v, err := ParseResource("memory", q.MemoryText)
 		if err != nil {
@@ -356,14 +354,10 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 		q.DiskText = ""
 	}
 	if q.Memory == 0 {
-		if q.Memory, e = units.Bytes(s.Config.VM.Defaults.Memory); e != nil {
-			return q, Categorize(e)
-		}
+		q.Memory = uint64(s.Config.VM.Defaults.Memory)
 	}
 	if q.Disk == 0 {
-		if q.Disk, e = units.Bytes(s.Config.VM.Defaults.Disk); e != nil {
-			return q, Categorize(e)
-		}
+		q.Disk = uint64(s.Config.VM.Defaults.Disk)
 	}
 	if e := s.resources(p, q.CPUs, q.Memory, q.Disk); e != nil {
 		return q, e
@@ -371,11 +365,7 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	return q, nil
 }
 func (s *Service) resources(p identity.Peer, cpus, mem, disk uint64) error {
-	l, e := s.Config.Limits()
-	if e != nil {
-		return Categorize(e)
-	}
-	cap := p.Permissions.Limits
+	l, cap := s.Config.Limits(), p.Permissions.Limits
 	if cpus == 0 || cpus > 255 || cpus > min(l.CPUs, cap.CPUs) || mem == 0 || mem > min(l.Memory, cap.Memory) || disk == 0 || disk > min(l.Disk, cap.Disk) {
 		return failure("limit", "resource ceiling exceeded", 6)
 	}
@@ -416,10 +406,7 @@ func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q *CreateR
 	if e := s.diskAdmissionLocked(q.Disk); e != nil {
 		return nil, e
 	}
-	l, e := s.Config.Limits()
-	if e != nil {
-		return nil, Categorize(e)
-	}
+	l := s.Config.Limits()
 	count, e := s.ownedCountLocked(ctx, q.Owner)
 	if e != nil {
 		return nil, e
@@ -485,10 +472,7 @@ func (s *Service) materialize(ctx context.Context, p identity.Peer, q CreateRequ
 	if e := s.diskAdmissionLocked(0); e != nil {
 		return nil, e
 	}
-	l, e := s.Config.Limits()
-	if e != nil {
-		return nil, Categorize(e)
-	}
+	l := s.Config.Limits()
 	count, e := s.ownedCountLocked(ctx, q.Owner)
 	if e != nil {
 		return nil, e

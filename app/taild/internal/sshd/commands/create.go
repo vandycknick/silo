@@ -9,7 +9,6 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
-	"github.com/vandycknick/silo/app/taild/internal/units"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -80,17 +79,10 @@ func (h *createHandler) Defaults(c config.Config) map[string]string {
 	}
 	return map[string]string{
 		"cpus":   cpus + suffix,
-		"memory": configuredSize(c.VM.Defaults.Memory) + suffix,
-		"disk":   configuredSize(c.VM.Defaults.Disk) + suffix,
+		"memory": c.VM.Defaults.Memory.String() + suffix,
+		"disk":   c.VM.Defaults.Disk.String() + suffix,
 		"image":  service.ImageDefaultForHelp(c) + suffix,
 	}
-}
-
-func configuredSize(value string) string {
-	if n, err := units.Bytes(value); err != nil || n == 0 || len(value) > 64 {
-		return "unavailable"
-	}
-	return strings.TrimSpace(value)
 }
 
 func (h *createHandler) Run(c *Context, args cmdline.Args) (Result, error) {

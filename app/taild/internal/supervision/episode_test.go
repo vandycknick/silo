@@ -12,16 +12,17 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/state"
+	"github.com/vandycknick/silo/app/taild/internal/units"
 )
 
 // These tests drive the ordered-message domain and real pipe FDs. They do not
 // emulate a D-Bus server, SDK stop behavior, or claim a live login1 qualification.
-func episodeFixture(t *testing.T, budget string) (*Inhibitor, *state.ShutdownGate, chan<- loginEvent, <-chan loginEvent, context.Context) {
+func episodeFixture(t *testing.T, budget time.Duration) (*Inhibitor, *state.ShutdownGate, chan<- loginEvent, <-chan loginEvent, context.Context) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	t.Cleanup(cancel)
 	c := config.Defaults()
-	c.Shutdown.StopBudget = budget
+	c.Shutdown.StopBudget = units.Duration{Duration: budget}
 	receipts := make(chan loginEvent, 8)
 	i := &Inhibitor{owner: ":1.42", maxDelay: time.Second, receipts: receipts, snapshotSequence: 10}
 	t.Cleanup(i.Close)
@@ -58,7 +59,7 @@ func TestReturnedFDUsesCurrentEpisodeDuringBlockedAcquisition(t *testing.T) {
 	for _, mode := range []string{"before-deadline", "after-deadline", "cancelled-request"} {
 		t.Run(mode, func(t *testing.T) {
 			for range 12 {
-				i, gate, receipts, events, ctx := episodeFixture(t, "40ms")
+				i, gate, receipts, events, ctx := episodeFixture(t, 40*time.Millisecond)
 				deliverEpisode(t, ctx, receipts, events, 11, true)
 				deliverEpisode(t, ctx, receipts, events, 12, false)
 				if !i.needsFD() {
@@ -116,7 +117,7 @@ func TestReturnedFDUsesCurrentEpisodeDuringBlockedAcquisition(t *testing.T) {
 
 func TestLatestCancelledEpisodeRecoversAfterOlderWorkerRetires(t *testing.T) {
 	for range 100 {
-		i, gate, receipts, events, ctx := episodeFixture(t, "1s")
+		i, gate, receipts, events, ctx := episodeFixture(t, time.Second)
 		home := t.TempDir()
 		deliverEpisode(t, ctx, receipts, events, 11, true)
 		a := i.snapshot()

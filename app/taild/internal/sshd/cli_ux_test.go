@@ -130,7 +130,7 @@ func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
 	}
 	defer audit.Close()
 	c := config.Defaults()
-	c.VM.Defaults = config.Resources{CPUs: 3, Memory: "4GB", Disk: "7GiB"}
+	c.VM.Defaults = config.Resources{CPUs: 3, Memory: 4_000_000_000, Disk: 7 << 30}
 	c.VM.DefaultImage = "ghcr.io/example/dev:latest"
 	c.VM.AllowedRegistries = []string{"ghcr.io/example"}
 	s := &service.Service{Audit: audit, Config: c}
@@ -163,8 +163,6 @@ func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
 	}
 	for _, image := range []string{"/SECRET/token", "https://ghcr.io/example?token=SECRET", "ghcr.io:SECRET@example.test/image", "ghcr.io:SECRET/example/dev", "elsewhere.test/SECRET/image"} {
 		s.Config.VM.DefaultImage = image
-		s.Config.VM.Defaults.Memory = "4SECRET"
-		s.Config.VM.Defaults.Disk = "SECRET/token"
 		for _, line := range []string{"create --help", "help create --json"} {
 			var out, human bytes.Buffer
 			if code := dispatch(s, p, line, &out, &human); code != 0 || strings.Contains(out.String()+human.String(), "SECRET") {

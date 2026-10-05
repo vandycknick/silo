@@ -26,7 +26,7 @@ func nativeService(t *testing.T, ctx context.Context, instance string, principal
 	c.TemplatesDir = t.TempDir()
 	c.PoliciesDir = t.TempDir()
 	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: "256MiB", Disk: "1GiB"}
+	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 256 << 20, Disk: 1 << 30}
 	c.VM.DefaultImage = registry.Reference
 	c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
 	r, e := runtime.Open(ctx, c, instance)
@@ -45,10 +45,7 @@ func nativeService(t *testing.T, ctx context.Context, instance string, principal
 		_ = audit.Close()
 		_ = r.Close()
 	})
-	limits, e := c.Limits()
-	if e != nil {
-		t.Fatal(e)
-	}
+	limits := c.Limits()
 	p := identity.Peer{Principals: principals, NodeID: "explicit-" + instance, ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
 	return s, service.Caller{Peer: p, Resolve: func(ctx context.Context) (identity.Peer, error) { return p, ctx.Err() }}, registry
 }

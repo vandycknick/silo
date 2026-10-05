@@ -60,10 +60,7 @@ func success(t *testing.T, s *service.Service, c service.Caller, op jobs.Operati
 }
 func principal(t *testing.T, c config.Config, owner identity.Principal) service.Caller {
 	t.Helper()
-	limits, e := c.Limits()
-	if e != nil {
-		t.Fatal(e)
-	}
+	limits := c.Limits()
 	peer := identity.Peer{Principals: []identity.Principal{owner}, NodeID: "explicit-native-input-" + string(owner), ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
 	return service.Caller{Peer: peer, Resolve: func(ctx context.Context) (identity.Peer, error) { return peer, ctx.Err() }}
 }
@@ -81,7 +78,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	c := config.Defaults()
 	c.Home = t.TempDir()
 	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: "1GiB", Disk: "1GiB"}
+	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 1 << 30, Disk: 1 << 30}
 	c.VM.DefaultImage = registry.Reference
 	c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
 	audit, e := state.OpenAudit(c.Home, 1<<20, 2)

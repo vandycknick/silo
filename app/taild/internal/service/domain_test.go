@@ -45,20 +45,17 @@ func TestRemoteSurfacePureDomain(t *testing.T) {
 		t.Fatal(diagnostic)
 	}
 	s := &Service{Config: config.Defaults()}
-	limits, e := s.Config.Limits()
-	if e != nil {
-		t.Fatal(e)
-	}
+	limits := s.Config.Limits()
 	p := identity.Peer{Permissions: identity.Permissions{Limits: limits}}
-	if e = s.resources(p, 8, 32<<30, 200<<30); e != nil {
+	if e := s.resources(p, 8, 32<<30, 200<<30); e != nil {
 		t.Fatal(e)
 	}
 	p.Permissions.Limits = identity.Limits{CPUs: 100, Memory: 100 << 30, Disk: 1000 << 30}
-	if e = s.resources(p, 9, 32<<30, 200<<30); Categorize(e).Exit != 6 {
+	if e := s.resources(p, 9, 32<<30, 200<<30); Categorize(e).Exit != 6 {
 		t.Fatal("capability exceeded operator ceiling", e)
 	}
 	p.Permissions.Limits.CPUs = 0
-	if e = s.resources(p, 1, 32<<30, 200<<30); Categorize(e).Exit != 6 {
+	if e := s.resources(p, 1, 32<<30, 200<<30); Categorize(e).Exit != 6 {
 		t.Fatal("explicit zero cap ignored", e)
 	}
 }
