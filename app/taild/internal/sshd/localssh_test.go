@@ -12,7 +12,6 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -27,11 +26,7 @@ func TestLocalSSHDispatchJSONAndExit(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	audit, e := state.OpenAudit(t.TempDir(), 4096, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	svc := &service.Service{Audit: audit, Capability: "cap"}
 	peer := identity.Peer{Principals: []identity.Principal{"tag:ci"}, NodeID: "domain-node", ObservedAt: time.Now()}
 	serverConfig := &ssh.ServerConfig{NoClientAuth: true}

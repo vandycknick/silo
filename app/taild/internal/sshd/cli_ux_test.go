@@ -23,11 +23,7 @@ import (
 )
 
 func TestCLIHelpPureAndLiteralValues(t *testing.T) {
-	audit, err := state.OpenAudit(t.TempDir(), 1<<20, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	s := &service.Service{Audit: audit, Config: config.Defaults()}
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "help", Login: "verified@example.com", NodeName: "node.tail.test.", ObservedAt: time.Now()}
 	caller := service.Caller{Peer: p}
@@ -108,11 +104,7 @@ var (
 )
 
 func TestCLIStreamingCommandsRefuseJSON(t *testing.T) {
-	audit, err := state.OpenAudit(t.TempDir(), 1<<20, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	s := &service.Service{Audit: audit, Config: config.Defaults()}
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "metadata", ObservedAt: time.Now()}
 	for _, line := range []string{"shell vm --json", "exec vm --json -- program", "logs vm --json"} {
@@ -124,11 +116,7 @@ func TestCLIStreamingCommandsRefuseJSON(t *testing.T) {
 }
 
 func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
-	audit, err := state.OpenAudit(t.TempDir(), 1<<20, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	c := config.Defaults()
 	c.VM.Defaults = config.Resources{CPUs: 3, Memory: 4_000_000_000, Disk: 7 << 30}
 	c.VM.DefaultImage = "ghcr.io/example/dev:latest"

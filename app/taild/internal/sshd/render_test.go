@@ -7,15 +7,10 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 )
 
 func TestUnknownCommandEnvelope(t *testing.T) {
-	audit, e := state.OpenAudit(t.TempDir(), 4096, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	s := &service.Service{Audit: audit}
 	p := identity.Peer{Principals: []identity.Principal{"user:1"}, NodeID: "explicit-domain", ObservedAt: time.Now()}
 	var out, stderr bytes.Buffer
