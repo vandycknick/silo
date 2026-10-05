@@ -26,19 +26,6 @@ const (
 	None        Mode = "none"
 )
 
-func Select(owner identity.Principal, configured, appSecret string) Mode {
-	if configured == "none" {
-		return None
-	}
-	if strings.HasPrefix(string(owner), "tag:") {
-		return Tag
-	}
-	if configured != "interactive" && appSecret != "" {
-		return User
-	}
-	return Interactive
-}
-
 type Result struct {
 	Token string
 	Err   error

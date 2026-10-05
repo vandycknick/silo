@@ -36,7 +36,7 @@ func (h *helpHandler) Run(c *Context, args cmdline.Args) (Result, error) {
 // helpFor renders general help for an empty path, otherwise the topic named
 // by a command and an optional subcommand.
 func helpFor(c *Context, path []string) (Result, error) {
-	text := generalHelp()
+	text := Help()
 	if len(path) > 0 {
 		var configured *config.Config
 		if c.Service != nil {
@@ -52,7 +52,8 @@ func helpFor(c *Context, path []string) (Result, error) {
 	}{text}, Human: text}, nil
 }
 
-func generalHelp() string {
+// Help is the general banner, also shown to sessions that arrive without a command.
+func Help() string {
 	var b strings.Builder
 	b.WriteString("silo · manage your VMs\n\nUsage:\n  COMMAND [ARGUMENTS] [OPTIONS]\n\nCommands:\n")
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)

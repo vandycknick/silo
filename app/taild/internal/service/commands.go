@@ -700,8 +700,7 @@ type StopRequest struct {
 	Timeout time.Duration
 }
 type RemoveRequest struct {
-	Force     bool
-	Confirmed bool
+	Force bool
 }
 
 // RemovalTarget contains only the authorized facts needed for confirmation.
@@ -851,18 +850,9 @@ func waitReady(ctx context.Context, m *silo.Machine) error {
 	}
 	return nil
 }
+
+// Remove assumes the caller already confirmed through PreflightRemove.
 func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequest) (jobs.Operation, error) {
-	if !q.Confirmed {
-		m, d, e := s.machine(ctx, c.Peer, ref, identity.Delete)
-		if e != nil {
-			return jobs.Operation{}, e
-		}
-		s.Runtime.CloseMachine(m)
-		if d.Status.Kind != silo.MachineStatusStopped && !q.Force {
-			return jobs.Operation{}, failure("conflict", "VM is running; use --force", 5)
-		}
-		return jobs.Operation{}, failure("usage", "removal requires confirmation; use --yes unattended", 2)
-	}
 	return s.mutation(ctx, c, ref, "remove", identity.Delete, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, _ func(string)) error {
 		if d.Status.Kind != silo.MachineStatusStopped {
 			if !q.Force {

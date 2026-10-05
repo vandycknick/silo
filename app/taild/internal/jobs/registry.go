@@ -124,18 +124,17 @@ func (r *Registry) prune(now time.Time) {
 		}
 	}
 }
-func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) error) (Operation, error) {
-	return r.SubmitFinalized(kind, vm, owner, run, nil)
-}
 
-// SubmitFinalized releases admission resources before publishing completion,
-// including rejection and cancellation before the callback can execute.
-func (r *Registry) SubmitFinalized(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) error, finalize func()) (op Operation, err error) {
+// Submit runs an operation without a completion record or finalizer.
+func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) error) (Operation, error) {
 	return r.SubmitResult(kind, vm, owner, func(ctx context.Context, progress func(string)) (*Completion, error) {
 		return nil, run(ctx, progress)
-	}, finalize)
+	}, nil)
 }
 
+// SubmitResult runs finalize once admission resources can be released: on
+// rejection, on cancellation before the callback runs, or after it returns,
+// always before completion is published.
 func (r *Registry) SubmitResult(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) (*Completion, error), finalize func()) (op Operation, err error) {
 	accepted := false
 	defer func() {

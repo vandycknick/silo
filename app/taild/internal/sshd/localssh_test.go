@@ -78,7 +78,7 @@ func TestLocalSSHDispatchJSONAndExit(t *testing.T) {
 					return
 				}
 				_ = req.Reply(true, nil)
-				code := Dispatch(svc, peer, payload.Command, ch, ch.Stderr())
+				code := dispatch(svc, peer, payload.Command, ch, ch.Stderr())
 				_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(code)}))
 				_ = ch.Close()
 				break

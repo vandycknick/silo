@@ -31,9 +31,6 @@ func flagsOf(c Command) *cmdline.FlagSet {
 	return f
 }
 
-// Help is the banner for sessions that arrive without a command.
-func Help() string { return generalHelp() }
-
 // Execute runs one tokenized line: session-wide flags, alias and help
 // resolution, option parsing, then the handler. It is the only entry point.
 func Execute(c *Context, tokens []string) (Result, error) {

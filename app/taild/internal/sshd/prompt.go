@@ -29,21 +29,9 @@ func sessionPrompt(streams service.IO) func(context.Context, string, int) (strin
 		} else if n != len(prompt) {
 			return "", io.ErrShortWrite
 		}
-		read := streams.Stdin.Read
-		afterCR := func() {}
 		if r, ok := streams.Stdin.(contextualInput); ok {
-			r = contextualInput{ctx, r.input}
-			r.input.mu.Lock()
-			defer r.input.mu.Unlock()
-			read = r.readLocked
-			afterCR = func() { r.input.skipLF = true }
+			return contextualInput{ctx, r.input}.ReadLine(limit)
 		}
-		return scanLine(limit, func(b []byte) (int, error) {
-			n, e := read(b)
-			if n > 0 && (b[0] == 3 || b[0] == 4) {
-				return 0, errLineCanceled
-			}
-			return n, e
-		}, afterCR)
+		return scanLine(limit, streams.Stdin.Read, func() {})
 	}
 }

@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/service"
 )
 
 func readLine(src io.Reader) (string, error) { return readLineLimit(src, 16384) }
@@ -124,4 +127,16 @@ func TestBackpressuredOutputClosesOnStreamCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("backpressured output ignored cancellation")
 	}
+}
+
+// dispatch runs one line with an explicit domain identity, below authentication.
+func dispatch(s *service.Service, p identity.Peer, line string, stdout, stderr io.Writer) int {
+	return DispatchSession(context.Background(), s, service.Caller{Peer: p}, line, service.IO{Stdout: stdout, Stderr: stderr})
+}
+
+func readLineLimit(src io.Reader, limit int) (string, error) {
+	if r, ok := src.(contextualInput); ok {
+		return r.ReadLine(limit)
+	}
+	return scanLine(limit, src.Read, func() {})
 }

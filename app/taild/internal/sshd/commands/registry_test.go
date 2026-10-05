@@ -93,7 +93,7 @@ func TestDeclarationsDriveHelpAndArity(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"create", "exec", "help", "ls", "logs", "ops", "policy", "restart", "rm", "set", "shell", "show", "start", "stop", "template", "version", "whoami"} {
-		if !strings.Contains(generalHelp(), "\n  "+name+" ") {
+		if !strings.Contains(Help(), "\n  "+name+" ") {
 			t.Fatal("general help misses", name)
 		}
 	}

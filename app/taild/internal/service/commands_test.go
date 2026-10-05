@@ -235,7 +235,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	if got := waitOperation(t, s, one, op); got.Error == nil || got.Error.Exit != 4 {
 		t.Fatal("queued revoked mutation ran", got)
 	}
-	op, e = s.Remove(context.Background(), one, name, RemoveRequest{Confirmed: true})
+	op, e = s.Remove(context.Background(), one, name, RemoveRequest{})
 	succeeded(t, s, one, op, e)
 	op, e = s.Create(context.Background(), one, CreateRequest{Name: "one", NoStart: true})
 	succeeded(t, s, one, op, e)

@@ -176,7 +176,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 		t.Fatal("create/read/exec principal exec denied", code, e)
 	}
 	ci.Peer.Permissions.Actions = append(ci.Peer.Permissions.Actions, identity.Delete, identity.Stop)
-	op, e = s.Remove(ctx, ci, "native-ci", service.RemoveRequest{Confirmed: true, Force: true})
+	op, e = s.Remove(ctx, ci, "native-ci", service.RemoveRequest{Force: true})
 	success(t, s, ci, op, e)
 	if _, e = s.Show(ctx, two.Peer, "native-one"); service.Categorize(e).Exit != 3 {
 		t.Fatal("positive-user isolation failed", e)
@@ -208,7 +208,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	probeOutputFailures(t, s, one, "native-one")
 	probeSDKLazyStdin(t, s, "native-one")
 	probeStreamAuthorization(t, s, one, "native-one")
-	op, e = s.Remove(ctx, one, "native-one", service.RemoveRequest{Confirmed: true})
+	op, e = s.Remove(ctx, one, "native-one", service.RemoveRequest{})
 	v := wait(t, s, one, op, e)
 	if v.Error == nil || v.Error.Exit != 5 {
 		t.Fatal("running rm accepted", v)
@@ -297,7 +297,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	if code = sshd.DispatchSession(ctx, s, one, "exec "+name+" -e VALUE=literal -- /bin/bash -c 'printf \"%s\" \"$VALUE\"'", service.IO{Stdout: &out, Stderr: &errout}); code != 0 || out.String() != "literal" {
 		t.Fatal(code, out.String(), errout.String())
 	}
-	op, e = s.Remove(ctx, one, name, service.RemoveRequest{Force: true, Confirmed: true})
+	op, e = s.Remove(ctx, one, name, service.RemoveRequest{Force: true})
 	success(t, s, one, op, e)
 	if code := sshd.DispatchSession(ctx, s, two, "--yes rm native-two", service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 0 {
 		t.Fatal("global --yes unattended remove", code)

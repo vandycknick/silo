@@ -311,7 +311,7 @@ func TestTerminalHandoffAndBounds(t *testing.T) {
 	var out bytes.Buffer
 	input := newInput(ctx, strings.NewReader("exec vm -- cat\r\n\x00\xff\x03\x1b[A\r\n"))
 	editor := newTerminalInput(ctx, input, &humanWriter{out: &out}, 80, 24)
-	line, e := editor.ReadLine(16384)
+	line, e := editor.ReadPrompt("", 16384)
 	if e != nil || line != "exec vm -- cat" {
 		t.Fatal(line, e)
 	}
@@ -331,14 +331,14 @@ func TestTerminalHandoffAndBounds(t *testing.T) {
 	for _, data := range []string{strings.Repeat("x", 5000) + "\r", "\x1b[200~" + strings.Repeat("x", 5000) + "\x1b[201~\r", "\x1b]title\x07whoami\r", "\xffwhoami\r"} {
 		input := newInput(ctx, strings.NewReader(data))
 		editor := newTerminalInput(ctx, input, io.Discard, 80, 24)
-		if line, e := editor.ReadLine(16384); e == nil || line != "" {
+		if line, e := editor.ReadPrompt("", 16384); e == nil || line != "" {
 			t.Fatal("unsafe/truncated input accepted", line, e)
 		}
 	}
 	input = newInput(ctx, strings.NewReader("whoami\r\rhelp\x03\x1b[A\r"))
 	editor = newTerminalInput(ctx, input, io.Discard, 80, 24)
 	for i, want := range []string{"whoami", "", "", "whoami"} {
-		line, e := editor.ReadLine(4096)
+		line, e := editor.ReadPrompt("", 4096)
 		if line != want || (i == 2 && !errors.Is(e, errLineCanceled)) || (i != 2 && e != nil) {
 			t.Fatal("history after empty/canceled line", i, line, e)
 		}
@@ -366,10 +366,10 @@ func TestTerminalHistoryEffectiveLineBounds(t *testing.T) {
 			defer cancel()
 			input := newInput(ctx, strings.NewReader(tc.seed+"\r\x1b[A"+tc.append+"\r"))
 			editor := newTerminalInput(ctx, input, io.Discard, 120, 30)
-			if line, e := editor.ReadLine(tc.limit); e != nil || line != tc.seed {
+			if line, e := editor.ReadPrompt("", tc.limit); e != nil || line != tc.seed {
 				t.Fatal("seed", len(line), e)
 			}
-			line, e := editor.ReadLine(tc.limit)
+			line, e := editor.ReadPrompt("", tc.limit)
 			if tc.overflow {
 				if e == nil || line != "" {
 					t.Fatalf("overflow dispatched %d bytes/%d runes: %v", len(line), utf8.RuneCountInString(line), e)
@@ -389,17 +389,17 @@ func TestTerminalHistoryEffectiveLineBounds(t *testing.T) {
 		data := "first\r" + seed + "\rlatest\r\x1b[A\x1b[A\x03\x1b[A\x1b[Axx\x7f\r\x1b[A\r"
 		editor := newTerminalInput(ctx, newInput(ctx, strings.NewReader(data)), io.Discard, 120, 30)
 		for _, want := range []string{"first", seed, "latest"} {
-			if line, e := editor.ReadLine(16384); e != nil || line != want {
+			if line, e := editor.ReadPrompt("", 16384); e != nil || line != want {
 				t.Fatal(len(line), e)
 			}
 		}
-		if line, e := editor.ReadLine(16384); line != "" || !errors.Is(e, errLineCanceled) {
+		if line, e := editor.ReadPrompt("", 16384); line != "" || !errors.Is(e, errLineCanceled) {
 			t.Fatal("recall cancellation", line, e)
 		}
-		if line, e := editor.ReadLine(16384); line != "" || e == nil {
+		if line, e := editor.ReadPrompt("", 16384); line != "" || e == nil {
 			t.Fatal("shortening after overflow dispatched prefix", len(line), e)
 		}
-		if line, e := editor.ReadLine(16384); line != "latest" || e != nil {
+		if line, e := editor.ReadPrompt("", 16384); line != "latest" || e != nil {
 			t.Fatal("canceled/overflow history replay", line, e)
 		}
 	})
@@ -432,7 +432,7 @@ func TestTerminalReadWriteErrorsAndCancellation(t *testing.T) {
 		readError := errors.New("transport read failed")
 		go func() { _, _ = io.WriteString(producer, "whoami"); _ = producer.CloseWithError(readError) }()
 		editor := newTerminalInput(ctx, newInput(ctx, src), io.Discard, 80, 24)
-		if line, e := editor.ReadLine(4096); line != "" || !errors.Is(e, readError) {
+		if line, e := editor.ReadPrompt("", 4096); line != "" || !errors.Is(e, readError) {
 			t.Fatal(line, e)
 		}
 	})
@@ -443,7 +443,7 @@ func TestTerminalReadWriteErrorsAndCancellation(t *testing.T) {
 		_ = drain.Close()
 		defer output.Close()
 		editor := newTerminalInput(ctx, newInput(ctx, strings.NewReader("whoami\r")), output, 80, 24)
-		if line, e := editor.ReadLine(4096); line != "" || !errors.Is(e, io.ErrClosedPipe) {
+		if line, e := editor.ReadPrompt("", 4096); line != "" || !errors.Is(e, io.ErrClosedPipe) {
 			t.Fatal(line, e)
 		}
 	})
@@ -455,7 +455,7 @@ func TestTerminalReadWriteErrorsAndCancellation(t *testing.T) {
 		defer producer.Close()
 		editor := newTerminalInput(ctx, newInput(ctx, src), io.Discard, 80, 24)
 		done := make(chan error, 1)
-		go func() { _, e := editor.ReadLine(4096); done <- e }()
+		go func() { _, e := editor.ReadPrompt("", 4096); done <- e }()
 		cancel()
 		select {
 		case e := <-done:

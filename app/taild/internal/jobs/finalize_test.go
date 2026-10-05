@@ -20,7 +20,7 @@ func TestFinalizerRunsForCancellationBeforeCallback(t *testing.T) {
 	<-entered
 	var called atomic.Bool
 	finalized := make(chan struct{})
-	_, err = r.SubmitFinalized("set", "vm", "user:1", func(context.Context, func(string)) error { called.Store(true); return nil }, func() { close(finalized) })
+	_, err = r.SubmitResult("set", "vm", "user:1", func(context.Context, func(string)) (*Completion, error) { called.Store(true); return nil, nil }, func() { close(finalized) })
 	if err != nil {
 		t.Fatal(err)
 	}

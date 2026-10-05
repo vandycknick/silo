@@ -123,6 +123,6 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	}
 	op, err = s.Start(ctx, c, "pending")
 	succeeded(t, s, c, op, err)
-	op, err = s.Remove(ctx, c, "pending", RemoveRequest{Force: true, Confirmed: true})
+	op, err = s.Remove(ctx, c, "pending", RemoveRequest{Force: true})
 	succeeded(t, s, c, op, err)
 }

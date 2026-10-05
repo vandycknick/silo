@@ -19,7 +19,7 @@ func TestUnknownCommandEnvelope(t *testing.T) {
 	s := &service.Service{Audit: audit}
 	p := identity.Peer{Principals: []identity.Principal{"user:1"}, NodeID: "explicit-domain", ObservedAt: time.Now()}
 	var out, stderr bytes.Buffer
-	if code := Dispatch(s, p, "unknown --json", &out, &stderr); code != 2 {
+	if code := dispatch(s, p, "unknown --json", &out, &stderr); code != 2 {
 		t.Fatal(code)
 	}
 	if out.String() != "{\"ok\":false,\"error\":{\"code\":\"usage\",\"message\":\"invalid command arguments; see help\"}}\n" || stderr.String() != "Error: invalid command arguments; see help\n" {

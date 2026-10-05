@@ -34,8 +34,7 @@ func (h *rmHandler) Run(c *Context, args cmdline.Args) (Result, error) {
 	if e != nil {
 		return Result{}, e
 	}
-	h.q.Confirmed = h.yes || c.Confirm(target)
-	if !h.q.Confirmed || c.Err() != nil {
+	if confirmed := h.yes || c.Confirm(target); !confirmed || c.Err() != nil {
 		return Result{}, &authz.Error{Code: "cancelled", Message: "removal cancelled", Exit: 2}
 	}
 	return c.Await(c.Service.Remove(c, c.Caller, target.ID, h.q))

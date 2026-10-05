@@ -22,7 +22,9 @@ func TestModeTable(t *testing.T) {
 	}{
 		{"user:1", "oauth-app", "app", User}, {"user:1", "oauth-app", "", Interactive}, {"user:1", "interactive", "app", Interactive}, {"tag:ci", "interactive", "", Tag}, {"tag:ci", "none", "", None},
 	} {
-		if got := Select(tc.owner, tc.config, tc.secret); got != tc.want {
+		m := Manager{}
+		m.Config.Enrollment.Mode, m.Secrets.AppSecret = tc.config, tc.secret
+		if got := m.Mode(tc.owner); got != tc.want {
 			t.Fatal(tc, got)
 		}
 	}
