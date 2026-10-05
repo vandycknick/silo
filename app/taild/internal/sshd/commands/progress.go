@@ -102,19 +102,33 @@ func completionText(op jobs.Operation, lobby string) string {
 	if v == nil || op.Kind != "create" && op.Kind != "start" && op.Kind != "restart" {
 		return text
 	}
-	if lobby == "" {
-		lobby = "silo"
-	}
 	if !v.Running {
-		return text + fmt.Sprintf("\nStart\n  ssh %s start %s\n", lobby, name)
+		return text + fmt.Sprintf("\nStart\n  ssh %s start %s\n", lobbyName(lobby), name)
 	}
-	text += fmt.Sprintf("\nShell\n  ssh -t %s shell %s\n", lobby, name)
-	if v.Node != "" && v.NodeState == "enrolled" {
-		text += fmt.Sprintf("\nSSH\n  ssh %s@%s\n", v.User, v.Node)
-	} else if v.ApprovalURL != "" {
+	text += connectionHints(lobby, name, v.User, v.Node, v.NodeState == "enrolled")
+	switch {
+	case v.Node != "" && v.NodeState == "enrolled":
+	case v.ApprovalURL != "":
 		text += "\nTailscale · approval required\n  " + v.ApprovalURL + "\n"
-	} else if v.NodeState != "none" && v.NodeState != "" {
+	case v.NodeState != "none" && v.NodeState != "":
 		text += fmt.Sprintf("\nTailscale · %s\n  Check with: show %s\n", v.NodeState, name)
+	}
+	return text
+}
+
+func lobbyName(configured string) string {
+	if configured == "" {
+		return "silo"
+	}
+	return configured
+}
+
+// connectionHints tells the peer how to reach a running VM: a shell through
+// the lobby always, and SSH straight to the node once it is enrolled.
+func connectionHints(lobby, name, user, node string, enrolled bool) string {
+	text := fmt.Sprintf("\nShell\n  ssh -t %s shell %s\n", lobbyName(lobby), name)
+	if enrolled && node != "" {
+		text += fmt.Sprintf("\nSSH\n  ssh %s@%s\n", user, node)
 	}
 	return text
 }

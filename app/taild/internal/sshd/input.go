@@ -86,17 +86,9 @@ func (t *terminalInput) checkInsertion(line string, pos int, key rune) (string, 
 }
 
 func (t *terminalInput) Write(p []byte) (int, error) {
-	var n int
-	var e error
-	if out, ok := t.out.(interface {
-		WriteContext(context.Context, []byte) (int, error)
-	}); ok {
-		ctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
-		defer cancel()
-		n, e = out.WriteContext(ctx, p)
-	} else {
-		n, e = t.out.Write(p)
-	}
+	ctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
+	defer cancel()
+	n, e := service.WriteContext(ctx, t.out, p)
 	if e == nil && n != len(p) {
 		e = io.ErrShortWrite
 	}
@@ -318,12 +310,7 @@ func terminalStreams(ctx context.Context, src io.Reader, streams service.IO) ser
 	input := newInput(ctx, src)
 	streams.Input = input.Reader
 	streams.Stdin = input.Reader(ctx)
-	if streams.Human == nil {
-		streams.Human = streams.Stderr
-		if streams.Terminal.Present {
-			streams.Human = &humanWriter{out: streams.Stderr}
-		}
-	}
+	streams = normalizeHuman(streams)
 	if streams.Terminal.Present {
 		w := streams.Terminal.Window
 		streams.Stdin = newTerminalInput(ctx, input, streams.Human, int(w.Columns), int(w.Rows))

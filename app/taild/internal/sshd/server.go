@@ -101,17 +101,15 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 	defer closeOnCancel()
 	initial, windows, pty := sess.Pty()
 	closeChannel := func() { _ = sess.Close() }
-	var diagnostic io.Writer = sessionOutput{ctx, sess.Stderr(), closeChannel}
-	if pty {
-		diagnostic = &humanWriter{out: diagnostic}
-	}
 	converted := make(chan service.Window, 1)
 	convertedSignals := make(chan uint32, 1)
 	terminal := service.Terminal{Present: pty, Term: initial.Term, Windows: converted, Signals: convertedSignals}
 	if initial.Window.Height > 0 && initial.Window.Height <= 65535 && initial.Window.Width > 0 && initial.Window.Width <= 65535 {
 		terminal.Window = service.Window{Rows: uint16(initial.Window.Height), Columns: uint16(initial.Window.Width)}
 	}
-	streams := terminalStreams(ctx, sess, service.IO{Stdout: sessionOutput{ctx, sess, closeChannel}, Stderr: sessionOutput{ctx, sess.Stderr(), closeChannel}, Human: diagnostic, Terminal: terminal})
+	streams := terminalStreams(ctx, sess, service.IO{Stdout: sessionOutput{ctx, sess, closeChannel}, Stderr: sessionOutput{ctx, sess.Stderr(), closeChannel}, Terminal: terminal})
+	// Refusals before any command runs go where daemon-owned text goes.
+	diagnostic := streams.Human
 	// Pty creates an upstream converter. Drain through close even when WhoIs
 	// denies the session, and fan resize out to the editor and guest controls.
 	if pty {
@@ -194,8 +192,7 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 			case <-ctx.Done():
 				return
 			case <-rechecks.C:
-				updated, err := s.Resolver.WhoIs(ctx, sess.RemoteAddr().String())
-				if err != nil || updated.NodeID != nodeID {
+				if _, err := caller.Fresh(ctx); err != nil {
 					cancel()
 					return
 				}

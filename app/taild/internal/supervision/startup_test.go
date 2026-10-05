@@ -12,7 +12,6 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/state"
-	"github.com/vandycknick/silo/app/taild/internal/units"
 	"golang.org/x/sys/unix"
 )
 
@@ -53,7 +52,6 @@ func TestReceiptDeadlineAndMemorySealWhileStartupHelperRecoveryBlocked(t *testin
 	defer cancel()
 	c := config.Defaults()
 	c.Home = t.TempDir()
-	c.Shutdown.StopBudget = units.Duration{Duration: 100 * time.Millisecond}
 	fd, err := state.LockShutdownHelper(c.Home)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +66,7 @@ func TestReceiptDeadlineAndMemorySealWhileStartupHelperRecoveryBlocked(t *testin
 	defer reader.Close()
 	defer writer.Close()
 	receipts := make(chan loginEvent, 4)
-	i := &Inhibitor{owner: ":1.42", fd: writer, maxDelay: time.Second, receipts: receipts, snapshotSequence: 10}
+	i := &Inhibitor{owner: ":1.42", fd: writer, maxDelay: time.Second, budget: StopBudget(100*time.Millisecond, time.Second, c.Shutdown.Margin.Duration), receipts: receipts, snapshotSequence: 10}
 	gate := &state.ShutdownGate{}
 	registry := jobs.New(ctx, 2)
 	registry.Shutdown = gate
@@ -82,7 +80,7 @@ func TestReceiptDeadlineAndMemorySealWhileStartupHelperRecoveryBlocked(t *testin
 		t.Fatal(err)
 	}
 	<-started
-	events := i.admitEvents(ctx, c, false, gate, func() { registry.InterruptIf(func() bool { return true }) })
+	events := i.admitEvents(ctx, false, gate, func() { registry.InterruptIf(func() bool { return true }) })
 	receipts <- loginEvent{signal: orderedSignal(8, true), received: time.Now().Add(-time.Second)}
 	receipts <- loginEvent{signal: orderedSignal(9, false), received: time.Now().Add(-time.Second)}
 	// The actual deadline is already 50ms old when intake consumes this event.
