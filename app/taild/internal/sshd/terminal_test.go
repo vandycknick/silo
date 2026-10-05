@@ -22,7 +22,6 @@ import (
 	gliderssh "github.com/tailscale/gliderssh"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
@@ -183,11 +182,7 @@ func assertTerminalNewlines(t *testing.T, text string) {
 }
 
 func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
-	audit, e := state.OpenAudit(t.TempDir(), 4096, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	svc := &service.Service{Audit: audit, Capability: "test-capability"}
 	caller := service.Caller{Peer: identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "explicit-domain-terminal", ObservedAt: time.Now(), Permissions: identity.Permissions{Reason: "No capability grants access"}}}
 	peer := caller.Peer

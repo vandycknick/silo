@@ -9,7 +9,6 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 )
 
 // The grammar is exercised below authentication with a verified peer that
@@ -18,11 +17,7 @@ import (
 // reaches authorization, which refuses the grantless peer with exit 4; had a
 // malformed request slipped through, the nil runtime would panic instead.
 func TestCommandGrammar(t *testing.T) {
-	audit, e := state.OpenAudit(t.TempDir(), 1<<20, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	s := &service.Service{Audit: audit, Capability: "cap", Config: config.Defaults()}
 	peer := identity.Peer{Principals: []identity.Principal{"tag:ci"}, NodeID: "grammar", NodeName: "ci", ObservedAt: time.Now()}
 	caller := service.Caller{Peer: peer}

@@ -9,7 +9,6 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 )
 
 func TestTokenizer(t *testing.T) {
@@ -37,11 +36,7 @@ func TestTokenizer(t *testing.T) {
 	}
 }
 func TestLocalCommandDispatchBelowAuthentication(t *testing.T) {
-	audit, e := state.OpenAudit(t.TempDir(), 4096, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
+	audit := offlineAudit(t)
 	s := &service.Service{Audit: audit, Capability: "cap"}
 	p := identity.Peer{Principals: []identity.Principal{"user:123"}, NodeID: "node", NodeName: "peer", ObservedAt: time.Now(), Permissions: identity.Permissions{Reason: "No capability"}}
 	for _, line := range []string{"whoami --json", "version --json", "help --json", "unknown --json", "whoami --bad --json"} {
