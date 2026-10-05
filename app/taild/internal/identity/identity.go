@@ -56,7 +56,6 @@ const (
 	Update         Action = "vm.update"
 	TemplateManage Action = "template.manage"
 	Restart        Action = "vm.restart"
-	Reauth         Action = "vm.reauth"
 )
 
 func Actions() []Action {

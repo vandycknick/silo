@@ -1,6 +1,7 @@
 package silo
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -17,24 +18,24 @@ func TestVerifiedNativeABIVersion(t *testing.T) {
 	}
 }
 
-func TestABI4RejectsActualABI3Bridge(t *testing.T) {
-	if os.Getenv("SILO_ABI3_CHILD") == "1" {
+func TestRejectsIncompatibleNativeBridge(t *testing.T) {
+	if os.Getenv("SILO_ABI_MISMATCH_CHILD") == "1" {
 		_, err := VerifiedNativeABIVersion()
-		if !IsErrorKind(err, ErrorABIMismatch) || !strings.Contains(err.Error(), "bridge ABI 3, SDK requires ABI 4") {
-			t.Fatalf("old ABI error = %v", err)
+		if !IsErrorKind(err, ErrorABIMismatch) || !strings.Contains(err.Error(), fmt.Sprintf("SDK requires ABI %d", NativeABIVersion)) {
+			t.Fatalf("incompatible ABI error = %v", err)
 		}
 		return
 	}
-	old := os.Getenv("SILO_TEST_OLD_FFI_PATH")
-	if old == "" {
-		t.Skip("SILO_TEST_OLD_FFI_PATH must name an actual older bridge")
+	incompatible := os.Getenv("SILO_TEST_INCOMPATIBLE_FFI_PATH")
+	if incompatible == "" {
+		t.Skip("SILO_TEST_INCOMPATIBLE_FFI_PATH must name an actual incompatible bridge")
 	}
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(executable, "-test.run=^TestABI4RejectsActualABI3Bridge$")
-	command.Env = append(os.Environ(), "SILO_ABI3_CHILD=1", "SILO_GO_FFI_PATH="+old)
+	command := exec.Command(executable, "-test.run=^TestRejectsIncompatibleNativeBridge$")
+	command.Env = append(os.Environ(), "SILO_ABI_MISMATCH_CHILD=1", "SILO_GO_FFI_PATH="+incompatible)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, output)
 	}
@@ -42,7 +43,7 @@ func TestABI4RejectsActualABI3Bridge(t *testing.T) {
 
 func TestNativeABIVersionConstant(t *testing.T) {
 	const got uint32 = NativeABIVersion
-	if got != 4 {
+	if got != 1 {
 		t.Fatalf("required ABI = %d", got)
 	}
 }

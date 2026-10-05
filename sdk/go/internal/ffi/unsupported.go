@@ -41,6 +41,7 @@ func (*Runtime) Query([]byte) ([]byte, error)           { return nil, nil }
 func (*Machine) ID() (string, error)                    { return "", nil }
 func (*Machine) Inspect() ([]byte, error)               { return nil, nil }
 func (*Machine) Start() ([]byte, error)                 { return nil, nil }
+func (*Machine) Secret([]byte) error                    { return nil }
 func (*Machine) Stop() ([]byte, error)                  { return nil, nil }
 func (*Machine) Update([]byte) ([]byte, error)          { return nil, nil }
 func (*Machine) StopWith([]byte) ([]byte, error)        { return nil, nil }

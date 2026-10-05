@@ -35,6 +35,7 @@ DECLARE_FFI(machine_stop);
 DECLARE_FFI(machine_update);
 DECLARE_FFI(machine_stop_with);
 DECLARE_FFI(machine_remove);
+DECLARE_FFI(machine_secret);
 DECLARE_FFI(machine_exec);
 DECLARE_FFI(machine_shell);
 DECLARE_FFI(machine_spawn);
@@ -125,6 +126,7 @@ char *bridge_load(const char *path, uint32_t expected_abi) {
     LOAD(ffi_machine_update, "silo_machine_update");
     LOAD(ffi_machine_stop_with, "silo_machine_stop_with");
     LOAD(ffi_machine_remove, "silo_machine_remove");
+    LOAD(ffi_machine_secret, "silo_machine_secret");
     LOAD(ffi_machine_exec, "silo_machine_exec");
     LOAD(ffi_machine_shell, "silo_machine_shell");
     LOAD(ffi_machine_spawn, "silo_machine_spawn");
@@ -182,6 +184,7 @@ silo_error *bridge_machine_stop(const silo_machine *machine, silo_buffer *out_da
 silo_error *bridge_machine_update(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_machine_update(machine, request, request_len, out_data); }
 silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_machine_stop_with(machine, request, request_len, out_data); }
 silo_error *bridge_machine_remove(const silo_machine *machine) { return ffi_machine_remove(machine); }
+silo_error *bridge_machine_secret(const silo_machine *machine, const uint8_t *request, size_t request_len) { return ffi_machine_secret(machine, request, request_len); }
 silo_error *bridge_machine_exec(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output) { return ffi_machine_exec(machine, request, request_len, out_output); }
 silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output) { return ffi_machine_shell(machine, request, request_len, out_output); }
 silo_error *bridge_machine_spawn(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution **out_session) { return ffi_machine_spawn(machine, request, request_len, out_session); }

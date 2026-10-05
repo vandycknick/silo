@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,35 +76,40 @@ func Categorize(err error) *authz.Error {
 }
 
 type VM struct {
-	GuestUser       *silo.GuestUser        `json:"guest_user,omitempty"`
-	DefaultUser     string                 `json:"default_user"`
-	NodeDiagnostics []string               `json:"node_diagnostics,omitempty"`
-	NodeState       state.NodeState        `json:"node_state"`
-	NodeID          string                 `json:"node_id,omitempty"`
-	Addresses       []string               `json:"addresses,omitempty"`
-	KeyExpiry       string                 `json:"key_expiry"`
-	ApprovalURL     string                 `json:"approval_url,omitempty"`
-	ApprovalExpires *time.Time             `json:"approval_expires,omitempty"`
-	Template        string                 `json:"template,omitempty"`
-	Policy          string                 `json:"policy,omitempty"`
-	GuestTCPPorts   []uint16               `json:"guest_tcp_ports,omitempty"`
-	ID              string                 `json:"id"`
-	Name            string                 `json:"name"`
-	Owner           identity.Principal     `json:"owner"`
-	State           silo.MachineStatusKind `json:"state"`
-	Node            string                 `json:"node"`
-	Address         string                 `json:"address"`
-	CPUs            uint8                  `json:"cpus"`
-	Memory          uint64                 `json:"memory"`
-	Disk            uint64                 `json:"disk"`
-	Created         time.Time              `json:"created"`
-	Image           string                 `json:"image"`
-	Labels          map[string]string      `json:"labels"`
-	LastOperation   *jobs.Operation        `json:"last_operation,omitempty"`
+	OwnerLogin          string                 `json:"owner_login,omitempty"`
+	KeyExpiryObservedAt *time.Time             `json:"key_expiry_observed_at,omitempty"`
+	KeyExpiryLastKnown  bool                   `json:"key_expiry_last_known,omitempty"`
+	Tags                []string               `json:"tags,omitempty"`
+	GuestUser           *silo.GuestUser        `json:"guest_user,omitempty"`
+	DefaultUser         string                 `json:"default_user"`
+	NodeDiagnostics     []string               `json:"node_diagnostics,omitempty"`
+	NodeState           state.NodeState        `json:"node_state"`
+	NodeID              string                 `json:"node_id,omitempty"`
+	Addresses           []string               `json:"addresses,omitempty"`
+	KeyExpiry           string                 `json:"key_expiry"`
+	ApprovalURL         string                 `json:"approval_url,omitempty"`
+	Template            string                 `json:"template,omitempty"`
+	Policy              string                 `json:"policy,omitempty"`
+	GuestTCPPorts       []uint16               `json:"guest_tcp_ports,omitempty"`
+	ID                  string                 `json:"id"`
+	Name                string                 `json:"name"`
+	Owner               identity.Principal     `json:"owner"`
+	State               silo.MachineStatusKind `json:"state"`
+	Node                string                 `json:"node"`
+	Address             string                 `json:"address"`
+	CPUs                uint8                  `json:"cpus"`
+	Memory              uint64                 `json:"memory"`
+	Disk                uint64                 `json:"disk"`
+	Created             time.Time              `json:"created"`
+	Image               string                 `json:"image"`
+	Labels              map[string]string      `json:"labels"`
 }
 
 func project(d *silo.MachineData) VM {
 	v := VM{ID: d.ID, Name: d.Name, Owner: identity.Principal(d.Labels[runtime.OwnerLabel]), State: d.Status.Kind, Created: d.CreatedAt.UTC()}
+	if !v.Owner.IsTag() {
+		v.OwnerLogin = d.Labels[runtime.LoginLabel]
+	}
 	v.DefaultUser = "root"
 	if d.GuestUser != nil {
 		u := *d.GuestUser
@@ -111,6 +117,7 @@ func project(d *silo.MachineData) VM {
 		v.DefaultUser = u.Name
 	}
 	v.Template = d.Labels[TemplateLabel]
+	_ = json.Unmarshal([]byte(d.Labels[runtime.TagsLabel]), &v.Tags)
 	v.Policy = d.Labels[PolicyLabel]
 	_ = json.Unmarshal([]byte(d.Labels[GuestPortsLabel]), &v.GuestTCPPorts)
 	v.Labels = map[string]string{}
@@ -173,7 +180,7 @@ func (s *Service) List(ctx context.Context, p identity.Peer) ([]VM, error) {
 		if !runtime.Managed(d, s.Runtime.Instance) || !p.Owns(identity.Principal(d.Labels[runtime.OwnerLabel])) {
 			continue
 		}
-		out = append(out, s.nodeView(ctx, d))
+		out = append(out, s.nodeView(d))
 	}
 	return out, nil
 }
@@ -183,14 +190,9 @@ func (s *Service) Show(ctx context.Context, p identity.Peer, ref string) (VM, er
 		return VM{}, e
 	}
 	defer s.Runtime.CloseMachine(m)
-	v := s.nodeView(ctx, d)
-	if s.Jobs != nil {
-		for _, op := range s.Jobs.List(p) {
-			if op.VM == d.ID || op.Kind == "create" && op.VM == d.Name {
-				last := op
-				v.LastOperation = &last
-			}
-		}
+	v := s.nodeView(d)
+	if !v.Owner.IsTag() && p.Owns(v.Owner) && p.Login != "" {
+		v.OwnerLogin = p.Login
 	}
 	return v, nil
 }
@@ -209,6 +211,7 @@ func (s *Service) Ops(p identity.Peer, id string) ([]jobs.Operation, error) {
 }
 
 type CreateRequest struct {
+	Tags        []string
 	GuestUser   *silo.GuestUser
 	Template    string
 	PolicyRef   string
@@ -225,7 +228,7 @@ type CreateRequest struct {
 	Userdata    string
 	Labels      map[string]string
 	Owner       identity.Principal
-	NoTailnet   bool
+	Tailscale   bool
 	NoStart     bool
 }
 
@@ -277,6 +280,25 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	if e := s.Authorize(p, identity.Create, nil); e != nil {
 		return q, e
 	}
+	if q.Tailscale && (!s.VMNodesEnabled || s.Enrollment == nil || s.Config.Enrollment.Mode == "none") {
+		return q, failure("usage", "Tailscale enrollment is disabled or unavailable", 2)
+	}
+	if len(q.Tags) > 0 && !q.Tailscale {
+		return q, failure("usage", "--tag requires --tailscale", 2)
+	}
+	if len(q.Tags) > 32 {
+		return q, failure("usage", "at most 32 tags may be requested", 2)
+	}
+	q.Tags = slices.Clone(q.Tags)
+	for i, tag := range q.Tags {
+		p, err := identity.ParsePrincipal(strings.ToLower(tag))
+		if err != nil || !p.IsTag() {
+			return q, failure("usage", "invalid Tailscale tag", 2)
+		}
+		q.Tags[i] = string(p)
+	}
+	slices.Sort(q.Tags)
+	q.Tags = slices.Compact(q.Tags)
 	if q.Name != "" && !config.ValidName(q.Name) {
 		return q, failure("usage", "invalid exact name", 2)
 	}
@@ -294,6 +316,11 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 		q.Owner = p.Principals[0]
 	} else if !q.Owner.IsTag() || !p.Owns(q.Owner) {
 		return q, failure("forbidden", "owner must be a verified peer tag", 4)
+	}
+	if q.Tailscale && q.Owner.IsTag() {
+		if len(q.Tags) == 0 {
+			q.Tags = []string{string(q.Owner)}
+		}
 	}
 	if q.Image == "" {
 		q.Image = s.Config.VM.DefaultImage
@@ -513,32 +540,46 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 	if e != nil {
 		return jobs.Operation{}, e
 	}
-	if s.VMNodesEnabled && !q.NoTailnet && s.Config.Enrollment.Mode != "none" {
+	if q.Tailscale {
 		controlURL := s.Config.Tailnet.ControlURL
 		if s.Enrollment != nil {
 			controlURL = s.Enrollment.Pin.ControlURL
 		}
-		q.policy, e = InjectTailnet(q.policy, q.Name, q.Owner, controlURL)
+		q.policy, e = InjectTailnet(q.policy, q.Name, q.Owner, controlURL, q.Tags...)
+		if e == nil {
+			q.policy, e = s.bindNodeIdentity(q.policy, q.Owner, q.Tags, s.Enrollment.Mode(q.Owner))
+		}
 		if e != nil {
 			release()
 			return jobs.Operation{}, e
 		}
 	}
-	return s.Jobs.SubmitFinalized("create", q.Name, q.Owner, func(ctx context.Context, progress func(string)) error {
+	return s.Jobs.SubmitResult("create", q.Name, q.Owner, func(ctx context.Context, progress func(string)) (*jobs.Completion, error) {
 		p, e := s.revalidateCreate(ctx, c, q)
 		if e != nil {
-			return e
+			return nil, e
+		}
+		var key []byte
+		if q.Tailscale {
+			key, e = s.Enrollment.Acquire(ctx, q.Name, q.Owner, progress)
+			if e != nil {
+				return nil, e
+			}
+			defer clear(key)
+			if p, e = s.revalidateCreate(ctx, c, q); e != nil {
+				return nil, e
+			}
 		}
 		progress("creating " + q.Name)
-		progress("pulling OCI image")
+		progress("pulling " + q.Image)
 		_, pullError := s.Runtime.SDK.Images().Pull(ctx, q.Image)
 		if pullError != nil {
-			return Categorize(pullError)
+			return nil, Categorize(pullError)
 		}
 		progress("image pull complete")
 		progress("materializing stopped VM")
 		if p, e = s.revalidateCreate(ctx, c, q); e != nil {
-			return e
+			return nil, e
 		}
 		labels := maps.Clone(q.Labels)
 		if labels == nil {
@@ -548,8 +589,10 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 		labels[runtime.LoginLabel] = p.Login
 		labels[runtime.NameLabel] = q.Name
 		labels[runtime.ModeLabel] = "none"
-		if s.VMNodesEnabled && s.Enrollment != nil {
-			labels[runtime.ModeLabel] = string(s.Enrollment.Mode(q.Owner, q.NoTailnet))
+		if q.Tailscale {
+			labels[runtime.ModeLabel] = string(s.Enrollment.Mode(q.Owner))
+			tags, _ := json.Marshal(q.Tags)
+			labels[runtime.TagsLabel] = string(tags)
 		}
 		labels[runtime.InstanceLabel] = s.Runtime.Instance
 		if q.Template != "" {
@@ -561,7 +604,7 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 		if len(q.GuestPorts) > 0 {
 			b, e := json.Marshal(q.GuestPorts)
 			if e != nil {
-				return Categorize(e)
+				return nil, Categorize(e)
 			}
 			labels[GuestPortsLabel] = string(b)
 		}
@@ -574,21 +617,34 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 		}
 		if q.policy != nil {
 			if e := s.checkSecrets(ctx, q.policy); e != nil {
-				return e
+				return nil, e
 			}
 			opts = append(opts, silo.WithMachineNetwork(silo.PrivateNetwork(q.policy)))
 		}
 		m, e := s.materialize(ctx, p, q, opts)
 		if e != nil {
-			return Categorize(e)
+			return nil, Categorize(e)
 		}
 		defer s.Runtime.CloseMachine(m)
+		if q.Tailscale {
+			if e = s.storeNodeCredentials(ctx, m, q.Owner, key); e != nil {
+				return nil, e
+			}
+		}
 		release()
 		progress("VM created: " + q.Name)
-		if q.NoStart {
-			return nil
+		user := "root"
+		if q.GuestUser != nil {
+			user = q.GuestUser.Name
 		}
-		return s.Jobs.WithVM(ctx, m.ID(), func() error {
+		completion := &jobs.Completion{VMID: m.ID(), Name: q.Name, Image: q.Image, User: user, NodeState: "none"}
+		if q.NoStart {
+			if q.Tailscale {
+				completion.NodeState = "enrollment starts on boot"
+			}
+			return completion, nil
+		}
+		err := s.Jobs.WithVM(ctx, m.ID(), func() error {
 			d, e := m.Inspect(ctx)
 			if e != nil {
 				return Categorize(e)
@@ -596,7 +652,7 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 			if e = s.reauthorize(ctx, c, identity.Create, d); e != nil {
 				return e
 			}
-			if e = s.enroll(ctx, c, identity.Create, m, d, false, progress); e != nil {
+			if e = s.prepareNode(ctx, c, identity.Create, m, d); e != nil {
 				return e
 			}
 			if e = s.reauthorize(ctx, c, identity.Create, d); e != nil {
@@ -606,14 +662,17 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 			if _, e = m.Start(ctx); e != nil {
 				return Categorize(e)
 			}
-			progress("waiting for guest provisioning readiness")
+			progress("preparing " + q.Name)
 			e = waitReady(ctx, m)
 			if e != nil {
 				return Categorize(e)
 			}
 			progress("guest ready")
+			completion.Running = true
+			s.completeNode(ctx, m, completion, progress)
 			return nil
 		})
+		return completion, err
 	}, release)
 }
 
@@ -699,26 +758,45 @@ func (s *Service) mutation(ctx context.Context, c Caller, ref, kind string, acti
 		return jobs.Operation{}, e
 	}
 	s.Runtime.CloseMachine(m)
-	return s.Jobs.Submit(kind, d.ID, identity.Principal(d.Labels[runtime.OwnerLabel]), func(ctx context.Context, progress func(string)) error {
+	s.createMu.Lock()
+	_, creating := s.pending[d.Name]
+	s.createMu.Unlock()
+	if creating {
+		return jobs.Operation{}, failure("conflict", "VM bootstrap setup is still in progress", 5)
+	}
+	return s.Jobs.SubmitResult(kind, d.ID, identity.Principal(d.Labels[runtime.OwnerLabel]), func(ctx context.Context, progress func(string)) (*jobs.Completion, error) {
 		p, e := c.Fresh(ctx)
 		if e != nil {
-			return e
+			return nil, e
 		}
 		m, d, e := s.machine(ctx, p, d.ID, action)
 		if e != nil {
-			return e
+			return nil, e
 		}
 		defer s.Runtime.CloseMachine(m)
-		progress(kind + " VM")
+		progress(kind + " " + d.Name)
 		if e = run(ctx, p, m, d, progress); e != nil {
-			return Categorize(e)
+			return nil, Categorize(e)
 		}
-		return nil
-	})
+		v := project(d)
+		if kind == "set" {
+			updated, err := m.Inspect(ctx)
+			if err != nil {
+				return nil, Categorize(err)
+			}
+			v = project(updated)
+		}
+		completion := &jobs.Completion{VMID: d.ID, Name: v.Name, Image: v.Image, User: v.DefaultUser, NodeState: "none"}
+		if kind == "start" || kind == "restart" {
+			completion.Running = true
+			s.completeNode(ctx, m, completion, progress)
+		}
+		return completion, nil
+	}, nil)
 }
 func (s *Service) Start(ctx context.Context, c Caller, ref string) (jobs.Operation, error) {
 	return s.mutation(ctx, c, ref, "start", identity.Start, func(ctx context.Context, _ identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
-		if e := s.enroll(ctx, c, identity.Start, m, d, false, f); e != nil {
+		if e := s.prepareNode(ctx, c, identity.Start, m, d); e != nil {
 			return e
 		}
 		if e := s.reauthorize(ctx, c, identity.Start, d); e != nil {
@@ -727,6 +805,7 @@ func (s *Service) Start(ctx context.Context, c Caller, ref string) (jobs.Operati
 		if _, e := m.Start(ctx); e != nil {
 			return e
 		}
+		f("preparing " + d.Name)
 		return waitReady(ctx, m)
 	})
 }
@@ -741,21 +820,24 @@ func (s *Service) Stop(ctx context.Context, c Caller, ref string, q StopRequest)
 }
 func (s *Service) Restart(ctx context.Context, c Caller, ref string) (jobs.Operation, error) {
 	return s.mutation(ctx, c, ref, "restart", identity.Restart, func(ctx context.Context, _ identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
+		f("stopping " + d.Name)
 		if _, e := m.StopWith(ctx, silo.StopOptions{}); e != nil {
 			return e
 		}
 		if e := s.reauthorize(ctx, c, identity.Restart, d); e != nil {
 			return e
 		}
-		if e := s.enroll(ctx, c, identity.Restart, m, d, false, f); e != nil {
+		if e := s.prepareNode(ctx, c, identity.Restart, m, d); e != nil {
 			return e
 		}
 		if e := s.reauthorize(ctx, c, identity.Restart, d); e != nil {
 			return e
 		}
+		f("starting " + d.Name)
 		if _, e := m.Start(ctx); e != nil {
 			return e
 		}
+		f("preparing " + d.Name)
 		return waitReady(ctx, m)
 	})
 }
@@ -781,7 +863,7 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 		}
 		return jobs.Operation{}, failure("usage", "removal requires confirmation; use --yes unattended", 2)
 	}
-	return s.mutation(ctx, c, ref, "remove", identity.Delete, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
+	return s.mutation(ctx, c, ref, "remove", identity.Delete, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, _ func(string)) error {
 		if d.Status.Kind != silo.MachineStatusStopped {
 			if !q.Force {
 				return failure("conflict", "VM is running; use --force", 5)
@@ -802,33 +884,7 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 		if e := s.reauthorize(ctx, c, identity.Delete, d); e != nil {
 			return e
 		}
-		var node state.NodeIdentity
-		if d.Network.Tailscale != nil {
-			lease, e := m.LeaseNodeState(ctx)
-			if e != nil {
-				return e
-			}
-			s.Runtime.Metrics.Handle("node_lease", 1)
-			if state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), s.pin()) == state.Unreadable {
-				_ = lease.Close()
-				s.Runtime.Metrics.Handle("node_lease", -1)
-				f("device_retained: node state recovery required")
-				return failure("conflict", "retained node state requires recovery before removal", 5)
-			}
-			var nodeState state.NodeState
-			node, nodeState = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), s.pin())
-			_ = lease.Close()
-			s.Runtime.Metrics.Handle("node_lease", -1)
-			if nodeState == state.Unreadable {
-				f("device_retained: unknown (state unreadable)")
-				return failure("conflict", "unreadable node state retained; recover before removal", 5)
-			}
-		}
-		if e := m.Remove(ctx); e != nil {
-			return e
-		}
-		s.removeDevice(ctx, node, f)
-		return nil
+		return m.Remove(ctx)
 	})
 }
 func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (jobs.Operation, error) {

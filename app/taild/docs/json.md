@@ -1,4 +1,4 @@
-# Lobby JSON, phase 13
+# Lobby JSON
 
 `--json` produces exactly one UTF-8 JSON object on stdout. Progress, human
 messages and errors use stderr. Shell, exec and logs are streaming byte commands
@@ -17,7 +17,7 @@ contents are projected into VM/operation queries.
 | --- | --- |
 | `ls` | Array of VM projections, empty array when no visible VMs |
 | `show VM` | One VM projection |
-| create/start/stop/restart/reauth/rm/set | One terminal operation record |
+| create/start/stop/restart/rm/set | One terminal operation record |
 | `ops`, `ops show ID` | Array of own operation records (one for show) |
 | `whoami` | `{peer, capability, explanation?}` |
 | `version` | `{taild, sdk, runtime, tailscale}` strings |
@@ -25,8 +25,8 @@ contents are projected into VM/operation queries.
 | `template` / `policy` commands | Array of document records (one for show/create/edit/rm/validate); ls includes both tiers |
 
 VM projections have `id`, `name`, `owner`, `state`, `node`, `address`, `cpus`,
-`memory`, `disk`, `created`, `image`, `labels`, and optional `last_operation` on
-show. Labels contain caller labels only; reserved ownership labels are projected
+`memory`, `disk`, `created`, `image`, and `labels`. Operation history is queried
+through `ops`. Labels contain caller labels only; reserved ownership labels are projected
 as validated fields. Image is empty for local-disk or unvalidated legacy sources.
 Optional `template`, `policy`, and `guest_tcp_ports` project immutable provenance
 and guest TCP discovery hints, never host publication authority or inbound ACLs.
@@ -46,11 +46,18 @@ forbidden (4), duplicate creates conflict (5), invalid stdin/documents fail (2),
 unsafe/unreadable stored documents fail (9).
 Resource sizes are integer bytes. Times are UTC
 RFC 3339 strings with optional fractional seconds. `node_state` is `none`,
-`pending approval`, `enrolled`, or `state unreadable`. `node_id` is the stable
+`pending approval`, `enrolled`, `connecting`, `disconnected`, `stopped`, `expired`,
+`enrollment failed`, `status unavailable`, or `state unreadable`. `node_id` is the stable
 Tailscale node ID, not its numeric peer ID or admin endpoint device ID.
-`addresses` and `key_expiry` are API-observed, otherwise address/expiry are `unknown`.
-Authorized owners see the current `approval_url` and `approval_expires`, never tokens.
-`reauth VM` requires a stopped VM and both `vm.stop` and `vm.start` capabilities.
+`addresses` and `key_expiry` come from netd observations. `key_expiry` is an RFC3339
+timestamp, `never` for observed non-expiring keys, or `unknown` when unavailable.
+`key_expiry_observed_at` records when expiry was observed, and
+`key_expiry_last_known: true` marks historical values. These do not prove connectivity.
+Stopped VMs retain their configured `node` name and report `node_state: stopped`.
+`owner_login` is a display-only human login; `owner` remains the authoritative principal.
+Authorized owners see the current `approval_url`, never tokens. `show` is read-only;
+netd handles authentication without a VM restart. `tags` contains requested tags,
+independently of the creating principal who owns the VM in taild.
 Ownership is one verified `user:<numeric-id>` or
 `tag:<name>`; other owners and instances are invisible (exit 3).
 
@@ -72,11 +79,14 @@ integer-byte sizes and address fields.
 Operations contain `id`, `kind`, `vm`, `principal`, `state`, `started`, `progress`,
 optional `finished`, optional `error` (`code`, `message`). `vm` is the requested
 exact name during create, otherwise the stable VM ID. Kinds are create/start/
-stop/restart/reauth/remove/set. States are queued/running/succeeded/failed. Progress
+stop/restart/remove/set. States are queued/running/succeeded/failed. Progress
 retains at most 128 lines of at most 1024 bytes. IDs use canonical uppercase
 Crockford ULID encoding: a 48-bit millisecond timestamp plus 80 crypto-random bits.
 Finished operations expire after 24 hours; all operations disappear on daemon
 restart. Querying a failed operation still succeeds as a query (exit 0).
+Optional `completion` captures immutable VM ID/name/image/default user, running
+state, node state, verified DNS name and current approval URL at job completion.
+Pre-creation consent links appear in pending `ops show ID` and its progress array.
 
 `peer` has principals (array), node_id, node_name, login (optional display-only),
 observed_at and permissions. Permissions has actions (array), limits
@@ -106,15 +116,18 @@ limits are additive; enforcement additionally constrains them by operator ceilin
         "id": {"type": "string"},
         "name": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"},
         "owner": {"type": "string"},
+        "owner_login": {"type": "string"},
         "state": {"enum": ["stopped", "starting", "running", "stopping", "error", "unknown"]},
         "node": {"type": "string"},
-        "node_state": {"enum": ["none", "pending approval", "enrolled", "state unreadable"]},
+        "node_state": {"enum": ["none", "pending approval", "enrolled", "state unreadable", "connecting", "disconnected", "stopped", "expired", "enrollment failed", "status unavailable"]},
+        "tags": {"type": "array", "items": {"type": "string"}},
         "node_id": {"type": "string"},
         "node_diagnostics": {"type": "array", "items": {"type": "string"}},
         "addresses": {"type": "array", "items": {"type": "string"}},
         "key_expiry": {"type": "string"},
+        "key_expiry_observed_at": {"type": "string", "format": "date-time"},
+        "key_expiry_last_known": {"type": "boolean"},
         "approval_url": {"type": "string", "format": "uri"},
-        "approval_expires": {"type": "string", "format": "date-time"},
         "address": {"type": "string"},
         "cpus": {"type": "integer", "minimum": 0},
         "memory": {"type": "integer", "minimum": 0},
@@ -136,8 +149,7 @@ limits are additive; enforcement additionally constrains them by operator ceilin
         },
         "template": {"type": "string"},
         "policy": {"type": "string"},
-        "guest_tcp_ports": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 65535}},
-        "last_operation": {"$ref": "#/$defs/operation"}
+        "guest_tcp_ports": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 65535}}
       },
       "additionalProperties": false
     },
@@ -146,7 +158,18 @@ limits are additive; enforcement additionally constrains them by operator ceilin
       "required": ["id", "kind", "vm", "principal", "state", "started", "progress"],
       "properties": {
         "id": {"type": "string", "pattern": "^op_[0-7][0-9A-HJKMNP-TV-Z]{25}$"},
-        "kind": {"enum": ["create", "start", "stop", "restart", "reauth", "remove", "set"]},
+        "kind": {"enum": ["create", "start", "stop", "restart", "remove", "set"]},
+        "completion": {
+          "type": "object",
+          "required": ["vm_id", "name", "image", "user", "running", "node_state"],
+          "properties": {
+            "vm_id": {"type": "string"}, "name": {"type": "string"},
+            "image": {"type": "string"}, "user": {"type": "string"},
+            "running": {"type": "boolean"}, "node_state": {"type": "string"},
+            "node": {"type": "string"}, "approval_url": {"type": "string", "format": "uri"}
+          },
+          "additionalProperties": false
+        },
         "vm": {"type": "string"},
         "principal": {"type": "string"},
         "state": {"enum": ["queued", "running", "succeeded", "failed"]},

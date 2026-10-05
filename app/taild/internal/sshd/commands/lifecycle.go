@@ -8,12 +8,12 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
 )
 
-// start, restart and reauth share one grammar: a VM and nothing else.
+// Lifecycle commands share one grammar: a VM and nothing else.
 var (
 	start = Command{
 		Name:      "start",
 		Summary:   "Start a stopped VM.",
-		Usage:     "start VM [--json]",
+		Usage:     "start VM [OPTIONS]",
 		Arguments: "VM  Exact name or VM ID.",
 		Example:   "start devbox",
 		New:       func() Handler { return &vmHandler{(*service.Service).Start} },
@@ -21,18 +21,10 @@ var (
 	restart = Command{
 		Name:      "restart",
 		Summary:   "Restart a VM.",
-		Usage:     "restart VM [--json]",
+		Usage:     "restart VM [OPTIONS]",
 		Arguments: "VM  Exact name or VM ID.",
 		Example:   "restart devbox",
 		New:       func() Handler { return &vmHandler{(*service.Service).Restart} },
-	}
-	reauth = Command{
-		Name:      "reauth",
-		Summary:   "Reauthenticate a stopped VM (requires start and stop grants).",
-		Usage:     "reauth VM [--json] (stopped VM; requires vm.start and vm.stop)",
-		Arguments: "VM  Exact name or VM ID.",
-		Example:   "reauth devbox",
-		New:       func() Handler { return &vmHandler{(*service.Service).Reauth} },
 	}
 )
 

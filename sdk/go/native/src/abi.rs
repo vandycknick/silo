@@ -1,6 +1,6 @@
 use std::ffi::c_char;
 
-const ABI_VERSION: u32 = 4;
+const ABI_VERSION: u32 = 1;
 const SDK_VERSION: &[u8] = b"0.1.0\0";
 
 #[no_mangle]
@@ -21,7 +21,7 @@ mod tests {
 
     #[test]
     fn reports_bridge_versions() {
-        assert_eq!(silo_ffi_abi_version(), 4);
+        assert_eq!(silo_ffi_abi_version(), 1);
         let version = unsafe { CStr::from_ptr(silo_ffi_sdk_version()) };
         assert_eq!(version.to_bytes(), b"0.1.0");
     }

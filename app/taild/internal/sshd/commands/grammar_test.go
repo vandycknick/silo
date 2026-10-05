@@ -117,7 +117,6 @@ func TestSafePositionalDiagnostics(t *testing.T) {
 		{[]string{"status"}, "show", "missing VM argument"},
 		{[]string{"start"}, "start", "missing VM argument"},
 		{[]string{"restart"}, "restart", "missing VM argument"},
-		{[]string{"reauth"}, "reauth", "missing VM argument"},
 		{[]string{"stop"}, "stop", "missing VM argument"},
 		{[]string{"ssh"}, "shell", "missing VM argument"},
 		{[]string{"logs"}, "logs", "missing VM argument"},

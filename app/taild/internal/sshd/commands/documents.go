@@ -8,25 +8,27 @@ import (
 
 // template and policy differ only in document kind.
 var (
-	template = documentsCommand("template", "Manage YAML templates: ls, show, create, edit, rm, validate.", "SUBCOMMAND  create/edit/validate read one YAML document from stdin.", "one YAML document", "help template create")
-	policy   = documentsCommand("policy", "Manage HCL policies: ls, show, create, edit, rm, validate.", "SUBCOMMAND  create/edit/validate read HCL from stdin.", "HCL", "help policy validate")
+	template = documentsCommand("template", "Manage YAML templates.", "help template create")
+	policy   = documentsCommand("policy", "Manage HCL network policies.", "help policy validate")
 )
 
-func documentsCommand(kind, summary, arguments, format, example string) Command {
+func documentsCommand(kind, summary, example string) Command {
 	return Command{
-		Name:      kind,
-		Summary:   summary,
-		Usage:     kind + " ls|show NAME|create NAME|edit NAME|rm NAME|validate [--owner tag:NAME] [--json]; create/edit/validate read " + format + " from stdin",
-		Arguments: arguments,
-		Example:   example,
-		Topics:    documentTopics(kind),
-		New:       func() Handler { return &documentsHandler{kind: kind} },
+		Name:        kind,
+		Summary:     summary,
+		Usage:       kind + " COMMAND [OPTIONS]",
+		Arguments:   "COMMAND  Document operation; see Commands below.",
+		Subcommands: []string{"ls", "show", "create", "edit", "rm", "validate"},
+		Example:     example,
+		Topics:      documentTopics(kind),
+		New:         func() Handler { return &documentsHandler{kind: kind} },
 	}
 }
 
 func documentTopics(kind string) func(string) (Topic, bool) {
 	return func(verb string) (Topic, bool) {
-		t := Topic{Summary: "Manage a " + kind + " document.", Example: kind + " " + verb}
+		summaries := map[string]string{"ls": "List available documents.", "show": "Show a document.", "create": "Create a document from stdin.", "edit": "Replace a document from stdin.", "rm": "Remove a document.", "validate": "Validate a document from stdin."}
+		t := Topic{Summary: summaries[verb], Example: kind + " " + verb}
 		switch verb {
 		case "ls", "validate":
 			t.Usage = kind + " " + verb + " [OPTIONS]"
@@ -38,7 +40,12 @@ func documentTopics(kind string) func(string) (Topic, bool) {
 			return Topic{}, false
 		}
 		if verb == "create" || verb == "edit" || verb == "validate" {
-			t.Summary += " Reads one document from stdin."
+			format, file := "YAML", "template.yaml"
+			if kind == "policy" {
+				format, file = "HCL", "policy.hcl"
+			}
+			t.Summary += " Reads one " + format + " document (up to 64KiB)."
+			t.Example = "ssh silo " + t.Example + " < " + file
 		}
 		return t, true
 	}

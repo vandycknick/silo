@@ -355,7 +355,7 @@ func serve(ctx context.Context, cancel context.CancelFunc, c config.Config, secr
 	}
 	r.NodePin = &pin
 	registry := enroll.NewRegistry()
-	enrollment := &enroll.Manager{Config: c, Secrets: secrets, Pin: pin, Registry: registry, Devices: enroll.NewDevices(secrets.APIToken), Visible: node.Status, Metrics: r.Metrics}
+	enrollment := &enroll.Manager{Config: c, Secrets: secrets, Pin: pin, Registry: registry, Metrics: r.Metrics}
 	if secrets.AppSecret != "" {
 		enrollment.OAuth, e = enroll.NewOAuth(registry, secrets.AppSecret, "https://"+c.Tailnet.Hostname+"."+pin.Suffix+"/oauth/callback")
 		if e != nil {

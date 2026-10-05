@@ -90,11 +90,16 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 	credentialManager := credentials.NewManager(spec.Secrets)
 	result := &Session{ctx: lifetimeCtx, cancel: cancel, flows: flows, runDone: make(chan struct{})}
 	if decl := spec.Policy.Tailscale(); decl != nil {
+		expected, err := netnode.ParseIdentity(spec.Policy.Metadata())
+		if err != nil {
+			cancel()
+			return nil, err
+		}
 		if err := config.ValidateTailscale(&config.Config{TailscaleStateDir: spec.TailscaleStateDir, VsockMux: spec.VsockMux}, spec.Policy); err != nil {
 			cancel()
 			return nil, err
 		}
-		result.node, err = netnode.New(netnode.Options{Dir: spec.TailscaleStateDir, Declaration: *decl, Secrets: spec.Secrets, Guest: result, Flows: flows,
+		result.node, err = netnode.New(netnode.Options{VMID: spec.VMID, RunID: spec.RunID, Identity: expected, Dir: spec.TailscaleStateDir, Declaration: *decl, Secrets: spec.Secrets, Guest: result, Flows: flows,
 			Ready: func(ctx context.Context) (func(), error) {
 				ca, ok := spec.Secrets.Lookup("silo.ssh_ca.private_key")
 				if !ok {
@@ -107,6 +112,10 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 				cancel()
 				if err != nil {
 					return nil, err
+				}
+				door.Verify = result.node.VerifyAccess
+				if expected != nil {
+					door.Owner = expected.Owner
 				}
 				client, err := result.node.LocalClient()
 				if err != nil {

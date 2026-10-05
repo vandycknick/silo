@@ -1,13 +1,17 @@
 package commands
 
-import "github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
+import (
+	"github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
+	"strings"
+)
 
 var ops = Command{
-	Name:      "ops",
-	Summary:   "List operations or inspect one operation.",
-	Usage:     "ops [show op_ULID] [--json]",
-	Arguments: "show op_ULID  Optional operation selector.",
-	Example:   "ops",
+	Name:        "ops",
+	Summary:     "List operations or inspect one operation.",
+	Usage:       "ops [COMMAND] [OPTIONS]",
+	Arguments:   "COMMAND  Omit to list operations, or use show to inspect one.",
+	Subcommands: []string{"show"},
+	Example:     "ops",
 	Topics: func(sub string) (Topic, bool) {
 		if sub != "show" {
 			return Topic{}, false
@@ -46,5 +50,20 @@ func (h *opsHandler) Run(c *Context, args cmdline.Args) (Result, error) {
 	if e != nil {
 		return Result{}, e
 	}
-	return Result{Data: ops, Human: renderOps(ops)}, nil
+	human := renderOps(ops)
+	if id != "" {
+		for _, op := range ops {
+			if op.Error != nil {
+				human += "\nError: " + op.Error.Message + "\n"
+			}
+			if op.Finished == nil {
+				for _, line := range op.Progress {
+					if url, ok := strings.CutPrefix(line, "approve: "); ok {
+						human += "\nLogin\n  " + url + "\n"
+					}
+				}
+			}
+		}
+	}
+	return Result{Data: ops, Human: human}, nil
 }

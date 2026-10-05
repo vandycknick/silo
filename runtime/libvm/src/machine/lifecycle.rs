@@ -609,7 +609,7 @@ impl Machine {
         }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
-        let _node_state = crate::node_state::acquire(&config)?;
+        let _node_state = crate::node_state::acquire_lock(&config)?;
         runtime.ensure_no_live_vmm_generation(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
 

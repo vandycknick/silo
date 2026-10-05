@@ -5,7 +5,7 @@ import "github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
 var whoami = Command{
 	Name:    "whoami",
 	Summary: "Show your verified user and node.",
-	Usage:   "whoami [--json]",
+	Usage:   "whoami [OPTIONS]",
 	Example: "whoami --json",
 	New:     func() Handler { return &whoamiHandler{} },
 }

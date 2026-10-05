@@ -14,9 +14,7 @@ tailnet:
   capability: github.com/vandycknick/silo/cap/taild
 enrollment:
   mode: oauth-app
-  timeout: 5m
   disable_key_expiry: false
-  delete_devices: true
 vm:
   default_image: ghcr.io/vandycknick/silo/devbox:latest
   allowed_registries: [ghcr.io/vandycknick]

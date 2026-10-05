@@ -9,7 +9,7 @@ import (
 var logs = Command{
 	Name:      "logs",
 	Summary:   "Read bounded VM logs.",
-	Usage:     "logs VM [--follow] [--stream monitor|serial|exec|network|network-audit] [--output stdout|stderr]",
+	Usage:     "logs VM [OPTIONS]",
 	Arguments: "VM  Exact name or VM ID.",
 	Example:   "logs devbox --stream serial",
 	Streaming: true,

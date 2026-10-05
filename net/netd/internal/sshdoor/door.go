@@ -19,6 +19,9 @@ type Event struct {
 	Duration                                                     time.Duration
 }
 type Door struct {
+	// Verify is installed before Serve for host-managed node identity checks.
+	Verify                  func(context.Context) error
+	Owner                   string
 	dir                     *os.File
 	ca, host                ssh.Signer
 	mux                     string
@@ -107,8 +110,14 @@ func (d *Door) handle(ctx context.Context, c net.Conn, client *local.Client) {
 		return
 	}
 	auth := func(meta ssh.ConnMetadata) (*ssh.Permissions, error) {
+		if d.Verify != nil {
+			if err := d.Verify(setup); err != nil {
+				event.Reason = "node_identity_unverified"
+				return nil, err
+			}
+		}
 		event.User = meta.User()
-		id, err := boundedWhoIs(setup, client, c.RemoteAddr().String())
+		id, err := boundedWhoIs(setup, client, c.RemoteAddr().String(), d.Owner)
 		event.Login = id.Login
 		event.Node = id.Node
 		event.UserID = id.UserID
@@ -159,7 +168,12 @@ func (d *Door) handle(ctx context.Context, c net.Conn, client *local.Client) {
 			case <-relayCtx.Done():
 				return
 			case <-ticker.C:
-				observed, err := boundedWhoIs(relayCtx, client, c.RemoteAddr().String())
+				if d.Verify != nil && d.Verify(relayCtx) != nil {
+					event.Reason = "node_identity_unverified"
+					relayCancel()
+					return
+				}
+				observed, err := boundedWhoIs(relayCtx, client, c.RemoteAddr().String(), d.Owner)
 				if err != nil || observed != id {
 					event.Reason = "owner_revoked"
 					relayCancel()

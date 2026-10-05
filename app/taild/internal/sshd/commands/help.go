@@ -13,7 +13,7 @@ import (
 var help = Command{
 	Name:      "help",
 	Summary:   "Show command help.",
-	Usage:     "help [COMMAND [SUBCOMMAND]] [--json]",
+	Usage:     "help [COMMAND [SUBCOMMAND]] [OPTIONS]",
 	Arguments: "COMMAND [SUBCOMMAND]  Optional help topic.",
 	Example:   "help template create",
 	New:       func() Handler { return &helpHandler{} },
@@ -54,7 +54,7 @@ func helpFor(c *Context, path []string) (Result, error) {
 
 func generalHelp() string {
 	var b strings.Builder
-	b.WriteString("silo · VMs on your tailnet\n\nUsage:\n  COMMAND [ARGUMENTS] [OPTIONS]\n\nCommands:\n")
+	b.WriteString("silo · manage your VMs\n\nUsage:\n  COMMAND [ARGUMENTS] [OPTIONS]\n\nCommands:\n")
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 	listed := append([]Command(nil), all...)
 	sort.Slice(listed, func(i, j int) bool { return listed[i].Name < listed[j].Name })
@@ -94,7 +94,23 @@ func detailedHelp(path []string, configured *config.Config) (string, bool) {
 		fmt.Fprintf(&b, "\nAliases:\n  %s\n", strings.Join(aliases, ", "))
 	}
 	if topic.Arguments != "" {
-		fmt.Fprintf(&b, "\nArguments:\n  %s\n", strings.ReplaceAll(topic.Arguments, "\n", "\n  "))
+		b.WriteString("\nArguments:\n")
+		w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		for _, line := range strings.Split(topic.Arguments, "\n") {
+			name, description, _ := strings.Cut(line, "  ")
+			fmt.Fprintf(w, "  %s\t%s\n", name, description)
+		}
+		_ = w.Flush()
+	}
+	if len(path) == 1 && len(cmd.Subcommands) > 0 {
+		b.WriteString("\nCommands:\n")
+		w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		for _, name := range cmd.Subcommands {
+			if sub, ok := cmd.Topics(name); ok {
+				fmt.Fprintf(w, "  %s\t%s\n", name, sub.Summary)
+			}
+		}
+		_ = w.Flush()
 	}
 	handler := cmd.New()
 	flags := cmdline.NewFlagSet()
@@ -106,7 +122,11 @@ func detailedHelp(path []string, configured *config.Config) (string, bool) {
 	options := flags.Options()
 	options = append(options, cmdline.Option{Names: []string{"h", "help"}, Help: "Show help."})
 	if !cmd.Streaming {
-		options = append(options, cmdline.Option{Names: []string{"json"}, Help: "Structured output; does not confirm removal.", Fallback: "false"})
+		description := "Structured output."
+		if cmd.Name == "rm" {
+			description = "Structured output; does not confirm removal."
+		}
+		options = append(options, cmdline.Option{Names: []string{"json"}, Help: description, Fallback: "false"})
 	}
 	b.WriteString("\nOptions:\n")
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
@@ -135,6 +155,6 @@ func detailedHelp(path []string, configured *config.Config) (string, bool) {
 		_, _ = fmt.Fprintf(w, "  %s\t%s\n", label, description)
 	}
 	_ = w.Flush()
-	fmt.Fprintf(&b, "\nExamples:\n  %s\n", topic.Example)
+	fmt.Fprintf(&b, "\nExamples:\n  %s\n", strings.ReplaceAll(topic.Example, "\n", "\n  "))
 	return b.String(), true
 }

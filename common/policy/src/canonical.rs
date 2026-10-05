@@ -175,18 +175,20 @@ impl NetworkPolicy {
             slots.extend(credential_secret_slots(credential));
         }
         for tunnel in &self.tailscale {
-            if let Ok(key) =
-                silo_secrets::SecretName::new(format!("tailscale.{}.auth_key", tunnel.name))
-            {
-                slots.push(NetworkSecretSlot {
-                    name: format!("{}.tailscale.auth_key", tunnel.name),
-                    required: false,
-                    kind: NetworkSecretKind::Plain,
-                    source: NetworkSecretSource {
-                        key,
-                        field: silo_secrets::SecretField::Value,
-                    },
-                });
+            for field in ["auth_key", "client_secret", "api_token"] {
+                if let Ok(key) =
+                    silo_secrets::SecretName::new(format!("tailscale.{}.{field}", tunnel.name))
+                {
+                    slots.push(NetworkSecretSlot {
+                        name: format!("{}.tailscale.{field}", tunnel.name),
+                        required: false,
+                        kind: NetworkSecretKind::Plain,
+                        source: NetworkSecretSource {
+                            key,
+                            field: silo_secrets::SecretField::Value,
+                        },
+                    });
+                }
             }
         }
         slots

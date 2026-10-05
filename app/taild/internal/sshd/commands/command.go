@@ -49,12 +49,13 @@ type Topic struct {
 
 // Command is what the registry knows about a verb without running it.
 type Command struct {
-	Name      string
-	Summary   string
-	Usage     string
-	Arguments string
-	Example   string
-	Aliases   []string
+	Name        string
+	Summary     string
+	Usage       string
+	Arguments   string
+	Example     string
+	Aliases     []string
+	Subcommands []string
 	// Streaming commands relay guest output and its exit code; the JSON
 	// envelope cannot wrap them.
 	Streaming bool

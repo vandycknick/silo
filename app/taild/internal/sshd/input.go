@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -25,6 +26,7 @@ var errLineCanceled = errors.New("terminal line canceled")
 // can then contain only an incomplete key, never bytes belonging to the guest.
 // All transport reads still go through sessionInput's bounded, single pump.
 type terminalInput struct {
+	ctx           context.Context
 	r             contextualInput
 	out           io.Writer
 	terminal      *term.Terminal
@@ -45,7 +47,7 @@ func newTerminalInput(ctx context.Context, input *sessionInput, out io.Writer, w
 	if width <= 0 || height <= 0 {
 		width, height = 80, 24
 	}
-	t := &terminalInput{r: contextualInput{ctx, input}, out: out, width: width, height: height}
+	t := &terminalInput{ctx: ctx, r: contextualInput{ctx, input}, out: out, width: width, height: height}
 	t.terminal = term.NewTerminal(t, "")
 	t.terminal.History = commandHistory{History: t.terminal.History, input: t}
 	t.terminal.AutoCompleteCallback = t.checkInsertion
@@ -84,7 +86,17 @@ func (t *terminalInput) checkInsertion(line string, pos int, key rune) (string, 
 }
 
 func (t *terminalInput) Write(p []byte) (int, error) {
-	n, e := t.out.Write(p)
+	var n int
+	var e error
+	if out, ok := t.out.(interface {
+		WriteContext(context.Context, []byte) (int, error)
+	}); ok {
+		ctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
+		defer cancel()
+		n, e = out.WriteContext(ctx, p)
+	} else {
+		n, e = t.out.Write(p)
+	}
 	if e == nil && n != len(p) {
 		e = io.ErrShortWrite
 	}
@@ -359,8 +371,10 @@ func Lobby(ctx context.Context, s *service.Service, caller service.Caller, strea
 	if streams.Prompt == nil {
 		return 0
 	}
+	notices := &lobbyNotices{seen: map[string]string{}}
+	streams.ApprovalShown = func(vm, url string) { notices.seen[vm] = url }
 	for {
-		line, e := streams.Prompt(ctx, "silo> ", 16384)
+		line, e := notices.prompt(ctx, s, caller, streams)
 		if errors.Is(e, errLineCanceled) {
 			continue
 		}

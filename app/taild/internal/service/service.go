@@ -28,7 +28,7 @@ type Service struct {
 	pending      map[string]identity.Principal
 	diskPending  map[string]uint64
 	documentMu   sync.Mutex
-	// Production enables node injection; --no-tailnet and mode none omit it.
+	// Production permits node injection when --tailscale is explicitly requested.
 	VMNodesEnabled bool
 }
 type WhoAmI struct {

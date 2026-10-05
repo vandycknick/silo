@@ -11,7 +11,7 @@ import (
 var set = Command{
 	Name:      "set",
 	Summary:   "Update a stopped VM.",
-	Usage:     "set VM name=NAME|cpus=N|memory=SIZE|disk=SIZE... [--json]",
+	Usage:     "set VM KEY=VALUE... [OPTIONS]",
 	Arguments: "VM  Exact name or VM ID.\nKEY=VALUE  name, cpus, memory or disk. Sizes are binary.",
 	Example:   "set devbox memory=8gb disk=16GiB",
 	New:       func() Handler { return &setHandler{} },

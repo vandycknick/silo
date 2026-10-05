@@ -16,15 +16,29 @@ import (
 )
 
 type Operation struct {
-	ID        string             `json:"id"`
-	Kind      string             `json:"kind"`
-	VM        string             `json:"vm"`
-	Principal identity.Principal `json:"principal"`
-	State     string             `json:"state"`
-	Started   time.Time          `json:"started"`
-	Finished  *time.Time         `json:"finished,omitempty"`
-	Progress  []string           `json:"progress"`
-	Error     *authz.Error       `json:"error,omitempty"`
+	Completion *Completion        `json:"completion,omitempty"`
+	ID         string             `json:"id"`
+	Kind       string             `json:"kind"`
+	VM         string             `json:"vm"`
+	Principal  identity.Principal `json:"principal"`
+	State      string             `json:"state"`
+	Started    time.Time          `json:"started"`
+	Finished   *time.Time         `json:"finished,omitempty"`
+	Progress   []string           `json:"progress"`
+	Error      *authz.Error       `json:"error,omitempty"`
+}
+
+// Completion contains safe, immutable connection hints captured by the job.
+// Rendering never resolves a mutable machine name after releasing its lock.
+type Completion struct {
+	VMID        string `json:"vm_id"`
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	User        string `json:"user"`
+	Running     bool   `json:"running"`
+	NodeState   string `json:"node_state"`
+	Node        string `json:"node,omitempty"`
+	ApprovalURL string `json:"approval_url,omitempty"`
 }
 type entry struct {
 	op      Operation
@@ -88,6 +102,10 @@ func newID(now time.Time) (string, error) {
 }
 
 func clone(op Operation) Operation {
+	if op.Completion != nil {
+		v := *op.Completion
+		op.Completion = &v
+	}
 	op.Progress = slices.Clone(op.Progress)
 	if op.Error != nil {
 		e := *op.Error
@@ -113,6 +131,12 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 // SubmitFinalized releases admission resources before publishing completion,
 // including rejection and cancellation before the callback can execute.
 func (r *Registry) SubmitFinalized(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) error, finalize func()) (op Operation, err error) {
+	return r.SubmitResult(kind, vm, owner, func(ctx context.Context, progress func(string)) (*Completion, error) {
+		return nil, run(ctx, progress)
+	}, finalize)
+}
+
+func (r *Registry) SubmitResult(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) (*Completion, error), finalize func()) (op Operation, err error) {
 	accepted := false
 	defer func() {
 		if !accepted && finalize != nil {
@@ -149,12 +173,13 @@ func (r *Registry) SubmitFinalized(kind, vm string, owner identity.Principal, ru
 		defer r.wg.Done()
 		defer cancel()
 		var err error
+		var completion *Completion
 		select {
 		case <-ctx.Done():
 			err = ctx.Err()
 		case <-l.token:
 			r.update(e, func(op *Operation) { op.State = "running" })
-			err = run(ctx, func(line string) {
+			completion, err = run(ctx, func(line string) {
 				r.update(e, func(op *Operation) {
 					if len(line) > 1024 {
 						line = line[:1024]
@@ -176,6 +201,10 @@ func (r *Registry) SubmitFinalized(kind, vm string, owner identity.Principal, ru
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		e.op.State = "succeeded"
+		if completion != nil {
+			v := *completion
+			e.op.Completion = &v
+		}
 		if err != nil {
 			e.op.State = "failed"
 			var categorized *authz.Error

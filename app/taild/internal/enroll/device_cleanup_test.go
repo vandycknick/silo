@@ -1,3 +1,5 @@
+//go:build e2e
+
 package enroll
 
 import (
@@ -129,11 +131,4 @@ func (d *Devices) Delete(ctx context.Context, nodeID string) error {
 		return err
 	}
 	return d.request(ctx, "DELETE", "/api/v2/device/"+url.PathEscape(device.ID), nil, nil)
-}
-func (d *Devices) DisableExpiry(ctx context.Context, nodeID string) error {
-	device, err := d.Get(ctx, nodeID)
-	if err != nil {
-		return err
-	}
-	return d.request(ctx, "POST", "/api/v2/device/"+url.PathEscape(device.ID)+"/key", []byte(`{"keyExpiryDisabled":true}`), nil)
 }

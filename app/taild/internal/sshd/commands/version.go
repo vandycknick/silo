@@ -5,7 +5,7 @@ import "github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
 var version = Command{
 	Name:    "version",
 	Summary: "Show daemon, SDK and runtime versions.",
-	Usage:   "version [--json]",
+	Usage:   "version [OPTIONS]",
 	Example: "version",
 	New:     func() Handler { return &versionHandler{} },
 }

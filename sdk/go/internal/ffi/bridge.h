@@ -30,6 +30,7 @@ silo_error *bridge_machine_stop(const silo_machine *machine, silo_buffer *out_da
 silo_error *bridge_machine_update(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);
 silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);
 silo_error *bridge_machine_remove(const silo_machine *machine);
+silo_error *bridge_machine_secret(const silo_machine *machine, const uint8_t *request, size_t request_len);
 silo_error *bridge_machine_exec(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output);
 silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output);
 silo_error *bridge_machine_spawn(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution **out_session);

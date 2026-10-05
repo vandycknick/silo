@@ -100,7 +100,7 @@ func TestPhase7NativePolicyAndStoppedMachineContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metadata.Slots) != 1 || metadata.Slots[0].Required {
+	if len(metadata.Slots) != 3 || metadata.Slots[0].Required {
 		t.Fatalf("optional tailscale slots: %#v", metadata)
 	}
 	ready, err := runtime.PolicySecretsReady(ctx, policy, "")

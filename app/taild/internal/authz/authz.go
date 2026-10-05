@@ -24,7 +24,7 @@ func Allow(peer identity.Peer, action identity.Action, vm *VM) error {
 	if vm != nil && !peer.Owns(vm.Owner) {
 		return &Error{"not_found", "VM not found", 3}
 	}
-	if action == identity.Restart || action == identity.Reauth {
+	if action == identity.Restart {
 		if !peer.Permissions.Has(identity.Stop) || !peer.Permissions.Has(identity.Start) {
 			return &Error{"forbidden", "requires vm.stop and vm.start", 4}
 		}

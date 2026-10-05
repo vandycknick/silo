@@ -9,7 +9,7 @@ import (
 var rm = Command{
 	Name:      "rm",
 	Summary:   "Remove a VM after confirmation.",
-	Usage:     "rm VM [--force] [--yes] [--json]",
+	Usage:     "rm VM [OPTIONS]",
 	Arguments: "VM  Exact name or VM ID.",
 	Example:   "rm devbox --yes",
 	New:       func() Handler { return &rmHandler{} },

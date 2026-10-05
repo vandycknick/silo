@@ -213,8 +213,9 @@ func validateLabels(labels map[string]string) error {
 }
 
 type policyAuthority struct {
-	Tailscale []json.RawMessage `json:"tailscale"`
-	Forwards  []json.RawMessage `json:"forwards"`
+	Metadata  map[string]json.RawMessage `json:"metadata"`
+	Tailscale []json.RawMessage          `json:"tailscale"`
+	Forwards  []json.RawMessage          `json:"forwards"`
 	Rules     []struct {
 		Tunnel *string `json:"tunnel"`
 	} `json:"rules"`
@@ -224,6 +225,11 @@ func remotePolicy(p *silo.NetworkPolicy) error {
 	var a policyAuthority
 	if e := json.Unmarshal([]byte(p.JSON()), &a); e != nil {
 		return usageDocument()
+	}
+	for key := range a.Metadata {
+		if strings.HasPrefix(key, "io.silo.taild.") {
+			return failure("usage", "remote policies cannot declare reserved taild metadata", 2)
+		}
 	}
 	if len(a.Tailscale) > 0 || len(a.Forwards) > 0 {
 		return failure("usage", "remote policies cannot declare tailscale or forwards", 2)
@@ -251,7 +257,7 @@ func parseRemotePolicy(raw string) (*silo.NetworkPolicy, error) {
 // their order/priority. IP allow rules gain neutral routing, which netd applies
 // only to tailnet destinations; the appended lowest-priority rules exempt the
 // tailnet from default deny without overriding any explicit matching rule.
-func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Principal, controlURL string) (*silo.NetworkPolicy, error) {
+func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Principal, controlURL string, requestedTags ...string) (*silo.NetworkPolicy, error) {
 	if _, e := identity.ParsePrincipal(string(owner)); e != nil {
 		return nil, usageDocument()
 	}
@@ -261,6 +267,9 @@ func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Princi
 	tags := []string{}
 	if owner.IsTag() {
 		tags = append(tags, string(owner))
+	}
+	if len(requestedTags) > 0 {
+		tags = append([]string{}, requestedTags...)
 	}
 	if p == nil {
 		var e error

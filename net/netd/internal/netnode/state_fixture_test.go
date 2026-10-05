@@ -1,4 +1,4 @@
-package enroll
+package netnode
 
 import (
 	"context"
@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/identity"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
 	"tailscale.com/tailcfg"
@@ -21,7 +19,9 @@ import (
 	"tailscale.com/types/persist"
 )
 
-func profileFixture(t *testing.T, dir, name, id string, pin state.NodePin, private key.NodePrivate, tags []string) {
+type fixturePin struct{ Tailnet, Suffix, ControlURL string }
+
+func profileFixture(t *testing.T, dir, name, id string, pin fixturePin, private key.NodePrivate, tags []string) {
 	t.Helper()
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		t.Fatal(e)
@@ -50,43 +50,6 @@ func profileFixture(t *testing.T, dir, name, id string, pin state.NodePin, priva
 	}
 }
 
-func TestClosedReauthPublicStateRejectsUnchangedOrUnboundKey(t *testing.T) {
-	// Pinned public serialization fixtures prove the closed-state contract only.
-	// There is no simulated successful control server or registration here.
-	pin := state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: ipn.DefaultControlURL}
-	oldDir := t.TempDir()
-	oldKey := key.NewNode()
-	profileFixture(t, oldDir, "dev", "stable", pin, oldKey, nil)
-	old, kind := state.ReadNode(oldDir, "dev", "user:7", &pin)
-	if kind != state.Enrolled {
-		t.Fatal(kind)
-	}
-	for _, tc := range []struct {
-		name, id string
-		private  key.NodePrivate
-		observed key.NodePublic
-		want     bool
-	}{
-		{"unchanged", "stable", oldKey, oldKey.Public(), false},
-		{"different-id", "other", key.NewNode(), key.NodePublic{}, false},
-		{"unbound-status", "stable", key.NewNode(), oldKey.Public(), false},
-		{"refreshed", "stable", key.NewNode(), key.NodePublic{}, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			profileFixture(t, dir, "dev", tc.id, pin, tc.private, nil)
-			observed := tc.observed
-			if observed.IsZero() {
-				observed = tc.private.Public()
-			}
-			e := checkClosedNode(dir, "dev", identity.Principal("user:7"), pin, tc.id, observed, old, true)
-			if (e == nil) != tc.want {
-				t.Fatal("closed-state key/identity contract violated")
-			}
-		})
-	}
-}
-
 func TestActualTSNetPrefsRewriteAndLocalAPIKeyRedaction(t *testing.T) {
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
 	defer endpoint.Close()
@@ -97,7 +60,7 @@ func TestActualTSNetPrefsRewriteAndLocalAPIKeyRedaction(t *testing.T) {
 			dir := t.TempDir()
 			private := key.NewNode()
 			tags := []string{"tag:owner"}
-			pin := state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: endpoint.URL}
+			pin := fixturePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: endpoint.URL}
 			profileFixture(t, dir, "dev", "fixture-stable", pin, private, tags)
 			server := &tsnet.Server{Dir: dir, Hostname: "dev", ControlURL: other.URL, Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
 			if keep {

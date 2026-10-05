@@ -42,9 +42,7 @@ type Config struct {
 	} `yaml:"tailnet"`
 	Enrollment struct {
 		Mode             string `yaml:"mode"`
-		Timeout          string `yaml:"timeout"`
 		DisableKeyExpiry bool   `yaml:"disable_key_expiry"`
-		DeleteDevices    bool   `yaml:"delete_devices"`
 	} `yaml:"enrollment"`
 	VM struct {
 		DefaultImage      string    `yaml:"default_image"`
@@ -81,8 +79,6 @@ func Defaults() Config {
 	c.Tailnet.Tag = "tag:silo"
 	c.Tailnet.Capability = "github.com/vandycknick/silo/cap/taild"
 	c.Enrollment.Mode = "oauth-app"
-	c.Enrollment.Timeout = "5m"
-	c.Enrollment.DeleteDevices = true
 	c.VM.DefaultImage = "ghcr.io/vandycknick/silo/devbox:latest"
 	c.VM.AllowedRegistries = []string{"ghcr.io/vandycknick"}
 	c.VM.Defaults = Resources{2, "4GiB", "20GiB"}
@@ -163,10 +159,6 @@ func (c Config) Validate() error {
 	case "oauth-app", "interactive", "none":
 	default:
 		return errors.New("invalid enrollment mode")
-	}
-	timeout, e := time.ParseDuration(c.Enrollment.Timeout)
-	if e != nil || timeout <= 0 || timeout > 5*time.Minute {
-		return errors.New("enrollment timeout must be positive and at most 5m")
 	}
 	for _, p := range []string{c.Home, c.SecretsDir, c.TemplatesDir, c.PoliciesDir} {
 		if !filepath.IsAbs(p) {

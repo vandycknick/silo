@@ -58,7 +58,15 @@ func (h *createHandler) Flags(f *cmdline.FlagSet) {
 		return nil
 	}).Default("template/none")
 	f.Value("owner", "tag:NAME", "Select a verified owner tag.", principal(&h.q.Owner)).Default("your principal")
-	f.Bool("no-tailnet", "Disable VM enrollment.", &h.q.NoTailnet)
+	f.Bool("tailscale", "Add a VM tailnet node; interactive approval continues after boot.", &h.q.Tailscale)
+	f.Repeat("tag", "tag:NAME", "Request a Tailscale tag (repeatable); Tailscale authorizes assignment.", func(v string) error {
+		p, err := identity.ParsePrincipal(strings.ToLower(v))
+		if err != nil || !p.IsTag() {
+			return errors.New("expected tag:NAME")
+		}
+		h.q.Tags = append(h.q.Tags, string(p))
+		return nil
+	}).Default("none")
 	f.Bool("no-start", "Leave the VM stopped.", &h.q.NoStart)
 }
 

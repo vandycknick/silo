@@ -18,12 +18,11 @@ func TestModeTable(t *testing.T) {
 	for _, tc := range []struct {
 		owner          identity.Principal
 		config, secret string
-		opt            bool
 		want           Mode
 	}{
-		{"user:1", "oauth-app", "app", false, User}, {"user:1", "oauth-app", "", false, Interactive}, {"user:1", "interactive", "app", false, Interactive}, {"tag:ci", "interactive", "", false, Tag}, {"tag:ci", "none", "", false, None}, {"user:1", "oauth-app", "app", true, None},
+		{"user:1", "oauth-app", "app", User}, {"user:1", "oauth-app", "", Interactive}, {"user:1", "interactive", "app", Interactive}, {"tag:ci", "interactive", "", Tag}, {"tag:ci", "none", "", None},
 	} {
-		if got := Select(tc.owner, tc.config, tc.secret, tc.opt); got != tc.want {
+		if got := Select(tc.owner, tc.config, tc.secret); got != tc.want {
 			t.Fatal(tc, got)
 		}
 	}
@@ -103,7 +102,10 @@ func TestCallbackRealTLSExchangeAtomicConsumeAndOpaqueToken(t *testing.T) {
 	if err != nil || token != "opaque-undocumented-provisioning-token" {
 		t.Fatal(token, err)
 	}
-	if registry.Current("vm", "user:1") != nil {
+	registry.mu.Lock()
+	remaining := len(registry.entries)
+	registry.mu.Unlock()
+	if remaining != 0 {
 		t.Fatal("consumed consent retained")
 	}
 	for _, kind := range []string{"expired", "cancelled", "restart"} {

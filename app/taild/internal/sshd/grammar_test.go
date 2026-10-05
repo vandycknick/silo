@@ -55,7 +55,7 @@ func TestCommandGrammar(t *testing.T) {
 		{"create dev --template ''", 2}, {"create dev --image ''", 2}, {"create dev --policy ''", 2}, {"create dev --bogus", 2},
 		{"create dev --label a", 2}, {"create dev --label a=1 --label a=2", 2}, {"create dev --provision-user nope", 2},
 		{"create dev --no-start --no-start", 2}, {"create dev --timeout 1s", 2},
-		{"create dev", 4}, {"create --name dev img", 4}, {"create --name dev --image img --cpus 2 --memory 512MiB --disk-size 1GiB --no-tailnet --no-start", 4},
+		{"create dev", 4}, {"create --name dev img", 4}, {"create --name dev --image img --cpus 2 --memory 512MiB --disk-size 1GiB --tailscale --no-start", 4}, {"create --no-tailnet", 2},
 		{"create dev --label a=1 --label b=2 --owner tag:ci --template t --policy p --userdata '#!/bin/sh'", 4}, {"create dev --userdata -", 4},
 		// Single-argument mutations.
 		{"start", 2}, {"start a b", 2}, {"restart", 2}, {"reauth a --force", 2},
