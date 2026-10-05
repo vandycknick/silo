@@ -17,6 +17,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -58,7 +59,7 @@ labels: {team: runtime}
 func TestPrincipalDocumentsRealFilesTiersAndReload(t *testing.T) {
 	s := actualService(t)
 	ctx := context.Background()
-	one, two := domainCaller(t, s, "user:1"), domainCaller(t, s, "user:2")
+	one, two := domainCaller(s, "user:1"), domainCaller(s, "user:2")
 	s.Config.TemplatesDir = t.TempDir()
 	s.Config.PoliciesDir = t.TempDir()
 	operator := filepath.Join(s.Config.TemplatesDir, "dev.yaml")
@@ -213,7 +214,7 @@ func TestPrincipalDocumentsRealFilesTiersAndReload(t *testing.T) {
 func TestRemotePoliciesCanonicalInjectionPreservesConfigAndDenies(t *testing.T) {
 	s := actualService(t)
 	ctx := context.Background()
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	for _, raw := range []string{`tailscale "vm" {}`, `tailscale "other" { tags = ["tag:a"] }`, `forward "host" "x" { target = "127.0.0.1" target_port = 80 }`} {
 		if _, e := s.Documents(ctx, c, "policy", "validate", "", "", raw); e == nil {
 			t.Fatal(raw)
@@ -338,19 +339,19 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Config.Tailnet.ControlURL = "https://wrong-config.example.test"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "https://pinned-control.example.test"}}
 	for _, owner := range []identity.Principal{"tag:owner", "user:7"} {
-		caller := domainCaller(t, s, owner)
+		caller := domainCaller(s, owner)
 		selected := owner
 		if owner == "user:7" {
 			selected = ""
 		}
 		ctx := context.Background()
 		op, e := s.Create(ctx, caller, CreateRequest{Name: "exact", Owner: selected, NoStart: true, Tailscale: true})
-		succeeded(t, s, caller, op, e)
+		daemon.Succeeded(t, s.Jobs, caller.Peer, op, e)
 		m, e := s.Runtime.SDK.Machine(ctx, "exact")
 		if e != nil {
 			t.Fatal(e)
@@ -449,7 +450,7 @@ func TestShippedOperatorExamplesThroughPublicSDK(t *testing.T) {
 func TestTemplateCreationOverridesAndStampedAuthority(t *testing.T) {
 	s := actualService(t)
 	ctx := context.Background()
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	// A real tiny OCI image, materialized into a stopped VM by the native SDK.
 	fixture := testfixture.OCIRegistry(t, "")
 	registry := fixture.Reference
@@ -459,7 +460,7 @@ func TestTemplateCreationOverridesAndStampedAuthority(t *testing.T) {
 		t.Fatal(e)
 	}
 	op, e := s.Create(ctx, c, CreateRequest{Name: "overridden", Template: "dev", CPUs: 1, Labels: map[string]string{"x": "override"}, NoStart: true})
-	succeeded(t, s, c, op, e)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, e)
 	m, e := s.Runtime.SDK.Machine(ctx, "overridden")
 	if e != nil {
 		t.Fatal(e)

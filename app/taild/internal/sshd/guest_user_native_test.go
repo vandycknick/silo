@@ -12,7 +12,7 @@ import (
 func TestNativeCreateProvisionUserParser(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	s, caller, registry := nativeService(t, ctx, "guest-user-parser", "user:7")
+	s, caller, registry := nativeService(t, "guest-user-parser", "user:7")
 	p := caller.Peer
 	r := s.Runtime
 	for _, flags := range []string{"--provision-user", "--provision-user nickvd", "--provision-user root:0:0:/root", "--provision-user nickvd:1000:1000:/home/x:extra", "--provision-user nickvd:1000:1000:/home/x --provision-user other:1001:1001:/home/y"} {

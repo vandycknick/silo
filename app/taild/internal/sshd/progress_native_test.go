@@ -11,7 +11,7 @@ import (
 func TestOpenSSHSpinnerUsesActualImagePullAndClearsBeforePrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
-	s, caller, registry := nativeService(t, ctx, "spinner", "user:7")
+	s, caller, registry := nativeService(t, "spinner", "user:7")
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once, unblock sync.Once
 	defer func() { unblock.Do(func() { close(release) }) }()

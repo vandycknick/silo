@@ -15,7 +15,7 @@ import (
 
 func TestDocumentCommandsActualRuntimeJSONCRUDAndFiniteInput(t *testing.T) {
 	ctx := context.Background()
-	s, caller, _ := nativeService(t, ctx, "documents-cli", "tag:one", "tag:two")
+	s, caller, _ := nativeService(t, "documents-cli", "tag:one", "tag:two")
 	run := func(line, input string, want int) string {
 		t.Helper()
 		var out, err bytes.Buffer

@@ -12,6 +12,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -22,11 +23,11 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true))
 	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.Enrollment.Mode = "interactive"
 	s.VMNodesEnabled = true
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "http://127.0.0.1:1"}, Registry: enroll.NewRegistry(), Metrics: s.Runtime.Metrics}
-	c := domainCaller(t, s, "user:7")
+	c := domainCaller(s, "user:7")
 	ctx := context.Background()
 	t.Cleanup(func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -51,15 +52,15 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	})
 	// Enabling the service does not opt an ordinary creation into enrollment.
 	op, err := s.Create(ctx, c, CreateRequest{Name: "ordinary", NoStart: true})
-	succeeded(t, s, c, op, err)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	v, err := s.Show(ctx, c.Peer, "ordinary")
 	if err != nil || v.NodeState != state.NoNode {
 		t.Fatal(v, err)
 	}
 	started := time.Now()
 	op, err = s.Create(ctx, c, CreateRequest{Name: "pending", Tailscale: true})
-	succeeded(t, s, c, op, err)
-	result := waitOperation(t, s, c, op)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	result := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 	if result.Completion == nil || !result.Completion.Running || result.Completion.Node != "" || time.Since(started) > 45*time.Second {
 		t.Fatal(result, time.Since(started))
 	}
@@ -89,7 +90,7 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	}
 	oldRun := *d.RunID
 	op, err = s.Restart(ctx, c, "pending")
-	succeeded(t, s, c, op, err)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	d, err = m.Inspect(ctx)
 	if err != nil || d.RunID == nil || *d.RunID == oldRun {
 		t.Fatal(d, err)
@@ -104,7 +105,7 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 		t.Fatal(v, err)
 	}
 	op, err = s.Stop(ctx, c, "pending", StopRequest{Force: true, Timeout: time.Second})
-	succeeded(t, s, c, op, err)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	v, err = s.Show(ctx, c.Peer, "pending")
 	if err != nil || v.Node != "pending.fixture.test" || v.NodeState != state.NodeState("stopped") {
 		t.Fatal("stopped node lost its configured name", v, err)
@@ -122,7 +123,7 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 		}
 	}
 	op, err = s.Start(ctx, c, "pending")
-	succeeded(t, s, c, op, err)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	op, err = s.Remove(ctx, c, "pending", RemoveRequest{Force: true})
-	succeeded(t, s, c, op, err)
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 }

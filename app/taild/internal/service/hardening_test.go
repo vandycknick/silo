@@ -14,6 +14,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 	"golang.org/x/sys/unix"
 )
@@ -22,7 +23,7 @@ func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 	s := actualService(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.Enrollment.Mode = "oauth-app"
 	s.VMNodesEnabled = true
 	r := enroll.NewRegistry()
@@ -31,7 +32,7 @@ func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Enrollment = &enroll.Manager{Config: s.Config, Secrets: config.Secrets{AppSecret: "tskey-app-test-secret"}, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test"}, Registry: r, OAuth: oauth, Metrics: s.Runtime.Metrics}
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	op, err := s.Create(context.Background(), c, CreateRequest{Name: "offline", Tailscale: true, NoStart: true})
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +63,7 @@ func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 		t.Fatal("creation ran before consent", entries, err, registry.Requests.Load())
 	}
 	s.Jobs.InterruptIf(func() bool { return true })
-	finished := waitOperation(t, s, c, op)
+	finished := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 	if finished.Error == nil {
 		t.Fatal("cancelled consent succeeded")
 	}
@@ -79,7 +80,7 @@ func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 
 func TestShutdownMarkerBlocksNativeMutationsAndRegistryAdmission(t *testing.T) {
 	s := actualService(t)
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	s.Jobs.Admission = func() bool { return !state.ShutdownPending(s.Config.Home) }
 	if err := state.MarkShutdown(s.Config.Home); err != nil {
 		t.Fatal(err)
@@ -104,7 +105,7 @@ func TestShutdownMarkerBlocksNativeMutationsAndRegistryAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := waitOperation(t, s, c, op); got.State != "succeeded" {
+	if got := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil); got.State != "succeeded" {
 		t.Fatal(got)
 	}
 }

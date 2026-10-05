@@ -75,7 +75,7 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 	// registry trust. No credentials or host-image escape enters the create API.
 	registry := testfixture.OCIRegistry(t, rootfs)
 	c.VM.DefaultImage = registry.Reference
-	c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	c.VM.AllowedRegistries = []string{registry.Allowed()}
 	r, e := runtime.Open(ctx, c, "live-s11")
 	if e != nil {
 		t.Fatal(e)

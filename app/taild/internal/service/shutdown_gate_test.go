@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,12 +11,13 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 )
 
 func TestRealMarkerFailureStillDeniesSynchronousMutations(t *testing.T) {
 	s := actualService(t)
 	s.Shutdown = &state.ShutdownGate{}
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	s.Shutdown.Seal()
 	// Real filesystem failure: PrivateDir rejects this existing nonprivate
 	// directory. No marker exists, and no system bus or SDK error is invented.
@@ -49,10 +49,10 @@ func TestActualSDKCreateInterruptedByMemoryGateWhenMarkerWriteFails(t *testing.T
 	s := actualService(t)
 	s.Shutdown = &state.ShutdownGate{}
 	s.Jobs.Shutdown = s.Shutdown
-	c := domainCaller(t, s, "user:1")
+	c := domainCaller(s, "user:1")
 	registry := testfixture.OCIRegistry(t, "")
 	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var enteredOnce, releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
@@ -93,7 +93,7 @@ func TestActualSDKCreateInterruptedByMemoryGateWhenMarkerWriteFails(t *testing.T
 		}
 	}
 	releaseOnce.Do(func() { close(release) })
-	finished := waitOperation(t, s, c, op)
+	finished := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 	if finished.Error == nil || finished.Error.Exit != 9 {
 		t.Fatal("in-flight create was not interrupted", finished)
 	}
