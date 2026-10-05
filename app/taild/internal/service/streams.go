@@ -80,11 +80,7 @@ func (s *Service) streamContext(parent context.Context, c Caller, ref string, ac
 			case <-ticker.C:
 				p, e := c.Fresh(ctx)
 				if e == nil {
-					m, _, err := s.machine(ctx, p, ref, action)
-					e = err
-					if m != nil {
-						s.Runtime.CloseMachine(m)
-					}
+					_, e = s.inspect(ctx, p, ref, action)
 				}
 				if e != nil {
 					mu.Lock()

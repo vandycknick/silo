@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -169,29 +169,26 @@ func (r *Runtime) nodeState(ctx context.Context, d *silo.MachineData) state.Node
 		}
 		return state.NodeState("status unavailable")
 	}
-	if d.Status.Kind == silo.MachineStatusStopped {
-		for _, suffix := range []string{".transaction", ".pending", ".backup", ".unreadable"} {
-			if _, err := os.Lstat(dir + suffix); os.IsNotExist(err) {
-				continue
-			}
-			machine, err := r.Machine(ctx, d.ID)
-			if err != nil {
-				return state.Unreadable
-			}
-			defer r.CloseMachine(machine)
-			lease, err := machine.LeaseNodeState(ctx)
-			if err != nil {
-				return state.Unreadable
-			}
-			defer lease.Close()
-			if state.RecoverNode(dir, d.Name, NodeOwner(d), r.NodePin) == state.Unreadable {
-				return state.Unreadable
-			}
-			break
+	if d.Status.Kind == silo.MachineStatusStopped && state.NeedsRecovery(dir) {
+		machine, err := r.Machine(ctx, d.ID)
+		if err != nil {
+			return state.Unreadable
+		}
+		defer r.CloseMachine(machine)
+		lease, err := machine.LeaseNodeState(ctx)
+		if err != nil {
+			return state.Unreadable
+		}
+		defer lease.Close()
+		if state.RecoverNode(dir, d.Name, NodeOwner(d), r.NodePin) == state.Unreadable {
+			return state.Unreadable
 		}
 	}
 	return state.NodeState(string(d.Status.Kind))
 }
+
+// ErrNameTaken is the one answer to every way a machine name can collide.
+var ErrNameTaken = &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
 
 // Reserve is a short in-process reservation, not a distributed claim. Create
 // holds it through SDK CreateMachine, whose native exact-name home lock also
@@ -202,22 +199,12 @@ func (r *Runtime) Reserve(ctx context.Context, name string, visibleNames []strin
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.reserved[name] {
-		return nil, &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
-	}
 	entries, e := r.SDK.Inventory(ctx)
 	if e != nil {
 		return nil, e
 	}
-	for _, entry := range entries {
-		if entry.Name == name {
-			return nil, &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
-		}
-	}
-	for _, visible := range visibleNames {
-		if visible == name {
-			return nil, &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
-		}
+	if r.reserved[name] || slices.Contains(visibleNames, name) || slices.ContainsFunc(entries, func(entry silo.MachineInventoryEntry) bool { return entry.Name == name }) {
+		return nil, ErrNameTaken
 	}
 	r.reserved[name] = true
 	var once sync.Once

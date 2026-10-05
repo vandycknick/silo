@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	silo "github.com/vandycknick/silo/sdk/go"
 	"go.yaml.in/yaml/v3"
@@ -44,18 +45,11 @@ type TemplateNetwork struct {
 	Publish []uint16 `yaml:"publish,omitempty" json:"publish,omitempty"`
 }
 
-func documentName(s string) bool {
-	if len(s) == 0 || len(s) > 63 {
-		return false
-	}
-	for i, r := range s {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' && i > 0 {
-			continue
-		}
-		return false
-	}
-	return true
-}
+// Document names follow the VM name grammar, so a name is safe as a file stem.
+var (
+	errDocumentName = failure("usage", "invalid document name", 2)
+	errDocumentSize = failure("usage", "document must be 1..65536 bytes", 2)
+)
 
 // YAML decoding normally coerces numbers into strings and ignores null. Check
 // the syntax tree against the typed allowlist first, rejecting aliases/merges.
@@ -130,7 +124,7 @@ func usageDocument() error { return failure("usage", "invalid remote document fi
 func (s *Service) ParseTemplate(raw string) (Template, error) {
 	var t Template
 	if len(raw) == 0 || len(raw) > DocumentLimit {
-		return t, failure("usage", "document must be 1..65536 bytes", 2)
+		return t, errDocumentSize
 	}
 	d := yaml.NewDecoder(strings.NewReader(raw))
 	var n yaml.Node
@@ -154,7 +148,7 @@ func (s *Service) ParseTemplate(raw string) (Template, error) {
 		return t, usageDocument()
 	}
 	if t.Image != nil && !imageAllowed(*t.Image, s.Config.VM.AllowedRegistries) {
-		return t, failure("usage", "image must be an allowlisted OCI reference", 2)
+		return t, errImage
 	}
 	if t.Resources != nil {
 		if t.Resources.CPUs != nil && (*t.Resources.CPUs == 0 || *t.Resources.CPUs > 255) {
@@ -175,7 +169,7 @@ func (s *Service) ParseTemplate(raw string) (Template, error) {
 		return t, failure("usage", "remote guest management requires vsock: true", 2)
 	}
 	if t.Userdata != nil && (*t.Userdata == "" || !validUserdata(*t.Userdata)) {
-		return t, failure("usage", "userdata must be an inline shebang script, at most 16KiB", 2)
+		return t, errUserdata
 	}
 	if e := validateLabels(t.Labels); e != nil {
 		return t, e
@@ -184,7 +178,7 @@ func (s *Service) ParseTemplate(raw string) (Template, error) {
 		if t.Network.Kind != "private" {
 			return t, failure("usage", "only private networking is allowed", 2)
 		}
-		if t.Network.PolicyRef != nil && !documentName(*t.Network.PolicyRef) {
+		if t.Network.PolicyRef != nil && !config.ValidName(*t.Network.PolicyRef) {
 			return t, failure("usage", "invalid policy_ref", 2)
 		}
 		seen := map[uint16]bool{}
@@ -243,7 +237,7 @@ func remotePolicy(p *silo.NetworkPolicy) error {
 }
 func parseRemotePolicy(raw string) (*silo.NetworkPolicy, error) {
 	if len(raw) == 0 || len(raw) > DocumentLimit {
-		return nil, failure("usage", "document must be 1..65536 bytes", 2)
+		return nil, errDocumentSize
 	}
 	p, e := silo.ParseNetworkPolicyHCL(raw)
 	if e != nil {
@@ -426,11 +420,9 @@ func (s *Service) Documents(ctx context.Context, c Caller, kind, verb, name stri
 		d, e := s.validateDocument(kind, raw)
 		return []Document{d}, e
 	}
-	if verb != "ls" && !documentName(name) {
-		return nil, failure("usage", "invalid document name", 2)
-	}
 	if verb == "ls" && owner == "" && len(p.Principals) > 1 {
-		out := []Document{}
+		// Every principal's own documents, then the shared operator tier once.
+		yours, operator := []Document{}, []Document{}
 		for _, principal := range p.Principals {
 			docs, e := s.documentsFor(kind, verb, name, principal, raw)
 			if e != nil {
@@ -438,20 +430,13 @@ func (s *Service) Documents(ctx context.Context, c Caller, kind, verb, name stri
 			}
 			for _, d := range docs {
 				if d.Tier == "yours" {
-					out = append(out, d)
+					yours = append(yours, d)
+				} else if principal == p.Principals[0] {
+					operator = append(operator, d)
 				}
 			}
 		}
-		docs, e := s.documentsFor(kind, verb, name, p.Principals[0], raw)
-		if e != nil {
-			return nil, e
-		}
-		for _, d := range docs {
-			if d.Tier == "operator" {
-				out = append(out, d)
-			}
-		}
-		return out, nil
+		return append(yours, operator...), nil
 	}
 	principal, e := selectedOwner(p, owner)
 	if e != nil {
