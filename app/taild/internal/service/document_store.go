@@ -12,9 +12,12 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"golang.org/x/sys/unix"
 )
+
+var errOperatorReadOnly = failure("forbidden", "operator documents are read-only", 4)
 
 // All paths are walked through directory descriptors with NOFOLLOW, including
 // ancestors. Anchored operations cannot follow a swapped directory or file link.
@@ -132,14 +135,36 @@ func storeFailure(e error) error {
 	}
 	return failure("unavailable", "document store unavailable or unsafe", 9)
 }
+
+// documentNames lists the stored documents with one extension, refusing
+// oversized directories and names the store would never have written.
+func documentNames(dir *os.File, ext string) ([]string, error) {
+	entries, e := dir.ReadDir(4097)
+	if e != nil && e != io.EOF {
+		return nil, e
+	}
+	if len(entries) > 4096 {
+		return nil, errors.New("document directory exceeds 4096 entries")
+	}
+	var names []string
+	for _, f := range entries {
+		if n, ok := strings.CutSuffix(f.Name(), ext); ok {
+			if !config.ValidName(n) {
+				return nil, errors.New("invalid stored document name")
+			}
+			names = append(names, n)
+		}
+	}
+	return names, nil
+}
 func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal, raw string) ([]Document, error) {
 	s.documentMu.Lock()
 	defer s.documentMu.Unlock()
 	if _, e := identity.ParsePrincipal(string(owner)); e != nil {
 		return nil, usageDocument()
 	}
-	if verb != "ls" && !documentName(name) {
-		return nil, failure("usage", "invalid document name", 2)
+	if verb != "ls" && !config.ValidName(name) {
+		return nil, errDocumentName
 	}
 	own, operator, ext := s.documentPaths(kind, owner)
 	write := verb == "create" || verb == "edit" || verb == "rm"
@@ -188,21 +213,11 @@ func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal
 			if entry.dir == nil {
 				continue
 			}
-			entries, e := entry.dir.ReadDir(4097)
-			if e != nil && e != io.EOF {
+			names, e := documentNames(entry.dir, ext)
+			if e != nil {
 				return nil, storeFailure(e)
 			}
-			if len(entries) > 4096 {
-				return nil, failure("unavailable", "document directory exceeds 4096 entries", 9)
-			}
-			for _, f := range entries {
-				if !strings.HasSuffix(f.Name(), ext) {
-					continue
-				}
-				n := strings.TrimSuffix(f.Name(), ext)
-				if !documentName(n) {
-					return nil, failure("unavailable", "invalid stored document name", 9)
-				}
+			for _, n := range names {
 				d, e := load(entry.dir, n, entry.tier)
 				if e != nil {
 					return nil, storeFailure(e)
@@ -239,7 +254,7 @@ func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal
 		}
 		if verb == "edit" && existingErr != nil {
 			if _, e := load(op, name, "operator"); e == nil {
-				return nil, failure("forbidden", "operator documents are read-only", 4)
+				return nil, errOperatorReadOnly
 			}
 			return nil, storeFailure(existingErr)
 		}
@@ -257,7 +272,7 @@ func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal
 	case "rm":
 		if existingErr != nil {
 			if _, e := load(op, name, "operator"); e == nil {
-				return nil, failure("forbidden", "operator documents are read-only", 4)
+				return nil, errOperatorReadOnly
 			}
 			return nil, storeFailure(existingErr)
 		}
@@ -292,21 +307,12 @@ func (s *Service) ReloadDocuments() error {
 		}
 		e = func() error {
 			defer dir.Close()
-			entries, e := dir.ReadDir(4097)
-			if e != nil && e != io.EOF {
+			names, e := documentNames(dir, ext)
+			if e != nil {
 				return e
 			}
-			if len(entries) > 4096 {
-				return errors.New("too many documents")
-			}
-			for _, entry := range entries {
-				if !strings.HasSuffix(entry.Name(), ext) {
-					continue
-				}
-				if !documentName(strings.TrimSuffix(entry.Name(), ext)) {
-					return usageDocument()
-				}
-				raw, e := readDocument(dir, entry.Name(), false)
+			for _, n := range names {
+				raw, e := readDocument(dir, n+ext, false)
 				if e != nil {
 					return e
 				}

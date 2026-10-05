@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/vandycknick/silo/app/taild/internal/service"
@@ -46,16 +45,22 @@ func (h *setHandler) Run(c *Context, args cmdline.Args) (Result, error) {
 		case "name":
 			h.q.Name = &v
 		case "cpus":
-			n, e := strconv.ParseUint(v, 10, 8)
-			if e != nil || n == 0 {
-				return Result{}, usageReason("invalid cpus setting: expected a positive integer (1..255)")
+			var n uint64
+			if e := cmdline.Count(&n)(v); e != nil {
+				return Result{}, usageReason("invalid cpus setting: " + e.Error())
 			}
 			cpus := uint8(n)
 			h.q.CPUs = &cpus
-		case "memory":
-			h.q.MemoryText = &v
-		case "disk":
-			h.q.DiskText = &v
+		case "memory", "disk":
+			size, e := service.ParseResource(k, v)
+			if e != nil {
+				return Result{}, e
+			}
+			if k == "memory" {
+				h.q.Memory = &size
+			} else {
+				h.q.Disk = &size
+			}
 		default:
 			return Result{}, usageReason("unknown setting; expected name, cpus, memory or disk")
 		}

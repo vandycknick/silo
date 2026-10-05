@@ -53,16 +53,6 @@ labels: {team: runtime}
 			t.Fatalf("accepted %q", raw)
 		}
 	}
-	for _, name := range []string{"a", "0", strings.Repeat("x", 63), "a-"} {
-		if !documentName(name) {
-			t.Fatal(name)
-		}
-	}
-	for _, name := range []string{"", "../x", "A", "-a", "a_b", strings.Repeat("x", 64)} {
-		if documentName(name) {
-			t.Fatal(name)
-		}
-	}
 }
 
 func TestPrincipalDocumentsRealFilesTiersAndReload(t *testing.T) {

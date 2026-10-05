@@ -172,6 +172,17 @@ func exists(path string) bool {
 	return !errors.Is(e, os.ErrNotExist)
 }
 
+// NeedsRecovery reports retained transaction material next to a node state
+// directory, which RecoverNode must settle before the state is trusted.
+func NeedsRecovery(dir string) bool {
+	for _, suffix := range []string{".transaction", ".pending", ".backup", ".unreadable"} {
+		if exists(dir + suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // RecoverNode completes validated replacements of a stopped machine's node
 // state; callers hold the native lease, so no VM can be running. Unknown or
 // conflicting recovery material is retained and reported, never blindly erased.

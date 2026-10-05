@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -23,6 +22,20 @@ func (s *Service) pin() *state.NodePin {
 	return &s.Enrollment.Pin
 }
 
+// nodeDNS is the MagicDNS name the pinned tailnet gives this VM's node.
+func (s *Service) nodeDNS(d *silo.MachineData) string {
+	if s.pin() == nil {
+		return ""
+	}
+	return identity.CanonicalDNS(d.Network.Tailscale.Hostname + "." + s.pin().Suffix)
+}
+
+// matchesNode reports whether a recorded observation describes this VM's node
+// on the pinned tailnet, so historical identity is never shown for another.
+func (s *Service) matchesNode(o *state.NodeObservation, v VM, dns string) bool {
+	return s.pin() != nil && o.Owner == string(v.Owner) && o.Tailnet == s.pin().Tailnet && o.DNSName == dns && sameTags(v.Tags, o.Tags)
+}
+
 // Prepare only launch metadata and legacy transaction recovery. Netd owns all
 // authentication, including expired or rejected identities in ordinary state.
 func (s *Service) prepareNode(ctx context.Context, c Caller, action identity.Action, m *silo.Machine, d *silo.MachineData) error {
@@ -36,18 +49,13 @@ func (s *Service) prepareNode(ctx context.Context, c Caller, action identity.Act
 	if err != nil {
 		return Categorize(err)
 	}
-	defer lease.Close()
 	dir := d.Network.Tailscale.StateDir
-	for _, suffix := range []string{".transaction", ".pending", ".backup", ".unreadable"} {
-		if _, e := os.Lstat(dir + suffix); e == nil || !os.IsNotExist(e) {
-			if state.RecoverNode(dir, d.Name, runtime.NodeOwner(d), s.pin()) == state.Unreadable {
-				return failure("conflict", "retained node state requires recovery", 5)
-			}
-			break
-		}
-	}
+	unreadable := state.NeedsRecovery(dir) && state.RecoverNode(dir, d.Name, runtime.NodeOwner(d), s.pin()) == state.Unreadable
 	// Updating the policy takes the native node-state lock itself.
 	_ = lease.Close()
+	if unreadable {
+		return failure("conflict", "retained node state requires recovery", 5)
+	}
 	if err = s.reauthorize(ctx, c, action, d); err != nil {
 		return err
 	}
@@ -159,11 +167,9 @@ func (s *Service) nodeView(d *silo.MachineData) VM {
 		return s.liveNodeView(d, v)
 	}
 	v.NodeState = state.NodeState(string(d.Status.Kind))
-	if s.pin() != nil {
-		v.Node = identity.CanonicalDNS(d.Network.Tailscale.Hostname + "." + s.pin().Suffix)
-	}
+	v.Node = s.nodeDNS(d)
 	if d.Status.Kind == silo.MachineStatusStopped {
-		if o, err := state.ReadNodeObservation(d.Network.Tailscale.StateDir, d.ID, time.Now()); err == nil && s.pin() != nil && o.Owner == string(v.Owner) && o.Tailnet == s.pin().Tailnet && o.DNSName == v.Node && sameTags(v.Tags, o.Tags) {
+		if o, err := state.ReadNodeObservation(d.Network.Tailscale.StateDir, d.ID, time.Now()); err == nil && s.matchesNode(o, v, v.Node) {
 			v.NodeID = o.NodeID
 			setExpiry(&v, o.KeyExpiry, o.ObservedAt, true)
 		}
@@ -199,10 +205,10 @@ func (s *Service) liveNodeView(d *silo.MachineData, v VM) VM {
 	if err != nil {
 		return v
 	}
-	v.Tags = project(d).Tags
+	dns := s.nodeDNS(d)
 	switch status.State {
 	case "ready":
-		if s.pin() == nil || status.NodeID == "" || status.DNSName != identity.CanonicalDNS(d.Network.Tailscale.Hostname+"."+s.pin().Suffix) {
+		if dns == "" || status.NodeID == "" || status.DNSName != dns {
 			v.NodeState = state.Unreadable
 			return v
 		}
@@ -230,7 +236,7 @@ func (s *Service) liveNodeView(d *silo.MachineData, v VM) VM {
 		}
 	case "approval_required":
 		v.NodeState, v.ApprovalURL = state.Pending, status.ApprovalURL
-		if status.ErrorCode == "key_expired" && status.KeyExpiryKnown && status.KeyExpiry != nil && !status.KeyExpiry.IsZero() && s.pin() != nil && status.NodeID != "" && status.DNSName == identity.CanonicalDNS(d.Network.Tailscale.Hostname+"."+s.pin().Suffix) && sameTags(v.Tags, status.Tags) {
+		if status.ErrorCode == "key_expired" && status.KeyExpiryKnown && status.KeyExpiry != nil && !status.KeyExpiry.IsZero() && dns != "" && status.NodeID != "" && status.DNSName == dns && sameTags(v.Tags, status.Tags) {
 			setExpiry(&v, status.KeyExpiry, status.ObservedAt, false)
 		}
 		if status.ErrorCode == "device_approval_required" {
@@ -242,11 +248,8 @@ func (s *Service) liveNodeView(d *silo.MachineData, v VM) VM {
 	default:
 		v.NodeState = state.NodeState(status.State)
 	}
-	if v.KeyExpiry == "unknown" && status.LastKnown != nil && s.pin() != nil && status.ErrorCode != "identity_mismatch" {
-		o := status.LastKnown
-		if o.Owner == string(v.Owner) && o.Tailnet == s.pin().Tailnet && o.DNSName == identity.CanonicalDNS(d.Network.Tailscale.Hostname+"."+s.pin().Suffix) && sameTags(v.Tags, o.Tags) && !o.ObservedAt.IsZero() && !o.ObservedAt.After(status.ObservedAt) {
-			setExpiry(&v, o.KeyExpiry, o.ObservedAt, true)
-		}
+	if o := status.LastKnown; v.KeyExpiry == "unknown" && o != nil && status.ErrorCode != "identity_mismatch" && s.matchesNode(o, v, dns) && !o.ObservedAt.IsZero() && !o.ObservedAt.After(status.ObservedAt) {
+		setExpiry(&v, o.KeyExpiry, o.ObservedAt, true)
 	}
 	return v
 }

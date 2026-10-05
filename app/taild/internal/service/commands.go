@@ -45,6 +45,15 @@ func failure(code, message string, exit int) *authz.Error {
 	return &authz.Error{Code: code, Message: message, Exit: exit}
 }
 
+// Failures several entry points report identically.
+var (
+	errVMNotFound  = failure("not_found", "VM not found", 3)
+	errVMRunning   = failure("conflict", "VM is running; use --force", 5)
+	errInvalidName = failure("usage", "invalid exact name", 2)
+	errImage       = failure("usage", "image must be an allowlisted OCI reference", 2)
+	errUserdata    = failure("usage", "userdata must be an inline shebang script, at most 16KiB", 2)
+)
+
 // Categorize never exposes native diagnostics, which may contain paths or credentials.
 func Categorize(err error) *authz.Error {
 	if err == nil {
@@ -58,9 +67,9 @@ func Categorize(err error) *authz.Error {
 	if errors.As(err, &e) {
 		switch e.Kind {
 		case silo.ErrorMachineNotFound:
-			return failure("not_found", "VM not found", 3)
+			return errVMNotFound
 		case silo.ErrorMachineAlreadyExists:
-			return failure("conflict", "name already taken locally or on the tailnet", 5)
+			return runtime.ErrNameTaken
 		case silo.ErrorMachineAlreadyRunning, silo.ErrorMachineNotRunning, silo.ErrorInvalidMachineUpdate:
 			return failure("conflict", "VM state does not permit this operation", 5)
 		case silo.ErrorInvalidArgument, silo.ErrorInvalidCreateRequest, silo.ErrorInvalidMachineName:
@@ -154,7 +163,7 @@ func (s *Service) machine(ctx context.Context, p identity.Peer, ref string, acti
 	if e == nil {
 		_, ownerErr := identity.ParsePrincipal(d.Labels[runtime.OwnerLabel])
 		if ownerErr != nil || d.Labels[runtime.NameLabel] != d.Name || !config.ValidName(d.Name) {
-			e = failure("not_found", "VM not found", 3)
+			e = errVMNotFound
 		} else {
 			e = s.Authorize(p, action, authority(d))
 		}
@@ -164,6 +173,16 @@ func (s *Service) machine(ctx context.Context, p identity.Peer, ref string, acti
 		return nil, nil, Categorize(e)
 	}
 	return m, d, nil
+}
+
+// inspect is machine for callers that only need the record, not a handle.
+func (s *Service) inspect(ctx context.Context, p identity.Peer, ref string, action identity.Action) (*silo.MachineData, error) {
+	m, d, e := s.machine(ctx, p, ref, action)
+	if e != nil {
+		return nil, e
+	}
+	s.Runtime.CloseMachine(m)
+	return d, nil
 }
 func (s *Service) List(ctx context.Context, p identity.Peer) ([]VM, error) {
 	if e := s.Authorize(p, identity.Read, nil); e != nil {
@@ -184,11 +203,10 @@ func (s *Service) List(ctx context.Context, p identity.Peer) ([]VM, error) {
 	return out, nil
 }
 func (s *Service) Show(ctx context.Context, p identity.Peer, ref string) (VM, error) {
-	m, d, e := s.machine(ctx, p, ref, identity.Read)
+	d, e := s.inspect(ctx, p, ref, identity.Read)
 	if e != nil {
 		return VM{}, e
 	}
-	defer s.Runtime.CloseMachine(m)
 	v := s.nodeView(d)
 	if !v.Owner.IsTag() && p.Owns(v.Owner) && p.Login != "" {
 		v.OwnerLogin = p.Login
@@ -299,7 +317,7 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	slices.Sort(q.Tags)
 	q.Tags = slices.Compact(q.Tags)
 	if q.Name != "" && !config.ValidName(q.Name) {
-		return q, failure("usage", "invalid exact name", 2)
+		return q, errInvalidName
 	}
 	if q.GuestUser != nil {
 		u := *q.GuestUser
@@ -308,27 +326,22 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 		}
 		q.GuestUser = &u
 	}
-	if q.Owner == "" {
-		if len(p.Principals) != 1 {
-			return q, failure("usage", "multi-tag peers require --owner tag:<name>", 2)
-		}
-		q.Owner = p.Principals[0]
-	} else if !q.Owner.IsTag() || !p.Owns(q.Owner) {
-		return q, failure("forbidden", "owner must be a verified peer tag", 4)
+	owner, e := selectedOwner(p, q.Owner)
+	if e != nil {
+		return q, e
 	}
-	if q.Tailscale && q.Owner.IsTag() {
-		if len(q.Tags) == 0 {
-			q.Tags = []string{string(q.Owner)}
-		}
+	q.Owner = owner
+	if q.Tailscale && q.Owner.IsTag() && len(q.Tags) == 0 {
+		q.Tags = []string{string(q.Owner)}
 	}
 	if q.Image == "" {
 		q.Image = s.Config.VM.DefaultImage
 	}
 	if !imageAllowed(q.Image, s.Config.VM.AllowedRegistries) {
-		return q, failure("usage", "image must be an allowlisted OCI reference", 2)
+		return q, errImage
 	}
 	if !validUserdata(q.Userdata) {
-		return q, failure("usage", "userdata must be an inline shebang script, at most 16KiB", 2)
+		return q, errUserdata
 	}
 	if e := validateLabels(q.Labels); e != nil {
 		return q, e
@@ -397,29 +410,49 @@ func (s *Service) ownedCountLocked(ctx context.Context, owner identity.Principal
 	}
 	return count, nil
 }
+
+// admitLocked is the create admission shared by reservation and the durable
+// write, under createMu: no host shutdown, the disk floor with disk reserved
+// on top, and the owner's VM count under both ceilings. Before a reservation
+// the count must leave room; once this create holds one, it may fill the slot.
+func (s *Service) admitLocked(ctx context.Context, p identity.Peer, owner identity.Principal, disk uint64, reserved bool) error {
+	if s.ShutdownPending() {
+		return failure("unavailable", "host is shutting down", 9)
+	}
+	if e := s.diskAdmissionLocked(disk); e != nil {
+		return e
+	}
+	count, e := s.ownedCountLocked(ctx, owner)
+	if e != nil {
+		return e
+	}
+	limit := min(s.Config.Limits().VMs, p.Permissions.Limits.VMs)
+	if count > limit || !reserved && count == limit {
+		return failure("limit", "VM count ceiling exceeded", 6)
+	}
+	return nil
+}
+
+// visibleNames is the tailnet's current machine names when a tailnet is attached.
+func (s *Service) visibleNames(ctx context.Context) ([]string, error) {
+	if s.VisibleNames == nil {
+		return nil, nil
+	}
+	names, e := s.VisibleNames(ctx)
+	if e != nil {
+		return nil, failure("unavailable", "tailnet name inventory unavailable", 9)
+	}
+	return names, nil
+}
 func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q *CreateRequest) (func(), error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
-	if s.ShutdownPending() {
-		return nil, failure("unavailable", "host is shutting down", 9)
-	}
-	if e := s.diskAdmissionLocked(q.Disk); e != nil {
+	if e := s.admitLocked(ctx, p, q.Owner, q.Disk, false); e != nil {
 		return nil, e
 	}
-	l := s.Config.Limits()
-	count, e := s.ownedCountLocked(ctx, q.Owner)
+	names, e := s.visibleNames(ctx)
 	if e != nil {
 		return nil, e
-	}
-	if count >= min(l.VMs, p.Permissions.Limits.VMs) {
-		return nil, failure("limit", "VM count ceiling exceeded", 6)
-	}
-	var names []string
-	if s.VisibleNames != nil {
-		names, e = s.VisibleNames(ctx)
-		if e != nil {
-			return nil, failure("unavailable", "tailnet name inventory unavailable", 9)
-		}
 	}
 	generated := q.Name == ""
 	var release func()
@@ -466,19 +499,8 @@ func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q *CreateR
 func (s *Service) materialize(ctx context.Context, p identity.Peer, q CreateRequest, opts []silo.MachineOption) (*silo.Machine, error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
-	if s.ShutdownPending() {
-		return nil, failure("unavailable", "host is shutting down", 9)
-	}
-	if e := s.diskAdmissionLocked(0); e != nil {
+	if e := s.admitLocked(ctx, p, q.Owner, 0, true); e != nil {
 		return nil, e
-	}
-	l := s.Config.Limits()
-	count, e := s.ownedCountLocked(ctx, q.Owner)
-	if e != nil {
-		return nil, e
-	}
-	if count > min(l.VMs, p.Permissions.Limits.VMs) {
-		return nil, failure("limit", "VM count ceiling exceeded", 6)
 	}
 	m, err := s.Runtime.SDK.CreateMachine(ctx, silo.OCIImage(q.Image), opts...)
 	if err == nil {
@@ -700,15 +722,14 @@ func (s *Service) PreflightRemove(ctx context.Context, c Caller, ref string, for
 	if e != nil {
 		return RemovalTarget{}, e
 	}
-	m, d, e := s.machine(ctx, p, ref, identity.Delete)
+	d, e := s.inspect(ctx, p, ref, identity.Delete)
 	if e != nil {
 		return RemovalTarget{}, e
 	}
-	defer s.Runtime.CloseMachine(m)
 	running := d.Status.Kind != silo.MachineStatusStopped
 	if running {
 		if !force {
-			return RemovalTarget{}, failure("conflict", "VM is running; use --force", 5)
+			return RemovalTarget{}, errVMRunning
 		}
 		if e := s.Authorize(p, identity.Stop, authority(d)); e != nil {
 			return RemovalTarget{}, e
@@ -717,13 +738,12 @@ func (s *Service) PreflightRemove(ctx context.Context, c Caller, ref string, for
 	return RemovalTarget{ID: d.ID, Name: d.Name, Running: running}, nil
 }
 
+// SetRequest carries only the settings to change; nil leaves a value alone.
 type SetRequest struct {
-	MemoryText *string
-	DiskText   *string
-	Name       *string
-	CPUs       *uint8
-	Memory     *silo.ByteSize
-	Disk       *silo.ByteSize
+	Name   *string
+	CPUs   *uint8
+	Memory *silo.ByteSize
+	Disk   *silo.ByteSize
 }
 
 // reauthorize checks the action against a fresh identity observation. Long
@@ -736,11 +756,10 @@ func (s *Service) reauthorize(ctx context.Context, c Caller, action identity.Act
 	return s.Authorize(p, action, authority(d))
 }
 func (s *Service) mutation(ctx context.Context, c Caller, ref, kind string, action identity.Action, run func(context.Context, identity.Peer, *silo.Machine, *silo.MachineData, func(string)) error) (jobs.Operation, error) {
-	m, d, e := s.machine(ctx, c.Peer, ref, action)
+	d, e := s.inspect(ctx, c.Peer, ref, action)
 	if e != nil {
 		return jobs.Operation{}, e
 	}
-	s.Runtime.CloseMachine(m)
 	s.createMu.Lock()
 	_, creating := s.pending[d.Name]
 	s.createMu.Unlock()
@@ -840,7 +859,7 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 	return s.mutation(ctx, c, ref, "remove", identity.Delete, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, _ func(string)) error {
 		if d.Status.Kind != silo.MachineStatusStopped {
 			if !q.Force {
-				return failure("conflict", "VM is running; use --force", 5)
+				return errVMRunning
 			}
 			if e := s.Authorize(p, identity.Stop, authority(d)); e != nil {
 				return e
@@ -862,51 +881,11 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 	})
 }
 func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (jobs.Operation, error) {
-	if q.MemoryText != nil || q.DiskText != nil {
-		if err := s.Authorize(c.Peer, identity.Update, nil); err != nil {
-			return jobs.Operation{}, err
-		}
-		m, _, err := s.machine(ctx, c.Peer, ref, identity.Update)
-		if err != nil {
-			return jobs.Operation{}, err
-		}
-		s.Runtime.CloseMachine(m)
-		if q.MemoryText != nil {
-			v, err := ParseResource("memory", *q.MemoryText)
-			if err != nil {
-				return jobs.Operation{}, err
-			}
-			q.Memory = &v
-		}
-		if q.DiskText != nil {
-			v, err := ParseResource("disk", *q.DiskText)
-			if err != nil {
-				return jobs.Operation{}, err
-			}
-			q.Disk = &v
-		}
-	}
 	if q.Name == nil && q.CPUs == nil && q.Memory == nil && q.Disk == nil {
 		return jobs.Operation{}, failure("usage", "set requires a setting", 2)
 	}
-	if q.Name != nil {
-		name := *q.Name
-		q.Name = &name
-		if !config.ValidName(name) {
-			return jobs.Operation{}, failure("usage", "invalid exact name", 2)
-		}
-	}
-	if q.CPUs != nil {
-		v := *q.CPUs
-		q.CPUs = &v
-	}
-	if q.Memory != nil {
-		v := *q.Memory
-		q.Memory = &v
-	}
-	if q.Disk != nil {
-		v := *q.Disk
-		q.Disk = &v
+	if q.Name != nil && !config.ValidName(*q.Name) {
+		return jobs.Operation{}, errInvalidName
 	}
 	return s.mutation(ctx, c, ref, "set", identity.Update, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
 		if d.Status.Kind != silo.MachineStatusStopped {
@@ -941,17 +920,13 @@ func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (
 			if d.Network.Tailscale != nil {
 				return failure("conflict", "cannot rename a VM with a tailscale declaration", 5)
 			}
-			var names []string
-			var e error
-			if s.VisibleNames != nil {
-				names, e = s.VisibleNames(ctx)
-				if e != nil {
-					return failure("unavailable", "tailnet name inventory unavailable", 9)
-				}
+			names, e := s.visibleNames(ctx)
+			if e != nil {
+				return e
 			}
 			release, e := s.Runtime.Reserve(ctx, *q.Name, names)
 			if e != nil {
-				return failure("conflict", "name already taken locally or on the tailnet", 5)
+				return runtime.ErrNameTaken
 			}
 			defer release()
 			labels := maps.Clone(d.Labels)
