@@ -32,13 +32,10 @@ import (
 const usageLine = "usage: taild [version|install-runtime|stop-vms] [--config FILE] [--check|--version] [--runtime-archive FILE] [--install-root DIR] [--only-when-shutting-down]"
 
 func main() {
-	if e := run(); e != nil {
+	if e := runArgs(os.Args[1:]); e != nil {
 		fmt.Fprintln(os.Stderr, "taild:", redact.Text(e.Error()))
 		os.Exit(1)
 	}
-}
-func run() error {
-	return runArgs(os.Args[1:])
 }
 
 // invocation is the parsed command line. The subcommand may precede or follow

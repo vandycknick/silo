@@ -22,8 +22,19 @@ type Manager struct {
 	OAuth    *OAuth
 }
 
+// Mode picks how a VM owned by owner bootstraps its node: tags use the client
+// secret, humans use a one-shot OAuth key when an app secret exists, otherwise
+// they log in interactively.
 func (m *Manager) Mode(owner identity.Principal) Mode {
-	return Select(owner, m.Config.Enrollment.Mode, m.Secrets.AppSecret)
+	switch {
+	case m.Config.Enrollment.Mode == "none":
+		return None
+	case owner.IsTag():
+		return Tag
+	case m.Config.Enrollment.Mode != "interactive" && m.Secrets.AppSecret != "":
+		return User
+	}
+	return Interactive
 }
 
 // Acquire binds consent to a reserved creation attempt, before a VM ID exists.

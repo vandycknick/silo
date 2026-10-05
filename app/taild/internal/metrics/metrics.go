@@ -109,7 +109,7 @@ func (m *Metrics) Write(w io.Writer) {
 			fmt.Fprintf(&b, "taild_%s_duration_seconds_sum{outcome=%q} %g\ntaild_%s_duration_seconds_count{outcome=%q} %d\n", kind, outcome, v.Seconds, kind, outcome, v.Count)
 		}
 	}
-	for _, kind := range []string{"runtime", "machine", "exec", "logs", "node_lease"} {
+	for _, kind := range []string{"runtime", "machine", "exec", "logs"} {
 		fmt.Fprintf(&b, "taild_native_handles{kind=%q,scope=\"daemon_owned\"} %d\n", kind, m.handles[kind])
 	}
 	_, _ = io.WriteString(w, b.String())

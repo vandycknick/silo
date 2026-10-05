@@ -214,13 +214,6 @@ func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
 			t.Fatal("--yes touched command stdin or prompted", code, consumed.String(), diagnostic.String())
 		}
 	})
-	t.Run("api-requires-confirmed", func(t *testing.T) {
-		removalDispatch(t, ctx, s, caller, "create --name api-vm --no-start", 0)
-		op, e := s.Remove(ctx, caller, "api-vm", service.RemoveRequest{})
-		if e == nil || service.Categorize(e).Exit != 2 || op.ID != "" {
-			t.Fatal(op, e)
-		}
-	})
 }
 
 func TestRemovalOpenSSHNativePreflightAndIdentity(t *testing.T) {

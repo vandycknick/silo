@@ -267,10 +267,6 @@ func (t *terminalInput) resize(width, height int) {
 	}
 }
 
-func (t *terminalInput) ReadLine(limit int) (string, error) {
-	return t.ReadPrompt("", limit)
-}
-
 func (t *terminalInput) ReadPrompt(prompt string, limit int) (string, error) {
 	t.sizeMu.Lock()
 	t.terminal.SetPrompt(prompt)
@@ -492,33 +488,31 @@ func (r contextualInput) readLocked(buf []byte) (int, error) {
 	}
 }
 
-// The optional LF belongs to the shared stream, not to a temporary command
-// reader. CR-only input returns immediately; the next line or guest data read
-// consumes a following LF exactly once, even across chunks/readers.
+// ReadLine reads one bounded line off the shared stream. The optional LF
+// belongs to the stream, not to a temporary command reader: CR-only input
+// returns immediately, and the next line or guest data read consumes a
+// following LF exactly once, even across chunks/readers.
 func (r contextualInput) ReadLine(limit int) (string, error) {
 	r.input.mu.Lock()
 	defer r.input.mu.Unlock()
 	return scanLine(limit, r.readLocked, func() { r.input.skipLF = true })
 }
 
-func readLineLimit(src io.Reader, limit int) (string, error) {
-	if reader, ok := src.(interface{ ReadLine(int) (string, error) }); ok {
-		return reader.ReadLine(limit)
-	}
-	return scanLine(limit, src.Read, func() {})
-}
-
+// scanLine reads bytes one at a time up to a line end. ^C and ^D cancel the
+// line rather than becoming part of it.
 func scanLine(limit int, read func([]byte) (int, error), afterCR func()) (string, error) {
 	buf := make([]byte, 0, 128)
 	var one [1]byte
 	for len(buf) <= limit {
 		n, e := read(one[:])
 		if n > 0 {
-			if one[0] == '\r' {
+			switch one[0] {
+			case 3, 4:
+				return "", errLineCanceled
+			case '\r':
 				afterCR()
 				return string(buf), nil
-			}
-			if one[0] == '\n' {
+			case '\n':
 				return string(buf), nil
 			}
 			buf = append(buf, one[0])

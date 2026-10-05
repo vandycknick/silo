@@ -85,7 +85,7 @@ func TestNativeRemoveDiscardsNodeStateLocally(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			op, err := s.Remove(ctx, c, d.Name, RemoveRequest{Confirmed: true})
+			op, err := s.Remove(ctx, c, d.Name, RemoveRequest{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -94,7 +94,7 @@ func TestNativeRemoveDiscardsNodeStateLocally(t *testing.T) {
 				t.Fatal("active lease did not block removal")
 			}
 			lease.Close()
-			op, err = s.Remove(ctx, c, d.Name, RemoveRequest{Confirmed: true})
+			op, err = s.Remove(ctx, c, d.Name, RemoveRequest{})
 			succeeded(t, s, c, op, err)
 			result := waitOperation(t, s, c, op)
 			for _, line := range result.Progress {

@@ -13,7 +13,6 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
-	"tailscale.com/types/key"
 )
 
 type NodeState string
@@ -26,10 +25,7 @@ const (
 	NoNode     NodeState = "none"
 )
 
-type NodeIdentity struct {
-	NodeID  string
-	NodeKey key.NodePublic
-}
+type NodeIdentity struct{ NodeID string }
 
 type NodePin struct{ Tailnet, Suffix, ControlURL string }
 
@@ -153,7 +149,7 @@ func ReadNode(dir, name string, owner identity.Principal, pin *NodePin) (NodeIde
 	} else if p.UserProfile.ID == 0 || p.UserProfile.LoginName == "tagged-devices" || len(prefs.AdvertiseTags) != 0 || identity.UserPrincipal(int64(p.UserProfile.ID)) != owner {
 		return NodeIdentity{}, Unreadable
 	}
-	return NodeIdentity{NodeID: string(p.NodeID), NodeKey: p.PrivateNodeKey.Public()}, Enrolled
+	return NodeIdentity{NodeID: string(p.NodeID)}, Enrolled
 }
 
 // FinishNodeTransaction runs under the native lease only after committing or

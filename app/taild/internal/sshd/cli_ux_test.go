@@ -82,19 +82,19 @@ func TestCLIHelpPureAndLiteralValues(t *testing.T) {
 		}
 	}
 	var out, human bytes.Buffer
-	if code := Dispatch(s, p, "whoami", &out, &human); code != 0 || human.String() != "User: verified@example.com\nNode: node.tail.test\n" {
+	if code := dispatch(s, p, "whoami", &out, &human); code != 0 || human.String() != "User: verified@example.com\nNode: node.tail.test\n" {
 		t.Fatal(code, human.String())
 	}
 	human.Reset()
 	p.Principals = []identity.Principal{"tag:ci"}
-	Dispatch(s, p, "whoami", &out, &human)
+	dispatch(s, p, "whoami", &out, &human)
 	if human.String() != "User: tagged device\nNode: node.tail.test\n" {
 		t.Fatal(human.String())
 	}
 	human.Reset()
 	p.Principals = []identity.Principal{"user:7"}
 	p.Login = ""
-	Dispatch(s, p, "whoami", &out, &human)
+	dispatch(s, p, "whoami", &out, &human)
 	if !strings.HasPrefix(human.String(), "User: unknown\n") {
 		t.Fatal(human.String())
 	}
@@ -117,7 +117,7 @@ func TestCLIStreamingCommandsRefuseJSON(t *testing.T) {
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "metadata", ObservedAt: time.Now()}
 	for _, line := range []string{"shell vm --json", "exec vm --json -- program", "logs vm --json"} {
 		var out, human bytes.Buffer
-		if code := Dispatch(s, p, line, &out, &human); code != 2 || !strings.Contains(human.String(), "--json is not supported") {
+		if code := dispatch(s, p, line, &out, &human); code != 2 || !strings.Contains(human.String(), "--json is not supported") {
 			t.Fatal(line, code, human.String())
 		}
 	}
@@ -137,7 +137,7 @@ func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "defaults", ObservedAt: time.Now()}
 	for _, line := range []string{"create --help", "help new", "help create --json"} {
 		var out, human bytes.Buffer
-		if code := Dispatch(s, p, line, &out, &human); code != 0 {
+		if code := dispatch(s, p, line, &out, &human); code != 0 {
 			t.Fatal(code, human.String())
 		}
 		text := human.String()
@@ -167,14 +167,14 @@ func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
 		s.Config.VM.Defaults.Disk = "SECRET/token"
 		for _, line := range []string{"create --help", "help create --json"} {
 			var out, human bytes.Buffer
-			if code := Dispatch(s, p, line, &out, &human); code != 0 || strings.Contains(out.String()+human.String(), "SECRET") {
+			if code := dispatch(s, p, line, &out, &human); code != 0 || strings.Contains(out.String()+human.String(), "SECRET") {
 				t.Fatal("unsafe configured defaults", code, out.String(), human.String())
 			}
 		}
 	}
 	for _, line := range []string{"help ops show", "ops show --help", "ops show -h --json"} {
 		var out, human bytes.Buffer
-		if code := Dispatch(s, p, line, &out, &human); code != 0 || !strings.Contains(out.String()+human.String(), "ops show OPERATION_ID") {
+		if code := dispatch(s, p, line, &out, &human); code != 0 || !strings.Contains(out.String()+human.String(), "ops show OPERATION_ID") {
 			t.Fatal(line, code, out.String(), human.String())
 		}
 	}

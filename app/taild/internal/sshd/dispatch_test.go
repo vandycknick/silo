@@ -46,7 +46,7 @@ func TestLocalCommandDispatchBelowAuthentication(t *testing.T) {
 	p := identity.Peer{Principals: []identity.Principal{"user:123"}, NodeID: "node", NodeName: "peer", ObservedAt: time.Now(), Permissions: identity.Permissions{Reason: "No capability"}}
 	for _, line := range []string{"whoami --json", "version --json", "help --json", "unknown --json", "whoami --bad --json"} {
 		var out, errOut bytes.Buffer
-		code := Dispatch(s, p, line, &out, &errOut)
+		code := dispatch(s, p, line, &out, &errOut)
 		if line == "whoami --json" && code != 0 {
 			t.Fatal(code)
 		}
@@ -63,10 +63,10 @@ func TestLocalCommandDispatchBelowAuthentication(t *testing.T) {
 		}
 	}
 	var out, errOut bytes.Buffer
-	if code := Dispatch(s, p, "whoami", &out, &errOut); code != 0 || out.Len() != 0 || errOut.Len() == 0 {
+	if code := dispatch(s, p, "whoami", &out, &errOut); code != 0 || out.Len() != 0 || errOut.Len() == 0 {
 		t.Fatal("human stream contract")
 	}
-	if code := Dispatch(s, identity.Peer{}, "whoami", &out, &errOut); code != 4 {
+	if code := dispatch(s, identity.Peer{}, "whoami", &out, &errOut); code != 4 {
 		t.Fatal("identity required")
 	}
 }

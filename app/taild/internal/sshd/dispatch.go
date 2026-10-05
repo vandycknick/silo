@@ -7,7 +7,6 @@ import (
 	"io"
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
-	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/sshd/commands"
@@ -22,12 +21,6 @@ type responseError struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
 	Operation string `json:"operation,omitempty"`
-}
-
-// Dispatch is below authentication. Tests supply explicit domain identity here,
-// never a localhost/header bypass to the production WhoIs boundary.
-func Dispatch(s *service.Service, p identity.Peer, line string, stdout, stderr io.Writer) int {
-	return DispatchSession(context.Background(), s, service.Caller{Peer: p}, line, service.IO{Stdout: stdout, Stderr: stderr})
 }
 
 // DispatchSession runs one command line: tokenize, check identity, hand the
