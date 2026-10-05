@@ -1,11 +1,11 @@
 package service
 
 import (
-	"fmt"
 	"math"
 	"testing"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/units"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,7 +20,7 @@ func TestActualFilesystemDiskReservationFloor(t *testing.T) {
 	if available < 256<<20 {
 		t.Skip("insufficient filesystem space for admission test")
 	}
-	c.DiskReserve = fmt.Sprintf("%dB", available-(128<<20))
+	c.DiskReserve = units.Size(available - (128 << 20))
 	s := &Service{Config: c, diskPending: map[string]uint64{}}
 	if err := s.diskAdmissionLocked(512); err != nil {
 		t.Fatal(err)

@@ -102,7 +102,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 			c := config.Defaults()
 			c.Home = t.TempDir()
 			c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-			c.VM.Defaults = config.Resources{CPUs: 1, Memory: "1GiB", Disk: "1GiB"}
+			c.VM.Defaults = config.Resources{CPUs: 1, Memory: 1 << 30, Disk: 1 << 30}
 			c.VM.DefaultImage = registry.Reference
 			c.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)

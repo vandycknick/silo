@@ -197,8 +197,7 @@ func stopVMs(ctx context.Context, c config.Config, onlyShutdown bool) error {
 	if _, e := state.LockShutdownHelper(c.Home); e != nil {
 		return errors.New("another shutdown helper is active or helper lock unavailable")
 	}
-	budget, _ := time.ParseDuration(c.Shutdown.StopBudget)
-	stopping, done := context.WithTimeout(ctx, budget)
+	stopping, done := context.WithTimeout(ctx, c.Shutdown.StopBudget.Duration)
 	defer done()
 	// The initial guard may precede config/home I/O. Recheck after taking the
 	// helper lease so a cancelled shutdown cannot launch a late stop process.

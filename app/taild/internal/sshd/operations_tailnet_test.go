@@ -46,7 +46,7 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 	c.Tailnet.Hostname = "silo-s11-" + suffix
 	c.Tailnet.Tag = "tag:silo-test"
 	c.Tailnet.ControlURL = os.Getenv("SILO_E2E_TS_CONTROL_URL")
-	c.VM.Defaults = config.Resources{CPUs: 1, Memory: "1GiB", Disk: "1GiB"}
+	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 1 << 30, Disk: 1 << 30}
 	node, e := tailnet.Start(ctx, c, config.Secrets{ClientSecret: os.Getenv("SILO_E2E_TS_CLIENT_SECRET")}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if e != nil {
 		t.Fatal(e)

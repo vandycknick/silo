@@ -46,11 +46,7 @@ func Start(ctx context.Context, c config.Config, secrets config.Secrets, log *sl
 			return nil, e
 		}
 	}
-	defaults, e := c.Limits()
-	if e != nil {
-		return nil, e
-	}
-	n := &Node{config: c, defaults: defaults, log: log}
+	n := &Node{config: c, defaults: c.Limits(), log: log}
 	n.Server = &tsnet.Server{Dir: dir, Hostname: c.Tailnet.Hostname, AuthKey: authKey, AdvertiseTags: []string{c.Tailnet.Tag}, ControlURL: c.Tailnet.ControlURL,
 		UserLogf: func(format string, args ...any) {
 			log.Info("tailnet", "message", redact.Text(fmt.Sprintf(format, args...), authKey, secrets.ClientSecret, secrets.AppSecret, secrets.APIToken))
@@ -59,10 +55,11 @@ func Start(ctx context.Context, c config.Config, secrets config.Secrets, log *sl
 			log.Debug("tailnet", "message", redact.Text(fmt.Sprintf(format, args...), authKey, secrets.ClientSecret, secrets.AppSecret, secrets.APIToken))
 		},
 	}
-	if e = n.Server.Start(); e != nil {
+	if e := n.Server.Start(); e != nil {
 		return nil, e
 	}
-	n.Client, e = n.Server.LocalClient()
+	client, e := n.Server.LocalClient()
+	n.Client = client
 	if e != nil {
 		_ = n.Server.Close()
 		return nil, e

@@ -84,9 +84,7 @@ func Acquire(ctx context.Context, c config.Config) (*Inhibitor, bool, error) {
 		return nil, false, errors.New("logind delay budget invalid")
 	}
 	i.maxDelay = time.Duration(usec) * time.Microsecond
-	requested, _ := time.ParseDuration(c.Shutdown.StopBudget)
-	margin, _ := time.ParseDuration(c.Shutdown.Margin)
-	budget := StopBudget(requested, i.maxDelay, margin)
+	budget := StopBudget(c.Shutdown.StopBudget.Duration, i.maxDelay, c.Shutdown.Margin.Duration)
 	if budget <= 0 {
 		return nil, false, errors.New("logind delay window insufficient")
 	}
@@ -244,9 +242,7 @@ func (o *startupOrder) accept(signal *dbus.Signal, owner string) (bool, bool) {
 // release and seals/cancels process-local admission without doing filesystem I/O.
 func (i *Inhibitor) admitEvents(ctx context.Context, c config.Config, preparing bool, gate *state.ShutdownGate, interrupt func()) <-chan loginEvent {
 	out := make(chan loginEvent, 1)
-	requested, _ := time.ParseDuration(c.Shutdown.StopBudget)
-	margin, _ := time.ParseDuration(c.Shutdown.Margin)
-	budget := StopBudget(requested, i.maxDelay, margin)
+	budget := StopBudget(c.Shutdown.StopBudget.Duration, i.maxDelay, c.Shutdown.Margin.Duration)
 	publish := func(event loginEvent) {
 		select {
 		case out <- event:
