@@ -15,15 +15,27 @@ couple guest images and credentials to host network enrollment.
 ## Decision
 
 Netd owns the VM's tsnet node, whose identity persists in tsnet's own machine state.
-Taild reads validated public IPN profile/node state; it must not write a second
-identity record. Missing/empty state means pending, while corrupt or mismatched
-state is unreadable and must not be treated as permission for fresh registration.
+Taild observes a private, atomic, versioned status file bound to the current VM run.
+The file reports connectivity, verified identity and required browser-login actions;
+it is not a command queue or a second source of identity truth. Historical observations
+retain their own timestamps for stopped-node expiry display. The configured hostname
+remains visible while stopped, without inspecting private authentication state.
 
-Enrollment runs while the VM is stopped under the SDK's per-machine node-state
-lease. Native Start/Remove/Update fail busy while replacement is active. A pending
-directory, validated identity-free digest receipt and recoverable backup promotion
-preserve the prior node state after failure. Reauthentication fences stable node ID
-and exact name, rather than creating a duplicate registration.
+Netd consumes initial credentials through the secret-store transport and uses its
+persisted node state thereafter. Registration, reconnects and required browser
+reauthentication do not block guest boot or require VM restarts. Taild retains the
+OAuth-app browser callback solely to acquire the initial auth key before creating
+the VM. Human requests use that delegated key or native browser identity rather
+than a privileged shared client. Tagged nodes and management ownership are modeled
+separately, with tag assignment decided by Tailscale's permissions.
+
+Legacy pending/backup transactions remain recoverable under the stopped-node lease.
+New onboarding does not create those transactions. There is no dedicated `reauth`
+command: netd handles required authentication and `show` exposes its current action.
+
+VM removal deletes local resources only, including credentials and node state.
+It does not log out or contact the device-deletion API. Abandoned node transactions
+do not block explicit deletion; active process and lease checks still apply.
 
 Netd terminates tailnet SSH and relays to guest SSH using a per-machine SSH CA and
 short-lived certificate for the requested guest login. Taild shell/exec defaults
@@ -42,8 +54,8 @@ never ambient Tailscale credential environment variables.
 ## Consequences
 
 Guest images remain independent of Tailscale and persistent node identity survives
-VM restart. The host must enforce principal/name validation and recover replacement
-transactions before admitting sessions. Tailnet control-plane interoperability,
+VM restart. The host must enforce management-owner and node-identity validation,
+and recover any legacy replacement transactions. Tailnet control-plane interoperability,
 key expiry, client forwarding and fallback-server behavior require real tests.
 The exact guest connection attempt is the readiness proof.
 

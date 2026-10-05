@@ -334,13 +334,13 @@ rule "allow" {
 	if _, e = parseRemotePolicy(hcl); e == nil {
 		t.Fatal("accepted injected authority as remote policy")
 	}
-	// Even --no-tailnet cannot bypass remote authority checks on operator files.
+	// Omitting --tailscale cannot bypass remote authority checks on operator files.
 	s.Config.PoliciesDir = t.TempDir()
 	if e = os.WriteFile(filepath.Join(s.Config.PoliciesDir, "evil.hcl"), []byte(hcl), 0644); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = s.Create(ctx, c, CreateRequest{Name: "no-bypass", PolicyRef: "evil", NoTailnet: true}); e == nil {
-		t.Fatal("no-tailnet bypass")
+	if _, e = s.Create(ctx, c, CreateRequest{Name: "no-bypass", PolicyRef: "evil"}); e == nil {
+		t.Fatal("remote authority bypass")
 	}
 }
 
@@ -351,7 +351,7 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
 	s.VMNodesEnabled = true
 	s.Config.Tailnet.ControlURL = "https://wrong-config.example.test"
-	s.Enrollment = &enroll.Manager{Pin: state.NodePin{ControlURL: "https://pinned-control.example.test"}}
+	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "https://pinned-control.example.test"}}
 	for _, owner := range []identity.Principal{"tag:owner", "user:7"} {
 		caller := domainCaller(t, s, owner)
 		selected := owner
@@ -359,7 +359,7 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 			selected = ""
 		}
 		ctx := context.Background()
-		op, e := s.Create(ctx, caller, CreateRequest{Name: "exact", Owner: selected, NoStart: true})
+		op, e := s.Create(ctx, caller, CreateRequest{Name: "exact", Owner: selected, NoStart: true, Tailscale: true})
 		succeeded(t, s, caller, op, e)
 		m, e := s.Runtime.SDK.Machine(ctx, "exact")
 		if e != nil {
@@ -369,6 +369,24 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 		if e != nil {
 			_ = m.Close()
 			t.Fatal(e)
+		}
+		var authority struct {
+			Metadata map[string]string `json:"metadata"`
+		}
+		if err := json.Unmarshal([]byte(data.Network.Policy.JSON()), &authority); err != nil {
+			t.Fatal(err)
+		}
+		var expected struct {
+			Owner   string `json:"owner"`
+			Tailnet string `json:"tailnet"`
+			Suffix  string `json:"suffix"`
+		}
+		if err := json.Unmarshal([]byte(authority.Metadata["io.silo.taild.node"]), &expected); err != nil || expected.Owner != string(owner) || expected.Tailnet != "fixture" || expected.Suffix != "fixture.test" {
+			t.Fatal("lost managed identity", expected, err)
+		}
+		injected, err := silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{Metadata: authority.Metadata})
+		if err != nil || remotePolicy(injected) == nil {
+			t.Fatal("reserved identity accepted without a tunnel", err)
 		}
 		hcl, e := data.Network.Policy.HCL()
 		removeErr := m.Remove(ctx)

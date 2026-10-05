@@ -39,7 +39,7 @@ limits remain bounded by the operator's configured ceilings.
 User-owned enrollment must verify the consenting user's identity and exact assigned
 DNS hostname. Tagged provisioning must be explicitly approved for that principal.
 Global DNS collisions are rejected; owner prefixes are never silently added.
-Use narrowly scoped device administration credentials if deletion or expiry changes
+Use narrowly scoped device administration credentials if expiry changes
 are enabled. Configure OAuth callbacks to the lobby's actual HTTPS name; never
 replace consent with an ambient host identity or a broadly shared auth key.
 

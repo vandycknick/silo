@@ -248,6 +248,10 @@ func (machine *Machine) Start() ([]byte, error) {
 	return copyBuffer(output), nil
 }
 
+func (machine *Machine) Secret(request []byte) error {
+	return takeError(C.bridge_machine_secret(machine.pointer, bytePointer(request), C.size_t(len(request))))
+}
+
 func (machine *Machine) Stop() ([]byte, error) {
 	var output C.silo_buffer
 	if err := takeError(C.bridge_machine_stop(machine.pointer, &output)); err != nil {

@@ -9,7 +9,7 @@ import (
 )
 
 func TestRegistryIsTheWholeApplication(t *testing.T) {
-	want := []string{"whoami", "version", "help", "ls", "show", "ops", "create", "start", "restart", "reauth", "stop", "rm", "set", "shell", "exec", "logs", "template", "policy"}
+	want := []string{"whoami", "version", "help", "ls", "show", "ops", "create", "start", "restart", "stop", "rm", "set", "shell", "exec", "logs", "template", "policy"}
 	if len(all) != len(want) {
 		t.Fatal(len(all), len(want))
 	}
@@ -92,7 +92,7 @@ func TestDeclarationsDriveHelpAndArity(t *testing.T) {
 			t.Fatal("unknown topic rendered", path)
 		}
 	}
-	for _, name := range []string{"create", "exec", "help", "ls", "logs", "ops", "policy", "reauth", "restart", "rm", "set", "shell", "show", "start", "stop", "template", "version", "whoami"} {
+	for _, name := range []string{"create", "exec", "help", "ls", "logs", "ops", "policy", "restart", "rm", "set", "shell", "show", "start", "stop", "template", "version", "whoami"} {
 		if !strings.Contains(generalHelp(), "\n  "+name+" ") {
 			t.Fatal("general help misses", name)
 		}

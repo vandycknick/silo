@@ -156,17 +156,6 @@ func ReadNode(dir, name string, owner identity.Principal, pin *NodePin) (NodeIde
 	return NodeIdentity{NodeID: string(p.NodeID), NodeKey: p.PrivateNodeKey.Public()}, Enrolled
 }
 
-// BeginNodeTransaction runs under the native lease. Sync the fence before any
-// pending state is created, so a writer crash cannot admit another native writer.
-func BeginNodeTransaction(dir string) error {
-	file, e := os.OpenFile(dir+".transaction", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if e != nil {
-		return e
-	}
-	_, e = file.WriteString("node-state-v1\n")
-	return errors.Join(e, file.Sync(), file.Close(), SyncDir(filepath.Dir(dir)))
-}
-
 // FinishNodeTransaction runs under the native lease only after committing or
 // safely aborting a transaction. Unknown recovery material keeps the fence.
 func FinishNodeTransaction(dir string) error {
@@ -293,22 +282,6 @@ func RecoverNode(dir, name string, owner identity.Principal, pin *NodePin) NodeS
 	return result
 }
 
-// A promotion receipt binds the closed, status-verified state bytes. It is a
-// transaction marker, not an identity database. A crash during login cannot
-// cause an unverified (possibly auto-suffixed) pending node to be admitted.
-func MarkVerifiedNode(dir string) error {
-	b, e := os.ReadFile(filepath.Join(dir, "tailscaled.state"))
-	if e != nil {
-		return e
-	}
-	sum := sha256.Sum256(b)
-	file, e := os.OpenFile(filepath.Join(dir, "promotion.verified"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if e != nil {
-		return e
-	}
-	_, e = file.WriteString(hex.EncodeToString(sum[:]))
-	return errors.Join(e, file.Sync(), file.Close(), SyncDir(dir))
-}
 func VerifiedNode(dir string) bool {
 	path := filepath.Join(dir, "promotion.verified")
 	info, e := os.Lstat(path)

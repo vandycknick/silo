@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
@@ -102,7 +103,7 @@ func TestCLIHelpPureAndLiteralValues(t *testing.T) {
 // The transport pins the application's verbs; the command package's own
 // registry test asserts the same list, so drift fails on both sides.
 var (
-	commandNames   = []string{"whoami", "version", "help", "ls", "show", "ops", "create", "start", "restart", "reauth", "stop", "rm", "set", "shell", "exec", "logs", "template", "policy"}
+	commandNames   = []string{"whoami", "version", "help", "ls", "show", "ops", "create", "start", "restart", "stop", "rm", "set", "shell", "exec", "logs", "template", "policy"}
 	commandAliases = []string{"list", "new", "status", "ssh"}
 )
 
@@ -225,8 +226,9 @@ func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 	}
 	s.VMNodesEnabled = true
 	s.Config.Enrollment.Mode = "interactive"
+	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test"}, Registry: enroll.NewRegistry()}
 	var out, diagnostic bytes.Buffer
-	if code := DispatchSession(ctx, s, caller, "create --memory 8gb --disk-size ' 2 GB ' --no-start --json", service.IO{Stdout: &out, Stderr: &diagnostic}); code != 0 {
+	if code := DispatchSession(ctx, s, caller, "create --memory 8gb --disk-size ' 2 GB ' --no-start --tailscale --json", service.IO{Stdout: &out, Stderr: &diagnostic}); code != 0 {
 		t.Fatal(code, diagnostic.String())
 	}
 	var envelope struct {
@@ -236,7 +238,7 @@ func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := envelope.Data.VM
-	if !config.ValidName(name) || name == "" || !strings.Contains(diagnostic.String(), "creating "+name) {
+	if !config.ValidName(name) || name == "" || diagnostic.Len() != 0 || envelope.Data.Completion == nil || envelope.Data.Completion.Name != name {
 		t.Fatal(name, diagnostic.String())
 	}
 	view, err := s.Show(ctx, caller.Peer, name)

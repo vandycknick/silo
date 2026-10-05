@@ -243,4 +243,8 @@ void silo_machine_handle_list_free(silo_machine_handle_list machines);
 
 void silo_machine_free(silo_machine *machine);
 
+silo_error *silo_machine_secret(const silo_machine *machine,
+                                const uint8_t *request_ptr,
+                                size_t request_len);
+
 #endif  /* SILO_GO_FFI_H */

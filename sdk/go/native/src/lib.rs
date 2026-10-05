@@ -12,6 +12,7 @@ mod machine;
 mod network;
 mod planning;
 mod runtime;
+mod secrets;
 mod timestamps;
 
 pub use crate::abi::{silo_ffi_abi_version, silo_ffi_sdk_version};

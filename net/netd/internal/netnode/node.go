@@ -38,6 +38,8 @@ type InboundEvent struct {
 	Duration         time.Duration
 }
 type Options struct {
+	VMID, RunID string
+	Identity    *ExpectedIdentity
 	Ready       func(context.Context) (func(), error)
 	Dir         string
 	Declaration policy.TailscaleDecl
@@ -48,9 +50,11 @@ type Options struct {
 }
 
 type Node struct {
+	lastKnown           *Observation
 	server              *tsnet.Server
 	options             Options
 	mu                  sync.Mutex
+	observationMu       sync.Mutex
 	started, closed     bool
 	initialized         bool
 	cancel              context.CancelFunc
@@ -71,6 +75,11 @@ type Node struct {
 	slots               chan struct{}
 	closeOnce           sync.Once
 	closeErr            error
+	bootstrapDone       bool
+	bootstrapKeyActive  bool
+	lastLogin           time.Time
+	maintenanceNode     string
+	maintenanceFailed   bool
 }
 
 func New(o Options) (*Node, error) {
@@ -83,13 +92,16 @@ func New(o Options) (*Node, error) {
 			key = string(value)
 		}
 	}
-	if !literalEnrollmentKey(key) {
-		return nil, errors.New("tailscale auth_key must be a literal tskey-auth- enrollment key; OAuth/client-secret/WIF discovery is not supported by netd")
+	if o.Identity != nil && (o.Identity.Bootstrap == "interactive" || o.Identity.Bootstrap == "client_secret") {
+		key = ""
+	}
+	if !literalEnrollmentKey(key) && !(o.Identity != nil && o.Identity.Bootstrap == "auth_key" && delegatedKey(key)) {
+		return nil, errors.New("invalid registration credential; OAuth client credentials belong in the client_secret slot")
 	}
 	return &Node{options: o, done: make(chan struct{}), slots: make(chan struct{}, 256), short: make(map[string]string), fullNames: make(map[string]struct{}), knownShort: make(map[string]struct{}), knownSuffixes: make(map[string]struct{}), provenance: make(map[netip.Addr]time.Time), quarantined: make(map[netip.Addr]time.Time), server: &tsnet.Server{
 		Dir: o.Dir, Hostname: o.Declaration.Hostname, AdvertiseTags: append([]string(nil), o.Declaration.Tags...), Ephemeral: o.Declaration.Ephemeral,
-		ControlURL: o.Declaration.ControlURL, AuthKey: key,
-		UserLogf: func(format string, args ...any) { slog.Info("tailscale", "message", fmt.Sprintf(format, args...)) },
+		ControlURL: o.Declaration.ControlURL,
+		UserLogf:   func(format string, args ...any) { slog.Info("tailscale", "message", fmt.Sprintf(format, args...)) },
 	}}, nil
 }
 
@@ -129,9 +141,21 @@ func (n *Node) Start(parent context.Context) {
 
 func (n *Node) run(ctx context.Context) {
 	defer close(n.done)
+	defer func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		v := n.snapshot(nil)
+		v.State = "stopped"
+		if ctx.Err() == nil {
+			v.State, v.ErrorCode = "failed", "node_start_failed"
+		}
+		n.publish(v)
+	}()
 	if ctx.Err() != nil {
 		return
 	}
+	n.restoreObservation()
+	n.observe(nil)
 	if err := n.server.Start(); err != nil {
 		slog.Warn("tailscale start failed", "error", err)
 		return
@@ -157,12 +181,13 @@ func (n *Node) run(ctx context.Context) {
 		}
 	}
 	watchDone := make(chan struct{})
+	n.authenticate(ctx, client)
 	go func() { defer close(watchDone); n.watch(ctx, client) }()
 	defer func() { <-watchDone }()
 	slog.Info("tailscale guest IPv6 transport unavailable", "guest_stack", "IPv4 only")
 	for {
 		upCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		status, upErr := n.server.Up(upCtx)
+		_, upErr := n.server.Up(upCtx)
 		cancel()
 		if upErr == nil {
 			dial, err := strictDialer(n.server)
@@ -174,28 +199,19 @@ func (n *Node) run(ctx context.Context) {
 				slog.Warn("tailscale strict adapter unavailable", "error", err)
 			}
 		}
-		statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		observed, statusErr := client.Status(statusCtx)
-		cancel()
-		if statusErr == nil {
-			status = observed
-		} else {
-			status = nil
-		}
-		n.observe(status)
-		if status != nil {
-			slog.Info("tailscale state", "state", status.BackendState, "auth_url", status.AuthURL)
-		}
+		n.refresh(ctx, client)
+		n.maintain(ctx, client)
 		if upErr != nil && ctx.Err() == nil {
 			slog.Debug("tailscale disconnected", "error", upErr)
 		}
-		timer := time.NewTimer(time.Minute)
+		timer := time.NewTimer(15 * time.Second)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			n.observe(nil)
 			return
 		case <-timer.C:
+			n.authenticate(ctx, client)
 		}
 	}
 }
@@ -204,7 +220,7 @@ func (n *Node) observe(s *ipnstate.Status) {
 	short := make(map[string]string)
 	full := make(map[string]struct{})
 	suffix := ""
-	running := s != nil && s.BackendState == "Running"
+	running := s != nil && s.BackendState == "Running" && n.options.Identity.verify(s, n.options.Declaration.Hostname) == nil
 	parts := []string{fmt.Sprint(running)}
 	if s != nil {
 		if s.CurrentTailnet != nil {
@@ -279,6 +295,7 @@ func (n *Node) observe(s *ipnstate.Status) {
 	}
 	n.suffix = suffix
 	n.running = running
+	n.publish(n.snapshot(s))
 }
 
 func (n *Node) watch(ctx context.Context, client *local.Client) {
@@ -290,14 +307,7 @@ func (n *Node) watch(ctx context.Context, client *local.Client) {
 				if err != nil {
 					break
 				}
-				bounded, cancel := context.WithTimeout(ctx, 3*time.Second)
-				status, statusErr := client.Status(bounded)
-				cancel()
-				if statusErr != nil {
-					n.observe(nil)
-				} else {
-					n.observe(status)
-				}
+				n.refresh(ctx, client)
 			}
 			_ = watcher.Close()
 		}
@@ -309,6 +319,24 @@ func (n *Node) watch(ctx context.Context, client *local.Client) {
 			return
 		case <-timer.C:
 		}
+	}
+}
+
+// Serialize sampling as well as publication: a slow periodic query must not
+// overwrite a newer notification's identity observation or approval URL.
+func (n *Node) refresh(ctx context.Context, client *local.Client) {
+	n.observationMu.Lock()
+	defer n.observationMu.Unlock()
+	bounded, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	status, err := client.Status(bounded)
+	if err != nil {
+		n.observe(nil)
+		return
+	}
+	n.observe(status)
+	if status != nil {
+		slog.Debug("tailscale state", "state", status.BackendState)
 	}
 }
 
@@ -399,7 +427,12 @@ func (n *Node) relay(src, dst netip.AddrPort, in net.Conn) {
 	n.relays.Add(1)
 	tracked = true
 	ctx := n.ctx
+	allowed := n.options.Identity == nil || n.running
 	n.mu.Unlock()
+	if !allowed {
+		event.Reason = "node_identity_unverified"
+		return
+	}
 	if dst.Port() == 22 {
 		event.Reason = "ssh_reserved"
 		return

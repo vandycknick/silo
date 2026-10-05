@@ -8,7 +8,7 @@ import (
 )
 
 // all is the whole application in one place, in help order.
-var all = []Command{whoami, version, help, ls, show, ops, create, start, restart, reauth, stop, rm, set, shell, exec, logs, template, policy}
+var all = []Command{whoami, version, help, ls, show, ops, create, start, restart, stop, rm, set, shell, exec, logs, template, policy}
 
 func lookup(name string) (Command, bool) {
 	for _, c := range all {

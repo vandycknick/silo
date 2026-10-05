@@ -40,6 +40,8 @@ type IO struct {
 	// Prompt asks the peer one line: a line editor on a PTY, a raw bounded read
 	// otherwise. The transport supplies it; absent, commands cannot ask.
 	Prompt func(ctx context.Context, prompt string, limit int) (string, error)
+	// ApprovalShown lets the lobby deduplicate a URL already printed by create/show.
+	ApprovalShown func(vm, url string)
 }
 
 // HumanWriter is where daemon-owned text goes: the dedicated human stream when

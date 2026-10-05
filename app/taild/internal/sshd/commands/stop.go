@@ -8,7 +8,7 @@ import (
 var stop = Command{
 	Name:      "stop",
 	Summary:   "Stop a VM.",
-	Usage:     "stop VM [--force] [--timeout DURATION] [--json]",
+	Usage:     "stop VM [OPTIONS]",
 	Arguments: "VM  Exact name or VM ID.",
 	Example:   "stop devbox --timeout 30s",
 	New:       func() Handler { return &stopHandler{} },

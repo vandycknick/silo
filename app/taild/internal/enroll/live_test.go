@@ -25,7 +25,7 @@ import (
 
 // This gate uses real control, tsnet-produced state, native KVM and a real tag
 // peer's SSH connection. Domain service inputs elsewhere do not qualify WhoIs.
-func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
+func TestLiveNetdTagEnrollmentKVMStateReuseAndSSH(t *testing.T) {
 	for _, key := range []string{"SILO_E2E_TS_TAILNET", "SILO_E2E_TS_CLIENT_SECRET", "SILO_E2E_TS_PEER_CLIENT_SECRET", "SILO_E2E_TS_API_TOKEN"} {
 		if os.Getenv(key) == "" {
 			t.Skip(key + " required; live enrollment UNVERIFIED")
@@ -61,13 +61,12 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 		t.Fatal("qualification tailnet mismatch")
 	}
 	pin := state.NodePin{Tailnet: observed.CurrentTailnet.Name, Suffix: observed.CurrentTailnet.MagicDNSSuffix, ControlURL: cfg.Tailnet.ControlURL}
-	cfg.Enrollment.Timeout = "1m"
-	manager := &Manager{Config: cfg, Secrets: secrets, Pin: pin, Registry: NewRegistry(), Devices: NewDevices(secrets.APIToken), Visible: lobby.Status}
+	devices := NewDevices(secrets.APIToken)
 	defer func() {
 		cleanup, done := context.WithTimeout(context.Background(), 30*time.Second)
 		defer done()
 		_ = lobby.Close()
-		if manager.Devices.Delete(cleanup, string(observed.Self.ID)) != nil {
+		if devices.Delete(cleanup, string(observed.Self.ID)) != nil {
 			t.Error("live lobby device retained")
 		}
 	}()
@@ -93,7 +92,7 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 		_, _ = machine.StopWith(cleanup, silo.StopOptions{Force: true, Timeout: time.Second})
 		_ = machine.Remove(cleanup)
 		if stable != "" {
-			if manager.Devices.Delete(cleanup, stable) != nil {
+			if devices.Delete(cleanup, stable) != nil {
 				t.Error("live VM device retained")
 			}
 		}
@@ -102,19 +101,30 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = manager.Enroll(ctx, machine, data, "tag:silo-test-vm", false, func(line string) { t.Log(line) }, nil); err != nil {
-		t.Fatal("live enrollment failed")
+	if err = machine.SetSecret(ctx, "tailscale.vm.client_secret", []byte(secrets.ClientSecret)); err != nil {
+		t.Fatal(err)
 	}
-	enrolled, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", &pin)
-	if s != state.Enrolled {
-		t.Fatal("actual tsnet state unreadable")
-	}
-	stable = enrolled.NodeID
 	if _, err = machine.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = machine.WaitReady(ctx, 45*time.Second); err != nil {
 		t.Fatal(err)
+	}
+	data, err = machine.Inspect(ctx)
+	if err != nil || data.RunID == nil {
+		t.Fatal(err)
+	}
+	for {
+		v, e := state.ReadNetdStatus(data.Network.Tailscale.StateDir, data.ID, *data.RunID, time.Now())
+		if e == nil && v.State == "ready" {
+			stable = v.NodeID
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("netd enrollment did not complete", v, e)
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 	key, err := tailnet.Mint(ctx, &http.Client{Timeout: 30 * time.Second}, "https://api.tailscale.com", os.Getenv("SILO_E2E_TS_PEER_CLIENT_SECRET"), "tag:silo-test-vm")
 	if err != nil {
@@ -130,7 +140,7 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 		cleanup, done := context.WithTimeout(context.Background(), 30*time.Second)
 		defer done()
 		_ = peer.Close()
-		if manager.Devices.Delete(cleanup, string(peerStatus.Self.ID)) != nil {
+		if devices.Delete(cleanup, string(peerStatus.Self.ID)) != nil {
 			t.Error("live peer device retained")
 		}
 	}()
@@ -159,13 +169,6 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 	}
 	if _, err = machine.StopWith(ctx, silo.StopOptions{Force: true, Timeout: time.Second}); err != nil {
 		t.Fatal(err)
-	}
-	if err = manager.Enroll(ctx, machine, data, "tag:silo-test-vm", true, func(line string) { t.Log(line) }, nil); err != nil {
-		t.Fatal("explicit live reauth failed")
-	}
-	renewed, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", &pin)
-	if s != state.Enrolled || renewed.NodeID != stable || renewed.NodeKey == enrolled.NodeKey {
-		t.Fatal("closed reauth state failed stable-ID or changed-public-key verification")
 	}
 	if _, err = machine.Start(ctx); err != nil {
 		t.Fatal(err)

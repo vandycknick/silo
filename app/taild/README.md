@@ -1,7 +1,7 @@
 # taild, owned VM lobby
 
 The management node exposes owned VM operations and templates over tailnet SSH.
-VM enrollment completes before boot; `--no-tailnet` retains ordinary networking. Closing this
+VM enrollment is opt-in with `--tailscale`; ordinary creation omits the node. Closing this
 daemon normally releases SDK handles and its own node without stopping VMs.
 Authenticated host shutdown is a separate, bounded lifecycle.
 
@@ -66,14 +66,14 @@ Scope is inspected before action/limit decoding, so a future-scope schema cannot
 invalidate applicable grants. Only omitted optional fields select defaults;
 explicit nulls in known fields or action elements are malformed. Explicit zero
 limits remain zero, with additive grants still taking their maximum.
-`vm.restart` and `vm.reauth` are composite operations requiring **both**
+`vm.restart` is a composite operation requiring **both**
 `vm.stop` and `vm.start`, never separate wildcard grants. No admin scope exists.
 Authenticated peers without capabilities can use whoami/help/version.
 Human whoami contains only the verified login and node; `whoami --json` retains
 the capability explanation and full identity diagnostics.
 
-The five exact label keys are `io.silo.taild.owner`, `.owner-login`, `.name`,
-`.node.mode`, `.instance`. Only this instance's valid labels select managed
+The label keys are `io.silo.taild.owner`, `.owner-login`, `.name`,
+`.node.mode`, `.node.tags`, `.instance`. Only this instance's valid labels select managed
 machines. Name is exact, globally reserved across owners, with the SDK's native
 home-wide name lock authoritative against CLI/SDK writers. There is no prefix
 or auto-suffix. Create holds name and selected-principal quota reservations through
@@ -86,41 +86,40 @@ unknown recovery material for operator inspection.
 
 ## Enrollment
 
-Human callers use OAuth app consent when `oauth-app-secret` is present, otherwise
-interactive login. Tagged callers mint an explicit bounded one-use key for their
-selected tag. `enrollment.mode: none` and `--no-tailnet` omit the VM node.
-TLS callbacks atomically consume a VM/principal-bound nonce before exchanging a
-code. Nonces expire after 15 minutes and disappear on cancellation/restart.
-Callback identity is never trusted; actual node status must match the immutable
-numeric user (untagged) or owner tag, pinned tailnet/control and exact DNS name.
+Without `--tailscale`, creation omits the VM node. `enrollment.mode: none`
+rejects an explicit request. Human callers use OAuth-app consent when configured;
+that consent completes **before image pull and VM creation**. TLS callbacks consume
+a creation-attempt/principal-bound nonce once, with a 15-minute expiry. Denial,
+expiry or exchange failure creates no VM. Taild holds the returned key privately,
+creates a stopped VM, writes `tailscale.vm.auth_key` through its machine-scoped
+secret store, and then starts it. A failed secret write prevents startup.
 
-Consent and enrollment hold a public SDK stopped-machine node-state lease.
-Native CLI/SDK Start, Remove and Update fail busy, while Inspect remains available.
-Synced transaction fences and pending/backup/unreadable artifacts continue to
-block native mutations after a writer crash. Recovery may acquire the lease;
-only a committed or safely aborted transaction clears its fence. Unknown state
-must be recovered before removal.
-Consent holds no global name lock. The temporary server closes before synced,
-recoverable pending/backup promotion; netd receives state, never the provisioning
-token. `enrollment.timeout` bounds node approval to at most 5 minutes.
-Expired/failed approvals leave the VM stopped (exit 8); `start` offers a fresh link.
-A control connection that cannot obtain even a login URL times out with exit 9,
-leaving the durable machine stopped and resumable. Device API data is validated
-before projecting it; a confirmed missing device or elapsed key expiry is shown
-as `expired`. Unavailable or corrupt responses do not prove deletion.
+Netd exclusively owns VM-node registration and persisted Tailscale authentication.
+It reads initial auth keys or OAuth client credentials through the existing private
+secret transport, then uses its state directory on subsequent starts. Browser login
+and reauthentication run alongside the guest, without restarting it. Human interactive
+requests never borrow shared service credentials to acquire tags.
 
-`reauth VM` explicitly refreshes the copied existing identity through the pinned
-local API, waits for login completion and a changed public key in actual status,
-then closes the temporary server and verifies that key in public-package IPN
-state with the same stable ID and exact name. Local API preferences redact
-private keys and are never used as a changed-key signal. Reauth requires a
-stopped VM and both lifecycle capabilities.
-Corrupt/unknown state is retained and requires stale-device/recovery cleanup.
-Remove snapshots the stable ID before native deletion; API cleanup resolves and
-verifies the endpoint device ID, otherwise reports `device_retained`.
-`disable_key_expiry: true` requires `api-token`; configured failures are explicit.
-Live OAuth consent, ownership/approval semantics and stable-ID reauthentication
-remain UNVERIFIED until the live/manual qualification gates run.
+`--tag tag:NAME` is repeatable and requires `--tailscale`. Tailscale authorizes tag
+assignment using the authenticating user's permissions. Management ownership stays
+with the creator; the node's user/tag identity is verified independently. Tagged
+callers select a verified management-owner tag; netd scopes their initial key to
+that tag before Tailscale evaluates requested tags through `tagOwners`. Netd verifies exact DNS and
+tailnet identity before guest access. Sharing a tag does not confer management
+authority over a human-owned VM.
+
+Netd atomically publishes `<machine>/tailscale.status.json`. Taild checks the current
+run and freshness, waits at most three seconds after guest readiness for a login URL,
+and exposes authentication actions through `show`/`ls`. Active lobby prompts display
+deduplicated notices; guest and command output are never interrupted. `reauth` and
+the obsolete `enrollment.timeout` setting are removed. OAuth consent still has its
+own bounded lifetime. See the [status file contract](../../docs/taild/operator.md#live-status-file-version-1).
+
+Pending/backup recovery remains under the native stopped-node lease for start/update.
+Explicit removal deletes local VM files, credentials and node state without contacting
+Tailscale. Persistent remote registrations may remain in the admin console. Stop/start
+preserves the node identity. `disable_key_expiry` uses the machine-scoped API credential
+inside netd, with retryable failures reported in node status.
 
 ## SSH contract and pinned evidence (D03)
 
@@ -153,6 +152,18 @@ and relative creation ages. `show` includes human sizes and an absolute UTC
 creation date. Addresses are hidden from these human views; node hostnames remain.
 JSON retains byte counts, timestamp values and its address fields.
 
+Stopped VMs retain their configured node name in `ls` and `show`. `show` displays
+the owner's login separately from the guest account, omits empty labels, and leaves
+operation history to `ops`. Key expiry is a timestamp, `Never`, or `Unavailable`;
+historical expiry observations are marked `(last known)` when the node is stopped.
+
+Long-running mutations use a single braille spinner on interactive terminals,
+cleared before the final checkmark/elapsed-time summary. Creation shows a usable
+lobby shell command and, when verified, direct SSH; pending onboarding URLs stay
+visible. Non-PTY/TERM=dumb output is static, and JSON has structured completion
+details without progress animation. Help uses one layout for all commands and
+nested topics, with subcommand listings for policy, template and ops.
+
 ## VM commands
 
 ```text
@@ -160,13 +171,12 @@ create [IMAGE] [-n/--name NAME] [--image OCI] [--template NAME] [--policy NAME]
              [--cpus N] [--memory SIZE] [--disk-size SIZE]
              [--provision-user NAME:UID:GID:HOME]
             [--userdata INLINE|-] [--label KEY=VALUE]... [--owner tag:NAME]
-            [--no-tailnet] [--no-start]
+            [--tailscale] [--tag tag:NAME]... [--no-start]
 ls
 show VM
 start VM
 stop VM [--force] [--timeout DURATION]
 restart VM
-reauth VM
 rm VM [--force] [--yes]
 set VM [name=NAME] [cpus=N] [memory=SIZE] [disk=SIZE]
 shell VM [-u USER]
@@ -309,7 +319,7 @@ labels and projected by `show`. Description remains template metadata.
 
 Policies are HCL parsed and emitted exclusively by the public Rust-backed SDK.
 Any Tailscale declaration, rule tunnel reference or forward is prohibited, even
-with `--no-tailnet`. Production enables the one `Service.VMNodesEnabled` switch.
+without `--tailscale`. Production enables the one `Service.VMNodesEnabled` switch.
 Injection retains the entire canonical JSON, supplies the exact
 hostname, verified owner tag (empty for users) and pinned control URL, and appends
 TCP routes for both `100.64.0.0/10` and

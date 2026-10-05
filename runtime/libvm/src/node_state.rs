@@ -12,7 +12,8 @@ pub struct NodeStateLease {
 pub(crate) fn acquire(config: &MachineConfig) -> Result<NodeStateLease, LibVmError> {
     let lease = acquire_lock(config)?;
     // Directory artifacts are fences too, including transactions from older writers.
-    // A process crash releases flock, but must never authorize lifecycle mutations.
+    // A process crash releases flock, but must not authorize starting/updating
+    // an identity mid-transaction. Explicit removal may discard abandoned state.
     for name in [
         "tailscale.transaction",
         "tailscale.pending",
@@ -33,7 +34,7 @@ pub(crate) fn acquire(config: &MachineConfig) -> Result<NodeStateLease, LibVmErr
     Ok(lease)
 }
 
-fn acquire_lock(config: &MachineConfig) -> Result<NodeStateLease, LibVmError> {
+pub(crate) fn acquire_lock(config: &MachineConfig) -> Result<NodeStateLease, LibVmError> {
     let lock = MachineLifetimeLock::try_acquire(&config.machine_dir.join("node-state.lock"))?
         .ok_or_else(|| LibVmError::InvalidMachineUpdate {
             reference: config.name.clone(),
@@ -162,17 +163,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("node state recovery required"));
-            assert!(machine
-                .clone()
-                .remove()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("node state recovery required"));
             assert!(path.exists());
-            std::fs::remove_file(path).unwrap();
         }
-        machine.update(MachineUpdate::new().cpus(2)).await.unwrap();
+        let lease = machine.lease_node_state().await.unwrap();
+        assert!(machine
+            .clone()
+            .remove()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("node state busy"));
+        drop(lease);
         machine.remove().await.unwrap();
+        assert!(!dir.exists());
     }
 }

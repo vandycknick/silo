@@ -56,7 +56,7 @@ func (m *Metrics) Operation(kind, outcome string, elapsed time.Duration) {
 		return
 	}
 	switch kind {
-	case "create", "start", "stop", "restart", "remove", "set", "reauth":
+	case "create", "start", "stop", "restart", "remove", "set":
 	default:
 		kind = "other"
 	}

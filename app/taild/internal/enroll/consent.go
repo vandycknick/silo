@@ -26,8 +26,8 @@ const (
 	None        Mode = "none"
 )
 
-func Select(owner identity.Principal, configured, appSecret string, optOut bool) Mode {
-	if optOut || configured == "none" {
+func Select(owner identity.Principal, configured, appSecret string) Mode {
+	if configured == "none" {
 		return None
 	}
 	if strings.HasPrefix(string(owner), "tag:") {
@@ -53,18 +53,11 @@ type Consent struct {
 type Registry struct {
 	mu      sync.Mutex
 	entries map[string]*Consent
-	links   map[string]*Consent
 }
 
 func NewRegistry() *Registry {
-	return &Registry{entries: make(map[string]*Consent), links: make(map[string]*Consent)}
+	return &Registry{entries: make(map[string]*Consent)}
 }
-func (r *Registry) Link(vm string, owner identity.Principal, link string, expires time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.links[vm] = &Consent{VM: vm, Principal: owner, URL: link, Expires: expires}
-}
-func (r *Registry) ClearLink(vm string) { r.mu.Lock(); delete(r.links, vm); r.mu.Unlock() }
 func (r *Registry) Begin(vm string, owner identity.Principal, clientID, redirect string) (string, *Consent, error) {
 	var bytes [32]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
@@ -95,19 +88,6 @@ func (r *Registry) consume(nonce string) *Consent {
 		return nil
 	}
 	return c
-}
-func (r *Registry) Current(vm string, owner identity.Principal) *Consent {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c := r.links[vm]; c != nil && c.Principal == owner && time.Now().Before(c.Expires) {
-		return &Consent{VM: c.VM, Principal: c.Principal, URL: c.URL, Expires: c.Expires}
-	}
-	for _, c := range r.entries {
-		if c.VM == vm && c.Principal == owner && time.Now().Before(c.Expires) {
-			return &Consent{VM: c.VM, Principal: c.Principal, URL: c.URL, Expires: c.Expires}
-		}
-	}
-	return nil
 }
 func (c *Consent) Wait(ctx context.Context) (string, error) {
 	timer := time.NewTimer(time.Until(c.Expires))

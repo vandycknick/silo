@@ -3,8 +3,11 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
@@ -19,6 +22,7 @@ const (
 	LoginLabel    = "io.silo.taild.owner-login"
 	NameLabel     = "io.silo.taild.name"
 	ModeLabel     = "io.silo.taild.node.mode"
+	TagsLabel     = "io.silo.taild.node.tags"
 	InstanceLabel = "io.silo.taild.instance"
 )
 
@@ -112,7 +116,7 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 		owner := identity.Principal(d.Labels[OwnerLabel])
 		node := state.NoNode
 		if mode != "none" {
-			node = r.nodeState(ctx, d, owner)
+			node = r.nodeState(ctx, d)
 		}
 		if len(entry.Issues) > 0 {
 			s.Unreadable++
@@ -132,29 +136,61 @@ func Managed(d *silo.MachineData, instance string) bool {
 	return err == nil
 }
 
+// NodeOwner is the identity used only when reading legacy stopped node state.
+// Management authority always comes from OwnerLabel, independently of tags.
+func NodeOwner(d *silo.MachineData) identity.Principal {
+	var tags []string
+	if json.Unmarshal([]byte(d.Labels[TagsLabel]), &tags) == nil && len(tags) > 0 {
+		if p, err := identity.ParsePrincipal(tags[0]); err == nil && p.IsTag() {
+			return p
+		}
+	}
+	return identity.Principal(d.Labels[OwnerLabel])
+}
+
 // nodeState reads a tailnet-declared machine's node state. Stopped machines are
 // recovered under the native lease; running ones are only observed.
-func (r *Runtime) nodeState(ctx context.Context, d *silo.MachineData, owner identity.Principal) state.NodeState {
+func (r *Runtime) nodeState(ctx context.Context, d *silo.MachineData) state.NodeState {
 	if d.Network.Tailscale == nil {
 		return state.Unreadable
 	}
-	machine, err := r.Machine(ctx, d.ID)
-	if err != nil {
-		return state.Unreadable
-	}
-	defer r.CloseMachine(machine)
 	dir := d.Network.Tailscale.StateDir
-	if d.Status.Kind != silo.MachineStatusStopped {
-		_, node := state.ReadNode(dir, d.Name, owner, r.NodePin)
-		return node
+	if d.Status.Kind == silo.MachineStatusRunning {
+		if d.RunID != nil {
+			if status, err := state.ReadNetdStatus(dir, d.ID, *d.RunID, time.Now()); err == nil {
+				if status.State == "ready" {
+					return state.Enrolled
+				}
+				if status.State == "approval_required" {
+					return state.Pending
+				}
+				return state.NodeState(status.State)
+			}
+		}
+		return state.NodeState("status unavailable")
 	}
-	lease, err := machine.LeaseNodeState(ctx)
-	if err != nil {
-		return state.Unreadable
+	if d.Status.Kind == silo.MachineStatusStopped {
+		for _, suffix := range []string{".transaction", ".pending", ".backup", ".unreadable"} {
+			if _, err := os.Lstat(dir + suffix); os.IsNotExist(err) {
+				continue
+			}
+			machine, err := r.Machine(ctx, d.ID)
+			if err != nil {
+				return state.Unreadable
+			}
+			defer r.CloseMachine(machine)
+			lease, err := machine.LeaseNodeState(ctx)
+			if err != nil {
+				return state.Unreadable
+			}
+			defer lease.Close()
+			if state.RecoverNode(dir, d.Name, NodeOwner(d), r.NodePin) == state.Unreadable {
+				return state.Unreadable
+			}
+			break
+		}
 	}
-	r.Metrics.Handle("node_lease", 1)
-	defer func() { _ = lease.Close(); r.Metrics.Handle("node_lease", -1) }()
-	return state.RecoverNode(dir, d.Name, owner, r.NodePin)
+	return state.NodeState(string(d.Status.Kind))
 }
 
 // Reserve is a short in-process reservation, not a distributed claim. Create

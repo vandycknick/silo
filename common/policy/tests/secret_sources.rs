@@ -99,7 +99,7 @@ tailscale "worktail" {{ tags = ["tag:dev"] }}
             NetworkPolicy::from_json_str(&serde_json::to_string(&policy).unwrap()).unwrap(),
         ] {
             let slots = policy.secret_slots();
-            assert_eq!(slots.len(), fields.len() + 1, "{kind}");
+            assert_eq!(slots.len(), fields.len() + 3, "{kind}");
             for (suffix, key_suffix, field, required) in &fields {
                 let slot = slots
                     .iter()
@@ -117,11 +117,18 @@ tailscale "worktail" {{ tags = ["tag:dev"] }}
                 assert_eq!(decoded.source.key, slot.source.key);
                 assert_eq!(decoded.source.field, slot.source.field);
             }
-            let slot = slots.last().unwrap();
-            assert_eq!(slot.name, "worktail.tailscale.auth_key");
-            assert_eq!(slot.source.key.as_str(), "tailscale.worktail.auth_key");
-            assert_eq!(slot.source.field, SecretField::Value);
-            assert!(!slot.required);
+            for field in ["auth_key", "client_secret", "api_token"] {
+                let slot = slots
+                    .iter()
+                    .find(|s| s.name == format!("worktail.tailscale.{field}"))
+                    .unwrap();
+                assert_eq!(
+                    slot.source.key.as_str(),
+                    format!("tailscale.worktail.{field}")
+                );
+                assert_eq!(slot.source.field, SecretField::Value);
+                assert!(!slot.required);
+            }
             assert!(policy.secret_requirements().iter().all(|r| r
                 .alternatives
                 .iter()

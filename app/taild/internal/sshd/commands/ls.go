@@ -5,7 +5,7 @@ import "github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
 var ls = Command{
 	Name:    "ls",
 	Summary: "List your VMs.",
-	Usage:   "ls [--json]",
+	Usage:   "ls [OPTIONS]",
 	Example: "ls",
 	Aliases: []string{"list"},
 	New:     func() Handler { return &lsHandler{} },

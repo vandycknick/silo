@@ -38,6 +38,23 @@ The target selects the current host paths and exports the development-only bridg
 overrides automatically. Set `PROFILE=release`, `KERNEL_PATH`, or the other standard Make options
 when needed.
 
+## Machine-scoped credentials
+
+The SDK supports plain secret writes through the runtime's selected secret store:
+
+```go
+if err := machine.SetSecret(ctx, "tailscale.vm.auth_key", authKey); err != nil {
+    return err
+}
+if _, err := machine.Start(ctx); err != nil { return err }
+```
+
+`DeleteSecret(ctx, name)` removes a machine-scoped key. Reserved `silo.*`
+infrastructure keys cannot be changed through these methods. The default file store
+accepts UTF-8 values. Values are not written to machine configuration or returned by
+inspection. Running helpers retain their launch-time secret snapshot; this API is
+not a live command channel. Use the matching ABI 1 bridge and runtime.
+
 ## Sizes
 
 Memory and disk sizes use explicit units at the call site:
@@ -109,9 +126,10 @@ projection types and empty selected values never masquerade as absent secrets.
 The older `PolicySecretsReady` boolean API remains available. This uses an optional
 operation on the existing runtime-query entry point.
 
-The current native bridge requires ABI **4**. ABI 3 bridges lack the required
-stateless planning query symbol contract and are rejected before
-new symbols are resolved. Rebuild the bridge and reassemble target-local SDK
+The current native bridge requires ABI **1**, the initial unreleased baseline for
+the complete bridge contract. The ABI number tracks binary compatibility, independently
+of the product version. Mismatched ABIs are rejected before symbols are resolved.
+Rebuild the bridge and reassemble target-local SDK
 bundles together. `NativeABIVersion` is the required numeric ABI constant,
 available without loading the bridge.
 `VerifiedNativeABIVersion()` loads and checks the exact product/ABI and returns

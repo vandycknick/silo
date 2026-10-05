@@ -248,7 +248,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	c.send(t, "help\x1b[D\x1b[")
 	c.send(t, "\x03")
 	c.wait(t, lobbyPrompt, 9)
-	if strings.Count(c.text(), "VMs on your tailnet") != 0 {
+	if strings.Count(c.text(), "manage your VMs") != 0 {
 		t.Fatal("Ctrl-C dispatched line", c.text())
 	}
 	// Bracketed paste cannot submit either command until explicit Enter.
@@ -261,7 +261,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	c.wait(t, lobbyPrompt, 10)
 	c.send(t, "\x1b[200~whoami\nhelp\x1b[201~\r")
 	c.wait(t, lobbyPrompt, 11)
-	if strings.Count(c.text(), "User:") != 3 || strings.Count(c.text(), "VMs on your tailnet") != 0 {
+	if strings.Count(c.text(), "User:") != 3 || strings.Count(c.text(), "manage your VMs") != 0 {
 		t.Fatal("multiline paste executed separate commands", c.text())
 	}
 	c.send(t, "\x04")
@@ -274,7 +274,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 		one := openTerminalClient(t, address, command)
 		one.exit(t)
 		assertTerminalNewlines(t, one.text())
-		if !strings.Contains(one.text(), map[string]string{"whoami": "User:", "help": "VMs on your tailnet"}[command]) {
+		if !strings.Contains(one.text(), map[string]string{"whoami": "User:", "help": "manage your VMs"}[command]) {
 			t.Fatal(one.text())
 		}
 	}

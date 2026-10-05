@@ -14,7 +14,7 @@ func TestAllow(t *testing.T) {
 		a     identity.Action
 		owner identity.Principal
 		exit  int
-	}{{identity.Read, "user:12", 0}, {identity.Read, "user:99", 3}, {identity.Delete, "user:12", 4}, {identity.Restart, "user:12", 4}, {identity.Reauth, "user:12", 4}} {
+	}{{identity.Read, "user:12", 0}, {identity.Read, "user:99", 3}, {identity.Delete, "user:12", 4}, {identity.Restart, "user:12", 4}} {
 		e := Allow(p, tt.a, &VM{Owner: tt.owner})
 		if tt.exit == 0 {
 			if e != nil {

@@ -13,6 +13,7 @@ mod name_generator;
 mod process;
 mod reference;
 pub(crate) mod root_disk;
+mod secrets;
 mod session;
 mod start;
 mod streams;

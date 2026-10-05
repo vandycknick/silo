@@ -23,9 +23,12 @@ identity and a freshly checked capability supplies authority. V1 accepts only
 the remote surface must not accept host paths or arbitrary host mounts.
 
 Exact user-requested names are globally collision-checked locally and on the
-tailnet. Taild must reject collisions rather than adding an owner prefix. Enrollment
-requires explicit consent or approved tag provisioning and verifies exact assigned
-DNS and principal ownership before state promotion. Readiness is established by
+tailnet. Taild must reject collisions rather than adding an owner prefix. VM nodes
+are opt-in with `--tailscale`. OAuth-app consent completes before VM creation;
+taild stores the resulting key through the machine-scoped secret abstraction.
+Netd performs enrollment alongside boot and verifies exact assigned DNS, tailnet
+and requested user/tag identity. Human tag assignment is authorized by Tailscale;
+management ownership remains with the creating principal. Readiness is established by
 an actual guest connection attempt, not solely an agent RPC.
 
 Linux systemd uses a dedicated private home and `KillMode=process`. Ordinary
@@ -43,8 +46,8 @@ In the embedded Go attachment path, Go owns each scoped process-signal
 subscription and sends typed controls through the native token. Return restores
 inherited ignored/default behavior and preserves independent application
 subscribers. The SDK must not rely on Tokio's cached process handlers being
-reinstalled after Go restores SIG_IGN. The current ABI3 includes this control
-export as well as cancellation and node-state leases.
+reinstalled after Go restores SIG_IGN. The initial ABI 1 includes scoped secret writes in
+addition to planning, signal controls, cancellation and node-state leases.
 
 ## Consequences
 

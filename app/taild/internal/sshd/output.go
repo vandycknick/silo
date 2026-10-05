@@ -37,6 +37,14 @@ type humanWriter struct {
 }
 
 func (w *humanWriter) Write(data []byte) (int, error) {
+	return w.write(nil, data)
+}
+
+func (w *humanWriter) WriteContext(ctx context.Context, data []byte) (int, error) {
+	return w.write(ctx, data)
+}
+
+func (w *humanWriter) write(ctx context.Context, data []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	buf := make([]byte, 0, len(data)+16)
@@ -47,7 +55,15 @@ func (w *humanWriter) Write(data []byte) (int, error) {
 		buf = append(buf, b)
 		w.cr = b == '\r'
 	}
-	n, err := w.out.Write(buf)
+	var n int
+	var err error
+	if out, ok := w.out.(interface {
+		WriteContext(context.Context, []byte) (int, error)
+	}); ok && ctx != nil {
+		n, err = out.WriteContext(ctx, buf)
+	} else {
+		n, err = w.out.Write(buf)
+	}
 	if err == nil && n != len(buf) {
 		err = io.ErrShortWrite
 	}

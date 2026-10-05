@@ -5,7 +5,7 @@ import "github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
 var shell = Command{
 	Name:      "shell",
 	Summary:   "Open a guest shell (requires SSH PTY).",
-	Usage:     "shell VM [-u USER] (requires ssh -t)",
+	Usage:     "shell VM [OPTIONS]",
 	Arguments: "VM  Exact name or VM ID.",
 	Example:   "shell devbox -u root",
 	Aliases:   []string{"ssh"},

@@ -2,9 +2,11 @@ package commands
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/service"
@@ -27,36 +29,78 @@ func renderListAt(vms []service.VM, now time.Time) string {
 	}
 	_ = table.Flush()
 	for _, vm := range vms {
-		if vm.ApprovalURL != "" && vm.ApprovalExpires != nil {
-			fmt.Fprintf(&b, "Approve %s: %s (expires %s)\n", vm.Name, vm.ApprovalURL, vm.ApprovalExpires.Format(time.RFC3339))
+		if vm.ApprovalURL != "" {
+			fmt.Fprintf(&b, "Approve %s: %s", vm.Name, vm.ApprovalURL)
+			b.WriteByte('\n')
 		}
 	}
 	return b.String()
 }
 
 func renderShow(v service.VM) string {
-	text := fmt.Sprintf("Name: %s\nID: %s\nOwner: %s\nState: %s\nCPUs: %d\nMemory: %s\nDisk: %s\nCreated: %s\nImage: %s\nLabels: %v\n", v.Name, v.ID, v.Owner, v.State, v.CPUs, humanMemory(v.Memory), humanDisk(v.Disk), absoluteTime(v.Created), v.Image, v.Labels)
+	owner := string(v.Owner)
+	if !v.Owner.IsTag() && v.OwnerLogin != "" {
+		owner = v.OwnerLogin
+	}
+	user := v.DefaultUser
+	if user == "" {
+		user = "root"
+	}
+	text := fmt.Sprintf("Name: %s\nID: %s\nOwner: %s\nGuest user: %s\nState: %s\nCPUs: %d\nMemory: %s\nDisk: %s\nCreated: %s\nImage: %s\n", safeText(v.Name), safeText(v.ID), safeText(owner), safeText(user), v.State, v.CPUs, humanMemory(v.Memory), humanDisk(v.Disk), absoluteTime(v.Created), safeText(v.Image))
+	if len(v.Labels) > 0 {
+		text += "Labels:\n"
+		keys := make([]string, 0, len(v.Labels))
+		for key := range v.Labels {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			text += fmt.Sprintf("  %s: %s\n", safeText(key), safeText(v.Labels[key]))
+		}
+	}
 	if v.Template != "" {
-		text += "Template: " + v.Template + "\n"
+		text += "Template: " + safeText(v.Template) + "\n"
+	}
+	if len(v.Tags) > 0 {
+		text += "Tags: " + safeText(strings.Join(v.Tags, ", ")) + "\n"
 	}
 	if v.Policy != "" {
-		text += "Policy: " + v.Policy + "\n"
+		text += "Policy: " + safeText(v.Policy) + "\n"
 	}
 	if len(v.GuestTCPPorts) > 0 {
 		text += fmt.Sprintf("Guest TCP hints (ACL controls access): %v\n", v.GuestTCPPorts)
 	}
-	if v.LastOperation != nil {
-		text += fmt.Sprintf("Last operation: %s %s\n", v.LastOperation.ID, v.LastOperation.State)
-	}
-	text += fmt.Sprintf("Node: %s\nNode state: %s\nKey expiry: %s\n", v.Node, v.NodeState, v.KeyExpiry)
+	text += fmt.Sprintf("Node: %s\nNode state: %s\nKey expiry: %s\n", safeText(v.Node), safeText(string(v.NodeState)), expiryText(v, time.Now()))
 	for _, diagnostic := range v.NodeDiagnostics {
-		text += "Node diagnostic: " + diagnostic + "\n"
+		text += "Node diagnostic: " + safeText(diagnostic) + "\n"
 	}
 	if v.ApprovalURL != "" {
-		text += "Approve: " + v.ApprovalURL + "\n"
-		if v.ApprovalExpires != nil {
-			text += "Approval expires: " + v.ApprovalExpires.Format(time.RFC3339) + "\n"
+		text += "Login: " + safeText(v.ApprovalURL) + "\n"
+	}
+	return text
+}
+
+func safeText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return '�'
 		}
+		return r
+	}, s)
+}
+
+func expiryText(v service.VM, now time.Time) string {
+	text := "Unavailable"
+	if v.KeyExpiry == "never" {
+		text = "Never"
+	} else if expiry, err := time.Parse(time.RFC3339, v.KeyExpiry); err == nil && !expiry.IsZero() {
+		text = absoluteTime(expiry)
+		if !expiry.After(now) {
+			text += " (expired)"
+		}
+	}
+	if text != "Unavailable" && v.KeyExpiryLastKnown {
+		text += " (last known)"
 	}
 	return text
 }

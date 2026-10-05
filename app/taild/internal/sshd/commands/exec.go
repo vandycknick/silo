@@ -8,7 +8,7 @@ import (
 var exec = Command{
 	Name:      "exec",
 	Summary:   "Run a guest command; arguments after -- are literal.",
-	Usage:     "exec VM [-u USER] [-w DIR] [-e K=V]... [-t] -- CMD...",
+	Usage:     "exec VM [OPTIONS] -- CMD...",
 	Arguments: "VM  Exact name or VM ID.\nCMD...  Guest program and arguments after --.",
 	Example:   "exec devbox -- uname -a",
 	Streaming: true,

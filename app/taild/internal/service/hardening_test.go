@@ -1,18 +1,16 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
@@ -20,61 +18,63 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestActualCreateControlUnreachableIsBoundedExit9AndResumable(t *testing.T) {
+func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 	s := actualService(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
-	s.Config.Enrollment.Mode = "interactive"
+	s.Config.Enrollment.Mode = "oauth-app"
 	s.VMNodesEnabled = true
-	var requests atomic.Int32
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(503) }))
-	defer control.Close()
-	s.Config.Enrollment.Timeout = "750ms"
-	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: control.URL}, Registry: enroll.NewRegistry(), Metrics: s.Runtime.Metrics}
-	c := domainCaller(t, s, "user:1")
-	started := time.Now()
-	op, err := s.Create(context.Background(), c, CreateRequest{Name: "offline"})
+	r := enroll.NewRegistry()
+	oauth, err := enroll.NewOAuth(r, "tskey-app-test-secret", "https://silo.fixture.test/oauth/callback")
 	if err != nil {
 		t.Fatal(err)
 	}
-	finished := waitOperation(t, s, c, op)
-	if finished.Error == nil || finished.Error.Exit != 9 || time.Since(started) > 30*time.Second || requests.Load() == 0 {
-		t.Fatal(finished, time.Since(started), requests.Load())
+	s.Enrollment = &enroll.Manager{Config: s.Config, Secrets: config.Secrets{AppSecret: "tskey-app-test-secret"}, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test"}, Registry: r, OAuth: oauth, Metrics: s.Runtime.Metrics}
+	c := domainCaller(t, s, "user:1")
+	op, err := s.Create(context.Background(), c, CreateRequest{Name: "offline", Tailscale: true, NoStart: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-	v, err := s.Show(context.Background(), c.Peer, "offline")
-	if err != nil || v.State != silo.MachineStatusStopped {
-		t.Fatal("not resumable", v, err)
+	deadline := time.Now().Add(time.Second)
+	link := ""
+	for link == "" {
+		current, _, e := s.Jobs.Observe(c.Peer, op.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, line := range current.Progress {
+			if u, ok := strings.CutPrefix(line, "approve: "); ok {
+				link = u
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("consent not started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	u, err := url.Parse(link)
+	if err != nil || u.Query().Get("state") == "" {
+		t.Fatal(link, err)
+	}
+	entries, err := s.Runtime.SDK.Inventory(context.Background())
+	if err != nil || len(entries) != 0 || registry.Requests.Load() != 0 {
+		t.Fatal("creation ran before consent", entries, err, registry.Requests.Load())
+	}
+	s.Jobs.InterruptIf(func() bool { return true })
+	finished := waitOperation(t, s, c, op)
+	if finished.Error == nil {
+		t.Fatal("cancelled consent succeeded")
+	}
+	entries, err = s.Runtime.SDK.Inventory(context.Background())
+	if err != nil || len(entries) != 0 || registry.Requests.Load() != 0 {
+		t.Fatal("cancelled consent created a VM", entries, err)
 	}
 	s.createMu.Lock()
 	if len(s.pending) != 0 || len(s.diskPending) != 0 {
 		t.Error("quota/disk reservations leaked")
 	}
 	s.createMu.Unlock()
-	// A second real attempt reacquires the lease on the same durable VM.
-	op, err = s.Start(context.Background(), c, "offline")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if finished = waitOperation(t, s, c, op); finished.Error == nil || finished.Error.Exit != 9 {
-		t.Fatal(finished)
-	}
-	var out bytes.Buffer
-	s.Runtime.Metrics.Write(&out)
-	for _, metric := range []string{
-		`taild_operations_total{kind="create",outcome="failed"} 1`,
-		`taild_operations_total{kind="start",outcome="failed"} 1`,
-		`taild_enrollment_duration_seconds_count{outcome="failed"} 2`,
-		`taild_native_handles{kind="machine",scope="daemon_owned"} 0`,
-		`taild_native_handles{kind="node_lease",scope="daemon_owned"} 0`,
-	} {
-		if !strings.Contains(out.String(), metric) {
-			t.Fatal("real operation metric missing", metric, out.String())
-		}
-	}
-	if strings.Contains(out.String(), s.Config.Home) || strings.Contains(out.String(), "offline") || strings.Contains(out.String(), "user:1") {
-		t.Fatal("metric label leaked identity")
-	}
 }
 
 func TestShutdownMarkerBlocksNativeMutationsAndRegistryAdmission(t *testing.T) {

@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -61,7 +63,7 @@ func Owner(peer *apitype.WhoIsResponse, status *ipnstate.Status) (Identity, erro
 	return id, nil
 }
 
-func boundedWhoIs(ctx context.Context, client *local.Client, remote string) (Identity, error) {
+func boundedWhoIs(ctx context.Context, client *local.Client, remote string, owner string) (Identity, error) {
 	if client == nil {
 		return Identity{}, errors.New("tailnet identity unavailable")
 	}
@@ -76,7 +78,32 @@ func boundedWhoIs(ctx context.Context, client *local.Client, remote string) (Ide
 		id, _ := Owner(peer, nil)
 		return id, err
 	}
-	return Owner(peer, status)
+	return ManagementOwner(peer, status, owner)
+}
+
+// Management ownership is independent of the VM node's tag identity. Native
+// callers without a management owner retain the node-owner authorization rule.
+func ManagementOwner(peer *apitype.WhoIsResponse, status *ipnstate.Status, owner string) (Identity, error) {
+	if owner == "" {
+		return Owner(peer, status)
+	}
+	deny := errors.New("not the owner of this VM")
+	if peer == nil || peer.Node == nil || peer.Node.StableID == "" || status == nil || status.BackendState != "Running" || status.Self == nil {
+		return Identity{}, deny
+	}
+	id := Identity{Node: string(peer.Node.StableID)}
+	if strings.HasPrefix(owner, "tag:") {
+		for _, tag := range peer.Node.Tags {
+			if tag == owner {
+				id.Login = "node:" + id.Node
+				return id, nil
+			}
+		}
+	} else if len(peer.Node.Tags) == 0 && peer.UserProfile != nil && peer.UserProfile.ID != 0 && peer.Node.User == peer.UserProfile.ID && "user:"+strconv.FormatInt(int64(peer.UserProfile.ID), 10) == owner && peer.UserProfile.LoginName != "" {
+		id.Login, id.UserID = peer.UserProfile.LoginName, fmt.Sprint(peer.UserProfile.ID)
+		return id, nil
+	}
+	return id, deny
 }
 
 func permissions(id Identity) *ssh.Permissions {

@@ -21,6 +21,11 @@ func (c *Context) Await(op jobs.Operation, err error) (Result, error) {
 		return Result{}, err
 	}
 	out := c.Streams.HumanWriter()
+	display := progressDisplay{out: out, animated: !c.JSON && c.Streams.Terminal.Present && c.Streams.Terminal.Term != "dumb", width: int(c.Streams.Terminal.Window.Columns), message: phase(op.Kind+" "+op.VM, op.VM)}
+	defer display.clear()
+	animation := time.NewTicker(80 * time.Millisecond)
+	defer animation.Stop()
+	windows := c.Streams.Terminal.Windows
 	reported := 0
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -33,25 +38,45 @@ func (c *Context) Await(op jobs.Operation, err error) (Result, error) {
 			reported = 0
 		}
 		for _, line := range current.Progress[reported:] {
-			if _, e := fmt.Fprintln(out, line); e != nil {
-				return Result{}, e
+			display.message = phase(line, current.VM)
+			// Pre-creation OAuth must publish its link before a
+			// JSON result can exist. Keep that diagnostic on stderr, never stdout.
+			if strings.HasPrefix(line, "approve: ") {
+				if e := display.clear(); e != nil {
+					return Result{}, e
+				}
+				if _, e := fmt.Fprintln(out, line); e != nil {
+					return Result{}, e
+				}
 			}
 		}
 		reported = len(current.Progress)
 		if current.Finished != nil {
+			if e := display.clear(); e != nil {
+				return Result{}, e
+			}
 			if current.Error != nil {
 				return Result{Data: current}, current.Error
 			}
-			message := current.Kind + " succeeded\n"
-			if current.Kind == "create" {
-				message = "create " + current.VM + " succeeded\n"
+			if v := current.Completion; v != nil && v.ApprovalURL != "" && c.Streams.ApprovalShown != nil {
+				c.Streams.ApprovalShown(v.VMID, v.ApprovalURL)
 			}
-			return Result{Data: current, Human: message}, nil
+			return Result{Data: current, Human: completionText(current, c.Service.Config.Tailnet.Hostname)}, nil
 		}
 		select {
 		case <-c.Done():
 			return Result{Data: op}, &authz.Error{Code: "disconnected", Message: "observer closed; operation continues", Exit: 255}
 		case <-changed:
+		case <-animation.C:
+			if e := display.tick(); e != nil {
+				return Result{}, e
+			}
+		case size, ok := <-windows:
+			if !ok {
+				windows = nil
+			} else {
+				display.width = int(size.Columns)
+			}
 		case <-ticker.C:
 			p, e := c.Caller.Fresh(c)
 			if e != nil || !p.Owns(current.Principal) {
