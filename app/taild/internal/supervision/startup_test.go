@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/state"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,7 +50,7 @@ func TestStartupSnapshotSupersedesHistoricalTrueFalse(t *testing.T) {
 func TestReceiptDeadlineAndMemorySealWhileStartupHelperRecoveryBlocked(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
 	fd, err := state.LockShutdownHelper(c.Home)
 	if err != nil {

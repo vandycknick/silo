@@ -1,69 +1,54 @@
-package config
+package config_test
 
 import (
 	"os"
-	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
-func TestStrictConfig(t *testing.T) {
-	for _, tt := range []struct {
-		body  string
-		valid bool
-	}{{"{}", true}, {"tailnet:\n  hostname: silo-test", true}, {"tailnet:\n  misspelled: true", false}, {"{}\n---\n{}", false}, {"home: relative", false}, {"tailnet:\n  hostname: trailing-", false}, {"vm:\n  defaults: {cpus: 99}", false}, {"vm:\n  defaults: {memory: 1.5GiB}", false}, {"vm:\n  defaults: {memory: 512MiB}", true}, {"shutdown:\n  stop_budget: 4", false}, {"shutdown:\n  stop_budget: 2s", true}, {"disk_reserve: 2GB", true}, {"tailnet: {hostname: a, hostname: b}", false}, {strings.Repeat(" ", 65537), false}} {
-		path := filepath.Join(t.TempDir(), "config.yaml")
-		if e := os.WriteFile(path, []byte(tt.body), 0600); e != nil {
-			t.Fatal(e)
-		}
-		_, e := Load(path)
-		if (e == nil) != tt.valid {
-			t.Fatalf("%q: %v", tt.body, e)
+func TestResolvedFrontendValidation(t *testing.T) {
+	if err := testfixture.Config().Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*config.Config){
+		func(c *config.Config) { c.Tailnet.Hostname = "trailing-" },
+		func(c *config.Config) { c.Tailnet.Tag = "user:1" },
+		func(c *config.Config) { c.Enrollment.Mode = "unknown" },
+		func(c *config.Config) { c.VM.Defaults.CPUs = 99 },
+		func(c *config.Config) { c.Sessions.PerPeer = c.Sessions.Global + 1 },
+		func(c *config.Config) { c.Shutdown.StopBudget.Duration = 0 },
+		func(c *config.Config) { c.Home = "relative" },
+	} {
+		c := testfixture.Config()
+		mutate(&c)
+		if err := c.Validate(); err == nil {
+			t.Fatal("invalid resolved configuration accepted")
 		}
 	}
 }
-func TestHomeAndSecrets(t *testing.T) {
+
+func TestHomeOwnership(t *testing.T) {
 	home := t.TempDir()
-	if e := os.Chmod(home, 0700); e != nil {
-		t.Fatal(e)
+	if err := os.Chmod(home, 0700); err != nil {
+		t.Fatal(err)
 	}
-	if _, e := ResolveHome(home, 0); e == nil {
+	if _, err := config.ResolveHome(home, 0); err == nil {
 		t.Fatal("root accepted")
 	}
 	if os.Geteuid() != 0 {
-		if _, e := ResolveHome(home, os.Geteuid()); e != nil {
-			t.Fatal(e)
+		if _, err := config.ResolveHome(home, os.Geteuid()); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if _, e := ResolveHome(home, os.Geteuid()+1); e == nil {
+	if _, err := config.ResolveHome(home, os.Geteuid()+1); err == nil {
 		t.Fatal("foreign UID accepted")
 	}
-	dir := t.TempDir()
-	s, e := ReadSecrets(dir)
-	if e != nil || s.ClientSecret != "" {
-		t.Fatal(e)
+	if err := os.Chmod(home, 0770); err != nil {
+		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "oauth-client-secret")
-	if e = os.WriteFile(path, []byte("synthetic\n"), 0600); e != nil {
-		t.Fatal(e)
-	}
-	s, e = ReadSecrets(dir)
-	if e != nil || s.ClientSecret != "synthetic" {
-		t.Fatalf("%+v %v", s, e)
-	}
-	if e = os.Chmod(path, 0644); e != nil {
-		t.Fatal(e)
-	}
-	if _, e = ReadSecrets(dir); e == nil {
-		t.Fatal("public secret accepted")
-	}
-	if e = os.Remove(path); e != nil {
-		t.Fatal(e)
-	}
-	if e = os.Symlink("/dev/null", path); e != nil {
-		t.Fatal(e)
-	}
-	if _, e = ReadSecrets(dir); e == nil {
-		t.Fatal("symlink secret accepted")
+	if _, err := config.ResolveHome(home, os.Geteuid()); err == nil {
+		t.Fatal("group-writable Home accepted")
 	}
 }

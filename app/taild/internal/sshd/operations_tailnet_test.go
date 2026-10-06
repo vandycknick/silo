@@ -39,9 +39,9 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 	rootfs := testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true)
 	ctx, cancel := context.WithTimeout(context.Background(), 220*time.Second)
 	defer cancel()
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
-	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
+	c.Components = testfixture.Components(testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true))
 	suffix := fmt.Sprintf("%x", time.Now().UnixNano())
 	c.Tailnet.Hostname = "silo-s11-" + suffix
 	c.Tailnet.Tag = "tag:silo-test"

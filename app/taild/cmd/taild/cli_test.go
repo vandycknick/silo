@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,62 +11,45 @@ import (
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
-func TestOfflineVersionCommandsNeverStartTailnet(t *testing.T) {
+func TestOfflineCommandsHaveNoRuntimeOrConnectionSideEffects(t *testing.T) {
 	if os.Getenv("SILO_TAILD_VERSION_CHILD") == "1" {
-		if err := runArgs([]string{os.Getenv("SILO_TAILD_VERSION_COMMAND"), "--config", os.Getenv("SILO_TAILD_VERSION_CONFIG")}); err != nil {
+		if err := runArgs([]string{os.Getenv("SILO_TAILD_VERSION_COMMAND")}); err != nil {
 			t.Fatal(err)
 		}
 		return
 	}
 	home := t.TempDir()
-	p := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(p, []byte(fmt.Sprintf("home: %q\n", home)), 0600); err != nil {
-		t.Fatal(err)
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, command := range []string{"version", "--version"} {
-		cmd := exec.Command(exe, "-test.run=^TestOfflineVersionCommandsNeverStartTailnet$")
-		cmd.Env = append(os.Environ(), "SILO_TAILD_VERSION_CHILD=1", "SILO_TAILD_VERSION_COMMAND="+command, "SILO_TAILD_VERSION_CONFIG="+p)
+	for _, command := range []string{"version", "--version", "help", "--help"} {
+		cmd := exec.Command(exe, "-test.run=^TestOfflineCommandsHaveNoRuntimeOrConnectionSideEffects$")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "SILO_HOME=" + home, "SILO_GO_FFI_PATH=" + filepath.Join(home, "missing-bridge"), "SILO_TAILD_VERSION_CHILD=1", "SILO_TAILD_VERSION_COMMAND=" + command}
 		out, err := cmd.CombinedOutput()
-		if err != nil || !strings.Contains(string(out), "SDK "+silo.Version+" runtime unavailable") {
+		if err != nil {
 			t.Fatalf("%v %s", err, out)
 		}
+		if strings.Contains(command, "version") && (!strings.Contains(string(out), "SDK "+silo.Version+" runtime unavailable") || !strings.Contains(string(out), "verified unavailable")) {
+			t.Fatal(string(out))
+		}
 	}
-	if _, err := os.Stat(filepath.Join(home, "taild", "tsnet")); !os.IsNotExist(err) {
-		t.Fatal("version created tailnet state", err)
-	}
-}
-
-func TestVersionRejectsMissingRuntimeManifest(t *testing.T) {
-	home, root := t.TempDir(), t.TempDir()
-	p := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(p, []byte(fmt.Sprintf("home: %q\nruntime_root: %q\n", home, root)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := runArgs([]string{"version", "--config", p}); err == nil || !strings.Contains(err.Error(), "manifest") {
-		t.Fatal("unverified runtime version accepted", err)
+	entries, err := os.ReadDir(home)
+	if err != nil || len(entries) != 0 {
+		t.Fatal("offline command wrote Home", entries, err)
 	}
 }
 
-func TestOfflineInstallerUsesConfigAndRequiresArchive(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("installer requires nonroot home")
+func TestManagedInvocationOnly(t *testing.T) {
+	for _, args := range [][]string{nil, {"install-runtime"}, {"stop-vms"}, {"--config", "/tmp/config"}, {"--check"}, {"--runtime-archive", "/tmp/archive"}, {"--bootstrap-fd", "-1"}, {"--version", "--bootstrap-fd", "0"}} {
+		err := runArgs(args)
+		var deterministic *deterministicError
+		if !errors.As(err, &deterministic) {
+			t.Fatal("unsafe invocation accepted", args, err)
+		}
 	}
-	home := t.TempDir()
-	p := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(p, []byte(fmt.Sprintf("home: %q\n", home)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := runArgs([]string{"install-runtime", "--config", p}); err == nil || !strings.Contains(err.Error(), "requires --runtime-archive") {
-		t.Fatal(err)
-	}
-	if err := runArgs([]string{"install-runtime", "--config", p, "--runtime-archive", filepath.Join(home, "missing"), "--install-root", filepath.Join(home, "store")}); err == nil || !strings.Contains(err.Error(), "offline SDK runtime installation failed") {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(home, "taild", "tsnet")); !os.IsNotExist(err) {
-		t.Fatal("installer created tailnet state", err)
+	iv, err := parseArgs([]string{"--bootstrap-fd", "0"})
+	if err != nil || iv.bootstrapFD != 0 {
+		t.Fatal("stdin bootstrap not accepted", iv, err)
 	}
 }

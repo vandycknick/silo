@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -51,25 +52,23 @@ type Runtime struct {
 }
 
 func Open(ctx context.Context, c config.Config, instance string) (*Runtime, error) {
-	root, e := Root(c)
-	if e != nil {
-		return nil, e
+	if c.BridgePath == "" {
+		return nil, errors.New("bootstrap native bridge and runtime components required")
 	}
-	manifest, e := ValidateManifest(root)
-	if e != nil {
+	if e := os.Setenv("SILO_GO_FFI_PATH", c.BridgePath); e != nil {
 		return nil, e
 	}
 	abi, e := silo.VerifiedNativeABIVersion()
 	if e != nil {
 		return nil, e
 	}
-	sdk, e := silo.Open(ctx, silo.WithHome(c.Home), silo.WithRuntimeRoot(root))
+	sdk, e := silo.Open(ctx, silo.WithHome(c.Home), silo.WithRuntimeComponents(c.Components))
 	if e != nil {
 		return nil, e
 	}
 	m := metrics.New()
 	m.Handle("runtime", 1)
-	return &Runtime{SDK: sdk, Instance: instance, reserved: make(map[string]bool), Metrics: m, Version: manifest.Version, ABI: abi}, nil
+	return &Runtime{SDK: sdk, Instance: instance, reserved: make(map[string]bool), Metrics: m, Version: silo.Version, ABI: abi}, nil
 }
 func (r *Runtime) Close() error {
 	err := r.SDK.Close()

@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestRemoteSurfacePureDomain(t *testing.T) {
@@ -44,7 +44,7 @@ func TestRemoteSurfacePureDomain(t *testing.T) {
 	if strings.Contains(diagnostic, "/var/lib") || strings.Contains(diagnostic, "synthetic") || !strings.Contains(diagnostic, "ordinary line") {
 		t.Fatal(diagnostic)
 	}
-	s := &Service{Config: config.Defaults()}
+	s := &Service{Config: testfixture.Config()}
 	limits := s.Config.Limits()
 	p := identity.Peer{Permissions: identity.Permissions{Limits: limits}}
 	if e := s.resources(p, 8, 32<<30, 200<<30); e != nil {

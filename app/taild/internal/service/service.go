@@ -7,6 +7,7 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
@@ -16,18 +17,21 @@ import (
 )
 
 type Service struct {
-	Shutdown     *state.ShutdownGate
-	Enrollment   *enroll.Manager
-	Runtime      *runtime.Runtime
-	Audit        *state.Audit
-	Jobs         *jobs.Registry
-	Capability   string
-	Config       config.Config
-	VisibleNames func(context.Context) ([]string, error)
-	createMu     sync.Mutex
-	pending      map[string]identity.Principal
-	diskPending  map[string]uint64
-	documentMu   sync.Mutex
+	Control            *control.Client
+	DaemonVersion      string
+	ManagementProtocol uint32
+	Shutdown           *state.ShutdownGate
+	Enrollment         *enroll.Manager
+	Runtime            *runtime.Runtime
+	Audit              *state.Audit
+	Jobs               *jobs.Registry
+	Capability         string
+	Config             config.Config
+	VisibleNames       func(context.Context) ([]string, error)
+	createMu           sync.Mutex
+	pending            map[string]identity.Principal
+	diskPending        map[string]uint64
+	documentMu         sync.Mutex
 	// Production permits node injection when --tailscale is explicitly requested.
 	VMNodesEnabled bool
 }
@@ -99,12 +103,14 @@ func (s *Service) Health(ctx context.Context, peer identity.Peer) (Health, error
 }
 
 type Version struct {
-	Taild       string `json:"taild"`
-	SDK         string `json:"sdk"`
-	Runtime     string `json:"runtime"`
-	Tailscale   string `json:"tailscale"`
-	ABIExpected uint32 `json:"abi_expected"`
-	ABIVerified uint32 `json:"abi_verified,omitempty"`
+	Taild              string `json:"taild"`
+	SDK                string `json:"sdk"`
+	Runtime            string `json:"runtime"`
+	Tailscale          string `json:"tailscale"`
+	Silod              string `json:"silod,omitempty"`
+	ManagementProtocol uint32 `json:"management_protocol,omitempty"`
+	ABIExpected        uint32 `json:"abi_expected"`
+	ABIVerified        uint32 `json:"abi_verified,omitempty"`
 }
 
 func Versions() Version {
@@ -112,6 +118,7 @@ func Versions() Version {
 }
 func (s *Service) Versions() Version {
 	v := Versions()
+	v.Silod, v.ManagementProtocol = s.DaemonVersion, s.ManagementProtocol
 	if s.Runtime != nil && s.Runtime.Version != "" {
 		v.Runtime = s.Runtime.Version
 		v.ABIVerified = s.Runtime.ABI

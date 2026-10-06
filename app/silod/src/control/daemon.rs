@@ -34,7 +34,7 @@ impl w::daemon_service_server::DaemonService for Service {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let v = r.into_inner();
-        let mut admission = self.admission.lock().await;
+        let mut admission = self.admission.lock();
         if admission.helper.as_deref() != Some(v.helper_generation.as_str())
             || header.as_deref() != Some(v.helper_generation.as_str())
         {
@@ -93,7 +93,7 @@ impl w::daemon_service_server::DaemonService for Service {
             },
         };
         self.publisher
-            .set_tailscale(component)
+            .report_tailscale(component)
             .map_err(|_| Status::internal("cannot publish component status"))?;
         Ok(Response::new(()))
     }
@@ -105,7 +105,7 @@ impl w::daemon_service_server::DaemonService for Service {
         if r.into_inner().expected_generation != self.generation.to_string() {
             return Err(Status::failed_precondition("daemon generation changed"));
         }
-        if !self.admission.lock().await.sealed {
+        if !self.admission.lock().sealed {
             return Err(Status::failed_precondition(
                 "seal mutation admission before draining",
             ));

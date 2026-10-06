@@ -11,16 +11,15 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
 func TestActualSDKRuntimeInventoryAndReservations(t *testing.T) {
 	root := testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
-	c.RuntimeRoot = root
+	c.Components = testfixture.Components(root)
 	r, e := Open(context.Background(), c, "instance")
 	if e != nil {
 		t.Fatal(e)
@@ -69,19 +68,20 @@ func TestActualSDKRuntimeInventoryAndReservations(t *testing.T) {
 	}
 }
 func TestMissingRuntime(t *testing.T) {
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
-	if _, e := Open(context.Background(), c, ""); e == nil || !strings.Contains(e.Error(), "runtime is missing") {
+	c.BridgePath = ""
+	if _, e := Open(context.Background(), c, ""); e == nil {
 		t.Fatal(e)
 	}
 }
 
 func TestActualBridgeRejectsInvalidRuntime(t *testing.T) {
 	testfixture.Path(t, "SILO_GO_FFI_PATH", false)
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
-	c.RuntimeRoot = t.TempDir()
-	_, e := silo.Open(context.Background(), silo.WithHome(c.Home), silo.WithRuntimeRoot(c.RuntimeRoot))
+	c.Components = testfixture.Components(t.TempDir())
+	_, e := silo.Open(context.Background(), silo.WithHome(c.Home), silo.WithRuntimeComponents(c.Components))
 	if !silo.IsErrorKind(e, silo.ErrorRuntimeComponentInvalid) {
 		t.Fatalf("actual SDK runtime validation: %v", e)
 	}
@@ -89,9 +89,9 @@ func TestActualBridgeRejectsInvalidRuntime(t *testing.T) {
 
 func TestActualSDKLabelAuthorityAndResilientRecords(t *testing.T) {
 	root := testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
-	c.RuntimeRoot = root
+	c.Components = testfixture.Components(root)
 	r, e := Open(context.Background(), c, "instance")
 	if e != nil {
 		t.Fatal(e)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestBoundedOAuthActualHTTP(t *testing.T) {
@@ -60,7 +61,7 @@ func TestUnregisteredRealTSNetLifecycle(t *testing.T) {
 		http.Error(w, "unregistered offline control", http.StatusServiceUnavailable)
 	}))
 	defer control.Close()
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
 	c.Tailnet.ControlURL = control.URL
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))

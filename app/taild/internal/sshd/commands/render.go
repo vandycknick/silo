@@ -106,7 +106,7 @@ func expiryText(v service.VM, now time.Time) string {
 }
 
 func renderVersion(v service.Version) string {
-	return fmt.Sprintf("taild %s · SDK %s · runtime %s · tailscale %s\n", v.Taild, v.SDK, v.Runtime, v.Tailscale)
+	return fmt.Sprintf("taild %s · SDK %s · runtime %s · tailscale %s · silod %s · management protocol %d · ABI expected %d verified %d\n", v.Taild, v.SDK, v.Runtime, v.Tailscale, v.Silod, v.ManagementProtocol, v.ABIExpected, v.ABIVerified)
 }
 
 func renderWhoAmI(who service.WhoAmI) string {

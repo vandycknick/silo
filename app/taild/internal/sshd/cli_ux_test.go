@@ -19,12 +19,13 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/state"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
 func TestCLIHelpPureAndLiteralValues(t *testing.T) {
 	audit := offlineAudit(t)
-	s := &service.Service{Audit: audit, Config: config.Defaults()}
+	s := &service.Service{Audit: audit, Config: testfixture.Config()}
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "help", Login: "verified@example.com", NodeName: "node.tail.test.", ObservedAt: time.Now()}
 	caller := service.Caller{Peer: p}
 	inputFile, err := os.CreateTemp(t.TempDir(), "input")
@@ -105,7 +106,7 @@ var (
 
 func TestCLIStreamingCommandsRefuseJSON(t *testing.T) {
 	audit := offlineAudit(t)
-	s := &service.Service{Audit: audit, Config: config.Defaults()}
+	s := &service.Service{Audit: audit, Config: testfixture.Config()}
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "metadata", ObservedAt: time.Now()}
 	for _, line := range []string{"shell vm --json", "exec vm --json -- program", "logs vm --json"} {
 		var out, human bytes.Buffer
@@ -117,7 +118,7 @@ func TestCLIStreamingCommandsRefuseJSON(t *testing.T) {
 
 func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
 	audit := offlineAudit(t)
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.VM.Defaults = config.Resources{CPUs: 3, Memory: 4_000_000_000, Disk: 7 << 30}
 	c.VM.DefaultImage = "ghcr.io/example/dev:latest"
 	c.VM.AllowedRegistries = []string{"ghcr.io/example"}

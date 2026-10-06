@@ -1,6 +1,7 @@
 mod config;
 mod control;
 mod engine;
+mod helper;
 mod paths;
 mod provision;
 mod record;
@@ -142,6 +143,7 @@ async fn run(args: Args) -> eyre::Result<()> {
     }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let helper_config = global.tailscale().clone();
     let state = std::sync::Arc::new(control::ControlState::new(
         host,
         global,
@@ -161,13 +163,24 @@ async fn run(args: Args) -> eyre::Result<()> {
     let api_shutdown = tokio_util::sync::CancellationToken::new();
     let mut api_task = tokio::spawn(server.serve(api_shutdown.clone()));
     let system_shutdown = tokio_util::sync::CancellationToken::new();
-    let mut system_task = desired.map(|desired| {
-        tokio::spawn(supervisor::serve(
+    let mut system_task = if let Some(desired) = desired {
+        Some(tokio::spawn(supervisor::serve(
             paths.clone(),
             desired,
-            system_status.unwrap(),
+            system_status.ok_or_else(|| eyre::eyre!("enabled system has no initial status"))?,
             system_shutdown.clone(),
             publisher.clone(),
+        )))
+    } else {
+        None
+    };
+    let helper_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut helper_task = features.tailscale.then(|| {
+        tokio::spawn(helper::serve(
+            state.clone(),
+            helper_config,
+            publisher.clone(),
+            helper_shutdown.clone(),
         ))
     });
     publisher.set_core(silod_spec::status::CorePhase::Ready, None)?;
@@ -194,13 +207,40 @@ async fn run(args: Args) -> eyre::Result<()> {
                 }
                 // Optional integration failure does not take away a working core API.
             }
+            result = async {
+                match helper_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                helper_task = None;
+                if let Err(error) = result.map_err(eyre::Report::from).and_then(|r| r) {
+                    state.set_helper_generation(None).await;
+                    publisher.set_tailscale(silod_spec::status::ComponentStatus {
+                        enabled: true,
+                        state: silod_spec::status::ComponentState::Failed,
+                        diagnostic: Some(format!("helper supervisor failed: {error:#}")),
+                        approval_url: None, dns_name: None, restart_count: 0,
+                        shutdown_protection: silod_spec::status::ShutdownProtection::Unavailable,
+                    })?;
+                }
+            }
         }
     };
     state.begin_stopping().await?;
-    state.seal_mutations().await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(87);
     system_shutdown.cancel();
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(85), async {
+    helper_shutdown.cancel();
+    let drained = tokio::time::timeout_at(deadline, async {
+        let helper_result = if let Some(task) = helper_task.as_mut() {
+            task.await.map_err(eyre::Report::from).and_then(|r| r)
+        } else {
+            Ok(())
+        };
+        state.set_helper_generation(None).await;
+        state.seal_mutations().await;
         state.drain_mutations().await?;
+        helper_result?;
         if let Some(task) = system_task {
             task.await??;
         }
@@ -209,6 +249,16 @@ async fn run(args: Args) -> eyre::Result<()> {
     .await
     .map_err(|_| eyre::eyre!("daemon shutdown deadline expired with incomplete mutation drain"))
     .and_then(|r| r);
+    if drained.is_err() {
+        if let Some(task) = helper_task.as_mut() {
+            if !task.is_finished() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        state.set_helper_generation(None).await;
+        state.seal_mutations().await;
+    }
     api_shutdown.cancel();
     let api_result = match api_result {
         Some(result) => result.map_err(Into::into).and_then(|r| r),

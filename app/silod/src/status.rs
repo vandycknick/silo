@@ -90,6 +90,13 @@ impl StatusPublisher {
     pub(crate) fn set_tailscale(&self, component: ComponentStatus) -> eyre::Result<()> {
         self.update(|s| s.tailscale = component)
     }
+    pub(crate) fn report_tailscale(&self, mut component: ComponentStatus) -> eyre::Result<()> {
+        self.update(|status| {
+            component.restart_count = status.tailscale.restart_count;
+            component.enabled = status.tailscale.enabled;
+            status.tailscale = component;
+        })
+    }
     pub(crate) fn wire(&self) -> eyre::Result<w::DaemonStatus> {
         let s = self
             .status

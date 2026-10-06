@@ -1,10 +1,8 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +11,7 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/units"
-	"go.yaml.in/yaml/v3"
+	silo "github.com/vandycknick/silo/sdk/go"
 )
 
 type Resources struct {
@@ -28,19 +26,17 @@ type Ceilings struct {
 	VMs       uint64 `yaml:"vms_per_principal"`
 }
 type Config struct {
-	TemplatesDir   string     `yaml:"templates_dir"`
-	PoliciesDir    string     `yaml:"policies_dir"`
-	Home           string     `yaml:"home"`
-	RuntimeRoot    string     `yaml:"runtime_root"`
-	InstallRoot    string     `yaml:"install_root"`
-	RuntimeArchive string     `yaml:"runtime_archive"`
-	DiskReserve    units.Size `yaml:"disk_reserve"`
-	Shutdown       struct {
+	TemplatesDir string `yaml:"templates_dir"`
+	PoliciesDir  string `yaml:"policies_dir"`
+	Home         string `yaml:"home"`
+	Components   silo.RuntimeComponents
+	BridgePath   string
+	DiskReserve  units.Size `yaml:"disk_reserve"`
+	Shutdown     struct {
 		StopBudget units.Duration `yaml:"stop_budget"`
 		Margin     units.Duration `yaml:"margin"`
 	} `yaml:"shutdown"`
-	SecretsDir string `yaml:"secrets_dir"`
-	Tailnet    struct {
+	Tailnet struct {
 		Hostname   string `yaml:"hostname"`
 		Tag        string `yaml:"tag"`
 		Capability string `yaml:"capability"`
@@ -67,58 +63,8 @@ type Secrets struct {
 	APIToken     string
 }
 
-func Defaults() Config {
-	var c Config
-	c.Home = "/var/lib/silo-taild"
-	c.DiskReserve = 1 << 30
-	c.Shutdown.StopBudget = units.Duration{Duration: 4 * time.Second}
-	c.Shutdown.Margin = units.Duration{Duration: 250 * time.Millisecond}
-	c.SecretsDir = "/etc/silo-taild/secrets"
-	c.TemplatesDir = "/etc/silo-taild/templates"
-	c.PoliciesDir = "/etc/silo-taild/policies"
-	c.Tailnet.Hostname = "silo"
-	c.Tailnet.Tag = "tag:silo"
-	c.Tailnet.Capability = "github.com/vandycknick/silo/cap/taild"
-	c.Enrollment.Mode = "oauth-app"
-	c.VM.DefaultImage = "ghcr.io/vandycknick/silo/devbox:latest"
-	c.VM.AllowedRegistries = []string{"ghcr.io/vandycknick"}
-	c.VM.Defaults = Resources{CPUs: 2, Memory: 4 << 30, Disk: 20 << 30}
-	c.VM.Ceilings = Ceilings{Resources: Resources{CPUs: 8, Memory: 32 << 30, Disk: 200 << 30}, VMs: 5}
-	c.Sessions.Global = 64
-	c.Sessions.PerPeer = 8
-	return c
-}
-func Load(path string) (Config, error) {
-	c := Defaults()
-	if home := os.Getenv("SILO_HOME"); home != "" {
-		c.Home = home
-	}
-	f, e := os.Open(path)
-	if e != nil {
-		return c, e
-	}
-	defer f.Close()
-	b, e := io.ReadAll(io.LimitReader(f, 65537))
-	if e != nil {
-		return c, e
-	}
-	if len(b) > 65536 {
-		return c, errors.New("config exceeds 64KiB")
-	}
-	d := yaml.NewDecoder(bytes.NewReader(b))
-	d.KnownFields(true)
-	if e = d.Decode(&c); e != nil {
-		if strings.Contains(e.Error(), "field guest_user not found") {
-			return c, errors.New("vm.guest_user is no longer supported; remove it and use create --provision-user NAME:UID:GID:HOME for each VM (default sessions use root)")
-		}
-		return c, e
-	}
-	var extra yaml.Node
-	if e = d.Decode(&extra); !errors.Is(e, io.EOF) {
-		return c, errors.New("config must contain one YAML document")
-	}
-	return c, c.Validate()
-}
+func (Secrets) String() string     { return "frontend credentials (redacted)" }
+func (s Secrets) GoString() string { return s.String() }
 
 // Limits is the operator ceiling as a capability grant, the shape every
 // per-peer grant is intersected with.
@@ -129,11 +75,6 @@ func (c Config) Validate() error {
 	budget, margin := c.Shutdown.StopBudget.Duration, c.Shutdown.Margin.Duration
 	if budget <= 0 || budget > time.Minute || margin <= 0 || margin > time.Second {
 		return errors.New("invalid shutdown stop_budget or margin")
-	}
-	for _, p := range []string{c.InstallRoot, c.RuntimeArchive} {
-		if p != "" && !filepath.IsAbs(p) {
-			return errors.New("install_root and runtime_archive must be absolute")
-		}
 	}
 	if !ValidName(c.Tailnet.Hostname) {
 		return errors.New("invalid tailnet hostname")
@@ -149,13 +90,13 @@ func (c Config) Validate() error {
 	default:
 		return errors.New("invalid enrollment mode")
 	}
-	for _, p := range []string{c.Home, c.SecretsDir, c.TemplatesDir, c.PoliciesDir} {
-		if !filepath.IsAbs(p) {
-			return errors.New("home, secrets_dir, templates_dir and policies_dir must be absolute")
-		}
+	if !filepath.IsAbs(c.Home) {
+		return errors.New("home must be absolute")
 	}
-	if c.RuntimeRoot != "" && !filepath.IsAbs(c.RuntimeRoot) {
-		return errors.New("runtime_root must be absolute")
+	for _, p := range []string{c.TemplatesDir, c.PoliciesDir} {
+		if p != "" && !filepath.IsAbs(p) {
+			return errors.New("document directories must be absolute")
+		}
 	}
 	l, d := c.Limits(), c.VM.Defaults
 	if l.VMs == 0 || l.CPUs == 0 || l.CPUs > 255 || l.Memory == 0 || l.Disk == 0 || d.CPUs == 0 || d.CPUs > l.CPUs || d.Memory == 0 || uint64(d.Memory) > l.Memory || d.Disk == 0 || uint64(d.Disk) > l.Disk {
@@ -167,12 +108,6 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func (c Config) RuntimeStore() string {
-	if c.InstallRoot != "" {
-		return c.InstallRoot
-	}
-	return filepath.Join(c.Home, "runtimes")
-}
 func ValidName(s string) bool {
 	if len(s) == 0 || len(s) > 63 || s[len(s)-1] == '-' {
 		return false
@@ -205,40 +140,4 @@ func ResolveHome(path string, uid int) (string, error) {
 		return "", errors.New("home must not be writable by group or others")
 	}
 	return resolved, nil
-}
-func ReadSecrets(dir string) (Secrets, error) {
-	var s Secrets
-	for _, v := range []struct {
-		name string
-		out  *string
-	}{{"oauth-client-secret", &s.ClientSecret}, {"oauth-app-secret", &s.AppSecret}, {"api-token", &s.APIToken}} {
-		path := filepath.Join(dir, v.name)
-		info, e := os.Lstat(path)
-		if errors.Is(e, os.ErrNotExist) {
-			continue
-		}
-		if e != nil {
-			return s, e
-		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-			return s, fmt.Errorf("secret %s must be a regular 0600 file", v.name)
-		}
-		f, e := os.Open(path)
-		if e != nil {
-			return s, e
-		}
-		b, e := io.ReadAll(io.LimitReader(f, 16385))
-		closeErr := f.Close()
-		if e != nil {
-			return s, e
-		}
-		if closeErr != nil {
-			return s, closeErr
-		}
-		if len(b) > 16384 || strings.TrimSpace(string(b)) == "" {
-			return s, fmt.Errorf("secret %s is empty or oversized", v.name)
-		}
-		*v.out = strings.TrimSpace(string(b))
-	}
-	return s, nil
 }
