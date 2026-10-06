@@ -78,6 +78,15 @@ impl MachineUpdate {
         Self::default()
     }
 
+    /// Rejects a deferred network-builder error before transporting or applying
+    /// this update. Machine-dependent validation still runs during `update`.
+    pub fn validate_network(&self) -> Result<(), &str> {
+        match self.network_error.as_deref() {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+
     /// Sets the machine name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());

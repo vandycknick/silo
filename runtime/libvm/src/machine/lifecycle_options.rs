@@ -51,6 +51,13 @@ pub struct MachineStart {
     pub run_id: MachineRunId,
 }
 
+impl MachineStart {
+    /// Constructs an acknowledged start observation without a live handle.
+    pub fn new(machine: MachineData, run_id: MachineRunId) -> Self {
+        Self { machine, run_id }
+    }
+}
+
 /// Options for waiting on a machine run to exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MachineWaitOptions {
@@ -152,6 +159,23 @@ pub struct MachineExit {
     pub exited_at: Option<SystemTime>,
     /// High-level exit outcome.
     pub outcome: MachineExitOutcome,
+}
+
+impl MachineExit {
+    /// Constructs an owned run-exit observation without altering lifecycle state.
+    pub fn new(
+        machine: MachineData,
+        run_id: Option<MachineRunId>,
+        exited_at: Option<SystemTime>,
+        outcome: MachineExitOutcome,
+    ) -> Self {
+        Self {
+            machine,
+            run_id,
+            exited_at,
+            outcome,
+        }
+    }
 }
 
 /// High-level outcome for a machine run observed by `Machine::wait`.

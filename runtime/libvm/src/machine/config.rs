@@ -88,10 +88,10 @@ impl Machine {
     /// Applies partial settings updates to a stopped machine.
     pub async fn update(&self, update: MachineUpdate) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
-        if let Some(reason) = update.network_error.as_ref() {
+        if let Err(reason) = update.validate_network() {
             return Err(LibVmError::InvalidMachineUpdate {
                 reference: self.id(),
-                reason: reason.clone(),
+                reason: reason.to_owned(),
             });
         }
         let replacement_network: Option<ModelMachineNetworkConfig> =

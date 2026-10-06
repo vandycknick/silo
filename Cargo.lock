@@ -671,6 +671,7 @@ dependencies = [
  "clap",
  "console",
  "eyre",
+ "hyper-util",
  "indicatif",
  "libc",
  "libvm",
@@ -681,11 +682,14 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "silo-config",
+ "silo-vm-control",
  "silod-spec",
  "ssh-key",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tonic",
+ "tower",
  "utils",
  "uuid",
  "vm-spec",
@@ -4659,6 +4663,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-vm-control"
+version = "0.1.0"
+dependencies = [
+ "forward-spec",
+ "libvm",
+ "policy",
+ "prost",
+ "prost-types",
+ "secrets",
+ "serde_json",
+ "silod-spec",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tonic",
+ "uuid",
+ "vm-spec",
+]
+
+[[package]]
 name = "silo-vmm"
 version = "0.1.0"
 dependencies = [
@@ -4729,9 +4753,16 @@ name = "silod-spec"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protoc-bin-vendored",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "uuid",
 ]
 
@@ -6369,9 +6400,11 @@ dependencies = [
  "clap",
  "cpio",
  "flate2",
+ "protoc-bin-vendored",
  "rustix",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 

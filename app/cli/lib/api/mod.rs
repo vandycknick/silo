@@ -3,6 +3,7 @@
 //! `local` is the in-process ABI adapter around libvm. ABI here means ordinary
 //! Rust calls within the CLI process, not a C ABI, FFI surface, or wire protocol.
 
+mod daemon;
 mod local;
 pub(crate) mod machine;
 pub(crate) mod start_options;

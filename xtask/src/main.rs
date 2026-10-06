@@ -23,6 +23,7 @@ mod initramfs;
 mod kernel;
 mod macos;
 mod profiles;
+mod protocol_go;
 mod release;
 mod rprobe;
 mod runtime;
@@ -116,6 +117,10 @@ enum Commands {
     TestUnit,
     TestIntegration,
     VersionCheck,
+    ProtocolGo {
+        #[arg(long)]
+        check: bool,
+    },
     RuntimeArchive {
         #[arg(long, value_enum, default_value_t = Profile::Release)]
         profile: Profile,
@@ -362,6 +367,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             test_integration(&workspace_root, &target_dir, host)?;
         }
         Commands::VersionCheck => version::check(&workspace_root)?,
+        Commands::ProtocolGo { check } => protocol_go::generate(&workspace_root, check)?,
         Commands::RuntimeArchive { profile } => {
             archive::produce_runtime(&workspace_root, &target_dir, profile)?
         }

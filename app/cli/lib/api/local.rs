@@ -2,12 +2,13 @@ use eyre::Context as _;
 use std::time::Duration;
 
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineAgent,
-    MachineBuilder, MachineData, MachineExitOutcome, MachineKillOptions, MachineReadinessOutcome,
-    MachineRef, MachineRetention, MachineRunId, MachineStartOptions, MachineStatus,
-    MachineStopOptions, MachineUpdate, MachineWaitOptions, Memory, NetworkDefinition,
-    NetworkDriver, NetworkTopology, ReadOnlyRuntime, Runtime, RuntimeConfig,
+    ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineBuilder,
+    MachineData, MachineExitOutcome, MachineKillOptions, MachineReadinessOutcome, MachineRef,
+    MachineRetention, MachineRunId, MachineStartOptions, MachineStatus, MachineStopOptions,
+    MachineUpdate, MachineWaitOptions, Memory, NetworkDefinition, NetworkDriver, NetworkTopology,
+    ReadOnlyRuntime, Runtime, RuntimeConfig,
 };
+use silo_vm_control::create::{NormalizedMachineCreate, ResolvedNetwork};
 
 use crate::api::machine::AppMachine;
 use crate::api::types::{ReadOnlyCreationResolution, SourceResolution};
@@ -410,9 +411,7 @@ impl LocalVmService {
         ensure_source_matches_plan(plan, &source)?;
         let runtime = self.runtime().await?.clone().with_image_progress(progress);
         let mut builder = runtime.machine();
-        if let Some(name) = &plan.proposed_name {
-            builder = builder.name(name);
-        }
+        // Source materialization remains native; normalization never selects an image.
         builder = match source.resolved_oci {
             Some(image) => builder.resolved_image(image),
             None => builder.image_source(ImageSource::disk(
@@ -429,63 +428,55 @@ impl LocalVmService {
 }
 
 fn apply_plan(
-    mut builder: MachineBuilder,
+    builder: MachineBuilder,
     plan: &CreatePlan,
     policy_config_dir: Option<&std::path::Path>,
 ) -> eyre::Result<MachineBuilder> {
-    builder = builder
-        .labels(plan.machine.labels.clone())
-        .process(plan.process.clone())
-        .retention(plan.retention)
-        .template_name(plan.template.name.clone())
-        .kernel_args(plan.machine_settings.kernel_args.clone())
-        .nested_virtualization(plan.machine_settings.nested_virtualization)
-        .rosetta(plan.machine_settings.rosetta)
-        .disks(plan.machine_settings.disks.clone())
-        .mounts(resolve_machine_mounts(&plan.machine.mounts)?)
-        .forwards(plan.machine.forwards.clone());
-    if let Some(vsock) = plan.machine.vsock {
-        builder = builder.vsock(vsock);
-    }
-    if let Some(resources) = &plan.machine.resources {
-        if let Some(cpus) = resources.cpus {
-            builder = builder.cpus(cpus);
-        }
-        if let Some(memory) = memory_mib(Some(resources))? {
-            builder = builder.memory(Memory::mebibytes(u64::from(memory)));
-        }
-    }
-    if let Some(bytes) = disk_size_bytes(plan.machine.disk_size.as_deref())? {
-        builder = builder.root_disk_size(bytes);
-    }
-    if let Some(userdata) = &plan.machine.userdata {
-        builder = builder.userdata(userdata);
-    }
-    if let Some(network) = plan.machine.network.clone() {
-        let network = network.resolve_machine_network(policy_config_dir)?;
-        builder = builder.network(|network_builder| network.apply(network_builder));
-    }
-    if let Some(kernel) = &plan.machine_settings.kernel {
-        builder = builder.kernel(kernel);
-    }
-    if let Some(initramfs) = &plan.machine_settings.initramfs {
-        builder = builder.initramfs(initramfs);
-    }
-    let agent = plan.machine_settings.agent.clone();
-    let user = plan.machine_settings.provision_user.clone();
-    builder = builder.guest(|guest| {
-        let guest = match agent.clone() {
-            MachineAgent::Default => guest,
-            MachineAgent::Custom { path } => guest.agent(Some(path)),
-            MachineAgent::Disabled => guest.agent(None),
-            _ => guest,
-        };
-        match user {
-            Some(user) => guest.user(user),
-            None => guest,
-        }
-    });
-    Ok(builder.agent_mode(Some(agent)))
+    let mounts = resolve_machine_mounts(&plan.machine.mounts)?;
+    let memory_bytes = memory_mib(plan.machine.resources.as_ref())?
+        .map(|memory| Memory::mebibytes(u64::from(memory)).as_bytes());
+    let root_disk_size_bytes = disk_size_bytes(plan.machine.disk_size.as_deref())?;
+    let network = plan
+        .machine
+        .network
+        .clone()
+        .map(|network| network.resolve_machine_network(policy_config_dir))
+        .transpose()?
+        .map(|network| match network {
+            ResolvedMachineNetwork::Private { policy, publish } => {
+                ResolvedNetwork::Private { policy, publish }
+            }
+            ResolvedMachineNetwork::None => ResolvedNetwork::None,
+            ResolvedMachineNetwork::Named { name } => ResolvedNetwork::Named { name },
+        });
+    let normalized = NormalizedMachineCreate {
+        name: plan.proposed_name.clone(),
+        template_name: plan.template.name.clone(),
+        labels: plan.machine.labels.clone(),
+        process: plan.process.clone(),
+        retention: plan.retention,
+        kernel: plan.machine_settings.kernel.clone(),
+        initramfs: plan.machine_settings.initramfs.clone(),
+        kernel_args: plan.machine_settings.kernel_args.clone(),
+        nested_virtualization: plan.machine_settings.nested_virtualization,
+        rosetta: plan.machine_settings.rosetta,
+        disks: plan.machine_settings.disks.clone(),
+        mounts,
+        forwards: plan.machine.forwards.clone(),
+        vsock: plan.machine.vsock,
+        cpus: plan
+            .machine
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.cpus),
+        memory_bytes,
+        root_disk_size_bytes,
+        userdata: plan.machine.userdata.clone(),
+        network,
+        agent: plan.machine_settings.agent.clone(),
+        provision_user: plan.machine_settings.provision_user.clone(),
+    };
+    Ok(normalized.apply_to_builder(builder)?)
 }
 
 fn ensure_source_matches_plan(plan: &CreatePlan, source: &SourceResolution) -> eyre::Result<()> {
