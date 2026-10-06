@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 // The grammar is exercised below authentication with a verified peer that
@@ -18,7 +18,7 @@ import (
 // malformed request slipped through, the nil runtime would panic instead.
 func TestCommandGrammar(t *testing.T) {
 	audit := offlineAudit(t)
-	s := &service.Service{Audit: audit, Capability: "cap", Config: config.Defaults()}
+	s := &service.Service{Audit: audit, Capability: "cap", Config: testfixture.Config()}
 	peer := identity.Peer{Principals: []identity.Principal{"tag:ci"}, NodeID: "grammar", NodeName: "ci", ObservedAt: time.Now()}
 	caller := service.Caller{Peer: peer}
 	terminal := service.Terminal{Present: true, Window: service.Window{Rows: 24, Columns: 80}}

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func TestCleanPublicConsumerAndActualCheckBinary(t *testing.T) {
+func TestCleanPublicConsumerAndManagedHelperBinary(t *testing.T) {
 	testfixture.Path(t, "SILO_GO_FFI_PATH", false)
 	_, source, _, ok := runtime.Caller(0)
 	if !ok {
@@ -55,50 +55,29 @@ func main(){ctx:=context.Background();_,e:=silo.Open(ctx,silo.WithHome(os.Args[1
 		t.Fatalf("taild build: %v\n%s", e, output)
 	}
 	home := t.TempDir()
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	writeConfig := func(home, root string) {
-		t.Helper()
-		body := fmt.Sprintf("home: %q\nsecrets_dir: %q\ntemplates_dir: %q\npolicies_dir: %q\n", home, t.TempDir(), t.TempDir(), t.TempDir())
-		if root != "" {
-			body += fmt.Sprintf("runtime_root: %q\n", root)
+	for _, command := range []string{"version", "--version", "--help"} {
+		cmd := exec.CommandContext(ctx, binary, command)
+		cmd.Env = []string{"HOME=" + home, "SILO_HOME=" + home, "SILO_GO_FFI_PATH=" + filepath.Join(home, "missing-bridge")}
+		bytes, e := cmd.CombinedOutput()
+		output := string(bytes)
+		if e != nil {
+			t.Fatalf("isolated helper command: %v %s", e, output)
 		}
-		if e := os.WriteFile(configPath, []byte(body), 0600); e != nil {
-			t.Fatal(e)
-		}
-	}
-	writeConfig(home, "")
-	output, e := run(module, binary, "--check", "--config", configPath)
-	if os.Geteuid() == 0 {
-		if e == nil || !strings.Contains(output, "refuses to run as root") {
-			t.Fatalf("root check: %v %s", e, output)
-		}
-		testfixture.Unavailable(t, "nonroot prepared-home binary check requires a nonroot uid")
-	}
-	if e == nil || !strings.Contains(output, "runtime is missing") {
-		t.Fatalf("missing-runtime check: %v %s", e, output)
-	}
-	writeConfig("/", "")
-	output, e = run(module, binary, "--check", "--config", configPath)
-	if e == nil || !strings.Contains(output, "not owned") {
-		t.Fatalf("foreign-home check: %v %s", e, output)
-	}
-	root := testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
-	writeConfig(home, root)
-	output, e = run(module, binary, "--check", "--config", configPath)
-	if e != nil || !strings.Contains(output, "configuration and runtime ready") {
-		t.Fatalf("prepared-home check: %v %s", e, output)
-	}
-	for _, command := range []string{"version", "--version"} {
-		output, e = run(module, binary, command, "--config", configPath)
-		if e != nil || !strings.Contains(output, "runtime "+silo.Version) || !strings.Contains(output, fmt.Sprintf("ABI expected %d verified %d", silo.NativeABIVersion, silo.NativeABIVersion)) {
-			t.Fatalf("actual installed version: %v %s", e, output)
+		if strings.Contains(command, "version") && (!strings.Contains(output, "SDK "+silo.Version+" runtime unavailable") || !strings.Contains(output, "verified unavailable")) {
+			t.Fatal("version claimed unverified runtime or ABI", output)
 		}
 	}
-	output, e = run(module, binary, "install-runtime", "--config", configPath, "--runtime-archive", filepath.Join(home, "missing-archive"), "--install-root", filepath.Join(home, "offline-store"))
-	if e == nil || !strings.Contains(output, "offline SDK runtime installation failed") {
-		t.Fatalf("explicit offline installer: %v %s", e, output)
+	for _, args := range [][]string{nil, {"--check"}, {"--config", filepath.Join(home, "missing-config")}, {"stop-vms"}, {"install-runtime"}} {
+		output, e := run(module, append([]string{binary}, args...)...)
+		if e == nil {
+			t.Fatal("standalone helper invocation accepted", args)
+		}
+		exit, ok := e.(*exec.ExitError)
+		if !ok || exit.ExitCode() != 2 {
+			t.Fatalf("configuration error must exit 2: %v %s", e, output)
+		}
 	}
-	if _, e = os.Stat(filepath.Join(home, "taild", "tsnet")); !os.IsNotExist(e) {
-		t.Fatal("--check initialized a tailnet node")
+	if entries, e := os.ReadDir(home); e != nil || len(entries) != 0 {
+		t.Fatal("offline helper command wrote Home", entries, e)
 	}
 }

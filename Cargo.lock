@@ -4743,6 +4743,8 @@ dependencies = [
  "libc",
  "libvm",
  "nix 0.31.3",
+ "parking_lot",
+ "prost",
  "prost-types",
  "secrets",
  "serde",

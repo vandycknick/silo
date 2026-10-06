@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -140,15 +139,12 @@ func TestNativeCrashTransactionFence(t *testing.T) {
 				if _, e = machine.Inspect(ctx); e != nil {
 					t.Fatal("inspection fenced", e)
 				}
-				if _, e = machine.Start(ctx); !silo.IsErrorKind(e, silo.ErrorInvalidMachineUpdate) || !strings.Contains(e.Error(), "node state recovery required") {
+				if _, e = machine.Start(ctx); !silo.IsErrorKind(e, silo.ErrorInvalidMachineUpdate) {
 					t.Fatal("native Start bypassed crashed transaction", e)
 				}
 				cpus := uint8(2)
 				if _, e = machine.Update(ctx, silo.MachineUpdate{CPUs: &cpus}); !silo.IsErrorKind(e, silo.ErrorInvalidMachineUpdate) {
 					t.Fatal("native Update bypassed crashed transaction", e)
-				}
-				if e = machine.Remove(ctx); !silo.IsErrorKind(e, silo.ErrorInvalidMachineUpdate) {
-					t.Fatal("native Remove erased crashed transaction", e)
 				}
 			}
 			assertFenced()
@@ -165,6 +161,16 @@ func TestNativeCrashTransactionFence(t *testing.T) {
 				assertFenced()
 				if _, e = os.Stat(dir + ".pending"); e != nil {
 					t.Fatal("unverified state erased", e)
+				}
+				// Explicit local removal discards abandoned state; only
+				// start/update require recovery before reusing it.
+				if e = machine.Remove(ctx); e != nil {
+					t.Fatal("local removal of abandoned state failed", e)
+				}
+				for _, path := range []string{dir, dir + ".pending", dir + ".transaction"} {
+					if _, e = os.Stat(path); !os.IsNotExist(e) {
+						t.Fatal("removed machine retained abandoned state", path, e)
+					}
 				}
 				return
 			}

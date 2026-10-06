@@ -2,10 +2,11 @@
 // Accepted native mutations own their semaphore permit independently of RPC waiters.
 // Sealing admission precedes draining; native sessions are outside this tracker.
 use libvm::{HostPaths, ResolvedRuntimeComponents, Runtime, RuntimeConfig};
+use parking_lot::Mutex;
 use silo_config::GlobalConfig;
 use silod_spec::daemon::v1 as w;
 use std::{future::Future, sync::Arc, time::Duration};
-use tokio::sync::{oneshot, Mutex, OnceCell, Semaphore};
+use tokio::sync::{oneshot, OnceCell, Semaphore};
 use tonic::{Request, Status};
 mod daemon;
 mod machine;
@@ -109,16 +110,25 @@ impl ControlState {
             .wire()
             .map_err(|_| Status::internal("cannot read daemon status"))
     }
+    pub(crate) fn check_helper(&self, request: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(tag) = request.metadata().get("x-silo-helper-generation") {
+            let admission = self.admission.lock();
+            if tag.to_str().ok().is_none() || tag.to_str().ok() != admission.helper.as_deref() {
+                return Err(Status::failed_precondition("stale helper generation"));
+            }
+        }
+        Ok(request)
+    }
     pub(crate) async fn set_helper_generation(&self, generation: Option<uuid::Uuid>) {
-        self.admission.lock().await.helper = generation.map(|v| v.to_string());
+        self.admission.lock().helper = generation.map(|v| v.to_string());
     }
     pub(crate) async fn begin_stopping(&self) -> eyre::Result<()> {
-        self.admission.lock().await.stopping = true;
+        self.admission.lock().stopping = true;
         self.publisher
             .set_core(silod_spec::status::CorePhase::Stopping, None)
     }
     pub(crate) async fn seal_mutations(&self) {
-        self.admission.lock().await.sealed = true;
+        self.admission.lock().sealed = true;
     }
     pub(crate) async fn drain_mutations(&self) -> Result<(), Status> {
         let _permits = self
@@ -166,12 +176,13 @@ impl ControlState {
         request: &Request<impl Sized>,
         protected: bool,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
-        let admission = self.admission.lock().await;
-        let helper = request
-            .metadata()
-            .get("x-silo-helper-generation")
-            .and_then(|v| v.to_str().ok());
-        if helper.is_some() && helper != admission.helper.as_deref() {
+        let admission = self.admission.lock();
+        let tag = request.metadata().get("x-silo-helper-generation");
+        let helper = tag
+            .map(|v| v.to_str())
+            .transpose()
+            .map_err(|_| Status::failed_precondition("stale helper generation"))?;
+        if tag.is_some() && helper != admission.helper.as_deref() {
             return Err(Status::failed_precondition("stale helper generation"));
         }
         if admission.sealed

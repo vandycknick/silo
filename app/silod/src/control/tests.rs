@@ -413,6 +413,18 @@ async fn helper_reports_preserve_instance_and_reject_stale_generations() {
     let root = tempfile::tempdir().unwrap();
     let owner = state(root.path());
     let generation = uuid::Uuid::new_v4();
+    owner
+        .publisher
+        .set_tailscale(silod_spec::status::ComponentStatus {
+            enabled: true,
+            state: silod_spec::status::ComponentState::Starting,
+            diagnostic: None,
+            approval_url: None,
+            dns_name: None,
+            restart_count: 3,
+            shutdown_protection: silod_spec::status::ShutdownProtection::Unavailable,
+        })
+        .unwrap();
     owner.set_helper_generation(Some(generation)).await;
     let service = Service(owner.clone());
     let report = |generation: uuid::Uuid, instance: &str| {
@@ -471,6 +483,16 @@ async fn helper_reports_preserve_instance_and_reject_stale_generations() {
         owner.get_status().await.unwrap().tailscale.unwrap().state,
         w::ComponentState::NeedsAuth as i32
     );
+    assert_eq!(
+        owner
+            .get_status()
+            .await
+            .unwrap()
+            .tailscale
+            .unwrap()
+            .restart_count,
+        3
+    );
     assert!(owner.runtime.get().is_none());
 }
 
@@ -495,4 +517,115 @@ async fn real_uds_server_stops_without_runtime_initialization() {
     assert!(!dir.join("control.sock").exists());
     assert!(owner.runtime.get().is_none());
     assert!(owner.components.get().is_none());
+}
+
+#[tokio::test]
+async fn stale_helper_reads_rejected_at_every_rpc_service_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let generation = uuid::Uuid::new_v4();
+    owner.set_helper_generation(Some(generation)).await;
+    let dir = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner.clone(), dir.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let path = dir.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let stale = || {
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "x-silo-helper-generation",
+            uuid::Uuid::new_v4().to_string().parse().unwrap(),
+        );
+        request
+    };
+    let mut daemon = w::daemon_service_client::DaemonServiceClient::new(channel.clone());
+    assert_eq!(
+        daemon.get_status(stale()).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        daemon.get_runtime_info(stale()).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut machine = w::machine_service_client::MachineServiceClient::new(channel.clone());
+    assert_eq!(
+        machine.list_machines(stale()).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut network = w::network_service_client::NetworkServiceClient::new(channel.clone());
+    assert_eq!(
+        network
+            .list_network_definitions(stale())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut runtime = w::runtime_service_client::RuntimeServiceClient::new(channel);
+    assert_eq!(
+        runtime
+            .propose_machine_name(stale())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut current = Request::new(());
+    current.metadata_mut().insert(
+        "x-silo-helper-generation",
+        generation.to_string().parse().unwrap(),
+    );
+    owner.begin_stopping().await.unwrap();
+    assert!(daemon.get_status(current).await.is_ok());
+    assert!(daemon.get_status(Request::new(())).await.is_ok());
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn draining_helper_can_finish_mutations_before_final_seal() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let generation = uuid::Uuid::new_v4();
+    owner.set_helper_generation(Some(generation)).await;
+    owner.begin_stopping().await.unwrap();
+    assert!(owner.admit(&Request::new(()), false).await.is_err());
+    let mut request = Request::new(());
+    request.metadata_mut().insert(
+        "x-silo-helper-generation",
+        generation.to_string().parse().unwrap(),
+    );
+    let permit = owner.admit(&request, false).await.unwrap();
+    // This represents helper exit: invalidate identity before final admission
+    // seal, but do not count cancellation of its waiter as native completion.
+    owner.set_helper_generation(None).await;
+    owner.seal_mutations().await;
+    assert!(owner.admit(&request, false).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), owner.drain_mutations())
+            .await
+            .is_err()
+    );
+    drop(permit);
+    tokio::time::timeout(Duration::from_secs(1), owner.drain_mutations())
+        .await
+        .unwrap()
+        .unwrap();
 }

@@ -1,53 +1,77 @@
 # Operating taild
 
-taild is an optional Linux service. It exposes a tailnet SSH lobby and authenticated
-HTTPS health/metrics endpoints, using the public Go SDK to manage one host's VMs.
-Native Linux amd64 and arm64 packaging must be qualified separately. macOS service
-operation is unsupported; Linux results do not qualify Virtualization.framework.
+Taild is an optional same-user helper supervised by silod. It exposes a tailnet
+SSH lobby and authenticated HTTPS health/metrics endpoints. It uses Silo's normal
+Home/configuration and the manager-selected native SDK assets, not a separate
+service account or runtime installation. Native Linux and macOS execution must
+be qualified on their respective hosts; Linux results do not qualify HVF.
 
-## Install
+## Enable
 
-Use the portable archive and matching runtime-only archive from the same release
-and target. See [PACKAGING](../../PACKAGING.md) for provenance and build order.
-Install `bin/taild` at `/usr/bin/taild`. Copy the shipped service and sysusers
-fragment into `/etc/systemd/system/silo-taild.service` and
-`/etc/sysusers.d/silo-taild.conf`, then run `systemd-sysusers`.
-The unit maintains `/var/lib/silo-taild` with mode 0700 and grants the service user
-membership in `kvm`. Create that directory before the initial offline installation,
-which runs before the unit starts. Check that `/dev/kvm` is group-accessible on this host.
-
-Create `/etc/silo-taild` and its `secrets`, `templates`, and `policies` directories.
-Secrets directory: owner `silo-taild:silo-taild`, mode 0700. Secret files: same owner,
-mode 0600, regular files, no symlinks. Config and operator documents must be readable
-by the service user and writable only by the operator. Start from the shipped
-`config.yaml`, `examples/devbox.yaml` and `examples/dev-egress.hcl`.
-Put the YAML template in `templates/devbox.yaml` and HCL in `policies/dev-egress.hcl`.
-Set `runtime_archive` to the absolute path of the matching runtime-only archive.
+Install matching Silo binaries, runtime assets and native Go bridge together.
+Silod requires `taild` and the native bridge beside its canonical executable:
+`libsilo_go_ffi.so` on Linux or `libsilo_go_ffi.dylib` on macOS. Do not override the
+helper's SDK loader or install a second SDK runtime. Product/protocol/ABI mismatch
+is a component failure, never a fallback to another installed binary.
 
 ```sh
-sudo install -d -o silo-taild -g silo-taild -m 0700 /var/lib/silo-taild
-sudo -u silo-taild /usr/bin/taild install-runtime --config /etc/silo-taild/config.yaml
-sudo -u silo-taild /usr/bin/taild --check --config /etc/silo-taild/config.yaml
-sudo -u silo-taild /usr/bin/taild version --config /etc/silo-taild/config.yaml
-sudo systemctl daemon-reload
-sudo systemctl enable --now silo-taild
+silo daemon up --tailscale --system=false
+silo daemon status
 ```
 
-Offline installation uses the archive checksum embedded in the qualified SDK,
-not a downloaded checksum or an operator-supplied digest. An explicit `runtime_root`
-must include root `runtime-manifest.json` with exact SDK version, native SDK target
-identifier and the complete bin/assets inventory with lowercase SHA-256 digests.
-Wrong versions, altered components, extra paths and traversal paths must fail
-before VM use. Do not set `SILO_GO_FFI_PATH` for installed binaries: the bridge is
-embedded, digest-checked and ABI/product-version checked by the SDK loader.
+The normal strict version-1 configuration accepts:
+
+```yaml
+daemon:
+  version: "1"
+  system:
+    enabled: false
+  tailscale:
+    enabled: true
+    hostname: silo
+    tag: tag:silo
+    enrollment:
+      mode: oauth-app
+```
+
+`up` persists explicitly selected features and leaves other settings intact.
+Core Ready, Tailscale Starting and Tailscale NeedsAuth are distinct states. Pending
+network/login does not take away the core API. Read the approval URL through
+local daemon status; URLs are not logged. Deterministic helper setup failures
+remain visible until configuration/restart, while unexpected exits get bounded
+restart backoff. Linux boot-before-login additionally depends on account linger;
+see [daemon bootstrap](../system-daemon.md).
+
+Operator templates and policies live in `<config_dir>/templates` and
+`<config_dir>/policies`. Missing directories are valid. Principal documents,
+audit, pins and the stable instance remain in `<Home>/taild`. Symlinks within
+selected roots and unsafe document/secret leaves are rejected.
+
+Do not install the old standalone service/sysusers configuration. Existing
+service accounts and `/var/lib/silo-taild` state are neither migrated nor deleted.
+`taild help` and `taild version` work offline; only a manager-provided bootstrap
+can start the helper. Offline version does not load a bridge or claim a verified
+ABI. Remote version reports the actual connected manager and native ABI.
 
 ## Credentials and authorization
 
-The local files are `oauth-client-secret`, `oauth-app-secret`, and `api-token`. Supply only those
-required by the configured enrollment mode. `oauth-client-secret` provisions the tagged
-lobby. Interactive enrollment requires user consent, OAuth-app enrollment also
-requires `oauth-app-secret`. Optional key-expiry administration uses `api-token`.
-Never put credentials in YAML, service environment, command arguments or reports.
+Use existing plain Home-scope secrets:
+
+| Name | Purpose |
+|---|---|
+| `tailscale.lobby.client_secret` | Tagged lobby provisioning and tagged VM bootstrap |
+| `tailscale.lobby.oauth_app_secret` | User-consent OAuth app setup |
+| `tailscale.lobby.api_token` | Optional key-expiry administration |
+
+For example:
+
+```sh
+silo secret set tailscale.lobby.client_secret --value-stdin < /private/client-secret
+```
+
+Each optional value is limited to 16KiB. Missing values are allowed; corrupt,
+unavailable or wrong-kind values fail helper setup. Credentials travel only in
+the one-use bootstrap frame, never YAML, argv, environment, status or logs.
 Configure the [tailnet policy](tailnet-policy.md) before admitting users.
 
 ## Optional VM enrollment
@@ -67,7 +91,7 @@ All VM-node enrollment runs inside netd alongside guest boot. Taild waits at mos
 three seconds after guest readiness for a login URL. The guest is accessible through
 `ssh -t silo shell NAME`. Netd initiates required browser reauthentication without a
 VM restart; `show` displays the login URL. Active lobbies surface deduplicated notices.
-`disable_key_expiry` runs in netd and failures appear in status while being retried.
+`daemon.tailscale.enrollment.disable-key-expiry` runs in netd and failures appear in status while being retried.
 
 Humans may request `--tag tag:NAME` repeatedly. Tailscale's tag-owner permissions
 authorize assignment through the caller's user-authorized credential or browser
@@ -119,20 +143,20 @@ reuse; ephemeral registrations follow Tailscale's own cleanup behavior. Successf
 `rm` output contains only the normal removal summary.
 
 Set per-principal VM ceilings, per-VM CPU/memory/disk ceilings, session concurrency,
-image registry allowlist and `disk_reserve` in the operator config. The remote
+image registry allowlist and `disk-reserve` under `daemon.tailscale`. The remote
 surface accepts operator-approved templates and policies, never arbitrary host
 paths or host file mounts. Only `own` scope is accepted in v1. SIGHUP reloads
 operator documents; inspect logs for rejection and retained prior documents.
 
 ## Restart and shutdown
 
-`KillMode=process` is essential: ordinary stop/restart terminates taild only.
-Lobby sessions drop; running VM workers and independent guest SSH sessions
-(`ssh root@dev` by default, or the explicitly provisioned guest username) survive.
-Never add `Delegate=` or use a whole-cgroup kill to repair the service.
-At host shutdown, the logind delay inhibitor permits a bounded SDK stop of managed
-VMs. The ExecStop fallback stops VMs only when system state is `stopping`.
-Configure shutdown budget/margin within the host's inhibitor delay and test them.
+`KillMode=process` is essential: the user service terminates silod, which drains
+and reaps taild explicitly. Independent VM workers and guest SSH sessions survive.
+Helper-owned lobby sessions drain within the bounded shutdown window; unexpected
+parent-pipe EOF cancels them immediately. Neither event is a host-shutdown request.
+Never use a whole-cgroup kill to repair the service. On Linux, the existing logind
+delay inhibitor permits a bounded stop of managed VMs only for authenticated host
+shutdown. Configure its budget/margin within the host's inhibitor delay and test it.
 
 Audit records live below the private home and rotate; treat them as access records.
 `/healthz` and `/metrics` use the same capability authorization as the lobby.
@@ -152,11 +176,12 @@ details is recorded. Automated offline tests do not establish real tailnet behav
   approve the URL and verify direct SSH without a reboot. For OAuth-app creation,
   verify no image pull or VM record before consent, and replay/late exchange rejection.
   Expire an enrolled node and complete its new browser login while the guest stays up.
-- [ ] OPS-03: run the packaged acceptance script with isolated HOME and offline
-  runtime installation; reject runtime version/hash/path and bridge version mismatch.
-- [ ] Crash native bridge deliberately on a disposable host. It is in-process:
-  a fatal crash means transport loss, **not a guaranteed SSH exit 9**. systemd
-  restarts taild; VM state is reconciled. Recoverable unavailability can return 9.
+- [ ] OPS-03: run packaged acceptance with an isolated Home and no installed SDK
+  runtime; verify the adjacent bridge is mapped and exact product assets are reused.
+  Reject component and bridge version/ABI/path mismatches.
+- [ ] Crash the native bridge deliberately on a disposable host. It is in-process:
+  a fatal crash means transport loss, **not a guaranteed SSH exit 9**. Silod restarts
+  taild and inventory reconciles. Recoverable unavailability can return 9.
 - [ ] Exhaust scratch disk during create and verify bounded error without corrupt
   inventory; inspect an unmanaged machine without mutating it.
 - [ ] Delete a VM node in the admin console; observe expired/unreadable state and
@@ -172,6 +197,7 @@ unavailable. Release memory acceptance must use the shipped artifact: the histor
 unstripped debug agent OOMs at 256 MiB. Retained debug builds require at least 1 GiB;
 the current Linux amd64 release archive passed real guest execution at 256 MiB on
 2026-10-01. This does not qualify other guest workloads or architectures.
-`taild version` reports numeric required and actual verified native ABI (currently
-1); mismatched bridges are rejected before native API symbols are resolved. The
-matching bridge is embedded in the portable taild binary.
+Offline `taild version` reports the required ABI (currently 1), not an invented
+verified value. The remote version reports the actually verified ABI and connected
+silod/protocol. Integrated startup loads the manager-selected adjacent bridge;
+it does not extract an embedded SDK bridge.

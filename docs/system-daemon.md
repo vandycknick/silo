@@ -455,15 +455,26 @@ Common failures are actionable:
   combinations need a separately installed binfmt/emulation path.
 - Unix socket bind mounts and filesystem notifications across shared paths do
   not have native-host filesystem semantics in every tool.
-- No root daemon, global socket takeover, automatic host-tool installation,
-  Kubernetes service, or manager RPC API is included in v1. Image upgrades are
-  always automatic; there is no switch to pin the running image yet.
-## Optional tailnet service
+- No root daemon, global socket takeover, automatic host-tool installation or
+  Kubernetes service is included. Management RPC is private and same-user only.
+  Image upgrades are automatic; there is no switch to pin the running image yet.
+## Optional tailnet helper
 
-`taild` is a separate optional Linux service using the public Go SDK, not a remote
-host-login interface to silod. Its dedicated home is `/var/lib/silo-taild`.
-See the [operator guide](taild/operator.md) for the shipped systemd unit, private
-secret directories, logind shutdown inhibitor, stopping-only fallback and manual
-restart/shutdown drills. Both service shapes require `KillMode=process` so ordinary
-restart leaves VM workers running. Real logind/systemd survival and a one-week soak
-remain explicit qualification gates; daemonless Linux results do not qualify macOS.
+`silo daemon up --tailscale` enables the same-user `taild` child. It is not a
+remote host-login interface. The existing user service owns silod, and silod owns
+the helper through a private bootstrap/lifetime pipe. Core readiness remains
+independent of tailnet enrollment and reports pending authentication separately.
+
+The helper uses normal Silo Home/config paths and exact manager-selected native
+assets. Its stable identity, pins and audit remain under `<Home>/taild`; optional
+frontend credentials come from plain Home-scope secrets. See the
+[operator guide](taild/operator.md) for setup and authorization.
+
+Helper crashes get bounded restart backoff. Normal silod termination drains and
+reaps the helper; owner-pipe EOF after an unexpected parent death cancels it
+within five seconds. Neither event stops VMs. `KillMode=process` preserves VM
+descendants while silod explicitly owns helper cleanup.
+
+Real logind/systemd survival, live tailnet authentication, native macOS/HVF and
+soak qualification require their corresponding hosts/credentials; Linux fixture
+results do not establish those gates.

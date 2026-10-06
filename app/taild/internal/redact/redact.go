@@ -41,6 +41,11 @@ func Text(text string, secrets ...string) string {
 	return text
 }
 
+// LogText never emits enrollment URLs; those belong to local component status.
+func LogText(text string, secrets ...string) string {
+	return urls.ReplaceAllString(Text(text, secrets...), "[url]")
+}
+
 type Handler struct {
 	next    slog.Handler
 	secrets []string
@@ -58,12 +63,12 @@ func (h *Handler) attr(a slog.Attr) slog.Attr {
 	case slog.KindGroup:
 		a.Value = slog.GroupValue(h.attrs(v.Group())...)
 	case slog.KindString, slog.KindAny:
-		a.Value = slog.StringValue(Text(v.String(), h.secrets...))
+		a.Value = slog.StringValue(LogText(v.String(), h.secrets...))
 	}
 	return a
 }
 func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
-	r := slog.NewRecord(record.Time, record.Level, Text(record.Message, h.secrets...), record.PC)
+	r := slog.NewRecord(record.Time, record.Level, LogText(record.Message, h.secrets...), record.PC)
 	record.Attrs(func(a slog.Attr) bool { r.AddAttrs(h.attr(a)); return true })
 	return h.next.Handle(ctx, r)
 }

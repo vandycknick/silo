@@ -14,6 +14,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/tailnet"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"golang.org/x/crypto/ssh"
 	"net/http"
 	"tailscale.com/tsnet"
@@ -27,7 +28,7 @@ func TestLiveTailnetLobbyIdentityAndCapability(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
 	c.Tailnet.Hostname = "silo-test"
 	c.Tailnet.Tag = "tag:silo-test"

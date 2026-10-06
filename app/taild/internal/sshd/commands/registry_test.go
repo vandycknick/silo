@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/sshd/cmdline"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestRegistryIsTheWholeApplication(t *testing.T) {
@@ -42,7 +42,7 @@ func TestRegistryIsTheWholeApplication(t *testing.T) {
 // One declaration per option drives parsing, the session-flag scanner and
 // help, so what help documents is exactly what the parser accepts.
 func TestDeclarationsDriveHelpAndArity(t *testing.T) {
-	cfg := config.Defaults()
+	cfg := testfixture.Config()
 	for _, c := range all {
 		flags := flagsOf(c)
 		text, ok := detailedHelp([]string{c.Name}, &cfg)

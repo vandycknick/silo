@@ -7,6 +7,7 @@ toolchain go1.26.8
 require (
 	github.com/creack/pty v1.1.24
 	github.com/godbus/dbus/v5 v5.2.2
+	github.com/google/uuid v1.6.0
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
 	github.com/vandycknick/silo/sdk/go v0.0.0
 	github.com/vandycknick/silo/specs/protocol/go v0.0.0

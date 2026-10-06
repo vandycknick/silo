@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
@@ -18,9 +17,9 @@ func TestActualKVMMultiVMShutdownCoordinator(t *testing.T) {
 		t.Skip("SILO_E2E_KVM=1 required for real multi-VM stop")
 	}
 	disk := testfixture.Path(t, "SILO_TEST_LOCAL_DISK", false)
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
-	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
+	c.Components = testfixture.Components(testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true))
 	ctx, done := context.WithTimeout(context.Background(), 150*time.Second)
 	defer done()
 	r, err := runtime.Open(ctx, c, "shutdown-instance")

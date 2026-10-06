@@ -14,12 +14,13 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/metrics"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/tailnet"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestActualUnregisteredNodeDeniesHTTPHeaders(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "offline", http.StatusServiceUnavailable) }))
 	defer control.Close()
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
 	c.Tailnet.ControlURL = control.URL
 	node, e := tailnet.Start(context.Background(), c, config.Secrets{}, slog.New(slog.NewTextHandler(io.Discard, nil)))

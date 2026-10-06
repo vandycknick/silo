@@ -4,6 +4,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -19,6 +20,8 @@ import (
 
 const HelperGenerationHeader = "x-silo-helper-generation"
 const MaxMessageBytes = 16 << 20
+
+var ErrIdentityMismatch = errors.New("daemon management identity mismatch")
 
 // Client exposes owned protobuf snapshots and immutable IDs, not closable native
 // machines. Close releases only the local management connection.
@@ -84,10 +87,10 @@ func (c *Client) Admit(ctx context.Context, productVersion, generation, home, co
 		return nil, fmt.Errorf("inspect daemon identity: %w", err)
 	}
 	if status.ProtocolMajor != 1 || status.ProductVersion != productVersion {
-		return nil, fmt.Errorf("daemon management product/protocol mismatch")
+		return nil, fmt.Errorf("%w: product/protocol", ErrIdentityMismatch)
 	}
 	if status.Generation != generation || string(status.Home) != home || string(status.ConfigDir) != configDir {
-		return nil, fmt.Errorf("daemon management generation or Home/config identity mismatch")
+		return nil, fmt.Errorf("%w: generation or Home/config", ErrIdentityMismatch)
 	}
 	return status, nil
 }

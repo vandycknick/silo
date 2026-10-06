@@ -38,9 +38,9 @@ func TestLiveNetdTagEnrollmentKVMStateReuseAndSSH(t *testing.T) {
 	defer cancel()
 	root := testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
 	registry := testfixture.OCIRegistry(t, testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true))
-	cfg := config.Defaults()
+	cfg := testfixture.Config()
 	cfg.Home = t.TempDir()
-	cfg.RuntimeRoot = root
+	cfg.Components = testfixture.Components(root)
 	cfg.Tailnet.Tag = "tag:silo-test"
 	cfg.Tailnet.Hostname = fmt.Sprintf("s13-lobby-%x", time.Now().UnixNano())
 	cfg.Tailnet.ControlURL = os.Getenv("SILO_E2E_TS_CONTROL_URL")

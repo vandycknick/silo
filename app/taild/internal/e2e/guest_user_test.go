@@ -250,7 +250,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 					t.Fatal("automatic account mutation", code, err, passwd.String())
 				}
 				command := exec.CommandContext(ctx, cli, "shell", variant)
-				command.Env = append(os.Environ(), "SILO_HOME="+c.Home, "SILO_RUNTIME_DIR="+c.RuntimeRoot)
+				command.Env = append(os.Environ(), "SILO_HOME="+c.Home, "SILO_RUNTIME_DIR="+filepath.Dir(c.Components.AssetDir))
 				command.Stdin = strings.NewReader("echo F2_CERT_ROOT=$HOME\necho F2_CERT_UID; /bin/id -u\nexit\n")
 				out, err := command.CombinedOutput()
 				text := strings.ReplaceAll(string(out), "\r\n", "\n")

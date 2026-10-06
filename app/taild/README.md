@@ -5,61 +5,72 @@ VM enrollment is opt-in with `--tailscale`; ordinary creation omits the node. Cl
 daemon normally releases SDK handles and its own node without stopping VMs.
 Authenticated host shutdown is a separate, bounded lifecycle.
 
-## Build and check
+## Managed startup
 
-Go minimum 1.26.6, toolchain 1.26.8, CGO **enabled**, target C toolchain and the
-actual `silo-go-ffi` bridge are required. Imports use the public Go SDK only.
+Taild is an optional same-user child of silod, not a separately installed service.
+Enable it through normal Silo configuration:
 
 ```sh
-cargo build -p silo-go-ffi
-CGO_ENABLED=1 go -C app/taild build ./cmd/taild
-SILO_GO_FFI_PATH=/absolute/path/libsilo_go_ffi.so app/taild/taild --check --config /etc/silo-taild/config.yaml
+silo daemon up --tailscale --system=false
+silo daemon status
 ```
 
-`--check` validates strict single-document YAML, optional private secret files,
-nonroot ownership of the resolved existing home, and actual SDK runtime
-validation. It never downloads artifacts. Default home is `/var/lib/silo-taild`,
-overridden by `SILO_HOME`, then `home` in YAML. `runtime_root` can select a
-complete operator-installed portable runtime; otherwise lookup is under
-`<home>/runtimes` (or `install_root`). Relative paths and writable-by-other homes are rejected.
-The selected root must contain `runtime-manifest.json` with exact SDK version,
-host target and SHA-256 for every installed regular file except the manifest.
-Missing manifests, extra files, symlinks, escaping paths and changed hashes fail
-before opening the SDK. Legacy stages need rebuilding by the packaging writer.
+The feature flags persist under the strict version-1 `daemon` section. Omitted
+flags preserve the selected features. Core readiness does not imply lobby
+readiness: network delay or pending authentication leaves the core API usable,
+and local daemon status reports the component state and any approval URL.
 
-`taild version` and `taild --version` report build/SDK versions and the verified
-installed runtime's metadata, or `runtime unavailable` when none is installed.
-They do not claim that an absent runtime matches the build. The public SDK
-verifies its bridge ABI on open; the version command labels this explicitly.
-`taild install-runtime --config FILE --runtime-archive /absolute/archive.tar.zst
---install-root /absolute/store` wraps the exact-version public SDK offline
-installer. YAML `runtime_archive` and `install_root` provide the same settings.
-Installation starts no tailnet node and reads no OAuth secrets. Development SDKs
-without compiled release archive digests refuse installation explicitly.
+Build the ordinary runtime assets with `make build`. Source development also
+requires the native Go bridge and adjacent helper:
 
-The shipped [`config.example.yaml`](config.example.yaml) shows operator defaults.
-Secrets are optional files in `/etc/silo-taild/secrets`: `oauth-client-secret`,
-`oauth-app-secret`, `api-token`. Files must be regular, private (0600), nonempty.
-Missing OAuth app secrets select per-VM interactive login. Tagged callers require
-the configured OAuth client to mint their selected owner tag. Configured errors
-fail explicitly, without a silent fallback.
+```sh
+cargo build -p silo-go-ffi -p silod -p cli
+CGO_ENABLED=1 go -C app/taild build -o ../../target/debug/taild ./cmd/taild
+```
 
-Startup: config/home/secrets, exclusive home lock and private state/audit,
-public SDK, service tailnet node, verified Running status/tag/tailnet pin,
-resilient SDK reconciliation, then listeners. Login URLs are logged while
-waiting. A different observed tailnet is refused. TCP 22 and TLS 443 are bound
-only through tsnet, never host listeners or Funnel. HTTP health/metrics require
-fresh WhoIs and configured own-scope `vm.read`; the TLS OAuth callback instead
-requires an unexpired one-use nonce. Shutdown cancels lobby sessions and waits at most 90 seconds for sessions
-and operations. The operation registry starts empty on restart.
+Go 1.26.6 or newer, the configured Go 1.26.8 toolchain, CGO and a native C
+toolchain are required. Silod selects its own canonical sibling `taild` and
+`libsilo_go_ffi.so` (`.dylib` on macOS). It passes canonical Home/config paths,
+all six resolved runtime component paths and resolved settings through a private
+bounded bootstrap pipe. The helper verifies product/protocol identity, the
+connected daemon and the native bridge ABI before serving. There is no helper
+runtime installer, standalone YAML file, PATH-based binary discovery or embedded
+bridge extraction.
+
+`taild help` and `taild version` are side-effect-free offline diagnostics.
+Offline version reports the expected ABI and explicitly leaves the verified ABI
+unavailable; it neither loads a runtime nor invents a connected daemon. The
+remote version command reports the actual connected silod/protocol and verified
+native ABI.
+
+Optional plain Home-scope secrets are `tailscale.lobby.client_secret`,
+`tailscale.lobby.oauth_app_secret` and `tailscale.lobby.api_token`. Set them with
+`silo secret set NAME --value-stdin`. Each value is bounded to 16KiB; corrupt or
+wrong-kind values fail setup. Missing optional values preserve the enrollment
+flow. Credentials never belong in YAML, argv, service environment or logs.
+
+Startup acquires the helper Home lock, preserves `<Home>/taild/instance`, opens
+the exact native runtime, and waits for the verified lobby tag/tailnet before
+opening listeners. Approval URLs are available only through local daemon status,
+not logs. TCP 22 and TLS 443 bind through tsnet, never host listeners or Funnel.
+HTTP health/metrics require fresh WhoIs and own-scope `vm.read`; the OAuth callback
+requires an unexpired one-use nonce.
+
+An unexpected helper exit gets capped restart backoff without restarting silod
+or stopping VMs. Deterministic bootstrap/configuration failures remain failed
+until reconfiguration/restart. Normal silod shutdown permits bounded helper
+job/session draining within 80 seconds, then reaps it before the 90-second
+service deadline. Unexpected owner-pipe EOF cancels the helper immediately and
+exits within five seconds; it is not a VM-stop request. Old standalone service
+accounts and `/var/lib/silo-taild` state are not imported or modified.
 
 ## Identity and permissions
 
 The accepted connection's fresh WhoIs is the identity boundary. Untagged peers
 use numeric `user:<id>`; tagged peers carry each verified `tag:<name>`. SSH
-username, display names and forwarded headers have no authority. Capabilities
-default to `github.com/vandycknick/silo/cap/taild`. Own-scope entries add actions
-and take maximum limits; omitted limits use operator ceilings. `*` expands to
+username, display names and forwarded headers have no authority. The fixed
+capability key is `github.com/vandycknick/silo/cap/taild`. Own-scope entries add
+actions and take maximum limits; omitted limits use operator ceilings. `*` expands to
 known primitive actions. Unknown actions are logged and ignored, unknown
 scopes ignored, malformed applicable entries deny the entire capability.
 Scope is inspected before action/limit decoding, so a future-scope schema cannot
@@ -286,9 +297,9 @@ show/write/VM creation; `ls` without an owner lists all their own namespaces.
 
 Principal documents live under `<home>/taild/principals/<base64url-principal>/`
 in private `templates/` and `policies/` directories, using atomic synced 0600
-files. Operator `templates_dir` and `policies_dir` default to
-`/etc/silo-taild/{templates,policies}`. Operator files are read-only, validated
-at startup/`--check`, on SIGHUP, and on every list/resolve. Principal names shadow
+files. Operator documents live in the normal Silo configuration directory's
+`templates` and `policies` subdirectories. Missing directories mean no operator
+documents. Files are read-only and validated at startup, on SIGHUP and every list/resolve. Principal names shadow
 operator names; editing/removing an operator-only name is forbidden (4), while
 create can make a private shadow. Other principals' files remain invisible (3).
 All ancestors/files are descriptor-walked without following symlinks; reads are

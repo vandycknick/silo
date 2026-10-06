@@ -90,27 +90,33 @@ impl BoundServer {
                 }
             });
         let limit = 16 * 1024 * 1024;
+        let state = self.state.clone();
+        let interceptor = move |request| state.check_helper(request);
         tonic::transport::Server::builder()
-            .add_service(
+            .add_service(tonic::service::interceptor::InterceptedService::new(
                 w::daemon_service_server::DaemonServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-            )
-            .add_service(
+                interceptor.clone(),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
                 w::machine_service_server::MachineServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-            )
-            .add_service(
+                interceptor.clone(),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
                 w::network_service_server::NetworkServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-            )
-            .add_service(
+                interceptor.clone(),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
                 w::runtime_service_server::RuntimeServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),
-            )
+                interceptor,
+            ))
             .serve_with_incoming_shutdown(incoming, async {
                 shutdown.cancelled().await;
                 self.state.stream_shutdown.cancel();

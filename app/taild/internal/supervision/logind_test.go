@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
@@ -32,7 +31,7 @@ func TestActualNonrootLogindAcquireListRelease(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	i, preparing, err := Acquire(ctx, config.Defaults())
+	i, preparing, err := Acquire(ctx, testfixture.Config())
 	if err != nil {
 		t.Skipf("real logind unavailable/denied: %v", err)
 	}
@@ -74,9 +73,9 @@ func TestActualNonrootLogindAcquireListRelease(t *testing.T) {
 }
 
 func TestActualStopAllUsesNativeManagedRecords(t *testing.T) {
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
-	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
+	c.Components = testfixture.Components(testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true))
 	r, err := runtime.Open(context.Background(), c, "instance")
 	if err != nil {
 		t.Fatal(err)

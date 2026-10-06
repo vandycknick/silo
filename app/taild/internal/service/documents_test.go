@@ -12,7 +12,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/state"
@@ -22,7 +21,7 @@ import (
 )
 
 func TestRemoteTemplateStrictAllowlist(t *testing.T) {
-	s := &Service{Config: config.Defaults()}
+	s := &Service{Config: testfixture.Config()}
 	good := `version: '1'
 description: Daily driver
 image: ghcr.io/vandycknick/silo/devbox:latest

@@ -4,13 +4,13 @@ import (
 	"math"
 	"testing"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/units"
 	"golang.org/x/sys/unix"
 )
 
 func TestActualFilesystemDiskReservationFloor(t *testing.T) {
-	c := config.Defaults()
+	c := testfixture.Config()
 	c.Home = t.TempDir()
 	var stat unix.Statfs_t
 	if err := unix.Statfs(c.Home, &stat); err != nil {
