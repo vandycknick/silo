@@ -41,6 +41,18 @@ impl Default for TailscaleConfig {
     }
 }
 impl TailscaleConfig {
+    pub(crate) fn effective_settings(&self) -> impl std::fmt::Debug + '_ {
+        (
+            &self.hostname,
+            &self.tag,
+            &self.control_url,
+            &self.enrollment,
+            &self.vm,
+            &self.sessions,
+            self.disk_reserve,
+            &self.shutdown,
+        )
+    }
     pub fn enabled(&self) -> Option<bool> {
         self.enabled
     }

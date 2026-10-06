@@ -1,7 +1,7 @@
 use clap::{Args, Subcommand};
 
 use silod_spec::paths::DaemonPaths;
-use silod_spec::status::{DaemonPhase, DaemonStatus, MemoryReclaimOutcome};
+use silod_spec::status::{CorePhase, DaemonStatus, MemoryReclaimOutcome, SystemStatus};
 
 use crate::context::Context;
 use crate::daemon::service;
@@ -15,7 +15,7 @@ pub struct Cmd {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Enable and start the per-user system VM.
+    /// Enable and start the per-user daemon and selected integrations.
     Up(Up),
     /// Disable the per-user service and stop the system VM.
     Down,
@@ -35,6 +35,8 @@ struct Up {
     system: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     tailscale: Option<bool>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, conflicts_with = "foreground")]
+    linger: Option<bool>,
 }
 
 #[derive(Debug, Args)]
@@ -57,6 +59,15 @@ impl Cmd {
         let paths = DaemonPaths::new(host.home());
         match self.command {
             DaemonCommand::Up(command) => {
+                eyre::ensure!(
+                    !command.foreground || command.linger.is_none(),
+                    "--linger cannot be used with --foreground"
+                );
+                #[cfg(not(target_os = "linux"))]
+                eyre::ensure!(
+                    command.linger.is_none(),
+                    "--linger is supported only on Linux"
+                );
                 let mut spinner = Spinner::start("Checking", "daemon configuration");
                 let selection = silo_config::FeatureOverrides {
                     system: command.system,
@@ -81,13 +92,27 @@ impl Cmd {
                     return crate::daemon::foreground(&executable, &arguments);
                 }
                 let service = service::ServiceConfig::new(&paths, executable)?;
+                service::validate_registration(&service)?;
+                service::bootstrap_linger(command.linger)?;
                 silo_config::GlobalConfig::persist_features(
                     &host,
                     selection,
                     existing_installation,
                 )?;
-                service::up(&service, &[], &mut spinner)?;
+                let persisted = silo_config::GlobalConfig::load_from(&host)?;
+                let features =
+                    persisted.resolve_features(Default::default(), existing_installation);
+                let identity = persisted.daemon_identity(features)?;
+                let status = service::up(
+                    &service,
+                    &identity,
+                    features.system,
+                    command.tailscale == Some(true),
+                    &mut spinner,
+                )
+                .await?;
                 spinner.finish_success("Started");
+                report_tailscale(&status);
                 if features.system {
                     crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
                     crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
@@ -122,7 +147,7 @@ struct DaemonStatusView {
     state: &'static str,
     /// Whether the native user service starts the daemon at login.
     autostart: Option<bool>,
-    /// Docker endpoint the daemon serves (or is registered to serve).
+    linger: Option<bool>,
     endpoint: Option<String>,
     /// Configured guest memory ceiling, in bytes, as the running daemon reports it.
     memory_bytes: Option<u64>,
@@ -134,30 +159,21 @@ impl DaemonStatusView {
     fn collect(paths: &DaemonPaths) -> eyre::Result<Self> {
         let daemon = service::status(paths)?;
         let autostart = service::is_enabled().ok();
-        let endpoint = Some(match &daemon {
-            Some(status) => status.docker_socket.clone(),
-            None => paths.docker_socket().display().to_string(),
-        });
-        let memory_bytes = daemon.as_ref().and_then(|status| status.memory_bytes);
-        let state = match daemon.as_ref().map(|status| status.phase) {
-            None | Some(DaemonPhase::Stopped) => "stopped",
-            Some(DaemonPhase::Ready) => "ready",
-            Some(DaemonPhase::Degraded) => "degraded",
-            Some(DaemonPhase::Failed) => "failed",
-            Some(DaemonPhase::Stopping) => "stopping",
-            Some(DaemonPhase::Upgrading) => "upgrading",
-            Some(
-                DaemonPhase::PreparingStorage
-                | DaemonPhase::Creating
-                | DaemonPhase::StartingVm
-                | DaemonPhase::WaitingGuest
-                | DaemonPhase::ActivatingEngine
-                | DaemonPhase::Retrying,
-            ) => "starting",
+        let linger = service::linger_status();
+        let system = daemon.as_ref().and_then(|status| status.system.as_ref());
+        let endpoint = system.map(|system| system.docker_socket.clone());
+        let memory_bytes = system.and_then(|system| system.memory_bytes);
+        let state = match daemon.as_ref().map(|status| status.core) {
+            None | Some(CorePhase::Stopped) => "stopped",
+            Some(CorePhase::Ready) => "ready",
+            Some(CorePhase::Failed) => "failed",
+            Some(CorePhase::Stopping) => "stopping",
+            Some(CorePhase::Starting) => "starting",
         };
         Ok(Self {
             state,
             autostart,
+            linger,
             endpoint,
             memory_bytes,
             daemon,
@@ -166,27 +182,7 @@ impl DaemonStatusView {
 
     fn print_human(&self) -> eyre::Result<()> {
         let mut rows: Vec<(String, String)> = Vec::new();
-        let state = match &self.daemon {
-            Some(status) => match status.phase {
-                DaemonPhase::PreparingStorage => "starting (preparing storage)".to_string(),
-                DaemonPhase::Creating => "starting (creating system machine)".to_string(),
-                DaemonPhase::StartingVm => "starting (booting VM)".to_string(),
-                DaemonPhase::WaitingGuest => "starting (waiting for guest)".to_string(),
-                DaemonPhase::ActivatingEngine => "starting (activating Docker)".to_string(),
-                DaemonPhase::Ready => "ready".to_string(),
-                DaemonPhase::Degraded => "degraded (Docker health probe failing)".to_string(),
-                DaemonPhase::Upgrading => "upgrading (replacing the system VM)".to_string(),
-                DaemonPhase::Retrying => format!(
-                    "starting (retrying; {} attempts so far)",
-                    status.restart_count
-                ),
-                DaemonPhase::Failed => "failed".to_string(),
-                DaemonPhase::Stopping => "stopping".to_string(),
-                DaemonPhase::Stopped => "stopped".to_string(),
-            },
-            None => "stopped".to_string(),
-        };
-        rows.push(("State".to_string(), state));
+        rows.push(("Core".to_string(), self.state.to_string()));
         rows.push((
             "Autostart".to_string(),
             match self.autostart {
@@ -195,11 +191,62 @@ impl DaemonStatusView {
                 None => "unknown".to_string(),
             },
         ));
+        rows.push((
+            "User linger".to_string(),
+            match self.linger {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
+            .to_string(),
+        ));
         if let Some(endpoint) = &self.endpoint {
             rows.push(("Endpoint".to_string(), format!("unix://{endpoint}")));
         }
-        if let Some(status) = &self.daemon {
-            rows.push(("PID".to_string(), status.pid.to_string()));
+        if let Some(daemon) = &self.daemon {
+            rows.push(("PID".to_string(), daemon.pid.to_string()));
+            rows.push((
+                "Control endpoint".to_string(),
+                daemon.control_endpoint.display().to_string(),
+            ));
+            rows.push((
+                "Tailscale".to_string(),
+                component_state(daemon.tailscale.state).to_string(),
+            ));
+            rows.push((
+                "Tailscale shutdown protection".to_string(),
+                format!("{:?}", daemon.tailscale.shutdown_protection).to_lowercase(),
+            ));
+            rows.push((
+                "Tailscale restarts".to_string(),
+                daemon.tailscale.restart_count.to_string(),
+            ));
+            if let Some(url) = &daemon.tailscale.approval_url {
+                rows.push(("Tailscale login".to_string(), url.clone()));
+            }
+            if let Some(diagnostic) = &daemon.tailscale.diagnostic {
+                rows.push(("Tailscale diagnostic".to_string(), diagnostic.clone()));
+            }
+            if let Some(dns) = &daemon.tailscale.dns_name {
+                rows.push(("Tailscale DNS".to_string(), dns.clone()));
+            }
+            rows.push((
+                "System".to_string(),
+                daemon
+                    .system
+                    .as_ref()
+                    .map(|system| format!("{:?}", system.phase))
+                    .unwrap_or_else(|| "disabled".into()),
+            ));
+            if let Some(error) = &daemon.last_error {
+                rows.push(("Core error".to_string(), error.clone()));
+            }
+        }
+        if let Some(status) = self
+            .daemon
+            .as_ref()
+            .and_then(|daemon| daemon.system.as_ref())
+        {
             if let Some(machine_id) = &status.machine_id {
                 rows.push(("Machine".to_string(), machine_id.clone()));
             }
@@ -264,7 +311,7 @@ impl DaemonStatusView {
 }
 
 /// When silod last asked the registry about the system image, and what went wrong.
-fn format_update_check(status: &DaemonStatus) -> String {
+fn format_update_check(status: &SystemStatus) -> String {
     let checked = status
         .update_checked_at
         .as_deref()
@@ -279,6 +326,33 @@ fn format_update_check(status: &DaemonStatus) -> String {
     match &status.update_error {
         Some(error) => format!("{checked}; {error}"),
         None => checked,
+    }
+}
+
+fn component_state(state: silod_spec::status::ComponentState) -> &'static str {
+    use silod_spec::status::ComponentState;
+    match state {
+        ComponentState::Disabled => "disabled",
+        ComponentState::Starting => "starting (lobby readiness not established)",
+        ComponentState::NeedsAuth => "needs authentication (lobby not ready)",
+        ComponentState::Ready => "ready",
+        ComponentState::Degraded => "degraded",
+        ComponentState::Failed => "failed",
+    }
+}
+
+fn report_tailscale(status: &DaemonStatus) {
+    if status.tailscale.enabled {
+        crate::ui::hint(format!(
+            "Tailscale: {}",
+            component_state(status.tailscale.state)
+        ));
+        if let Some(url) = &status.tailscale.approval_url {
+            crate::ui::hint(format!("Tailscale login: {url}"));
+        }
+        if let Some(diagnostic) = &status.tailscale.diagnostic {
+            crate::ui::hint(format!("Tailscale: {diagnostic}"));
+        }
     }
 }
 
@@ -383,6 +457,11 @@ mod tests {
         let omitted = Options::try_parse_from(["up"]).expect("omitted");
         assert_eq!(omitted.up.system, None);
         assert_eq!(omitted.up.tailscale, None);
+        assert_eq!(omitted.up.linger, None);
+        let linger = Options::try_parse_from(["up", "--linger"]).expect("linger");
+        assert_eq!(linger.up.linger, Some(true));
+        let no_linger = Options::try_parse_from(["up", "--linger=false"]).expect("no linger");
+        assert_eq!(no_linger.up.linger, Some(false));
         let selected =
             Options::try_parse_from(["up", "--system=false", "--tailscale"]).expect("selection");
         assert_eq!(selected.up.system, Some(false));
@@ -391,7 +470,25 @@ mod tests {
             Options::try_parse_from(["up", "--system", "--tailscale=false"]).expect("selection");
         assert_eq!(reversed.up.system, Some(true));
         assert_eq!(reversed.up.tailscale, Some(false));
+        assert!(Options::try_parse_from(["up", "--foreground", "--linger"]).is_err());
         assert!(Options::try_parse_from(["up", "--system=invalid"]).is_err());
+    }
+
+    #[test]
+    fn pending_authentication_never_claims_lobby_readiness() {
+        use silod_spec::status::ComponentState;
+        assert!(
+            crate::commands::daemon::component_state(ComponentState::Starting)
+                .contains("not established")
+        );
+        assert!(
+            crate::commands::daemon::component_state(ComponentState::NeedsAuth)
+                .contains("lobby not ready")
+        );
+        assert_eq!(
+            crate::commands::daemon::component_state(ComponentState::Ready),
+            "ready"
+        );
     }
 
     #[test]
@@ -498,10 +595,9 @@ mod tests {
 
     #[test]
     fn update_check_row_reports_errors_alongside_the_last_check() {
-        let mut status: silod_spec::status::DaemonStatus =
+        let mut status: silod_spec::status::SystemStatus =
             serde_json::from_value(serde_json::json!({
-                "schema": 1, "generation": "d823458f-090b-48c3-87d4-33daf76c0000",
-                "pid": 1, "phase": "ready", "machine_id": null, "run_id": null,
+                "phase": "ready", "machine_id": null, "run_id": null,
                 "image_digest": null, "docker_socket": "/tmp/test.sock",
                 "updated_at": "2026-01-01T00:00:00Z", "last_error": null, "restart_count": 0,
             }))

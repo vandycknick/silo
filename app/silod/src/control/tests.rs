@@ -7,22 +7,37 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 use tonic::{Request, Status};
 fn state(root: &std::path::Path) -> Arc<ControlState> {
-    Arc::new(ControlState::new(
-        HostPaths::new(root.join("home"), root.join("config")),
-        GlobalConfig::default(),
-        uuid::Uuid::new_v4(),
-        silo_config::FeatureSelection {
-            system: false,
-            tailscale: false,
-        },
-    ))
+    let host = HostPaths::new(root.join("home"), root.join("config"));
+    let global = GlobalConfig::default();
+    let generation = uuid::Uuid::new_v4();
+    let features = silo_config::FeatureSelection {
+        system: false,
+        tailscale: false,
+    };
+    let publisher = Arc::new(
+        crate::status::StatusPublisher::new(
+            &host,
+            generation,
+            features,
+            global.daemon_identity(features).unwrap(),
+            None,
+        )
+        .unwrap(),
+    );
+    Arc::new(ControlState::new(host, global, generation, publisher))
 }
 #[tokio::test]
 async fn status_does_not_initialize_runtime() {
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
-    state.set_core_phase(w::CorePhase::Ready).await;
-    assert_eq!(state.get_status().await.core, w::CorePhase::Ready as i32);
+    state
+        .publisher
+        .set_core(silod_spec::status::CorePhase::Ready, None)
+        .unwrap();
+    assert_eq!(
+        state.get_status().await.unwrap().core,
+        w::CorePhase::Ready as i32
+    );
     assert!(!root.path().join("home/state.db").exists());
     assert!(state.components.get().is_none());
     assert!(state.runtime.get().is_none());
@@ -96,7 +111,7 @@ async fn stale_helper_and_public_stopping_requests_rejected() {
     let state = state(root.path());
     let generation = uuid::Uuid::new_v4();
     state.set_helper_generation(Some(generation)).await;
-    state.begin_stopping().await;
+    state.begin_stopping().await.unwrap();
     assert!(state.admit(&Request::new(()), false).await.is_err());
     let mut request = Request::new(());
     request.metadata_mut().insert(
@@ -453,7 +468,7 @@ async fn helper_reports_preserve_instance_and_reject_stale_generations() {
         tonic::Code::FailedPrecondition
     );
     assert_eq!(
-        owner.get_status().await.tailscale.unwrap().state,
+        owner.get_status().await.unwrap().tailscale.unwrap().state,
         w::ComponentState::NeedsAuth as i32
     );
     assert!(owner.runtime.get().is_none());

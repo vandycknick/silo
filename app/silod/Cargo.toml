@@ -37,3 +37,5 @@ prost-types = "0.14.4"
 [dev-dependencies]
 nix = { version = "0.31.3", features = ["signal"] }
 tempfile = "3.27.0"
+tower = "0.5.3"
+hyper-util = "0.1.20"

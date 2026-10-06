@@ -66,6 +66,24 @@ impl GlobalConfig {
         &self.daemon.tailscale
     }
 
+    /// Opaque, nonsecret identity for deciding whether the running daemon needs
+    /// a configuration restart. CLI-only defaults and disabled integrations do
+    /// not affect it. This is an equality token, not an authentication digest.
+    pub fn daemon_identity(&self, features: FeatureSelection) -> eyre::Result<String> {
+        let system = features
+            .system
+            .then(|| self.daemon_overrides())
+            .transpose()?;
+        let tailscale = features
+            .tailscale
+            .then(|| self.tailscale().effective_settings());
+        Ok(format!(
+            "{}:{features:?}:{:?}:{system:?}:{tailscale:?}",
+            env!("CARGO_PKG_VERSION"),
+            self.networking()
+        ))
+    }
+
     pub fn resolve_features(
         &self,
         overrides: FeatureOverrides,
@@ -281,5 +299,55 @@ mod tests {
         assert_eq!(config.daemon_overrides().expect("overrides").cpus, Some(2));
         assert!(parse_global_config("daemon:\n  version: '1'\n  unknown: true\n").is_err());
         assert!(parse_global_config("daemon:\n  version: '2'\n").is_err());
+    }
+
+    #[test]
+    fn daemon_restart_identity_ignores_cli_defaults_and_disabled_components() {
+        let baseline = parse_global_config("{}").unwrap();
+        let changed = parse_global_config(concat!(
+            "default_machine: different\n",
+            "daemon:\n  version: '1'\n",
+            "  system:\n    resources:\n      cpus: 4\n",
+            "  tailscale:\n    hostname: another-lobby\n"
+        ))
+        .unwrap();
+        let disabled = crate::FeatureSelection {
+            system: false,
+            tailscale: false,
+        };
+        assert_eq!(
+            baseline.daemon_identity(disabled).unwrap(),
+            changed.daemon_identity(disabled).unwrap()
+        );
+        for enabled in [
+            crate::FeatureSelection {
+                system: true,
+                tailscale: false,
+            },
+            crate::FeatureSelection {
+                system: false,
+                tailscale: true,
+            },
+        ] {
+            assert_ne!(
+                baseline.daemon_identity(enabled).unwrap(),
+                changed.daemon_identity(enabled).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn persisting_effective_feature_selection_does_not_require_restart() {
+        let selected = crate::FeatureSelection {
+            system: false,
+            tailscale: true,
+        };
+        let baseline = parse_global_config("{}").unwrap();
+        let persisted = parse_global_config(
+            "daemon:\n  version: '1'\n  system:\n    enabled: false\n  tailscale:\n    enabled: true\n"
+        ).unwrap();
+        assert_eq!(
+            baseline.daemon_identity(selected).unwrap(),
+            persisted.daemon_identity(selected).unwrap()
+        );
     }
 }

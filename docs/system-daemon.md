@@ -1,10 +1,11 @@
-# Silo system daemon
+# Silo daemon
 
-The optional Silo system daemon runs a persistent Docker Engine inside one
-per-user microVM. Docker and containerd data live on an installation-owned ext4
-disk, separate from the replaceable appliance root disk. The host endpoint is
-`<Home>/run/docker.sock`. The daemon resolves the same `SILO_HOME` and
-`XDG_CONFIG_HOME` paths as the CLI; `silod` has no `--home` or `--state` argument.
+Silod is an optional per-user VM-management daemon. Its independently enabled
+system integration runs a persistent Docker Engine in one microVM. Docker and
+containerd data live on an installation-owned ext4 disk, separate from the
+replaceable appliance root disk. Its endpoint is `<Home>/run/docker.sock`.
+The daemon resolves the same `SILO_HOME` and `XDG_CONFIG_HOME` as the CLI;
+`silod` has no `--home` or `--state` argument.
 
 The Docker socket grants its callers administrative control of the guest and
 read/write access to every configured host share. Treat access to it like
@@ -96,19 +97,20 @@ definition points at `silod`. Rebuilding alone does not replace a running proces
   Hypervisor.framework. Apple Virtualization.framework remains available as an
   explicit backend.
 - A non-root login session with a systemd user manager on Linux or GUI launchd
-  domain on macOS. Silo does not install a system service, enable lingering, or
-  use a privileged helper.
-- A native host Docker CLI for automatic context setup and normal Docker use.
-  Docker Compose and Buildx remain separately installed host plugins. A host
-  Docker Engine is not required.
-- Access to the configured appliance registry and enough space for the root
-  image, persistent data disk, and an offline upgrade backup.
+  domain on macOS for native service registration. Foreground operation does
+  not require a service manager.
+- When system integration is enabled, a native host Docker CLI for context
+  integration, access to the appliance registry, and space for the root image,
+  persistent data disk, and offline upgrade backup. Docker Compose/Buildx remain
+  separate host plugins. Core-only operation needs none of these Docker inputs.
 
 ## Configuration
 
-No configuration file is required: run `silo daemon up` to use the built-in
-system image and defaults (4 CPUs, 8 GiB memory, a sparse 20 GiB root disk and
-500 GiB data disk, and a read/write home share). `silod` generates
+No configuration file is required. A fresh Linux `silo daemon up` starts core
+management only; macOS and existing appliance installations default to system
+integration enabled. Use `silo daemon up --system` to enable the built-in system
+image (4 CPUs, 8 GiB memory, a sparse 20 GiB root disk, 500 GiB data disk, and a
+read/write home share). For that integration, silod generates
 `~/.silo/daemon/daemon.json` as internal installation state; do not create or
 edit it yourself. An omitted option always means its default, so removing a key
 from `config.yaml` reverts it on the next `up`. The exceptions are settings
@@ -251,12 +253,25 @@ silo daemon logs --follow
 silo daemon down
 ```
 
-`up` installs/enables the per-user native service and waits for guest, engine,
-and host-socket readiness. It creates or validates the `silo` Docker context and
-selects it unless `--no-switch-context` is passed. Native service restarts never
-change the active Docker context. Silo invokes `docker context create` and
-`docker context use`; Docker itself writes the context metadata and updates
-`config.json`. Silo does not edit those files directly.
+`up` installs/enables the per-user native service and waits for the core API.
+When system integration is enabled, it also waits for guest, engine, and
+host-socket readiness, then validates/selects the `silo` Docker context unless
+`--no-switch-context` is passed. System-disabled startup performs no Docker
+preflight or context work. Tailscale startup or pending authentication is
+reported separately and does not claim lobby readiness.
+
+Repeating `up` with the same configuration is idempotent. Changed daemon settings
+restart the owned service without the explicit appliance-stop operation; ordinary
+and system VM runs survive. The service reads normal configuration on each launch.
+Deterministic configuration/usage errors exit 2 and are not restart-looped by
+systemd; transient runtime failures remain restartable.
+
+On Linux, `up --linger` asks `loginctl enable-linger <current-user>` to enable
+account-wide boot-before-login and logout persistence, without sudo. Authorization
+failure is explicit. Omitted selection offers consent only on a terminal;
+noninteractive operation prints the command and limited-startup warning.
+`--linger=false` suppresses the offer, never disables existing lingering.
+Foreground/macOS reject `--linger`; `down` never changes account linger.
 
 `DOCKER_CONFIG` selects where the Docker CLI stores context metadata and must be
 absolute. `DOCKER_HOST` and `DOCKER_CONTEXT` override the active context; Silo
@@ -346,33 +361,27 @@ retried until silod restarts.
 
 ## Diagnostics
 
-`daemon status` reports the summary state, whether the service autostarts at
-login, the Docker endpoint, and, while a daemon runs, its PID, machine, image
-reference and digest, the last image update check, last status update, and a
-one-line summary of the last failure. The full cause chain
-is in `daemon logs`.
+`daemon status` reports core readiness, optional system/Tailscale state,
+native service enablement, and account linger separately. Appliance diagnostics
+include its VM/run identity, Docker endpoint, configured image, update failures,
+and guest/host memory-reclaim observations. A system retry does not change a
+working core API into a failed daemon.
 
-```
-State:      starting (retrying; 3 attempts so far)
-Autostart:  enabled
-Endpoint:   unix:///Users/me/.silo/run/docker.sock
-PID:        80954
-Memory:     8 GiB; last idle cache reclaim used bounded cgroup reclaim 12 minutes ago, observed guest cache delta 5.2 GiB
-Updated:    2026-09-11 10:37:29 UTC (12 seconds ago)
-Error:      could not fetch the system image: registry denied anonymous access to image "ghcr.io/example/system:dev"; it may not exist or may be private
-```
 
-`--format json` returns the same view with the raw supervisor record under
-`daemon`.
+`--format json` returns the view with the schema-2 record under `daemon`.
+`daemon.core` is independent of optional `daemon.system` and `daemon.tailscale`.
+One publisher merges component updates for the status file and gRPC API.
 
 The appliance ships no OpenSSH server. `silo shell silo-system` and
 `silo exec silo-system` go through the injected Silo agent's built-in SSH
 service over vsock, so they need no guest configuration or host keys.
 
 `daemon status` and `daemon logs` do not initialize libvm or start the engine.
-The live status is corroborated with native service PID, daemon generation, and
-process-start identity rather than trusting an old `ready` file. Logs are
-bounded and rotated under `~/.silo/logs/daemon`.
+Foreground daemons are visible without a native service MainPID. Kernel PID
+birth-time identity rejects stale status, including PID reuse; a live old-schema
+record requires a daemon restart rather than being interpreted as ready.
+Status reports account linger independently of native service enablement.
+Logs remain bounded and rotated under `<Home>/logs/daemon`.
 
 If the engine cannot be brought up, for example because the system image is
 not available yet, the daemon stays running: it records the failure in

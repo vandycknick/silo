@@ -5,7 +5,7 @@ use tonic::{Request, Response, Status};
 #[tonic::async_trait]
 impl w::daemon_service_server::DaemonService for Service {
     async fn get_status(&self, _: Request<()>) -> Result<Response<w::DaemonStatus>, Status> {
-        Ok(Response::new(ControlState::get_status(self).await))
+        Ok(Response::new(ControlState::get_status(self).await?))
     }
 
     async fn get_runtime_info(&self, _: Request<()>) -> Result<Response<w::RuntimeInfo>, Status> {
@@ -44,6 +44,8 @@ impl w::daemon_service_server::DaemonService for Service {
         if !(1..=6).contains(&status.state) || !(1..=3).contains(&status.shutdown_protection) {
             return Err(Status::invalid_argument("invalid component status"));
         }
+        let restart_count = u32::try_from(status.restart_count)
+            .map_err(|_| Status::invalid_argument("restart count exceeds uint32"))?;
         if status.diagnostic.as_ref().is_some_and(|v| v.len() > 1024)
             || status.approval_url.as_ref().is_some_and(|v| v.len() > 2048)
             || status.dns_name.as_ref().is_some_and(|v| v.len() > 253)
@@ -65,7 +67,34 @@ impl w::daemon_service_server::DaemonService for Service {
             }
             admission.instance = Some(instance);
         }
-        self.status.lock().await.tailscale = Some(status);
+        use silod_spec::status::{ComponentState, ComponentStatus, ShutdownProtection};
+        let component = ComponentStatus {
+            enabled: status.enabled,
+            state: match w::ComponentState::try_from(status.state).unwrap() {
+                w::ComponentState::Disabled => ComponentState::Disabled,
+                w::ComponentState::Starting => ComponentState::Starting,
+                w::ComponentState::NeedsAuth => ComponentState::NeedsAuth,
+                w::ComponentState::Ready => ComponentState::Ready,
+                w::ComponentState::Degraded => ComponentState::Degraded,
+                w::ComponentState::Failed => ComponentState::Failed,
+                w::ComponentState::Unspecified => unreachable!(),
+            },
+            diagnostic: status.diagnostic,
+            approval_url: status.approval_url,
+            dns_name: status.dns_name,
+            restart_count,
+            shutdown_protection: match w::ShutdownProtection::try_from(status.shutdown_protection)
+                .unwrap()
+            {
+                w::ShutdownProtection::Active => ShutdownProtection::Active,
+                w::ShutdownProtection::Unavailable => ShutdownProtection::Unavailable,
+                w::ShutdownProtection::Unsupported => ShutdownProtection::Unsupported,
+                w::ShutdownProtection::Unspecified => unreachable!(),
+            },
+        };
+        self.publisher
+            .set_tailscale(component)
+            .map_err(|_| Status::internal("cannot publish component status"))?;
         Ok(Response::new(()))
     }
 
