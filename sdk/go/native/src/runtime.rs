@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 
-use libvm::{MachineRef, Runtime, RuntimeConfig};
+use libvm::{MachineRef, ResolvedRuntimeComponents, Runtime, RuntimeConfig};
 use serde::Deserialize;
 
 use crate::buffer::SiloBuffer;
@@ -149,6 +149,18 @@ struct RuntimeOpenRequest {
     home: Option<String>,
     runtime_root: Option<String>,
     supervisor_path: Option<String>,
+    runtime_components: Option<RuntimeComponentsRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeComponentsRequest {
+    supervisor_path: PathBuf,
+    netd_path: PathBuf,
+    kernel_path: PathBuf,
+    initramfs_path: PathBuf,
+    agent_path: PathBuf,
+    asset_dir: PathBuf,
 }
 
 #[no_mangle]
@@ -165,11 +177,11 @@ pub unsafe extern "C" fn silo_runtime_open(
         let request = request_bytes(request_ptr, request_len)?;
         let request: RuntimeOpenRequest = serde_json::from_slice(request)
             .map_err(|error| invalid_argument(format!("decode runtime open request: {error}")))?;
+        let config = runtime_config(request)?;
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| SiloError::new("Io", format!("create Tokio runtime: {error}")))?;
-        let config = runtime_config(request)?;
         let runtime = tokio
             .block_on(Runtime::new(config))
             .map_err(error_from_libvm)?;
@@ -278,6 +290,13 @@ pub unsafe extern "C" fn silo_machine_free(machine: *mut MachineHandle) {
 }
 
 fn runtime_config(request: RuntimeOpenRequest) -> Result<RuntimeConfig, *mut SiloError> {
+    if request.runtime_components.is_some()
+        && (request.runtime_root.is_some() || request.supervisor_path.is_some())
+    {
+        return Err(invalid_argument(
+            "runtime components conflict with runtime root or supervisor path",
+        ));
+    }
     let mut config = match request.home {
         Some(home) => RuntimeConfig::local(home),
         None => RuntimeConfig::from_env().map_err(error_from_libvm)?,
@@ -287,6 +306,18 @@ fn runtime_config(request: RuntimeOpenRequest) -> Result<RuntimeConfig, *mut Sil
     }
     if let Some(supervisor_path) = request.supervisor_path {
         config = config.with_supervisor_path(PathBuf::from(supervisor_path));
+    }
+    if let Some(components) = request.runtime_components {
+        let components = ResolvedRuntimeComponents::from_paths(
+            components.supervisor_path,
+            components.netd_path,
+            components.kernel_path,
+            components.initramfs_path,
+            components.agent_path,
+            components.asset_dir,
+        )
+        .map_err(error_from_libvm)?;
+        config = config.with_runtime_components(components);
     }
     Ok(config)
 }
@@ -322,6 +353,106 @@ pub(crate) unsafe fn request_string(
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::{runtime_config, RuntimeOpenRequest};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn components_request(root: &std::path::Path) -> serde_json::Value {
+        let mut value = serde_json::Map::new();
+        for name in [
+            "supervisor_path",
+            "netd_path",
+            "kernel_path",
+            "initramfs_path",
+            "agent_path",
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"component").expect("write component");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("component mode");
+            value.insert(name.into(), serde_json::json!(path));
+        }
+        value.insert("asset_dir".into(), serde_json::json!(root));
+        serde_json::Value::Object(value)
+    }
+
+    #[test]
+    fn runtime_components_preserve_exact_paths_without_opening_store() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let components = components_request(temp.path());
+        let home = temp.path().join("unopened-home");
+        let request = serde_json::from_value::<RuntimeOpenRequest>(serde_json::json!({
+            "home": home, "runtime_components": components,
+        }))
+        .expect("decode");
+        let config = runtime_config(request).expect("config");
+        let resolved = config.resolve_components().expect("resolve components");
+        for (actual, key) in [
+            (resolved.supervisor(), "supervisor_path"),
+            (resolved.netd(), "netd_path"),
+            (resolved.kernel(), "kernel_path"),
+            (resolved.initramfs(), "initramfs_path"),
+            (resolved.agent(), "agent_path"),
+            (resolved.asset_dir(), "asset_dir"),
+        ] {
+            assert_eq!(
+                actual,
+                std::path::Path::new(components[key].as_str().expect("path"))
+                    .canonicalize()
+                    .expect("canonical path"),
+            );
+        }
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn runtime_components_reject_mixed_incomplete_and_unknown_options() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let components = components_request(temp.path());
+        for selector in ["runtime_root", "supervisor_path"] {
+            let mut value = serde_json::json!({
+                "home": temp.path(), "runtime_components": components,
+            });
+            value[selector] = serde_json::json!("");
+            let request = serde_json::from_value::<RuntimeOpenRequest>(value).expect("decode");
+            let error = runtime_config(request).expect_err("mixed selection");
+            unsafe { crate::error::silo_error_free(error) };
+        }
+        for key in [
+            "supervisor_path",
+            "netd_path",
+            "kernel_path",
+            "initramfs_path",
+            "agent_path",
+            "asset_dir",
+        ] {
+            let mut incomplete = components.clone();
+            incomplete.as_object_mut().expect("object").remove(key);
+            assert!(
+                serde_json::from_value::<RuntimeOpenRequest>(serde_json::json!({
+                    "runtime_components": incomplete,
+                }))
+                .is_err()
+            );
+        }
+        let mut unknown = components.clone();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<RuntimeOpenRequest>(serde_json::json!({
+                "runtime_components": unknown,
+            }))
+            .is_err()
+        );
+        for invalid in ["", "relative", "/nonexistent/silo-component"] {
+            let mut value = components.clone();
+            value["kernel_path"] = serde_json::json!(invalid);
+            let request = serde_json::from_value::<RuntimeOpenRequest>(serde_json::json!({
+                "home": temp.path(), "runtime_components": value,
+            }))
+            .expect("decode invalid path");
+            let error = runtime_config(request).expect_err("invalid exact component");
+            unsafe { crate::error::silo_error_free(error) };
+        }
+    }
     #[test]
     fn runtime_query_schema_is_strict_for_every_operation() {
         assert!(serde_json::from_str::<crate::runtime::QueryRequest>(

@@ -8,6 +8,8 @@ use silod_spec::status::{DaemonPhase, DaemonStatus};
 fn command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_silod"));
     command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("SILO_HOME", home.join("runtime-home"))
@@ -60,6 +62,7 @@ fn invalid_configuration_is_published_as_a_failure() {
     }
     let root = tempfile::tempdir().expect("temporary home");
     let output = command(root.path())
+        .arg("--system-enabled=true")
         .args(["--system-memory", "1MiB"])
         .output()
         .expect("serve");
@@ -81,6 +84,29 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_selected_home() {
     if nix::unistd::geteuid().is_root() {
         return;
     }
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(std::env::temp_dir().join(format!(
+            "silo-control-fixture-{}.lock",
+            nix::unistd::geteuid()
+        )))
+        .expect("fixture lock");
+    let _fixture = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .expect("use an idle dedicated test UID");
+    let existing = Command::new("pgrep")
+        .args(["-x", "silod"])
+        .output()
+        .expect("check live silod");
+    assert_eq!(
+        existing.status.code(),
+        Some(1),
+        "live silod found; use an idle dedicated test UID"
+    );
     let root = tempfile::tempdir().expect("temporary home");
     // A genuinely missing runtime prevents any VM launch or registry access, while
     // exercising real startup, status publication, retry, and signal handling.

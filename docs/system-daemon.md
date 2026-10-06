@@ -30,6 +30,18 @@ use pinned Go generators and vendored protoc. Guest execution and secret reads
 are deliberately absent from this management protocol. Session transport stays
 in libvm and its SDK bindings.
 
+The foreground daemon serves management on
+`<HostPaths::run_root()>/silod/control.sock`, with a private 0700 directory,
+0600 socket, same-UID peer admission, and one active daemon per UID. Core status
+does not open the VM store. Ordinary runtime initialization is lazy and retryable;
+its exact six-component selection is shared with native SDK sessions.
+
+Accepted native mutations remain tracked after a client disconnects. Admission
+is bounded to 64 active mutations; shutdown seals admission and drains actual
+work, not merely RPC waiters. A disconnected mutation must not be replayed
+automatically. Log tails and following share native snapshot descriptors to avoid
+duplicating or losing bytes between history and live output.
+
 
 ```text
  silo ── --system-* argv ─────────────────────────────► silod
@@ -52,7 +64,8 @@ Before registering, `up` runs `silod --check`, so invalid configuration does not
 replace the service. `up --foreground` applies process-only overrides without
 persisting feature choices.
 Every `--system-*` argument configures the system appliance, not defaults for
-ordinary VMs. Both executables use libvm directly; there is no RPC API.
+ordinary VMs. Silod implements the local management API through libvm; guest
+execution remains a direct libvm/SDK session, not a daemon stream relay.
 
 Build both executables with `make cli silod` (or the full build). Portable
 installations keep `silod` beside `silo`; macOS bundles install it under

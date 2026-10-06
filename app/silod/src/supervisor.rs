@@ -22,8 +22,8 @@ use libvm::{
 };
 use nix::fcntl::{Flock, FlockArg};
 use silod_spec::status::{DaemonPhase, DaemonStatus, MemoryReclaimOutcome};
-use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::{DesiredSystem, SystemBackend};
@@ -71,27 +71,12 @@ impl LifetimeLock {
     }
 }
 
-/// SIGINT and SIGTERM, registered once for the process lifetime. A signal that
-/// arrives while the supervisor is busy (mid-upgrade, say) is kept and observed at
-/// the next `recv`, rather than lost between short-lived listeners.
-struct Shutdown {
-    interrupt: Signal,
-    terminate: Signal,
-}
+/// The main process owns signals and retains cancellation through long operations.
+struct Shutdown(CancellationToken);
 
 impl Shutdown {
-    fn listen() -> eyre::Result<Self> {
-        Ok(Self {
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
-        })
-    }
-
     async fn recv(&mut self) {
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-        }
+        self.0.cancelled().await;
     }
 }
 
@@ -171,13 +156,14 @@ struct Supervisor {
     next_update_check: Instant,
 }
 
-/// Runs until SIGINT/SIGTERM. The caller holds the lifetime lock.
+/// Runs until the daemon owner requests detachment. The caller holds the lifetime lock.
 pub(crate) async fn serve(
     paths: SystemPaths,
     desired: DesiredSystem,
     mut status: DaemonStatus,
+    cancellation: CancellationToken,
 ) -> eyre::Result<()> {
-    let mut shutdown = Shutdown::listen()?;
+    let mut shutdown = Shutdown(cancellation);
     let host_reclaim = desired.config.backend == SystemBackend::Krun;
     status.configured_image = Some(desired.image.clone());
     status.memory_bytes = Some(desired.config.memory_bytes);

@@ -11,14 +11,89 @@ const ENV_ASSET_DIR: &str = "SILO_ASSET_DIR";
 const ENV_RUNTIME_DIR: &str = "SILO_RUNTIME_DIR";
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A validated, canonical snapshot of all native runtime components.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedRuntimeComponents {
-    pub(crate) supervisor: PathBuf,
-    pub(crate) netd: PathBuf,
-    pub(crate) kernel: PathBuf,
-    pub(crate) initramfs: PathBuf,
-    pub(crate) agent: PathBuf,
-    pub(crate) asset_dir: PathBuf,
+pub struct ResolvedRuntimeComponents {
+    supervisor: PathBuf,
+    netd: PathBuf,
+    kernel: PathBuf,
+    initramfs: PathBuf,
+    agent: PathBuf,
+    asset_dir: PathBuf,
+}
+
+impl ResolvedRuntimeComponents {
+    /// Validates an exact component set without discovering another installation.
+    /// Components may be independently located, but every input must be absolute.
+    pub fn from_paths(
+        supervisor: PathBuf,
+        netd: PathBuf,
+        kernel: PathBuf,
+        initramfs: PathBuf,
+        agent: PathBuf,
+        asset_dir: PathBuf,
+    ) -> Result<Self, LibVmError> {
+        for (name, path) in [
+            ("supervisor_path", &supervisor),
+            ("netd_path", &netd),
+            ("kernel_path", &kernel),
+            ("initramfs_path", &initramfs),
+            ("agent_path", &agent),
+            ("asset_dir", &asset_dir),
+        ] {
+            if !path.is_absolute() {
+                return Err(LibVmError::RuntimeComponentInvalid {
+                    input: name.to_string(),
+                    message: format!("path must be absolute, got {}", path.display()),
+                });
+            }
+        }
+        validate_components(
+            ComponentPaths {
+                supervisor,
+                netd,
+                kernel,
+                initramfs,
+                agent,
+                asset_dir,
+            },
+            None,
+        )
+        .map_err(|message| LibVmError::RuntimeComponentInvalid {
+            input: "runtime_components".to_string(),
+            message,
+        })
+    }
+
+    /// Canonical silo-vmm executable.
+    pub fn supervisor(&self) -> &Path {
+        &self.supervisor
+    }
+
+    /// Canonical netd executable.
+    pub fn netd(&self) -> &Path {
+        &self.netd
+    }
+
+    /// Canonical default guest kernel.
+    pub fn kernel(&self) -> &Path {
+        &self.kernel
+    }
+
+    /// Canonical default guest initramfs.
+    pub fn initramfs(&self) -> &Path {
+        &self.initramfs
+    }
+
+    /// Canonical guest agent executable.
+    pub fn agent(&self) -> &Path {
+        &self.agent
+    }
+
+    /// Canonical runtime asset directory.
+    pub fn asset_dir(&self) -> &Path {
+        &self.asset_dir
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,6 +207,9 @@ impl ComponentEnvironment for ProcessEnvironment {
 pub(crate) fn resolve_components(
     config: &RuntimeConfig,
 ) -> Result<ResolvedRuntimeComponents, LibVmError> {
+    if let Some(components) = &config.runtime_components {
+        return Ok(components.clone());
+    }
     let mut environment = ProcessEnvironment;
     let mut considered = Vec::new();
     let canonical_executable = match std::env::current_exe().and_then(fs::canonicalize) {
@@ -160,6 +238,9 @@ fn resolve_components_for_executable<E>(
 where
     E: ComponentEnvironment,
 {
+    if let Some(components) = &config.runtime_components {
+        return Ok(components.clone());
+    }
     let api = explicit_api_overrides(config)?;
     if let Some(root) = config.runtime_root.as_deref() {
         let components = resolve_required_portable_root("runtime_root", root)?;
@@ -885,6 +966,150 @@ mod tests {
             &native,
             Vec::new(),
         )
+    }
+
+    fn exact(paths: ComponentPaths) -> ResolvedRuntimeComponents {
+        ResolvedRuntimeComponents::from_paths(
+            paths.supervisor,
+            paths.netd,
+            paths.kernel,
+            paths.initramfs,
+            paths.agent,
+            paths.asset_dir,
+        )
+        .expect("exact components")
+    }
+
+    #[test]
+    fn exact_components_ignore_discovery_and_retain_all_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = portable(&temp.path().join("runtime"));
+        let snapshot = exact(paths.clone());
+        let config = RuntimeConfig::default()
+            .with_runtime_root("/missing/old-root")
+            .with_bundled_runtime_root("/missing/bundled-root")
+            .with_supervisor_path("/missing/old-supervisor")
+            .with_netd_path("/missing/old-netd")
+            .with_kernel_path("/missing/old-kernel")
+            .with_initramfs_path("/missing/old-initramfs")
+            .with_agent_path("/missing/old-agent")
+            .with_runtime_components(snapshot.clone());
+        assert!(config.runtime_root.is_none());
+        assert!(config.supervisor_path.is_none());
+        assert!(config.bundled_runtime_root.is_none());
+        assert!(config.netd_path.is_none());
+        assert!(config.kernel_path.is_none());
+        assert!(config.initramfs_path.is_none());
+        assert!(config.agent_path.is_none());
+        let mut env = TestEnvironment::default();
+        env.values
+            .insert("SILO_RUNTIME_DIR", "/missing/ambient".into());
+        env.values
+            .insert("SILO_ASSET_DIR", "/missing/assets".into());
+        env.values.insert("SILO_VMM_PATH", "/missing/vmm".into());
+        env.values.insert("NETD_BIN", "/missing/netd".into());
+        let resolved = resolve(&config, &mut env, "/missing/executable".into(), vec![])
+            .expect("exact resolution");
+        assert!(env.read.is_empty());
+        for (actual, expected) in [
+            (resolved.supervisor(), paths.supervisor),
+            (resolved.netd(), paths.netd),
+            (resolved.kernel(), paths.kernel),
+            (resolved.initramfs(), paths.initramfs),
+            (resolved.agent(), paths.agent),
+            (resolved.asset_dir(), paths.asset_dir),
+        ] {
+            assert_eq!(
+                actual,
+                expected.canonicalize().expect("canonical component")
+            );
+        }
+        assert_eq!(
+            config.resolve_components().expect("resolve").supervisor(),
+            snapshot.supervisor()
+        );
+    }
+
+    #[test]
+    fn exact_components_validate_independent_paths_and_reject_invalid_sets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut paths = portable(&temp.path().join("runtime"));
+        let other = temp.path().join("independent-agent");
+        write_file(&other, true);
+        paths.agent = other.clone();
+        assert_eq!(
+            exact(paths.clone()).agent(),
+            other.canonicalize().expect("canonical agent")
+        );
+        paths.kernel = PathBuf::from("relative");
+        assert!(ResolvedRuntimeComponents::from_paths(
+            paths.supervisor.clone(),
+            paths.netd.clone(),
+            paths.kernel,
+            paths.initramfs.clone(),
+            paths.agent.clone(),
+            paths.asset_dir.clone(),
+        )
+        .is_err());
+        paths.kernel = temp.path().join("missing-kernel");
+        assert!(ResolvedRuntimeComponents::from_paths(
+            paths.supervisor,
+            paths.netd,
+            paths.kernel,
+            paths.initramfs,
+            paths.agent,
+            paths.asset_dir,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn exact_components_reject_each_incomplete_or_invalid_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = portable(&temp.path().join("runtime"));
+        let original = [
+            paths.supervisor,
+            paths.netd,
+            paths.kernel,
+            paths.initramfs,
+            paths.agent,
+            paths.asset_dir,
+        ];
+        for index in 0..original.len() {
+            for invalid in [
+                PathBuf::new(),
+                PathBuf::from("relative/component"),
+                temp.path().join("missing-component"),
+            ] {
+                let mut paths = original.clone();
+                paths[index] = invalid;
+                let [supervisor, netd, kernel, initramfs, agent, asset_dir] = paths;
+                assert!(
+                    ResolvedRuntimeComponents::from_paths(
+                        supervisor, netd, kernel, initramfs, agent, asset_dir,
+                    )
+                    .is_err(),
+                    "component index {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_setters_discard_exact_selection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = RuntimeConfig::default().with_runtime_components(exact(portable(temp.path())));
+        for changed in [
+            config.clone().with_runtime_root("/new/root"),
+            config.clone().with_bundled_runtime_root("/new/bundled"),
+            config.clone().with_supervisor_path("/new/vmm"),
+            config.clone().with_netd_path("/new/netd"),
+            config.clone().with_kernel_path("/new/kernel"),
+            config.clone().with_initramfs_path("/new/initramfs"),
+            config.clone().with_agent_path("/new/agent"),
+        ] {
+            assert!(changed.runtime_components.is_none());
+        }
     }
 
     #[test]

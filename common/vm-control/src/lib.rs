@@ -5,6 +5,7 @@ pub mod errors;
 pub mod images;
 pub mod lifecycle;
 pub mod network;
+pub mod node_status;
 pub mod policy;
 pub mod readiness;
 pub mod reports;

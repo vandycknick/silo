@@ -27,6 +27,13 @@ Loading the small Go FFI bridge is separate from runtime installation. It may ma
 
 `Open` accepts `WithHome` to select the Silo home holding all persistent state (default `SILO_HOME`, else `~/.silo`; generated sockets always live under `/tmp/silo-<euid>`), `WithRuntimeRoot` to select one complete runtime installation, and `WithSupervisorPath` to override only the `silo-vmm` executable.
 
+Manager-integrated callers can instead use `WithRuntimeComponents(RuntimeComponents{...})`
+to pin the exact `SupervisorPath`, `NetdPath`, `KernelPath`, `InitramfsPath`,
+`AgentPath`, and `AssetDir` selected by their manager. All six paths are required,
+absolute, and natively validated/canonicalized. This bypasses ambient component
+discovery and cannot be combined with `WithRuntimeRoot` or `WithSupervisorPath`.
+It does not install assets or change the native bridge's version/ABI checks.
+
 Development checkouts deliberately contain no release archive digests or embedded bridge binaries.
 From the repository root, build the staged runtime and bridge and run an example with one command:
 

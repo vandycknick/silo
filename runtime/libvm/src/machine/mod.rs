@@ -10,6 +10,7 @@ mod logs;
 mod memory;
 mod mounts;
 mod name_generator;
+mod node_status;
 mod process;
 mod reference;
 pub(crate) mod root_disk;
@@ -42,6 +43,10 @@ pub use logs::{
 };
 pub use memory::Memory;
 pub use mounts::resolve_mount_location;
+pub use node_status::{
+    MachineNetworkObservation, MachineNetworkObservationIssue, MachineNodeObservation,
+    MachineNodeState, MachineNodeStatus,
+};
 pub use process::{MachineRetention, ProcessConfig};
 pub use reference::MachineRef;
 pub(crate) use session::launch_failure_reason;

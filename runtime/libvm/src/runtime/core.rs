@@ -173,8 +173,11 @@ impl Runtime {
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let supervisor =
-            VmSupervisor::new(paths.clone(), components.supervisor.clone(), virt_backend);
+        let supervisor = VmSupervisor::new(
+            paths.clone(),
+            components.supervisor().to_path_buf(),
+            virt_backend,
+        );
         let runtime = Self {
             secret_store: Arc::new(silo_secrets::FileStore::new(paths.home())),
             secret_provider: None,
@@ -430,8 +433,8 @@ impl Runtime {
     ) -> Result<ResolvedBootAssets, LibVmError> {
         boot_assets::resolve_boot_assets(
             BootAssetOverrides { kernel, initramfs },
-            &self.components.kernel,
-            &self.components.initramfs,
+            self.components.kernel(),
+            self.components.initramfs(),
         )
     }
 
@@ -1314,7 +1317,7 @@ impl Runtime {
             config,
             run_id,
             &self.networking,
-            &self.components.netd,
+            self.components.netd(),
             egress_credentials,
         )
         .await
@@ -1353,7 +1356,7 @@ impl Runtime {
 
             let agent_enabled = config.guest.agent.enabled();
             if let Some(agent_path) =
-                boot_assets::resolve_agent(&config.guest.agent, &self.components.agent)?
+                boot_assets::resolve_agent(&config.guest.agent, self.components.agent())?
             {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
                     machine_name: &config.name,
@@ -1389,7 +1392,7 @@ impl Runtime {
             Ok(crate::supervisor::VmmLaunchInputs {
                 agent_enabled,
                 rosetta_intent,
-                asset_directory: self.components.asset_dir.clone(),
+                asset_directory: self.components.asset_dir().to_path_buf(),
             })
         };
 
@@ -2546,8 +2549,8 @@ mod tests {
                 kernel: Some(&override_kernel),
                 initramfs: None,
             },
-            &components.kernel,
-            &components.initramfs,
+            components.kernel(),
+            components.initramfs(),
         )
         .expect("resolve assets");
 
@@ -2565,7 +2568,7 @@ mod tests {
         assert_eq!(
             crate::runtime::boot_assets::resolve_agent(
                 &crate::machine::MachineAgent::Default,
-                &components.agent,
+                components.agent(),
             )
             .expect("resolve default agent"),
             Some(

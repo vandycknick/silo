@@ -7,6 +7,7 @@ mod planning;
 mod transitions;
 
 pub use builder::RuntimeBuilder;
+pub use components::ResolvedRuntimeComponents;
 pub(crate) use config::normalize_absolute_path;
 pub use config::{NetdRuntimeConfig, RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride};
 pub use core::Runtime;
