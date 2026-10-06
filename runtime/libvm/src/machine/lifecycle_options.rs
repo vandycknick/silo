@@ -84,7 +84,8 @@ impl MachineWaitOptions {
         self
     }
 
-    pub(crate) fn timeout_value(self) -> Duration {
+    /// Returns the configured maximum wait.
+    pub fn timeout_value(self) -> Duration {
         self.timeout
     }
 }
@@ -115,11 +116,13 @@ impl MachineStopOptions {
         self
     }
 
-    pub(crate) fn force_timeout(self) -> Option<Duration> {
+    /// Returns the optional forced-stop escalation budget.
+    pub fn force_timeout(self) -> Option<Duration> {
         self.force_timeout
     }
 
-    pub(crate) fn wait_options(self) -> MachineWaitOptions {
+    /// Returns the graceful-stop wait configuration.
+    pub fn wait_options(self) -> MachineWaitOptions {
         self.wait
     }
 }
@@ -142,7 +145,8 @@ impl MachineKillOptions {
         self
     }
 
-    pub(crate) fn wait_options(self) -> MachineWaitOptions {
+    /// Returns the forced-stop wait configuration.
+    pub fn wait_options(self) -> MachineWaitOptions {
         self.wait
     }
 }
