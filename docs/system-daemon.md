@@ -42,11 +42,28 @@ work, not merely RPC waiters. A disconnected mutation must not be replayed
 automatically. Log tails and following share native snapshot descriptors to avoid
 duplicating or losing bytes between history and live output.
 
+Each CLI command selects management once. A matching ready silod receives its
+management calls; proven absence uses local libvm. Selection has a two-second
+deadline. A live owner without a usable API, incompatible identity, unsafe socket,
+or different Home/config root is an error, never permission to fall back.
+The admitted connection is pinned: losing it cannot retarget an in-flight command
+to a replacement daemon or replay a mutation locally.
+
+CLI SSH shell, structured exec, forwarding, serial, and logs remain native.
+Their lazy session runtime adopts the selected daemon's exact runtime components
+and immutable machine ID. An established independent CLI session survives silod
+shutdown. Foreground cleanup still requires its selected management backend and
+original run ID; detached cleanup runs locally in the monitor's trusted hook.
+`create/run --dry-run` remain local, metadata-only planning without probing silod
+or opening a mutable runtime. CLI creation and updates normalize host paths before
+dispatch, so the daemon's working directory cannot change their meaning.
+
 
 ```text
- silo ── --system-* argv ─────────────────────────────► silod
- silo ◄─ ~/.silo/daemon/status.json, logs/daemon/ ───── silod
- both ── io.silo.system.* machine labels ────────────── libvm
+ CLI management, daemon absent  -> libvm
+ CLI management, daemon ready   -> gRPC -> silod -> libvm
+ CLI shell/exec                 -> libvm -> silo-vmm -> guest
+ CLI service control            -> native user service -> silod
 ```
 
 - The CLI owns service registration (launchd/systemd), Docker context integration

@@ -6,11 +6,11 @@ use std::time::Duration;
 use clap::Args;
 use libvm::{
     ImageProgressSender, MachineExitOutcome, MachineReadinessOutcome, MachineRetention,
-    MachineRunId, MachineStartOptions, MachineWaitOptions, RuntimeConfig,
-    DEFAULT_GUEST_READINESS_TIMEOUT,
+    MachineRunId, MachineWaitOptions, RuntimeConfig, DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 
 use crate::api::machine::AppMachine;
+use crate::api::start_options::AppStartOptions;
 use crate::commands::create::{
     load_template, machine_settings, parse_environment, read_environment_layers, render_plan,
     resolve_plan, selected_image_reference, validate_process_overrides, MachineCliOptions,
@@ -238,9 +238,8 @@ impl Cmd {
             let options = match detached_start_options(context, &machine, &plan).await {
                 Ok(options) => options,
                 Err(error) => {
-                    return Err(
-                        cleanup_foreground_failure(&machine, plan.create.retention, error).await,
-                    )
+                    cleanup_ephemeral_best_effort(&machine, plan.create.retention).await;
+                    return Err(execution_infrastructure(error));
                 }
             };
             if let Err(error) = machine.start_with_options(options).await {
@@ -265,17 +264,17 @@ impl Cmd {
         {
             Ok(options) => options,
             Err(error) => {
-                return Err(
-                    cleanup_foreground_failure(&machine, plan.create.retention, error).await,
-                )
+                return Err(execution_infrastructure(error.wrap_err(format!(
+                    "machine {name} was retained for diagnostics; remove it with `silo rm {name}`"
+                ))));
             }
         };
         let start = match machine.start_with_options(options).await {
             Ok(start) => start,
             Err(error) => {
-                return Err(
-                    cleanup_foreground_failure(&machine, plan.create.retention, error).await,
-                )
+                return Err(execution_infrastructure(error.wrap_err(format!(
+                    "machine {name} was retained for diagnostics; remove it with `silo rm {name}`"
+                ))));
             }
         };
         progress.step("Waiting", &name);
@@ -290,9 +289,7 @@ impl Cmd {
                 )
                 .await;
                 let stop = stop_run(&machine, start.run_id, plan.create.retention, None).await;
-                return Err(
-                    foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
-                );
+                return Err(foreground_stop_failure(stop, error));
             }
         };
         if readiness.outcome != MachineReadinessOutcome::Ready {
@@ -306,9 +303,7 @@ impl Cmd {
                 eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome)
             };
             let stop = stop_run(&machine, start.run_id, plan.create.retention, None).await;
-            return Err(
-                foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
-            );
+            return Err(foreground_stop_failure(stop, error));
         }
         progress.step("Ready", &name);
         progress.finish_success("Started");
@@ -332,13 +327,11 @@ impl Cmd {
         let result = match execution {
             Ok(result) => result,
             Err(error) => {
-                return Err(
-                    foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
-                );
+                return Err(foreground_stop_failure(stop, error));
             }
         };
         if let Err(error) = stop {
-            return Err(cleanup_foreground_failure(&machine, plan.create.retention, error).await);
+            return Err(execution_infrastructure(error));
         }
         if let Some(message) = crate::commands::exec::execution_failure_message(&result) {
             eprintln!("{} {message}", crate::ui::error_label());
@@ -394,7 +387,7 @@ async fn detached_start_options(
     context: &mut crate::context::Context,
     machine: &AppMachine,
     plan: &crate::planning::RunPlan,
-) -> eyre::Result<MachineStartOptions> {
+) -> eyre::Result<AppStartOptions> {
     let process = &plan.create.process;
     let (program, args) = plan
         .argv
@@ -448,7 +441,7 @@ async fn stop_run(
             // Keep polling the graceful operation: it may already hold a
             // cleanup lock. Dropping it or leaving it suspended could interrupt
             // cleanup or deadlock the forced stop waiting for that same lock.
-            let (stopped, forced) = tokio::join!(stopping, machine.force_stop_run(run_id));
+            let (stopped, forced) = tokio::join!(stopping, machine.force_stop_run(run_id.clone()));
             completed_stop(stopped, forced)
         }
     };
@@ -458,7 +451,9 @@ async fn stop_run(
         | Err(libvm::LibVmError::MachineStaleGeneration { current: None, .. }) => {}
         Err(error) => return Err(error.into()),
     }
-    cleanup_ephemeral_best_effort(machine, retention).await;
+    if retention == MachineRetention::Ephemeral {
+        machine.clone().remove_after_run(run_id).await?;
+    }
     Ok(())
 }
 
@@ -541,32 +536,12 @@ fn execution_infrastructure(error: eyre::Report) -> eyre::Report {
     error.wrap_err(crate::errors::ExecutionExit::new(125))
 }
 
-async fn cleanup_foreground_failure(
-    machine: &AppMachine,
-    retention: MachineRetention,
-    error: eyre::Report,
-) -> eyre::Report {
-    cleanup_ephemeral_best_effort(machine, retention).await;
-    error.wrap_err(crate::errors::ExecutionExit::new(125))
-}
-
-async fn foreground_stop_failure(
-    machine: &AppMachine,
-    retention: MachineRetention,
-    stop: eyre::Result<()>,
-    error: eyre::Report,
-) -> eyre::Report {
-    match stop {
-        Ok(()) => execution_infrastructure(error),
-        Err(stop_error) => {
-            cleanup_foreground_failure(
-                machine,
-                retention,
-                error.wrap_err(format!("stop foreground machine: {stop_error}")),
-            )
-            .await
-        }
-    }
+fn foreground_stop_failure(stop: eyre::Result<()>, error: eyre::Report) -> eyre::Report {
+    let error = match stop {
+        Ok(()) => error,
+        Err(stop_error) => error.wrap_err(format!("stop foreground machine: {stop_error}")),
+    };
+    execution_infrastructure(error)
 }
 
 async fn cleanup_ephemeral_best_effort(machine: &AppMachine, retention: MachineRetention) {

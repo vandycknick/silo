@@ -13,44 +13,63 @@ pub(crate) mod types;
 use std::time::Duration;
 
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, MachineData, MachineStartOptions, MachineUpdate,
-    NetworkDefinition, NetworkDriver, NetworkTopology, RuntimeConfig,
+    ImageProgressSender, ImagePullPolicy, MachineData, MachineUpdate, NetworkDefinition,
+    NetworkDriver, NetworkTopology, RuntimeConfig,
 };
 
 use crate::machine_defaults::ResolvedMachineNetwork;
 use crate::planning::{CreatePlan, PullPolicy};
 use crate::template::Template;
 
-use self::machine::AppMachine;
-use self::types::{ReadOnlyCreationResolution, SourceResolution};
+use crate::api::machine::AppMachine;
+use crate::api::start_options::AppStartOptions;
+use crate::api::types::{ReadOnlyCreationResolution, SourceResolution};
 
 #[derive(Debug)]
-pub(crate) struct AppApi {
-    local: local::LocalVmService,
+pub(crate) enum AppApi {
+    Local(local::LocalVmService),
+    Daemon(daemon::DaemonVmService),
 }
 
 impl AppApi {
     pub(crate) fn local(config: RuntimeConfig) -> Self {
-        Self {
-            local: local::LocalVmService::new(config),
+        Self::Local(local::LocalVmService::new(config))
+    }
+
+    pub(crate) async fn select(
+        config: RuntimeConfig,
+        host: &libvm::HostPaths,
+    ) -> eyre::Result<Self> {
+        match daemon::DaemonVmService::probe(&config, host).await? {
+            Some(service) => Ok(Self::Daemon(service)),
+            None => Ok(Self::local(config)),
         }
     }
 
     pub(crate) async fn list_machines(
         &mut self,
     ) -> eyre::Result<Vec<libvm::MachineInventoryEntry>> {
-        self.local.list_machines().await
+        match self {
+            Self::Local(service) => service.list_machines().await,
+            Self::Daemon(service) => service.list_machines().await,
+        }
     }
 
     pub(crate) async fn inspect_inventory(
         &mut self,
         reference: &str,
     ) -> eyre::Result<libvm::MachineInventoryEntry> {
-        self.local.inspect_inventory(reference).await
+        match self {
+            Self::Local(service) => service.inspect_inventory(reference).await,
+            Self::Daemon(service) => service.inspect_inventory(reference).await,
+        }
     }
 
     pub(crate) async fn inspect_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
-        self.local.inspect_machine(reference).await
+        match self {
+            Self::Local(service) => service.inspect_machine(reference).await,
+            Self::Daemon(service) => service.inspect_machine(reference).await,
+        }
     }
 
     pub(crate) async fn start_machine(
@@ -58,7 +77,18 @@ impl AppApi {
         reference: &str,
         readiness_timeout: Duration,
     ) -> eyre::Result<MachineData> {
-        self.local.start_machine(reference, readiness_timeout).await
+        let machine = self.machine(reference).await?;
+        let before = machine.inspect().await?;
+        crate::commands::start::ensure_startable(&before)?;
+        let options = self.machine_start_options(&machine, true).await?;
+        let start = machine.start_with_options(options).await?;
+        if crate::commands::start::requires_guest_readiness(&start.machine) {
+            let readiness = machine.wait_ready(readiness_timeout).await?;
+            if readiness.outcome != libvm::MachineReadinessOutcome::Ready {
+                eyre::bail!("guest readiness check ended with {:?}", readiness.outcome);
+            }
+        }
+        Ok(start.machine)
     }
 
     pub(crate) async fn stop_machine(
@@ -67,7 +97,10 @@ impl AppApi {
         force: bool,
         timeout: Duration,
     ) -> eyre::Result<MachineData> {
-        self.local.stop_machine(reference, force, timeout).await
+        match self {
+            Self::Local(service) => service.stop_machine(reference, force, timeout).await,
+            Self::Daemon(service) => service.stop_machine(reference, force, timeout).await,
+        }
     }
 
     pub(crate) async fn remove_machine(
@@ -75,26 +108,52 @@ impl AppApi {
         reference: &str,
         force: bool,
     ) -> eyre::Result<MachineData> {
-        self.local.remove_machine(reference, force).await
+        let machine = self.machine(reference).await?;
+        let data = machine.inspect().await?;
+        if force && data.is_running() {
+            if let Err(error) = self
+                .stop_machine(&machine.id(), false, Duration::from_secs(60))
+                .await
+            {
+                if !matches!(
+                    error.downcast_ref::<libvm::LibVmError>(),
+                    Some(libvm::LibVmError::MachineNotRunning { .. })
+                ) {
+                    return Err(error);
+                }
+            }
+        }
+        machine.remove().await?;
+        Ok(data)
     }
 
     pub(crate) async fn update_machine(
         &mut self,
         reference: &str,
-        update: MachineUpdate,
+        mut update: MachineUpdate,
     ) -> eyre::Result<MachineData> {
-        self.local.update_machine(reference, update).await
+        local::normalize_update(&mut update)?;
+        match self {
+            Self::Local(service) => service.update_machine(reference, update).await,
+            Self::Daemon(service) => service.update_machine(reference, update).await,
+        }
     }
 
     pub(crate) async fn list_networks(&mut self) -> eyre::Result<Vec<NetworkDefinition>> {
-        self.local.list_networks().await
+        match self {
+            Self::Local(service) => service.list_networks().await,
+            Self::Daemon(service) => service.list_networks().await,
+        }
     }
 
     pub(crate) async fn inspect_network(
         &mut self,
         name: &str,
     ) -> eyre::Result<Option<NetworkDefinition>> {
-        self.local.inspect_network(name).await
+        match self {
+            Self::Local(service) => service.inspect_network(name).await,
+            Self::Daemon(service) => service.inspect_network(name).await,
+        }
     }
 
     pub(crate) async fn create_network(
@@ -103,11 +162,17 @@ impl AppApi {
         topology: NetworkTopology,
         driver: NetworkDriver,
     ) -> eyre::Result<()> {
-        self.local.create_network(name, topology, driver).await
+        match self {
+            Self::Local(service) => service.create_network(name, topology, driver).await,
+            Self::Daemon(service) => service.create_network(name, topology, driver).await,
+        }
     }
 
     pub(crate) async fn remove_network(&mut self, name: &str) -> eyre::Result<()> {
-        self.local.remove_network(name).await
+        match self {
+            Self::Local(service) => service.remove_network(name).await,
+            Self::Daemon(service) => service.remove_network(name).await,
+        }
     }
 
     pub(crate) async fn set_machine_network(
@@ -115,7 +180,10 @@ impl AppApi {
         reference: &str,
         network: ResolvedMachineNetwork,
     ) -> eyre::Result<MachineData> {
-        self.local.set_machine_network(reference, network).await
+        match self {
+            Self::Local(service) => service.set_machine_network(reference, network).await,
+            Self::Daemon(service) => service.set_machine_network(reference, network).await,
+        }
     }
 
     pub(crate) async fn resolve_source(
@@ -125,9 +193,18 @@ impl AppApi {
         pull: Option<(ImagePullPolicy, PullPolicy)>,
         progress: ImageProgressSender,
     ) -> eyre::Result<SourceResolution> {
-        self.local
-            .resolve_source(positional, template, pull, progress)
-            .await
+        match self {
+            Self::Local(service) => {
+                service
+                    .resolve_source(positional, template, pull, progress)
+                    .await
+            }
+            Self::Daemon(service) => {
+                service
+                    .resolve_source(positional, template, pull, progress)
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn resolve_read_only_creation(
@@ -148,7 +225,10 @@ impl AppApi {
     }
 
     pub(crate) async fn ensure_name_available(&mut self, name: &str) -> eyre::Result<()> {
-        self.local.ensure_name_available(name).await
+        match self {
+            Self::Local(service) => service.ensure_name_available(name).await,
+            Self::Daemon(service) => service.ensure_name_available(name).await,
+        }
     }
 
     pub(crate) async fn create_machine(
@@ -158,23 +238,38 @@ impl AppApi {
         policy_config_dir: Option<&std::path::Path>,
         progress: ImageProgressSender,
     ) -> eyre::Result<MachineData> {
-        self.local
-            .create_machine(plan, source, policy_config_dir, progress)
-            .await
+        match self {
+            Self::Local(service) => {
+                service
+                    .create_machine(plan, source, policy_config_dir, progress)
+                    .await
+            }
+            Self::Daemon(service) => {
+                service
+                    .create_machine(plan, source, policy_config_dir, progress)
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn machine(&mut self, reference: &str) -> eyre::Result<AppMachine> {
-        self.local.machine_handle(reference).await
+        match self {
+            Self::Local(service) => service.machine_handle(reference).await,
+            Self::Daemon(service) => service.machine_handle(reference).await,
+        }
     }
 
     pub(crate) async fn machine_start_options(
         &mut self,
         machine: &AppMachine,
         detached_cleanup: bool,
-    ) -> eyre::Result<MachineStartOptions> {
-        self.local
-            .machine_start_options(machine, detached_cleanup)
-            .await
+    ) -> eyre::Result<AppStartOptions> {
+        let data = machine.inspect().await?;
+        Ok(AppStartOptions {
+            cleanup_on_exit: detached_cleanup
+                && data.retention == libvm::MachineRetention::Ephemeral,
+            ..AppStartOptions::new()
+        })
     }
 
     pub(crate) async fn cleanup_local(
@@ -309,8 +404,10 @@ mod tests {
         let disk = temp.path().join("disk.img");
         std::fs::write(&disk, b"never-booted disk fixture").unwrap();
         let policy = libvm::NetworkPolicy::from_json_str(r#"{"version":1,"endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],"credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"}]}"#).unwrap();
-        let created = api
-            .local
+        let AppApi::Local(service) = &mut api else {
+            unreachable!("explicit local fixture")
+        };
+        let created = service
             .runtime()
             .await
             .unwrap()

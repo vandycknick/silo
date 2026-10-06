@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -52,6 +53,41 @@ func TestNativeControlLifecycle(t *testing.T) {
 			command.Env = append(command.Env, key+"="+value)
 		}
 	}
+	runCLI := func(environment []string, expected int, args ...string) (string, string) {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, filepath.Join(bin, "silo"), args...)
+		cmd.Env = environment
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != expected {
+			t.Fatalf("silo %v: expected exit %d, got %v\nstdout: %s\nstderr: %s", args, expected, err, &stdout, &stderr)
+		}
+		return stdout.String(), stderr.String()
+	}
+	exerciseCLI := func(environment []string, name string) {
+		t.Helper()
+		runCLI(environment, 0, "create", "--name", name, "--cpus", "2", "--memory", "512MiB", "--network", "none", registry.Reference)
+		t.Cleanup(func() {
+			cleanup, done := context.WithTimeout(context.Background(), 20*time.Second)
+			defer done()
+			for _, args := range [][]string{{"stop", "--force", name}, {"rm", name}} {
+				cmd := exec.CommandContext(cleanup, filepath.Join(bin, "silo"), args...)
+				cmd.Env = environment
+				_ = cmd.Run()
+			}
+		})
+		runCLI(environment, 0, "start", name)
+		stdout, stderr := runCLI(environment, 7, "exec", name, "--", "/bin/sh", "-c", "printf out; printf err >&2; exit 7")
+		if stdout != "out" || stderr != "err" {
+			t.Fatalf("%s execution mismatch: stdout=%q stderr=%q", name, stdout, stderr)
+		}
+		runCLI(environment, 0, "stop", name)
+		runCLI(environment, 0, "rm", name)
+	}
+	localHome := t.TempDir()
+	localEnv := append(append([]string{}, command.Env...), "HOME="+localHome, "SILO_HOME="+filepath.Join(localHome, "state"), "XDG_CONFIG_HOME="+filepath.Join(localHome, "config"))
+	exerciseCLI(localEnv, "route-local")
 	command.Stderr = os.Stderr
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
@@ -107,6 +143,11 @@ func TestNativeControlLifecycle(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, "state", "state.db")); !os.IsNotExist(err) {
 		t.Fatalf("status or component resolution initialized the store: %v", err)
 	}
+	// A live daemon for another Home must not silently select local management.
+	runCLI(localEnv, 1, "list")
+	// Read-only planning is an explicit local exception, even with that mismatch.
+	runCLI(localEnv, 0, "create", "--name", "dryrun-local", "--dry-run", registry.Reference)
+	exerciseCLI(command.Env, "route-daemon")
 	images, err := client.Runtime.ResolveImage(ctx, &w.ResolveImageRequest{Reference: registry.Reference, PullPolicy: w.PullPolicy_PULL_POLICY_ALWAYS})
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +168,7 @@ func TestNativeControlLifecycle(t *testing.T) {
 	if image == nil {
 		t.Fatal("missing immutable image")
 	}
-	created, err := client.Machines.CreateMachine(ctx, &w.CreateMachineRequest{Configuration: &w.NormalizedMachineCreate{Name: proto.String("control-smoke"), Cpus: proto.Uint32(2), MemoryBytes: proto.Uint64(512 << 20), Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{}, Labels: map[string]string{"smoke": "control"}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}}, Source: &w.CreateMachineRequest_Oci{Oci: image.Identity}})
+	created, err := client.Machines.CreateMachine(ctx, &w.CreateMachineRequest{Configuration: &w.NormalizedMachineCreate{Name: proto.String("control-smoke"), Cpus: proto.Uint32(2), MemoryBytes: proto.Uint64(512 << 20), Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{WorkingDirectory: "/"}, Labels: map[string]string{"smoke": "control"}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}}, Source: &w.CreateMachineRequest_Oci{Oci: image.Identity}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,15 +189,17 @@ func TestNativeControlLifecycle(t *testing.T) {
 		t.Fatal("missing created machine")
 	}
 	ref := &w.MachineRef{Reference: &w.MachineRef_Id{Id: machine.Id}}
-	defer func() {
+	t.Cleanup(func() {
 		cleanup, done := context.WithTimeout(context.Background(), 20*time.Second)
 		defer done()
-		_, _ = client.Machines.StopMachine(cleanup, &w.StopMachineRequest{Machine: ref, Force: true, Timeout: durationpb.New(10 * time.Second)})
-		_, err := client.Machines.RemoveMachine(cleanup, &w.RemoveMachineRequest{Machine: ref})
-		if err != nil {
-			t.Error("fixture cleanup:", err)
+		for _, args := range [][]string{{"stop", "--force", machine.Id}, {"rm", machine.Id}} {
+			cmd := exec.CommandContext(cleanup, filepath.Join(bin, "silo"), args...)
+			cmd.Env = command.Env
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("fixture cleanup %v: %v: %s", args, err, output)
+			}
 		}
-	}()
+	})
 	inspected, err := client.Machines.InspectMachine(ctx, ref)
 	if err != nil {
 		t.Fatal(err)
@@ -209,6 +252,34 @@ func TestNativeControlLifecycle(t *testing.T) {
 	}
 	if updated.Id != machine.Id || updated.Name != "control-renamed" {
 		t.Fatalf("update changed identity: %v", updated)
+	}
+	runCLI(command.Env, 0, "start", "control-renamed")
+	streaming := exec.CommandContext(ctx, filepath.Join(bin, "silo"), "exec", "control-renamed", "--", "/bin/sh", "-c", "printf ready; sleep 2; printf survived")
+	streaming.Env = command.Env
+	var sessionErrors bytes.Buffer
+	streaming.Stderr = &sessionErrors
+	stdout, err := streaming.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := streaming.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = streaming.Process.Kill() }()
+	prefix := make([]byte, 5)
+	if _, err := io.ReadFull(stdout, prefix); err != nil || string(prefix) != "ready" {
+		waitErr := streaming.Wait()
+		t.Fatalf("native session did not start: %q %v, exit=%v, stderr=%s", prefix, err, waitErr, &sessionErrors)
+	}
+	if err := command.Process.Signal(unix.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	remainder, err := io.ReadAll(stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := streaming.Wait(); err != nil || string(remainder) != "survived" {
+		t.Fatalf("manager exit interrupted native session: %q %v %s", remainder, err, &sessionErrors)
 	}
 	t.Logf("real OCI/UDS lifecycle passed: machine=%s run=%s", machine.Id, started.RunId)
 }

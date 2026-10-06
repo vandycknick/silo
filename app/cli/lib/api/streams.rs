@@ -17,7 +17,8 @@ pub(crate) async fn attach_shell(
 ) -> eyre::Result<SshExitStatus> {
     let cwd = std::env::current_dir().context("resolve current working directory")?;
     machine
-        .inner()
+        .session_machine()
+        .await?
         .attach_shell_with(|options| {
             let options = options.cwd(cwd.to_string_lossy()).best_effort_cwd();
             let options = match user {
@@ -62,7 +63,8 @@ pub(crate) async fn run_command_streaming(
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
     let mut session = machine
-        .inner()
+        .session_machine()
+        .await?
         .spawn_with(program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment).stdin_pipe()
         })
@@ -79,7 +81,8 @@ pub(crate) async fn attach_command(
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
     machine
-        .inner()
+        .session_machine()
+        .await?
         .attach_with(program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment)
         })

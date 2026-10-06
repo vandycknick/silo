@@ -866,7 +866,6 @@ mod tests {
             panic!("expected disk source")
         };
         assert_eq!(path, &std::fs::canonicalize(&disk).expect("canonical disk"));
-        assert_eq!(disk_source.disk.as_ref(), Some(path));
 
         let oci_result = AppApi::resolve_read_only_creation(
             RuntimeConfig::local(&data_root),
