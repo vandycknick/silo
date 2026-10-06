@@ -41,15 +41,59 @@ pub(crate) struct ServiceConfig {
     pub(crate) executable: PathBuf,
     pub(crate) native_service_path: PathBuf,
     pub(crate) paths: DaemonPaths,
+    environment: ServiceEnvironment,
 }
 
 impl ServiceConfig {
     pub(crate) fn new(paths: &DaemonPaths, executable: PathBuf) -> eyre::Result<Self> {
+        let host = libvm::HostPaths::from_env()?;
+        if paths.home() != host.home() {
+            bail!("daemon paths do not match the selected Silo Home");
+        }
+        let environment = ServiceEnvironment::from_host(&host)?;
         Ok(Self {
             executable,
             native_service_path: native_service_path()?,
             paths: paths.clone(),
+            environment,
         })
+    }
+}
+
+/// Only the resolved path identities are copied into the native service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceEnvironment {
+    user_home: PathBuf,
+    silo_home: PathBuf,
+    config_home: PathBuf,
+}
+
+impl ServiceEnvironment {
+    fn from_host(host: &libvm::HostPaths) -> eyre::Result<Self> {
+        let user_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| eyre::eyre!("HOME is required for the native user service"))?;
+        if !user_home.is_absolute() {
+            bail!("HOME must be absolute: {}", user_home.display());
+        }
+        let config_home = host
+            .config_dir()
+            .parent()
+            .ok_or_else(|| eyre::eyre!("configuration directory has no parent"))?
+            .to_path_buf();
+        Ok(Self {
+            user_home,
+            silo_home: host.home().to_path_buf(),
+            config_home,
+        })
+    }
+
+    fn entries(&self) -> [(&'static str, &Path); 3] {
+        [
+            ("HOME", &self.user_home),
+            ("SILO_HOME", &self.silo_home),
+            ("XDG_CONFIG_HOME", &self.config_home),
+        ]
     }
 }
 
@@ -62,13 +106,38 @@ impl OperationLock {
         let parent = path
             .parent()
             .ok_or_else(|| eyre::eyre!("operation lock has no parent"))?;
-        std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+        match std::fs::DirBuilder::new().mode(0o700).create(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+            .open(parent)?;
+        let metadata = directory.metadata()?;
+        if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o7777 != 0o700 {
+            bail!(
+                "daemon controller directory must be owned by the current UID with mode 0700: {}",
+                parent.display()
+            );
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
             .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != nix::unistd::geteuid().as_raw()
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            bail!("unsafe daemon controller lock: {}", path.display());
+        }
         Flock::lock(file, FlockArg::LockExclusive)
             .map(|file| Self { _file: file })
             .map_err(|(_, error)| error.into())
@@ -83,7 +152,7 @@ pub(crate) fn up(
     spinner: &mut Spinner,
 ) -> eyre::Result<()> {
     reject_root()?;
-    let _lock = OperationLock::acquire(&service.paths.operation_lock())?;
+    let _lock = OperationLock::acquire(&controller_lock_path())?;
     spinner.step("Registering", "silod service");
     install_native(service, arguments)?;
     let started = chrono::Utc::now();
@@ -97,8 +166,10 @@ pub(crate) fn up(
 pub(crate) fn down(paths: &DaemonPaths, executable: &Path) -> eyre::Result<()> {
     reject_root()?;
     let mut spinner = Spinner::start("Stopping", "system daemon");
-    let _lock = OperationLock::acquire(&paths.operation_lock())?;
-    verify_native_owned(&native_service_path()?)?;
+    let _lock = OperationLock::acquire(&controller_lock_path())?;
+    let native_path = native_service_path()?;
+    verify_native_owned(&native_path)?;
+    verify_home_for_down(&native_path, paths)?;
     native_stop()?;
     wait_for_exit(paths, Duration::from_secs(120))?;
     spinner.step("Stopping", "system VM");
@@ -141,6 +212,11 @@ pub(crate) fn is_enabled() -> eyre::Result<bool> {
 /// The published status, when the silod that wrote it is the one the service
 /// manager is running.
 pub(crate) fn status(paths: &DaemonPaths) -> eyre::Result<Option<DaemonStatus>> {
+    verify_running_home(
+        &native_service_path()?,
+        paths.home(),
+        native_pid()?.is_some(),
+    )?;
     let Some(status) = read_status(paths) else {
         return Ok(None);
     };
@@ -384,6 +460,7 @@ fn install_native(service: &ServiceConfig, arguments: &[OsString]) -> eyre::Resu
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
     let marker = service_marker(existing.as_deref())?;
+    verify_running_home(path, service.paths.home(), native_pid()?.is_some())?;
     let bytes = render_native(service, &marker, arguments)?;
     if let Some(existing) = existing {
         if validate_existing_service(path, &existing, &bytes, &marker, native_pid()?.is_some())? {
@@ -459,6 +536,69 @@ fn verify_native_owned(native_service_path: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
+/// A service manager has one registration per UID, even when Silo Home changes.
+fn controller_lock_path() -> PathBuf {
+    libvm::HostPaths::run_root().join("silod-controller.lock")
+}
+
+fn verify_running_home(path: &Path, home: &Path, running: bool) -> eyre::Result<()> {
+    if !running {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path).context(
+        "running silod has no readable service definition; run `silo daemon down` and reconfigure",
+    )?;
+    validate_running_home(&bytes, home)
+}
+
+fn verify_home_for_down(path: &Path, paths: &DaemonPaths) -> eyre::Result<()> {
+    let Some(pid) = native_pid()? else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(path)?;
+    if validate_running_home(&bytes, paths.home()).is_ok() {
+        return Ok(());
+    }
+    // Older owned registrations did not encode Home. Permit their explicit
+    // shutdown only when this Home's published status identifies the live PID.
+    let text = std::str::from_utf8(&bytes)?;
+    if !text.contains("SILO_HOME") {
+        if let Some(status) = read_status(paths) {
+            if status.pid == pid && status_owner_is_live(&status)? {
+                return Ok(());
+            }
+        }
+    }
+    validate_running_home(&bytes, paths.home())
+}
+
+fn validate_running_home(bytes: &[u8], home: &Path) -> eyre::Result<()> {
+    let identity = home_environment_identity(home)?;
+    if !std::str::from_utf8(bytes)?
+        .lines()
+        .any(|line| line == identity)
+    {
+        bail!("the running silod is bound to another Silo Home or an old service definition; run `silo daemon down` with its original Home, then reconfigure with `silo daemon up`");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn home_environment_identity(home: &Path) -> eyre::Result<String> {
+    Ok(format!(
+        "Environment={}",
+        systemd_environment("SILO_HOME", home)?
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn home_environment_identity(home: &Path) -> eyre::Result<String> {
+    Ok(format!(
+        "\t\t<key>SILO_HOME</key><string>{}</string>",
+        plist_path(home)?
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn render_native(
     service: &ServiceConfig,
@@ -470,8 +610,17 @@ fn render_native(
         .map(|value| systemd_arg(Path::new(value)))
         .collect::<eyre::Result<Vec<_>>>()?
         .join(" ");
+    let environment = service
+        .environment
+        .entries()
+        .into_iter()
+        .map(|(key, path)| {
+            systemd_environment(key, path).map(|value| format!("Environment={value}\n"))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?
+        .concat();
     Ok(format!(
-        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo system VM manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nExecStart={}\nRestart=on-failure\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo system VM manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\n{environment}ExecStart={}\nRestart=on-failure\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         command
     ).into_bytes())
 }
@@ -494,6 +643,24 @@ fn systemd_arg(path: &Path) -> eyre::Result<String> {
     ))
 }
 
+/// Environment= has specifier expansion but no shell or ExecStart dollar expansion.
+#[cfg(target_os = "linux")]
+fn systemd_environment(key: &str, path: &Path) -> eyre::Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("service path is not UTF-8"))?;
+    if value.contains(['\n', '\r', '\0']) {
+        bail!("invalid service environment path");
+    }
+    Ok(format!(
+        "\"{key}={}\"",
+        value
+            .replace('%', "%%")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    ))
+}
+
 #[cfg(target_os = "macos")]
 const LAUNCHD_LABEL: &str = "io.silo.system";
 
@@ -503,25 +670,21 @@ fn render_native(
     marker: &str,
     arguments: &[OsString],
 ) -> eyre::Result<Vec<u8>> {
-    fn xml(value: &str) -> String {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-    }
-    fn plist_path(path: &Path) -> eyre::Result<String> {
-        path.to_str()
-            .map(xml)
-            .ok_or_else(|| eyre::eyre!("service path is not UTF-8"))
-    }
     let executable = plist_path(&service.executable)?;
     let native_log = plist_path(&service.paths.native_log())?;
     let arguments = arguments
         .iter()
         .map(|value| {
             plist_path(Path::new(value)).map(|value| format!("\t\t<string>{value}</string>\n"))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?
+        .concat();
+    let environment = service
+        .environment
+        .entries()
+        .into_iter()
+        .map(|(key, path)| {
+            plist_path(path).map(|value| format!("\t\t<key>{key}</key><string>{value}</string>\n"))
         })
         .collect::<eyre::Result<Vec<_>>>()?
         .concat();
@@ -543,6 +706,7 @@ fn render_native(
             "\t\t<string>{executable}</string>\n",
             "{arguments}",
             "\t</array>\n",
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n{environment}\t</dict>\n",
             "\t<key>RunAtLoad</key>\n\t<true/>\n",
             "\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>\n",
             "\t<key>ThrottleInterval</key>\n\t<integer>5</integer>\n",
@@ -560,8 +724,25 @@ fn render_native(
         executable = executable,
         arguments = arguments,
         native_log = native_log,
+        environment = environment,
     )
     .into_bytes())
+}
+
+#[cfg(target_os = "macos")]
+fn plist_path(path: &Path) -> eyre::Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("service path is not UTF-8"))?;
+    if value.contains(['\n', '\r', '\0']) {
+        bail!("invalid service environment path");
+    }
+    Ok(value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;"))
 }
 
 #[cfg(target_os = "linux")]
@@ -801,7 +982,83 @@ mod tests {
             executable: PathBuf::from(executable),
             native_service_path: home.join("service"),
             paths: DaemonPaths::new(home.join(".silo")),
+            environment: crate::daemon::service::ServiceEnvironment {
+                user_home: home.to_path_buf(),
+                silo_home: home.join(".silo"),
+                config_home: home.join(".config"),
+            },
         }
+    }
+
+    #[test]
+    fn service_environment_contains_only_resolved_path_identities() {
+        let service = service(
+            std::path::Path::new("/users/a & $b/100%"),
+            "/opt/silo/bin/silod",
+        );
+        let bytes = render_native(&service, "test", &[]).expect("render");
+        let text = std::str::from_utf8(&bytes).expect("UTF-8");
+        assert!(text.contains("HOME"));
+        assert!(text.contains("SILO_HOME"));
+        assert!(text.contains("XDG_CONFIG_HOME"));
+        assert_eq!(service.environment.entries().len(), 3);
+        assert!(
+            crate::daemon::service::validate_running_home(&bytes, service.paths.home()).is_ok()
+        );
+        assert!(crate::daemon::service::validate_running_home(
+            &bytes,
+            std::path::Path::new("/other/home")
+        )
+        .is_err());
+        assert!(crate::daemon::service::validate_running_home(
+            b"legacy definition",
+            service.paths.home()
+        )
+        .is_err());
+        #[cfg(target_os = "linux")]
+        {
+            assert!(text.contains("Environment=\"HOME=/users/a & $b/100%%\""));
+            assert!(!text.contains("$$b"));
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("Environment="))
+                    .count(),
+                3
+            );
+            assert!(crate::daemon::service::systemd_environment(
+                "HOME",
+                std::path::Path::new("/bad\npath")
+            )
+            .is_err());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(text.contains("<key>EnvironmentVariables</key>"));
+            assert!(text.contains("/users/a &amp; $b/100%"));
+            assert!(
+                crate::daemon::service::plist_path(std::path::Path::new("/bad\npath")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn controller_lock_rejects_unsafe_files_and_is_independent_of_home() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("private/operation.lock");
+        drop(crate::daemon::service::OperationLock::acquire(&path).expect("safe lock"));
+        std::fs::remove_file(&path).expect("remove lock");
+        symlink(temp.path().join("target"), &path).expect("symlink");
+        assert!(crate::daemon::service::OperationLock::acquire(&path).is_err());
+        std::fs::remove_file(&path).expect("remove symlink");
+        std::fs::write(&path, b"unsafe").expect("file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("permissions");
+        assert!(crate::daemon::service::OperationLock::acquire(&path).is_err());
+        assert_eq!(
+            crate::daemon::service::controller_lock_path(),
+            libvm::HostPaths::run_root().join("silod-controller.lock")
+        );
     }
 
     #[test]
@@ -1022,7 +1279,12 @@ mod tests {
             native_service_path: PathBuf::from(
                 "/Users/me/Library/LaunchAgents/io.silo.system.plist",
             ),
-            paths: DaemonPaths::for_user_home(std::path::Path::new("/Users/me")),
+            paths: DaemonPaths::new("/Users/me/.silo"),
+            environment: crate::daemon::service::ServiceEnvironment {
+                user_home: "/Users/me".into(),
+                silo_home: "/Users/me/.silo".into(),
+                config_home: "/Users/me/.config".into(),
+            },
         };
         let plist = String::from_utf8(
             render_native(&service, "Silo-Installation-ID: test", &[]).expect("render"),

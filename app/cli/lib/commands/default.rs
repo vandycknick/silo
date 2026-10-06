@@ -1,8 +1,8 @@
 use clap::Args;
 use libvm::MachineRetention;
 
-use crate::config::GlobalConfig;
 use crate::context::Context;
+use silo_config::GlobalConfig;
 
 #[derive(Debug, Args)]
 #[command(about = "Show or set the default VM")]

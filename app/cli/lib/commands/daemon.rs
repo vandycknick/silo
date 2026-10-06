@@ -31,6 +31,10 @@ struct Up {
     foreground: bool,
     #[arg(long)]
     no_switch_context: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    system: Option<bool>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    tailscale: Option<bool>,
 }
 
 #[derive(Debug, Args)]
@@ -49,25 +53,45 @@ struct Logs {
 
 impl Cmd {
     pub(crate) async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let paths = DaemonPaths::from_env()?;
+        let host = libvm::HostPaths::from_env()?;
+        let paths = DaemonPaths::new(host.home());
         match self.command {
             DaemonCommand::Up(command) => {
                 let mut spinner = Spinner::start("Checking", "daemon configuration");
-                let arguments = context.config()?.daemon_overrides()?.to_args();
+                let selection = silo_config::FeatureOverrides {
+                    system: command.system,
+                    tailscale: command.tailscale,
+                };
+                let existing_installation = paths.daemon_data().join("daemon.json").try_exists()?;
+                let features = context
+                    .config()?
+                    .resolve_features(selection, existing_installation);
+                let mut arguments = context.config()?.daemon_overrides()?.to_args();
+                arguments.push(format!("--system-enabled={}", features.system).into());
+                arguments.push(format!("--tailscale-enabled={}", features.tailscale).into());
                 let executable = crate::daemon::executable()?;
                 let socket = paths.docker_socket();
                 let live = service::status(&paths)?.is_some();
-                crate::daemon::docker::preflight(&socket, live)?;
+                if features.system {
+                    crate::daemon::docker::preflight(&socket, live)?;
+                }
                 crate::daemon::check(&executable, &arguments)?;
                 if command.foreground {
                     spinner.finish_clear();
                     return crate::daemon::foreground(&executable, &arguments);
                 }
                 let service = service::ServiceConfig::new(&paths, executable)?;
-                service::up(&service, &arguments, &mut spinner)?;
+                silo_config::GlobalConfig::persist_features(
+                    &host,
+                    selection,
+                    existing_installation,
+                )?;
+                service::up(&service, &[], &mut spinner)?;
                 spinner.finish_success("Started");
-                crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
-                crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
+                if features.system {
+                    crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
+                    crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
+                }
                 Ok(())
             }
             DaemonCommand::Down => service::down(&paths, &crate::daemon::executable()?),
@@ -348,6 +372,27 @@ mod tests {
     use crate::commands::daemon::{
         format_actual_backend, format_host_memory_reclaim, format_update_check,
     };
+
+    #[test]
+    fn feature_flags_distinguish_omitted_enabled_and_disabled() {
+        #[derive(clap::Parser)]
+        struct Options {
+            #[command(flatten)]
+            up: crate::commands::daemon::Up,
+        }
+        let omitted = Options::try_parse_from(["up"]).expect("omitted");
+        assert_eq!(omitted.up.system, None);
+        assert_eq!(omitted.up.tailscale, None);
+        let selected =
+            Options::try_parse_from(["up", "--system=false", "--tailscale"]).expect("selection");
+        assert_eq!(selected.up.system, Some(false));
+        assert_eq!(selected.up.tailscale, Some(true));
+        let reversed =
+            Options::try_parse_from(["up", "--system", "--tailscale=false"]).expect("selection");
+        assert_eq!(reversed.up.system, Some(true));
+        assert_eq!(reversed.up.tailscale, Some(false));
+        assert!(Options::try_parse_from(["up", "--system=invalid"]).is_err());
+    }
 
     #[test]
     fn parses_controller_commands_only() {

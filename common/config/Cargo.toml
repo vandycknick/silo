@@ -1,0 +1,13 @@
+[package]
+name = "silo-config"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libvm = { path = "../../runtime/libvm" }
+silod-spec = { path = "../../specs/silod-spec" }
+serde = { workspace = true }
+serde_yaml_ng = "0.10.0"
+eyre = "0.6.12"
+nix = { version = "0.31.3", features = ["fs", "user"] }
+tempfile = { workspace = true }

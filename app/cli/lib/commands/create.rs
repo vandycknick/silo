@@ -235,7 +235,7 @@ impl Cmd {
             &template.template,
             &machine,
             self.image.as_deref(),
-            context.config()?.networking.policy_config_dir.as_deref(),
+            context.config()?.networking().policy_config_dir.as_deref(),
         )?;
 
         if self.dry_run {
@@ -305,7 +305,7 @@ impl Cmd {
             let Plan::Create(plan) = plan else {
                 unreachable!("create resolution returns a create plan")
             };
-            let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+            let policy_config_dir = context.config()?.networking().policy_config_dir.clone();
             context
                 .app_api()
                 .await?
@@ -317,7 +317,7 @@ impl Cmd {
         let name = image_result?.name;
         success(format!("Created {name}"));
         if self.set_default {
-            crate::config::GlobalConfig::write_default_machine(Some(&name))?;
+            silo_config::GlobalConfig::write_default_machine(Some(&name))?;
         }
         println!("{name}");
         Ok(())

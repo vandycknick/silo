@@ -2,6 +2,7 @@
 members = [
     "app/cli",
     "app/silod",
+    "common/config",
     "common/policy",
     "common/secrets",
     "common/disk-image",

@@ -10,7 +10,7 @@ fn command(home: &std::path::Path) -> Command {
     command
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("SILO_HOME", home.join("ignored-home"))
+        .env("SILO_HOME", home.join("runtime-home"))
         .env("SILO_VIRT_BACKEND", "not-a-daemon-setting")
         .env("SILO_RUNTIME_DIR", home.join("missing-runtime"));
     command
@@ -39,40 +39,18 @@ impl Drop for Process {
 }
 
 #[test]
-fn help_and_check_do_not_read_cli_config_or_create_state() {
+fn malformed_shared_configuration_is_rejected_without_creating_state() {
     let root = tempfile::tempdir().expect("temporary home");
     unreadable_cli_config(root.path());
-    let help = command(root.path()).arg("--help").output().expect("help");
-    assert!(help.status.success());
-    let help = String::from_utf8_lossy(&help.stdout);
-    assert!(help.contains("silod [OPTIONS]"));
-    assert!(help.contains("--system-cpus"));
-    assert!(help.contains("--check"));
-    assert!(!help.contains("Commands:"));
-
-    let valid = command(root.path())
-        .args(["--check", "--system-cpus", "2"])
-        .output()
-        .expect("check");
-    assert!(valid.status.success(), "{valid:?}");
-    let invalid = command(root.path())
-        .args(["--check", "--system-cpus", "0"])
-        .output()
-        .expect("check");
-    assert!(!invalid.status.success());
-    let error = String::from_utf8_lossy(&invalid.stderr);
-    assert!(error.contains("cpus must be greater than zero"), "{error}");
+    let original = std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config");
+    let check = command(root.path()).arg("--check").output().expect("check");
+    assert!(!check.status.success());
+    assert_eq!(
+        std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config"),
+        original
+    );
+    assert!(!root.path().join("runtime-home").exists());
     assert!(!root.path().join(".silo").exists());
-    assert!(!root.path().join("ignored-home").exists());
-
-    for argument in ["--home", "--state", "service", "start", "stop", "upgrade"] {
-        assert!(!command(root.path())
-            .arg(argument)
-            .output()
-            .expect("reject management interface")
-            .status
-            .success());
-    }
 }
 
 #[test]
@@ -86,29 +64,29 @@ fn invalid_configuration_is_published_as_a_failure() {
         .output()
         .expect("serve");
     assert!(!output.status.success());
-    let status = read_status(&DaemonPaths::for_user_home(root.path())).expect("status");
+    let status = read_status(&DaemonPaths::new(root.path().join("runtime-home"))).expect("status");
     assert_eq!(status.phase, DaemonPhase::Failed);
     assert!(status
         .last_error
         .as_deref()
         .unwrap_or_default()
         .contains("at least 128MiB"));
-    assert!(!root.path().join(".silo/daemon/daemon.json").exists());
+    assert!(!root.path().join("runtime-home/daemon/daemon.json").exists());
 }
 
 #[test]
-fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
+fn daemon_retries_startup_and_stops_cleanly_in_the_selected_home() {
     // The daemon intentionally refuses root. This test exercises the same entrypoint
     // under an ordinary user, as in the host CI lanes.
     if nix::unistd::geteuid().is_root() {
         return;
     }
     let root = tempfile::tempdir().expect("temporary home");
-    unreadable_cli_config(root.path());
     // A genuinely missing runtime prevents any VM launch or registry access, while
     // exercising real startup, status publication, retry, and signal handling.
     let mut child = Process(
         command(root.path())
+            .arg("--system-enabled=true")
             .args([
                 "--system-image",
                 "registry.invalid/unused:test",
@@ -128,7 +106,7 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
             .spawn()
             .expect("spawn daemon"),
     );
-    let paths = DaemonPaths::for_user_home(root.path());
+    let paths = DaemonPaths::new(root.path().join("runtime-home"));
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = read_status(&paths) {
@@ -158,7 +136,7 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
         status.docker_socket,
         paths.docker_socket().display().to_string()
     );
-    assert!(!root.path().join("ignored-home").exists());
+    assert!(!root.path().join(".silo").exists());
 
     // A second daemon for the same installation refuses to start.
     let second = command(root.path()).output().expect("second daemon");
@@ -191,7 +169,7 @@ fn stop_without_an_installation_reports_stopped() {
     let root = tempfile::tempdir().expect("temporary home");
     let output = command(root.path()).arg("--stop").output().expect("stop");
     assert!(output.status.success(), "{output:?}");
-    let status = read_status(&DaemonPaths::for_user_home(root.path())).expect("status");
+    let status = read_status(&DaemonPaths::new(root.path().join("runtime-home"))).expect("status");
     assert_eq!(status.phase, DaemonPhase::Stopped);
-    assert!(!root.path().join(".silo/daemon/daemon.json").exists());
+    assert!(!root.path().join("runtime-home/daemon/daemon.json").exists());
 }

@@ -175,7 +175,7 @@ async fn remove_network(context: &mut Context, command: RmCmd) -> eyre::Result<(
 }
 
 async fn set_machine_network(context: &mut Context, command: SetCmd) -> eyre::Result<()> {
-    let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+    let policy_config_dir = context.config()?.networking().policy_config_dir.clone();
     let network = machine_network_with_policy(
         command.network,
         command.policy.as_deref(),

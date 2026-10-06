@@ -1,8 +1,8 @@
 use clap::Args;
 
-use crate::config::GlobalConfig;
 use crate::context::Context;
 use crate::ui::{self, Spinner};
+use silo_config::GlobalConfig;
 
 #[derive(Debug, Args)]
 #[command(about = "Remove a VM")]

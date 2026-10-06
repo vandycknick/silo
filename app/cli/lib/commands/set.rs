@@ -3,10 +3,10 @@ use libvm::{MachineUpdate, Memory};
 use std::path::PathBuf;
 use utils::HumanSize;
 
-use crate::config::GlobalConfig;
 use crate::context::Context;
 use crate::machine_defaults::MachineNetworkSelection;
 use crate::ui;
+use silo_config::GlobalConfig;
 
 const SETTINGS: &[(&str, &str)] = &[
     ("name=NAME", "Rename the VM"),

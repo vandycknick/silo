@@ -1,6 +1,3 @@
-//! The `daemon` section of the CLI's `config.yaml`. The CLI owns this schema and
-//! translates only the explicit values into silod's `--system-*` arguments; silod
-//! never reads the file.
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -8,18 +5,32 @@ use silod_spec::arguments::{Backend, PublishBind, Share, SystemOverrides};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DaemonConfig {
+pub(super) struct DaemonConfig {
     version: String,
     /// Backend for the system appliance only. Fixed once the system VM exists.
     #[serde(default)]
     backend: Option<Backend>,
     #[serde(default)]
     system: SystemSection,
+    #[serde(default)]
+    pub(super) tailscale: crate::tailscale::TailscaleConfig,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            version: "1".into(),
+            backend: None,
+            system: SystemSection::default(),
+            tailscale: crate::tailscale::TailscaleConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SystemSection {
+    enabled: Option<bool>,
     /// Only Docker exists today; accepted so the key keeps its documented meaning.
     #[serde(default)]
     engine: Option<Engine>,
@@ -80,7 +91,31 @@ struct Networking {
 }
 
 impl DaemonConfig {
-    pub(crate) fn overrides(&self) -> eyre::Result<SystemOverrides> {
+    pub(super) fn system_enabled(&self) -> Option<bool> {
+        self.system.enabled
+    }
+
+    pub(super) fn validate(&self) -> eyre::Result<()> {
+        self.overrides()?;
+        let system = &self.system;
+        if system.resources.cpus == Some(0) {
+            eyre::bail!("system cpus must be nonzero");
+        }
+        if let Some(memory) = &system.resources.memory {
+            libvm::planning::parse_machine_memory(memory)
+                .map_err(|e| eyre::eyre!("invalid system memory: {e}"))?;
+        }
+        for size in [&system.storage.root_size, &system.storage.data_size]
+            .into_iter()
+            .flatten()
+        {
+            libvm::planning::parse_root_disk_size(size)
+                .map_err(|e| eyre::eyre!("invalid system disk size: {e}"))?;
+        }
+        self.tailscale.validate()
+    }
+
+    pub(super) fn overrides(&self) -> eyre::Result<SystemOverrides> {
         if self.version != "1" {
             eyre::bail!(
                 "unsupported daemon config version {:?}; expected \"1\"",
@@ -120,7 +155,7 @@ impl DaemonConfig {
 mod tests {
     use silod_spec::arguments::{Backend, PublishBind, Share, SystemOverrides};
 
-    use crate::daemon::config::DaemonConfig;
+    use crate::daemon::DaemonConfig;
 
     fn parse(yaml: &str) -> Result<DaemonConfig, serde_yaml_ng::Error> {
         serde_yaml_ng::from_str(yaml)
