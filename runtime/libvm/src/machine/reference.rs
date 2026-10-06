@@ -39,6 +39,30 @@ impl MachineRef {
         })
     }
 
+    /// Exact immutable UUID, when this reference selects one machine ID.
+    pub fn id_uuid(&self) -> Option<uuid::Uuid> {
+        match &self.kind {
+            MachineRefKind::Id(id) => Some((*id).into()),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name selected by the native parser.
+    pub fn name(&self) -> Option<&str> {
+        match &self.kind {
+            MachineRefKind::Name(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Normalized ID prefix selected by the native parser.
+    pub fn id_prefix(&self) -> Option<&str> {
+        match &self.kind {
+            MachineRefKind::IdPrefix(prefix) => Some(prefix),
+            _ => None,
+        }
+    }
+
     pub(crate) fn id(id: MachineId) -> Self {
         Self {
             kind: MachineRefKind::Id(id),

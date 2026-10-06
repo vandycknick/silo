@@ -42,6 +42,29 @@ pub struct MachineRootfs {
     pub created_at: i64,
 }
 
+impl MachineRootfs {
+    /// Constructs a disk pin observation; OCI identity can be supplied in public fields.
+    pub fn new(
+        source_kind: ImageSourceKind,
+        requested_reference: String,
+        root_disk_path: PathBuf,
+        root_disk_size_bytes: u64,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            source_kind,
+            requested_reference,
+            selected_reference: None,
+            selected_manifest_digest: None,
+            config_digest: None,
+            image_id: None,
+            root_disk_path,
+            root_disk_size_bytes,
+            created_at,
+        }
+    }
+}
+
 impl From<MachineRootfsRecord> for MachineRootfs {
     fn from(value: MachineRootfsRecord) -> Self {
         Self {
@@ -177,6 +200,40 @@ pub struct MachineData {
 }
 
 impl MachineData {
+    /// Constructs an owned observation for adapters without opening a machine handle.
+    /// Optional observations remain unavailable until the adapter supplies them.
+    pub fn new(id: String, name: String, spec: VmSpec) -> Self {
+        Self {
+            id,
+            name,
+            spec,
+            retention: MachineRetention::Persistent,
+            process: ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
+            machine_dir: PathBuf::new(),
+            created_at: 0,
+            modified_at: 0,
+            image_ref: String::new(),
+            rootfs: None,
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+            tailscale: None,
+            guest: MachineGuestConfig::default(),
+            status: MachineStatus::Stopped,
+            observation: MachineObservation::Unavailable,
+            issues: Vec::new(),
+            run_id: None,
+            boot_report: None,
+            provision_report: None,
+            started_at: None,
+            last_error: None,
+            updated_at: 0,
+        }
+    }
+
     pub(crate) fn from_models_with_status(
         config: MachineConfig,
         rootfs: Option<MachineRootfsRecord>,

@@ -157,6 +157,13 @@ fmt: ## Format workspace source code.
 clippy: ## Lint all host-supported workspace components.
 	$(XTASK) clippy
 
+.PHONY: protocol-go protocol-go-check
+protocol-go: ## Generate pinned Go daemon management bindings.
+	$(XTASK) protocol-go
+
+protocol-go-check: ## Check committed Go management bindings for drift.
+	$(XTASK) protocol-go --check
+
 test: ## Run unit and integration tests for all host-supported workspace components.
 	$(XTASK) test
 

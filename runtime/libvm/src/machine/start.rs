@@ -64,6 +64,23 @@ pub struct Entrypoint {
 }
 
 impl Entrypoint {
+    /// Exact guest program, without shell interpretation.
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+    pub fn arguments(&self) -> &[String] {
+        &self.args
+    }
+    pub fn working_directory(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+    pub fn environment(&self) -> &[(String, String)] {
+        &self.env
+    }
+    pub fn user_selector(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
     /// Creates an entrypoint for the given guest program path.
     pub fn new(program: impl Into<String>) -> Self {
         Self {

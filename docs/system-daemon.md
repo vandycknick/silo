@@ -17,6 +17,20 @@ or replace `/var/run/docker.sock`.
 controller. Both read normal configuration through `silo-config`. Their published
 daemon contract is the `silod-spec` crate, which holds data and encodings only:
 
+The typed management schema is
+`specs/silod-spec/proto/daemon.proto` (`silo.daemon.v1`). It separates daemon
+status/runtime selection, machine lifecycle, network definitions and runtime
+image/policy operations. Rust adapters in `common/vm-control` preserve native
+snapshots, run identities, errors, byte-valued host paths and absent-versus-empty
+updates. Local creation uses the same normalized builder application.
+
+Committed Go clients live in `specs/protocol/go`; regenerate with
+`make protocol-go` and verify drift with `make protocol-go-check`. Both commands
+use pinned Go generators and vendored protoc. Guest execution and secret reads
+are deliberately absent from this management protocol. Session transport stays
+in libvm and its SDK bindings.
+
+
 ```text
  silo ── --system-* argv ─────────────────────────────► silod
  silo ◄─ ~/.silo/daemon/status.json, logs/daemon/ ───── silod
