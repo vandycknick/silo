@@ -68,16 +68,17 @@ pub use crate::machine::{
     MachineLoadAverageMetrics, MachineLogChunk, MachineLogOptions, MachineLogOutput,
     MachineLogSource, MachineLogStream, MachineMemoryMetrics, MachineMemoryReclaimReport,
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
-    MachineNetworkInterfaceMetrics, MachineObservation, MachineProvisionFailurePolicy,
-    MachineProvisionOverallStatus, MachineProvisionReport, MachineProvisionStatus,
-    MachineProvisionStepReport, MachineProvisionStepStatus, MachineProvisioningReport,
-    MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
-    MachineRef, MachineRetention, MachineRootfs, MachineRunId, MachineSshBackend,
-    MachineSshListenerReport, MachineStaleReason, MachineStart, MachineStartOptions, MachineStatus,
-    MachineStopOptions, MachineSystemInfo, MachineTailscale, MachineUpdate, MachineUserConfig,
-    MachineUserUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions, Memory,
-    NetworkPolicyUpdate, ProcessConfig, SshExitStatus, SshShellOptions, SshShellOptionsBuilder,
-    StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineNetworkInterfaceMetrics, MachineNetworkObservation, MachineNetworkObservationIssue,
+    MachineNodeObservation, MachineNodeState, MachineNodeStatus, MachineObservation,
+    MachineProvisionFailurePolicy, MachineProvisionOverallStatus, MachineProvisionReport,
+    MachineProvisionStatus, MachineProvisionStepReport, MachineProvisionStepStatus,
+    MachineProvisioningReport, MachineReadiness, MachineReadinessOutcome, MachineReadinessReason,
+    MachineReadinessState, MachineRef, MachineRetention, MachineRootfs, MachineRunId,
+    MachineSshBackend, MachineSshListenerReport, MachineStaleReason, MachineStart,
+    MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineTailscale,
+    MachineUpdate, MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState,
+    MachineWaitOptions, Memory, NetworkPolicyUpdate, ProcessConfig, SshExitStatus, SshShellOptions,
+    SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,
@@ -85,8 +86,8 @@ pub use crate::network::{
 };
 pub use crate::paths::HostPaths;
 pub use crate::runtime::{
-    NetdRuntimeConfig, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
-    RuntimeNetworkingConfig, VirtBackendOverride,
+    NetdRuntimeConfig, ReadOnlyRuntime, ResolvedRuntimeComponents, Runtime, RuntimeBuilder,
+    RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride,
 };
 pub use crate::supervisor::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use forward_spec::{

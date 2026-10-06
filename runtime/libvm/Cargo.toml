@@ -16,6 +16,7 @@ utils = { path = "../../common/utils" }
 async-trait = "0.1.91"
 base64 = "0.23.0"
 bytes = "1.12.1"
+chrono.workspace = true
 cpio = "0.4.1"
 eyre = "0.6.12"
 getrandom = "0.4.3"
@@ -41,6 +42,7 @@ tower = "0.5.3"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 prost-types = "0.14.4"
 zeroize.workspace = true
+url = "2.5.8"
 x509-parser = "0.18.0"
 
 [dev-dependencies]

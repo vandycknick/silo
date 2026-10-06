@@ -1,4 +1,5 @@
 mod config;
+mod control;
 mod engine;
 mod paths;
 mod provision;
@@ -77,28 +78,75 @@ async fn run(args: Args) -> eyre::Result<()> {
             Ok(())
         };
     }
+    let host = silo_config::prepare_host_paths(&host)?;
+    let global = GlobalConfig::load_from(&host)?;
+    let paths = SystemPaths::from_host(&host);
     let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
-    let mut status = supervisor::initial_status(&paths.docker_socket())?;
+    let mut system_status = supervisor::initial_status(&paths.docker_socket())?;
     if args.stop {
-        return supervisor::stop_installation(&paths, status).await;
+        return supervisor::stop_installation(&paths, system_status).await;
     }
-    let desired = match desired_system(&paths, &overrides) {
-        Ok(desired) => desired,
-        Err(error) => {
-            // Report a configuration the installation cannot accept to the
-            // controller waiting on status, not only to stderr.
-            supervisor::publish_failure(&paths, &mut status, &error)?;
-            return Err(error);
+    let desired = if features.system {
+        match desired_system(&paths, &overrides) {
+            Ok(desired) => Some(desired),
+            Err(error) => {
+                supervisor::publish_failure(&paths, &mut system_status, &error)?;
+                return Err(error);
+            }
         }
+    } else {
+        None
     };
-    // Component startup is still appliance-only. Reject unsupported activation
-    // instead of claiming that a disabled appliance or enabled helper is running.
-    if !features.system || features.tailscale {
-        let error = eyre::eyre!("this silod supports only the system appliance; the selected optional-component configuration requires a daemon with optional-component startup support");
-        supervisor::publish_failure(&paths, &mut status, &error)?;
-        return Err(error);
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let generation = uuid::Uuid::new_v4();
+    let state = std::sync::Arc::new(control::ControlState::new(
+        host, global, generation, features,
+    ));
+    let server = control::socket::BoundServer::bind(state.clone())?;
+    let api_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut api_task = tokio::spawn(server.serve(api_shutdown.clone()));
+    let system_shutdown = tokio_util::sync::CancellationToken::new();
+    let system_task = desired.map(|desired| {
+        tokio::spawn(supervisor::serve(
+            paths,
+            desired,
+            system_status,
+            system_shutdown.clone(),
+        ))
+    });
+    state
+        .set_core_phase(silod_spec::daemon::v1::CorePhase::Ready)
+        .await;
+    let api_result = tokio::select! {
+        _ = interrupt.recv() => None,
+        _ = terminate.recv() => None,
+        result = &mut api_task => Some(result),
+    };
+    state.begin_stopping().await;
+    state.seal_mutations().await;
+    system_shutdown.cancel();
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(85), async {
+        state.drain_mutations().await?;
+        if let Some(task) = system_task {
+            task.await??;
+        }
+        Ok::<(), eyre::Report>(())
+    })
+    .await;
+    state
+        .set_core_phase(silod_spec::daemon::v1::CorePhase::Stopped)
+        .await;
+    api_shutdown.cancel();
+    match api_result {
+        Some(result) => result??,
+        None => {
+            tokio::time::timeout(std::time::Duration::from_secs(3), api_task).await???;
+        }
     }
-    supervisor::serve(paths, desired, status).await
+    drained.map_err(|_| {
+        eyre::eyre!("daemon shutdown deadline expired with incomplete mutation drain")
+    })?
 }
 
 fn desired_system(paths: &SystemPaths, overrides: &SystemOverrides) -> eyre::Result<DesiredSystem> {

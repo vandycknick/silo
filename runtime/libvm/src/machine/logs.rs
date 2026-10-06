@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -93,6 +93,28 @@ impl Machine {
         source: MachineLogSource,
         options: MachineLogOptions,
     ) -> Result<MachineLogStream, LibVmError> {
+        self.open_logs(source, options, None).await
+    }
+
+    /// Opens at most the last `limit` bytes of a source's snapshot, then optionally
+    /// follows appended bytes using the same descriptor. For execution logs the
+    /// limit spans the ordered archives and active log, not each file separately.
+    /// A zero limit skips existing bytes without skipping subsequent appends.
+    pub async fn logs_tail(
+        &self,
+        source: MachineLogSource,
+        options: MachineLogOptions,
+        limit: u64,
+    ) -> Result<MachineLogStream, LibVmError> {
+        self.open_logs(source, options, Some(limit)).await
+    }
+
+    async fn open_logs(
+        &self,
+        source: MachineLogSource,
+        options: MachineLogOptions,
+        tail: Option<u64>,
+    ) -> Result<MachineLogStream, LibVmError> {
         let runtime = self.runtime().clone();
         let machine_id = self.machine_id();
         // Logs are recovery evidence, not a lifecycle operation. Neither a busy
@@ -108,15 +130,27 @@ impl Machine {
             Err(error) => return Err(error),
         }
         let paths = runtime.local_paths().clone();
-        let file = (source != MachineLogSource::Exec)
+        let mut file = (source != MachineLogSource::Exec)
             .then(|| open_log(&paths, machine_id, source))
             .transpose()?
             .flatten();
+        let exec_snapshot = if source == MachineLogSource::Exec {
+            let (mut archives, mut active) = open_exec_log_snapshots(&paths, machine_id)?;
+            if let Some(limit) = tail {
+                seek_snapshot_tail(archives.iter_mut().chain(active.iter_mut()), limit)?;
+            }
+            Some((archives, active))
+        } else {
+            if let (Some(file), Some(limit)) = (file.as_mut(), tail) {
+                seek_snapshot_tail(std::iter::once(file), limit)?;
+            }
+            None
+        };
         let (sender, receiver) = mpsc::channel(LOG_STREAM_BUFFER);
 
         tokio::spawn(async move {
-            let result = if source == MachineLogSource::Exec {
-                stream_exec_log(paths, machine_id, options.follow, sender.clone()).await
+            let result = if let Some(snapshot) = exec_snapshot {
+                stream_exec_log(paths, machine_id, snapshot, options.follow, sender.clone()).await
             } else {
                 stream_log(
                     paths,
@@ -170,6 +204,8 @@ async fn stream_log(
             if !wait_for_log(&sender).await {
                 return Ok(());
             }
+            // An absent initial snapshot has no history to trim: newly created
+            // files contain bytes produced after this following stream opened.
             file = open_log(&paths, machine_id, source)?;
         }
     }
@@ -248,10 +284,11 @@ fn open_log(
 async fn stream_exec_log(
     paths: crate::paths::LocalPaths,
     machine_id: crate::store::models::MachineId,
+    snapshot: (Vec<OpenedLog>, Option<OpenedLog>),
     follow: bool,
     sender: mpsc::Sender<Result<MachineLogChunk, LibVmError>>,
 ) -> Result<(), LibVmError> {
-    let (archives, mut active) = open_exec_log_snapshots(&paths, machine_id)?;
+    let (archives, mut active) = snapshot;
     for mut archive in archives {
         send_snapshot(&mut archive, &sender).await?;
     }
@@ -379,11 +416,26 @@ fn file_identity(file: File) -> Result<FileIdentity, LibVmError> {
     })
 }
 
+fn seek_snapshot_tail<'a>(
+    files: impl DoubleEndedIterator<Item = &'a mut OpenedLog>,
+    mut remaining: u64,
+) -> Result<(), LibVmError> {
+    for file in files.rev() {
+        let retained = file.snapshot_len.min(remaining);
+        remaining -= retained;
+        file.file
+            .seek(SeekFrom::Start(file.snapshot_len - retained))?;
+    }
+    Ok(())
+}
+
 async fn send_snapshot(
     file: &mut OpenedLog,
     sender: &mpsc::Sender<Result<MachineLogChunk, LibVmError>>,
 ) -> Result<(), LibVmError> {
-    let mut remaining = file.snapshot_len;
+    let mut remaining = file
+        .snapshot_len
+        .saturating_sub(file.file.stream_position()?);
     while remaining > 0 {
         let read = read_chunk(&mut file.file, remaining)?;
         if read.is_empty() {
@@ -683,6 +735,154 @@ mod tests {
 
         let bytes = read_bytes(&mut stream, b"before-after".len()).await;
         assert_eq!(bytes, b"before-after");
+    }
+
+    #[tokio::test]
+    async fn tail_follow_has_no_snapshot_to_append_gap_or_replay() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::default()).await;
+        let path = runtime.machine_paths(id).vm_trace_log_path();
+        write_log(&path, b"discard-before-");
+        let mut stream = machine
+            .logs_tail(
+                MachineLogSource::Monitor,
+                MachineLogOptions { follow: true },
+                7,
+            )
+            .await
+            .expect("open tail follow stream");
+
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append log")
+            .write_all(b"after")
+            .expect("append log");
+
+        assert_eq!(read_bytes(&mut stream, 12).await, b"before-after");
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_tail_snapshot_limits_bytes_across_archives() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::default()).await;
+        let paths = runtime.machine_paths(id);
+        write_log(&paths.exec_log_archive_path(3), b"three\n");
+        write_log(&paths.exec_log_archive_path(2), b"two\n");
+        write_log(&paths.exec_log_archive_path(1), b"one\n");
+        write_log(&paths.exec_log_path(), b"active\n");
+        let all = b"three\ntwo\none\nactive\n";
+        for limit in [0, 1, 7, 9, 15, 100] {
+            let snapshot = collect(
+                machine
+                    .logs_tail(MachineLogSource::Exec, MachineLogOptions::default(), limit)
+                    .await
+                    .expect("open exec tail snapshot"),
+            )
+            .await;
+            let start = all.len().saturating_sub(limit as usize);
+            assert_eq!(snapshot, all[start..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_tail_follow_retains_snapshot_descriptors_across_rotation() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::default()).await;
+        let paths = runtime.machine_paths(id);
+        let active = paths.exec_log_path();
+        write_log(&paths.exec_log_archive_path(2), b"discard\n");
+        write_log(&paths.exec_log_archive_path(1), b"archive\n");
+        write_log(&active, b"old\n");
+        let mut stream = machine
+            .logs_tail(
+                MachineLogSource::Exec,
+                MachineLogOptions { follow: true },
+                7,
+            )
+            .await
+            .expect("open exec tail follow stream");
+
+        // Rotate before consuming the snapshot: the retained active descriptor
+        // must deliver both its selected suffix and the late append exactly once.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .expect("open old active log")
+            .write_all(b"late\n")
+            .expect("append before rotation");
+        std::fs::rename(
+            paths.exec_log_archive_path(2),
+            paths.exec_log_archive_path(3),
+        )
+        .expect("shift second archive");
+        std::fs::rename(
+            paths.exec_log_archive_path(1),
+            paths.exec_log_archive_path(2),
+        )
+        .expect("shift first archive");
+        std::fs::rename(&active, paths.exec_log_archive_path(1)).expect("rotate active");
+        write_log(&active, b"new\n");
+
+        assert_eq!(read_bytes(&mut stream, 16).await, b"ve\nold\nlate\nnew\n");
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn zero_tail_follow_skips_snapshot_but_not_appends() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::default()).await;
+        let path = runtime.machine_paths(id).serial_log_path();
+        write_log(&path, b"discard");
+        let mut stream = machine
+            .logs_tail(
+                MachineLogSource::Serial,
+                MachineLogOptions { follow: true },
+                0,
+            )
+            .await
+            .expect("open zero tail follow stream");
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append log")
+            .write_all(b"new")
+            .expect("append log");
+        assert_eq!(read_bytes(&mut stream, 3).await, b"new");
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn tail_follow_reads_all_bytes_when_initial_snapshot_is_missing() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::default()).await;
+        for source in [MachineLogSource::Serial, MachineLogSource::Exec] {
+            let mut stream = machine
+                .logs_tail(source, MachineLogOptions { follow: true }, 0)
+                .await
+                .expect("open missing tail follow stream");
+            assert!(timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err());
+            let paths = runtime.machine_paths(id);
+            let path = match source {
+                MachineLogSource::Serial => paths.serial_log_path(),
+                MachineLogSource::Exec => paths.exec_log_path(),
+                _ => unreachable!(),
+            };
+            write_log(&path, b"created later");
+            assert_eq!(read_bytes(&mut stream, 13).await, b"created later");
+        }
     }
 
     #[tokio::test]
