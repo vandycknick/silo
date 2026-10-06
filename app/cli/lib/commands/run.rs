@@ -133,7 +133,7 @@ impl Cmd {
             process_overrides.user.as_deref(),
             run_options.shell.as_deref(),
         )?;
-        let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+        let policy_config_dir = context.config()?.networking().policy_config_dir.clone();
         crate::commands::create::preflight_create(
             &template.template,
             &machine,
@@ -214,7 +214,7 @@ impl Cmd {
             let Plan::Run(plan) = plan else {
                 unreachable!("run resolution returns a run plan")
             };
-            let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+            let policy_config_dir = context.config()?.networking().policy_config_dir.clone();
             let data = context
                 .app_api()
                 .await?

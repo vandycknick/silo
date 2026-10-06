@@ -3,8 +3,8 @@
 The optional Silo system daemon runs a persistent Docker Engine inside one
 per-user microVM. Docker and containerd data live on an installation-owned ext4
 disk, separate from the replaceable appliance root disk. The host endpoint is
-`~/.silo/run/docker.sock`. The daemon always uses the fixed `~/.silo` state
-root, regardless of `SILO_HOME`; `silod` has no `--home` or `--state` argument.
+`<Home>/run/docker.sock`. The daemon resolves the same `SILO_HOME` and
+`XDG_CONFIG_HOME` paths as the CLI; `silod` has no `--home` or `--state` argument.
 
 The Docker socket grants its callers administrative control of the guest and
 read/write access to every configured host share. Treat access to it like
@@ -14,8 +14,8 @@ or replace `/var/run/docker.sock`.
 ## Process boundary
 
 `silod` (`app/silod`) is the daemon; `silo daemon up/down/status/logs` is its
-controller. The two share no code. Their whole contract is the `silod-spec`
-crate (`specs/silod-spec`), which holds data and encodings only:
+controller. Both read normal configuration through `silo-config`. Their published
+daemon contract is the `silod-spec` crate, which holds data and encodings only:
 
 ```text
  silo ── --system-* argv ─────────────────────────────► silod
@@ -23,19 +23,20 @@ crate (`specs/silod-spec`), which holds data and encodings only:
  both ── io.silo.system.* machine labels ────────────── libvm
 ```
 
-- The CLI owns `config.yaml`, service registration (launchd/systemd), the
-  Docker context, and the status display. It never reads silod's installation
-  record and performs no system-VM operations.
-- `silod` owns the installation record, provisioning, supervision, and image
-  upgrades. It never reads the CLI configuration file or inherits its global
-  networking configuration.
+- The CLI owns service registration (launchd/systemd), Docker context integration
+  and the status display. It never reads silod's installation record or performs
+  appliance provisioning.
+- `silod` reads the shared configuration and owns installation records,
+  provisioning, supervision and image upgrades. Appliance networking remains
+  separate from ordinary VM networking.
 
 `silod` has no subcommands: running it starts the foreground daemon. The CLI
-registers the native service as `silod` plus only the explicitly configured
-`--system-*` arguments, which the service definition retains for login starts.
-Before registering, `up` runs `silod --check` with the same arguments, so a
-configuration the installation cannot accept fails without touching the service.
-`up --foreground` replaces the CLI process with the same invocation instead.
+registers the native service without copying default-filled configuration into
+arguments. The service reads configuration on every launch and persists only
+the resolved `HOME`, `SILO_HOME` and `XDG_CONFIG_HOME` environment identities.
+Before registering, `up` runs `silod --check`, so invalid configuration does not
+replace the service. `up --foreground` applies process-only overrides without
+persisting feature choices.
 Every `--system-*` argument configures the system appliance, not defaults for
 ordinary VMs. Both executables use libvm directly; there is no RPC API.
 
@@ -76,8 +77,8 @@ built without an embedded image requires an explicit image override.
 
 To override defaults, optionally add a strict version-1 `daemon` section to
 `~/.config/silo/config.yaml` (or the equivalent `XDG_CONFIG_HOME` path).
-Only specify settings you want to change. The CLI translates those explicit
-values into arguments; it does not send a filled-in default configuration:
+Only specify settings you want to change. Both executables use the shared strict
+parser; explicit foreground arguments take precedence over stored values.
 
 ```yaml
 daemon:
@@ -98,6 +99,21 @@ daemon:
       publish-bind: any
     # rosetta: true
 ```
+
+Feature selection is stored in `daemon.system.enabled` and
+`daemon.tailscale.enabled`. `silo daemon up --system[=true|false]` and
+`--tailscale[=true|false]` update these selections; omission preserves stored
+choices. An omitted initial system selection resolves to enabled on macOS or
+for an existing appliance installation, otherwise disabled. Tailscale defaults
+to disabled. Feature and default-machine writes share a sidecar transaction
+lock and atomic replacement, preserving unrelated configuration. Invalid
+configuration is never overwritten.
+
+There is one native service registration per UID. A live service bound to
+another Home must be stopped with its original Home before reconfiguration.
+Configuration leaves and transaction locks must be owned regular files, not
+symlinks or FIFOs; group/world-writable configuration is rejected.
+
 
 The equivalent direct daemon interface is:
 

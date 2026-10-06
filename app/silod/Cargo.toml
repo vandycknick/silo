@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 silod-spec = { path = "../../specs/silod-spec" }
+silo-config = { path = "../../common/config" }
 libvm = { path = "../../runtime/libvm" }
 vm-spec = { path = "../../specs/vm-spec" }
 utils = { path = "../../common/utils" }

@@ -680,6 +680,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "silo-config",
  "silod-spec",
  "ssh-key",
  "tempfile",
@@ -4608,6 +4609,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-config"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "libvm",
+ "nix 0.31.3",
+ "serde",
+ "serde_yaml_ng",
+ "silod-spec",
+ "tempfile",
+]
+
+[[package]]
 name = "silo-go-ffi"
 version = "0.1.0"
 dependencies = [
@@ -4701,6 +4715,7 @@ dependencies = [
  "nix 0.31.3",
  "serde",
  "serde_json",
+ "silo-config",
  "silod-spec",
  "tempfile",
  "tokio",
