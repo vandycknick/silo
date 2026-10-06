@@ -47,9 +47,6 @@ impl SystemPaths {
     pub(crate) fn lifetime_lock(&self) -> PathBuf {
         self.published.lifetime_lock()
     }
-    pub(crate) fn status(&self) -> PathBuf {
-        self.published.status()
-    }
     pub(crate) fn log(&self) -> PathBuf {
         self.published.log()
     }

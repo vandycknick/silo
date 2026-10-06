@@ -3,7 +3,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use silod_spec::paths::DaemonPaths;
-use silod_spec::status::{DaemonPhase, DaemonStatus};
+use silod_spec::status::{CorePhase, DaemonStatus, SystemPhase};
 
 fn command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_silod"));
@@ -46,7 +46,7 @@ fn malformed_shared_configuration_is_rejected_without_creating_state() {
     unreadable_cli_config(root.path());
     let original = std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config");
     let check = command(root.path()).arg("--check").output().expect("check");
-    assert!(!check.status.success());
+    assert_eq!(check.status.code(), Some(2));
     assert_eq!(
         std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config"),
         original
@@ -56,7 +56,7 @@ fn malformed_shared_configuration_is_rejected_without_creating_state() {
 }
 
 #[test]
-fn invalid_configuration_is_published_as_a_failure() {
+fn invalid_system_configuration_exits_two_before_startup() {
     if nix::unistd::geteuid().is_root() {
         return;
     }
@@ -66,19 +66,13 @@ fn invalid_configuration_is_published_as_a_failure() {
         .args(["--system-memory", "1MiB"])
         .output()
         .expect("serve");
-    assert!(!output.status.success());
-    let status = read_status(&DaemonPaths::new(root.path().join("runtime-home"))).expect("status");
-    assert_eq!(status.phase, DaemonPhase::Failed);
-    assert!(status
-        .last_error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("at least 128MiB"));
-    assert!(!root.path().join("runtime-home/daemon/daemon.json").exists());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least 128MiB"));
+    assert!(!root.path().join("runtime-home").exists());
 }
 
 #[test]
-fn daemon_retries_startup_and_stops_cleanly_in_the_selected_home() {
+fn daemon_keeps_core_ready_through_system_retry_and_log_failure() {
     // The daemon intentionally refuses root. This test exercises the same entrypoint
     // under an ordinary user, as in the host CI lanes.
     if nix::unistd::geteuid().is_root() {
@@ -136,7 +130,11 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_selected_home() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = read_status(&paths) {
-            if status.phase == DaemonPhase::Retrying {
+            if status
+                .system
+                .as_ref()
+                .is_some_and(|system| system.phase == SystemPhase::Retrying)
+            {
                 break status;
             }
         }
@@ -147,19 +145,21 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_selected_home() {
         assert!(Instant::now() < deadline, "daemon did not reach retrying");
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(status
+    assert_eq!(status.core, CorePhase::Ready);
+    let system = status.system.as_ref().expect("enabled system");
+    assert!(system
         .last_error
         .as_deref()
         .unwrap_or_default()
         .contains("missing-runtime"));
     assert_eq!(status.pid, child.0.id());
     assert_eq!(
-        status.configured_image.as_deref(),
+        system.configured_image.as_deref(),
         Some("registry.invalid/unused:test")
     );
-    assert_eq!(status.memory_bytes, Some(1024 * 1024 * 1024));
+    assert_eq!(system.memory_bytes, Some(1024 * 1024 * 1024));
     assert_eq!(
-        status.docker_socket,
+        system.docker_socket,
         paths.docker_socket().display().to_string()
     );
     assert!(!root.path().join(".silo").exists());
@@ -173,7 +173,54 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_selected_home() {
     assert!(!stop.status.success());
     assert!(String::from_utf8_lossy(&stop.stderr).contains("another Silo system daemon"));
 
-    // SIGTERM during startup retries is a clean, reported stop.
+    // Losing the optional system's log must not tear down the core API.
+    std::fs::remove_file(paths.log()).expect("remove fixture log");
+    std::fs::create_dir(paths.log()).expect("block optional log writes");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            child.0.try_wait().expect("poll daemon").is_none(),
+            "optional logging failure killed core"
+        );
+        if read_status(&paths).is_some_and(|status| {
+            status.core == CorePhase::Ready
+                && status
+                    .system
+                    .is_some_and(|system| system.phase == SystemPhase::Failed)
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "system did not report failure");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let endpoint = status.control_endpoint;
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async move {
+            let channel = tonic::transport::Endpoint::from_static("http://localhost")
+                .connect_with_connector(tower::service_fn(move |_| {
+                    let endpoint = endpoint.clone();
+                    async move {
+                        tokio::net::UnixStream::connect(endpoint)
+                            .await
+                            .map(hyper_util::rt::TokioIo::new)
+                    }
+                }))
+                .await
+                .expect("core connection");
+            let response =
+                silod_spec::daemon::v1::daemon_service_client::DaemonServiceClient::new(channel)
+                    .get_status(())
+                    .await
+                    .expect("working core after system failure")
+                    .into_inner();
+            assert_eq!(
+                response.core,
+                silod_spec::daemon::v1::CorePhase::Ready as i32
+            );
+        });
+
+    // SIGTERM after optional failure is still a clean, reported stop.
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(child.0.id()).expect("pid")),
         nix::sys::signal::Signal::SIGTERM,
@@ -182,8 +229,8 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_selected_home() {
     let exit = child.0.wait().expect("wait");
     assert!(exit.success(), "{exit:?}");
     assert_eq!(
-        read_status(&paths).expect("status").phase,
-        DaemonPhase::Stopped
+        read_status(&paths).expect("status").core,
+        CorePhase::Stopped
     );
 }
 
@@ -196,6 +243,7 @@ fn stop_without_an_installation_reports_stopped() {
     let output = command(root.path()).arg("--stop").output().expect("stop");
     assert!(output.status.success(), "{output:?}");
     let status = read_status(&DaemonPaths::new(root.path().join("runtime-home"))).expect("status");
-    assert_eq!(status.phase, DaemonPhase::Stopped);
+    assert_eq!(status.core, CorePhase::Stopped);
+    assert_eq!(status.system.unwrap().phase, SystemPhase::Stopped);
     assert!(!root.path().join("runtime-home/daemon/daemon.json").exists());
 }

@@ -6,5 +6,8 @@ edition = "2021"
 [dependencies]
 ssh-key = { version = "0.7.0-rc.11", default-features = false, features = ["ed25519", "std"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
 tempfile = "3.27.0"

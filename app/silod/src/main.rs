@@ -5,6 +5,7 @@ mod paths;
 mod provision;
 mod record;
 mod runtime;
+mod status;
 mod storage;
 mod supervisor;
 mod upgrade;
@@ -49,81 +50,153 @@ async fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
-            std::process::ExitCode::FAILURE
+            std::process::ExitCode::from(if error.downcast_ref::<ConfigurationError>().is_some() {
+                2
+            } else {
+                1
+            })
         }
     }
 }
 
+#[derive(Debug)]
+struct ConfigurationError(eyre::Report);
+impl std::fmt::Display for ConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for ConfigurationError {}
+fn configuration<T>(result: eyre::Result<T>) -> eyre::Result<T> {
+    result.map_err(|error| {
+        if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+            error
+        } else {
+            ConfigurationError(error).into()
+        }
+    })
+}
+
 async fn run(args: Args) -> eyre::Result<()> {
     if nix::unistd::geteuid().is_root() {
-        eyre::bail!("silod is a per-user daemon; run without sudo/root");
+        return configuration(Err(eyre::eyre!(
+            "silod is a per-user daemon; run without sudo/root"
+        )));
     }
-    let host = libvm::HostPaths::from_env()?;
-    // Validate the shared document before creating daemon state or service locks.
-    let global = GlobalConfig::load_from(&host)?;
+    let host = configuration(libvm::HostPaths::from_env().map_err(Into::into))?;
+    // Validate before creating daemon state or service locks.
+    let global = configuration(GlobalConfig::load_from(&host))?;
     let paths = SystemPaths::from_host(&host);
-    let overrides =
-        merge_system_overrides(global.daemon_overrides()?, args.system.into_overrides());
+    let overrides = merge_system_overrides(
+        configuration(global.daemon_overrides())?,
+        args.system.into_overrides(),
+    );
     let features = global.resolve_features(
         FeatureOverrides {
             system: args.system_enabled,
             tailscale: args.tailscale_enabled,
         },
-        DaemonRecord::load(&paths)?.is_some(),
+        configuration(DaemonRecord::load(&paths))?.is_some(),
     );
     if args.check {
         return if features.system {
-            desired_system(&paths, &overrides).map(drop)
+            configuration(desired_system(&paths, &overrides)).map(drop)
         } else {
             Ok(())
         };
     }
-    let host = silo_config::prepare_host_paths(&host)?;
-    let global = GlobalConfig::load_from(&host)?;
-    let paths = SystemPaths::from_host(&host);
-    let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
-    let mut system_status = supervisor::initial_status(&paths.docker_socket())?;
-    if args.stop {
-        return supervisor::stop_installation(&paths, system_status).await;
-    }
-    let desired = if features.system {
-        match desired_system(&paths, &overrides) {
-            Ok(desired) => Some(desired),
-            Err(error) => {
-                supervisor::publish_failure(&paths, &mut system_status, &error)?;
-                return Err(error);
-            }
-        }
+    let desired = if features.system && !args.stop {
+        Some(configuration(desired_system(&paths, &overrides))?)
     } else {
         None
     };
+    let configuration_identity = configuration(global.daemon_identity(features))?;
+    let host = configuration(silo_config::prepare_host_paths(&host))?;
+    let paths = SystemPaths::from_host(&host);
+    let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
+    let generation = uuid::Uuid::new_v4();
+    let system_status = if features.system || args.stop {
+        Some(supervisor::initial_status(&paths.docker_socket())?)
+    } else {
+        None
+    };
+    let publisher = std::sync::Arc::new(status::StatusPublisher::new(
+        &host,
+        generation,
+        features,
+        configuration_identity,
+        system_status.clone(),
+    )?);
+    if args.stop {
+        let result =
+            supervisor::stop_installation(&paths, system_status.unwrap(), &publisher).await;
+        publisher.set_core(
+            if result.is_ok() {
+                silod_spec::status::CorePhase::Stopped
+            } else {
+                silod_spec::status::CorePhase::Failed
+            },
+            result.as_ref().err().map(|e| format!("{e:#}")),
+        )?;
+        return result;
+    }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let generation = uuid::Uuid::new_v4();
     let state = std::sync::Arc::new(control::ControlState::new(
-        host, global, generation, features,
+        host,
+        global,
+        generation,
+        publisher.clone(),
     ));
-    let server = control::socket::BoundServer::bind(state.clone())?;
+    let server = match control::socket::BoundServer::bind(state.clone()) {
+        Ok(server) => server,
+        Err(error) => {
+            publisher.set_core(
+                silod_spec::status::CorePhase::Failed,
+                Some(format!("{error:#}")),
+            )?;
+            return Err(error);
+        }
+    };
     let api_shutdown = tokio_util::sync::CancellationToken::new();
     let mut api_task = tokio::spawn(server.serve(api_shutdown.clone()));
     let system_shutdown = tokio_util::sync::CancellationToken::new();
-    let system_task = desired.map(|desired| {
+    let mut system_task = desired.map(|desired| {
         tokio::spawn(supervisor::serve(
-            paths,
+            paths.clone(),
             desired,
-            system_status,
+            system_status.unwrap(),
             system_shutdown.clone(),
+            publisher.clone(),
         ))
     });
-    state
-        .set_core_phase(silod_spec::daemon::v1::CorePhase::Ready)
-        .await;
-    let api_result = tokio::select! {
-        _ = interrupt.recv() => None,
-        _ = terminate.recv() => None,
-        result = &mut api_task => Some(result),
+    publisher.set_core(silod_spec::status::CorePhase::Ready, None)?;
+    let api_result = loop {
+        tokio::select! {
+            _ = interrupt.recv() => break None,
+            _ = terminate.recv() => break None,
+            result = &mut api_task => break Some(result),
+            result = async {
+                match system_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                system_task = None;
+                let error = match result {
+                    Ok(Ok(())) => eyre::eyre!("system supervisor stopped unexpectedly"),
+                    Ok(Err(error)) => error,
+                    Err(error) => eyre::eyre!("system supervisor task failed: {error}"),
+                };
+                publisher.fail_system(format!("{error:#}"))?;
+                if let Err(log_error) = supervisor::append_log(&paths, &format!("system supervisor failed: {error:#}")) {
+                    eprintln!("system supervisor diagnostic could not be logged: {log_error:#}");
+                }
+                // Optional integration failure does not take away a working core API.
+            }
+        }
     };
-    state.begin_stopping().await;
+    state.begin_stopping().await?;
     state.seal_mutations().await;
     system_shutdown.cancel();
     let drained = tokio::time::timeout(std::time::Duration::from_secs(85), async {
@@ -133,20 +206,28 @@ async fn run(args: Args) -> eyre::Result<()> {
         }
         Ok::<(), eyre::Report>(())
     })
-    .await;
-    state
-        .set_core_phase(silod_spec::daemon::v1::CorePhase::Stopped)
-        .await;
+    .await
+    .map_err(|_| eyre::eyre!("daemon shutdown deadline expired with incomplete mutation drain"))
+    .and_then(|r| r);
     api_shutdown.cancel();
-    match api_result {
-        Some(result) => result??,
-        None => {
-            tokio::time::timeout(std::time::Duration::from_secs(3), api_task).await???;
-        }
-    }
-    drained.map_err(|_| {
-        eyre::eyre!("daemon shutdown deadline expired with incomplete mutation drain")
-    })?
+    let api_result = match api_result {
+        Some(result) => result.map_err(Into::into).and_then(|r| r),
+        None => tokio::time::timeout(std::time::Duration::from_secs(3), api_task)
+            .await
+            .map_err(Into::into)
+            .and_then(|r| r.map_err(Into::into))
+            .and_then(|r| r),
+    };
+    let result = drained.and(api_result);
+    publisher.set_core(
+        if result.is_ok() {
+            silod_spec::status::CorePhase::Stopped
+        } else {
+            silod_spec::status::CorePhase::Failed
+        },
+        result.as_ref().err().map(|e| format!("{e:#}")),
+    )?;
+    result
 }
 
 fn desired_system(paths: &SystemPaths, overrides: &SystemOverrides) -> eyre::Result<DesiredSystem> {
@@ -262,5 +343,15 @@ mod tests {
         assert_eq!(args.system_enabled, Some(false));
         assert_eq!(args.tailscale_enabled, Some(true));
         assert_eq!(args.system.into_overrides(), Default::default());
+    }
+    #[test]
+    fn operational_io_failures_remain_restartable() {
+        let io = eyre::Report::from(std::io::Error::from_raw_os_error(nix::libc::ENOSPC))
+            .wrap_err("preparing the selected Home");
+        let error = crate::configuration::<()>(Err(io)).expect_err("operational failure");
+        assert!(error.downcast_ref::<crate::ConfigurationError>().is_none());
+        let error = crate::configuration::<()>(Err(eyre::eyre!("unsafe root")))
+            .expect_err("invalid configuration");
+        assert!(error.downcast_ref::<crate::ConfigurationError>().is_some());
     }
 }

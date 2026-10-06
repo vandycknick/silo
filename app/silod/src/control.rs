@@ -64,7 +64,7 @@ pub(crate) struct ControlState {
     pub(super) generation: uuid::Uuid,
     components: OnceCell<ResolvedRuntimeComponents>,
     runtime: OnceCell<Runtime>,
-    status: Mutex<w::DaemonStatus>,
+    publisher: Arc<crate::status::StatusPublisher>,
     admission: Mutex<Admission>,
     capacity: Arc<Semaphore>,
     stream_shutdown: tokio_util::sync::CancellationToken,
@@ -74,44 +74,16 @@ impl ControlState {
         host: HostPaths,
         global: GlobalConfig,
         generation: uuid::Uuid,
-        features: silo_config::FeatureSelection,
+        publisher: Arc<crate::status::StatusPublisher>,
     ) -> Self {
         let config = RuntimeConfig::local(host.home()).with_networking(global.networking().clone());
-        let status = w::DaemonStatus {
-            product_version: env!("CARGO_PKG_VERSION").into(),
-            protocol_major: 1,
-            generation: generation.to_string(),
-            home: silo_vm_control::path_to_wire(host.home()),
-            config_dir: silo_vm_control::path_to_wire(host.config_dir()),
-            core: w::CorePhase::Starting as i32,
-            schema: 2,
-            pid: std::process::id(),
-            control_endpoint: silo_vm_control::path_to_wire(
-                &HostPaths::run_root().join("silod/control.sock"),
-            ),
-            tailscale: Some(w::ComponentStatus {
-                enabled: features.tailscale,
-                state: if features.tailscale {
-                    w::ComponentState::Starting as i32
-                } else {
-                    w::ComponentState::Disabled as i32
-                },
-                shutdown_protection: if cfg!(target_os = "macos") {
-                    w::ShutdownProtection::Unsupported as i32
-                } else {
-                    w::ShutdownProtection::Unavailable as i32
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
         Self {
             host,
             config,
             generation,
             components: OnceCell::new(),
             runtime: OnceCell::new(),
-            status: Mutex::new(status),
+            publisher,
             admission: Mutex::new(Admission {
                 sealed: false,
                 stopping: false,
@@ -132,21 +104,18 @@ impl ControlState {
                 .take_until(self.stream_shutdown.clone().cancelled_owned()),
         )
     }
-    pub(crate) async fn set_core_phase(&self, phase: w::CorePhase) {
-        self.status.lock().await.core = phase as i32;
-    }
-    pub(crate) async fn get_status(&self) -> w::DaemonStatus {
-        let mut s = self.status.lock().await.clone();
-        s.updated_at =
-            silo_vm_control::readiness::system_time_to_wire(std::time::SystemTime::now()).ok();
-        s
+    pub(crate) async fn get_status(&self) -> Result<w::DaemonStatus, Status> {
+        self.publisher
+            .wire()
+            .map_err(|_| Status::internal("cannot read daemon status"))
     }
     pub(crate) async fn set_helper_generation(&self, generation: Option<uuid::Uuid>) {
         self.admission.lock().await.helper = generation.map(|v| v.to_string());
     }
-    pub(crate) async fn begin_stopping(&self) {
+    pub(crate) async fn begin_stopping(&self) -> eyre::Result<()> {
         self.admission.lock().await.stopping = true;
-        self.set_core_phase(w::CorePhase::Stopping).await;
+        self.publisher
+            .set_core(silod_spec::status::CorePhase::Stopping, None)
     }
     pub(crate) async fn seal_mutations(&self) {
         self.admission.lock().await.sealed = true;

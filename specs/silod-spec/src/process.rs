@@ -20,7 +20,16 @@ pub fn start_time(pid: u32) -> std::io::Result<Option<String>> {
     Ok(Some(start.to_string()))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+/// The Darwin kernel's microsecond-resolution process birth time.
+#[cfg(target_os = "macos")]
+pub fn start_time(pid: u32) -> std::io::Result<Option<String>> {
+    let Ok(pid) = i32::try_from(pid) else {
+        return Ok(None);
+    };
+    utils::process::start_time(pid).map(|value| value.map(|time| time.to_string()))
+}
+
+#[cfg(test)]
 mod tests {
     use crate::process::start_time;
 

@@ -3,6 +3,7 @@ package control
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -46,7 +47,7 @@ func TestNativeControlLifecycle(t *testing.T) {
 	home := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	command := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false")
+	command := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false", "--system-image=registry.invalid/disabled:test")
 	command.Env = []string{"HOME=" + home, "SILO_HOME=" + filepath.Join(home, "state"), "XDG_CONFIG_HOME=" + filepath.Join(home, "config"), "PATH=" + os.Getenv("PATH")}
 	for _, key := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "SILO_RUNTIME_DIR"} {
 		if value := os.Getenv(key); value != "" {
@@ -142,6 +143,28 @@ func TestNativeControlLifecycle(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "state", "state.db")); !os.IsNotExist(err) {
 		t.Fatalf("status or component resolution initialized the store: %v", err)
+	}
+	statusJSON, _ := runCLI(command.Env, 0, "daemon", "status", "--format=json")
+	var view struct {
+		State  string `json:"state"`
+		Daemon struct {
+			Schema    uint32          `json:"schema"`
+			PID       int             `json:"pid"`
+			Core      string          `json:"core"`
+			System    json.RawMessage `json:"system"`
+			Tailscale struct {
+				Enabled bool   `json:"enabled"`
+				State   string `json:"state"`
+			} `json:"tailscale"`
+		} `json:"daemon"`
+	}
+	if err := json.Unmarshal([]byte(statusJSON), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.State != "ready" || view.Daemon.Schema != 2 || view.Daemon.PID != command.Process.Pid ||
+		view.Daemon.Core != "ready" || string(view.Daemon.System) != "null" ||
+		view.Daemon.Tailscale.Enabled || view.Daemon.Tailscale.State != "disabled" {
+		t.Fatalf("foreground core status did not preserve component independence: %s", statusJSON)
 	}
 	// A live daemon for another Home must not silently select local management.
 	runCLI(localEnv, 1, "list")
