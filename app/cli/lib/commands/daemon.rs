@@ -68,7 +68,7 @@ impl Cmd {
                     command.linger.is_none(),
                     "--linger is supported only on Linux"
                 );
-                let mut spinner = Spinner::start("Checking", "daemon configuration");
+                let spinner = Spinner::start("Checking", "daemon configuration");
                 let selection = silo_config::FeatureOverrides {
                     system: command.system,
                     tailscale: command.tailscale,
@@ -93,7 +93,9 @@ impl Cmd {
                 }
                 let service = service::ServiceConfig::new(&paths, executable)?;
                 service::validate_registration(&service)?;
+                spinner.finish_success("Checked");
                 service::bootstrap_linger(command.linger)?;
+                let mut spinner = Spinner::start("Starting", "silod");
                 silo_config::GlobalConfig::persist_features(
                     &host,
                     selection,

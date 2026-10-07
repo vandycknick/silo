@@ -326,7 +326,6 @@ pub(crate) fn bootstrap_linger(requested: Option<bool>) -> eyre::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        use std::io::{IsTerminal as _, Write as _};
         if requested == Some(false) {
             return Ok(());
         }
@@ -339,18 +338,11 @@ pub(crate) fn bootstrap_linger(requested: Option<bool>) -> eyre::Result<()> {
         let mut enable = requested == Some(true);
         if requested.is_none() {
             eprintln!("User linger keeps all of your user services running after logout and starts them at boot, before login.");
-            if linger == Some(false)
-                && std::io::stdin().is_terminal()
-                && std::io::stderr().is_terminal()
-            {
-                eprint!("Enable user linger for {user}? [y/N] ");
-                std::io::stderr().flush()?;
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                enable = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+            if linger == Some(false) {
+                enable = crate::ui::confirm(&format!("Enable user linger for {user}?"))?;
             }
             if !enable {
-                eprintln!("warning: boot-before-login and survival after logout are not assured without user linger.\nEnable it explicitly with: {command}");
+                crate::ui::hint(format!("Linger unchanged. Startup will continue without enabling it.\n     Boot-before-login and survival after logout are not assured.\n     Enable later: {command}"));
             }
         }
         if enable {
