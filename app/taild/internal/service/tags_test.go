@@ -12,8 +12,9 @@ import (
 )
 
 func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
-	s := actualService(t)
+	// Install fixture TLS trust before the real daemon inherits its environment.
 	registry := testfixture.OCIRegistry(t, "")
+	s := actualService(t)
 	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
@@ -21,7 +22,7 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 	s.Enrollment = &enroll.Manager{Config: s.Config, Registry: enroll.NewRegistry(), Pin: state.NodePin{Tailnet: "fixture", Suffix: "tail.test"}}
 	c := domainCaller(s, "user:7")
 	tagged := domainCaller(s, "tag:creator")
-	if _, err := s.ValidateCreate(tagged.Peer, CreateRequest{Tailscale: true, Tags: []string{"tag:delegated"}}); err != nil {
+	if _, err := s.ValidateCreate(t.Context(), tagged.Peer, CreateRequest{Tailscale: true, Tags: []string{"tag:delegated"}}); err != nil {
 		t.Fatal("taild tried to replace Tailscale tagOwners", err)
 	}
 	if _, err := s.Create(t.Context(), c, CreateRequest{Name: "invalid", Tags: []string{"tag:dev"}}); err == nil {
@@ -29,12 +30,7 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 	}
 	op, err := s.Create(t.Context(), c, CreateRequest{Name: "tagged", Tailscale: true, Tags: []string{"tag:Dev", "tag:testing", "tag:dev"}, NoStart: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
-	m, err := s.Runtime.SDK.Machine(t.Context(), "tagged")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
-	d, err := m.Inspect(t.Context())
+	d, err := s.Runtime.Control.Inspect(t.Context(), "tagged")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,12 +38,16 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 		t.Fatal(d.Labels)
 	}
 	var policy struct {
-		Metadata  map[string]string `json:"metadata"`
+		Metadata  map[string]json.RawMessage `json:"metadata"`
 		Tailscale []struct {
 			Tags []string `json:"tags"`
 		} `json:"tailscale"`
 	}
-	if err = json.Unmarshal([]byte(d.Network.Policy.JSON()), &policy); err != nil {
+	if err = json.Unmarshal([]byte(d.PolicyJSON), &policy); err != nil {
+		t.Fatal(err)
+	}
+	var nodeAuthority string
+	if err = json.Unmarshal(policy.Metadata["io.silo.taild.node"], &nodeAuthority); err != nil {
 		t.Fatal(err)
 	}
 	if len(policy.Tailscale) != 1 || len(policy.Tailscale[0].Tags) != 2 {
@@ -58,13 +58,13 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 		Bootstrap string   `json:"bootstrap"`
 		Tags      []string `json:"tags"`
 	}
-	if err = json.Unmarshal([]byte(policy.Metadata["io.silo.taild.node"]), &expected); err != nil || expected.Owner != "user:7" || expected.Bootstrap != "interactive" || len(expected.Tags) != 2 {
+	if err = json.Unmarshal([]byte(nodeAuthority), &expected); err != nil || expected.Owner != "user:7" || expected.Bootstrap != "interactive" || len(expected.Tags) != 2 {
 		t.Fatal(expected, err)
 	}
 	if _, err = s.Show(t.Context(), domainCaller(s, "tag:dev").Peer, "tagged"); err == nil {
 		t.Fatal("tag membership conferred management ownership")
 	}
-	if err = m.Remove(t.Context()); err != nil {
+	if err = s.Runtime.Control.Remove(t.Context(), d.ID); err != nil {
 		t.Fatal(err)
 	}
 }

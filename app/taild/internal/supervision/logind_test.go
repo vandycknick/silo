@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -76,16 +76,8 @@ func TestActualStopAllUsesNativeManagedRecords(t *testing.T) {
 	c := testfixture.Config()
 	c.Home = t.TempDir()
 	c.Components = testfixture.Components(testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true))
-	r, err := runtime.Open(context.Background(), c, "instance")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	lock, err := state.LockHome(c.Home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Close()
+	n := daemon.Open(t, c, "instance", 8)
+	r := n.Runtime
 	// Real stopped disk machines need no guest boot or host shutdown.
 	path := c.Home + "/input.raw"
 	if err := os.WriteFile(path, []byte("stopped disk"), 0600); err != nil {
@@ -96,7 +88,7 @@ func TestActualStopAllUsesNativeManagedRecords(t *testing.T) {
 		if name == "managed" {
 			labels = map[string]string{runtime.OwnerLabel: "user:1", runtime.NameLabel: name, runtime.InstanceLabel: "instance", runtime.ModeLabel: "none"}
 		}
-		m, err := r.SDK.CreateMachine(context.Background(), silo.DiskImage(path), silo.WithName(name), silo.WithLabels(labels))
+		m, err := n.SDK.CreateMachine(context.Background(), silo.DiskImage(path), silo.WithName(name), silo.WithLabels(labels))
 		if err != nil {
 			t.Fatal(err)
 		}

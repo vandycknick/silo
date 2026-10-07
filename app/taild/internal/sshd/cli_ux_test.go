@@ -235,12 +235,7 @@ func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 	if view.Memory != 8<<30 || view.Disk != 2<<30 {
 		t.Fatal(view.Memory, view.Disk)
 	}
-	machine, err := s.Runtime.SDK.Machine(ctx, view.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer machine.Close()
-	data, err := machine.Inspect(ctx)
+	data, err := s.Runtime.Control.Inspect(ctx, view.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

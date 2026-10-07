@@ -12,9 +12,12 @@ import (
 	"strings"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 	"go.yaml.in/yaml/v3"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"tailscale.com/ipn"
 )
 
@@ -121,7 +124,7 @@ func yamlShape(n *yaml.Node, t reflect.Type, depth int) error {
 	return nil
 }
 func usageDocument() error { return failure("usage", "invalid remote document field type", 2) }
-func (s *Service) ParseTemplate(raw string) (Template, error) {
+func (s *Service) ParseTemplate(ctx context.Context, raw string) (Template, error) {
 	var t Template
 	if len(raw) == 0 || len(raw) > DocumentLimit {
 		return t, errDocumentSize
@@ -155,14 +158,14 @@ func (s *Service) ParseTemplate(raw string) (Template, error) {
 			return t, usageDocument()
 		}
 		if t.Resources.Memory != nil {
-			if _, e := silo.ParseMachineMemory(*t.Resources.Memory); e != nil {
-				return t, failure("usage", "invalid memory size", 2)
+			if _, e := s.ParseResource(ctx, "memory", *t.Resources.Memory); e != nil {
+				return t, e
 			}
 		}
 	}
 	if t.DiskSize != nil {
-		if _, e := silo.ParseRootDiskSize(*t.DiskSize); e != nil {
-			return t, failure("usage", "invalid disk_size", 2)
+		if _, e := s.ParseResource(ctx, "disk", *t.DiskSize); e != nil {
+			return t, e
 		}
 	}
 	if t.Vsock != nil && !*t.Vsock {
@@ -215,9 +218,9 @@ type policyAuthority struct {
 	} `json:"rules"`
 }
 
-func remotePolicy(p *silo.NetworkPolicy) error {
+func remotePolicy(p *control.Policy) error {
 	var a policyAuthority
-	if e := json.Unmarshal([]byte(p.JSON()), &a); e != nil {
+	if e := json.Unmarshal([]byte(p.CanonicalJSON), &a); e != nil {
 		return usageDocument()
 	}
 	for key := range a.Metadata {
@@ -235,13 +238,16 @@ func remotePolicy(p *silo.NetworkPolicy) error {
 	}
 	return nil
 }
-func parseRemotePolicy(raw string) (*silo.NetworkPolicy, error) {
+func (s *Service) parseRemotePolicy(ctx context.Context, raw string) (*control.Policy, error) {
 	if len(raw) == 0 || len(raw) > DocumentLimit {
 		return nil, errDocumentSize
 	}
-	p, e := silo.ParseNetworkPolicyHCL(raw)
+	p, e := s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_Hcl{Hcl: raw}})
 	if e != nil {
-		return nil, failure("usage", "invalid network policy HCL", 2)
+		return nil, Categorize(e)
+	}
+	if len(p.CanonicalJSON) > DocumentLimit || len(p.HCL) > DocumentLimit {
+		return nil, failure("usage", "canonical document exceeds 64KiB", 2)
 	}
 	return p, remotePolicy(p)
 }
@@ -251,7 +257,7 @@ func parseRemotePolicy(raw string) (*silo.NetworkPolicy, error) {
 // their order/priority. IP allow rules gain neutral routing, which netd applies
 // only to tailnet destinations; the appended lowest-priority rules exempt the
 // tailnet from default deny without overriding any explicit matching rule.
-func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Principal, controlURL string, requestedTags ...string) (*silo.NetworkPolicy, error) {
+func (s *Service) InjectTailnet(ctx context.Context, p *control.Policy, hostname string, owner identity.Principal, controlURL string, requestedTags ...string) (*control.Policy, error) {
 	if _, e := identity.ParsePrincipal(string(owner)); e != nil {
 		return nil, usageDocument()
 	}
@@ -267,7 +273,7 @@ func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Princi
 	}
 	if p == nil {
 		var e error
-		p, e = silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{})
+		p, e = s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_Empty{Empty: &emptypb.Empty{}}})
 		if e != nil {
 			return nil, e
 		}
@@ -276,7 +282,7 @@ func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Princi
 		return nil, e
 	}
 	var root map[string]json.RawMessage
-	if e := json.Unmarshal([]byte(p.JSON()), &root); e != nil {
+	if e := json.Unmarshal([]byte(p.CanonicalJSON), &root); e != nil {
 		return nil, e
 	}
 	var endpoints []map[string]json.RawMessage
@@ -312,16 +318,53 @@ func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Princi
 			return nil, failure("usage", "policy uses reserved injection name "+n, 2)
 		}
 	}
-	priority := int32(-2147483648)
-	injected, e := silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{Tunnels: []silo.TailscaleTunnel{{Name: "vm", Hostname: &hostname, Tags: tags, ControlURL: &controlURL}}, Endpoints: []silo.NetworkEndpoint{{Name: "silo-tailnet-v4", Kind: silo.NetworkEndpointIP, Protocol: silo.NetworkProtocolTCP, DestinationCIDRs: []string{"100.64.0.0/10"}}, {Name: "silo-tailnet-v6", Kind: silo.NetworkEndpointIP, Protocol: silo.NetworkProtocolTCP, DestinationCIDRs: []string{"fd7a:115c:a1e0::/48"}}}, Rules: []silo.NetworkRule{{Name: ptr("silo-tailnet-v4"), Endpoints: []string{"silo-tailnet-v4"}, Tunnel: ptr("vm"), Priority: &priority, Verdict: silo.NetworkVerdictAllow}, {Name: ptr("silo-tailnet-v6"), Endpoints: []string{"silo-tailnet-v6"}, Tunnel: ptr("vm"), Priority: &priority, Verdict: silo.NetworkVerdictAllow}}})
+	tagJSON, e := json.Marshal(tags)
+	if e != nil {
+		return nil, e
+	}
+	// Normalize a minimal HCL addition instead of serializing SDK builder
+	// configuration, whose schema is not the canonical policy schema.
+	addition := fmt.Sprintf(`tailscale "vm" {
+  hostname = %q
+  tags = %s
+  control_url = %q
+}
+endpoint "ip" "silo-tailnet-v4" {
+  protocol = "tcp"
+  destination_cidrs = ["100.64.0.0/10"]
+}
+endpoint "ip" "silo-tailnet-v6" {
+  protocol = "tcp"
+  destination_cidrs = ["fd7a:115c:a1e0::/48"]
+}
+rule "silo-tailnet-v4" {
+  endpoints = [ip.silo-tailnet-v4]
+  tunnel = tailscale.vm
+  priority = -2147483648
+  verdict = "allow"
+}
+rule "silo-tailnet-v6" {
+  endpoints = [ip.silo-tailnet-v6]
+  tunnel = tailscale.vm
+  priority = -2147483648
+  verdict = "allow"
+}
+`, hostname, tagJSON, controlURL)
+	injected, e := s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_Hcl{Hcl: addition}})
 	if e != nil {
 		return nil, e
 	}
 	var additions map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(injected.JSON()), &additions)
+	if e := json.Unmarshal([]byte(injected.CanonicalJSON), &additions); e != nil {
+		return nil, e
+	}
 	var extraEndpoints, extraRules []map[string]json.RawMessage
-	_ = json.Unmarshal(additions["endpoints"], &extraEndpoints)
-	_ = json.Unmarshal(additions["rules"], &extraRules)
+	if e := json.Unmarshal(additions["endpoints"], &extraEndpoints); e != nil {
+		return nil, e
+	}
+	if e := json.Unmarshal(additions["rules"], &extraRules); e != nil {
+		return nil, e
+	}
 	root["endpoints"], e = json.Marshal(append(endpoints, extraEndpoints...))
 	if e != nil {
 		return nil, e
@@ -335,7 +378,7 @@ func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Princi
 	if e != nil {
 		return nil, e
 	}
-	return silo.ParseNetworkPolicyJSON(string(raw))
+	return s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_CanonicalJson{CanonicalJson: string(raw)}})
 }
 func ptr[T any](v T) *T { return &v }
 
@@ -349,11 +392,11 @@ type Document struct {
 	Secrets  *silo.NetworkSecretMetadata `json:"secrets,omitempty"`
 }
 
-func (s *Service) validateDocument(kind, raw string) (Document, error) {
+func (s *Service) validateDocument(ctx context.Context, kind, raw string) (Document, error) {
 	d := Document{Kind: kind}
 	switch kind {
 	case "template":
-		t, e := s.ParseTemplate(raw)
+		t, e := s.ParseTemplate(ctx, raw)
 		if e != nil {
 			return d, e
 		}
@@ -364,18 +407,12 @@ func (s *Service) validateDocument(kind, raw string) (Document, error) {
 		d.Content = string(b)
 		d.Template = &t
 	case "policy":
-		p, e := parseRemotePolicy(raw)
+		p, e := s.parseRemotePolicy(ctx, raw)
 		if e != nil {
 			return d, e
 		}
-		d.Content, e = p.HCL()
-		if e != nil {
-			return d, e
-		}
-		d.Secrets, e = p.SecretMetadata()
-		if e != nil {
-			return d, e
-		}
+		d.Content = p.HCL
+		d.Secrets = &p.Secrets
 	default:
 		return d, usageDocument()
 	}
@@ -417,14 +454,14 @@ func (s *Service) Documents(ctx context.Context, c Caller, kind, verb, name stri
 		return nil, usageDocument()
 	}
 	if verb == "validate" {
-		d, e := s.validateDocument(kind, raw)
+		d, e := s.validateDocument(ctx, kind, raw)
 		return []Document{d}, e
 	}
 	if verb == "ls" && owner == "" && len(p.Principals) > 1 {
 		// Every principal's own documents, then the shared operator tier once.
 		yours, operator := []Document{}, []Document{}
 		for _, principal := range p.Principals {
-			docs, e := s.documentsFor(kind, verb, name, principal, raw)
+			docs, e := s.documentsFor(ctx, kind, verb, name, principal, raw)
 			if e != nil {
 				return nil, e
 			}
@@ -442,7 +479,7 @@ func (s *Service) Documents(ctx context.Context, c Caller, kind, verb, name stri
 	if e != nil {
 		return nil, e
 	}
-	return s.documentsFor(kind, verb, name, principal, raw)
+	return s.documentsFor(ctx, kind, verb, name, principal, raw)
 }
 func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRequest) (CreateRequest, error) {
 	owner, e := selectedOwner(p, q.Owner)
@@ -450,7 +487,7 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 		return q, e
 	}
 	if q.Template != "" {
-		docs, e := s.documentsFor("template", "show", q.Template, owner, "")
+		docs, e := s.documentsFor(ctx, "template", "show", q.Template, owner, "")
 		if e != nil {
 			return q, e
 		}
@@ -486,11 +523,11 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 		}
 	}
 	if q.PolicyRef != "" {
-		docs, e := s.documentsFor("policy", "show", q.PolicyRef, owner, "")
+		docs, e := s.documentsFor(ctx, "policy", "show", q.PolicyRef, owner, "")
 		if e != nil {
 			return q, e
 		}
-		q.policy, e = parseRemotePolicy(docs[0].Content)
+		q.policy, e = s.parseRemotePolicy(ctx, docs[0].Content)
 		if e != nil {
 			return q, e
 		}
@@ -502,25 +539,47 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 	}
 	return q, nil
 }
-func (s *Service) checkSecrets(ctx context.Context, p *silo.NetworkPolicy) error {
-	check, e := s.Runtime.SDK.CheckPolicySecrets(ctx, p, "", nil)
+func (s *Service) checkSecrets(ctx context.Context, p *control.Policy) error {
+	check, e := s.Runtime.Control.CheckPolicySecrets(ctx, p, "")
 	if e != nil {
 		return Categorize(e)
 	}
-	switch check.Status {
-	case silo.PolicySecretsReady:
+	switch check.State {
+	case w.PolicySecretsState_POLICY_SECRETS_STATE_READY:
 		return nil
-	case silo.PolicySecretsMissing:
+	case w.PolicySecretsState_POLICY_SECRETS_STATE_MISSING:
 		var b bytes.Buffer
+		for i, requirement := range check.Requirements {
+			if i > 0 {
+				b.WriteString("; ")
+			}
+			fmt.Fprintf(&b, "%s: ", requirement.Owner)
+			for j, alternative := range requirement.Alternatives {
+				if j > 0 {
+					b.WriteString(" or ")
+				}
+				b.WriteString(strings.Join(alternative.Slots, " + "))
+			}
+		}
+		if len(check.Requirements) > 0 && len(check.Slots) > 0 {
+			b.WriteString("; slots: ")
+		}
 		for i, slot := range check.Slots {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			fmt.Fprintf(&b, "%s (key %s)", slot.Name, slot.Source.Key)
+			fmt.Fprintf(&b, "%s (key %s)", slot.Name, slot.Key)
 		}
 		return failure("usage", "missing policy secrets; satisfy an alternative: "+b.String(), 2)
-	case silo.PolicySecretsUnavailable:
-		return failure("unavailable", fmt.Sprintf("policy secret unavailable: slot %s, key %s (%s)", check.Slot, check.Key, check.Code), 9)
+	case w.PolicySecretsState_POLICY_SECRETS_STATE_UNAVAILABLE:
+		var b bytes.Buffer
+		for i, diagnostic := range check.Diagnostics {
+			if i > 0 {
+				b.WriteString("; ")
+			}
+			fmt.Fprintf(&b, "slot %s, key %s (%s)", diagnostic.Slot, diagnostic.GetKey(), diagnostic.Code)
+		}
+		return failure("unavailable", "policy secret unavailable: "+b.String(), 9)
 	default:
 		return failure("unavailable", "secret resolver returned an unknown status", 9)
 	}

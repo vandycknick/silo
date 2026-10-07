@@ -16,13 +16,10 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/jobs"
-	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/tailnet"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
-	silo "github.com/vandycknick/silo/sdk/go"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	"golang.org/x/crypto/ssh"
 	"tailscale.com/tsnet"
 )
@@ -76,19 +73,9 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, rootfs)
 	c.VM.DefaultImage = registry.Reference
 	c.VM.AllowedRegistries = []string{registry.Allowed()}
-	r, e := runtime.Open(ctx, c, "live-s11")
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer r.Close()
-	audit, e := state.OpenAudit(c.Home, 1<<20, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
-	jobctx, stopJobs := context.WithCancel(ctx)
-	defer stopJobs()
-	svc := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(jobctx, 16), Config: c, Capability: c.Tailnet.Capability, VisibleNames: node.VisibleNames}
+	n := daemon.Open(t, c, "live-s11", 16)
+	r := n.Runtime
+	svc := &service.Service{Runtime: r, Audit: n.Audit, Jobs: n.Jobs, Config: c, Capability: c.Tailnet.Capability, VisibleNames: node.VisibleNames}
 	listener, e := node.Server.ListenSSH(":22")
 	if e != nil {
 		t.Fatal(e)
@@ -109,15 +96,7 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 		case <-closing.Done():
 			t.Error("live service did not drain")
 		}
-		entries, _ := r.SDK.Inventory(closing)
-		for _, entry := range entries {
-			m, e := r.SDK.Machine(closing, entry.ID)
-			if e == nil {
-				_, _ = m.StopWith(closing, silo.StopOptions{Force: true, Timeout: time.Second})
-				_ = m.Remove(closing)
-				_ = m.Close()
-			}
-		}
+		n.RemoveAll(closing)
 	}()
 	if status.Self == nil || len(status.Self.TailscaleIPs) == 0 {
 		t.Fatal("service has no tailnet address")

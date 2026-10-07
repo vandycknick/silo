@@ -25,7 +25,7 @@ func TestGuestUserValidationBeforeImagePull(t *testing.T) {
 	if registry.Requests.Load() != 0 {
 		t.Fatal("invalid account pulled a VM image")
 	}
-	entries, err := s.Runtime.SDK.Inventory(context.Background())
+	entries, err := s.Runtime.Control.Inventory(context.Background())
 	if err != nil || len(entries) != 0 {
 		t.Fatal(entries, err)
 	}

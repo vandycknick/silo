@@ -58,7 +58,7 @@ func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 	if err != nil || u.Query().Get("state") == "" {
 		t.Fatal(link, err)
 	}
-	entries, err := s.Runtime.SDK.Inventory(context.Background())
+	entries, err := s.Runtime.Control.Inventory(context.Background())
 	if err != nil || len(entries) != 0 || registry.Requests.Load() != 0 {
 		t.Fatal("creation ran before consent", entries, err, registry.Requests.Load())
 	}
@@ -67,7 +67,7 @@ func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 	if finished.Error == nil {
 		t.Fatal("cancelled consent succeeded")
 	}
-	entries, err = s.Runtime.SDK.Inventory(context.Background())
+	entries, err = s.Runtime.Control.Inventory(context.Background())
 	if err != nil || len(entries) != 0 || registry.Requests.Load() != 0 {
 		t.Fatal("cancelled consent created a VM", entries, err)
 	}

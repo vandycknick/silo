@@ -530,7 +530,7 @@ impl Machine {
         options: MachineKillOptions,
     ) -> Result<MachineExit, LibVmError> {
         let runtime = self.runtime();
-        let wait_target = {
+        let exit = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             require_current_run(&config, &status, expected_run_id)?;
@@ -578,17 +578,49 @@ impl Machine {
             }
             runtime.request_machine_stop(config.id, &generation).await?;
 
-            WaitTarget {
-                config,
-                generation,
-                identity,
-                stop_requested: true,
-                forced: true,
+            // SIGKILL prevents the monitor from publishing its own exit record.
+            // Keep lifecycle ownership until death is confirmed and its run
+            // fence is durable, before another start can replace this generation.
+            wait_for_monitor_stop(
+                &identity,
+                &config.name,
+                options.wait_options().timeout_value(),
+            )
+            .await?;
+            let path = runtime.machine_paths(config.id).vmm_exit_status_path();
+            let machine_id = config.id.to_string();
+            let recorded = exit_status::read(&path)?;
+            let mut forced_at = None;
+            if !recorded.as_ref().is_some_and(|status| {
+                status.machine_id == machine_id
+                    && exit_status_matches_generation(status, &generation)
+            }) {
+                if let Some(run_id) = generation.run_id.as_deref() {
+                    forced_at = Some(exit_status::write_forced(
+                        &path,
+                        &machine_id,
+                        run_id,
+                        generation.pid,
+                    )?);
+                }
             }
+            if !runtime
+                .complete_stop_locked(&config, generation.clone(), None)
+                .await?
+            {
+                return Err(LibVmError::MachineNotRunning {
+                    reference: config.name,
+                });
+            }
+            let machine = runtime.machine_inspect_data(config).await?;
+            let mut exit = machine_exit(machine, generation, true, recorded);
+            if let Some(exited_at) = forced_at {
+                exit.exited_at = unix_time(exited_at);
+            }
+            exit
         };
 
-        self.wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
-            .await
+        Ok(exit)
     }
 
     /// Removes a stopped machine's durable records and files.

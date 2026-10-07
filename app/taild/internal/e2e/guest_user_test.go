@@ -13,12 +13,11 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
-	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
@@ -103,42 +102,30 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 			c.VM.Defaults.Memory = 1 << 30
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
-			r, err := runtime.Open(ctx, c, "guest-user-kvm")
-			if err != nil {
-				t.Fatal(err)
-			}
-			audit, err := state.OpenAudit(c.Home, 1<<20, 2)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer audit.Close()
-			s := &service.Service{Runtime: r, Audit: audit, Config: c, Jobs: jobs.New(ctx, 8)}
+			n := daemon.Open(t, c, "guest-user-kvm", 8)
+			r := n.Runtime
+			s := &service.Service{Runtime: r, Audit: n.Audit, Config: c, Jobs: jobs.New(ctx, 8)}
 			defer func() {
 				cleanup, done := context.WithTimeout(context.Background(), 20*time.Second)
 				defer done()
 				cancel()
 				_ = s.Jobs.Wait(cleanup)
-				m, err := s.Runtime.SDK.Machine(cleanup, variant)
-				if err == nil {
-					_, _ = m.StopWith(cleanup, silo.StopOptions{Force: true, Timeout: time.Second})
-					_ = m.Remove(cleanup)
-					_ = m.Close()
-				}
+				n.RemoveAll(cleanup)
 				_ = s.Runtime.Close()
 			}()
 			caller := principal(c, "user:7")
 			op, err := s.Create(ctx, caller, service.CreateRequest{Name: variant, GuestUser: user, NoStart: variant == "uid-conflict" || variant == "no-shell" || variant == "no-sh-stored"})
 			if variant == "no-shell" || variant == "no-sh-stored" {
 				daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
-				m, err := r.SDK.Machine(ctx, variant)
+				d, err := r.Control.Inspect(ctx, variant)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer m.Close()
-				if _, err := m.Start(ctx); err != nil {
+				started, err := r.Control.Start(ctx, d.ID)
+				if err != nil {
 					t.Fatal(err)
 				}
-				_, _ = m.WaitReady(ctx, 10*time.Second)
+				_, _ = r.Control.WaitReady(ctx, d.ID, started.RunID, 10*time.Second)
 				var out bytes.Buffer
 				code, err := s.Exec(ctx, caller, variant, service.ExecRequest{Program: "/bin/id", Args: []string{"-u"}}, service.IO{Stdout: &out})
 				want := "0\n"
@@ -167,16 +154,16 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 			}
 			if variant == "uid-conflict" {
 				daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
-				m, err := r.SDK.Machine(ctx, variant)
+				d, err := r.Control.Inspect(ctx, variant)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer m.Close()
-				if _, err := m.Start(ctx); err != nil {
+				started, err := r.Control.Start(ctx, d.ID)
+				if err != nil {
 					t.Fatal(err)
 				}
-				_, _ = m.WaitReady(ctx, 20*time.Second)
-				d, err := m.Inspect(ctx)
+				_, _ = r.Control.WaitReady(ctx, d.ID, started.RunID, 20*time.Second)
+				d, err = r.Control.Inspect(ctx, d.ID)
 				if err != nil || d.ProvisionReport == nil {
 					t.Fatal("missing actual provisioning failure", d, err)
 				}
@@ -189,6 +176,11 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				if !failed {
 					t.Fatalf("conflicting UID did not fail user provisioning: %+v", d.ProvisionReport)
 				}
+				m, err := n.SDK.Machine(ctx, d.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer m.Close()
 				out, err := m.Exec(ctx, "/bin/cat", []string{"/etc/passwd"}, silo.WithExecUser("root"))
 				if err != nil || out.Stdout() != "root:x:0:0:root:/root:/bin/bash\nexisting:x:1000:1000:existing:/home/existing:/bin/bash\n" {
 					t.Fatal("conflicting account was mutated", err, out)
@@ -196,12 +188,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				return
 			}
 			daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
-			m, err := r.SDK.Machine(ctx, variant)
-			if err != nil {
-				t.Fatal(err)
-			}
-			d, err := m.Inspect(ctx)
-			_ = m.Close()
+			d, err := r.Control.Inspect(ctx, variant)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -249,8 +236,12 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				if code != 0 || err != nil || passwd.String() != "root:x:0:0:root:/root:/bin/sh\n" {
 					t.Fatal("automatic account mutation", code, err, passwd.String())
 				}
+				manager, err := n.Control.Daemon.GetStatus(ctx, &emptypb.Empty{})
+				if err != nil {
+					t.Fatal(err)
+				}
 				command := exec.CommandContext(ctx, cli, "shell", variant)
-				command.Env = append(os.Environ(), "SILO_HOME="+c.Home, "SILO_RUNTIME_DIR="+filepath.Dir(c.Components.AssetDir))
+				command.Env = append(os.Environ(), "HOME="+string(manager.Home), "SILO_HOME="+string(manager.Home), "XDG_CONFIG_HOME="+filepath.Dir(string(manager.ConfigDir)))
 				command.Stdin = strings.NewReader("echo F2_CERT_ROOT=$HOME\necho F2_CERT_UID; /bin/id -u\nexit\n")
 				out, err := command.CombinedOutput()
 				text := strings.ReplaceAll(string(out), "\r\n", "\n")
@@ -263,10 +254,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 			if err := r.Close(); err != nil {
 				t.Fatal(err)
 			}
-			r, err = runtime.Open(ctx, c, "guest-user-kvm")
-			if err != nil {
-				t.Fatal(err)
-			}
+			r = n.Reopen(t, c, "guest-user-kvm")
 			s.Runtime = r
 			check("", wantUID, wantHome, wantShell)
 			v, err := s.Show(ctx, caller.Peer, variant)

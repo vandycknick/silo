@@ -207,14 +207,17 @@ impl w::machine_service_server::MachineService for Service {
     ) -> Result<Response<w::MachineSnapshot>, Status> {
         let v = r.get_ref().clone();
         let reference = reference(v.machine)?;
-        let timeout = duration(v.timeout)?;
+        let timeout = v.timeout.map(|value| duration(Some(value))).transpose()?;
         let expected = v.expected_run.as_deref().map(run).transpose()?;
         let state = self.clone();
         Ok(Response::new(
             self.mutate(&r, false, async move {
                 let m = state.machine(&reference).await?;
                 if v.force {
-                    let options = libvm::MachineKillOptions::new().timeout(timeout);
+                    let mut options = libvm::MachineKillOptions::new();
+                    if let Some(timeout) = timeout {
+                        options = options.timeout(timeout);
+                    }
                     match expected {
                         Some(run) => {
                             m.kill_run_with(run, options).await.map_err(native)?;
@@ -225,7 +228,10 @@ impl w::machine_service_server::MachineService for Service {
                     }
                     snapshot(&m.inspect().await.map_err(native)?)
                 } else {
-                    let options = libvm::MachineStopOptions::new().timeout(timeout);
+                    let mut options = libvm::MachineStopOptions::new();
+                    if let Some(timeout) = timeout {
+                        options = options.timeout(timeout);
+                    }
                     let data = match expected {
                         Some(run) => m.stop_run_with(run, options).await,
                         None => m.stop_with(options).await,
@@ -446,18 +452,30 @@ impl w::machine_service_server::MachineService for Service {
                 None => m.logs(source_native, options).await,
             }
             .map_err(native)?;
+            let mut discard_partial_line = stream.starts_mid_line();
             let tx = tx.clone();
             tokio::spawn(async move {
                 while let Some(chunk) =
                     tokio::select! { _=tx.closed()=>None, chunk=stream.next()=>chunk }
                 {
-                    let chunk = match chunk {
+                    let mut chunk = match chunk {
                         Ok(c) => c,
                         Err(e) => {
                             let _ = tx.send(Err(native(e))).await;
                             return;
                         }
                     };
+                    if discard_partial_line {
+                        let Some(newline) = chunk.data.iter().position(|byte| *byte == b'\n')
+                        else {
+                            continue;
+                        };
+                        discard_partial_line = false;
+                        chunk.data = chunk.data.slice(newline + 1..);
+                        if chunk.data.is_empty() {
+                            continue;
+                        }
+                    }
                     let wire = match requests::log_chunk_to_wire(&chunk, source_native) {
                         Ok(v) => v,
                         Err(e) => {

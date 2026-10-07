@@ -32,7 +32,7 @@ func TestCreateAdmissionFinalizerWithActualHome(t *testing.T) {
 			t.Fatal("leaked name", err)
 		}
 		release()
-		entries, err := s.Runtime.SDK.Inventory(t.Context())
+		entries, err := s.Runtime.Control.Inventory(t.Context())
 		if err != nil || len(entries) != 0 {
 			t.Fatal("submission/cancellation created durable records", entries, err)
 		}
@@ -70,7 +70,7 @@ func TestCreateAdmissionFinalizerWithActualHome(t *testing.T) {
 
 func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
-	s := actualService(t)
+	s, sdk := actualNativeService(t)
 	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	c := domainCaller(s, "user:1")
@@ -89,7 +89,7 @@ func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 		t.Fatal("OCI pull not reached")
 	}
 	// A real independent native writer wins the Home name race after publication.
-	m, err := s.Runtime.SDK.CreateMachine(t.Context(), silo.DiskImage(testfixture.Path(t, "SILO_TEST_LOCAL_DISK", false)), silo.WithName(op.VM))
+	m, err := sdk.CreateMachine(t.Context(), silo.DiskImage(testfixture.Path(t, "SILO_TEST_LOCAL_DISK", false)), silo.WithName(op.VM))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 	if finished.VM != op.VM || finished.Error == nil || finished.Error.Exit != 5 {
 		t.Fatal("published proposal renamed or race hidden", finished)
 	}
-	entries, err := s.Runtime.SDK.Inventory(t.Context())
+	entries, err := s.Runtime.Control.Inventory(t.Context())
 	if err != nil || len(entries) != 1 || entries[0].Name != op.VM {
 		t.Fatal(entries, err)
 	}

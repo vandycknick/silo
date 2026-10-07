@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 )
 
 type Window struct{ Rows, Columns uint16 }
@@ -133,14 +133,18 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 	if e != nil {
 		return 4, e
 	}
-	m, d, e := s.machine(parent, p, ref, action)
+	d, e := s.inspect(parent, p, ref, action)
 	if e != nil {
 		return Categorize(e).Exit, e
 	}
-	defer s.Runtime.CloseMachine(m)
 	if d.Status.Kind != silo.MachineStatusRunning {
 		return 5, failure("conflict", "VM must be running", 5)
 	}
+	m, e := s.Runtime.Machine(parent, d.ID)
+	if e != nil {
+		return Categorize(e).Exit, Categorize(e)
+	}
+	defer s.Runtime.CloseMachine(m)
 	ctx, cancel, recheck := s.streamContext(parent, c, d.ID, action)
 	defer cancel()
 	defer func() {
@@ -390,11 +394,10 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 	if e != nil {
 		return e
 	}
-	m, d, e := s.machine(parent, p, ref, identity.Logs)
+	d, e := s.inspect(parent, p, ref, identity.Logs)
 	if e != nil {
 		return e
 	}
-	defer s.Runtime.CloseMachine(m)
 	ctx, cancel, recheck := s.streamContext(parent, c, d.ID, identity.Logs)
 	defer cancel()
 	defer func() {
@@ -402,107 +405,58 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 			err = denied
 		}
 	}()
-	stream, e := m.Logs(ctx, q.Source, silo.MachineLogOptions{})
+	source := map[silo.MachineLogSource]w.LogSource{
+		silo.MachineLogMonitor:      w.LogSource_LOG_SOURCE_MONITOR,
+		silo.MachineLogSerial:       w.LogSource_LOG_SOURCE_SERIAL,
+		silo.MachineLogExec:         w.LogSource_LOG_SOURCE_EXEC,
+		silo.MachineLogNetwork:      w.LogSource_LOG_SOURCE_NETWORK,
+		silo.MachineLogNetworkAudit: w.LogSource_LOG_SOURCE_NETWORK_AUDIT,
+	}[q.Source]
+	output := w.LogOutput_LOG_OUTPUT_ALL
+	if q.Output == silo.MachineLogStdout {
+		output = w.LogOutput_LOG_OUTPUT_STDOUT
+	} else if q.Output == silo.MachineLogStderr {
+		output = w.LogOutput_LOG_OUTPUT_STDERR
+	}
+	tailBytes := uint64(logLimit)
+	stream, e := s.Runtime.Control.ReadLogs(ctx, &w.ReadLogsRequest{Id: d.ID, Source: source, Output: output, Follow: q.Follow, TailBytes: &tailBytes})
 	if e != nil {
 		return Categorize(e)
 	}
 	s.Runtime.Metrics.Handle("logs", 1)
-	var tail []byte
-	var historical uint64
-	truncated := false
+	defer s.Runtime.Metrics.Handle("logs", -1)
+	var line []byte
+	discard := false
+	flush := func(newline bool) error {
+		value := redact(string(line))
+		if discard {
+			value = "[oversized log line omitted]"
+		}
+		if newline {
+			value += "\n"
+		}
+		_, err := WriteContext(ctx, out, []byte(value))
+		line = line[:0]
+		discard = false
+		return err
+	}
 	for {
-		chunk, e := stream.Recv(ctx)
+		chunk, e := stream.Recv()
 		if errors.Is(e, io.EOF) {
-			break
-		}
-		if e != nil {
-			_ = stream.Close()
-			s.Runtime.Metrics.Handle("logs", -1)
-			return Categorize(e)
-		}
-		historical += uint64(len(chunk.Data))
-		if q.Output != "" && q.Output != chunk.Output {
-			continue
-		}
-		data := chunk.Data
-		if len(data) >= logLimit {
-			truncated = true
-			tail = append(tail[:0], data[len(data)-logLimit:]...)
-		} else {
-			if len(tail)+len(data) > logLimit {
-				truncated = true
-				tail = tail[len(tail)+len(data)-logLimit:]
+			if len(line) > 0 || discard {
+				return flush(false)
 			}
-			tail = append(tail, data...)
-		}
-	}
-	_ = stream.Close()
-	s.Runtime.Metrics.Handle("logs", -1)
-	if truncated {
-		if i := strings.IndexByte(string(tail), '\n'); i >= 0 {
-			tail = tail[i+1:]
-		} else {
-			tail = nil
-		}
-	}
-	var pending []byte
-	if q.Follow {
-		if i := bytes.LastIndexByte(tail, '\n'); i >= 0 {
-			pending = append([]byte(nil), tail[i+1:]...)
-			tail = tail[:i+1]
-		} else {
-			pending = tail
-			tail = nil
-		}
-	}
-	if _, e = WriteContext(ctx, out, []byte(redact(string(tail)))); e != nil {
-		return e
-	}
-	if !q.Follow {
-		return nil
-	}
-	stream, e = m.Logs(ctx, q.Source, silo.MachineLogOptions{Follow: true})
-	if e != nil {
-		return Categorize(e)
-	}
-	s.Runtime.Metrics.Handle("logs", 1)
-	defer func() { _ = stream.Close(); s.Runtime.Metrics.Handle("logs", -1) }()
-	// Follow reopens at the beginning. Skip the snapshot already observed, then
-	// redact complete bounded lines, including credentials split across chunks.
-	line := pending
-	discard := len(line) > 65536
-	if discard {
-		line = nil
-	}
-	for {
-		chunk, e := stream.Recv(ctx)
-		if errors.Is(e, io.EOF) {
 			return nil
 		}
 		if e != nil {
 			return Categorize(e)
 		}
-		data := chunk.Data
-		if historical > 0 {
-			skip := min(historical, uint64(len(data)))
-			historical -= skip
-			data = data[skip:]
-		}
-		if q.Output != "" && q.Output != chunk.Output {
-			continue
-		}
-		for _, b := range data {
+		for _, b := range chunk.Data {
 			switch {
 			case b == '\n':
-				text := redact(string(line))
-				if discard {
-					text = "[oversized log line omitted]"
-				}
-				if _, e = WriteContext(ctx, out, []byte(text+"\n")); e != nil {
+				if e := flush(true); e != nil {
 					return e
 				}
-				line = line[:0]
-				discard = false
 			case len(line) < 65536 && !discard:
 				line = append(line, b)
 			default:

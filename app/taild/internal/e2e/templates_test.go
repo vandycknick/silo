@@ -83,16 +83,11 @@ rule "allow-local-http" {
 	run(two, "template show dev --json", "", 3)
 	run(two, "policy show local --json", "", 3)
 	run(one, "create --name templated --template dev --provision-user silo:1000:1000:/home/silo --json", "", 0)
-	m, e := r.SDK.Machine(ctx, "templated")
+	d, e := r.Control.Inspect(ctx, "templated")
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer m.Close()
-	d, e := m.Inspect(ctx)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if d.Network.Tailscale != nil || d.Network.Publish != nil || d.Network.Policy == nil || d.Labels[service.TemplateLabel] != "dev" || d.Labels[service.PolicyLabel] != "local" {
+	if d.Network.Tailscale != nil || d.Network.Publish != nil || d.PolicyJSON == "" || d.Labels[service.TemplateLabel] != "dev" || d.Labels[service.PolicyLabel] != "local" {
 		t.Fatalf("authority drift %+v", d)
 	}
 	if d.RunID == nil {
@@ -130,7 +125,7 @@ rule "github" {
  verdict = "allow"
 }`
 	run(one, "policy create needs-token --json", missing, 0)
-	before, e := r.SDK.Inventory(ctx)
+	before, e := r.Control.Inventory(ctx)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -138,11 +133,11 @@ rule "github" {
 	if !strings.Contains(result, "github-api.token") || !strings.Contains(result, "bearer_token.github-api.token") {
 		t.Fatal(result)
 	}
-	after, e := r.SDK.Inventory(ctx)
+	after, e := r.Control.Inventory(ctx)
 	if e != nil || len(after) != len(before) {
 		t.Fatal(after, e)
 	}
-	if _, e = r.SDK.Machine(ctx, "must-not-exist"); !silo.IsErrorKind(e, silo.ErrorMachineNotFound) {
+	if _, e = r.Control.Inspect(ctx, "must-not-exist"); !silo.IsErrorKind(e, silo.ErrorMachineNotFound) {
 		t.Fatal(e)
 	}
 	run(one, "rm templated --force --yes --json", "", 0)

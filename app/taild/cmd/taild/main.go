@@ -189,7 +189,7 @@ func serve(ctx context.Context, cancel context.CancelFunc, c config.Config, secr
 		return e
 	}
 	defer func() { _ = audit.Close() }()
-	r, e := runtime.Open(ctx, c, instance)
+	r, e := runtime.Open(ctx, c, instance, client)
 	if e != nil {
 		for _, kind := range []silo.ErrorKind{silo.ErrorFFILoad, silo.ErrorABIMismatch, silo.ErrorUnsupportedTarget, silo.ErrorInvalidArgument, silo.ErrorRuntimeComponentInvalid, silo.ErrorRuntimeComponentsNotFound} {
 			if silo.IsErrorKind(e, kind) {
@@ -327,8 +327,8 @@ func serve(ctx context.Context, cancel context.CancelFunc, c config.Config, secr
 	log.Info("reconciled", "managed", len(snapshot.VMs), "unmanaged", snapshot.Unmanaged, "unreadable", snapshot.Unreadable)
 	// Operations outlive sessions and graceful listener shutdown, but are owned
 	// by this daemon and cancelled when its bounded drain budget expires.
-	s := &service.Service{Runtime: r, Control: client, DaemonVersion: daemon.ProductVersion, ManagementProtocol: daemon.ProtocolMajor, Audit: audit, Jobs: registryJobs, Shutdown: gate, Capability: c.Tailnet.Capability, Config: c, VisibleNames: node.VisibleNames, VMNodesEnabled: true, Enrollment: enrollment}
-	if e = s.ReloadDocuments(); e != nil {
+	s := &service.Service{Runtime: r, DaemonVersion: daemon.ProductVersion, ManagementProtocol: daemon.ProtocolMajor, Audit: audit, Jobs: registryJobs, Shutdown: gate, Capability: c.Tailnet.Capability, Config: c, VisibleNames: node.VisibleNames, VMNodesEnabled: true, Enrollment: enrollment}
+	if e = s.ReloadDocuments(ctx); e != nil {
 		return e
 	}
 	hup := make(chan os.Signal, 1)
@@ -340,7 +340,7 @@ func serve(ctx context.Context, cancel context.CancelFunc, c config.Config, secr
 			case <-ctx.Done():
 				return
 			case <-hup:
-				if e := s.ReloadDocuments(); e != nil {
+				if e := s.ReloadDocuments(ctx); e != nil {
 					log.Error("operator documents reload failed", "error", e)
 				}
 			}

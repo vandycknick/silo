@@ -598,26 +598,19 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 		if e != nil || view.State != silo.MachineStatusStopped {
 			t.Fatal("userdata create must remain stopped", view, e)
 		}
-		m, e := r.SDK.Machine(ctx, view.ID)
+		started, e := r.Control.Start(ctx, view.ID)
 		if e != nil {
 			t.Fatal(e)
 		}
-		if _, e := m.Start(ctx); e != nil {
-			_ = m.Close()
-			t.Fatal(e)
-		}
-		if _, e := m.WaitReady(ctx, 20*time.Second); e != nil {
-			_ = m.Close()
+		if _, e := r.Control.WaitReady(ctx, view.ID, started.RunID, 20*time.Second); e != nil {
 			t.Fatal(e)
 		}
 		var actual, guestErr bytes.Buffer
 		code, e := svc.Exec(ctx, caller, name, service.ExecRequest{Program: "/bin/cat", Args: []string{"/var/lib/silo-agent/userdata.sh"}}, service.IO{Stdout: &actual, Stderr: &guestErr})
 		if code != 0 || e != nil || actual.String() != payload {
-			_ = m.Close()
 			t.Fatalf("guest userdata changed (%s): %d %v %q, want %q", mode, code, e, actual.String(), payload)
 		}
-		_, e = m.StopWith(ctx, silo.StopOptions{Force: true, Timeout: time.Second})
-		_ = m.Close()
+		_, e = r.Control.Stop(ctx, view.ID, &started.RunID, silo.StopOptions{Force: true, Timeout: time.Second})
 		if e != nil {
 			t.Fatal(e)
 		}

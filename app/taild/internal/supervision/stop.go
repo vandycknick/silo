@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
@@ -43,13 +44,12 @@ func (r *StopResult) add(o StopResult) {
 }
 
 type inventoryResult struct {
-	entries []silo.MachineInventoryEntry
+	entries []control.InventoryEntry
 	err     error
 }
 
-// StopAll issues every stop concurrently before waiting. SDK native calls may
-// outlive their Go context. The returned counts never call those calls finished.
-// Native per-machine lifecycle locks coordinate this with SDK/CLI writers.
+// StopAll issues every stop concurrently before waiting. Drained tracks local
+// RPC waiters only: cancelled RPCs do not prove daemon mutations have completed.
 func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 	drained := make(chan struct{})
 	var wg sync.WaitGroup
@@ -60,10 +60,10 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		entries, err := r.SDK.Inventory(ctx)
+		entries, err := r.Control.Inventory(ctx)
 		entriesDone <- inventoryResult{entries, err}
 	}()
-	var entries []silo.MachineInventoryEntry
+	var entries []control.InventoryEntry
 	select {
 	case got := <-entriesDone:
 		if got.err != nil {
@@ -75,7 +75,7 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 	}
 	completed := make(chan error, len(entries))
 	for _, entry := range entries {
-		if !runtime.Managed(entry.Data, r.Instance) {
+		if entry.Data == nil || !runtime.Managed(entry.Data.MachineData, r.Instance) {
 			continue
 		}
 		id := entry.Data.ID
@@ -83,16 +83,18 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			m, err := r.Machine(ctx, id)
+			data, err := r.Control.Inspect(ctx, id)
 			if err == nil {
-				defer r.CloseMachine(m)
-				data, inspectErr := m.Inspect(ctx)
-				if inspectErr != nil {
-					completed <- inspectErr
+				if !runtime.Managed(data.MachineData, r.Instance) {
+					completed <- errors.New("shutdown ownership changed")
 					return
 				}
-				if !runtime.Managed(data, r.Instance) {
-					completed <- errors.New("shutdown ownership changed")
+				if data.Status.Kind == silo.MachineStatusStopped {
+					completed <- nil
+					return
+				}
+				if data.RunID == nil {
+					completed <- errors.New("shutdown running generation unavailable")
 					return
 				}
 				remaining := time.Second
@@ -100,7 +102,7 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 					remaining = time.Until(deadline)
 				}
 				grace := max(time.Millisecond, remaining*2/3)
-				_, err = m.StopWith(ctx, silo.StopOptions{Timeout: grace})
+				_, err = r.Control.Stop(ctx, id, data.RunID, silo.StopOptions{Timeout: grace})
 				if silo.IsErrorKind(err, silo.ErrorMachineNotRunning) {
 					err = nil
 				}
@@ -110,7 +112,10 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 						forceBudget = min(forceBudget, time.Until(deadline))
 					}
 					if forceBudget > 0 {
-						_, err = m.StopWith(ctx, silo.StopOptions{Force: true, Timeout: forceBudget})
+						_, err = r.Control.Stop(ctx, id, data.RunID, silo.StopOptions{Force: true, Timeout: forceBudget})
+						if silo.IsErrorKind(err, silo.ErrorMachineNotRunning) {
+							err = nil
+						}
 					}
 				}
 			}
@@ -120,12 +125,15 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 	for result.Finished < result.Issued {
 		select {
 		case err := <-completed:
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return result, errors.New("shutdown stop waiter cancelled; daemon mutation completion unknown")
+			}
 			result.Finished++
 			if err != nil {
 				result.Failed++
 			}
 		case <-ctx.Done():
-			return result, errors.New("shutdown stop deadline reached; native calls may remain in flight")
+			return result, errors.New("shutdown stop deadline reached; daemon mutations may remain in flight")
 		}
 	}
 	if result.Failed != 0 {
@@ -134,7 +142,7 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 	return result, nil
 }
 
-// Sweep keeps discovering records materialized by pre-seal native calls until
+// Sweep keeps discovering records materialized by pre-seal daemon mutations until
 // the helper budget expires. It never takes the daemon's exclusive home lock.
 func Sweep(ctx context.Context, r *runtime.Runtime) (total StopResult, finalError error) {
 	var lastError error

@@ -18,6 +18,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -292,7 +293,7 @@ func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 	c.prompt(t, "Remove VM 'devbox'? [y/N] ", 1)
 	// A genuine SDK rename and replacement while the prompt is blocked proves
 	// neither a native handle nor a per-VM operation lock is retained.
-	m, e := s.Runtime.SDK.Machine(ctx, original.ID)
+	m, e := daemon.Writer(t, s.Config).Machine(ctx, original.ID)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -371,10 +372,11 @@ func TestRemovalOpenSSHNativeRunningForce(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, "removal-running", "user:7")
 	registry := testfixture.OCIRegistry(t, testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true))
-	s.Config.VM.DefaultImage = registry.Reference
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
+	cfg := daemon.Config(t, registry)
+	n := daemon.Open(t, cfg, "removal-running", 8)
+	s := &service.Service{Runtime: n.Runtime, Audit: n.Audit, Jobs: n.Jobs, Config: cfg}
+	caller := service.Caller{Peer: daemon.Peer(cfg, "explicit-removal-running", "user:7")}
 	var stopRevoked atomic.Bool
 	peer := caller.Peer
 	caller.Resolve = func(ctx context.Context) (identity.Peer, error) {
@@ -393,18 +395,12 @@ func TestRemovalOpenSSHNativeRunningForce(t *testing.T) {
 	t.Cleanup(func() {
 		cleanup, done := context.WithTimeout(context.Background(), 20*time.Second)
 		defer done()
-		m, e := s.Runtime.SDK.Machine(cleanup, "devbox")
+		data, e := s.Runtime.Control.Inspect(cleanup, "devbox")
 		if e == nil {
-			_, _ = m.StopWith(cleanup, silo.StopOptions{Force: true, Timeout: time.Second})
-			_ = m.Close()
+			_, _ = s.Runtime.Control.Stop(cleanup, data.ID, data.RunID, silo.StopOptions{Force: true, Timeout: time.Second})
 		}
 	})
-	m, e := s.Runtime.SDK.Machine(ctx, "devbox")
-	if e != nil {
-		t.Fatal(e)
-	}
-	before, e := m.Inspect(ctx)
-	_ = m.Close()
+	before, e := s.Runtime.Control.Inspect(ctx, "devbox")
 	if e != nil || before.RunID == nil {
 		t.Fatal(before, e)
 	}
@@ -435,12 +431,7 @@ func TestRemovalOpenSSHNativeRunningForce(t *testing.T) {
 	c.send(t, "yes\n")
 	c.exit(t, 4, true)
 	stopRevoked.Store(false)
-	m, e = s.Runtime.SDK.Machine(ctx, "devbox")
-	if e != nil {
-		t.Fatal(e)
-	}
-	after, e := m.Inspect(ctx)
-	_ = m.Close()
+	after, e := s.Runtime.Control.Inspect(ctx, "devbox")
 	if e != nil || after.Status.Kind != silo.MachineStatusRunning || after.RunID == nil || *after.RunID != *before.RunID {
 		t.Fatal("negative reply stopped/restarted VM", after, e)
 	}
