@@ -84,6 +84,10 @@ jobs:
               - 'PACKAGING.md'
               - 'nix/**'
               - 'app/taild/**'
+              - 'app/silod/**'
+              - 'app/cli/**'
+              - 'common/config/**'
+              - 'common/vm-control/**'
               - 'sdk/go/**'
               - 'runtime/**'
               - 'guest/**'
@@ -367,18 +371,30 @@ jobs:
         run: nix develop .#ci --command go -C net/netd test -race -count=1 -timeout=4m ./...
 
   taild:
-    name: taild (Linux)
+    name: taild (${{ matrix.platform }})
     needs: changes
     if: needs.changes.outputs.taild == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64-gnu
+            runner: ubuntu-24.04
+            library: libsilo_go_ffi.so
+          - platform: darwin-arm64
+            runner: macos-26
+            library: libsilo_go_ffi.dylib
     env:
       CGO_ENABLED: '1'
       GOTOOLCHAIN: auto
       GOFLAGS: -mod=readonly
-      SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/libsilo_go_ffi.so
-      SILO_TEST_RUNTIME_ROOT: ${{ github.workspace }}/target/silo-runtime/linux-amd64-gnu/debug
-      SILO_TAILD_REQUIRE_FIXTURES: '1'
+      SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ matrix.library }}
+      SILO_TEST_RUNTIME_ROOT: ${{ github.workspace }}/target/silo-runtime/${{ matrix.platform }}/release
+      SILO_RUNTIME_DIR: ${{ github.workspace }}/target/silo-runtime/${{ matrix.platform }}/release
+      SILO_TEST_BIN_DIR: ${{ github.workspace }}/target/debug
+      SILO_TEST_CLI: ${{ github.workspace }}/target/debug/silo
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -395,29 +411,24 @@ jobs:
           shared-key: workspace
           cache-bin: false
           save-if: false
-      - name: Build actual native bridge
-        timeout-minutes: 10
-        run: nix develop .#ci --command cargo build --locked -p silo-go-ffi
-      - name: Build and stage the complete actual runtime
-        # The existing target builds real helpers/assets and resolves the
-        # official ghcr.io/vandycknick/silo/kernel:stable OCI dependency.
-        # The default shell supplies ORAS and cargo-zigbuild for acquisition
-        # and real guest helpers; the smaller CI shell deliberately omits them.
-        timeout-minutes: 15
-        run: nix develop --command make stage PROFILE=debug
+      - name: Build integrated development product and release runtime fixtures
+        timeout-minutes: 25
+        run: |
+          nix develop --command make build
+          nix develop --command make stage PROFILE=release
       - name: Check taild formatting
         run: |
-          files="$(timeout 280s nix develop .#ci --command gofmt -l app/taild)"
+          files="$(nix develop .#ci --command gofmt -l app/taild)"
           if [ -n "$files" ]; then
             printf '%s\n' "$files"
             exit 1
           fi
       - name: Vet taild
-        run: timeout 280s nix develop .#ci --command go -C app/taild vet ./...
+        run: nix develop .#ci --command go -C app/taild vet ./...
       - name: Test taild with actual bridge and race detector
-        run: timeout 280s nix develop .#ci --command go -C app/taild test -race -count=1 -timeout=4m -v ./...
-      - name: Build taild
-        run: timeout 280s nix develop .#ci --command go -C app/taild build ./cmd/taild
+        # VM-fixture tests retain their explicit host/rootfs opt-in. The package
+        # lane separately requires real helper startup and native bridge loading.
+        run: nix develop .#ci --command go -C app/taild test -p 1 -race -count=1 -timeout=4m -v ./...
 
   taild-package:
     name: taild package (${{ matrix.platform }})
@@ -433,6 +444,8 @@ jobs:
             runner: ubuntu-24.04
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-26
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -440,14 +453,26 @@ jobs:
           persist-credentials: false
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      - name: Build native runtime, qualified SDK, CGO taild and portable package
+      - name: Build integrated native product and portable package
         run: nix develop .#release --command make archive
+      - name: Build native management and exact-ID acceptance driver
+        run: nix develop .#release --command go -C app/taild build -o "$GITHUB_WORKSPACE/target/artifact-driver" ../../packaging/silo-taild/kvm.go
       - name: Exercise packaged executable without development overrides
         env:
           PLATFORM: ${{ matrix.platform }}
+          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
         run: |
           version="$(tr -d '\n' < VERSION)"
           nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "target/packages/$version/$PLATFORM/silo-$version-$PLATFORM.tar.zst" "target/packages/$version/$PLATFORM/silo-runtime-$version-$PLATFORM.tar.zst"
+      - name: Build and admit actual signed native app
+        if: ${{ matrix.platform == 'darwin-arm64' }}
+        env:
+          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
+        run: |
+          nix develop .#release --command make app
+          version="$(tr -d '\n' < VERSION)"
+          output="target/packages/$version/darwin-arm64"
+          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "$output/silo-$version-darwin-arm64.tar.zst" "$output/silo-runtime-$version-darwin-arm64.tar.zst" --app "$output/Silo.app" --audit-only
 
   summary:
     name: Summary

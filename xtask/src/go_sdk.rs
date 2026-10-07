@@ -148,29 +148,6 @@ pub fn qualify_bridge(context: &BuildContext<'_>) -> Result<(), GoSdkError> {
 }
 
 pub fn assemble(workspace_root: &Path, packages_root: &Path) -> Result<(), GoSdkError> {
-    assemble_targets(workspace_root, packages_root, &TARGETS)
-}
-
-pub fn assemble_native(
-    workspace_root: &Path,
-    packages_root: &Path,
-    host: crate::targets::HostTarget,
-) -> Result<(), GoSdkError> {
-    let target = TARGETS
-        .iter()
-        .find(|target| target.name == host.runtime_target())
-        .ok_or_else(|| GoSdkError::Invalid {
-            path: packages_root.to_path_buf(),
-            reason: "unsupported native SDK target".into(),
-        })?;
-    assemble_targets(workspace_root, packages_root, std::slice::from_ref(target))
-}
-
-fn assemble_targets(
-    workspace_root: &Path,
-    packages_root: &Path,
-    targets: &[Target],
-) -> Result<(), GoSdkError> {
     let version_path = workspace_root.join("VERSION");
     let version = read_string(&version_path)?.trim().to_string();
     if !crate::version::is_semver(&version) {
@@ -180,10 +157,10 @@ fn assemble_targets(
         );
     }
 
-    validate_release_inputs(packages_root, &version, targets)?;
+    validate_release_inputs(packages_root, &version, &TARGETS)?;
 
     let mut runtime_digests = Vec::with_capacity(TARGETS.len());
-    for target in targets {
+    for target in &TARGETS {
         let target_root = packages_root.join(&version).join(target.name);
         let archive = target_root.join(format!("silo-runtime-{version}-{}.tar.zst", target.name));
         runtime_digests.push((target.name, verified_digest(&archive)?));
@@ -218,17 +195,6 @@ fn assemble_targets(
         )?;
     }
 
-    if targets.len() == 1 {
-        let target = &targets[0];
-        let digest = runtime_digest(&runtime_digests, target.name)?;
-        let metadata = format!("package silo\n\nconst defaultRuntimeReleaseOrigin = \"https://github.com/vandycknick/silo/releases/download\"\n\ntype runtimeArchiveMetadata struct {{ version string; target RuntimeTarget; name string; sha256 string }}\n\nvar runtimeArchives = map[RuntimeTarget]runtimeArchiveMetadata{{RuntimeTarget({target:?}): {{version: Version, target: RuntimeTarget({target:?}), name: \"silo-runtime-\" + Version + \"-{name}.tar.zst\", sha256: {digest:?}}}}}\n", target=target.name, name=target.name);
-        return write_file(
-            &workspace_root.join("sdk/go/runtime_metadata.go"),
-            metadata
-                .replace("version: Version", &format!("version: {version:?}"))
-                .as_bytes(),
-        );
-    }
     let darwin_digest = runtime_digest(&runtime_digests, "darwin-arm64")?;
     let linux_amd64_digest = runtime_digest(&runtime_digests, "linux-amd64-gnu")?;
     let linux_arm64_digest = runtime_digest(&runtime_digests, "linux-arm64-gnu")?;
@@ -424,7 +390,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::components::BuildContext;
-    use crate::go_sdk::{assemble, assemble_native, run_example, sha256, TARGETS};
+    use crate::go_sdk::{assemble, run_example, sha256, TARGETS};
     use crate::profiles::Profile;
     use crate::targets::HostTarget;
 
@@ -491,32 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn native_assembly_needs_only_current_target_and_pins_exact_digests() {
-        let repository = TestDirectory::new("native-repository");
-        let packages = TestDirectory::new("native-packages");
-        fs::write(repository.path().join("VERSION"), "0.1.0\n").unwrap();
-        let target = &TARGETS[1];
-        let directory = packages.path().join("0.1.0").join(target.name);
-        fs::create_dir_all(directory.join("go-ffi")).unwrap();
-        let archive = directory.join(format!("silo-runtime-0.1.0-{}.tar.zst", target.name));
-        write_qualified(&archive, b"current runtime archive");
-        write_qualified(
-            &directory.join("go-ffi").join(target.bridge_input),
-            b"current bridge",
-        );
-        assemble_native(repository.path(), packages.path(), HostTarget::LinuxX86_64).unwrap();
-        let metadata =
-            fs::read_to_string(repository.path().join("sdk/go/runtime_metadata.go")).unwrap();
-        assert!(metadata.contains(&sha256(&archive).unwrap()));
-        assert!(metadata.contains("version: \"0.1.0\""));
-        assert!(!metadata.contains("darwin-arm64"));
-        fs::write(&archive, b"changed runtime").unwrap();
-        assert!(
-            assemble_native(repository.path(), packages.path(), HostTarget::LinuxX86_64).is_err()
-        );
-    }
-
-    #[test]
     fn rejects_unsafe_example_names() {
         let repository = TestDirectory::new("example-repository");
         let target = TestDirectory::new("example-target");
@@ -536,9 +476,12 @@ mod tests {
         let repository = TestDirectory::new("unsafe-version");
         let packages = TestDirectory::new("unsafe-version-packages");
         fs::write(repository.path().join("VERSION"), "../outside\n").unwrap();
-        let error = assemble_native(repository.path(), packages.path(), HostTarget::LinuxX86_64)
-            .unwrap_err();
-        assert!(error.to_string().contains("three numeric components"));
+        let error = assemble(repository.path(), packages.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::go_sdk::GoSdkError::Invalid { path, .. }
+                if path == repository.path().join("VERSION")
+        ));
     }
 
     #[test]

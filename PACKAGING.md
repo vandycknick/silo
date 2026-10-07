@@ -1,14 +1,19 @@
 # Packaging Silo for Distribution
 
-## Taild Linux packages
+## Integrated native product packages
 
-`make archive` builds the native release runtime stage, creates its runtime-only
-archive and checksum, builds/hashes the native SDK bridge, generates a target-local
-qualified SDK in `target/taild-qualified-source/release`, builds `taild` against that
-isolated source with `CGO_ENABLED=1`, then creates the portable archive. It does not
-wait for other native targets. Netd's release `CGO_ENABLED=0` recipe must not be used
-for taild. Linux release CGO uses `/usr/bin/cc` and `/usr/bin/c++`; cross compilation
-is not a native qualification substitute. macOS archives omit taild/service material.
+`make build` produces the CLI, silod, taild and its adjacent native Go bridge
+alongside the ordinary runtime assets. Taild builds directly from `app/taild`
+with the source SDK and generated management-module replacements. Its build
+ensures the bridge once, uses `CGO_ENABLED=1`, and never assembles or installs a
+standalone SDK distribution. This graph supports native Linux and macOS.
+Netd's `CGO_ENABLED=0` recipe must not be used for taild.
+
+`make archive` stages the release runtime, produces runtime-only and portable
+archives, and qualifies the existing bridge for independent standalone SDK
+assembly. Linux release CGO uses native `/usr/bin` compiler/linker tools; macOS
+uses the existing Xcode/deployment-target configuration. Cross compilation is
+not native runtime qualification.
 
 Both runtime roots include `runtime-manifest.json`: `{version, target, files}`.
 Version equals the exact SDK product version. Targets are `linux-amd64-gnu`,
@@ -16,47 +21,58 @@ Version equals the exact SDK product version. Targets are `linux-amd64-gnu`,
 the complete current bin/assets inventory mapped to lowercase SHA-256 digests;
 manifest metadata is never a made-up constant. Stage validation rejects unexpected
 entries/symlinks and verifies manifest bytes against current components and VERSION.
-The archive checksum is embedded in qualified SDK source for explicit offline
-installation. The bridge loader checks the embedded digest, ABI and product version.
-`make version-check` also checks the SDK bundle cache-version constant.
+Qualified standalone SDK releases still embed runtime archive checksums and
+bridge bytes through `make assemble-go-sdk`. Those APIs remain supported.
+The integrated product instead loads the canonical adjacent sidecar, verifies
+its ABI/product version and uses the exact manager-selected six components.
+`make version-check` also checks the standalone SDK bundle cache-version constant.
 
-Linux portable archives include `bin/taild`, `share/silo-taild` (service, sysusers,
-config, examples and acceptance tools), and generated `LICENSES/taild` notices from
-the exact Go module graph. The generator fails on missing license material; review
-`modules.json` and the SBOM. Godbus is BSD-2-Clause (not MIT), and retains its actual
-module license. Runtime notices are generated from the existing template with
-the actual locked libkrun revision and vendored signal-registry attribution;
-the Apache license remains included. These are archive outputs, not distro
-package/signature claims.
+Portable archives on both operating systems include `bin/silo`, `bin/silod`,
+`bin/taild` and `bin/libsilo_go_ffi.so` (or `.dylib`). Runtime-only SDK archives
+contain VMM/netd/guest assets, never those frontends or bridge. Product archives
+include only useful `share/silo-taild/examples`, not standalone units, sysusers,
+configuration or acceptance tooling. Existing installed standalone state is
+not removed or migrated.
 
-For bounded component builds, build each release component separately (CLI, silod,
-silo-vmm, netd, agent, init) and stop to inspect a cold-build timeout rather than
-blindly retrying. After coordinated `make stage PROFILE=release`, run:
+Generated `LICENSES/taild` material comes from the exact Go module graph;
+missing license material is fatal. Review `modules.json`, SBOM and provenance.
+Runtime notices retain the locked libkrun revision, vendored signal-registry
+attribution and Apache license. Product provenance records actual helper and
+bridge hashes. These are archive outputs, not distro-package/signature claims.
+
+For bounded cold builds, build release components separately and inspect any
+timeout instead of blindly retrying. `make taild PROFILE=release` already
+builds its bridge dependency. After coordinated `make stage PROFILE=release`:
 
 ```sh
 make runtime-archive PROFILE=release
-make go-ffi PROFILE=release
 make qualify-go-bridge PROFILE=release
-make taild PROFILE=release
 make portable-archive
+CGO_ENABLED=1 go -C app/taild build \
+  -o "$PWD/target/artifact-driver" ../../packaging/silo-taild/kvm.go
 python3 packaging/silo-taild/verify-artifact.py \
   target/packages/0.1.0/linux-amd64-gnu/silo-0.1.0-linux-amd64-gnu.tar.zst \
-  target/packages/0.1.0/linux-amd64-gnu/silo-runtime-0.1.0-linux-amd64-gnu.tar.zst
+  target/packages/0.1.0/linux-amd64-gnu/silo-runtime-0.1.0-linux-amd64-gnu.tar.zst \
+  --driver "$PWD/target/artifact-driver"
 ```
 
-Use the source VERSION and native target in the final command. The script extracts
-the actual binary into isolated HOME, removes development/native-loader overrides,
-installs the actual runtime archive offline, checks versions/config, and rejects
-version/hash/traversal and archive-checksum mismatches. It is wired into native
-Linux Test and Release Tip lanes. KVM memory and real systemd/tailnet acceptance
-remain additional gates in the [operator guide](docs/taild/operator.md).
-The current Linux amd64 release runtime passed real packaged guest execution at
-256 MiB (2026-10-01, agent 10,444,032 bytes). The current unstripped debug archive
-passed at 1 GiB (agent 173,188,384 bytes) and retains that minimum. The historical
-debug256 OOM remains a failure. These are native guest execution/memory results,
-not a qualification of arbitrary guest workloads, other architectures or tailnets.
-Debug qualification archives/bridges use `target/packages-debug`, separate from
-release outputs, with the build profile recorded in provenance.
+Use the source VERSION and native target. Build the acceptance driver in the
+same native release toolchain as the product; a Nix-linked observation tool
+cannot execute with `/nix` hidden.
+
+The verifier extracts real archives into fresh canonical Home/config roots,
+starts the packaged silod and taild, observes the mapped sidecar and checks
+exact six-component selection over the real management API. It creates no SDK
+installation/cache. Missing bridge, malformed library, dependency, ABI and
+version failures leave core inventory usable. Missing shared guest assets leave
+the core status RPC ready but correctly prevent operations needing that runtime.
+Only disposable extracted copies are damaged by negative cases.
+
+Historical 2026-10-01 standalone SDK memory runs passed release guests at 256MiB
+(agent 10,444,032 bytes) and debug guests at 1GiB (agent 173,188,384 bytes).
+They do not qualify the newly integrated product, other workloads or architectures.
+Debug archives/bridges use `target/packages-debug`, separate from release
+outputs, with build profile recorded in provenance.
 
 Linux release commands use verified `/usr/bin` C tools, clear Nix wrapper flags,
 and give CGO `-B/usr/bin` to select native assembler/linker subprograms. An absolute
@@ -73,34 +89,44 @@ than ADR0012's 2.39 floor. GNU host linker subprograms are pinned for Rust as we
 as CGO. Do not repair a too-new ABI by merely removing an interpreter/search path
 or copying an arbitrary system library closure.
 
-The extracted-archive acceptance script audits both archive payloads and requires
-exactly one materialized embedded bridge for closure inspection. It actually
-executes `silo-vmm --help`, netd's help entry point, and taild version/install/check.
-When rootless user/mount namespaces are available, `no_nix.py` hides `/nix` in the
-child while preserving the user UID. Use `--require-no-nix` to make that isolation
-mandatory, or `--audit-only` to inspect immutable older archive snapshots without
-installing/booting VMs. An unavailable namespace is explicitly unqualified;
-static dependency auditing and designated-loader execution still run. Helper
-entry-point execution alone is not proof of a guest boot on a clean distro.
+With available rootless user/mount namespaces, the verifier hides `/nix` while
+preserving the service UID. `--require-no-nix` makes that isolation mandatory.
+`--audit-only` still starts real helpers and verifies mapping/RPC admission, but
+omits negative artifact mutations. Neither mode implies VM boot, live tailnet
+authentication or host reboot qualification.
 
-The shipped `packaging/silo-taild/kvm.go` is a real SDK consumer for that additional
-gate. Build it from the isolated qualified SDK module, then run the built consumer
-with `-archive` (the actual runtime archive), `-disk` (a disposable bootable Linux
-disk with `/bin/sh`), `-home` (a new absolute evidence directory), and
-`-memory-mib 1024` or `256`. It installs offline using the embedded digest, boots the
-packaged guest agent, executes a proof command, stops the VM and retains evidence.
-It refuses known oversized (>64 MiB agent) artifacts at 256 MiB; passing that size
-screen is not itself a memory qualification. Build and VM execution are separate
-bounded commands, with normal Go preemption enabled and no FFI override:
+Hosted Go lanes run the native bridge/control tests; VM-fixture tests retain
+their explicit disk/rootfs and execution opt-ins. The separate package lanes
+require actual helper startup and bridge mapping. Neither substitutes for the
+native VM, live-tailnet or shutdown qualification scenarios.
+
+On native macOS, pass `--app /absolute/path/Silo.app` after `make app`. The app
+contains taild and the bridge under `Contents/Helpers`, and complete notices
+under `Contents/Resources`. The dylib is signed first, then executables and the
+outer app, all with the selected identity. Only silo-vmm receives virtualization
+entitlements; library validation is not disabled. Nested certificate identity
+is checked, and `Silo.app.provenance.json` records actual post-sign bytes outside
+the sealed bundle. Ad-hoc validation is not Developer-ID qualification.
+
+For real KVM/HVF guest execution, the source acceptance driver connects to an
+already-running packaged manager with isolated Home and an absolute disposable
+bootable Linux disk. Lifecycle uses management RPC; guest exec uses an exact-ID
+SDK handle with authoritative `GetRuntimeInfo` paths, not a guessed runtime root:
 
 ```sh
-go -C target/taild-qualified-source/release/sdk/go build \
-  -o "$PWD/target/packaged-kvm" "$PWD/packaging/silo-taild/kvm.go"
-env -u SILO_GO_FFI_PATH -u GODEBUG target/packaged-kvm \
-  -archive /absolute/path/silo-runtime-VERSION-TARGET.tar.zst \
-  -disk /absolute/path/disposable-linux.ext4 \
-  -home /absolute/path/new-acceptance-home -memory-mib 256
+SILO_E2E_VM=1 target/artifact-driver \
+  --endpoint /absolute/path/control.sock \
+  --home /absolute/path/isolated-state \
+  --config-dir /absolute/path/isolated-config/silo \
+  --bridge /absolute/path/product/bin/libsilo_go_ffi.so \
+  --components-root /absolute/path/product \
+  --disk /absolute/path/disposable-linux.ext4 --memory-mib 1024
 ```
+
+For an app, use its canonical root and `Contents/Helpers/libsilo_go_ffi.dylib`.
+The driver refuses oversized agents at 256MiB; that size screen alone is not
+memory qualification. Native macOS/HVF/Developer-ID, real tailnet credentials
+and permitted login1/reboot access remain separate platform gates.
 
 This guide is for Silo contributors and downstream package maintainers. It
 describes how to build the package formats that exist in this source tree, how

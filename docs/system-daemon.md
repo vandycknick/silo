@@ -85,9 +85,9 @@ Every `--system-*` argument configures the system appliance, not defaults for
 ordinary VMs. Silod implements the local management API through libvm; guest
 execution remains a direct libvm/SDK session, not a daemon stream relay.
 
-Build both executables with `make cli silod` (or the full build). Portable
-installations keep `silod` beside `silo`; macOS bundles install it under
-`Contents/Helpers/silod`. Existing services must be stopped before upgrading
+`make build` produces the CLI, silod, taild and native bridge together. Portable
+installations keep them in `bin/`; macOS bundles place silod, taild and the bridge
+under `Contents/Helpers/`. Existing services must be stopped before upgrading
 from the embedded daemon, then started with the new CLI so its service
 definition points at `silod`. Rebuilding alone does not replace a running process.
 
