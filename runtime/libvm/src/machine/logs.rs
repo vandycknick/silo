@@ -68,6 +68,16 @@ pub struct MachineLogChunk {
 /// Async stream of semantic machine log chunks.
 pub struct MachineLogStream {
     receiver: ReceiverStream<Result<MachineLogChunk, LibVmError>>,
+    starts_mid_line: bool,
+}
+
+impl MachineLogStream {
+    /// Whether the selected byte tail omitted the beginning of its first line.
+    /// Line-oriented consumers must discard through the next newline before
+    /// applying redaction, including when that newline arrives during follow.
+    pub fn starts_mid_line(&self) -> bool {
+        self.starts_mid_line
+    }
 }
 
 impl Stream for MachineLogStream {
@@ -134,15 +144,17 @@ impl Machine {
             .then(|| open_log(&paths, machine_id, source))
             .transpose()?
             .flatten();
+        let mut starts_mid_line = false;
         let exec_snapshot = if source == MachineLogSource::Exec {
             let (mut archives, mut active) = open_exec_log_snapshots(&paths, machine_id)?;
             if let Some(limit) = tail {
-                seek_snapshot_tail(archives.iter_mut().chain(active.iter_mut()), limit)?;
+                starts_mid_line =
+                    seek_snapshot_tail(archives.iter_mut().chain(active.iter_mut()), limit)?;
             }
             Some((archives, active))
         } else {
             if let (Some(file), Some(limit)) = (file.as_mut(), tail) {
-                seek_snapshot_tail(std::iter::once(file), limit)?;
+                starts_mid_line = seek_snapshot_tail(std::iter::once(file), limit)?;
             }
             None
         };
@@ -169,6 +181,7 @@ impl Machine {
 
         Ok(MachineLogStream {
             receiver: ReceiverStream::new(receiver),
+            starts_mid_line,
         })
     }
 }
@@ -419,14 +432,21 @@ fn file_identity(file: File) -> Result<FileIdentity, LibVmError> {
 fn seek_snapshot_tail<'a>(
     files: impl DoubleEndedIterator<Item = &'a mut OpenedLog>,
     mut remaining: u64,
-) -> Result<(), LibVmError> {
+) -> Result<bool, LibVmError> {
+    let mut boundary = None;
     for file in files.rev() {
         let retained = file.snapshot_len.min(remaining);
         remaining -= retained;
-        file.file
-            .seek(SeekFrom::Start(file.snapshot_len - retained))?;
+        let offset = file.snapshot_len - retained;
+        if offset > 0 && boundary.is_none() {
+            file.file.seek(SeekFrom::Start(offset - 1))?;
+            let mut previous = [0];
+            file.file.read_exact(&mut previous)?;
+            boundary = Some(previous[0] != b'\n');
+        }
+        file.file.seek(SeekFrom::Start(offset))?;
     }
-    Ok(())
+    Ok(boundary.unwrap_or(false))
 }
 
 async fn send_snapshot(
@@ -777,16 +797,34 @@ mod tests {
         write_log(&paths.exec_log_path(), b"active\n");
         let all = b"three\ntwo\none\nactive\n";
         for limit in [0, 1, 7, 9, 15, 100] {
-            let snapshot = collect(
-                machine
-                    .logs_tail(MachineLogSource::Exec, MachineLogOptions::default(), limit)
-                    .await
-                    .expect("open exec tail snapshot"),
-            )
-            .await;
+            let stream = machine
+                .logs_tail(MachineLogSource::Exec, MachineLogOptions::default(), limit)
+                .await
+                .expect("open exec tail snapshot");
             let start = all.len().saturating_sub(limit as usize);
+            assert_eq!(
+                stream.starts_mid_line(),
+                start > 0 && all[start - 1] != b'\n'
+            );
+            let snapshot = collect(stream).await;
             assert_eq!(snapshot, all[start..]);
         }
+    }
+
+    #[tokio::test]
+    async fn tail_boundary_crosses_archive_without_newline() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::default()).await;
+        let paths = runtime.machine_paths(id);
+        write_log(&paths.exec_log_archive_path(2), b"complete\n");
+        write_log(&paths.exec_log_archive_path(1), b"credential=private");
+        write_log(&paths.exec_log_path(), b"-suffix\nsafe\n");
+        let stream = machine
+            .logs_tail(MachineLogSource::Exec, MachineLogOptions::default(), 13)
+            .await
+            .expect("open archive-boundary tail");
+        assert!(stream.starts_mid_line());
+        assert_eq!(collect(stream).await, b"-suffix\nsafe\n");
     }
 
     #[tokio::test]

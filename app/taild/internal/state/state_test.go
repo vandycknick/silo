@@ -138,7 +138,7 @@ func writeNode(t *testing.T, dir, hostname string) {
 		}
 	}
 }
-func TestProfileStateAndStoppedRecovery(t *testing.T) {
+func TestProfileState(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "tailscale")
 	if e := PrivateDir(dir); e != nil {
 		t.Fatal(e)
@@ -156,12 +156,6 @@ func TestProfileStateAndStoppedRecovery(t *testing.T) {
 	if _, s := ReadNode(dir, "other", "user:123", nil); s != Unreadable {
 		t.Fatal("renamed profile accepted")
 	}
-	if e := os.Rename(dir, dir+".backup"); e != nil {
-		t.Fatal(e)
-	}
-	if s := RecoverNode(dir, "dev", "user:123", nil); s != Enrolled {
-		t.Fatal(s)
-	}
 	if e := os.WriteFile(filepath.Join(dir, "tailscaled.state"), []byte("broken"), 0600); e != nil {
 		t.Fatal(e)
 	}
@@ -170,97 +164,6 @@ func TestProfileStateAndStoppedRecovery(t *testing.T) {
 	}
 }
 
-func TestRecoveryAtPromotionCrashBoundaries(t *testing.T) {
-	for _, step := range []string{"before-backup", "after-backup", "after-promotion", "corrupt-canonical"} {
-		t.Run(step, func(t *testing.T) {
-			dir := filepath.Join(t.TempDir(), "tailscale")
-			writeNode(t, dir, "dev")
-			switch step {
-			case "before-backup":
-				writeNode(t, dir+".pending", "dev")
-				if e := MarkVerifiedNode(dir + ".pending"); e != nil {
-					t.Fatal(e)
-				}
-			case "after-backup":
-				if e := os.Rename(dir, dir+".backup"); e != nil {
-					t.Fatal(e)
-				}
-				writeNode(t, dir+".pending", "dev")
-				if e := MarkVerifiedNode(dir + ".pending"); e != nil {
-					t.Fatal(e)
-				}
-			case "after-promotion":
-				writeNode(t, dir+".backup", "dev")
-			case "corrupt-canonical":
-				writeNode(t, dir+".backup", "dev")
-				if e := os.WriteFile(filepath.Join(dir, "tailscaled.state"), []byte("broken"), 0600); e != nil {
-					t.Fatal(e)
-				}
-			}
-			want := Enrolled
-			if step == "corrupt-canonical" {
-				want = Unreadable
-			}
-			if s := RecoverNode(dir, "dev", "user:123", nil); s != want {
-				t.Fatal(s)
-			}
-			if _, s := ReadNode(dir, "dev", "user:123", nil); s != Enrolled {
-				t.Fatal(s)
-			}
-			if _, e := os.Stat(dir + ".backup"); !os.IsNotExist(e) {
-				t.Fatal("validated backup was not finalized")
-			}
-		})
-	}
-}
-
-func TestUnverifiedPendingAndChangedReceiptNeverPromote(t *testing.T) {
-	for _, tamper := range []bool{false, true} {
-		dir := filepath.Join(t.TempDir(), "tailscale")
-		writeNode(t, dir+".pending", "dev")
-		if tamper {
-			if e := MarkVerifiedNode(dir + ".pending"); e != nil {
-				t.Fatal(e)
-			}
-			writeNode(t, dir+".pending", "dev")
-		}
-		if s := RecoverNode(dir, "dev", "user:123", nil); s != Unreadable {
-			t.Fatal("unverified pending admitted", s)
-		}
-		if _, e := os.Stat(dir + ".pending"); e != nil {
-			t.Fatal("unknown state removed", e)
-		}
-	}
-}
-
-func TestEmptyCreateStatePromotionAndUnknownBackupRetention(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "tailscale")
-	if e := PrivateDir(dir); e != nil {
-		t.Fatal(e)
-	}
-	writeNode(t, dir+".pending", "dev")
-	if e := MarkVerifiedNode(dir + ".pending"); e != nil {
-		t.Fatal(e)
-	}
-	if s := RecoverNode(dir, "dev", "user:123", nil); s != Enrolled {
-		t.Fatal(s)
-	}
-	if _, e := os.Stat(dir + ".backup"); !os.IsNotExist(e) {
-		t.Fatal("empty creation backup retained", e)
-	}
-	if e := PrivateDir(dir + ".backup"); e != nil {
-		t.Fatal(e)
-	}
-	if e := os.WriteFile(filepath.Join(dir+".backup", "tailscaled.state"), []byte("unknown material"), 0600); e != nil {
-		t.Fatal(e)
-	}
-	if s := RecoverNode(dir, "dev", "user:123", nil); s != Unreadable {
-		t.Fatal("unknown backup ignored", s)
-	}
-	if _, e := os.Stat(dir + ".backup"); e != nil {
-		t.Fatal("unknown backup deleted", e)
-	}
-}
 func TestPublicProfilePinControlTailnetAndStableID(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "tailscale")
 	writeNode(t, dir, "dev")

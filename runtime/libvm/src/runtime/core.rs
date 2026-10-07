@@ -4162,7 +4162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_with_returns_forced_machine_exit() {
+    async fn kill_with_persists_generation_for_fenced_removal() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -4224,6 +4224,25 @@ mod tests {
         assert_eq!(exit.outcome, MachineExitOutcome::Forced);
         assert_eq!(exit.machine.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);
+        let stale = machine_handle(&runtime, machine.id)
+            .remove_after_run(
+                uuid::Uuid::new_v4()
+                    .to_string()
+                    .parse()
+                    .expect("parse stale run"),
+            )
+            .await
+            .expect_err("different run must not remove the machine");
+        assert!(matches!(stale, LibVmError::MachineStaleGeneration { .. }));
+        machine_handle(&runtime, machine.id)
+            .remove_after_run(expected_run_id.parse().expect("parse killed run"))
+            .await
+            .expect("confirmed killed run remains removable");
+        assert!(runtime
+            .machine_config(machine.id)
+            .await
+            .expect("inspect removed machine")
+            .is_none());
     }
 
     #[tokio::test]

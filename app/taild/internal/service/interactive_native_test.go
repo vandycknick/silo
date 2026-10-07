@@ -14,6 +14,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 )
 
 func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
@@ -32,22 +33,21 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	t.Cleanup(func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		entries, err := s.Runtime.SDK.Inventory(cleanup)
+		entries, err := s.Runtime.Control.Inventory(cleanup)
 		if err != nil {
 			t.Error(err)
 			return
 		}
 		for _, entry := range entries {
-			m, err := s.Runtime.SDK.Machine(cleanup, entry.ID)
+			d, err := s.Runtime.Control.Inspect(cleanup, entry.ID)
 			if err != nil {
 				t.Error(err)
 				continue
 			}
-			_, _ = m.StopWith(cleanup, silo.StopOptions{Force: true, Timeout: time.Second})
-			if err = m.Remove(cleanup); err != nil {
+			_, _ = s.Runtime.Control.Stop(cleanup, d.ID, d.RunID, silo.StopOptions{Force: true, Timeout: time.Second})
+			if err = s.Runtime.Control.Remove(cleanup, d.ID); err != nil {
 				t.Error(err)
 			}
-			_ = m.Close()
 		}
 	})
 	// Enabling the service does not opt an ordinary creation into enrollment.
@@ -64,18 +64,13 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	if result.Completion == nil || !result.Completion.Running || result.Completion.Node != "" || time.Since(started) > 45*time.Second {
 		t.Fatal(result, time.Since(started))
 	}
-	m, err := s.Runtime.SDK.Machine(ctx, "pending")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
-	d, err := m.Inspect(ctx)
+	d, err := s.Runtime.Control.Inspect(ctx, "pending")
 	if err != nil || d.RunID == nil || d.Network.Tailscale == nil {
 		t.Fatal(d, err)
 	}
-	status, err := state.ReadNetdStatus(d.Network.Tailscale.StateDir, d.ID, *d.RunID, time.Now())
-	if err != nil || status.State == "ready" {
-		t.Fatal("current netd must publish its actual pending state", status, err)
+	status := d.NetworkObservation.GetLive()
+	if status == nil || status.State == w.NodeState_NODE_STATE_READY {
+		t.Fatal("current netd must publish its actual pending state", status)
 	}
 	var output bytes.Buffer
 	code, err := s.Exec(ctx, c, "pending", ExecRequest{Program: "/bin/sh", Args: []string{"-c", "printf usable"}}, IO{Stdout: &output, Stderr: io.Discard})
@@ -91,11 +86,11 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	oldRun := *d.RunID
 	op, err = s.Restart(ctx, c, "pending")
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
-	d, err = m.Inspect(ctx)
+	d, err = s.Runtime.Control.Inspect(ctx, d.ID)
 	if err != nil || d.RunID == nil || *d.RunID == oldRun {
 		t.Fatal(d, err)
 	}
-	if _, err = state.ReadNetdStatus(d.Network.Tailscale.StateDir, d.ID, oldRun, time.Now()); err == nil {
+	if status := d.NetworkObservation.GetLive(); status != nil && status.RunId == oldRun {
 		t.Fatal("old run accepted after restart")
 	}
 	// A fresh service observer reads the running node without starting enrollment.

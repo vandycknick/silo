@@ -1,21 +1,22 @@
-// Package runtime owns one public SDK handle and projects label authority.
+// Package runtime owns direct native session handles and RPC label authority.
 package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"slices"
 	"sync"
-	"time"
 
+	"github.com/google/uuid"
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/metrics"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 )
 
 const (
@@ -44,14 +45,18 @@ type Runtime struct {
 	Version  string
 	ABI      uint32
 	NodePin  *state.NodePin
-	SDK      *silo.Runtime
+	Control  *control.Client
+	sessions *silo.Runtime
 	Instance string
 	mu       sync.Mutex
 	reserved map[string]bool
 	closed   bool
 }
 
-func Open(ctx context.Context, c config.Config, instance string) (*Runtime, error) {
+func Open(ctx context.Context, c config.Config, instance string, manager *control.Client) (*Runtime, error) {
+	if manager == nil {
+		return nil, errors.New("daemon management client required")
+	}
 	if c.BridgePath == "" {
 		return nil, errors.New("bootstrap native bridge and runtime components required")
 	}
@@ -68,10 +73,10 @@ func Open(ctx context.Context, c config.Config, instance string) (*Runtime, erro
 	}
 	m := metrics.New()
 	m.Handle("runtime", 1)
-	return &Runtime{SDK: sdk, Instance: instance, reserved: make(map[string]bool), Metrics: m, Version: silo.Version, ABI: abi}, nil
+	return &Runtime{Control: manager, sessions: sdk, Instance: instance, reserved: make(map[string]bool), Metrics: m, Version: silo.Version, ABI: abi}, nil
 }
 func (r *Runtime) Close() error {
-	err := r.SDK.Close()
+	err := r.sessions.Close()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.closed {
@@ -80,8 +85,13 @@ func (r *Runtime) Close() error {
 	}
 	return err
 }
-func (r *Runtime) Machine(ctx context.Context, ref string) (*silo.Machine, error) {
-	m, err := r.SDK.Machine(ctx, ref)
+
+// Machine opens only an already authorized immutable ID for a guest session.
+func (r *Runtime) Machine(ctx context.Context, id string) (*silo.Machine, error) {
+	if !exactID(id) {
+		return nil, errors.New("native session requires an exact machine ID")
+	}
+	m, err := r.sessions.Machine(ctx, id)
 	if err == nil {
 		r.Metrics.Handle("machine", 1)
 	}
@@ -92,7 +102,7 @@ func (r *Runtime) CloseMachine(m *silo.Machine) {
 	r.Metrics.Handle("machine", -1)
 }
 func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
-	entries, e := r.SDK.Inventory(ctx)
+	entries, e := r.Control.Inventory(ctx)
 	if e != nil {
 		return Snapshot{}, e
 	}
@@ -102,7 +112,7 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 			s.Unreadable++
 			continue
 		}
-		d := entry.Data
+		d := entry.Data.MachineData
 		if d.Labels[InstanceLabel] != r.Instance {
 			s.Unmanaged++
 			continue
@@ -115,7 +125,13 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 		owner := identity.Principal(d.Labels[OwnerLabel])
 		node := state.NoNode
 		if mode != "none" {
-			node = r.nodeState(ctx, d)
+			fresh, err := r.Control.Inspect(ctx, d.ID)
+			if err != nil || !Managed(freshData(fresh), r.Instance) || fresh.Name != d.Name || fresh.Labels[OwnerLabel] != d.Labels[OwnerLabel] || fresh.Labels[ModeLabel] != mode {
+				s.Unreadable++
+				continue
+			}
+			d = fresh.MachineData
+			node = nodeState(fresh)
 		}
 		if len(entry.Issues) > 0 {
 			s.Unreadable++
@@ -135,62 +151,48 @@ func Managed(d *silo.MachineData, instance string) bool {
 	return err == nil
 }
 
-// NodeOwner is the identity used only when reading legacy stopped node state.
-// Management authority always comes from OwnerLabel, independently of tags.
-func NodeOwner(d *silo.MachineData) identity.Principal {
-	var tags []string
-	if json.Unmarshal([]byte(d.Labels[TagsLabel]), &tags) == nil && len(tags) > 0 {
-		if p, err := identity.ParsePrincipal(tags[0]); err == nil && p.IsTag() {
-			return p
-		}
+func freshData(d *control.Snapshot) *silo.MachineData {
+	if d == nil {
+		return nil
 	}
-	return identity.Principal(d.Labels[OwnerLabel])
+	return d.MachineData
 }
 
-// nodeState reads a tailnet-declared machine's node state. Stopped machines are
-// recovered under the native lease; running ones are only observed.
-func (r *Runtime) nodeState(ctx context.Context, d *silo.MachineData) state.NodeState {
+// nodeState consumes only the manager's authoritative observation, never StateDir.
+func nodeState(d *control.Snapshot) state.NodeState {
 	if d.Network.Tailscale == nil {
 		return state.Unreadable
 	}
-	dir := d.Network.Tailscale.StateDir
-	if d.Status.Kind == silo.MachineStatusRunning {
-		if d.RunID != nil {
-			if status, err := state.ReadNetdStatus(dir, d.ID, *d.RunID, time.Now()); err == nil {
-				if status.State == "ready" {
-					return state.Enrolled
-				}
-				if status.State == "approval_required" {
-					return state.Pending
-				}
-				return state.NodeState(status.State)
-			}
-		}
+	if d.Status.Kind != silo.MachineStatusRunning {
+		return state.NodeState(string(d.Status.Kind))
+	}
+	n := d.NetworkObservation
+	if d.RunID == nil || n == nil || n.Live == nil || n.Live.MachineId != d.ID || n.Live.RunId != *d.RunID {
 		return state.NodeState("status unavailable")
 	}
-	if d.Status.Kind == silo.MachineStatusStopped && state.NeedsRecovery(dir) {
-		machine, err := r.Machine(ctx, d.ID)
-		if err != nil {
-			return state.Unreadable
-		}
-		defer r.CloseMachine(machine)
-		lease, err := machine.LeaseNodeState(ctx)
-		if err != nil {
-			return state.Unreadable
-		}
-		defer lease.Close()
-		if state.RecoverNode(dir, d.Name, NodeOwner(d), r.NodePin) == state.Unreadable {
-			return state.Unreadable
-		}
+	switch n.Live.State {
+	case w.NodeState_NODE_STATE_READY:
+		return state.Enrolled
+	case w.NodeState_NODE_STATE_APPROVAL_REQUIRED:
+		return state.Pending
+	case w.NodeState_NODE_STATE_CONNECTING:
+		return state.NodeState("connecting")
+	case w.NodeState_NODE_STATE_DISCONNECTED:
+		return state.NodeState("disconnected")
+	case w.NodeState_NODE_STATE_FAILED:
+		return state.NodeState("failed")
+	case w.NodeState_NODE_STATE_STOPPED:
+		return state.NodeState("stopped")
+	default:
+		return state.Unreadable
 	}
-	return state.NodeState(string(d.Status.Kind))
 }
 
 // ErrNameTaken is the one answer to every way a machine name can collide.
 var ErrNameTaken = &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
 
 // Reserve is a short in-process reservation, not a distributed claim. Create
-// holds it through SDK CreateMachine, whose native exact-name home lock also
+// holds it through RPC CreateMachine, whose native exact-name home lock also
 // covers CLI/SDK writers. Consent/boot must never hold that native lock.
 func (r *Runtime) Reserve(ctx context.Context, name string, visibleNames []string) (func(), error) {
 	if !config.ValidName(name) {
@@ -198,14 +200,19 @@ func (r *Runtime) Reserve(ctx context.Context, name string, visibleNames []strin
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entries, e := r.SDK.Inventory(ctx)
+	entries, e := r.Control.Inventory(ctx)
 	if e != nil {
 		return nil, e
 	}
-	if r.reserved[name] || slices.Contains(visibleNames, name) || slices.ContainsFunc(entries, func(entry silo.MachineInventoryEntry) bool { return entry.Name == name }) {
+	if r.reserved[name] || slices.Contains(visibleNames, name) || slices.ContainsFunc(entries, func(entry control.InventoryEntry) bool { return entry.Name == name }) {
 		return nil, ErrNameTaken
 	}
 	r.reserved[name] = true
 	var once sync.Once
 	return func() { once.Do(func() { r.mu.Lock(); delete(r.reserved, name); r.mu.Unlock() }) }, nil
+}
+
+func exactID(id string) bool {
+	_, err := uuid.Parse(id)
+	return err == nil && (len(id) == 32 || len(id) == 36)
 }

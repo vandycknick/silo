@@ -52,7 +52,7 @@ func (h *setHandler) Run(c *Context, args cmdline.Args) (Result, error) {
 			cpus := uint8(n)
 			h.q.CPUs = &cpus
 		case "memory", "disk":
-			size, e := service.ParseResource(k, v)
+			size, e := c.Service.ParseResource(c, k, v)
 			if e != nil {
 				return Result{}, e
 			}

@@ -30,12 +30,7 @@ func TestNativeCreateProvisionUserParser(t *testing.T) {
 		if code := DispatchSession(ctx, s, caller, "create --name "+test.name+" --no-start "+test.flags, service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 0 {
 			t.Fatal(test.name, code)
 		}
-		m, err := r.SDK.Machine(ctx, test.name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		d, err := m.Inspect(ctx)
-		_ = m.Close()
+		d, err := r.Control.Inspect(ctx, test.name)
 		if err != nil {
 			t.Fatal(err)
 		}

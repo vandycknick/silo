@@ -18,6 +18,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 )
 
 func TestRemoteTemplateStrictAllowlist(t *testing.T) {
@@ -25,8 +26,7 @@ func TestRemoteTemplateStrictAllowlist(t *testing.T) {
 	good := `version: '1'
 description: Daily driver
 image: ghcr.io/vandycknick/silo/devbox:latest
-resources: {cpus: 4, memory: 8GiB}
-disk_size: 20GiB
+resources: {cpus: 4}
 vsock: true
 userdata: |
   #!/bin/sh
@@ -34,22 +34,39 @@ userdata: |
 network: {kind: private, policy_ref: dev-egress, publish: [1, 22, 65535]}
 labels: {team: runtime}
 `
-	if _, e := s.ParseTemplate(good); e != nil {
+	if _, e := s.ParseTemplate(context.Background(), good); e != nil {
 		t.Fatal(e)
 	}
 	for _, field := range []string{"mounts", "disks", "kernel", "initramfs", "guest_agent", "forwards", "mount", "disk", "user", "unknown"} {
-		if _, e := s.ParseTemplate("version: '1'\n" + field + ": []\n"); e == nil {
+		if _, e := s.ParseTemplate(context.Background(), "version: '1'\n"+field+": []\n"); e == nil {
 			t.Fatalf("accepted %s", field)
 		}
 	}
 	for _, raw := range []string{
 		"version: '1'\nuserdata: ''",
 		"version: 1", "version: '2'", "version: null", "version: ['1']", "[]", "version: '1'\n---\n", "version: '1'\nversion: '1'",
-		"version: '1'\nresources: {cpus: null}", "version: '1'\nresources: {cpus: '4'}", "version: '1'\nresources: {cpus: 0}", "version: '1'\nresources: {cpus: 256}", "version: '1'\nresources: {memory: 1.5GiB}", "version: '1'\ndisk_size: 18446744073709551615GiB", "version: '1'\ndisk_size: 0GiB",
+		"version: '1'\nresources: {cpus: null}", "version: '1'\nresources: {cpus: '4'}", "version: '1'\nresources: {cpus: 0}", "version: '1'\nresources: {cpus: 256}",
 		"version: '1'\nnetwork: {kind: none}", "version: '1'\nnetwork: {kind: named, target: private}", "version: '1'\nnetwork: {kind: private, target: /etc/passwd}", "version: '1'\nnetwork: {kind: private, policy_ref: ../x}", "version: '1'\nnetwork: {kind: private, publish: [0]}", "version: '1'\nnetwork: {kind: private, publish: [65536]}", "version: '1'\nnetwork: {kind: private, publish: [22,22]}", "version: '1'\nnetwork: {kind: private, publish: {bind: any}}", "version: '1'\nnetwork: {kind: private, publish: ['127.0.0.1:8080:80']}",
 		"version: '1'\nvsock: false", "version: '1'\nuserdata: /etc/passwd", "version: '1'\nuserdata: {file: /etc/passwd}", "version: '1'\nlabels: {io.silo.taild.owner: forged}", "version: '1'\nlabels: {n: 7}", "version: '1'\nlabels: {n: one, n: two}", "version: &v '1'\ndescription: *v", "version: '1'\n<<: {image: bad}", strings.Repeat("x", DocumentLimit+1),
 	} {
-		if _, e := s.ParseTemplate(raw); e == nil {
+		if _, e := s.ParseTemplate(context.Background(), raw); e == nil {
+			t.Fatalf("accepted %q", raw)
+		}
+	}
+}
+
+func TestRemoteTemplateResourceValidationThroughRPC(t *testing.T) {
+	s := actualService(t)
+	ctx := context.Background()
+	if _, err := s.ParseTemplate(ctx, "version: '1'\nresources: {memory: 8GiB}\ndisk_size: 20GiB"); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{
+		"version: '1'\nresources: {memory: 1.5GiB}",
+		"version: '1'\ndisk_size: 18446744073709551615GiB",
+		"version: '1'\ndisk_size: 0GiB",
+	} {
+		if _, err := s.ParseTemplate(ctx, raw); err == nil {
 			t.Fatalf("accepted %q", raw)
 		}
 	}
@@ -112,7 +129,7 @@ func TestPrincipalDocumentsRealFilesTiersAndReload(t *testing.T) {
 	if e = os.WriteFile(operator, []byte("version: '1'\ndescription: refreshed"), 0644); e != nil {
 		t.Fatal(e)
 	}
-	if e = s.ReloadDocuments(); e != nil {
+	if e = s.ReloadDocuments(ctx); e != nil {
 		t.Fatal(e)
 	}
 	d, e = call(two, "show", "dev", "")
@@ -122,7 +139,7 @@ func TestPrincipalDocumentsRealFilesTiersAndReload(t *testing.T) {
 	if e = os.WriteFile(operator, []byte("version: '1'\nmounts: []"), 0644); e != nil {
 		t.Fatal(e)
 	}
-	if e = s.ReloadDocuments(); e == nil {
+	if e = s.ReloadDocuments(ctx); e == nil {
 		t.Fatal("invalid operator reload accepted")
 	}
 	if _, e = call(one, "ls", "", ""); Categorize(e).Exit != 9 {
@@ -219,23 +236,26 @@ func TestRemotePoliciesCanonicalInjectionPreservesConfigAndDenies(t *testing.T) 
 			t.Fatal(raw)
 		}
 	}
-	// Valid SDK policies with either forward kind or a tunnel reference are
-	// rejected for their authority, not merely because of malformed HCL syntax.
-	for _, forward := range []silo.NetworkForward{{Name: "host", Kind: silo.NetworkForwardHost, Target: ptr("name:other-vm"), TargetPort: ptr(uint16(80))}, {Name: "tail", Kind: silo.NetworkForwardTailscale, Tunnel: ptr("vm"), Target: ptr("name:peer"), TargetPort: ptr(uint16(80))}} {
-		var tunnels []silo.TailscaleTunnel
-		if forward.Kind == silo.NetworkForwardTailscale {
-			tunnels = []silo.TailscaleTunnel{{Name: "vm"}}
-		}
-		built, e := silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{Tunnels: tunnels, Forwards: []silo.NetworkForward{forward}})
+	// Normalize valid declarations through the real daemon first, then reject
+	// their remote authority rather than relying on malformed HCL syntax.
+	for _, declaration := range []string{
+		`forward "host" "host" {
+ target = "name:other-vm"
+ target_port = 80
+}`,
+		`tailscale "vm" {}
+forward "tailscale" "tail" {
+ tunnel = tailscale.vm
+ target = "name:peer"
+ target_port = 80
+}`,
+	} {
+		built, e := s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_Hcl{Hcl: declaration}})
 		if e != nil {
 			t.Fatal(e)
 		}
-		hcl, e := built.HCL()
-		if e != nil {
-			t.Fatal(e)
-		}
-		if _, e = parseRemotePolicy(hcl); e == nil {
-			t.Fatal("accepted authority", hcl)
+		if _, e = s.parseRemotePolicy(ctx, built.HCL); e == nil {
+			t.Fatal("accepted authority", built.HCL)
 		}
 	}
 	raw := `settings { default_action = "deny" }
@@ -244,6 +264,12 @@ endpoint "ip" "all" {
  destination_cidrs = ["0.0.0.0/0", "::/0"]
 }
 
+endpoint "https" "plugin" {
+ hosts = ["api.example.test"]
+}
+credential "openai_codex_oauth" "plugin-auth" {
+ endpoint = https.plugin
+}
 rule "deny" {
  endpoints = [ip.all]
  priority = -2147483648
@@ -256,34 +282,43 @@ rule "allow" {
  reason = "keep me"
  disabled = true
 }
+rule "plugin-rule" {
+ endpoints = [https.plugin]
+ credential = openai_codex_oauth.plugin-auth
+ condition = "http.method == 'POST'"
+ verdict = "allow"
+}
 `
-	p, e := parseRemotePolicy(raw)
+	p, e := s.parseRemotePolicy(ctx, raw)
 	if e != nil {
 		t.Fatal(e)
 	}
-	injected, e := InjectTailnet(p, "exact-name", "user:1", "")
+	injected, e := s.InjectTailnet(ctx, p, "exact-name", "user:1", "")
 	if e != nil {
 		t.Fatal(e)
 	}
-	hcl, e := injected.HCL()
-	if e != nil {
-		t.Fatal(e)
-	}
-	round, e := silo.ParseNetworkPolicyHCL(hcl)
-	if e != nil {
-		t.Fatal(e)
-	}
-	again, e := round.HCL()
-	if e != nil || hcl != again {
-		t.Fatal(e, hcl, again)
+	hcl := injected.HCL
+	round, e := s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_Hcl{Hcl: hcl}})
+	if e != nil || hcl != round.HCL {
+		t.Fatal(e, hcl, round)
 	}
 	var before, after map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(p.JSON()), &before)
-	_ = json.Unmarshal([]byte(injected.JSON()), &after)
+	_ = json.Unmarshal([]byte(p.CanonicalJSON), &before)
+	_ = json.Unmarshal([]byte(injected.CanonicalJSON), &after)
 	for _, key := range []string{"metadata", "settings", "credentials", "forwards"} {
 		if !reflect.DeepEqual(before[key], after[key]) {
 			t.Fatalf("lost %s", key)
 		}
+	}
+	var beforeEndpoints, afterEndpoints []json.RawMessage
+	if err := json.Unmarshal(before["endpoints"], &beforeEndpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(after["endpoints"], &afterEndpoints); err != nil {
+		t.Fatal(err)
+	}
+	if len(afterEndpoints) != len(beforeEndpoints)+2 || !reflect.DeepEqual(beforeEndpoints, afterEndpoints[:len(beforeEndpoints)]) {
+		t.Fatal("lost canonical endpoint plugin fields")
 	}
 	// Canonical metadata is not an HCL declaration, but JSON injection must
 	// retain even nested values the convenient Go config does not model.
@@ -292,18 +327,18 @@ rule "allow" {
 	if e != nil {
 		t.Fatal(e)
 	}
-	withMetadata, e := silo.ParseNetworkPolicyJSON(string(canonical))
+	withMetadata, e := s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_CanonicalJson{CanonicalJson: string(canonical)}})
 	if e != nil {
 		t.Fatal(e)
 	}
 	var original map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(withMetadata.JSON()), &original)
-	withMetadata, e = InjectTailnet(withMetadata, "exact-name", "user:1", "")
+	_ = json.Unmarshal([]byte(withMetadata.CanonicalJSON), &original)
+	withMetadata, e = s.InjectTailnet(ctx, withMetadata, "exact-name", "user:1", "")
 	if e != nil {
 		t.Fatal(e)
 	}
 	var kept map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(withMetadata.JSON()), &kept)
+	_ = json.Unmarshal([]byte(withMetadata.CanonicalJSON), &kept)
 	if !reflect.DeepEqual(kept["metadata"], original["metadata"]) {
 		t.Fatal("lost metadata")
 	}
@@ -311,7 +346,7 @@ rule "allow" {
 	_ = json.Unmarshal(after["rules"], &rules)
 	var old []map[string]json.RawMessage
 	_ = json.Unmarshal(before["rules"], &old)
-	if len(rules) != 4 || !reflect.DeepEqual(rules[0], old[0]) {
+	if len(rules) != 5 || !reflect.DeepEqual(rules[0], old[0]) || !reflect.DeepEqual(rules[2], old[2]) {
 		t.Fatal(rules)
 	}
 	old[1]["tunnel"] = json.RawMessage(`"vm"`)
@@ -321,7 +356,7 @@ rule "allow" {
 	if !strings.Contains(hcl, "100.64.0.0/10") || !strings.Contains(hcl, "fd7a:115c:a1e0::/48") || !strings.Contains(hcl, `hostname = "exact-name"`) {
 		t.Fatal(hcl)
 	}
-	if _, e = parseRemotePolicy(hcl); e == nil {
+	if _, e = s.parseRemotePolicy(ctx, hcl); e == nil {
 		t.Fatal("accepted injected authority as remote policy")
 	}
 	// Omitting --tailscale cannot bypass remote authority checks on operator files.
@@ -351,19 +386,20 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 		ctx := context.Background()
 		op, e := s.Create(ctx, caller, CreateRequest{Name: "exact", Owner: selected, NoStart: true, Tailscale: true})
 		daemon.Succeeded(t, s.Jobs, caller.Peer, op, e)
-		m, e := s.Runtime.SDK.Machine(ctx, "exact")
+		data, e := s.Runtime.Control.Inspect(ctx, "exact")
 		if e != nil {
-			t.Fatal(e)
-		}
-		data, e := m.Inspect(ctx)
-		if e != nil {
-			_ = m.Close()
 			t.Fatal(e)
 		}
 		var authority struct {
-			Metadata map[string]string `json:"metadata"`
+			Metadata map[string]json.RawMessage `json:"metadata"`
 		}
-		if err := json.Unmarshal([]byte(data.Network.Policy.JSON()), &authority); err != nil {
+		if err := json.Unmarshal([]byte(data.PolicyJSON), &authority); err != nil {
+			t.Fatal(err)
+		}
+		// Canonical metadata can contain objects; node authority itself is a
+		// JSON string consumed by netd, not an object-valued metadata entry.
+		var nodeAuthority string
+		if err := json.Unmarshal(authority.Metadata["io.silo.taild.node"], &nodeAuthority); err != nil {
 			t.Fatal(err)
 		}
 		var expected struct {
@@ -371,30 +407,28 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 			Tailnet string `json:"tailnet"`
 			Suffix  string `json:"suffix"`
 		}
-		if err := json.Unmarshal([]byte(authority.Metadata["io.silo.taild.node"]), &expected); err != nil || expected.Owner != string(owner) || expected.Tailnet != "fixture" || expected.Suffix != "fixture.test" {
+		if err := json.Unmarshal([]byte(nodeAuthority), &expected); err != nil || expected.Owner != string(owner) || expected.Tailnet != "fixture" || expected.Suffix != "fixture.test" {
 			t.Fatal("lost managed identity", expected, err)
 		}
-		injected, err := silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{Metadata: authority.Metadata})
+		reserved, err := json.Marshal(map[string]any{"version": 1, "metadata": authority.Metadata})
+		if err != nil {
+			t.Fatal(err)
+		}
+		injected, err := s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_CanonicalJson{CanonicalJson: string(reserved)}})
 		if err != nil || remotePolicy(injected) == nil {
 			t.Fatal("reserved identity accepted without a tunnel", err)
 		}
-		hcl, e := data.Network.Policy.HCL()
-		removeErr := m.Remove(ctx)
-		_ = m.Close()
-		if removeErr != nil {
+		round, e := s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_CanonicalJson{CanonicalJson: data.PolicyJSON}})
+		if removeErr := s.Runtime.Control.Remove(ctx, data.ID); removeErr != nil {
 			t.Fatal(removeErr)
 		}
-		if e != nil {
-			t.Fatal(e)
-		}
-		round, e := silo.ParseNetworkPolicyHCL(hcl)
 		if e != nil {
 			t.Fatal(e)
 		}
 		var root struct {
 			Tailscale []silo.TailscaleTunnel `json:"tailscale"`
 		}
-		if e = json.Unmarshal([]byte(round.JSON()), &root); e != nil {
+		if e = json.Unmarshal([]byte(round.CanonicalJSON), &root); e != nil {
 			t.Fatal(e)
 		}
 		if len(root.Tailscale) != 1 {
@@ -408,13 +442,13 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 		if node.Hostname == nil || *node.Hostname != "exact" || node.ControlURL == nil || *node.ControlURL != s.Enrollment.Pin.ControlURL || !slices.Equal(node.Tags, want) {
 			t.Fatal("lost verified node handoff settings")
 		}
-		if _, e = parseRemotePolicy(hcl); e == nil {
+		if _, e = s.parseRemotePolicy(ctx, round.HCL); e == nil {
 			t.Fatal("caller could override injected node authority")
 		}
 	}
 }
 
-func TestShippedOperatorExamplesThroughPublicSDK(t *testing.T) {
+func TestShippedOperatorExamplesThroughRPC(t *testing.T) {
 	s := actualService(t)
 	_, source, _, ok := goruntime.Caller(0)
 	if !ok {
@@ -425,7 +459,7 @@ func TestShippedOperatorExamplesThroughPublicSDK(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	parsed, e := s.ParseTemplate(string(template))
+	parsed, e := s.ParseTemplate(context.Background(), string(template))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -433,25 +467,26 @@ func TestShippedOperatorExamplesThroughPublicSDK(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	p, e := parseRemotePolicy(string(policy))
+	p, e := s.parseRemotePolicy(context.Background(), string(policy))
 	if e != nil {
 		t.Fatal(e)
 	}
 	if parsed.Network == nil || parsed.Network.PolicyRef == nil || *parsed.Network.PolicyRef != "dev-egress" {
 		t.Fatal(parsed)
 	}
-	check, e := s.Runtime.SDK.CheckPolicySecrets(context.Background(), p, "", nil)
-	if e != nil || check.Status != silo.PolicySecretsMissing || check.Slots[0].Name != "github-api.token" {
+	check, e := s.Runtime.Control.CheckPolicySecrets(context.Background(), p, "")
+	if e != nil || check.State != w.PolicySecretsState_POLICY_SECRETS_STATE_MISSING || check.Slots[0].Name != "github-api.token" {
 		t.Fatal(check, e)
 	}
 }
 
 func TestTemplateCreationOverridesAndStampedAuthority(t *testing.T) {
+	// Install fixture TLS trust before the real daemon inherits its environment.
+	fixture := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	ctx := context.Background()
 	c := domainCaller(s, "user:1")
-	// A real tiny OCI image, materialized into a stopped VM by the native SDK.
-	fixture := testfixture.OCIRegistry(t, "")
+	// A real tiny OCI image, materialized into a stopped VM through silod.
 	registry := fixture.Reference
 	s.Config.VM.AllowedRegistries = []string{strings.Split(registry, "/")[0] + "/fixture"}
 	raw := "version: '1'\nimage: " + registry + "\nresources: {cpus: 2, memory: 512MiB}\ndisk_size: 1GiB\nnetwork: {kind: private, publish: [8080]}\nlabels: {team: template, x: original}"
@@ -460,21 +495,95 @@ func TestTemplateCreationOverridesAndStampedAuthority(t *testing.T) {
 	}
 	op, e := s.Create(ctx, c, CreateRequest{Name: "overridden", Template: "dev", CPUs: 1, Labels: map[string]string{"x": "override"}, NoStart: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, e)
-	m, e := s.Runtime.SDK.Machine(ctx, "overridden")
+	d, e := s.Runtime.Control.Inspect(ctx, "overridden")
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer m.Close()
-	defer m.Remove(ctx)
-	d, e := m.Inspect(ctx)
-	if e != nil {
-		t.Fatal(e)
-	}
+	defer func() {
+		if err := s.Runtime.Control.Remove(ctx, d.ID); err != nil {
+			t.Error(err)
+		}
+	}()
 	if *d.CPUs != 1 || d.Memory.Bytes() != 512<<20 || d.Labels[TemplateLabel] != "dev" || d.Labels[GuestPortsLabel] != "[8080]" || d.Labels["team"] != "template" || d.Labels["x"] != "override" || d.Network.Publish != nil || d.Network.Tailscale != nil {
 		t.Fatalf("%+v", d)
 	}
 	v, e := s.Show(ctx, c.Peer, "overridden")
 	if e != nil || v.Template != "dev" || len(v.GuestTCPPorts) != 1 {
 		t.Fatal(v, e)
+	}
+}
+
+func TestPolicySecretAlternativesThroughRPC(t *testing.T) {
+	s := actualService(t)
+	ctx := context.Background()
+	p, err := s.parseRemotePolicy(ctx, `endpoint "https" "aws" {
+ hosts = ["sts.amazonaws.com"]
+}
+credential "aws_credential" "prod" {
+ endpoint = https.aws
+}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check, err := s.Runtime.Control.CheckPolicySecrets(ctx, p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.State != w.PolicySecretsState_POLICY_SECRETS_STATE_MISSING || len(check.Requirements) != 1 {
+		t.Fatalf("lost requirements: %+v", check)
+	}
+	alternatives := check.Requirements[0].Alternatives
+	profile, static := false, false
+	for _, alternative := range alternatives {
+		profile = profile || slices.Equal(alternative.Slots, []string{"prod.profile"})
+		static = static || slices.Equal(alternative.Slots, []string{"prod.access_key_id", "prod.secret_access_key"})
+	}
+	if !profile || !static || len(p.Secrets.Requirements) != 1 {
+		t.Fatalf("lost alternatives: %+v %+v", check, p.Secrets)
+	}
+	diagnostic := Categorize(s.checkSecrets(ctx, p))
+	if diagnostic.Exit != 2 || !strings.Contains(diagnostic.Error(), "prod.profile") || !strings.Contains(diagnostic.Error(), "prod.access_key_id + prod.secret_access_key") || !strings.Contains(diagnostic.Error(), " or ") {
+		t.Fatalf("lost alternative diagnostics: %v", diagnostic)
+	}
+	// Policy documents expose metadata, never resolved credential values.
+	caller := domainCaller(s, "user:1")
+	docs, err := s.Documents(ctx, caller, "policy", "validate", "", "", p.HCL)
+	if err != nil || len(docs) != 1 || docs[0].Secrets == nil || len(docs[0].Secrets.Requirements) != 1 {
+		t.Fatal(docs, err)
+	}
+}
+
+func TestPolicyDocumentOwnershipAndOperatorPrecedenceThroughRPC(t *testing.T) {
+	s := actualService(t)
+	ctx := context.Background()
+	s.Config.PoliciesDir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(s.Config.PoliciesDir, "egress.hcl"), []byte(`settings { default_action = "deny" }`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	one, two := domainCaller(s, "user:1"), domainCaller(s, "user:2")
+	if _, err := s.Documents(ctx, one, "policy", "create", "egress", "", `settings { default_action = "allow" }`); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		caller Caller
+		tier   string
+		action string
+	}{{one, "yours", "allow"}, {two, "operator", "deny"}} {
+		docs, err := s.Documents(ctx, test.caller, "policy", "show", "egress", "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(docs) != 1 || docs[0].Tier != test.tier || !strings.Contains(docs[0].Content, `default_action = "`+test.action+`"`) {
+			t.Fatal(docs)
+		}
+	}
+	for _, verb := range []string{"edit", "rm"} {
+		if _, err := s.Documents(ctx, two, "policy", verb, "egress", "", `settings { default_action = "allow" }`); Categorize(err).Exit != 4 {
+			t.Fatal(err)
+		}
+	}
+	if err := s.ReloadDocuments(ctx); err != nil {
+		t.Fatal(err)
 	}
 }

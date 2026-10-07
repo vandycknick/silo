@@ -1,6 +1,21 @@
 use crate::{invalid, required, ConversionError};
 use prost::Message;
 use silod_spec::daemon::v1 as w;
+
+const ERROR_DETAIL_TYPE: &str = "type.googleapis.com/silo.daemon.v1.ErrorDetail";
+
+// google.rpc.Status is the standard grpc-status-details-bin envelope. Its
+// schema is stable; prost-types already supplies the nested google.protobuf.Any.
+#[derive(Clone, PartialEq, Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
 pub fn launch_reason_to_wire(v: libvm::ExecutionLaunchFailureReason) -> i32 {
     match v {
         libvm::ExecutionLaunchFailureReason::Unspecified => 0,
@@ -139,11 +154,35 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         }
         _ => tonic::Code::Internal,
     };
-    tonic::Status::with_details(code, d.safe_message.clone(), d.encode_to_vec().into())
+    let rich = RpcStatus {
+        code: code as i32,
+        message: d.safe_message.clone(),
+        details: vec![prost_types::Any {
+            type_url: ERROR_DETAIL_TYPE.into(),
+            value: d.encode_to_vec(),
+        }],
+    };
+    let encoded = rich.encode_to_vec();
+    tonic::Status::with_details(code, rich.message, encoded.into())
 }
 pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, ConversionError> {
-    let d = w::ErrorDetail::decode(v.details())
-        .map_err(|_| invalid("error.detail", "missing or malformed typed detail"))?;
+    let rich = RpcStatus::decode(v.details())
+        .map_err(|_| invalid("error.status", "missing or malformed rich status"))?;
+    if rich.code != v.code() as i32 {
+        return Err(invalid("error.status", "rich status code mismatch"));
+    }
+    let mut details = rich
+        .details
+        .into_iter()
+        .filter(|detail| detail.type_url == ERROR_DETAIL_TYPE);
+    let detail = details
+        .next()
+        .ok_or_else(|| invalid("error.detail", "missing typed detail"))?;
+    if details.next().is_some() {
+        return Err(invalid("error.detail", "ambiguous typed details"));
+    }
+    let d = w::ErrorDetail::decode(detail.value.as_slice())
+        .map_err(|_| invalid("error.detail", "malformed typed detail"))?;
     if !(1..=8).contains(&d.kind) {
         return Err(invalid("error.kind", "invalid enum"));
     }

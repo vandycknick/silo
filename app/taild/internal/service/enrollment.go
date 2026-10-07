@@ -7,12 +7,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func (s *Service) pin() *state.NodePin {
@@ -32,83 +35,82 @@ func (s *Service) nodeDNS(d *silo.MachineData) string {
 
 // matchesNode reports whether a recorded observation describes this VM's node
 // on the pinned tailnet, so historical identity is never shown for another.
-func (s *Service) matchesNode(o *state.NodeObservation, v VM, dns string) bool {
-	return s.pin() != nil && o.Owner == string(v.Owner) && o.Tailnet == s.pin().Tailnet && o.DNSName == dns && sameTags(v.Tags, o.Tags)
+func (s *Service) matchesNode(o *w.NodeObservation, v VM, dns string) bool {
+	return s.pin() != nil && o.MachineId == v.ID && o.Owner == string(v.Owner) && o.Tailnet == s.pin().Tailnet && o.DnsName == dns && sameTags(v.Tags, o.Tags)
 }
 
-// Prepare only launch metadata and legacy transaction recovery. Netd owns all
-// authentication, including expired or rejected identities in ordinary state.
-func (s *Service) prepareNode(ctx context.Context, c Caller, action identity.Action, m *silo.Machine, d *silo.MachineData) error {
+// Prepare launch policy and credentials; netd owns retained node state.
+func (s *Service) prepareNode(ctx context.Context, c Caller, action identity.Action, d *control.Snapshot) error {
 	if d.Network.Tailscale == nil {
 		return nil
 	}
 	if s.Enrollment == nil {
 		return failure("unavailable", "enrollment unavailable", 9)
 	}
-	lease, err := m.LeaseNodeState(ctx)
-	if err != nil {
-		return Categorize(err)
-	}
-	dir := d.Network.Tailscale.StateDir
-	unreadable := state.NeedsRecovery(dir) && state.RecoverNode(dir, d.Name, runtime.NodeOwner(d), s.pin()) == state.Unreadable
-	// Updating the policy takes the native node-state lock itself.
-	_ = lease.Close()
-	if unreadable {
-		return failure("conflict", "retained node state requires recovery", 5)
-	}
-	if err = s.reauthorize(ctx, c, action, d); err != nil {
-		return err
-	}
-	v := project(d)
-	if err = s.storeNodeCredentials(ctx, m, v.Owner, nil); err != nil {
+	v := project(d.MachineData)
+	if err := s.storeNodeCredentials(ctx, c, action, d, v.Owner, nil); err != nil {
 		return err
 	}
 	if len(v.Tags) == 0 && v.Owner.IsTag() {
 		v.Tags = []string{string(v.Owner)}
 	}
-	policy, err := s.bindNodeIdentity(d.Network.Policy, v.Owner, v.Tags, enroll.Mode(d.Labels[runtime.ModeLabel]))
+	if err := s.reauthorize(ctx, c, action, d); err != nil {
+		return err
+	}
+	policy, err := s.bindNodeIdentity(ctx, &control.Policy{CanonicalJSON: d.PolicyJSON}, v.Owner, v.Tags, enroll.Mode(d.Labels[runtime.ModeLabel]))
 	if err != nil {
 		return err
 	}
-	if d.Network.Policy == nil || policy.JSON() != d.Network.Policy.JSON() {
-		network := d.Network
-		network.Policy = policy
-		if _, err = m.Update(ctx, silo.MachineUpdate{Network: &network}); err != nil {
+	if policy.CanonicalJSON != d.PolicyJSON {
+		if err = s.reauthorize(ctx, c, action, d); err != nil {
+			return err
+		}
+		_, err = s.Runtime.Control.Update(ctx, d.ID, &w.MachineUpdate{Policy: &w.PolicyUpdate{Update: &w.PolicyUpdate_Set{Set: policy.CanonicalJSON}}})
+		if err != nil {
 			return Categorize(err)
 		}
 	}
 	return nil
 }
 
-func (s *Service) storeNodeCredentials(ctx context.Context, m *silo.Machine, owner identity.Principal, key []byte) error {
-	if len(key) > 0 {
-		if err := m.SetSecret(ctx, "tailscale.vm.auth_key", key); err != nil {
+func (s *Service) storeNodeCredentials(ctx context.Context, c Caller, action identity.Action, d *control.Snapshot, owner identity.Principal, key []byte) error {
+	set := func(name string, value []byte) error {
+		if err := s.reauthorize(ctx, c, action, d); err != nil {
+			return err
+		}
+		if err := s.Runtime.Control.SetSecret(ctx, d.ID, name, value); err != nil {
 			return Categorize(err)
+		}
+		return nil
+	}
+	if len(key) > 0 {
+		if err := set("tailscale.vm.auth_key", key); err != nil {
+			return err
 		}
 	}
 	if owner.IsTag() && s.Enrollment.Secrets.ClientSecret != "" {
 		value := []byte(s.Enrollment.Secrets.ClientSecret)
 		defer clear(value)
-		if err := m.SetSecret(ctx, "tailscale.vm.client_secret", value); err != nil {
-			return Categorize(err)
+		if err := set("tailscale.vm.client_secret", value); err != nil {
+			return err
 		}
 	}
 	if s.Config.Enrollment.DisableKeyExpiry && s.Enrollment.Secrets.APIToken != "" {
 		value := []byte(s.Enrollment.Secrets.APIToken)
 		defer clear(value)
-		if err := m.SetSecret(ctx, "tailscale.vm.api_token", value); err != nil {
-			return Categorize(err)
+		if err := set("tailscale.vm.api_token", value); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (s *Service) bindNodeIdentity(policy *silo.NetworkPolicy, owner identity.Principal, tags []string, mode enroll.Mode) (*silo.NetworkPolicy, error) {
+func (s *Service) bindNodeIdentity(ctx context.Context, policy *control.Policy, owner identity.Principal, tags []string, mode enroll.Mode) (*control.Policy, error) {
 	if policy == nil || s.pin() == nil || s.pin().Tailnet == "" || s.pin().Suffix == "" {
 		return nil, failure("unavailable", "verified tailnet identity unavailable", 9)
 	}
 	var root map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(policy.JSON()), &root); err != nil {
+	if err := json.Unmarshal([]byte(policy.CanonicalJSON), &root); err != nil {
 		return nil, Categorize(err)
 	}
 	metadata := map[string]json.RawMessage{}
@@ -152,11 +154,11 @@ func (s *Service) bindNodeIdentity(policy *silo.NetworkPolicy, owner identity.Pr
 	if err != nil {
 		return nil, Categorize(err)
 	}
-	return silo.ParseNetworkPolicyJSON(string(raw))
+	return s.Runtime.Control.NormalizePolicy(ctx, &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_CanonicalJson{CanonicalJson: string(raw)}})
 }
 
-func (s *Service) nodeView(d *silo.MachineData) VM {
-	v := project(d)
+func (s *Service) nodeView(d *control.Snapshot) VM {
+	v := project(d.MachineData)
 	v.NodeState = state.NoNode
 	v.Address = "unknown"
 	v.KeyExpiry = "unknown"
@@ -167,11 +169,11 @@ func (s *Service) nodeView(d *silo.MachineData) VM {
 		return s.liveNodeView(d, v)
 	}
 	v.NodeState = state.NodeState(string(d.Status.Kind))
-	v.Node = s.nodeDNS(d)
+	v.Node = s.nodeDNS(d.MachineData)
 	if d.Status.Kind == silo.MachineStatusStopped {
-		if o, err := state.ReadNodeObservation(d.Network.Tailscale.StateDir, d.ID, time.Now()); err == nil && s.matchesNode(o, v, v.Node) {
-			v.NodeID = o.NodeID
-			setExpiry(&v, o.KeyExpiry, o.ObservedAt, true)
+		if o := d.NetworkObservation.GetHistorical(); o != nil && s.matchesNode(o, v, v.Node) {
+			v.NodeID = o.NodeId
+			setExpiry(&v, timestamp(o.KeyExpiry), o.ObservedAt.AsTime(), true)
 		}
 	}
 	return v
@@ -193,7 +195,7 @@ func setExpiry(v *VM, expiry *time.Time, observed time.Time, historical bool) {
 	v.KeyExpiryLastKnown = historical
 }
 
-func (s *Service) liveNodeView(d *silo.MachineData, v VM) VM {
+func (s *Service) liveNodeView(d *control.Snapshot, v VM) VM {
 	v.NodeState = state.NodeState("status unavailable")
 	if v.KeyExpiry == "" {
 		v.KeyExpiry = "unknown"
@@ -201,14 +203,14 @@ func (s *Service) liveNodeView(d *silo.MachineData, v VM) VM {
 	if d.RunID == nil {
 		return v
 	}
-	status, err := state.ReadNetdStatus(d.Network.Tailscale.StateDir, d.ID, *d.RunID, time.Now())
-	if err != nil {
+	status := d.NetworkObservation.GetLive()
+	if status == nil || status.MachineId != d.ID || status.RunId != *d.RunID {
 		return v
 	}
-	dns := s.nodeDNS(d)
+	dns := s.nodeDNS(d.MachineData)
 	switch status.State {
-	case "ready":
-		if dns == "" || status.NodeID == "" || status.DNSName != dns {
+	case w.NodeState_NODE_STATE_READY:
+		if dns == "" || status.GetNodeId() == "" || status.GetDnsName() != dns {
 			v.NodeState = state.Unreadable
 			return v
 		}
@@ -216,46 +218,46 @@ func (s *Service) liveNodeView(d *silo.MachineData, v VM) VM {
 			v.NodeState = state.Unreadable
 			return v
 		}
-		v.NodeState, v.NodeID, v.Node = state.Enrolled, status.NodeID, status.DNSName
+		v.NodeState, v.NodeID, v.Node = state.Enrolled, status.GetNodeId(), status.GetDnsName()
 		for _, address := range status.Addresses {
-			v.Addresses = append(v.Addresses, address.String())
+			v.Addresses = append(v.Addresses, address)
 		}
 		if len(v.Addresses) > 0 {
 			v.Address = strings.Join(v.Addresses, ",")
 		}
 		if status.KeyExpiryKnown {
-			setExpiry(&v, status.KeyExpiry, status.ObservedAt, false)
+			setExpiry(&v, timestamp(status.KeyExpiry), status.UpdatedAt.AsTime(), false)
 		}
 		if status.KeyExpiry != nil {
-			if !status.KeyExpiry.IsZero() && !status.KeyExpiry.After(time.Now()) {
+			if !status.KeyExpiry.AsTime().After(time.Now()) {
 				v.NodeState, v.Node = state.Expired, ""
 			}
 		}
-		if status.ErrorCode == "key_expiry_update_failed" {
+		if status.GetErrorCode() == "key_expiry_update_failed" {
 			v.NodeDiagnostics = append(v.NodeDiagnostics, "key-expiry policy update pending; netd will retry")
 		}
-	case "approval_required":
-		v.NodeState, v.ApprovalURL = state.Pending, status.ApprovalURL
-		if status.ErrorCode == "key_expired" && status.KeyExpiryKnown && status.KeyExpiry != nil && !status.KeyExpiry.IsZero() && dns != "" && status.NodeID != "" && status.DNSName == dns && sameTags(v.Tags, status.Tags) {
-			setExpiry(&v, status.KeyExpiry, status.ObservedAt, false)
+	case w.NodeState_NODE_STATE_APPROVAL_REQUIRED:
+		v.NodeState, v.ApprovalURL = state.Pending, status.GetApprovalUrl()
+		if status.GetErrorCode() == "key_expired" && status.KeyExpiryKnown && status.KeyExpiry != nil && dns != "" && status.GetNodeId() != "" && status.GetDnsName() == dns && sameTags(v.Tags, status.Tags) {
+			setExpiry(&v, timestamp(status.KeyExpiry), status.UpdatedAt.AsTime(), false)
 		}
-		if status.ErrorCode == "device_approval_required" {
+		if status.GetErrorCode() == "device_approval_required" {
 			v.NodeDiagnostics = append(v.NodeDiagnostics, "device approval required in the Tailscale admin console")
 		}
-	case "failed":
+	case w.NodeState_NODE_STATE_FAILED:
 		v.NodeState = state.NodeState("enrollment failed")
 		v.NodeDiagnostics = append(v.NodeDiagnostics, "node enrollment failed; inspect network logs")
 	default:
-		v.NodeState = state.NodeState(status.State)
+		v.NodeState = state.NodeState(strings.ToLower(strings.TrimPrefix(status.State.String(), "NODE_STATE_")))
 	}
-	if o := status.LastKnown; v.KeyExpiry == "unknown" && o != nil && status.ErrorCode != "identity_mismatch" && s.matchesNode(o, v, dns) && !o.ObservedAt.IsZero() && !o.ObservedAt.After(status.ObservedAt) {
-		setExpiry(&v, o.KeyExpiry, o.ObservedAt, true)
+	if o := d.NetworkObservation.GetHistorical(); v.KeyExpiry == "unknown" && o != nil && status.GetErrorCode() != "identity_mismatch" && s.matchesNode(o, v, dns) && o.ObservedAt != nil && !o.ObservedAt.AsTime().After(status.UpdatedAt.AsTime()) {
+		setExpiry(&v, timestamp(o.KeyExpiry), o.ObservedAt.AsTime(), true)
 	}
 	return v
 }
 
-func (s *Service) completeNode(ctx context.Context, m *silo.Machine, out *jobs.Completion, progress func(string)) {
-	d, err := m.Inspect(ctx)
+func (s *Service) completeNode(ctx context.Context, id string, out *jobs.Completion, progress func(string)) {
+	d, err := s.Runtime.Control.Inspect(ctx, id)
 	if err != nil || d.Network.Tailscale == nil {
 		return
 	}
@@ -265,7 +267,11 @@ func (s *Service) completeNode(ctx context.Context, m *silo.Machine, out *jobs.C
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		v := s.liveNodeView(d, project(d))
+		d, err = s.Runtime.Control.Inspect(grace, id)
+		if err != nil {
+			return
+		}
+		v := s.liveNodeView(d, project(d.MachineData))
 		out.NodeState, out.Node, out.ApprovalURL = string(v.NodeState), v.Node, v.ApprovalURL
 		if v.ApprovalURL != "" || v.NodeState == state.Enrolled || v.NodeState == state.NodeState("enrollment failed") || v.NodeState == state.Unreadable {
 			return
@@ -276,4 +282,12 @@ func (s *Service) completeNode(ctx context.Context, m *silo.Machine, out *jobs.C
 		case <-ticker.C:
 		}
 	}
+}
+
+func timestamp(value *timestamppb.Timestamp) *time.Time {
+	if value == nil {
+		return nil
+	}
+	t := value.AsTime()
+	return &t
 }

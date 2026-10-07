@@ -497,3 +497,17 @@ fn references_use_native_id_name_and_prefix_semantics() {
     })
     .is_err());
 }
+
+#[test]
+fn conflicting_rich_status_code_does_not_reconstruct_a_native_error() {
+    let native = libvm::LibVmError::MachineNotFound {
+        reference: "missing".into(),
+    };
+    let status = native_error_to_status(&native);
+    let contradictory = tonic::Status::with_details(
+        tonic::Code::AlreadyExists,
+        status.message(),
+        status.details().to_vec().into(),
+    );
+    assert!(status_to_native_error(&contradictory).is_err());
+}

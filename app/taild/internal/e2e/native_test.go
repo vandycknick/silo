@@ -21,10 +21,8 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
-	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/sshd"
-	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
@@ -48,15 +46,8 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, rootfs)
 	c := daemon.Config(t, registry)
 	c.VM.Defaults.Memory = 1 << 30
-	audit, e := state.OpenAudit(c.Home, 1<<20, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
-	r, e := runtime.Open(context.Background(), c, "native-e2e")
-	if e != nil {
-		t.Fatal(e)
-	}
+	n := daemon.Open(t, c, "native-e2e", 16)
+	r, audit := n.Runtime, n.Audit
 	jobctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(jobctx, 16), Config: c}
@@ -67,15 +58,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 		defer done()
 		cancel()
 		_ = s.Jobs.Wait(ctx)
-		entries, _ := s.Runtime.SDK.Inventory(ctx)
-		for _, entry := range entries {
-			m, e := s.Runtime.SDK.Machine(ctx, entry.ID)
-			if e == nil {
-				_, _ = m.StopWith(ctx, silo.StopOptions{Force: true, Timeout: time.Second})
-				_ = m.Remove(ctx)
-				_ = m.Close()
-			}
-		}
+		n.RemoveAll(ctx)
 		_ = s.Runtime.Close()
 	}()
 	one, two := principal(c, "user:11"), principal(c, "user:22")
@@ -186,12 +169,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	}
 	// Genuine drain, native handle close, constructor reopen. A VM's run ID must
 	// survive unchanged, not just return to the same high-level Running state.
-	m, e := r.SDK.Machine(ctx, "native-one")
-	if e != nil {
-		t.Fatal(e)
-	}
-	before, e := m.Inspect(ctx)
-	_ = m.Close()
+	before, e := r.Control.Inspect(ctx, "native-one")
 	if e != nil || before.RunID == nil {
 		t.Fatal(e)
 	}
@@ -204,19 +182,11 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	if e = r.Close(); e != nil {
 		t.Fatal(e)
 	}
-	r, e = runtime.Open(ctx, c, "native-e2e")
-	if e != nil {
-		t.Fatal(e)
-	}
+	r = n.Reopen(t, c, "native-e2e")
 	jobctx, cancel = context.WithCancel(ctx)
 	defer cancel()
 	s = &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(jobctx, 16), Config: c}
-	m, e = r.SDK.Machine(ctx, "native-one")
-	if e != nil {
-		t.Fatal(e)
-	}
-	after, e := m.Inspect(ctx)
-	_ = m.Close()
+	after, e := r.Control.Inspect(ctx, "native-one")
 	if e != nil || after.RunID == nil || *before.RunID != *after.RunID || after.Status.Kind != silo.MachineStatusRunning {
 		t.Fatalf("reopen changed VM %+v %v", after, e)
 	}
@@ -238,6 +208,8 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	probeLostExecution(t, s, one, "native-one")
 	op, e = s.Stop(ctx, one, "native-one", service.StopRequest{Force: true, Timeout: time.Second})
 	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
+	op, e = s.Stop(ctx, one, "native-one", service.StopRequest{})
+	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	name := "native-renamed"
 	memory := silo.Mebibytes(768)
 	disk := silo.Gibibytes(2)
@@ -247,7 +219,8 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	if e != nil || show.Memory != memory.Bytes() || show.Disk != disk.Bytes() {
 		t.Fatal(show, e)
 	}
-	op, e = s.Start(ctx, one, name)
+	// Restart must start an already stopped machine as well as replace a live run.
+	op, e = s.Restart(ctx, one, name)
 	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	op, e = s.Restart(ctx, one, name)
 	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
@@ -548,11 +521,15 @@ func probeSDKLazyStdin(t *testing.T, s *service.Service, ref string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	m, e := s.Runtime.SDK.Machine(ctx, ref)
+	d, e := s.Runtime.Control.Inspect(ctx, ref)
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer m.Close()
+	m, e := s.Runtime.Machine(ctx, d.ID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Runtime.CloseMachine(m)
 	exec, e := m.Spawn(ctx, "/bin/bash", []string{"-c", `read -r value; printf '%s' "$value"`}, silo.WithExecStdinPipe())
 	if e != nil {
 		t.Fatal(e)

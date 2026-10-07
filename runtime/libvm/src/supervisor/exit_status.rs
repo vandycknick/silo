@@ -1,13 +1,13 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
-use nix::fcntl::{open, OFlag};
-use nix::sys::stat::{fstat, Mode, SFlag};
-use nix::unistd::geteuid;
-use serde::Deserialize;
+use nix::fcntl::{open, openat, renameat, OFlag};
+use nix::sys::stat::{fchmod, fstat, Mode, SFlag};
+use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
+use serde::{Deserialize, Serialize};
 
-/// Exit status written by silo-vmm when a machine run ends.
+/// Exit status written by silo-vmm, or libvm after a confirmed force-kill.
 ///
 /// This is silo-vmm telemetry, not the machine lifecycle state stored in SQLite.
 /// The runtime uses it as one input while reconciling `MachineState` after a
@@ -102,6 +102,69 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<VmmExitStatus>> {
         )
     })?;
     Ok(Some(status))
+}
+
+/// Records a confirmed forced exit while the caller still owns the machine's
+/// lifecycle lock. The lock must span killing, observing exit, and publication
+/// so this record cannot overwrite evidence from a replacement generation.
+pub(crate) fn write_forced(
+    path: &Path,
+    machine_id: &str,
+    run_id: &str,
+    pid: i32,
+) -> io::Result<i64> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ForcedExit<'a> {
+        machine_id: &'a str,
+        run_id: &'a str,
+        pid: i32,
+        exited_at: i64,
+        outcome: &'static str,
+    }
+    let exited_at = crate::utils::now_unix();
+    let payload = serde_json::to_vec(&ForcedExit {
+        machine_id,
+        run_id,
+        pid,
+        exited_at,
+        outcome: "forced",
+    })
+    .map_err(io::Error::other)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid(path, "has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid(path, "has no filename"))?;
+    let directory = File::from(open(
+        parent,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?);
+    let stat = fstat(&directory)?;
+    if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
+        return Err(invalid(parent, "is not a private owned directory"));
+    }
+    let temporary = format!(".exit-{}.tmp", uuid::Uuid::new_v4());
+    let fd = openat(
+        &directory,
+        temporary.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_retain(0o600),
+    )?;
+    let result = (|| {
+        fchmod(&fd, Mode::from_bits_retain(0o600))?;
+        let mut file = File::from(fd);
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        renameat(&directory, temporary.as_str(), &directory, name)?;
+        directory.sync_all()
+    })();
+    if result.is_err() {
+        let _ = unlinkat(&directory, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+    }
+    result.map(|()| exited_at)
 }
 
 fn path_error(path: &Path, error: nix::errno::Errno) -> io::Error {

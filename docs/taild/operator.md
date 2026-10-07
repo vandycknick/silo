@@ -114,15 +114,17 @@ queue. Fields are `version`, `vm_id`, `run_id`, `observed_at`, `state` and optio
 `approval_required`, `ready`, `disconnected`, `failed` and `stopped`. URLs are
 cleared when no longer applicable; the file contains no credentials or private keys.
 
-Taild accepts it only for the current running VM/run, with an observation no more
-than 60 seconds old (and at most five seconds in the future). Missing, malformed,
+Libvm accepts it only for the current running VM/run, with an observation no more
+than 60 seconds old (and at most five seconds in the future). Taild consumes the
+validated observation through `InspectMachine`, never by reading VM state files.
+Missing, malformed,
 stale or mismatched files mean status is unavailable. Stopped VMs and previous
 runs cannot reuse an old snapshot. After an unclean netd exit within the same VM
 run, its last observation can remain visible until the 60-second freshness bound;
 the snapshot is not an instantaneous health probe. Netd refreshes status
 periodically and on Tailscale notifications; the VM remains usable if the snapshot
 cannot be written. `show` and `ls` expose current approval URLs without requiring
-the original creation session. The status protocol is independent of the SDK.
+the original creation session. Observation validation is shared native management behavior.
 
 `last_known` retains the last verified node identity and expiry with its original
 observation timestamp. Stopped VMs display their configured hostname and historical

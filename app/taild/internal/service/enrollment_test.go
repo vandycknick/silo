@@ -21,7 +21,7 @@ import (
 func TestNativeRemoveDiscardsNodeStateLocally(t *testing.T) {
 	for _, kind := range []string{"enrolled", "pending", "malformed", "transaction"} {
 		t.Run(kind, func(t *testing.T) {
-			s := actualService(t)
+			s, sdk := actualNativeService(t)
 			ctx := context.Background()
 			c := domainCaller(s, "user:123")
 			disk := filepath.Join(s.Config.Home, "input.raw")
@@ -33,7 +33,7 @@ func TestNativeRemoveDiscardsNodeStateLocally(t *testing.T) {
 				t.Fatal(err)
 			}
 			labels := map[string]string{runtime.OwnerLabel: "user:123", runtime.InstanceLabel: s.Runtime.Instance, runtime.NameLabel: "local-removal", runtime.ModeLabel: "interactive"}
-			m, err := s.Runtime.SDK.CreateMachine(ctx, silo.DiskImage(disk), silo.WithName("local-removal"), silo.WithLabels(labels), silo.WithVsock(true), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
+			m, err := sdk.CreateMachine(ctx, silo.DiskImage(disk), silo.WithName("local-removal"), silo.WithLabels(labels), silo.WithVsock(true), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
 			if err != nil {
 				t.Fatal(err)
 			}

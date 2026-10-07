@@ -1,6 +1,7 @@
-package runtime
+package runtime_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -11,7 +12,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/vandycknick/silo/app/taild/internal/control"
+	. "github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
@@ -20,11 +24,8 @@ func TestActualSDKRuntimeInventoryAndReservations(t *testing.T) {
 	c := testfixture.Config()
 	c.Home = t.TempDir()
 	c.Components = testfixture.Components(root)
-	r, e := Open(context.Background(), c, "instance")
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer r.Close()
+	n := daemon.Open(t, c, "instance", 1)
+	r := n.Runtime
 	snapshot, e := r.Reconcile(context.Background())
 	if e != nil || len(snapshot.VMs) != 0 {
 		t.Fatalf("%+v %v", snapshot, e)
@@ -66,12 +67,18 @@ func TestActualSDKRuntimeInventoryAndReservations(t *testing.T) {
 	if _, e = os.Stat(filepath.Join(c.Home, "state.db")); e != nil {
 		t.Fatal("SDK did not open real home:", e)
 	}
+	if e = r.Close(); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = n.Control.Inventory(context.Background()); e != nil {
+		t.Fatalf("closing session runtime closed externally owned manager: %v", e)
+	}
 }
 func TestMissingRuntime(t *testing.T) {
 	c := testfixture.Config()
 	c.Home = t.TempDir()
 	c.BridgePath = ""
-	if _, e := Open(context.Background(), c, ""); e == nil {
+	if _, e := Open(context.Background(), c, "", &control.Client{}); e == nil {
 		t.Fatal(e)
 	}
 }
@@ -92,18 +99,15 @@ func TestActualSDKLabelAuthorityAndResilientRecords(t *testing.T) {
 	c := testfixture.Config()
 	c.Home = t.TempDir()
 	c.Components = testfixture.Components(root)
-	r, e := Open(context.Background(), c, "instance")
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer r.Close()
+	n := daemon.Open(t, c, "instance", 1)
+	r := n.Runtime
 	ctx := context.Background()
 	disk := filepath.Join(c.Home, "input.raw")
-	if e = os.WriteFile(disk, []byte("stopped-only disk fixture"), 0600); e != nil {
+	if e := os.WriteFile(disk, []byte("stopped-only disk fixture"), 0600); e != nil {
 		t.Fatal(e)
 	}
 	for _, v := range []struct{ name, owner, instance string }{{"owned", "user:1", "instance"}, {"foreign", "user:2", "instance"}, {"unmanaged", "user:1", "other-instance"}, {"broken", "user:1", "instance"}} {
-		m, e := r.SDK.CreateMachine(ctx, silo.DiskImage(disk), silo.WithName(v.name), silo.WithLabels(map[string]string{OwnerLabel: v.owner, NameLabel: v.name, InstanceLabel: v.instance, ModeLabel: "none"}))
+		m, e := n.SDK.CreateMachine(ctx, silo.DiskImage(disk), silo.WithName(v.name), silo.WithLabels(map[string]string{OwnerLabel: v.owner, NameLabel: v.name, InstanceLabel: v.instance, ModeLabel: "none"}))
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -134,11 +138,24 @@ func TestActualSDKLabelAuthorityAndResilientRecords(t *testing.T) {
 	if e != nil {
 		testfixture.Unavailable(t, "python3 sqlite3 required for actual corrupt-record inventory")
 	}
-	cmd := exec.Command(python, "-c", `import sqlite3,sys
-db=sqlite3.connect(sys.argv[1]);db.execute("UPDATE machine_config SET config_json=x'00' WHERE name='broken'");db.commit()`, filepath.Join(c.Home, "state.db"))
-	if output, e := cmd.CombinedOutput(); e != nil {
-		t.Fatalf("%v %s", e, output)
+	cmd := exec.Command(python, "-c", `import sqlite3,sys,json
+db=sqlite3.connect(sys.argv[1]);original=db.execute("SELECT hex(config_json), typeof(config_json) FROM machine_config WHERE name='broken'").fetchone()
+sys.stdout.write(json.dumps(original));db.execute("UPDATE machine_config SET config_json=x'00' WHERE name='broken'");db.commit()`, filepath.Join(c.Home, "state.db"))
+	original, e := cmd.Output()
+	if e != nil {
+		t.Fatal(e)
 	}
+	// Restore the exact stored value before the fixture's authoritative cleanup.
+	t.Cleanup(func() {
+		restore := exec.Command(python, "-c", `import sqlite3,sys,json
+encoded,kind=json.load(sys.stdin);value=bytes.fromhex(encoded)
+if kind == "text": value=value.decode("utf-8")
+db=sqlite3.connect(sys.argv[1]);db.execute("UPDATE machine_config SET config_json=? WHERE name='broken'", (value,));db.commit()`, filepath.Join(c.Home, "state.db"))
+		restore.Stdin = bytes.NewReader(original)
+		if output, err := restore.CombinedOutput(); err != nil {
+			t.Errorf("restore corrupt-record fixture: %v %s", err, output)
+		}
+	})
 	snapshot, e = r.Reconcile(ctx)
 	if e != nil || len(snapshot.VMs) != 2 || snapshot.Unreadable < 1 {
 		t.Fatalf("healthy records hidden by corruption: %+v %v", snapshot, e)

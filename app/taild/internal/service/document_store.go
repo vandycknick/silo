@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -157,7 +158,7 @@ func documentNames(dir *os.File, ext string) ([]string, error) {
 	}
 	return names, nil
 }
-func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal, raw string) ([]Document, error) {
+func (s *Service) documentsFor(ctx context.Context, kind, verb, name string, owner identity.Principal, raw string) ([]Document, error) {
 	s.documentMu.Lock()
 	defer s.documentMu.Unlock()
 	if _, e := identity.ParsePrincipal(string(owner)); e != nil {
@@ -193,7 +194,7 @@ func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal
 		if e != nil {
 			return Document{}, e
 		}
-		d, e := s.validateDocument(kind, b)
+		d, e := s.validateDocument(ctx, kind, b)
 		if e != nil {
 			return Document{}, failure("unavailable", "stored "+kind+" failed validation", 9)
 		}
@@ -258,7 +259,7 @@ func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal
 			}
 			return nil, storeFailure(existingErr)
 		}
-		d, e := s.validateDocument(kind, raw)
+		d, e := s.validateDocument(ctx, kind, raw)
 		if e != nil {
 			return nil, e
 		}
@@ -290,7 +291,7 @@ func (s *Service) documentsFor(kind, verb, name string, owner identity.Principal
 
 // Operator files are deliberately uncached. SIGHUP eagerly validates the same
 // fresh view that every list/resolve reads, without replacing running VM policy.
-func (s *Service) ReloadDocuments() error {
+func (s *Service) ReloadDocuments(ctx context.Context) error {
 	s.documentMu.Lock()
 	defer s.documentMu.Unlock()
 	for _, kind := range []string{"template", "policy"} {
@@ -316,7 +317,7 @@ func (s *Service) ReloadDocuments() error {
 				if e != nil {
 					return e
 				}
-				if _, e = s.validateDocument(kind, raw); e != nil {
+				if _, e = s.validateDocument(ctx, kind, raw); e != nil {
 					return e
 				}
 			}

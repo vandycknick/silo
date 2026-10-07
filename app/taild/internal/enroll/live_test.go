@@ -5,22 +5,25 @@ package enroll
 import (
 	"context"
 	"fmt"
-	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/identity"
-	"github.com/vandycknick/silo/app/taild/internal/state"
-	"github.com/vandycknick/silo/app/taild/internal/tailnet"
-	"github.com/vandycknick/silo/app/taild/internal/testfixture"
-	silo "github.com/vandycknick/silo/sdk/go"
-	"golang.org/x/crypto/ssh"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"strings"
-	"tailscale.com/tsnet"
 	"testing"
 	"time"
+
+	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/state"
+	"github.com/vandycknick/silo/app/taild/internal/tailnet"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
+	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
+	"golang.org/x/crypto/ssh"
+	"tailscale.com/tsnet"
 )
 
 // This gate uses real control, tsnet-produced state, native KVM and a real tag
@@ -70,11 +73,8 @@ func TestLiveNetdTagEnrollmentKVMStateReuseAndSSH(t *testing.T) {
 			t.Error("live lobby device retained")
 		}
 	}()
-	sdk, err := silo.Open(ctx, silo.WithHome(cfg.Home), silo.WithRuntimeRoot(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sdk.Close()
+	fixture := daemon.Open(t, cfg, "live-enrollment", 1)
+	sdk := fixture.SDK
 	name := fmt.Sprintf("s13-vm-%x", time.Now().UnixNano())
 	policy, err := silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{Tunnels: []silo.TailscaleTunnel{{Name: "vm", Hostname: &name, Tags: []string{"tag:silo-test-vm"}, ControlURL: &pin.ControlURL}}})
 	if err != nil {
@@ -97,10 +97,6 @@ func TestLiveNetdTagEnrollmentKVMStateReuseAndSSH(t *testing.T) {
 			}
 		}
 	}()
-	data, err := machine.Inspect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err = machine.SetSecret(ctx, "tailscale.vm.client_secret", []byte(secrets.ClientSecret)); err != nil {
 		t.Fatal(err)
 	}
@@ -110,22 +106,32 @@ func TestLiveNetdTagEnrollmentKVMStateReuseAndSSH(t *testing.T) {
 	if _, err = machine.WaitReady(ctx, 45*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	data, err = machine.Inspect(ctx)
+	data, err := fixture.Control.Inspect(ctx, machine.ID())
 	if err != nil || data.RunID == nil {
-		t.Fatal(err)
+		t.Fatal("started VM run unavailable", err)
 	}
-	for {
-		v, e := state.ReadNetdStatus(data.Network.Tailscale.StateDir, data.ID, *data.RunID, time.Now())
-		if e == nil && v.State == "ready" {
-			stable = v.NodeID
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("netd enrollment did not complete", v, e)
-		case <-time.After(200 * time.Millisecond):
+	firstRun := *data.RunID
+	waitNode := func(run string) string {
+		t.Helper()
+		for {
+			snapshot, inspectErr := fixture.Control.Inspect(ctx, data.ID)
+			if inspectErr == nil && snapshot.NetworkObservation != nil {
+				live := snapshot.NetworkObservation.Live
+				if live != nil && live.State == w.NodeState_NODE_STATE_READY {
+					if snapshot.RunID == nil || *snapshot.RunID != run || live.MachineId != data.ID || live.RunId != run || live.GetNodeId() == "" {
+						t.Fatal("ready node observation does not match VM run")
+					}
+					return live.GetNodeId()
+				}
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("netd enrollment did not complete", inspectErr)
+			case <-time.After(200 * time.Millisecond):
+			}
 		}
 	}
+	stable = waitNode(firstRun)
 	key, err := tailnet.Mint(ctx, &http.Client{Timeout: 30 * time.Second}, "https://api.tailscale.com", os.Getenv("SILO_E2E_TS_PEER_CLIENT_SECRET"), "tag:silo-test-vm")
 	if err != nil {
 		t.Fatal("live peer mint failed")
@@ -176,8 +182,14 @@ func TestLiveNetdTagEnrollmentKVMStateReuseAndSSH(t *testing.T) {
 	if _, err = machine.WaitReady(ctx, 45*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	reused, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", &pin)
-	if s != state.Enrolled || reused.NodeID != stable {
+	restarted, err := fixture.Control.Inspect(ctx, data.ID)
+	if err != nil || restarted.RunID == nil {
+		t.Fatal("restarted VM run unavailable", err)
+	}
+	if *restarted.RunID == firstRun {
+		t.Fatal("restart reused VM run")
+	}
+	if waitNode(*restarted.RunID) != stable {
 		t.Fatal("restart changed stable node")
 	}
 }

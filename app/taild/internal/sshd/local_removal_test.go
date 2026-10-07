@@ -26,12 +26,7 @@ func TestRemovalOpenSSHLocalTailscaleAndStoppedShow(t *testing.T) {
 	s.Config.Enrollment.Mode = "interactive"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "tail.test"}, Registry: enroll.NewRegistry()}
 	removalDispatch(t, ctx, s, caller, "create --name local-vm --tailscale --no-start", 0)
-	m, err := s.Runtime.SDK.Machine(ctx, "local-vm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
-	d, err := m.Inspect(ctx)
+	d, err := s.Runtime.Control.Inspect(ctx, "local-vm")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,6 +16,8 @@ import (
 	silo "github.com/vandycknick/silo/sdk/go"
 	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 	"golang.org/x/sys/unix"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -171,6 +173,19 @@ func TestNativeControlLifecycle(t *testing.T) {
 	// Read-only planning is an explicit local exception, even with that mismatch.
 	runCLI(localEnv, 0, "create", "--name", "dryrun-local", "--dry-run", registry.Reference)
 	exerciseCLI(command.Env, "route-daemon")
+	_, missing := client.Machines.InspectMachine(ctx, &w.MachineRef{Reference: &w.MachineRef_Name{Name: "missing-control-machine"}})
+	if grpcstatus.Code(missing) != codes.NotFound {
+		t.Fatalf("native missing resource lost its gRPC category: %v", missing)
+	}
+	typedMissing := false
+	for _, detail := range grpcstatus.Convert(missing).Details() {
+		if detail, ok := detail.(*w.ErrorDetail); ok && detail.GetNativeVariant() == "MachineNotFound" {
+			typedMissing = true
+		}
+	}
+	if !typedMissing {
+		t.Fatal("native missing resource lost its typed rich error detail across gRPC")
+	}
 	images, err := client.Runtime.ResolveImage(ctx, &w.ResolveImageRequest{Reference: registry.Reference, PullPolicy: w.PullPolicy_PULL_POLICY_ALWAYS})
 	if err != nil {
 		t.Fatal(err)

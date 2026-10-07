@@ -64,6 +64,35 @@ service deadline. Unexpected owner-pipe EOF cancels the helper immediately and
 exits within five seconds; it is not a VM-stop request. Old standalone service
 accounts and `/var/lib/silo-taild` state are not imported or modified.
 
+## Management and guest sessions
+
+Taild uses generated silod gRPC clients for inventory, image resolution,
+creation, lifecycle, policy normalization, secret writes and logs. Silod
+implements those operations through libvm. Management returns owned snapshots
+and immutable IDs, not native handles; an ambiguous transport failure is
+reported for inspection, never replayed through a local fallback.
+
+```text
+tailnet request -> taild authorization -> silod gRPC -> libvm management
+                         |
+                         +-> exact authorized VM ID
+                              -> private Go SDK runtime -> native libvm
+                                   -> silo-vmm Execute -> guest
+```
+
+Exec and interactive shell retain the existing native SDK session machinery.
+After fresh RPC authorization, `Runtime.Machine` opens only the authorized UUID
+in the manager-selected Home with its exact component set. `Machine.Spawn`
+streams stdout/stderr and structured exit results directly from the VMM;
+interactive shell retains account lookup, login shell, PTY resize and signals.
+No terminal bytes pass through silod. Closing native handles does not stop VMs.
+
+VM enrollment observations come from libvm through `InspectMachine`, not Go
+reads of VM state files. Bounded log tails keep the snapshot/follow descriptors
+and discard an incomplete first line before redaction, including when its
+newline arrives later. Rust and Go preserve native error categories through
+standard gRPC rich error details.
+
 ## Identity and permissions
 
 The accepted connection's fresh WhoIs is the identity boundary. Untagged peers
@@ -88,12 +117,11 @@ The label keys are `io.silo.taild.owner`, `.owner-login`, `.name`,
 machines. Name is exact, globally reserved across owners, with the SDK's native
 home-wide name lock authoritative against CLI/SDK writers. There is no prefix
 or auto-suffix. Create holds name and selected-principal quota reservations through
-durable SDK creation, releasing them on failure. Assigned VM DNS is checked exactly,
+durable RPC creation, releasing them on failure. Assigned VM DNS is checked exactly,
 normalizing case/trailing dot only. Inventory projections exclude host
 paths and native issue text. Unreadable indexed records never hide healthy
-ones. State readers use public ipn/profile/store types; directory presence does
-not prove enrollment. Stopped recovery only promotes validated state, retaining
-unknown recovery material for operator inspection.
+ones. The lobby alone reads its own public ipn/profile/store identity; VM
+enrollment observations and recovery belong to the native runtime.
 
 ## Enrollment
 
@@ -119,14 +147,15 @@ that tag before Tailscale evaluates requested tags through `tagOwners`. Netd ver
 tailnet identity before guest access. Sharing a tag does not confer management
 authority over a human-owned VM.
 
-Netd atomically publishes `<machine>/tailscale.status.json`. Taild checks the current
-run and freshness, waits at most three seconds after guest readiness for a login URL,
-and exposes authentication actions through `show`/`ls`. Active lobby prompts display
-deduplicated notices; guest and command output are never interrupted. `reauth` and
+Netd atomically publishes `<machine>/tailscale.status.json`. Libvm validates the
+current run and freshness; taild consumes that observation over RPC, waits at most
+three seconds after guest readiness for a login URL, and exposes it through `show`/`ls`.
+Active lobby prompts display deduplicated notices; guest and command output are never interrupted. `reauth` and
 the obsolete `enrollment.timeout` setting are removed. OAuth consent still has its
 own bounded lifetime. See the [status file contract](../../docs/taild/operator.md#live-status-file-version-1).
 
-Pending/backup recovery remains under the native stopped-node lease for start/update.
+Start/update retain native enrollment-state fencing. Taild does not repair
+unknown pending/backup transaction material.
 Explicit removal deletes local VM files, credentials and node state without contacting
 Tailscale. Persistent remote registrations may remain in the admin console. Stop/start
 preserves the node identity. `disable_key_expiry` uses the machine-scoped API credential
@@ -248,14 +277,16 @@ operator ceilings and capability limits. Exact names collide globally with all
 local records (including unmanaged/unreadable names) and visible tailnet names.
 
 Create reports actual pull completion/digest, durable creation, start and guest
-provisioning readiness. The SDK has no byte-progress callback; percentages are not
-invented. `--no-start` persists a stopped VM. Start never repulls its image. Set
+provisioning readiness. Progress comes from the native management operation;
+percentages are not invented. `--no-start` persists a stopped VM. Start never repulls its image. Set
 requires a stopped VM; disks only grow. Name and display label update through one
-atomic native SDK update. Any tailscale declaration, even pending enrollment,
+atomic libvm update through RPC. Any tailscale declaration, even pending enrollment,
 prevents rename.
 
 Remove refuses running VMs without `--force` (5). Force requires stop permission,
-uses bounded `StopWith`, then reauthorizes deletion. Remove prompts on stderr with
+uses a bounded, exact-run RPC stop, then reauthorizes generation-fenced deletion.
+Libvm records a confirmed force-kill while holding lifecycle ownership, so
+fenced removal works without accepting a replacement run. Remove prompts on stderr with
 `Remove VM 'devbox'? [y/N] ` (or `Stop and remove VM 'devbox'? [y/N] ` when running).
 Trimmed, case-insensitive `y` or `yes` confirms; `n`, `no`, Enter, Ctrl-C, EOF or
 disconnect cancels without submitting an operation (exit 2, `cancelled`). Other
@@ -328,7 +359,7 @@ overrides its policy reference. Labels merge with explicit flags winning;
 `io.silo.*` remains reserved. Template/policy names are stamped in immutable
 labels and projected by `show`. Description remains template metadata.
 
-Policies are HCL parsed and emitted exclusively by the public Rust-backed SDK.
+Policies are HCL parsed and emitted by libvm through silod's `NormalizePolicy` RPC.
 Any Tailscale declaration, rule tunnel reference or forward is prohibited, even
 without `--tailscale`. Production enables the one `Service.VMNodesEnabled` switch.
 Injection retains the entire canonical JSON, supplies the exact
@@ -340,13 +371,12 @@ routing, used only for tailnet destinations by netd. Thus explicit denials win,
 while otherwise the tailnet is exempt from default deny. User HTTP rules and
 non-tailnet routing remain intact.
 
-Before image pull/admission and again before SDK CreateMachine, public
-`Runtime.CheckPolicySecrets` runs the actual start resolver. Missing alternatives
+Before image pull/admission and again before RPC creation,
+`CheckPolicySecrets` runs libvm's actual start resolver. Missing alternatives
 fail with slot and backing key names (2). Corrupt/unavailable stores and invalid
 selected projections are separately categorized and redacted (9). Optional
 Tailscale auth keys, Machine/Home precedence, AWS profile suppression and complete
 explicit overrides follow that resolver. Values and host paths are never returned.
-Machine-scoped remote secret writes arrive later.
 
 Operator examples: [`devbox.yaml`](../../packaging/silo-taild/examples/devbox.yaml)
 and [`dev-egress.hcl`](../../packaging/silo-taild/examples/dev-egress.hcl).

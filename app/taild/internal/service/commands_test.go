@@ -19,6 +19,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
 	silo "github.com/vandycknick/silo/sdk/go"
+	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 )
 
 // domainCaller is explicit principal input at the domain boundary, below WhoIs.
@@ -31,6 +32,13 @@ func actualService(t *testing.T) *Service {
 	c := daemon.Config(t, nil)
 	n := daemon.Open(t, c, "native-service", 32)
 	return &Service{Runtime: n.Runtime, Audit: n.Audit, Config: c, Jobs: n.Jobs}
+}
+
+func actualNativeService(t *testing.T) (*Service, *silo.Runtime) {
+	t.Helper()
+	c := daemon.Config(t, nil)
+	n := daemon.Open(t, c, "native-service", 32)
+	return &Service{Runtime: n.Runtime, Audit: n.Audit, Config: c, Jobs: n.Jobs}, n.SDK
 }
 func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 	s := actualService(t)
@@ -55,7 +63,7 @@ func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			q := CreateRequest{Name: "safe"}
 			tt.change(&q)
-			_, e := s.ValidateCreate(c.Peer, q)
+			_, e := s.ValidateCreate(t.Context(), c.Peer, q)
 			var a *authz.Error
 			if !errors.As(e, &a) || a.Exit != tt.exit {
 				t.Fatalf("%v", e)
@@ -63,14 +71,14 @@ func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 		})
 	}
 	c.Peer.Permissions.Limits.CPUs = 1
-	if _, e := s.ValidateCreate(c.Peer, CreateRequest{Name: "safe", CPUs: 2}); Categorize(e).Exit != 6 {
+	if _, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Name: "safe", CPUs: 2}); Categorize(e).Exit != 6 {
 		t.Fatal(e)
 	}
 	c.Peer.Principals = []identity.Principal{"tag:ci", "tag:team"}
-	if _, e := s.ValidateCreate(c.Peer, CreateRequest{Name: "safe"}); e == nil {
+	if _, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Name: "safe"}); e == nil {
 		t.Fatal("missing owner accepted")
 	}
-	q, e := s.ValidateCreate(c.Peer, CreateRequest{Name: "safe", Owner: "tag:team"})
+	q, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Name: "safe", Owner: "tag:team"})
 	if e != nil || q.Owner != "tag:team" {
 		t.Fatal(q, e)
 	}
@@ -135,7 +143,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	if e != nil || v.Name != name || v.State != "stopped" {
 		t.Fatal(v, e)
 	}
-	reopened, e := runtime.Open(context.Background(), s.Config, s.Runtime.Instance)
+	reopened, e := runtime.Open(context.Background(), s.Config, s.Runtime.Instance, s.Runtime.Control)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -211,10 +219,17 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 	s.Jobs = jobs.New(ctx, 4)
 	c := domainCaller(s, "user:1")
 	persisted := make(chan struct{})
-	calls := 0
+	// Observe the real durable record at identity refresh, rather than counting
+	// refreshes: create now revalidates several times before materialization.
 	c.Resolve = func(ctx context.Context) (identity.Peer, error) {
-		calls++
-		if calls == 3 {
+		d, err := s.Runtime.Control.Inspect(ctx, "interrupted")
+		if err != nil && !silo.IsErrorKind(err, silo.ErrorMachineNotFound) {
+			return identity.Peer{}, err
+		}
+		if err == nil {
+			if d.Status.Kind != silo.MachineStatusStopped {
+				return identity.Peer{}, errors.New("created VM was not durably stopped before boot authorization")
+			}
 			close(persisted)
 			<-ctx.Done()
 			return identity.Peer{}, ctx.Err()
@@ -232,7 +247,7 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 	}
 	cancel()
 	v := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
-	if v.State != "failed" {
+	if v.State != "failed" || v.Error == nil || v.Error.Exit != 9 {
 		t.Fatal(v)
 	}
 	if e = s.Jobs.Wait(context.Background()); e != nil {
@@ -242,7 +257,7 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 	if e = s.Runtime.Close(); e != nil {
 		t.Fatal(e)
 	}
-	reopened, e := runtime.Open(context.Background(), s.Config, instance)
+	reopened, e := runtime.Open(context.Background(), s.Config, instance, s.Runtime.Control)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -325,6 +340,18 @@ func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
 	if out.Len() > logLimit || !strings.Contains(out.String(), "last-line") || strings.Contains(out.String(), "obsolete-first-line") || strings.Contains(out.String(), s.Config.Home) || strings.Contains(out.String(), "synthetic-fixture-token") {
 		t.Fatal("unbounded/unredacted logs", out.Len())
 	}
+	// A byte tail can start inside a credential, beyond its recognizable prefix.
+	// The daemon must discard that incomplete line before frontend redaction.
+	if e = os.WriteFile(path, []byte("Authorization: Bearer "+strings.Repeat("x", logLimit)+"\nvisible\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	out.Reset()
+	if e = s.Logs(context.Background(), c, "logs", LogsRequest{Source: silo.MachineLogSerial}, &out); e != nil {
+		t.Fatal(e)
+	}
+	if out.String() != "visible\n" {
+		t.Fatalf("truncated credential line escaped redaction: %d bytes", out.Len())
+	}
 	out.Reset()
 	if e = s.Logs(context.Background(), c, "logs", LogsRequest{Source: silo.MachineLogSerial, Output: silo.MachineLogStderr}, &out); e != nil || out.Len() != 0 {
 		t.Fatal("log output filter", e, out.Len())
@@ -332,16 +359,15 @@ func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
 	if e = s.Logs(context.Background(), c, "logs", LogsRequest{Source: "../../secrets"}, &out); Categorize(e).Exit != 2 {
 		t.Fatal("unsafe source accepted", e)
 	}
-	m, e := s.Runtime.SDK.Machine(context.Background(), "logs")
+	d, e := s.Runtime.Control.Inspect(t.Context(), "logs")
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer m.Close()
-	policy, e := silo.ParseNetworkPolicyHCL("tailscale \"vm\" {\n hostname = \"logs\"\n}\n")
+	policy, e := s.Runtime.Control.NormalizePolicy(t.Context(), &w.NormalizePolicyRequest{Input: &w.NormalizePolicyRequest_Hcl{Hcl: "tailscale \"vm\" {\n hostname = \"logs\"\n}\n"}})
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = m.Update(context.Background(), silo.MachineUpdate{Policy: policy}); e != nil {
+	if _, e = s.Runtime.Control.Update(t.Context(), d.ID, &w.MachineUpdate{Policy: &w.PolicyUpdate{Update: &w.PolicyUpdate_Set{Set: policy.CanonicalJSON}}}); e != nil {
 		t.Fatal(e)
 	}
 	name := "declared-pending"
@@ -351,5 +377,34 @@ func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
 	}
 	if got := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil); got.Error == nil || got.Error.Exit != 5 {
 		t.Fatal("pending tailscale declaration renamed", got)
+	}
+}
+
+func TestNativeFailedStartRemainsRemovable(t *testing.T) {
+	if os.Getenv("SILO_E2E_KVM") != "1" {
+		t.Skip("SILO_E2E_KVM=1 required")
+	}
+	s, sdk := actualNativeService(t)
+	kernel := filepath.Join(s.Config.Home, "invalid-kernel")
+	if err := os.WriteFile(kernel, []byte("not a bootable kernel"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := sdk.CreateMachine(t.Context(),
+		silo.DiskImage(testfixture.Path(t, "SILO_TEST_LOCAL_DISK", false)),
+		silo.WithName("failed-start"), silo.WithKernel(kernel),
+		silo.WithCPUs(1), silo.WithMemory(silo.Mebibytes(512)),
+		silo.WithLabels(map[string]string{runtime.OwnerLabel: "user:1", runtime.NameLabel: "failed-start", runtime.InstanceLabel: s.Runtime.Instance, runtime.ModeLabel: "none"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, err := s.Runtime.Control.Start(t.Context(), m.ID()); err == nil {
+		t.Fatal("invalid kernel started")
+	}
+	caller := domainCaller(s, "user:1")
+	op, err := s.Remove(t.Context(), caller, m.ID(), RemoveRequest{Force: true})
+	daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
+	if _, err := s.Runtime.Control.Inspect(t.Context(), m.ID()); !silo.IsErrorKind(err, silo.ErrorMachineNotFound) {
+		t.Fatalf("failed VM remains after removal: %v", err)
 	}
 }

@@ -7,7 +7,6 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
@@ -17,7 +16,6 @@ import (
 )
 
 type Service struct {
-	Control            *control.Client
 	DaemonVersion      string
 	ManagementProtocol uint32
 	Shutdown           *state.ShutdownGate
@@ -96,7 +94,7 @@ func (s *Service) Health(ctx context.Context, peer identity.Peer) (Health, error
 	if e := s.Authorize(peer, identity.Read, nil); e != nil {
 		return Health{}, e
 	}
-	if _, e := s.Runtime.SDK.Inventory(ctx); e != nil {
+	if _, e := s.Runtime.Control.Inventory(ctx); e != nil {
 		return Health{}, &authz.Error{Code: "unavailable", Message: "runtime unavailable", Exit: 9}
 	}
 	return Health{true, true}, nil
