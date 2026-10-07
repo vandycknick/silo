@@ -629,3 +629,199 @@ async fn draining_helper_can_finish_mutations_before_final_seal() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn ownership_acquisition_does_not_replace_socket_and_retains_both_locks() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let dir = root.path().join("control");
+    let lifetime_path = owner.host.home().join("daemon/daemon.lock");
+    let lifetime = crate::supervisor::LifetimeLock::acquire(&lifetime_path).unwrap();
+    let ownership = socket::SocketOwnership::acquire_at(dir.clone()).unwrap();
+    let stale = tokio::net::UnixListener::bind(dir.join("control.sock")).unwrap();
+    let before = std::fs::metadata(dir.join("control.sock")).unwrap().ino();
+    assert!(crate::supervisor::LifetimeLock::acquire(&lifetime_path).is_err());
+    assert!(socket::SocketOwnership::acquire_at(dir.clone()).is_err());
+    assert_eq!(
+        std::fs::metadata(dir.join("control.sock")).unwrap().ino(),
+        before
+    );
+    drop(stale);
+    let server = ownership.bind(owner).unwrap();
+    assert!(crate::supervisor::LifetimeLock::acquire(&lifetime_path).is_err());
+    assert!(socket::SocketOwnership::acquire_at(dir.clone()).is_err());
+    drop(server);
+    assert!(!dir.join("control.sock").exists());
+    drop(lifetime);
+    assert!(crate::supervisor::LifetimeLock::acquire(&lifetime_path).is_ok());
+    assert!(socket::SocketOwnership::acquire_at(dir).is_ok());
+}
+
+#[tokio::test]
+async fn marker_drain_tracks_real_work_without_queueing_ahead_of_stops() {
+    use w::daemon_service_server::DaemonService;
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let initial = owner.admit(&Request::new(()), true).await.unwrap();
+    std::fs::create_dir_all(owner.host.home().join("taild")).unwrap();
+    std::fs::write(owner.host.home().join("taild/shutdown"), b"sealed").unwrap();
+    let service = Service(owner.clone());
+    let drain_request = || {
+        Request::new(w::DrainMutationsRequest {
+            expected_generation: owner.generation.to_string(),
+        })
+    };
+    let mut drain = Box::pin(service.drain_mutations(drain_request()));
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain)
+        .await
+        .is_err());
+    // Drain does not consume/queue all semaphore permits: safe stop admission
+    // remains available while protected mutations are sealed by the marker.
+    let stop = owner.admit(&Request::new(()), false).await.unwrap();
+    assert!(owner.admit(&Request::new(()), true).await.is_err());
+    drop(initial);
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain)
+        .await
+        .is_err());
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(1), &mut drain)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        service
+            .drain_mutations(Request::new(w::DrainMutationsRequest {
+                expected_generation: uuid::Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    owner.seal_mutations().await;
+    assert!(owner.admit(&Request::new(()), false).await.is_err());
+}
+
+#[tokio::test]
+async fn unsafe_marker_parent_seals_admission_and_allows_drain() {
+    use w::daemon_service_server::DaemonService;
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    std::os::unix::fs::symlink(root.path().join("missing"), owner.host.home().join("taild"))
+        .unwrap();
+    assert!(owner.admit(&Request::new(()), true).await.is_err());
+    drop(owner.admit(&Request::new(()), false).await.unwrap());
+    Service(owner.clone())
+        .drain_mutations(Request::new(w::DrainMutationsRequest {
+            expected_generation: owner.generation.to_string(),
+        }))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_only_real_transport_enforces_every_protocol_method() {
+    let root = tempfile::tempdir().unwrap();
+    let mut owner = state(root.path());
+    Arc::get_mut(&mut owner).unwrap().shutdown_only = true;
+    let dir = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner.clone(), dir.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let path = dir.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut daemon = w::daemon_service_client::DaemonServiceClient::new(channel.clone());
+    assert_eq!(
+        daemon.get_status(()).await.unwrap().into_inner().generation,
+        owner.generation.to_string()
+    );
+    std::fs::create_dir_all(owner.host.home().join("taild")).unwrap();
+    std::fs::write(owner.host.home().join("taild/shutdown"), b"sealed").unwrap();
+    daemon
+        .drain_mutations(w::DrainMutationsRequest {
+            expected_generation: owner.generation.to_string(),
+        })
+        .await
+        .unwrap();
+    // Parse the authoritative protocol, so additions must explicitly be admitted.
+    let mut service = "";
+    let mut denied = 0;
+    for line in include_str!("../../../../specs/silod-spec/proto/daemon.proto").lines() {
+        if let Some(declaration) = line.strip_prefix("service ") {
+            service = declaration.split_whitespace().next().unwrap();
+        } else if let Some(declaration) = line.trim().strip_prefix("rpc ") {
+            let method = declaration.split('(').next().unwrap();
+            if matches!(
+                (service, method),
+                ("DaemonService", "GetStatus" | "DrainMutations")
+                    | (
+                        "MachineService",
+                        "ListMachines" | "InspectInventory" | "InspectMachine" | "StopMachine"
+                    )
+            ) {
+                continue;
+            }
+            let uri = format!("/silo.daemon.v1.{service}/{method}");
+            let mut grpc = tonic::client::Grpc::new(channel.clone());
+            grpc.ready().await.unwrap();
+            let result: Result<tonic::Response<()>, tonic::Status> = grpc
+                .unary(
+                    Request::new(()),
+                    tonic::codegen::http::uri::PathAndQuery::try_from(uri.clone()).unwrap(),
+                    tonic_prost::ProstCodec::default(),
+                )
+                .await;
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::PermissionDenied,
+                "{uri}"
+            );
+            denied += 1;
+        }
+    }
+    assert!(denied > 20);
+    let mut machines = w::machine_service_client::MachineServiceClient::new(channel);
+    // Allowed methods reach validation rather than the URI denial.
+    assert_eq!(
+        machines
+            .inspect_machine(w::MachineRef::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        machines
+            .inspect_inventory(w::MachineRef::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        machines
+            .stop_machine(w::StopMachineRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert!(owner.components.get().is_none());
+    assert!(owner.runtime.get().is_none());
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

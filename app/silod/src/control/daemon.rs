@@ -70,26 +70,33 @@ impl w::daemon_service_server::DaemonService for Service {
         use silod_spec::status::{ComponentState, ComponentStatus, ShutdownProtection};
         let component = ComponentStatus {
             enabled: status.enabled,
-            state: match w::ComponentState::try_from(status.state).unwrap() {
+            state: match w::ComponentState::try_from(status.state)
+                .map_err(|_| Status::invalid_argument("invalid component state"))?
+            {
                 w::ComponentState::Disabled => ComponentState::Disabled,
                 w::ComponentState::Starting => ComponentState::Starting,
                 w::ComponentState::NeedsAuth => ComponentState::NeedsAuth,
                 w::ComponentState::Ready => ComponentState::Ready,
                 w::ComponentState::Degraded => ComponentState::Degraded,
                 w::ComponentState::Failed => ComponentState::Failed,
-                w::ComponentState::Unspecified => unreachable!(),
+                w::ComponentState::Unspecified => {
+                    return Err(Status::invalid_argument("unspecified component state"))
+                }
             },
             diagnostic: status.diagnostic,
             approval_url: status.approval_url,
             dns_name: status.dns_name,
             restart_count,
             shutdown_protection: match w::ShutdownProtection::try_from(status.shutdown_protection)
-                .unwrap()
-            {
+                .map_err(|_| {
+                Status::invalid_argument("invalid shutdown protection")
+            })? {
                 w::ShutdownProtection::Active => ShutdownProtection::Active,
                 w::ShutdownProtection::Unavailable => ShutdownProtection::Unavailable,
                 w::ShutdownProtection::Unsupported => ShutdownProtection::Unsupported,
-                w::ShutdownProtection::Unspecified => unreachable!(),
+                w::ShutdownProtection::Unspecified => {
+                    return Err(Status::invalid_argument("unspecified shutdown protection"))
+                }
             },
         };
         self.publisher
@@ -105,7 +112,7 @@ impl w::daemon_service_server::DaemonService for Service {
         if r.into_inner().expected_generation != self.generation.to_string() {
             return Err(Status::failed_precondition("daemon generation changed"));
         }
-        if !self.admission.lock().sealed {
+        if !self.admission.lock().sealed && !self.marker_sealed() {
             return Err(Status::failed_precondition(
                 "seal mutation admission before draining",
             ));

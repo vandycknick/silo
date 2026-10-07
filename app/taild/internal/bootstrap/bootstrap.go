@@ -27,6 +27,13 @@ import (
 const MaxFrame = 64 << 10
 const ReadTimeout = 10 * time.Second
 
+type Mode uint8
+
+const (
+	Normal Mode = iota
+	ShutdownOnly
+)
+
 // Input deliberately has no String or Debug representation of credentials.
 type Input struct {
 	Config           config.Config
@@ -41,7 +48,7 @@ func (*Input) String() string     { return "managed helper bootstrap (credential
 func (i *Input) GoString() string { return i.String() }
 
 // Read owns fd on success and failure. The returned pipe is also the lifeline.
-func Read(ctx context.Context, fd int) (*Input, *os.File, error) {
+func Read(ctx context.Context, fd int, mode Mode) (*Input, *os.File, error) {
 	if fd < 0 {
 		return nil, nil, errors.New("bootstrap descriptor is required")
 	}
@@ -67,7 +74,7 @@ func Read(ctx context.Context, fd int) (*Input, *os.File, error) {
 	if pipe == nil {
 		return nil, nil, errors.New("invalid bootstrap descriptor")
 	}
-	input, err := readFrame(ctx, pipe, ReadTimeout)
+	input, err := readFrame(ctx, pipe, ReadTimeout, mode)
 	if err != nil {
 		_ = pipe.Close()
 		return nil, nil, err
@@ -75,7 +82,7 @@ func Read(ctx context.Context, fd int) (*Input, *os.File, error) {
 	return input, pipe, nil
 }
 
-func readFrame(ctx context.Context, pipe *os.File, timeout time.Duration) (*Input, error) {
+func readFrame(ctx context.Context, pipe *os.File, timeout time.Duration, mode Mode) (*Input, error) {
 	deadline := time.Now().Add(timeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
@@ -103,7 +110,7 @@ func readFrame(ctx context.Context, pipe *os.File, timeout time.Duration) (*Inpu
 	if err := proto.Unmarshal(buffer, &wire); err != nil {
 		return nil, errors.New("invalid bootstrap protobuf")
 	}
-	input, err := Validate(&wire)
+	input, err := Validate(&wire, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +148,13 @@ func canonical(path []byte, directory bool) (string, error) {
 	return value, nil
 }
 
-func Validate(w *daemonv1.HelperBootstrap) (*Input, error) {
+func Validate(w *daemonv1.HelperBootstrap, mode Mode) (*Input, error) {
+	if mode != Normal && mode != ShutdownOnly {
+		return nil, errors.New("invalid bootstrap mode")
+	}
+	if mode == ShutdownOnly && (w.RuntimeComponents != nil || len(w.NativeBridgePath) != 0 || len(w.TemplatesDir) != 0 || len(w.PoliciesDir) != 0 || w.ClientSecret != nil || w.OauthAppSecret != nil || w.ApiToken != nil) {
+		return nil, errors.New("shutdown bootstrap must not contain native assets or credentials")
+	}
 	if w.ProtocolMajor != 1 || w.ProductVersion != silo.Version {
 		return nil, errors.New("bootstrap product/protocol mismatch")
 	}
@@ -187,6 +200,12 @@ func Validate(w *daemonv1.HelperBootstrap) (*Input, error) {
 	parent, err := filepath.EvalSymlinks(filepath.Dir(input.Endpoint))
 	if err != nil || parent != filepath.Dir(input.Endpoint) {
 		return nil, errors.New("noncanonical control endpoint directory")
+	}
+	if mode == ShutdownOnly {
+		if err := shutdownSettings(&input.Config, w.Settings); err != nil {
+			return nil, err
+		}
+		return input, nil
 	}
 	if w.RuntimeComponents == nil {
 		return nil, errors.New("bootstrap runtime components required")
@@ -293,4 +312,18 @@ func settings(c *config.Config, s *daemonv1.TailscaleSettings) error {
 	c.Shutdown.StopBudget = units.Duration{Duration: s.StopBudget.AsDuration()}
 	c.Shutdown.Margin = units.Duration{Duration: s.ShutdownMargin.AsDuration()}
 	return c.Validate()
+}
+
+func shutdownSettings(c *config.Config, s *daemonv1.TailscaleSettings) error {
+	if s == nil || s.StopBudget == nil || s.ShutdownMargin == nil ||
+		s.StopBudget.CheckValid() != nil || s.ShutdownMargin.CheckValid() != nil {
+		return errors.New("valid shutdown settings required")
+	}
+	budget, margin := s.StopBudget.AsDuration(), s.ShutdownMargin.AsDuration()
+	if budget <= 0 || budget > time.Minute || margin <= 0 || margin > time.Second {
+		return errors.New("shutdown durations outside supported bounds")
+	}
+	c.Shutdown.StopBudget = units.Duration{Duration: budget}
+	c.Shutdown.Margin = units.Duration{Duration: margin}
+	return nil
 }

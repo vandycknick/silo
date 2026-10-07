@@ -10,7 +10,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/runtime"
+	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"golang.org/x/sys/unix"
 )
@@ -303,14 +303,14 @@ func (i *Inhibitor) admitEvents(ctx context.Context, preparing bool, gate *state
 	return out
 }
 
-func (i *Inhibitor) Start(ctx context.Context, c config.Config, r *runtime.Runtime, preparing bool, gate *state.ShutdownGate, interrupt func(), resume func(), jobsDrained func() <-chan struct{}, log *slog.Logger) {
+func (i *Inhibitor) Start(ctx context.Context, c config.Config, manager *control.Client, instance, generation string, preparing bool, gate *state.ShutdownGate, interrupt func(), resume func(), jobsDrained func() <-chan struct{}, log *slog.Logger) {
 	events := i.admitEvents(ctx, preparing, gate, interrupt)
-	go i.watch(ctx, c, r, events, gate, resume, jobsDrained, log)
+	go i.watch(ctx, c, manager, instance, generation, events, gate, resume, jobsDrained, log)
 }
 
 // Watch remains responsive to cancellation and bus loss even while a native
 // call is blocked. FD release is independent of native completion.
-func (i *Inhibitor) watch(ctx context.Context, c config.Config, r *runtime.Runtime, events <-chan loginEvent, gate *state.ShutdownGate, resume func(), jobsDrained func() <-chan struct{}, log *slog.Logger) {
+func (i *Inhibitor) watch(ctx context.Context, c config.Config, manager *control.Client, instance, generation string, events <-chan loginEvent, gate *state.ShutdownGate, resume func(), jobsDrained func() <-chan struct{}, log *slog.Logger) {
 	defer i.Close()
 	coordinator := episodeCoordinator{}
 	var acquisition <-chan error
@@ -330,10 +330,16 @@ func (i *Inhibitor) watch(ctx context.Context, c config.Config, r *runtime.Runti
 		}
 		if coordinator.canSweep(current) {
 			coordinator.sweptRevision = current.revision
-			coordinator.work = i.stopEpisode(ctx, c, r, current, gate, jobsDrained, log)
+			coordinator.work = i.stopEpisode(ctx, c, manager, instance, generation, current, gate, jobsDrained, log)
 		} else if acquisition == nil && coordinator.canRecover(current) {
 			// Cancellation of an episode that never swept still needs a fresh
 			// job/helper drain. All older stop workers have already retired.
+			// A fast true/false pair may have sealed only local admission.
+			// Native settlement also requires the durable cross-process seal.
+			if err := gate.Mark(c.Home); err != nil {
+				log.Error("shutdown cancellation marker write failed; admission sealed", "error", err)
+				return
+			}
 			call, cancel := context.WithTimeout(ctx, 2*time.Second)
 			jobs := jobsDrained()
 			select {
@@ -343,9 +349,32 @@ func (i *Inhibitor) watch(ctx context.Context, c config.Config, r *runtime.Runti
 				coordinator.work = jobs
 				continue
 			}
+			helperErr := state.WaitShutdownHelpers(call, c.Home)
+			if helperErr != nil {
+				cancel()
+				settled := make(chan struct{})
+				coordinator.work = settled
+				go func() {
+					defer close(settled)
+					_ = state.WaitShutdownHelpers(ctx, c.Home)
+					_ = settleMutations(ctx, manager, generation)
+				}()
+				continue
+			}
+			// Keep the coordinator occupied on a failed/timed-out drain. An
+			// independent worker settles accepted work before recovery retries.
+			if err := manager.DrainMutations(call, generation); err != nil {
+				cancel()
+				settled := make(chan struct{})
+				coordinator.work = settled
+				go func() {
+					defer close(settled)
+					_ = settleMutations(ctx, manager, generation)
+				}()
+				continue
+			}
 			pending, pe := i.Preparing(call)
 			host, hostErr := SystemState(call)
-			helperErr := state.WaitShutdownHelpers(call, c.Home)
 			cancel()
 			if pe != nil || hostErr != nil || helperErr != nil || host == "stopping" && !pending {
 				log.Error("shutdown cancellation recovery failed; admission sealed")
@@ -389,37 +418,38 @@ func (i *Inhibitor) watch(ctx context.Context, c config.Config, r *runtime.Runti
 	}
 }
 
-func (i *Inhibitor) stopEpisode(parent context.Context, c config.Config, r *runtime.Runtime, episode shutdownEpisode, gate *state.ShutdownGate, jobsDrained func() <-chan struct{}, log *slog.Logger) <-chan struct{} {
+func (i *Inhibitor) stopEpisode(parent context.Context, c config.Config, manager *control.Client, instance, generation string, episode shutdownEpisode, gate *state.ShutdownGate, jobsDrained func() <-chan struct{}, log *slog.Logger) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := gate.Mark(c.Home); err != nil {
-			log.Error("shutdown marker write failed; memory admission sealed and jobs cancelled; cross-process durable protection unavailable")
+		markerError := gate.Mark(c.Home)
+		if markerError != nil {
+			log.Error("shutdown marker write failed; admission remains sealed")
 		}
-		result, err := StopAll(episode.ctx, r)
+		result, err := Sweep(episode.ctx, manager, instance, generation)
+		err = errors.Join(markerError, err)
 		jobs := jobsDrained()
-		firstDrained := result.Drained
-		var secondDrained <-chan struct{}
 		select {
 		case <-jobs:
-			current := i.snapshot()
-			if episode.ctx.Err() == nil && current.phase == episodePreparing && current.revision == episode.revision {
-				second, secondError := StopAll(episode.ctx, r)
-				result.Issued += second.Issued
-				result.Finished += second.Finished
-				result.Failed += second.Failed
-				secondDrained = second.Drained
-				err = errors.Join(err, secondError)
-			}
 		case <-episode.ctx.Done():
 			err = errors.Join(err, episode.ctx.Err())
 		}
-		i.completeStops(episode.revision)
-		log.Info("host shutdown VM stops", "issued", result.Issued, "finished", result.Finished, "failed", result.Failed, "complete", err == nil)
-		// Context expiration reports incomplete native work, but does not retire
-		// that worker. Admission cannot recover until these channels really close.
+		if err == nil {
+			err = state.WaitShutdownHelpers(episode.ctx, c.Home)
+			if err == nil {
+				err = manager.DrainMutations(episode.ctx, generation)
+			}
+		}
+		current := i.snapshot()
+		complete := err == nil && episode.ctx.Err() == nil && current.phase == episodePreparing && current.revision == episode.revision
+		if complete {
+			i.completeStops(episode.revision)
+		}
+		log.Info("host shutdown VM stops", "issued", result.Issued, "finished", result.Finished, "failed", result.Failed, "complete", complete)
+		// Cancelled waiters are not completion. Keep this worker and marker
+		// alive until the actual daemon work settles, without another sweep.
 		select {
-		case <-firstDrained:
+		case <-result.Drained:
 		case <-parent.Done():
 			return
 		}
@@ -428,16 +458,21 @@ func (i *Inhibitor) stopEpisode(parent context.Context, c config.Config, r *runt
 		case <-parent.Done():
 			return
 		}
-		if secondDrained != nil {
-			select {
-			case <-secondDrained:
-			case <-parent.Done():
-				return
-			}
-		}
-		if err := state.WaitShutdownHelpers(parent, c.Home); err != nil {
+		if state.WaitShutdownHelpers(parent, c.Home) != nil {
+			<-parent.Done()
 			return
 		}
+		_ = settleMutations(parent, manager, generation)
 	}()
 	return done
+}
+
+// A failed settlement is never authority to retire this worker and reopen
+// admission. The original transport is pinned; no mutation or drain is replayed.
+func settleMutations(ctx context.Context, manager *control.Client, generation string) error {
+	if err := manager.DrainMutations(ctx, generation); err != nil {
+		<-ctx.Done()
+		return err
+	}
+	return nil
 }

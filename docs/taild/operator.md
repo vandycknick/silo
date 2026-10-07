@@ -160,6 +160,20 @@ Never use a whole-cgroup kill to repair the service. On Linux, the existing logi
 delay inhibitor permits a bounded stop of managed VMs only for authenticated host
 shutdown. Configure its budget/margin within the host's inhibitor delay and test it.
 
+The Linux unit also runs `silod --host-shutdown` as ExecStop. On an ordinary
+stop/restart this observes the real non-stopping host state and stops nothing.
+During shutdown it uses the live manager, or a restricted temporary manager only
+after proving absence and acquiring both ownership locks. Its shutdown-only
+helper reads the existing instance, rechecks host state after taking its lease,
+and uses exact-run management stops. It does not need SDK assets or credentials.
+Native mutation drain and a fresh final inventory precede successful completion;
+cancelled local RPCs do not count as completed native operations.
+
+The Linux service user needs permission to acquire login1 delay inhibitors.
+An available system bus alone is insufficient; a denied inhibitor reports loss
+of protection. macOS reports `Unsupported` and does not attempt Linux shutdown
+recovery. Real reboot/logind ordering remains a prepared-host qualification.
+
 Audit records live below the private home and rotate; treat them as access records.
 `/healthz` and `/metrics` use the same capability authorization as the lobby.
 Unlabelled machines are reported unmanaged, never adopted or stopped by taild.

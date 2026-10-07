@@ -16,7 +16,13 @@ prost-types = "0.14.4"
 tonic = "0.14.6"
 uuid = "1.24.0"
 thiserror = "2.0.19"
+eyre = "0.6.12"
+nix = { version = "0.31.3", features = ["fs", "user"] }
+tokio = { version = "1.53.1", features = ["net", "time", "sync"] }
+tower = { version = "0.5.3", features = ["util"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "io-util"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }

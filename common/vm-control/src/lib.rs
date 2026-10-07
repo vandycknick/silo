@@ -1,5 +1,5 @@
 //! Native adapters for the typed, same-user daemon management contract.
-//! This crate owns no runtime, transport connection, or session implementation.
+//! This crate owns no runtime or session implementation.
 pub mod create;
 pub mod errors;
 pub mod images;
@@ -12,6 +12,7 @@ pub mod reports;
 pub mod requests;
 pub mod snapshots;
 pub mod spec;
+pub mod transport;
 pub mod updates;
 pub mod values;
 

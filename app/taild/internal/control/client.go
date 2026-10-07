@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	daemonv1 "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
@@ -30,6 +31,7 @@ type Client struct {
 	Machines   daemonv1.MachineServiceClient
 	Networks   daemonv1.NetworkServiceClient
 	Runtime    daemonv1.RuntimeServiceClient
+	endpoint   string
 	connection *grpc.ClientConn
 }
 
@@ -48,15 +50,27 @@ func New(endpoint, helperGeneration string) (*Client, error) {
 		}
 		return metadata.AppendToOutgoingContext(ctx, HelperGenerationHeader, helperGeneration)
 	}
+	var dialMu sync.Mutex
+	connected := false
 	connection, err := grpc.NewClient("passthrough:///silod",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDisableRetry(),
+		grpc.WithIdleTimeout(0),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxMessageBytes), grpc.MaxCallSendMsgSize(MaxMessageBytes)),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			dialMu.Lock()
+			defer dialMu.Unlock()
+			if connected {
+				return nil, errors.New("admitted daemon connection lost; replacement refused")
+			}
 			if err := validateEndpoint(endpoint); err != nil {
 				return nil, err
 			}
-			return (&net.Dialer{}).DialContext(ctx, "unix", endpoint)
+			conn, err := (&net.Dialer{}).DialContext(ctx, "unix", endpoint)
+			if err == nil {
+				connected = true
+			}
+			return conn, err
 		}),
 		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, request, response interface{}, cc *grpc.ClientConn, invoke grpc.UnaryInvoker, options ...grpc.CallOption) error {
 			return invoke(tag(ctx), method, request, response, cc, options...)
@@ -73,11 +87,18 @@ func New(endpoint, helperGeneration string) (*Client, error) {
 		Machines:   daemonv1.NewMachineServiceClient(connection),
 		Networks:   daemonv1.NewNetworkServiceClient(connection),
 		Runtime:    daemonv1.NewRuntimeServiceClient(connection),
+		endpoint:   endpoint,
 		connection: connection,
 	}, nil
 }
 
 func (c *Client) Close() error { return c.connection.Close() }
+
+// DrainMutations waits for actual accepted daemon work, not local RPC waiters.
+func (c *Client) DrainMutations(ctx context.Context, generation string) error {
+	_, err := c.Daemon.DrainMutations(ctx, &daemonv1.DrainMutationsRequest{ExpectedGeneration: generation})
+	return rpcError(ctx, err)
+}
 
 // Admit verifies the bootstrap-selected daemon before any management operation.
 // A mismatch is never a reason to switch to native lifecycle calls.
@@ -89,8 +110,8 @@ func (c *Client) Admit(ctx context.Context, productVersion, generation, home, co
 	if status.ProtocolMajor != 1 || status.ProductVersion != productVersion {
 		return nil, fmt.Errorf("%w: product/protocol", ErrIdentityMismatch)
 	}
-	if status.Generation != generation || string(status.Home) != home || string(status.ConfigDir) != configDir {
-		return nil, fmt.Errorf("%w: generation or Home/config", ErrIdentityMismatch)
+	if status.Generation != generation || string(status.Home) != home || string(status.ConfigDir) != configDir || string(status.ControlEndpoint) != c.endpoint {
+		return nil, fmt.Errorf("%w: generation, Home/config or endpoint", ErrIdentityMismatch)
 	}
 	return status, nil
 }

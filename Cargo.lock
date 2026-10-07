@@ -671,7 +671,6 @@ dependencies = [
  "clap",
  "console",
  "eyre",
- "hyper-util",
  "indicatif",
  "libc",
  "libvm",
@@ -689,7 +688,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tower",
  "utils",
  "uuid",
  "vm-spec",
@@ -4669,8 +4667,11 @@ dependencies = [
 name = "silo-vm-control"
 version = "0.1.0"
 dependencies = [
+ "eyre",
  "forward-spec",
+ "hyper-util",
  "libvm",
+ "nix 0.31.3",
  "policy",
  "prost",
  "prost-types",
@@ -4680,7 +4681,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-stream",
  "tonic",
+ "tower",
  "uuid",
  "vm-spec",
 ]
@@ -4757,6 +4760,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tonic-prost",
  "tower",
  "tracing",
  "utils",
