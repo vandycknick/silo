@@ -127,9 +127,9 @@ func removalDispatch(t *testing.T, ctx context.Context, s *service.Service, call
 func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, "removal-decisions", "user:7")
+	s, caller, registry := nativeService(t, "removal-decisions", "user:7")
 	address := terminalSSHServer(t, s, caller)
-	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name devbox --no-start", 0)
 	before := len(s.Jobs.List(caller.Peer))
 	prompt := "Remove VM 'devbox'? [y/N] "
 	for _, tc := range []struct {
@@ -195,13 +195,13 @@ func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
 		}
 	})
 	t.Run("yes-skips-live-stdin", func(t *testing.T) {
-		removalDispatch(t, ctx, s, caller, "create --name unattended --no-start", 0)
+		removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name unattended --no-start", 0)
 		c := openRemovalClient(t, ctx, address, "rm unattended --yes --json")
 		c.exit(t, 0, true) // stdin remains open and receives no bytes.
 		if strings.Contains(c.diagnostic.text(), "[y/N]") {
 			t.Fatal(c.diagnostic.text())
 		}
-		removalDispatch(t, ctx, s, caller, "create --name untouched-input --no-start", 0)
+		removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name untouched-input --no-start", 0)
 		var consumed, diagnostic bytes.Buffer
 		streams := service.IO{Stdin: io.TeeReader(strings.NewReader("no\n"), &consumed), Stdout: io.Discard, Stderr: &diagnostic}
 		if code := DispatchSession(ctx, s, caller, "rm untouched-input --yes", streams); code != 0 || consumed.Len() != 0 || strings.Contains(diagnostic.String(), "[y/N]") {
@@ -213,8 +213,8 @@ func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
 func TestRemovalOpenSSHNativePreflightAndIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, "removal-preflight", "user:7")
-	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
+	s, caller, registry := nativeService(t, "removal-preflight", "user:7")
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name devbox --no-start", 0)
 	var revoked atomic.Bool
 	peer := caller.Peer
 	caller.Resolve = func(ctx context.Context) (identity.Peer, error) {
@@ -282,9 +282,9 @@ func TestRemovalOpenSSHNativePreflightAndIdentity(t *testing.T) {
 func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, "removal-pin", "user:7")
+	s, caller, registry := nativeService(t, "removal-pin", "user:7")
 	address := terminalSSHServer(t, s, caller)
-	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name devbox --no-start", 0)
 	original, e := s.Show(ctx, caller.Peer, "devbox")
 	if e != nil {
 		t.Fatal(e)
@@ -308,7 +308,7 @@ func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 	if e != nil {
 		t.Fatal("real SDK rename blocked/failed", e)
 	}
-	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name devbox --no-start", 0)
 	replacement, e := s.Show(ctx, caller.Peer, "devbox")
 	if e != nil || replacement.ID == original.ID {
 		t.Fatal(replacement, e)
@@ -324,7 +324,7 @@ func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 	c = openRemovalClient(t, ctx, address, "rm devbox --json")
 	c.prompt(t, "Remove VM 'devbox'? [y/N] ", 1)
 	removalDispatch(t, ctx, s, caller, "rm devbox --yes", 0)
-	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name devbox --no-start", 0)
 	c.send(t, "yes\n")
 	c.exit(t, 3, true)
 	if _, e := s.Show(ctx, caller.Peer, "devbox"); e != nil {
@@ -335,9 +335,9 @@ func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 func TestRemovalOpenSSHNativePTY(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, "removal-pty", "user:7")
+	s, caller, registry := nativeService(t, "removal-pty", "user:7")
 	address := terminalSSHServer(t, s, caller)
-	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name devbox --no-start", 0)
 	for _, answer := range []string{"\x03", "\x04", "no\r"} {
 		c := openTerminalClient(t, address, "rm devbox")
 		c.wait(t, "Remove VM 'devbox'? [y/N] ", 1)
@@ -387,7 +387,7 @@ func TestRemovalOpenSSHNativeRunningForce(t *testing.T) {
 		return p, ctx.Err()
 	}
 	address := terminalSSHServer(t, s, caller)
-	removalDispatch(t, ctx, s, caller, "create --name devbox --no-start", 0)
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name devbox --no-start", 0)
 	// The VM becomes running while a stopped-VM confirmation is pending.
 	c := openRemovalClient(t, ctx, address, "rm devbox --json")
 	c.prompt(t, "Remove VM 'devbox'? [y/N] ", 1)

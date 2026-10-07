@@ -157,6 +157,12 @@ surface accepts operator-approved templates and policies, never arbitrary host
 paths or host file mounts. Only `own` scope is accepted in v1. SIGHUP reloads
 operator documents; inspect logs for rejection and retained prior documents.
 
+There is no global VM image default. Remove `daemon.tailscale.vm.default-image`
+from older configurations; strict configuration loading rejects the removed key.
+Users must supply an OCI image or select a template containing one. Explicit
+images override template images, and both remain subject to the registry allowlist.
+Existing VMs and the separate `daemon.system.image` setting are unchanged.
+
 ## Restart and shutdown
 
 `KillMode=process` is essential: the user service terminates silod, which drains

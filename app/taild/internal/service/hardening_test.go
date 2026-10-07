@@ -22,7 +22,6 @@ import (
 func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 	s := actualService(t)
 	registry := testfixture.OCIRegistry(t, "")
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.Enrollment.Mode = "oauth-app"
 	s.VMNodesEnabled = true
@@ -33,7 +32,7 @@ func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 	}
 	s.Enrollment = &enroll.Manager{Config: s.Config, Secrets: config.Secrets{AppSecret: "tskey-app-test-secret"}, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test"}, Registry: r, OAuth: oauth, Metrics: s.Runtime.Metrics}
 	c := domainCaller(s, "user:1")
-	op, err := s.Create(context.Background(), c, CreateRequest{Name: "offline", Tailscale: true, NoStart: true})
+	op, err := s.Create(context.Background(), c, CreateRequest{Image: registry.Reference, Name: "offline", Tailscale: true, NoStart: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +84,7 @@ func TestShutdownMarkerBlocksNativeMutationsAndRegistryAdmission(t *testing.T) {
 	if err := state.MarkShutdown(s.Config.Home); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Create(context.Background(), c, CreateRequest{Name: "sealed", NoStart: true}); Categorize(err).Exit != 9 {
+	if _, err := s.Create(context.Background(), c, CreateRequest{Image: "ghcr.io/vandycknick/silo/devbox:latest", Name: "sealed", NoStart: true}); Categorize(err).Exit != 9 {
 		t.Fatal(err)
 	}
 	if _, err := s.Jobs.Submit("start", "sealed", "user:1", func(context.Context, func(string)) error { t.Error("sealed job ran"); return nil }); Categorize(err).Exit != 9 {

@@ -23,7 +23,6 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	}
 	registry := testfixture.OCIRegistry(t, testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true))
 	s := actualService(t)
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.Enrollment.Mode = "interactive"
 	s.VMNodesEnabled = true
@@ -51,14 +50,14 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 		}
 	})
 	// Enabling the service does not opt an ordinary creation into enrollment.
-	op, err := s.Create(ctx, c, CreateRequest{Name: "ordinary", NoStart: true})
+	op, err := s.Create(ctx, c, CreateRequest{Image: registry.Reference, Name: "ordinary", NoStart: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	v, err := s.Show(ctx, c.Peer, "ordinary")
 	if err != nil || v.NodeState != state.NoNode {
 		t.Fatal(v, err)
 	}
 	started := time.Now()
-	op, err = s.Create(ctx, c, CreateRequest{Name: "pending", Tailscale: true})
+	op, err = s.Create(ctx, c, CreateRequest{Image: registry.Reference, Name: "pending", Tailscale: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	result := daemon.WaitOperation(t, s.Jobs, c.Peer, op, nil)
 	if result.Completion == nil || !result.Completion.Running || result.Completion.Node != "" || time.Since(started) > 45*time.Second {

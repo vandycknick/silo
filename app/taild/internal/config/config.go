@@ -47,7 +47,6 @@ type Config struct {
 		DisableKeyExpiry bool   `yaml:"disable_key_expiry"`
 	} `yaml:"enrollment"`
 	VM struct {
-		DefaultImage      string    `yaml:"default_image"`
 		AllowedRegistries []string  `yaml:"allowed_registries"`
 		Defaults          Resources `yaml:"defaults"`
 		Ceilings          Ceilings  `yaml:"ceilings"`

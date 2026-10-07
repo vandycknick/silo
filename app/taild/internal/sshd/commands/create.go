@@ -16,7 +16,7 @@ var create = Command{
 	Name:      "create",
 	Summary:   "Create and start a VM unless --no-start is supplied.",
 	Usage:     "create [IMAGE] [-n/--name NAME] [OPTIONS]",
-	Arguments: "IMAGE  Optional OCI reference (template, then configured default).",
+	Arguments: "IMAGE  OCI reference, required unless the selected template provides one.",
 	Example:   "create ghcr.io/example/dev:latest --name devbox --memory 4GiB",
 	Aliases:   []string{"new"},
 	New:       func() Handler { return &createHandler{q: service.CreateRequest{Labels: map[string]string{}}} },
@@ -36,7 +36,7 @@ func (h *createHandler) Flags(f *cmdline.FlagSet) {
 		h.q.Name = v
 		return nil
 	}).Default("generated"))
-	h.image = f.Value("image", "OCI", "Compatibility alias; cannot be combined with IMAGE.", cmdline.NonEmpty(&h.q.Image)).Default("template/configured")
+	h.image = f.Value("image", "OCI", "OCI reference; cannot be combined with IMAGE.", cmdline.NonEmpty(&h.q.Image))
 	f.Value("template", "NAME", "Apply a template; explicit options take precedence.", cmdline.NonEmpty(&h.q.Template)).Default("none")
 	f.Value("policy", "NAME", "Named network policy.", cmdline.NonEmpty(&h.q.PolicyRef)).Default("template/configured")
 	f.Value("cpus", "N", "Positive CPU count, 1..255, subject to grants.", cmdline.Count(&h.q.CPUs)).Default("configured")
@@ -81,7 +81,6 @@ func (h *createHandler) Defaults(c config.Config) map[string]string {
 		"cpus":   cpus + suffix,
 		"memory": c.VM.Defaults.Memory.String() + suffix,
 		"disk":   c.VM.Defaults.Disk.String() + suffix,
-		"image":  service.ImageDefaultForHelp(c) + suffix,
 	}
 }
 

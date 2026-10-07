@@ -15,20 +15,19 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 	// Install fixture TLS trust before the real daemon inherits its environment.
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Config.Enrollment.Mode = "interactive"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Registry: enroll.NewRegistry(), Pin: state.NodePin{Tailnet: "fixture", Suffix: "tail.test"}}
 	c := domainCaller(s, "user:7")
 	tagged := domainCaller(s, "tag:creator")
-	if _, err := s.ValidateCreate(t.Context(), tagged.Peer, CreateRequest{Tailscale: true, Tags: []string{"tag:delegated"}}); err != nil {
+	if _, err := s.ValidateCreate(t.Context(), tagged.Peer, CreateRequest{Image: registry.Reference, Tailscale: true, Tags: []string{"tag:delegated"}}); err != nil {
 		t.Fatal("taild tried to replace Tailscale tagOwners", err)
 	}
-	if _, err := s.Create(t.Context(), c, CreateRequest{Name: "invalid", Tags: []string{"tag:dev"}}); err == nil {
+	if _, err := s.Create(t.Context(), c, CreateRequest{Image: registry.Reference, Name: "invalid", Tags: []string{"tag:dev"}}); err == nil {
 		t.Fatal("tag without tailscale accepted")
 	}
-	op, err := s.Create(t.Context(), c, CreateRequest{Name: "tagged", Tailscale: true, Tags: []string{"tag:Dev", "tag:testing", "tag:dev"}, NoStart: true})
+	op, err := s.Create(t.Context(), c, CreateRequest{Image: registry.Reference, Name: "tagged", Tailscale: true, Tags: []string{"tag:Dev", "tag:testing", "tag:dev"}, NoStart: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 	d, err := s.Runtime.Control.Inspect(t.Context(), "tagged")
 	if err != nil {

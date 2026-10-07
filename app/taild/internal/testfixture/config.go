@@ -22,7 +22,6 @@ func Config() config.Config {
 	c.Tailnet.Hostname, c.Tailnet.Tag = "silo", "tag:silo"
 	c.Tailnet.Capability = "github.com/vandycknick/silo/cap/taild"
 	c.Enrollment.Mode = "oauth-app"
-	c.VM.DefaultImage = "ghcr.io/vandycknick/silo/devbox:latest"
 	c.VM.AllowedRegistries = []string{"ghcr.io/vandycknick"}
 	c.VM.Defaults = config.Resources{CPUs: 2, Memory: 4 << 30, Disk: 20 << 30}
 	c.VM.Ceilings = config.Ceilings{Resources: config.Resources{CPUs: 8, Memory: 32 << 30, Disk: 200 << 30}, VMs: 5}

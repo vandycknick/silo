@@ -17,7 +17,7 @@ import (
 func TestRemovalOpenSSHLocalTailscaleAndStoppedShow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
-	s, caller, _ := nativeService(t, "local-removal", "user:7")
+	s, caller, registry := nativeService(t, "local-removal", "user:7")
 	caller.Peer.Login = "owner@example.test"
 	// Keep the fresh identity resolver consistent with this explicit test input.
 	peer := caller.Peer
@@ -25,7 +25,7 @@ func TestRemovalOpenSSHLocalTailscaleAndStoppedShow(t *testing.T) {
 	s.VMNodesEnabled = true
 	s.Config.Enrollment.Mode = "interactive"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "tail.test"}, Registry: enroll.NewRegistry()}
-	removalDispatch(t, ctx, s, caller, "create --name local-vm --tailscale --no-start", 0)
+	removalDispatch(t, ctx, s, caller, "create "+registry.Reference+" --name local-vm --tailscale --no-start", 0)
 	d, err := s.Runtime.Control.Inspect(ctx, "local-vm")
 	if err != nil {
 		t.Fatal(err)

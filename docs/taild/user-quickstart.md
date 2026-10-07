@@ -35,7 +35,7 @@ short-lived and one-use.
 You may request tags you are permitted to assign through Tailscale:
 
 ```sh
-ssh silo create --name tagged-dev --tailscale --tag tag:dev --tag tag:testing
+ssh silo create --name tagged-dev --template devbox --tailscale --tag tag:dev --tag tag:testing
 ```
 
 Tailscale evaluates tag-owner permissions using the authenticating identity. The
@@ -62,9 +62,11 @@ as an image. With no name, Silo generates one and reports it in progress and the
 JSON operation's `vm` field. There are at most three collision proposals before
 publication. Explicit names stay exact, and a later conflict fails rather than
 renaming the VM. Options may appear before or after IMAGE. `--image` is a
-compatibility alias, but cannot be combined with positional IMAGE. Without an
-image, the template then configured image applies. Create starts the VM by
-default; `--no-start` leaves it stopped and defers enrollment until startup.
+compatibility alias, but cannot be combined with positional IMAGE. An image must
+be supplied explicitly or by the selected template; there is no global default
+image. An explicit image overrides the template image. If neither provides one,
+creation fails with a usage error before reserving a name or starting work.
+Create starts the VM by default; `--no-start` leaves it stopped and defers enrollment until startup.
 The former `--no-tailnet` flag has been removed; omitting `--tailscale` is the default.
 
 Interactive terminals show an updating Silo-style spinner followed by a concise

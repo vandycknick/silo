@@ -16,7 +16,7 @@ func TestNativeCreateProvisionUserParser(t *testing.T) {
 	p := caller.Peer
 	r := s.Runtime
 	for _, flags := range []string{"--provision-user", "--provision-user nickvd", "--provision-user root:0:0:/root", "--provision-user nickvd:1000:1000:/home/x:extra", "--provision-user nickvd:1000:1000:/home/x --provision-user other:1001:1001:/home/y"} {
-		if code := DispatchSession(ctx, s, caller, "create --name invalid-user --no-start "+flags, service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 2 {
+		if code := DispatchSession(ctx, s, caller, "create "+registry.Reference+" --name invalid-user --no-start "+flags, service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 2 {
 			t.Fatalf("%s: %d", flags, code)
 		}
 	}
@@ -27,7 +27,7 @@ func TestNativeCreateProvisionUserParser(t *testing.T) {
 		t.Fatal("invalid account pulled a VM image")
 	}
 	for _, test := range []struct{ name, flags, user string }{{"default-root", "", ""}, {"opt-in", "--provision-user nickvd:1000:1000:/home/nickvd", "nickvd"}} {
-		if code := DispatchSession(ctx, s, caller, "create --name "+test.name+" --no-start "+test.flags, service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 0 {
+		if code := DispatchSession(ctx, s, caller, "create "+registry.Reference+" --name "+test.name+" --no-start "+test.flags, service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 0 {
 			t.Fatal(test.name, code)
 		}
 		d, err := r.Control.Inspect(ctx, test.name)

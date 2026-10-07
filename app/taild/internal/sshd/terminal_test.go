@@ -523,7 +523,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	address := terminalSSHServer(t, svc, caller)
 	var diagnostic bytes.Buffer
 	beforeCreate := time.Now().Truncate(time.Second)
-	if code := DispatchSession(ctx, svc, caller, "create --name terminal-vm --no-start", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
+	if code := DispatchSession(ctx, svc, caller, "create "+registry.Reference+" --name terminal-vm --no-start", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
 		t.Fatal(code, diagnostic.String())
 	}
 	view, e := svc.Show(ctx, peer, "terminal-vm")
@@ -585,7 +585,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	payload := "#!/bin/sh\nexit 0\n#" + strings.Repeat("x", 5000) + "\r\n# controls:\x03\x04\x08\x7f\t\x1b[200~paste\x1b[201~\r\n"
 	for _, mode := range []string{"exec", "lobby"} {
 		name := "userdata-" + mode
-		command := "create --name " + name + " --no-start --userdata -"
+		command := "create " + registry.Reference + " --name " + name + " --no-start --userdata -"
 		if mode == "exec" {
 			out, errOut, code := sshPipeCommand(t, address, command, []byte(payload), true)
 			if code != 0 || len(out) != 0 || bytes.Contains(errOut, []byte("\x1b[?2004h")) {
@@ -616,7 +616,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 		}
 	}
 	diagnostic.Reset()
-	if code := DispatchSession(ctx, svc, caller, "create --name terminal-guest", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
+	if code := DispatchSession(ctx, svc, caller, "create "+registry.Reference+" --name terminal-guest", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
 		t.Fatal(code, diagnostic.String())
 	}
 	lobby := openTerminalClient(t, address, "")

@@ -27,7 +27,7 @@ func TestOpenSSHSpinnerUsesActualImagePullAndClearsBeforePrompt(t *testing.T) {
 	address := terminalSSHServer(t, s, caller)
 	c := openTerminalClient(t, address, "")
 	c.wait(t, lobbyPrompt, 1)
-	c.send(t, "create --name spinner-vm --no-start\r")
+	c.send(t, "create "+registry.Reference+" --name spinner-vm --no-start\r")
 	select {
 	case <-entered:
 	case <-ctx.Done():
@@ -52,7 +52,7 @@ func TestOpenSSHSpinnerUsesActualImagePullAndClearsBeforePrompt(t *testing.T) {
 	c.send(t, "\x04")
 	c.exit(t)
 	for _, tty := range []bool{false, true} {
-		out, diagnostic, code := sshPipeCommand(t, address, "create --no-start --json", nil, tty)
+		out, diagnostic, code := sshPipeCommand(t, address, "create "+registry.Reference+" --no-start --json", nil, tty)
 		if code != 0 || len(diagnostic) != 0 || !strings.Contains(string(out), `"completion":`) {
 			t.Fatal("JSON progress leaked", code, string(out), string(diagnostic))
 		}

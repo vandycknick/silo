@@ -42,7 +42,7 @@ func TestRealMarkerFailureStillDeniesSynchronousMutations(t *testing.T) {
 			t.Errorf("%s admitted without durable marker: %v", action, err)
 		}
 	}
-	if _, err := s.Create(context.Background(), c, CreateRequest{Name: "sealed", NoStart: true}); err == nil || Categorize(err).Exit != 9 {
+	if _, err := s.Create(context.Background(), c, CreateRequest{Image: "ghcr.io/vandycknick/silo/devbox:latest", Name: "sealed", NoStart: true}); err == nil || Categorize(err).Exit != 9 {
 		t.Error("create admitted", err)
 	}
 }
@@ -54,13 +54,12 @@ func TestActualSDKCreateInterruptedByMemoryGateWhenMarkerWriteFails(t *testing.T
 	s.Shutdown = &state.ShutdownGate{}
 	s.Jobs.Shutdown = s.Shutdown
 	c := domainCaller(s, "user:1")
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var enteredOnce, releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
 	registry.BeforeManifest = func() { enteredOnce.Do(func() { close(entered); <-release }) }
-	op, err := s.Create(context.Background(), c, CreateRequest{Name: "interrupted"})
+	op, err := s.Create(context.Background(), c, CreateRequest{Image: registry.Reference, Name: "interrupted"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +88,7 @@ func TestActualSDKCreateInterruptedByMemoryGateWhenMarkerWriteFails(t *testing.T
 	if state.ShutdownPending(s.Config.Home) {
 		t.Fatal("unexpected durable marker")
 	}
-	if _, err := s.Create(context.Background(), c, CreateRequest{Name: "new"}); err == nil || Categorize(err).Exit != 9 {
+	if _, err := s.Create(context.Background(), c, CreateRequest{Image: registry.Reference, Name: "new"}); err == nil || Categorize(err).Exit != 9 {
 		t.Fatal("new create admitted", err)
 	}
 	for _, action := range []identity.Action{identity.Exec, identity.Shell, identity.TemplateManage} {
