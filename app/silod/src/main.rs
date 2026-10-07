@@ -6,6 +6,7 @@ mod paths;
 mod provision;
 mod record;
 mod runtime;
+mod shutdown;
 mod status;
 mod storage;
 mod supervisor;
@@ -43,6 +44,9 @@ struct Args {
     /// Stop the installation's VMs if no daemon is running, then exit.
     #[arg(long)]
     stop: bool,
+    /// Internal Linux user-service ExecStop entrypoint.
+    #[arg(long, hide = true, conflicts_with_all = ["stop", "check"])]
+    host_shutdown: bool,
 }
 
 #[tokio::main]
@@ -84,6 +88,9 @@ async fn run(args: Args) -> eyre::Result<()> {
             "silod is a per-user daemon; run without sudo/root"
         )));
     }
+    if args.host_shutdown {
+        return shutdown::run().await;
+    }
     let host = configuration(libvm::HostPaths::from_env().map_err(Into::into))?;
     // Validate before creating daemon state or service locks.
     let global = configuration(GlobalConfig::load_from(&host))?;
@@ -115,6 +122,11 @@ async fn run(args: Args) -> eyre::Result<()> {
     let host = configuration(silo_config::prepare_host_paths(&host))?;
     let paths = SystemPaths::from_host(&host);
     let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
+    let socket_ownership = if args.stop {
+        None
+    } else {
+        Some(control::socket::SocketOwnership::acquire()?)
+    };
     let generation = uuid::Uuid::new_v4();
     let system_status = if features.system || args.stop {
         Some(supervisor::initial_status(&paths.docker_socket())?)
@@ -129,8 +141,12 @@ async fn run(args: Args) -> eyre::Result<()> {
         system_status.clone(),
     )?);
     if args.stop {
-        let result =
-            supervisor::stop_installation(&paths, system_status.unwrap(), &publisher).await;
+        let result = supervisor::stop_installation(
+            &paths,
+            system_status.ok_or_else(|| eyre::eyre!("stop has no initial system status"))?,
+            &publisher,
+        )
+        .await;
         publisher.set_core(
             if result.is_ok() {
                 silod_spec::status::CorePhase::Stopped
@@ -150,7 +166,10 @@ async fn run(args: Args) -> eyre::Result<()> {
         generation,
         publisher.clone(),
     ));
-    let server = match control::socket::BoundServer::bind(state.clone()) {
+    let server = match socket_ownership
+        .ok_or_else(|| eyre::eyre!("daemon control ownership unavailable"))?
+        .bind(state.clone())
+    {
         Ok(server) => server,
         Err(error) => {
             publisher.set_core(
@@ -221,7 +240,11 @@ async fn run(args: Args) -> eyre::Result<()> {
                         state: silod_spec::status::ComponentState::Failed,
                         diagnostic: Some(format!("helper supervisor failed: {error:#}")),
                         approval_url: None, dns_name: None, restart_count: 0,
-                        shutdown_protection: silod_spec::status::ShutdownProtection::Unavailable,
+                        shutdown_protection: if cfg!(target_os = "macos") {
+                            silod_spec::status::ShutdownProtection::Unsupported
+                        } else {
+                            silod_spec::status::ShutdownProtection::Unavailable
+                        },
                     })?;
                 }
             }
@@ -332,6 +355,15 @@ mod tests {
         );
         for flag in ["--state", "--home"] {
             assert!(Args::try_parse_from(["silod", flag, "/tmp/unused"]).is_err());
+        }
+    }
+    #[test]
+    fn host_shutdown_is_explicit_and_not_ordinary_stop() {
+        let args = Args::try_parse_from(["silod", "--host-shutdown"]).unwrap();
+        assert!(args.host_shutdown);
+        assert!(!args.stop);
+        for flag in ["--stop", "--check"] {
+            assert!(Args::try_parse_from(["silod", "--host-shutdown", flag]).is_err());
         }
     }
 

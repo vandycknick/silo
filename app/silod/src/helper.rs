@@ -139,6 +139,79 @@ async fn write_frame(
         .map_err(|_| eyre::eyre!("helper bootstrap write deadline expired"))??;
     Ok(())
 }
+fn bootstrap(
+    identity: &w::DaemonStatus,
+    c: &silo_config::tailscale::TailscaleConfig,
+    generation: uuid::Uuid,
+) -> eyre::Result<w::HelperBootstrap> {
+    Ok(w::HelperBootstrap {
+        protocol_major: identity.protocol_major,
+        product_version: identity.product_version.clone(),
+        daemon_generation: identity.generation.clone(),
+        helper_generation: generation.to_string(),
+        control_endpoint: identity.control_endpoint.clone(),
+        home: identity.home.clone(),
+        config_dir: identity.config_dir.clone(),
+        settings: Some(settings(c)?),
+        ..Default::default()
+    })
+}
+
+fn spawn(path: &Path, shutdown_only: bool) -> eyre::Result<tokio::process::Child> {
+    let mut command = Command::new(path);
+    if shutdown_only {
+        command.arg("--shutdown-only");
+    }
+    command
+        .args(["--bootstrap-fd", "0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    for (key, _) in std::env::vars_os() {
+        let bytes = key.as_encoded_bytes();
+        if bytes.starts_with(b"SILO_") || bytes.starts_with(b"TS_") || bytes.starts_with(b"TSNET_")
+        {
+            command.env_remove(key);
+        }
+    }
+    Ok(command.spawn()?)
+}
+
+#[cfg(target_os = "linux")]
+/// One-shot owner pipe, deliberately independent of normal helper generations.
+pub(crate) async fn host_shutdown(
+    identity: &w::DaemonStatus,
+    config: &silo_config::tailscale::TailscaleConfig,
+    deadline: tokio::time::Instant,
+) -> eyre::Result<()> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let path = sibling(&exe, "taild", true).wrap_err("matching taild sibling unavailable")?;
+    let frame = encode(bootstrap(identity, config, uuid::Uuid::new_v4())?)?;
+    let mut child = spawn(&path, true)?;
+    let mut owner = child
+        .stdin
+        .take()
+        .ok_or_else(|| eyre::eyre!("helper owner pipe unavailable"))?;
+    let result = tokio::time::timeout_at(deadline, async {
+        write_frame(&mut owner, &frame, Duration::from_secs(2)).await?;
+        drop(frame);
+        let status = child.wait().await?;
+        eyre::ensure!(status.success(), "shutdown helper exited: {status}");
+        Ok::<(), eyre::Report>(())
+    })
+    .await
+    .map_err(|_| eyre::eyre!("shutdown helper deadline expired"))
+    .and_then(|r| r);
+    if result.is_err() {
+        tokio::time::timeout(Duration::from_secs(2), reap(&mut child))
+            .await
+            .map_err(|_| eyre::eyre!("shutdown helper kill/reap deadline expired"))??;
+    }
+    // EOF is owner loss, so retain the writer until the child is reaped.
+    drop(owner);
+    result
+}
 async fn prepare(
     state: &ControlState,
     c: &silo_config::tailscale::TailscaleConfig,
@@ -160,32 +233,18 @@ async fn prepare(
     let host = &state.host;
     let store = FileStore::new(host.home());
     // Allocate credential fields last and erase them even when later reads fail.
-    let mut bootstrap = w::HelperBootstrap {
-        protocol_major: 1,
-        product_version: env!("CARGO_PKG_VERSION").into(),
-        daemon_generation: state.generation.to_string(),
-        helper_generation: generation.to_string(),
-        control_endpoint: silo_vm_control::path_to_wire(
-            &libvm::HostPaths::run_root().join("silod/control.sock"),
-        ),
-        home: silo_vm_control::path_to_wire(&host.home().canonicalize()?),
-        config_dir: silo_vm_control::path_to_wire(&host.config_dir().canonicalize()?),
-        templates_dir: document(host.config_dir().join("templates"))?,
-        policies_dir: document(host.config_dir().join("policies"))?,
-        runtime_components: Some(w::RuntimeComponents {
-            supervisor_path: silo_vm_control::path_to_wire(components.supervisor()),
-            netd_path: silo_vm_control::path_to_wire(components.netd()),
-            kernel_path: silo_vm_control::path_to_wire(components.kernel()),
-            initramfs_path: silo_vm_control::path_to_wire(components.initramfs()),
-            agent_path: silo_vm_control::path_to_wire(components.agent()),
-            asset_dir: silo_vm_control::path_to_wire(components.asset_dir()),
-        }),
-        native_bridge_path: silo_vm_control::path_to_wire(&bridge),
-        settings: Some(settings(c)?),
-        client_secret: None,
-        oauth_app_secret: None,
-        api_token: None,
-    };
+    let mut bootstrap = bootstrap(&state.get_status().await?, c, generation)?;
+    bootstrap.templates_dir = document(host.config_dir().join("templates"))?;
+    bootstrap.policies_dir = document(host.config_dir().join("policies"))?;
+    bootstrap.runtime_components = Some(w::RuntimeComponents {
+        supervisor_path: silo_vm_control::path_to_wire(components.supervisor()),
+        netd_path: silo_vm_control::path_to_wire(components.netd()),
+        kernel_path: silo_vm_control::path_to_wire(components.kernel()),
+        initramfs_path: silo_vm_control::path_to_wire(components.initramfs()),
+        agent_path: silo_vm_control::path_to_wire(components.agent()),
+        asset_dir: silo_vm_control::path_to_wire(components.asset_dir()),
+    });
+    bootstrap.native_bridge_path = silo_vm_control::path_to_wire(&bridge);
     let (tx, rx) = tokio::sync::oneshot::channel();
     // FileStore uses a blocking advisory lock. An external same-user writer
     // must not pin Tokio runtime shutdown; this thread never owns a lifeline.
@@ -226,7 +285,11 @@ fn publish(
         approval_url: None,
         dns_name: None,
         restart_count: count,
-        shutdown_protection: ShutdownProtection::Unavailable,
+        shutdown_protection: if cfg!(target_os = "macos") {
+            ShutdownProtection::Unsupported
+        } else {
+            ShutdownProtection::Unavailable
+        },
     })
 }
 fn terminate(child: &tokio::process::Child) -> eyre::Result<()> {
@@ -278,24 +341,7 @@ pub(crate) async fn serve(
         };
         publish(&publisher, ComponentState::Starting, count, None)?;
         state.set_helper_generation(Some(generation)).await;
-        let mut command = Command::new(path);
-        command
-            .args(["--bootstrap-fd", "0"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        for (key, _) in std::env::vars_os() {
-            let bytes = key.as_encoded_bytes();
-            if bytes.starts_with(b"SILO_")
-                || bytes.starts_with(b"TS_")
-                || bytes.starts_with(b"TSNET_")
-            {
-                command.env_remove(key);
-            }
-        }
-        let spawned = command.spawn();
-        let mut child = match spawned {
+        let mut child = match spawn(&path, false) {
             Ok(child) => child,
             Err(error) => {
                 state.set_helper_generation(None).await;
@@ -368,6 +414,50 @@ pub(crate) async fn serve(
 mod tests {
     use crate::helper::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    #[test]
+    fn shutdown_frame_never_resolves_assets_documents_or_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = root.path().join("config");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        // These paths would fail ordinary preparation; shutdown never reads them.
+        std::fs::write(home.join("secrets.json"), b"invalid secrets").unwrap();
+        symlink(root.path().join("missing"), config.join("templates")).unwrap();
+        symlink(root.path().join("missing"), config.join("policies")).unwrap();
+        let daemon = uuid::Uuid::new_v4();
+        let helper = uuid::Uuid::new_v4();
+        let identity = w::DaemonStatus {
+            protocol_major: 1,
+            product_version: env!("CARGO_PKG_VERSION").into(),
+            generation: daemon.to_string(),
+            home: silo_vm_control::path_to_wire(&home.canonicalize().unwrap()),
+            config_dir: silo_vm_control::path_to_wire(&config.canonicalize().unwrap()),
+            control_endpoint: b"/private/control.sock".to_vec(),
+            ..Default::default()
+        };
+        let config = silo_config::GlobalConfig::default();
+        let frame = encode(bootstrap(&identity, config.tailscale(), helper).unwrap()).unwrap();
+        let decoded = w::HelperBootstrap::decode(&frame[4..]).unwrap();
+        assert_eq!(decoded.daemon_generation, daemon.to_string());
+        assert_eq!(decoded.helper_generation, helper.to_string());
+        assert_eq!(decoded.home, identity.home);
+        assert_eq!(decoded.config_dir, identity.config_dir);
+        assert_eq!(decoded.control_endpoint, identity.control_endpoint);
+        assert!(decoded.native_bridge_path.is_empty());
+        assert!(decoded.runtime_components.is_none());
+        assert!(decoded.templates_dir.is_none());
+        assert!(decoded.policies_dir.is_none());
+        assert!(decoded.client_secret.is_none());
+        assert!(decoded.oauth_app_secret.is_none());
+        assert!(decoded.api_token.is_none());
+        assert_eq!(
+            decoded.settings,
+            Some(settings(config.tailscale()).unwrap())
+        );
+        assert!(!home.join("state.db").exists());
+        assert!(!home.join("taild").exists());
+    }
     #[test]
     fn siblings_reject_links_writable_and_nonexecutable_files() {
         let root = tempfile::tempdir().unwrap();

@@ -100,7 +100,7 @@ func TestActualStopAllUsesNativeManagedRecords(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	result, err := StopAll(ctx, r)
+	result, err := StopAll(ctx, r.Control, r.Instance)
 	if err != nil || result.Issued != 1 || result.Finished != 1 || result.Failed != 0 {
 		t.Fatal(result, err)
 	}

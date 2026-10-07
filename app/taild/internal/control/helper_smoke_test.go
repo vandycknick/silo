@@ -66,6 +66,18 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	hostProbe, finishProbe := context.WithTimeout(ctx, 3*time.Second)
+	hostState, _ := exec.CommandContext(hostProbe, "systemctl", "is-system-running").Output()
+	finishProbe()
+	guardAvailable := false
+	switch strings.TrimSpace(string(hostState)) {
+	case "running", "degraded", "starting", "initializing", "maintenance", "offline":
+		guardAvailable = true
+	case "stopping":
+		t.Skip("host is actually shutting down")
+	default:
+		t.Log("actual host-state guard unavailable; helper lifetime checks still run")
+	}
 	runCLI := func(args ...string) {
 		t.Helper()
 		command := exec.CommandContext(ctx, filepath.Join(bin, "silo"), args...)
@@ -201,6 +213,15 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 	// this surviving VMM would keep the orphan helper alive after silod dies.
 	runCLI("create", "--name", "helper-lifetime", "--cpus", "1", "--memory", "512MiB", "--network", "none", registry.Reference)
 	machineCreated = true
+	if _, err := client.Machines.UpdateMachine(ctx, &w.UpdateMachineRequest{
+		Machine: &w.MachineRef{Reference: &w.MachineRef_Name{Name: "helper-lifetime"}},
+		Update: &w.MachineUpdate{Labels: &w.StringMap{Values: map[string]string{
+			"io.silo.taild.owner": "user:7", "io.silo.taild.name": "helper-lifetime",
+			"io.silo.taild.instance": instance, "io.silo.taild.node.mode": "none",
+		}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	runCLI("start", "helper-lifetime")
 	machine, err := client.Machines.InspectMachine(ctx, &w.MachineRef{Reference: &w.MachineRef_Name{Name: "helper-lifetime"}})
 	if err != nil {
@@ -225,6 +246,26 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 			t.Fatalf("helper instance changed: %q -> %q (%v)", instance, current, err)
 		}
 	}
+	guardShutdown := func(scenario string) {
+		t.Helper()
+		if !guardAvailable {
+			return
+		}
+		guard, finish := context.WithTimeout(ctx, 20*time.Second)
+		defer finish()
+		command := exec.CommandContext(guard, filepath.Join(bin, "silod"), "--host-shutdown")
+		command.Env = append(append([]string(nil), environment...),
+			"SILO_RUNTIME_DIR="+filepath.Join(home, "absent-runtime"),
+			"SILO_GO_FFI_PATH="+filepath.Join(home, "absent-bridge"))
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("%s host-shutdown guard: %v: %s", scenario, err, output)
+		}
+		assertRun()
+		if _, err := os.Lstat(filepath.Join(home, "state", "taild", "shutdown")); !os.IsNotExist(err) {
+			t.Fatalf("%s created a shutdown marker on a non-stopping host: %v", scenario, err)
+		}
+		t.Logf("%s guarded shutdown preserved managed VM on actual host state %s", scenario, strings.TrimSpace(string(hostState)))
+	}
 	if err := unix.Kill(first, unix.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
@@ -237,6 +278,11 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 		t.Fatalf("helper failure did not preserve core/report restart: %v", status)
 	}
 	assertRun()
+	guardShutdown("live manager")
+	currentStatus, err := client.Daemon.GetStatus(ctx, &emptypb.Empty{})
+	if err != nil || currentStatus.GetGeneration() != status.Generation || !helperAlive(replacement) {
+		t.Fatalf("one-shot shutdown replaced the live manager/helper: %v %v", currentStatus, err)
+	}
 	if err := daemon.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +297,7 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 	}
 	assertRun()
 	_ = client.Close()
+	guardShutdown("crashed manager with stale socket")
 	client = startDaemon()
 	gracefulHelper := waitHelper(0)
 	if err := daemon.Process.Signal(unix.SIGTERM); err != nil {
@@ -269,6 +316,7 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 		t.Fatal("normal shutdown did not reap helper")
 	}
 	assertRun()
+	guardShutdown("stopped manager without socket")
 	t.Logf("helper replacement %d -> %d; owner EOF and normal drain preserved instance=%s VM=%s run=%s", first, replacement, instance, machine.Id, machine.GetRunId())
 }
 

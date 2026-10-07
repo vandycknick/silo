@@ -308,13 +308,20 @@ also accepted). The last 4 MiB
 are retained, follow uses bounded line buffering, and path/credential diagnostics
 are redacted. Native error text never reaches remote responses.
 
-Shutdown seals admission, closes sessions and drains jobs within a shared 90-second
-budget. Operations have a separate daemon-owned context; it is cancelled when the
-drain expires. SDK Close starts only after both sessions and jobs drain successfully
-and budget remains; its wait is bounded by that same deadline. A timed-out drain or
-blocked library close reports incomplete runtime cleanup and leaves handle cleanup
-to process exit. No shutdown path calls Stop or Remove. Restart
-reconciles libvm records; it neither replays operations nor creates a service database.
+Ordinary termination seals local admission, closes sessions and drains jobs
+within the parent's bounded cleanup window. SDK Close starts only after sessions
+and jobs drain, and is bounded by the same deadline. Incomplete cleanup is
+reported rather than treated as native completion. Ordinary termination never
+requests VM Stop or Remove; restart reads authoritative libvm state through silod.
+
+Linux host shutdown is separate: authenticated logind episodes and the guarded
+`silod --host-shutdown` ExecStop path share run-fenced management stops, actual
+server mutation drain and a fresh final inventory. The shutdown-only child
+requires neither SDK assets nor a bridge and never starts a frontend. Cancellation
+retains admission sealing until native work, jobs and helpers settle and fresh
+host/episode checks permit recovery. macOS explicitly reports shutdown protection
+as unsupported. See [the shutdown contract](docs/supervision.md) for deadlines,
+ownership and qualification requirements.
 
 ## Templates and policies (phase 12)
 

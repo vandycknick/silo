@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ func TestRealPipeFrameRejectionBeforeNativeInitialization(t *testing.T) {
 			}
 			_ = w.Close()
 			fd := ownedFD(t, r)
-			if _, _, err := Read(context.Background(), fd); err == nil {
+			if _, _, err := Read(context.Background(), fd, Normal); err == nil {
 				t.Fatal(err)
 			}
 			if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != unix.EBADF {
@@ -70,7 +71,7 @@ func TestRealPipeFrameRejectionBeforeNativeInitialization(t *testing.T) {
 		var header [4]byte
 		binary.BigEndian.PutUint32(header[:], uint32(len(body)))
 		go func() { _, _ = w.Write(header[:2]); _, _ = w.Write(header[2:]); _, _ = w.Write(body) }()
-		if _, _, err := Read(context.Background(), ownedFD(t, r)); err == nil {
+		if _, _, err := Read(context.Background(), ownedFD(t, r), Normal); err == nil {
 			t.Fatal(err)
 		}
 	}
@@ -96,7 +97,7 @@ func TestRealPipeBootstrapDeadlineAndCancellation(t *testing.T) {
 			cancel()
 		}
 		start := time.Now()
-		_, err = readFrame(ctx, reader, 30*time.Millisecond)
+		_, err = readFrame(ctx, reader, 30*time.Millisecond, Normal)
 		cancel()
 		_ = reader.Close()
 		if err == nil || time.Since(start) > time.Second {
@@ -113,7 +114,7 @@ func TestRequiredFIFOAndAccessMode(t *testing.T) {
 	defer file.Close()
 	r, w := pipe(t)
 	for _, fd := range []int{-1, ownedFD(t, file), ownedFD(t, w)} {
-		if _, _, err := Read(context.Background(), fd); err == nil {
+		if _, _, err := Read(context.Background(), fd, Normal); err == nil {
 			t.Fatal("invalid descriptor accepted", fd)
 		}
 	}
@@ -171,7 +172,10 @@ func TestOptionalCredentialBoundsAndNoDebugExposure(t *testing.T) {
 }
 
 func TestCanonicalRootsRejectAliasesAndWrongFileTypes(t *testing.T) {
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := canonical([]byte(root), true); err != nil {
 		t.Fatal(err)
 	}

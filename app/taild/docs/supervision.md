@@ -41,38 +41,45 @@ still denies exec, shell, document mutations and final create/start authorizatio
 The error explicitly reports loss of cross-process durable protection rather
 than pretending the marker exists. Recovery uses episode revisions, so an old
 cancellation cannot clear a newer shutdown latch.
-Every valid instance/owner/name-labelled VM receives a concurrent public SDK
-stop before operations drain. Existing operations observe cancellation, releasing
-enrollment leases; synchronous native calls may still run past cancellation.
-After operation drain a second inventory stops late durable creations. Graceful
-stop uses part of the remaining budget, followed by force only while the parent
-budget remains. Native lifecycle/run identity locks remain authoritative.
-Logs distinguish issued, returned and failed stops. A deadline cannot imply that
-blocked native calls finished.
+Every valid instance/owner/name-labelled VM is inspected and stopped through
+silod's generated management API, with at most 16 concurrent workers. Graceful
+and forced requests retain the same inspected run ID. The first stop pass is
+followed by `DrainMutations` for actual accepted native work, a fresh inventory
+and final stop pass, then another actual drain. Cancelled RPC waiters are not
+native completion. Jobs and shutdown helpers must also settle before early
+inhibitor release; the deadline still releases its FD on time and reports
+incomplete work rather than inventing success.
 
-The fallback `taild stop-vms --only-when-shutting-down` reads **stdout** from the
-real `systemctl is-system-running`, including its nonzero `stopping` result.
-Unknown/failed observations diagnose and stop nothing. It does not acquire the
-daemon-exclusive home lock: ExecStop runs before the main process gets SIGTERM.
-It writes the same seal, uses native per-VM locks and re-inventories through its
-bounded budget. The still-running main process observes the seal and interrupts
-existing jobs. Only existing valid instance ownership is read, never invented.
-An independent helper lease lives until helper process exit, including native
-threads still in flight. Cancellation/restart recovery waits for that lease;
-guarded helpers recheck systemctl after acquiring it so a delayed helper cannot
-stop newly admitted VMs after a cancelled shutdown.
+Linux service `ExecStop` invokes the adjacent `silod --host-shutdown`.
+It uses an authenticated existing manager, or, only after proven absence,
+holds both Home and per-UID ownership before publishing a temporary restricted
+control service. That service admits only status, mutation drain, machine
+list/inventory/inspect and run-fenced stop, never creation or session access.
+Both paths launch `taild --shutdown-only --bootstrap-fd 0` through the normal
+framed owner pipe, without loading the SDK, native assets, documents or secrets,
+creating an instance, replacing the normal helper generation or starting listeners.
+
+The child reads **stdout** from the real `systemctl is-system-running`,
+including its nonzero `stopping` result. Unknown observations fail closed;
+ordinary non-stopping observations are a no-op. It reads only existing instance
+ownership, acquires the independent shutdown-helper lease, rechecks host state,
+then persists the marker and runs the same stop/drain/fresh-final-pass sequence.
+The lease survives to helper exit. Its management connection is pinned to the
+admitted daemon; replacement connections and automatic replay are forbidden.
 
 On authenticated false, FD reacquisition runs independently of old native drain.
-One stop/drain worker remains tracked until its actual native calls, jobs and
-helper processes finish. Retiring that worker does not recover its old revision:
-recovery targets the latest cancelled episode, even if it never began a sweep.
-PreparingForShutdown is checked again and the current episode is checked before
-and after the durable latch compare-and-swap. Only then can admission resume.
-Thus A draining after a received B true/false pair cannot leave B permanently
-sealed, and no false can reopen a newer true. If recovery fails, admission
-stays sealed. Restart clears a crash-retained seal only after a known safe host
-observation. A manual unguarded stop-vms invocation intentionally leaves a seal;
-restart on a verified non-shutdown host clears it.
+One stop/drain worker remains tracked until accepted native calls, jobs and
+helper processes finish. A true/false pair that never began a sweep must still
+persist the marker before native drain. Retiring an old worker does not recover
+its old revision: recovery targets the latest cancelled episode.
+PreparingForShutdown and actual host state are checked again, and the current
+episode is checked before and after the durable latch compare-and-swap.
+Only then can admission resume. A racing newer true remains sealed.
+Startup recovery also drains the admitted manager before clearing a crash marker.
+Failed persistence or settlement cannot claim recovery.
+
+On macOS, shutdown protection is explicitly `Unsupported`. No logind,
+systemctl, inhibitor or fabricated host-state recovery is attempted.
 
 ## Disk admission and metrics
 
@@ -80,7 +87,7 @@ restart on a verified non-shutdown host clears it.
 service UID, excluding root filesystem reserves. Each concurrent create reserves
 its full requested logical disk capacity before pull and rechecks before
 materialization. Reservations release on every returned outcome. Disk growth
-also holds a concurrent reservation through SDK Update. Existing disk
+also holds a concurrent reservation through management Update. Existing disk
 allocation is already accounted for by statfs. Sparse apparent size is not
 allocated size; the logical reservations are deliberately conservative and do
 not promise permanent capacity as guests or unrelated writers consume space.
@@ -97,15 +104,10 @@ HTTP errors and host paths. Intentional operator login URLs remain visible.
 ## Qualification and failure semantics
 
 An ordinary returned SDK/native error can be categorized as exit 9. A fatal
-native SIGSEGV inside this process cannot return a structured SSH exit 9. The
-client sees transport loss (normally SSH 255), and systemd Restart=on-failure
-restarts the daemon. Durable SDK records are recovery truth; supervisors are not
-stopped by closing the broken lobby transport. Phase 14.6 must use this corrected
-contract rather than assert that an in-process fatal crash returns exit 9.
-
-The silod inhibitor is a nontrivial Rust lifecycle change and is an allowed
-Phase 14 follow-up, with a separate real-unit qualification. No silod change is
-made by this app subtask.
+native SIGSEGV inside the direct session bridge cannot return a structured SSH
+exit 9. The client sees transport loss (normally SSH 255); silod supervises
+replacement of its helper. Durable libvm records remain recovery truth.
+Closing or replacing a broken lobby transport does not stop VM supervisors.
 
 The real-unit restart/kill/stop/session-survival drill and any host shutdown
 drill remain a user-run manual phase on a prepared test host after this work.

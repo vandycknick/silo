@@ -177,7 +177,7 @@ pub(crate) async fn up(
                 bail!("the foreground daemon has different settings; stop it and rerun `silo daemon up`");
             }
             return wait_ready(
-                &service.paths,
+                service,
                 chrono::Utc::now(),
                 configuration_identity,
                 system_enabled,
@@ -202,7 +202,7 @@ pub(crate) async fn up(
     spinner.step("Starting", "silod");
     native_start(service)?;
     wait_ready(
-        &service.paths,
+        service,
         started,
         configuration_identity,
         system_enabled,
@@ -452,7 +452,7 @@ fn tail_lines(path: &Path, lines: usize) -> eyre::Result<String> {
 }
 
 async fn wait_ready(
-    paths: &DaemonPaths,
+    service: &ServiceConfig,
     since: chrono::DateTime<chrono::Utc>,
     identity: &str,
     system_enabled: bool,
@@ -460,6 +460,11 @@ async fn wait_ready(
     timeout: Duration,
     spinner: &mut Spinner,
 ) -> eyre::Result<DaemonStatus> {
+    let paths = &service.paths;
+    let host = libvm::HostPaths::new(
+        &service.environment.silo_home,
+        service.environment.config_home.join("silo"),
+    );
     let mut readiness = StartupReadiness::new(timeout);
     loop {
         readiness
@@ -479,7 +484,7 @@ async fn wait_ready(
                 }
                 CorePhase::Starting => spinner.step("Starting", "core management API"),
                 CorePhase::Ready => {
-                    let core_ready = verify_core_api(&status).await?;
+                    let core_ready = verify_core_api(&status, &host).await?;
                     if system_enabled {
                         if let Some(system) = &status.system {
                             let (label, target) = phase_step(system);
@@ -506,46 +511,19 @@ async fn wait_ready(
     }
 }
 
-async fn verify_core_api(status: &DaemonStatus) -> eyre::Result<bool> {
-    use hyper_util::rt::TokioIo;
-    use silod_spec::daemon::v1::daemon_service_client::DaemonServiceClient;
-    use tonic::transport::Endpoint;
-    use tower::service_fn;
+async fn verify_core_api(status: &DaemonStatus, host: &libvm::HostPaths) -> eyre::Result<bool> {
     eyre::ensure!(
         status.control_endpoint == libvm::HostPaths::run_root().join("silod/control.sock"),
         "silod control endpoint does not match the per-user endpoint"
     );
-    let path = status.control_endpoint.clone();
     let check = tokio::time::timeout(Duration::from_secs(2), async {
-        let channel = Endpoint::from_static("http://silod.local")
-            .connect_with_connector(service_fn(move |_| {
-                let path = path.clone();
-                async move {
-                    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-                    let metadata = std::fs::symlink_metadata(&path)?;
-                    if !metadata.file_type().is_socket()
-                        || metadata.uid() != nix::unistd::geteuid().as_raw()
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "unsafe silod control endpoint",
-                        ));
-                    }
-                    let stream = tokio::net::UnixStream::connect(path).await?;
-                    if stream.peer_cred()?.uid() != nix::unistd::geteuid().as_raw() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "silod peer UID mismatch",
-                        ));
-                    }
-                    Ok::<_, std::io::Error>(TokioIo::new(stream))
-                }
-            }))
-            .await?;
-        let response = DaemonServiceClient::new(channel)
-            .get_status(())
-            .await?
-            .into_inner();
+        let Some(selected) =
+            silo_vm_control::transport::probe(host, silo_vm_control::transport::Admission::Owned)
+                .await?
+        else {
+            return Ok(false);
+        };
+        let response = selected.status;
         eyre::ensure!(
             response.generation == status.generation.to_string(),
             "silod generation changed during startup"
@@ -555,14 +533,8 @@ async fn verify_core_api(status: &DaemonStatus) -> eyre::Result<bool> {
             "silod process identity changed during startup"
         );
         eyre::ensure!(
-            response.schema == 2
-                && response.protocol_major == 1
-                && response.product_version == env!("CARGO_PKG_VERSION"),
-            "silod product/protocol mismatch; restart required"
-        );
-        eyre::ensure!(
-            silo_vm_control::path_from_wire(response.home)? == status.home,
-            "silod API Home mismatch"
+            response.schema == 2,
+            "silod status schema mismatch; restart required"
         );
         Ok::<_, eyre::Report>(response.core == silod_spec::daemon::v1::CorePhase::Ready as i32)
     })
@@ -913,11 +885,12 @@ fn render_native(
     marker: &str,
     arguments: &[OsString],
 ) -> eyre::Result<Vec<u8>> {
-    let command = std::iter::once(service.executable.as_os_str())
-        .chain(arguments.iter().map(OsString::as_os_str))
-        .map(|value| systemd_arg(Path::new(value)))
-        .collect::<eyre::Result<Vec<_>>>()?
-        .join(" ");
+    let mut command = systemd_executable(&service.executable)?;
+    let stop_command = format!("{command} --host-shutdown");
+    for argument in arguments {
+        command.push(' ');
+        command.push_str(&systemd_arg(Path::new(argument))?);
+    }
     let environment = service
         .environment
         .entries()
@@ -928,9 +901,25 @@ fn render_native(
         .collect::<eyre::Result<Vec<_>>>()?
         .concat();
     Ok(format!(
-        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo daemon manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\n{environment}ExecStart={}\nRestart=on-failure\nRestartPreventExitStatus=2\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
-        command
+        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo daemon manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\n{environment}ExecStart={}\nExecStop={}\nRestart=on-failure\nRestartPreventExitStatus=2\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        command, stop_command
     ).into_bytes())
+}
+
+// systemd does not expand environment variables in argv[0], and rejects
+// quotes, backslashes and control characters in the decoded executable path.
+#[cfg(target_os = "linux")]
+fn systemd_executable(path: &Path) -> eyre::Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("service executable path is not UTF-8"))?;
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '\'' | '\\'))
+    {
+        bail!("service executable path cannot contain quotes, backslashes or control characters");
+    }
+    Ok(format!("\"{}\"", value.replace('%', "%%")))
 }
 
 #[cfg(target_os = "linux")]
@@ -1429,8 +1418,6 @@ mod tests {
     use silod_spec::paths::DaemonPaths;
     use silod_spec::status::SystemPhase;
 
-    #[cfg(target_os = "linux")]
-    use crate::daemon::service::systemd_arg;
     use crate::daemon::service::{
         lifetime_lock_is_free, logs, render_native, service_marker, validate_existing_service,
         ServiceConfig, StartupReadiness,
@@ -1634,33 +1621,122 @@ mod tests {
         assert_eq!(logs(&paths, 2).expect("logs"), "two\nthree");
     }
 
+    /// Opt-in: exercises systemd's parser and execution, not unit-template wording.
     #[cfg(target_os = "linux")]
     #[test]
-    fn systemd_launches_silod_without_installation_arguments() {
+    fn systemd_execstop_uses_selected_executable_and_same_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+        if std::env::var("SILO_TEST_USER_SYSTEMD").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIPPED: SILO_TEST_USER_SYSTEMD=1 and a live user systemd manager are required"
+            );
+            return;
+        }
+        fn systemctl(arguments: &[&std::ffi::OsStr]) {
+            let output = Command::new("systemctl")
+                .arg("--user")
+                .args(arguments)
+                .output()
+                .expect("systemctl");
+            assert!(
+                output.status.success(),
+                "systemctl failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        struct RegisteredUnit(String);
+        impl Drop for RegisteredUnit {
+            fn drop(&mut self) {
+                // Only this fixture's unique unit is stopped and unlinked.
+                let _ = Command::new("systemctl")
+                    .args(["--user", "disable", "--now", &self.0])
+                    .output();
+                let _ = Command::new("systemctl")
+                    .args(["--user", "reset-failed", &self.0])
+                    .output();
+                let _ = Command::new("systemctl")
+                    .args(["--user", "daemon-reload"])
+                    .output();
+            }
+        }
         let temp = tempfile::tempdir().expect("temp");
-        let service = service(temp.path(), "/opt/silo/bin/silod");
-        let unit =
-            String::from_utf8(render_native(&service, "test-installation", &[]).expect("render"))
-                .expect("utf8");
-        assert!(unit.contains(&format!(
-            "ExecStart={}\n",
-            systemd_arg(&service.executable).expect("escape")
-        )));
-        assert!(!unit.contains("--state"));
-        assert!(!unit.contains("daemon serve"));
-        assert!(unit.contains("RestartPreventExitStatus=2\n"));
-        assert!(unit.contains("KillMode=process\n"));
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let executable = root.join("silod space$literal%");
+        let record = root.join("stop-record");
+        let start_record = root.join("start-record");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = --host-shutdown ]; then\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nelse\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nexec /bin/sleep 60\nfi\n",
+            crate::daemon::service::shell_word(record.to_str().unwrap()),
+            crate::daemon::service::shell_word(start_record.to_str().unwrap()),
+        );
+        std::fs::write(&executable, script).expect("fixture executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("executable mode");
+        let mut service = service(
+            &root.join("home space$literal%\"quote"),
+            executable.to_str().unwrap(),
+        );
+        let name = format!("silo-execstop-test-{}.service", uuid::Uuid::new_v4());
+        service.native_service_path = root.join(&name);
+        std::fs::write(
+            &service.native_service_path,
+            render_native(
+                &service,
+                "execstop-fixture",
+                &[
+                    "--system-cpus".into(),
+                    "9".into(),
+                    "literal $percent%\"quote\\slash".into(),
+                ],
+            )
+            .expect("render"),
+        )
+        .expect("unit file");
+        systemctl(&["link".as_ref(), service.native_service_path.as_os_str()]);
+        let _registration = RegisteredUnit(name.clone());
+        systemctl(&["daemon-reload".as_ref()]);
+        systemctl(&["start".as_ref(), name.as_ref()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !start_record.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture did not execute"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        systemctl(&["stop".as_ref(), name.as_ref()]);
+        let environment = [
+            service.environment.user_home.to_str().unwrap(),
+            service.environment.silo_home.to_str().unwrap(),
+            service.environment.config_home.to_str().unwrap(),
+        ]
+        .join("\n");
+        assert_eq!(
+            std::fs::read_to_string(start_record).expect("start arguments/environment"),
+            format!("--system-cpus\n9\nliteral $percent%\"quote\\slash\n{environment}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(record).expect("stop arguments/environment"),
+            format!("--host-shutdown\n{environment}\n")
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn systemd_paths_escape_spaces_percent_and_quotes() {
-        use std::path::Path;
-
-        assert_eq!(
-            systemd_arg(Path::new("/tmp/Silo dir/100%/a\"b")).expect("escape"),
-            "\"/tmp/Silo dir/100%%/a\\\"b\""
-        );
+    fn rejects_executable_paths_systemd_cannot_represent() {
+        for executable in [
+            "/tmp/bad\"quote",
+            "/tmp/bad'quote",
+            "/tmp/bad\\slash",
+            "/tmp/bad\tcontrol",
+        ] {
+            let service = service(std::path::Path::new("/tmp/home"), executable);
+            assert!(
+                render_native(&service, "fixture", &[]).is_err(),
+                "{executable:?}"
+            );
+        }
     }
 
     #[test]

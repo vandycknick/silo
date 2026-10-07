@@ -26,13 +26,12 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/sshd"
 	"github.com/vandycknick/silo/app/taild/internal/state"
-	"github.com/vandycknick/silo/app/taild/internal/supervision"
 	"github.com/vandycknick/silo/app/taild/internal/tailnet"
 	silo "github.com/vandycknick/silo/sdk/go"
 	daemonv1 "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 )
 
-const usageLine = "usage: taild [help|version|--version] | --bootstrap-fd N"
+const usageLine = "usage: taild [help|version|--version] | [--shutdown-only] --bootstrap-fd N"
 
 type deterministicError struct{ error }
 
@@ -49,8 +48,9 @@ func main() {
 
 // invocation has no standalone configuration or management mode.
 type invocation struct {
-	command     string
-	bootstrapFD int
+	command      string
+	bootstrapFD  int
+	shutdownOnly bool
 }
 
 func parseArgs(args []string) (invocation, error) {
@@ -63,6 +63,7 @@ func parseArgs(args []string) (invocation, error) {
 	flags.SetOutput(io.Discard)
 	version := flags.Bool("version", false, "print build versions without loading native runtime")
 	flags.IntVar(&iv.bootstrapFD, "bootstrap-fd", -1, "manager bootstrap and owner pipe")
+	flags.BoolVar(&iv.shutdownOnly, "shutdown-only", false, "internal host shutdown helper")
 	if err := flags.Parse(args); err != nil {
 		return iv, err
 	}
@@ -70,7 +71,7 @@ func parseArgs(args []string) (invocation, error) {
 		return iv, errors.New("unexpected arguments")
 	}
 	if *version {
-		if iv.bootstrapFD != -1 {
+		if iv.bootstrapFD != -1 || iv.shutdownOnly {
 			return iv, errors.New("version cannot consume bootstrap")
 		}
 		iv.command = "version"
@@ -98,7 +99,11 @@ func runArgs(args []string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	input, pipe, err := bootstrap.Read(ctx, iv.bootstrapFD)
+	mode := bootstrap.Normal
+	if iv.shutdownOnly {
+		mode = bootstrap.ShutdownOnly
+	}
+	input, pipe, err := bootstrap.Read(ctx, iv.bootstrapFD, mode)
 	if err != nil {
 		return &deterministicError{err}
 	}
@@ -122,7 +127,11 @@ func runArgs(args []string) error {
 		case <-finished:
 		}
 	}()
-	client, err := control.New(input.Endpoint, input.HelperGeneration)
+	helperGeneration := input.HelperGeneration
+	if iv.shutdownOnly {
+		helperGeneration = ""
+	}
+	client, err := control.New(input.Endpoint, helperGeneration)
 	if err != nil {
 		return &deterministicError{err}
 	}
@@ -135,6 +144,9 @@ func runArgs(args []string) error {
 			return &deterministicError{err}
 		}
 		return err
+	}
+	if iv.shutdownOnly {
+		return runShutdownOnly(ctx, input.Config, client, input.DaemonGeneration)
 	}
 	report := func(state daemonv1.ComponentState, diagnostic, url, dns, instance string, protection daemonv1.ShutdownProtection) {
 		reportCtx, finish := context.WithTimeout(context.Background(), 2*time.Second)
@@ -155,10 +167,10 @@ func runArgs(args []string) error {
 		}
 		_, _ = client.Daemon.ReportTailscaleStatus(reportCtx, request)
 	}
-	report(daemonv1.ComponentState_COMPONENT_STATE_STARTING, "", "", "", "", daemonv1.ShutdownProtection_SHUTDOWN_PROTECTION_UNAVAILABLE)
+	report(daemonv1.ComponentState_COMPONENT_STATE_STARTING, "", "", "", "", defaultShutdownProtection())
 	err = serve(ctx, cancel, input.Config, input.Secrets, ownerLost, client, status, report)
 	if err != nil && ctx.Err() == nil {
-		report(daemonv1.ComponentState_COMPONENT_STATE_FAILED, redact.LogText(err.Error(), input.Secrets.ClientSecret, input.Secrets.AppSecret, input.Secrets.APIToken), "", "", "", daemonv1.ShutdownProtection_SHUTDOWN_PROTECTION_UNAVAILABLE)
+		report(daemonv1.ComponentState_COMPONENT_STATE_FAILED, redact.LogText(err.Error(), input.Secrets.ClientSecret, input.Secrets.AppSecret, input.Secrets.APIToken), "", "", "", defaultShutdownProtection())
 	}
 	return err
 }
@@ -183,7 +195,7 @@ func serve(ctx context.Context, cancel context.CancelFunc, c config.Config, secr
 	if e != nil {
 		return e
 	}
-	report(daemonv1.ComponentState_COMPONENT_STATE_STARTING, "", "", "", instance, daemonv1.ShutdownProtection_SHUTDOWN_PROTECTION_UNAVAILABLE)
+	report(daemonv1.ComponentState_COMPONENT_STATE_STARTING, "", "", "", instance, defaultShutdownProtection())
 	audit, e := state.OpenAudit(c.Home, 10<<20, 5)
 	if e != nil {
 		return e
@@ -221,49 +233,16 @@ func serve(ctx context.Context, cancel context.CancelFunc, c config.Config, secr
 	}()
 	registryJobs.Metrics = r.Metrics
 	registryJobs.Admission = func() bool { return !state.ShutdownPending(c.Home) }
-	inhibitor, preparing, inhibitErr := supervision.Acquire(ctx, c)
-	if inhibitErr != nil {
-		log.Warn("logind shutdown protection unavailable")
-		if state.ShutdownPending(c.Home) {
-			if e := recoverShutdownSeal(ctx, c.Home, gate); e != nil {
-				return e
-			}
-		}
-	} else {
-		defer inhibitor.Close()
-		inhibitor.Start(ctx, c, r, preparing, gate,
-			func() { registryJobs.InterruptIf(func() bool { return true }) },
-			registryJobs.Resume, registryJobs.Drained, log)
-		if !preparing {
-			if e := recoverShutdownSeal(ctx, c.Home, gate); e != nil {
-				return e
-			}
-		}
+	protection, closeProtection, e := startShutdownProtection(ctx, c, client, instance, daemon.Generation, gate, registryJobs, log)
+	if e != nil {
+		return e
 	}
-	// Start after crash-retained marker recovery, so a stale marker cannot
-	// pause this fresh registry permanently before admission is established.
-	// ExecStop runs before SIGTERM; cancellation releases enrollment leases.
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				registryJobs.InterruptIf(func() bool { return state.ShutdownPending(c.Home) })
-			}
-		}
-	}()
+	defer closeProtection()
 	node, e := tailnet.Start(ctx, c, secrets, log)
 	if e != nil {
 		return e
 	}
 	node.Metrics = r.Metrics
-	protection := daemonv1.ShutdownProtection_SHUTDOWN_PROTECTION_UNAVAILABLE
-	if inhibitErr == nil {
-		protection = daemonv1.ShutdownProtection_SHUTDOWN_PROTECTION_ACTIVE
-	}
 	reportCtx, stopReports := context.WithCancel(ctx)
 	defer stopReports()
 	listenersReady := make(chan struct{})
@@ -415,27 +394,6 @@ func cleanupBudget(ownerLost <-chan struct{}) time.Duration {
 	default:
 		return 80 * time.Second
 	}
-}
-func recoverShutdownSeal(ctx context.Context, home string, gate *state.ShutdownGate) error {
-	revision := gate.Revision()
-	if gate.Pending() {
-		return nil
-	}
-	if !state.ShutdownPending(home) {
-		return nil
-	}
-	if e := state.WaitShutdownHelpers(ctx, home); e != nil {
-		return errors.New("shutdown helper still active; admission sealed")
-	}
-	if gate.Revision() != revision || gate.Pending() {
-		return nil
-	}
-	host, err := supervision.SystemState(ctx)
-	if err != nil || host == "stopping" {
-		return errors.New("shutdown marker retained; host state not safe for admission")
-	}
-	_, err = gate.Recover(home, revision)
-	return err
 }
 
 var errRuntimeCleanupIncomplete = errors.New("runtime cleanup incomplete")

@@ -411,7 +411,7 @@ The launchd agent restarts only after an unsuccessful exit, allows 90 seconds
 for the manager to detach before SIGKILL, uses `AbandonProcessGroup`, and runs
 with the `Standard` process type. The systemd unit uses `KillMode=process`:
 restarting the management service must not kill the surviving VMM/netd processes.
-Explicit `down` still stops the VM through the separate `silod --stop` operation. The VM inherits this scheduling policy: `Background` throttles its CPU and
+Explicit `down` still stops the system appliance through the separate `silod --stop` operation. The VM inherits this scheduling policy: `Background` throttles its CPU and
 I/O work even when a user is actively building or running containers. Standard
 uses normal service scheduling, without requesting the `Interactive` class or
 pinning host cores. See [build performance](architecture/build-performance.md)
@@ -474,6 +474,20 @@ Helper crashes get bounded restart backoff. Normal silod termination drains and
 reaps the helper; owner-pipe EOF after an unexpected parent death cancels it
 within five seconds. Neither event stops VMs. `KillMode=process` preserves VM
 descendants while silod explicitly owns helper cleanup.
+
+Linux `ExecStop` uses `silod --host-shutdown`, not a VM-stop request on ordinary
+service termination. The adjacent shutdown-only helper authorizes stops only
+after real `systemctl` state is `stopping`, existing ownership is read and the
+helper lease is held. A live manager remains authoritative; proven absence
+permits a temporary, doubly locked API restricted to inspection, draining and
+run-fenced stops. No SDK/bridge/assets or frontend enrollment are required.
+Actual native drain and a fresh final inventory protect against late creations.
+macOS reports shutdown protection as unsupported.
+
+Linux service executable paths may contain spaces, dollar signs and percent
+signs; quotes, backslashes and control characters are rejected before installing
+an invalid unit. Executable and argument escaping differ under
+[systemd command-line rules](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20Lines).
 
 Real logind/systemd survival, live tailnet authentication, native macOS/HVF and
 soak qualification require their corresponding hosts/credentials; Linux fixture

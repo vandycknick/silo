@@ -41,7 +41,7 @@ func TestOfflineCommandsHaveNoRuntimeOrConnectionSideEffects(t *testing.T) {
 }
 
 func TestManagedInvocationOnly(t *testing.T) {
-	for _, args := range [][]string{nil, {"install-runtime"}, {"stop-vms"}, {"--config", "/tmp/config"}, {"--check"}, {"--runtime-archive", "/tmp/archive"}, {"--bootstrap-fd", "-1"}, {"--version", "--bootstrap-fd", "0"}} {
+	for _, args := range [][]string{nil, {"install-runtime"}, {"stop-vms"}, {"--config", "/tmp/config"}, {"--check"}, {"--runtime-archive", "/tmp/archive"}, {"--bootstrap-fd", "-1"}, {"--version", "--bootstrap-fd", "0"}, {"--shutdown-only"}, {"--version", "--shutdown-only"}} {
 		err := runArgs(args)
 		var deterministic *deterministicError
 		if !errors.As(err, &deterministic) {
@@ -51,5 +51,9 @@ func TestManagedInvocationOnly(t *testing.T) {
 	iv, err := parseArgs([]string{"--bootstrap-fd", "0"})
 	if err != nil || iv.bootstrapFD != 0 {
 		t.Fatal("stdin bootstrap not accepted", iv, err)
+	}
+	iv, err = parseArgs([]string{"--shutdown-only", "--bootstrap-fd", "0"})
+	if err != nil || !iv.shutdownOnly || iv.bootstrapFD != 0 {
+		t.Fatal("explicit shutdown bootstrap not accepted", iv, err)
 	}
 }
