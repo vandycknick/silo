@@ -9404,7 +9404,6 @@ type TailscaleSettings struct {
 	ControlUrl        string                 `protobuf:"bytes,3,opt,name=control_url,json=controlUrl,proto3" json:"control_url,omitempty"`
 	EnrollmentMode    EnrollmentMode         `protobuf:"varint,4,opt,name=enrollment_mode,json=enrollmentMode,proto3,enum=silo.daemon.v1.EnrollmentMode" json:"enrollment_mode,omitempty"`
 	DisableKeyExpiry  bool                   `protobuf:"varint,5,opt,name=disable_key_expiry,json=disableKeyExpiry,proto3" json:"disable_key_expiry,omitempty"`
-	DefaultImage      string                 `protobuf:"bytes,6,opt,name=default_image,json=defaultImage,proto3" json:"default_image,omitempty"`
 	AllowedRegistries []string               `protobuf:"bytes,7,rep,name=allowed_registries,json=allowedRegistries,proto3" json:"allowed_registries,omitempty"`
 	Defaults          *ResourceDefaults      `protobuf:"bytes,8,opt,name=defaults,proto3" json:"defaults,omitempty"`
 	Ceilings          *ResourceCeilings      `protobuf:"bytes,9,opt,name=ceilings,proto3" json:"ceilings,omitempty"`
@@ -9480,13 +9479,6 @@ func (x *TailscaleSettings) GetDisableKeyExpiry() bool {
 		return x.DisableKeyExpiry
 	}
 	return false
-}
-
-func (x *TailscaleSettings) GetDefaultImage() string {
-	if x != nil {
-		return x.DefaultImage
-	}
-	return ""
 }
 
 func (x *TailscaleSettings) GetAllowedRegistries() []string {
@@ -11580,15 +11572,14 @@ const file_daemon_proto_rawDesc = "" +
 	"\fmemory_bytes\x18\x02 \x01(\x04R\vmemoryBytes\x12\x1d\n" +
 	"\n" +
 	"disk_bytes\x18\x03 \x01(\x04R\tdiskBytes\x12*\n" +
-	"\x11vms_per_principal\x18\x04 \x01(\x04R\x0fvmsPerPrincipal\"\xac\x05\n" +
+	"\x11vms_per_principal\x18\x04 \x01(\x04R\x0fvmsPerPrincipal\"\x9c\x05\n" +
 	"\x11TailscaleSettings\x12\x1a\n" +
 	"\bhostname\x18\x01 \x01(\tR\bhostname\x12\x10\n" +
 	"\x03tag\x18\x02 \x01(\tR\x03tag\x12\x1f\n" +
 	"\vcontrol_url\x18\x03 \x01(\tR\n" +
 	"controlUrl\x12G\n" +
 	"\x0fenrollment_mode\x18\x04 \x01(\x0e2\x1e.silo.daemon.v1.EnrollmentModeR\x0eenrollmentMode\x12,\n" +
-	"\x12disable_key_expiry\x18\x05 \x01(\bR\x10disableKeyExpiry\x12#\n" +
-	"\rdefault_image\x18\x06 \x01(\tR\fdefaultImage\x12-\n" +
+	"\x12disable_key_expiry\x18\x05 \x01(\bR\x10disableKeyExpiry\x12-\n" +
 	"\x12allowed_registries\x18\a \x03(\tR\x11allowedRegistries\x12<\n" +
 	"\bdefaults\x18\b \x01(\v2 .silo.daemon.v1.ResourceDefaultsR\bdefaults\x12<\n" +
 	"\bceilings\x18\t \x01(\v2 .silo.daemon.v1.ResourceCeilingsR\bceilings\x12'\n" +
@@ -11598,7 +11589,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x12disk_reserve_bytes\x18\f \x01(\x04R\x10diskReserveBytes\x12:\n" +
 	"\vstop_budget\x18\r \x01(\v2\x19.google.protobuf.DurationR\n" +
 	"stopBudget\x12B\n" +
-	"\x0fshutdown_margin\x18\x0e \x01(\v2\x19.google.protobuf.DurationR\x0eshutdownMargin\"\xfd\x05\n" +
+	"\x0fshutdown_margin\x18\x0e \x01(\v2\x19.google.protobuf.DurationR\x0eshutdownMarginJ\x04\b\x06\x10\aR\rdefault_image\"\xfd\x05\n" +
 	"\x0fHelperBootstrap\x12%\n" +
 	"\x0eprotocol_major\x18\x01 \x01(\rR\rprotocolMajor\x12'\n" +
 	"\x0fproduct_version\x18\x02 \x01(\tR\x0eproductVersion\x12+\n" +

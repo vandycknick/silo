@@ -37,10 +37,6 @@ fn missing_config_has_resolved_defaults_without_side_effects() {
     assert_eq!(c.control_url(), "");
     assert_eq!(c.enrollment_mode(), EnrollmentMode::OauthApp);
     assert!(!c.disable_key_expiry());
-    assert_eq!(
-        c.vm().default_image(),
-        "ghcr.io/vandycknick/silo/devbox:latest"
-    );
     assert_eq!(c.vm().allowed_registries(), &["ghcr.io/vandycknick"]);
     assert_eq!(c.vm().defaults().cpus(), 2);
     assert_eq!(c.vm().defaults().memory(), 4 << 30);
@@ -79,6 +75,7 @@ fn strict_validation_rejects_unknown_fields_units_and_limits() {
         "vm: {defaults: {disk: 0}}",
         "vm: {ceilings: {vms-per-principal: 0}}",
         "vm: {guest-user: root}",
+        "vm: {default-image: registry.example.test/image:latest}",
     ] {
         assert!(
             load(&format!(

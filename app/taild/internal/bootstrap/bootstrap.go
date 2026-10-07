@@ -301,7 +301,7 @@ func settings(c *config.Config, s *daemonv1.TailscaleSettings) error {
 		return errors.New("invalid bootstrap enrollment mode")
 	}
 	c.Enrollment.DisableKeyExpiry = s.DisableKeyExpiry
-	c.VM.DefaultImage, c.VM.AllowedRegistries = s.DefaultImage, s.AllowedRegistries
+	c.VM.AllowedRegistries = s.AllowedRegistries
 	c.VM.Defaults = config.Resources{CPUs: uint64(s.Defaults.Cpus), Memory: units.Size(s.Defaults.MemoryBytes), Disk: units.Size(s.Defaults.DiskBytes)}
 	c.VM.Ceilings = config.Ceilings{Resources: config.Resources{CPUs: uint64(s.Ceilings.Cpus), Memory: units.Size(s.Ceilings.MemoryBytes), Disk: units.Size(s.Ceilings.DiskBytes)}, VMs: s.Ceilings.VmsPerPrincipal}
 	if s.SessionsGlobal > uint64(^uint(0)>>1) || s.SessionsPerPeer > uint64(^uint(0)>>1) {

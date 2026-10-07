@@ -61,7 +61,7 @@ func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 		{"operator-disk", func(q *CreateRequest) { q.Disk = 201 << 30 }, 6},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			q := CreateRequest{Name: "safe"}
+			q := CreateRequest{Image: "ghcr.io/vandycknick/silo/devbox:latest", Name: "safe"}
 			tt.change(&q)
 			_, e := s.ValidateCreate(t.Context(), c.Peer, q)
 			var a *authz.Error
@@ -71,14 +71,14 @@ func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 		})
 	}
 	c.Peer.Permissions.Limits.CPUs = 1
-	if _, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Name: "safe", CPUs: 2}); Categorize(e).Exit != 6 {
+	if _, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Image: "ghcr.io/vandycknick/silo/devbox:latest", Name: "safe", CPUs: 2}); Categorize(e).Exit != 6 {
 		t.Fatal(e)
 	}
 	c.Peer.Principals = []identity.Principal{"tag:ci", "tag:team"}
-	if _, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Name: "safe"}); e == nil {
+	if _, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Image: "ghcr.io/vandycknick/silo/devbox:latest", Name: "safe"}); e == nil {
 		t.Fatal("missing owner accepted")
 	}
-	q, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Name: "safe", Owner: "tag:team"})
+	q, e := s.ValidateCreate(t.Context(), c.Peer, CreateRequest{Image: "ghcr.io/vandycknick/silo/devbox:latest", Name: "safe", Owner: "tag:team"})
 	if e != nil || q.Owner != "tag:team" {
 		t.Fatal(q, e)
 	}
@@ -87,7 +87,6 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.Ceilings.VMs = 1
 	one, two := domainCaller(s, "user:1"), domainCaller(s, "user:2")
 	entered := make(chan struct{})
@@ -98,7 +97,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	var once sync.Once
 	registry.BeforeManifest = func() { once.Do(func() { close(entered); <-release }) }
 	disconnected, cancel := context.WithCancel(context.Background())
-	op, e := s.Create(disconnected, one, CreateRequest{Name: "one", NoStart: true})
+	op, e := s.Create(disconnected, one, CreateRequest{Image: registry.Reference, Name: "one", NoStart: true})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -112,11 +111,11 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	if _, _, e := s.Jobs.Observe(two.Peer, op.ID); Categorize(e).Exit != 3 {
 		t.Fatal("foreign op visible", e)
 	}
-	quota, e := s.Create(context.Background(), one, CreateRequest{Name: "over", NoStart: true})
+	quota, e := s.Create(context.Background(), one, CreateRequest{Image: registry.Reference, Name: "over", NoStart: true})
 	if e == nil || Categorize(e).Exit != 6 || quota.ID != "" {
 		t.Fatal("quota must reject before publication", quota, e)
 	}
-	collision, e := s.Create(context.Background(), two, CreateRequest{Name: "one", NoStart: true})
+	collision, e := s.Create(context.Background(), two, CreateRequest{Image: registry.Reference, Name: "one", NoStart: true})
 	if e == nil || Categorize(e).Exit != 5 || collision.ID != "" {
 		t.Fatal("collision must reject before publication", collision, e)
 	}
@@ -125,7 +124,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	if registry.Requests.Load() < 3 {
 		t.Fatal("native OCI did not use real registry")
 	}
-	op, e = s.Create(context.Background(), two, CreateRequest{Name: "two", NoStart: true})
+	op, e = s.Create(context.Background(), two, CreateRequest{Image: registry.Reference, Name: "two", NoStart: true})
 	daemon.Succeeded(t, s.Jobs, two.Peer, op, e)
 	for _, c := range []Caller{one, two} {
 		v, e := s.List(context.Background(), c.Peer)
@@ -186,7 +185,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	}
 	op, e = s.Remove(context.Background(), one, name, RemoveRequest{})
 	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
-	op, e = s.Create(context.Background(), one, CreateRequest{Name: "one", NoStart: true})
+	op, e = s.Create(context.Background(), one, CreateRequest{Image: registry.Reference, Name: "one", NoStart: true})
 	daemon.Succeeded(t, s.Jobs, one.Peer, op, e)
 	third := domainCaller(s, "user:3")
 	failed, e := s.Create(context.Background(), third, CreateRequest{Name: "retry", Image: strings.Split(registry.Reference, "/fixture/")[0] + "/fixture/missing:latest", NoStart: true})
@@ -196,14 +195,14 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	if got := daemon.WaitOperation(t, s.Jobs, third.Peer, failed, nil); got.Error == nil || got.Error.Exit != 7 {
 		t.Fatal("failed OCI pull did not report category 7", got)
 	}
-	op, e = s.Create(context.Background(), third, CreateRequest{Name: "retry", NoStart: true})
+	op, e = s.Create(context.Background(), third, CreateRequest{Image: registry.Reference, Name: "retry", NoStart: true})
 	daemon.Succeeded(t, s.Jobs, third.Peer, op, e)
 	tagged := domainCaller(s, "tag:team")
 	tagged.Peer.Principals = []identity.Principal{"tag:team", "tag:ci"}
 	tagged.Resolve = func(context.Context) (identity.Peer, error) { return tagged.Peer, nil }
-	op, e = s.Create(context.Background(), tagged, CreateRequest{Name: "tagged", Owner: "tag:ci", NoStart: true})
+	op, e = s.Create(context.Background(), tagged, CreateRequest{Image: registry.Reference, Name: "tagged", Owner: "tag:ci", NoStart: true})
 	daemon.Succeeded(t, s.Jobs, tagged.Peer, op, e)
-	op, e = s.Create(context.Background(), tagged, CreateRequest{Name: "tagged-over", Owner: "tag:ci", NoStart: true})
+	op, e = s.Create(context.Background(), tagged, CreateRequest{Image: registry.Reference, Name: "tagged-over", Owner: "tag:ci", NoStart: true})
 	if e == nil || Categorize(e).Exit != 6 || op.ID != "" {
 		t.Fatal("selected tag quota bypass", op, e)
 	}
@@ -212,7 +211,6 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -236,7 +234,7 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 		}
 		return c.Peer, ctx.Err()
 	}
-	op, e := s.Create(context.Background(), c, CreateRequest{Name: "interrupted"})
+	op, e := s.Create(context.Background(), c, CreateRequest{Image: registry.Reference, Name: "interrupted"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -277,7 +275,6 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 func TestCreateCountRevokedDuringActualPull(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	caller := domainCaller(s, "user:1")
 	var current atomic.Pointer[identity.Peer]
@@ -287,7 +284,7 @@ func TestCreateCountRevokedDuringActualPull(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	registry.BeforeManifest = func() { once.Do(func() { close(entered); <-release }) }
-	op, e := s.Create(context.Background(), caller, CreateRequest{Name: "revoked-quota", NoStart: true})
+	op, e := s.Create(context.Background(), caller, CreateRequest{Image: registry.Reference, Name: "revoked-quota", NoStart: true})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -316,10 +313,9 @@ func TestCreateCountRevokedDuringActualPull(t *testing.T) {
 func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	c := domainCaller(s, "user:1")
-	op, e := s.Create(context.Background(), c, CreateRequest{Name: "logs", NoStart: true})
+	op, e := s.Create(context.Background(), c, CreateRequest{Image: registry.Reference, Name: "logs", NoStart: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, e)
 	v, e := s.Show(context.Background(), c.Peer, "logs")
 	if e != nil {

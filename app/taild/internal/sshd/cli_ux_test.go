@@ -120,8 +120,6 @@ func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
 	audit := offlineAudit(t)
 	c := testfixture.Config()
 	c.VM.Defaults = config.Resources{CPUs: 3, Memory: 4_000_000_000, Disk: 7 << 30}
-	c.VM.DefaultImage = "ghcr.io/example/dev:latest"
-	c.VM.AllowedRegistries = []string{"ghcr.io/example"}
 	s := &service.Service{Audit: audit, Config: c}
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "defaults", ObservedAt: time.Now()}
 	for _, line := range []string{"create --help", "help new", "help create --json"} {
@@ -141,23 +139,14 @@ func TestCLIHelpConfiguredDefaultsArePureAndSafe(t *testing.T) {
 			}
 			text = envelope.Data.Help
 		}
-		for _, expected := range []string{"default: 3;", "default: 4GB;", "default: 7GiB;", "default: ghcr.io/example/dev:latest;", "template takes precedence, explicit option overrides both"} {
+		for _, expected := range []string{"default: 3;", "default: 4GB;", "default: 7GiB;"} {
 			if !strings.Contains(text, expected) {
 				t.Fatal("configured default missing", expected, text)
 			}
 		}
 	}
-	if s.Config.VM.Defaults != c.VM.Defaults || s.Config.VM.DefaultImage != c.VM.DefaultImage {
+	if s.Config.VM.Defaults != c.VM.Defaults {
 		t.Fatal("help mutated config")
-	}
-	for _, image := range []string{"/SECRET/token", "https://ghcr.io/example?token=SECRET", "ghcr.io:SECRET@example.test/image", "ghcr.io:SECRET/example/dev", "elsewhere.test/SECRET/image"} {
-		s.Config.VM.DefaultImage = image
-		for _, line := range []string{"create --help", "help create --json"} {
-			var out, human bytes.Buffer
-			if code := dispatch(s, p, line, &out, &human); code != 0 || strings.Contains(out.String()+human.String(), "SECRET") {
-				t.Fatal("unsafe configured defaults", code, out.String(), human.String())
-			}
-		}
 	}
 	for _, line := range []string{"help ops show", "ops show --help", "ops show -h --json"} {
 		var out, human bytes.Buffer
@@ -190,14 +179,14 @@ func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 		}{
 			{"create --help", 0, "Usage:"}, {"help template create", 0, "Usage:"},
 			{"help ops show", 0, "ops show OPERATION_ID"}, {"ops show --help", 0, "ops show OPERATION_ID"},
-			{"create --memory bad", 2, "invalid value for --memory"}, {"create --name", 2, "requires a value"},
+			{"create " + registry.Reference + " --memory bad", 2, "invalid value for --memory"}, {"create --name", 2, "requires a value"},
 			{"create --unknown=SECRET", 2, "unknown option"},
 			{"create --cpus SECRET/token", 2, "positive integer"},
 			{"create --cpus 1SECRET --json", 2, "positive integer"},
-			{"create --memory SECRET/token --json", 2, "--memory"},
-			{"create --memory 8SECRET", 2, "4GiB or 8gb"},
-			{"create --disk-size SECRET/token --json", 2, "--disk"},
-			{"create --disk-size 2SECRET", 2, "4GiB or 8gb"},
+			{"create " + registry.Reference + " --memory SECRET/token --json", 2, "--memory"},
+			{"create " + registry.Reference + " --memory 8SECRET", 2, "4GiB or 8gb"},
+			{"create " + registry.Reference + " --disk-size SECRET/token --json", 2, "--disk"},
+			{"create " + registry.Reference + " --disk-size 2SECRET", 2, "4GiB or 8gb"},
 		} {
 			out, diagnostic, code := sshPipeCommand(t, address, tc.line, nil, tty)
 			if code != tc.code || !bytes.Contains(diagnostic, []byte(tc.text)) || bytes.Contains(diagnostic, []byte("SECRET")) || bytes.Contains(out, []byte("SECRET")) {
@@ -215,7 +204,7 @@ func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 	s.Config.Enrollment.Mode = "interactive"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test"}, Registry: enroll.NewRegistry()}
 	var out, diagnostic bytes.Buffer
-	if code := DispatchSession(ctx, s, caller, "create --memory 8gb --disk-size ' 2 GB ' --no-start --tailscale --json", service.IO{Stdout: &out, Stderr: &diagnostic}); code != 0 {
+	if code := DispatchSession(ctx, s, caller, "create "+registry.Reference+" --memory 8gb --disk-size ' 2 GB ' --no-start --tailscale --json", service.IO{Stdout: &out, Stderr: &diagnostic}); code != 0 {
 		t.Fatal(code, diagnostic.String())
 	}
 	var envelope struct {
@@ -270,7 +259,7 @@ func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 			}
 		}
 	}
-	if code := DispatchSession(ctx, s, caller, "create --name exact --no-start", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 5 {
+	if code := DispatchSession(ctx, s, caller, "create "+registry.Reference+" --name exact --no-start", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 5 {
 		t.Fatal("exact collision", code, diagnostic.String())
 	}
 	if code := DispatchSession(ctx, s, caller, "set exact memory=512mb disk=3gb", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
@@ -284,7 +273,7 @@ func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
 	if silo.Gigabytes(8).Bytes() != 8000000000 {
 		t.Fatal("decimal constructor changed")
 	}
-	raw := "version: '1'\nresources:\n  memory: '512mb'\ndisk_size: '2 gb'\n"
+	raw := "version: '1'\nimage: " + registry.Reference + "\nresources:\n  memory: '512mb'\ndisk_size: '2 gb'\n"
 	if code := DispatchSession(ctx, s, caller, "template create binary", service.IO{Stdin: strings.NewReader(raw), Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
 		t.Fatal(code, diagnostic.String())
 	}

@@ -522,6 +522,9 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 			q.GuestPorts = append([]uint16(nil), t.Network.Publish...)
 		}
 	}
+	if q.Image == "" {
+		return q, errImageMissing
+	}
 	if q.PolicyRef != "" {
 		docs, e := s.documentsFor(ctx, "policy", "show", q.PolicyRef, owner, "")
 		if e != nil {

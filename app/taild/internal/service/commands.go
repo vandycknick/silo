@@ -6,7 +6,6 @@ import (
 	"errors"
 	"maps"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,11 +49,12 @@ func failure(code, message string, exit int) *authz.Error {
 
 // Failures several entry points report identically.
 var (
-	errVMNotFound  = failure("not_found", "VM not found", 3)
-	errVMRunning   = failure("conflict", "VM is running; use --force", 5)
-	errInvalidName = failure("usage", "invalid exact name", 2)
-	errImage       = failure("usage", "image must be an allowlisted OCI reference", 2)
-	errUserdata    = failure("usage", "userdata must be an inline shebang script, at most 16KiB", 2)
+	errVMNotFound   = failure("not_found", "VM not found", 3)
+	errVMRunning    = failure("conflict", "VM is running; use --force", 5)
+	errInvalidName  = failure("usage", "invalid exact name", 2)
+	errImage        = failure("usage", "image must be an allowlisted OCI reference", 2)
+	errImageMissing = failure("usage", "an image is required; supply IMAGE or --image, or select a --template that provides an image", 2)
+	errUserdata     = failure("usage", "userdata must be an inline shebang script, at most 16KiB", 2)
 )
 
 // Categorize never exposes native diagnostics, which may contain paths or credentials.
@@ -269,21 +269,6 @@ func imageAllowed(ref string, allow []string) bool {
 	return false
 }
 
-// Help uses the loaded config only, with the same OCI allowlist as admission.
-// Never render host paths or userinfo-shaped registry credentials.
-func ImageDefaultForHelp(c config.Config) string {
-	ref := c.VM.DefaultImage
-	host, _, _ := strings.Cut(ref, "/")
-	if !imageAllowed(ref, c.VM.AllowedRegistries) || strings.Contains(host, "@") {
-		return "unavailable"
-	}
-	if _, port, ok := strings.Cut(host, ":"); ok {
-		if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
-			return "unavailable"
-		}
-	}
-	return ref
-}
 func (s *Service) ValidateCreate(ctx context.Context, p identity.Peer, q CreateRequest) (CreateRequest, error) {
 	if e := s.Authorize(p, identity.Create, nil); e != nil {
 		return q, e
@@ -326,7 +311,7 @@ func (s *Service) ValidateCreate(ctx context.Context, p identity.Peer, q CreateR
 		q.Tags = []string{string(q.Owner)}
 	}
 	if q.Image == "" {
-		q.Image = s.Config.VM.DefaultImage
+		return q, errImageMissing
 	}
 	if !imageAllowed(q.Image, s.Config.VM.AllowedRegistries) {
 		return q, errImage

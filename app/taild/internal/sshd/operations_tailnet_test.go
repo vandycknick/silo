@@ -71,7 +71,6 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 	// Registered control-plane clients are initialized before temporary native
 	// registry trust. No credentials or host-image escape enters the create API.
 	registry := testfixture.OCIRegistry(t, rootfs)
-	c.VM.DefaultImage = registry.Reference
 	c.VM.AllowedRegistries = []string{registry.Allowed()}
 	n := daemon.Open(t, c, "live-s11", 16)
 	r := n.Runtime
@@ -134,7 +133,7 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 		t.Fatal(string(output), e)
 	}
 	name := "s11-" + suffix
-	for _, command := range []string{"create --name " + name + " --json", "ls --json", "show " + name + " --json", "exec " + name + " -- /bin/id -u"} {
+	for _, command := range []string{"create " + registry.Reference + " --name " + name + " --json", "ls --json", "show " + name + " --json", "exec " + name + " -- /bin/id -u"} {
 		output, e = run(command)
 		if e != nil {
 			t.Fatalf("%s: %v %s", command, e, output)

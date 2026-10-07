@@ -219,7 +219,6 @@ impl Ceilings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VmSettings {
-    default_image: String,
     allowed_registries: Vec<String>,
     defaults: ResourceLimits,
     ceilings: Ceilings,
@@ -227,7 +226,6 @@ pub struct VmSettings {
 impl Default for VmSettings {
     fn default() -> Self {
         Self {
-            default_image: "ghcr.io/vandycknick/silo/devbox:latest".into(),
             allowed_registries: vec!["ghcr.io/vandycknick".into()],
             defaults: ResourceLimits::default(),
             ceilings: Ceilings::default(),
@@ -235,9 +233,6 @@ impl Default for VmSettings {
     }
 }
 impl VmSettings {
-    pub fn default_image(&self) -> &str {
-        &self.default_image
-    }
     pub fn allowed_registries(&self) -> &[String] {
         &self.allowed_registries
     }

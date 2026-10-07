@@ -16,7 +16,6 @@ enrollment:
   mode: oauth-app
   disable_key_expiry: false
 vm:
-  default_image: ghcr.io/vandycknick/silo/devbox:latest
   allowed_registries: [ghcr.io/vandycknick]
   defaults: {cpus: 2, memory: 4GiB, disk: 20GiB}
   ceilings: {cpus: 8, memory: 32GiB, disk: 200GiB, vms_per_principal: 5}

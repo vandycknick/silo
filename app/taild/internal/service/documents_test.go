@@ -364,7 +364,7 @@ rule "plugin-rule" {
 	if e = os.WriteFile(filepath.Join(s.Config.PoliciesDir, "evil.hcl"), []byte(hcl), 0644); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = s.Create(ctx, c, CreateRequest{Name: "no-bypass", PolicyRef: "evil"}); e == nil {
+	if _, e = s.Create(ctx, c, CreateRequest{Image: "ghcr.io/vandycknick/silo/devbox:latest", Name: "no-bypass", PolicyRef: "evil"}); e == nil {
 		t.Fatal("remote authority bypass")
 	}
 }
@@ -372,7 +372,6 @@ rule "plugin-rule" {
 func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.DefaultImage = registry.Reference
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Config.Tailnet.ControlURL = "https://wrong-config.example.test"
@@ -384,7 +383,7 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 			selected = ""
 		}
 		ctx := context.Background()
-		op, e := s.Create(ctx, caller, CreateRequest{Name: "exact", Owner: selected, NoStart: true, Tailscale: true})
+		op, e := s.Create(ctx, caller, CreateRequest{Image: registry.Reference, Name: "exact", Owner: selected, NoStart: true, Tailscale: true})
 		daemon.Succeeded(t, s.Jobs, caller.Peer, op, e)
 		data, e := s.Runtime.Control.Inspect(ctx, "exact")
 		if e != nil {
