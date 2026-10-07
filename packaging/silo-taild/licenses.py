@@ -9,7 +9,8 @@ import sys
 
 def main() -> None:
     module, output = Path(sys.argv[1]), Path(sys.argv[2])
-    data = subprocess.check_output(["go", "list", "-mod=readonly", "-deps", "-json", "./cmd/taild"], cwd=module, text=True)
+    go = sys.argv[3] if len(sys.argv) > 3 else "go"
+    data = subprocess.check_output([go, "list", "-mod=readonly", "-deps", "-json", "./cmd/taild"], cwd=module, text=True)
     decoder = json.JSONDecoder()
     modules = []
     while data.strip():

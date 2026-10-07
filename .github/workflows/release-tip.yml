@@ -97,16 +97,17 @@ jobs:
           xcodebuild -version
 
       - name: Build release archives
-        # Native target-local order: runtime stage/archive/hash, bridge/hash,
-        # isolated qualified SDK embedding, CGO taild, then portable archive.
-        # No dependency on all-target SDK assembly, so there is no release cycle.
+        # Product build precedes staging/archive; standalone SDK assembly stays
+        # downstream and is not a prerequisite for integrated taild.
         run: nix develop .#release --command make archive
 
-      - name: Qualify packaged taild offline on native Linux
-        if: ${{ !matrix.create_dmg }}
+      - name: Build native management and exact-ID acceptance driver
+        run: nix develop .#release --command go -C app/taild build -o "$GITHUB_WORKSPACE/target/artifact-driver" ../../packaging/silo-taild/kvm.go
+      - name: Qualify integrated portable product on the native host
         env:
           PLATFORM: ${{ matrix.platform }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
         run: |
           nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "target/packages/$VERSION/$PLATFORM/silo-$VERSION-$PLATFORM.tar.zst" "target/packages/$VERSION/$PLATFORM/silo-runtime-$VERSION-$PLATFORM.tar.zst"
 
@@ -116,6 +117,14 @@ jobs:
       - name: Build macOS package
         if: ${{ matrix.create_dmg }}
         run: nix develop .#release --command make package DMG=1
+      - name: Qualify actual signed native app
+        if: ${{ matrix.create_dmg }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
+        run: |
+          output="target/packages/$VERSION/darwin-arm64"
+          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "$output/silo-$VERSION-darwin-arm64.tar.zst" "$output/silo-runtime-$VERSION-darwin-arm64.tar.zst" --app "$output/Silo.app" --audit-only
 
       - name: Stage core artifacts for transfer
         env:

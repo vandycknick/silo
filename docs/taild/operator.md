@@ -14,6 +14,13 @@ Silod requires `taild` and the native bridge beside its canonical executable:
 helper's SDK loader or install a second SDK runtime. Product/protocol/ABI mismatch
 is a component failure, never a fallback to another installed binary.
 
+`make build` builds this integrated layout directly from the source Go SDK;
+standalone SDK assembly is not a prerequisite. Portable product archives include
+the helper, adjacent bridge and generated third-party notices. The macOS app
+places them in its signed Helpers layout, with the bridge signed before the
+executables using the same identity. See [packaging](../../PACKAGING.md) for
+artifact verification and the separate native-host qualification gates.
+
 ```sh
 silo daemon up --tailscale --system=false
 silo daemon status

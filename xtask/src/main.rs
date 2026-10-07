@@ -258,13 +258,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &rprobe,
             )?;
             archive::produce_runtime(&workspace_root, &target_dir, Profile::Release)?;
+            let context = build_context(&workspace_root, &target_dir, Profile::Release)?;
+            go_sdk::qualify_bridge(&context)?;
             if !runtime_only {
-                let context = build_context(&workspace_root, &target_dir, Profile::Release)?;
-                if context.host != HostTarget::MacosArm64 {
-                    build_component(Component::GoFfi, &context)?;
-                    go_sdk::qualify_bridge(&context)?;
-                    build_component(Component::Taild, &context)?;
-                }
                 archive::produce_portable(&workspace_root, &target_dir)?;
             }
         }
@@ -402,7 +398,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &rprobe,
             )?;
             let context = build_context(&workspace_root, &target_dir, profile)?;
-            build_component(Component::GoFfi, &context)?;
             go_sdk::run_example(&context, &example)?;
         }
         Commands::PackInitramfs { init, out } => {

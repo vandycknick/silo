@@ -20,13 +20,10 @@ flags preserve the selected features. Core readiness does not imply lobby
 readiness: network delay or pending authentication leaves the core API usable,
 and local daemon status reports the component state and any approval URL.
 
-Build the ordinary runtime assets with `make build`. Source development also
-requires the native Go bridge and adjacent helper:
-
-```sh
-cargo build -p silo-go-ffi -p silod -p cli
-CGO_ENABLED=1 go -C app/taild build -o ../../target/debug/taild ./cmd/taild
-```
+`make build` builds the ordinary runtime assets, CLI, silod, native Go bridge
+and adjacent taild together on Linux and macOS. For a helper-only incremental
+build, use `make taild PROFILE=debug`; it ensures the bridge dependency once.
+Neither path assembles or installs a standalone SDK runtime.
 
 Go 1.26.6 or newer, the configured Go 1.26.8 toolchain, CGO and a native C
 toolchain are required. Silod selects its own canonical sibling `taild` and

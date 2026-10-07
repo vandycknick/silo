@@ -1,3 +1,0 @@
-g kvm -
-u silo-taild - "Silo tailnet service" /var/lib/silo-taild
-m silo-taild kvm

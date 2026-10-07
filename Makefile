@@ -114,7 +114,7 @@ help: ## Show public targets and configurable options.
 
 ##@ Build
 .PHONY: build stage go-sdk-example
-build: ## Build the complete adjacent runtime.
+build: ## Build the complete adjacent runtime, CLI, daemon, native taild and Go bridge.
 	$(XTASK) build --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
 stage: ## Build and assemble the portable runtime stage.
@@ -125,7 +125,7 @@ go-sdk-example: ## Build the runtime and Go bridge, then run EXAMPLE (default: b
 
 ##@ Distribution
 .PHONY: archive runtime-archive portable-archive qualify-go-bridge app package assemble-go-sdk install
-archive: ## Build release runtime and CLI archives.
+archive: ## Build release runtime and product archives, qualifying the bridge for standalone SDK assembly.
 	$(XTASK) archive $(RUNTIME_ARGS)
 
 runtime-archive: ## Archive an already-built PROFILE runtime stage with checksum, SBOM and provenance.
@@ -134,7 +134,7 @@ runtime-archive: ## Archive an already-built PROFILE runtime stage with checksum
 qualify-go-bridge: ## Hash an already-built native bridge into target-local package inputs.
 	$(XTASK) qualify-go-bridge --profile "$(PROFILE)"
 
-portable-archive: ## Archive an already-built release runtime, CLI and qualified native taild.
+portable-archive: ## Archive an already-built release runtime, CLI, native taild and Go bridge.
 	$(XTASK) portable-archive
 
 app: ## Build and sign the macOS release application.
