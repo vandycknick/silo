@@ -503,6 +503,50 @@ pub fn watch_image_progress(
     })
 }
 
+/// Ask a default-no question between progress phases, after consuming any spinner.
+/// Noninteractive callers decline without reading input; EOF aborts the operation.
+pub fn confirm(question: &str) -> std::io::Result<bool> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(false);
+    }
+    confirm_with_io(
+        question,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+fn confirm_with_io(
+    question: &str,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> std::io::Result<bool> {
+    let mut answer = String::new();
+    loop {
+        write!(output, "{question} [y/N]: ")?;
+        output.flush()?;
+        answer.clear();
+        if input.read_line(&mut answer)? == 0 {
+            writeln!(output)?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "confirmation cancelled: input closed",
+            ));
+        }
+        let answer = answer.trim();
+        if answer.is_empty()
+            || answer.eq_ignore_ascii_case("n")
+            || answer.eq_ignore_ascii_case("no")
+        {
+            return Ok(false);
+        }
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+            return Ok(true);
+        }
+        writeln!(output, "Please answer yes or no (Enter selects no).")?;
+    }
+}
+
 pub fn success(message: impl AsRef<str>) {
     let check = if should_style_stderr() {
         style("✓").green().to_string()
@@ -756,6 +800,35 @@ mod tests {
     use libvm::ImageProgress;
 
     use crate::ui::{relative_time, short_id, with_delayed_spinner, PullProgressDisplay};
+
+    #[test]
+    fn confirmation_accepts_explicit_choices_and_defaults_to_no() {
+        for (input, expected) in [
+            ("\n", false),
+            (" n \n", false),
+            ("NO\n", false),
+            ("y\n", true),
+            (" YeS \n", true),
+            ("perhaps\nyes\n", true),
+            ("perhaps\nno\n", false),
+        ] {
+            assert_eq!(
+                crate::ui::confirm_with_io("Continue?", &mut input.as_bytes(), &mut Vec::new())
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_eof_aborts_instead_of_accepting_a_default() {
+        for input in ["", "perhaps\n"] {
+            let error =
+                crate::ui::confirm_with_io("Continue?", &mut input.as_bytes(), &mut Vec::new())
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+    }
 
     #[tokio::test]
     async fn delayed_spinner_does_not_delay_fast_operations() {

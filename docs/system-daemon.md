@@ -268,8 +268,13 @@ systemd; transient runtime failures remain restartable.
 
 On Linux, `up --linger` asks `loginctl enable-linger <current-user>` to enable
 account-wide boot-before-login and logout persistence, without sudo. Authorization
-failure is explicit. Omitted selection offers consent only on a terminal;
-noninteractive operation prints the command and limited-startup warning.
+failure is explicit. Omitted selection offers consent only on a terminal, after
+the configuration-check spinner finishes and normal input echo is restored.
+Enter declines; invalid answers ask again; EOF or Ctrl-C cancels before service
+registration. Declining leaves account linger unchanged and continues startup
+with a persistence note, not a warning. Noninteractive operation does not read
+input and prints the same note and explicit enable command. A fresh startup
+spinner starts after the linger decision, so its elapsed time excludes answering.
 `--linger=false` suppresses the offer, never disables existing lingering.
 Foreground/macOS reject `--linger`; `down` never changes account linger.
 
