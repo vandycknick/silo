@@ -73,6 +73,24 @@ silo.WithRootDiskSize(silo.Gigabytes(40))
 
 Decimal (`Gigabytes`) and binary (`Gibibytes`) constructors are intentionally distinct.
 
+## Tailnet policy forwards
+
+`NetworkPolicyConfig.Forwards` configures network-policy listeners, independently
+of machine-scoped forwards. `NetworkForward.Protocol` defaults to
+`NetworkForwardTCP`; port 443 does not imply TLS. Use `NetworkForwardHTTPS` with
+`TLS: &NetworkForwardTLS{Provider: NetworkForwardTLSTailscale}` for managed
+HTTPS termination. This shape requires `Kind: NetworkForwardTailscale`,
+`Target` pointing to `"self"`, a listen address such as `":443"`, and the guest's
+HTTP `TargetPort`. The guest service must listen on its interface or wildcard
+address, not only loopback.
+
+`Tunnel` may be omitted for a same-VM forward; managed SSH policy injection
+supplies it. A local launch still needs exactly one declared Tailscale node and
+its enrollment/state configuration; explicit bindings must reference that node.
+These forwards require a dedicated 1:1 network attachment; shared/unknown scopes
+reject `self`. TCP cannot configure TLS. Managed certificates require an
+eligible tailnet node but introduce no certificate secret requirement.
+
 ## Forwards and guest publications
 
 Machine-scoped forwards work without networking and persist across starts:

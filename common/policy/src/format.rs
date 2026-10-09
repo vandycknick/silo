@@ -175,6 +175,12 @@ impl NetworkPolicy {
             ));
             attribute(&mut output, "target", &value(&json!(forward.target)));
             attribute(&mut output, "target_port", &forward.target_port.to_string());
+            attribute(&mut output, "protocol", &value(&json!(forward.protocol)));
+            if let Some(tls) = &forward.tls {
+                output.push_str("  tls {\n");
+                output.push_str(&format!("    provider = {}\n", value(&json!(tls.provider))));
+                output.push_str("  }\n");
+            }
             if !forward.listen.is_empty() {
                 attribute(&mut output, "listen", &value(&json!(forward.listen)));
             }
@@ -204,7 +210,11 @@ mod tests {
                     rule.endpoint(name).credential(name).tunnel(name).allow()
                 })
                 .forward("relay", |forward| {
-                    forward.tailscale(name).target("name:web").target_port(80)
+                    forward
+                        .tailscale()
+                        .tunnel(name)
+                        .target("name:web")
+                        .target_port(80)
                 })
                 .build()
                 .unwrap();

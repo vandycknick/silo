@@ -201,13 +201,30 @@ const (
 	NetworkForwardTailscale NetworkForwardKind = "tailscale"
 )
 
+type NetworkForwardProtocol string
+
+const (
+	NetworkForwardTCP   NetworkForwardProtocol = "tcp"
+	NetworkForwardHTTPS NetworkForwardProtocol = "https"
+)
+
+type NetworkForwardTLSProvider string
+
+const NetworkForwardTLSTailscale NetworkForwardTLSProvider = "tailscale"
+
+type NetworkForwardTLS struct {
+	Provider NetworkForwardTLSProvider `json:"provider"`
+}
+
 type NetworkForward struct {
-	Name       string             `json:"name"`
-	Kind       NetworkForwardKind `json:"kind"`
-	Tunnel     *string            `json:"tunnel,omitempty"`
-	Target     *string            `json:"target,omitempty"`
-	TargetPort *uint16            `json:"target_port,omitempty"`
-	Listen     *string            `json:"listen,omitempty"`
+	Name       string                 `json:"name"`
+	Kind       NetworkForwardKind     `json:"kind"`
+	Tunnel     *string                `json:"tunnel,omitempty"`
+	Target     *string                `json:"target,omitempty"`
+	TargetPort *uint16                `json:"target_port,omitempty"`
+	Listen     *string                `json:"listen,omitempty"`
+	Protocol   NetworkForwardProtocol `json:"protocol,omitempty"`
+	TLS        *NetworkForwardTLS     `json:"tls,omitempty"`
 }
 
 func BuildNetworkPolicy(config NetworkPolicyConfig) (*NetworkPolicy, error) {

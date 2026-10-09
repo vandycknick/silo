@@ -39,6 +39,7 @@ type Spec struct {
 	Policy            *policy.Policy
 	GuestPublish      config.PublishBind
 	Secrets           credentials.Source
+	AttachmentScope   policy.AttachmentScope
 }
 
 type Shared struct {
@@ -73,6 +74,9 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 	if spec.Policy == nil {
 		return nil, errors.New("session policy is required")
 	}
+	if err := policy.ValidateForwardAttachment(spec.AttachmentScope, spec.Policy.Forwards()); err != nil {
+		return nil, err
+	}
 	if spec.Policy.HasRegistries() && shared.Intelligence == nil {
 		return nil, errors.New("registry policy requires shared package intelligence")
 	}
@@ -99,7 +103,7 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 			cancel()
 			return nil, err
 		}
-		result.node, err = netnode.New(netnode.Options{VMID: spec.VMID, RunID: spec.RunID, Identity: expected, Dir: spec.TailscaleStateDir, Declaration: *decl, Secrets: spec.Secrets, Guest: result, Flows: flows,
+		result.node, err = netnode.New(netnode.Options{VMID: spec.VMID, RunID: spec.RunID, Identity: expected, Dir: spec.TailscaleStateDir, Declaration: *decl, Secrets: spec.Secrets, Guest: result, Flows: flows, Forwards: spec.Policy.Forwards(), AttachmentScope: spec.AttachmentScope,
 			Ready: func(ctx context.Context) (func(), error) {
 				ca, ok := spec.Secrets.Lookup("silo.ssh_ca.private_key")
 				if !ok {

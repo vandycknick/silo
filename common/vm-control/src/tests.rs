@@ -316,6 +316,86 @@ rule "deny-api" {
 }
 
 #[test]
+fn forward_normalization_preserves_unbound_transport_without_secrets() {
+    for extra in [
+        "",
+        "protocol = \"tcp\"",
+        "protocol = \"https\"\n tls { provider = \"tailscale\" }",
+    ] {
+        let source = format!("forward \"tailscale\" \"web\" {{\n listen = \":00443\"\n target = \"self\"\n target_port = 8080\n {extra}\n}}");
+        let doc = policy::normalize_policy(w::NormalizePolicyRequest {
+            input: Some(w::normalize_policy_request::Input::Hcl(source)),
+        })
+        .unwrap();
+        assert!(doc.secret_requirements.is_empty());
+        assert!(doc.secret_slots.is_empty());
+        let native = values::policy_from_wire(&doc.canonical_json).unwrap();
+        assert_eq!(native.forwards()[0].listen, ":443");
+        assert_eq!(native.forwards()[0].tunnel, None);
+        assert_eq!(native.forwards()[0].target, "self");
+        assert_eq!(
+            libvm::NetworkPolicy::from_hcl_str(&doc.hcl)
+                .unwrap()
+                .forwards(),
+            native.forwards()
+        );
+        let round_trip = policy::normalize_policy(w::NormalizePolicyRequest {
+            input: Some(w::normalize_policy_request::Input::CanonicalJson(
+                doc.canonical_json.clone(),
+            )),
+        })
+        .unwrap();
+        assert_eq!(round_trip.canonical_json, doc.canonical_json);
+        assert_eq!(round_trip.hcl, doc.hcl);
+    }
+}
+
+#[test]
+fn forward_normalization_rejects_invalid_tls_and_reserved_port() {
+    for source in [
+        "forward \"tailscale\" \"web\" {\n listen = \":22\"\n target = \"self\"\n target_port = 8080\n}",
+        "forward \"tailscale\" \"web\" {\n listen = \":443\"\n target = \"self\"\n target_port = 8080\n protocol = \"https\"\n}",
+        "forward \"host\" \"web\" {\n listen = \"127.0.0.1:443\"\n target = \"self\"\n target_port = 8080\n}",
+    ] {
+        assert!(policy::normalize_policy(w::NormalizePolicyRequest {
+            input: Some(w::normalize_policy_request::Input::Hcl(source.into())),
+        }).is_err());
+    }
+}
+
+#[test]
+fn forward_normalization_retains_explicit_node_binding_and_rejects_json_bypass() {
+    let doc = policy::normalize_policy(w::NormalizePolicyRequest {
+        input: Some(w::normalize_policy_request::Input::Hcl(
+            "tailscale \"vm\" {}\nforward \"tailscale\" \"web\" {\n tunnel = tailscale.vm\n listen = \":9443\"\n target = \"self\"\n target_port = 9000\n protocol = \"https\"\n tls { provider = \"tailscale\" }\n}".into(),
+        )),
+    }).unwrap();
+    let native = values::policy_from_wire(&doc.canonical_json).unwrap();
+    assert_eq!(native.forwards()[0].tunnel.as_deref(), Some("vm"));
+    assert_eq!(native.forwards()[0].protocol, libvm::ForwardProtocol::Https);
+    assert_eq!(
+        native.forwards()[0].tls.as_ref().unwrap().provider,
+        libvm::ForwardCertificateProvider::Tailscale
+    );
+    assert_eq!(
+        libvm::NetworkPolicy::from_hcl_str(&doc.hcl)
+            .unwrap()
+            .forwards(),
+        native.forwards()
+    );
+    for replacement in [serde_json::json!("host"), serde_json::json!("unknown")] {
+        let mut invalid: serde_json::Value = serde_json::from_str(&doc.canonical_json).unwrap();
+        invalid["forwards"][0]["kind"] = replacement;
+        assert!(policy::normalize_policy(w::NormalizePolicyRequest {
+            input: Some(w::normalize_policy_request::Input::CanonicalJson(
+                invalid.to_string()
+            )),
+        })
+        .is_err());
+    }
+}
+
+#[test]
 fn readiness_preserves_each_outcome_and_reason() {
     let now = std::time::UNIX_EPOCH + std::time::Duration::new(123, 456_789_123);
     let reasons = [

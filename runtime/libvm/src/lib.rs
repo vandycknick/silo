@@ -95,8 +95,9 @@ pub use forward_spec::{
     ForwardShape, UnixMode,
 };
 pub use silo_policy::{
-    NetworkAuditBuilder, NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder,
-    NetworkForwardBuilder, NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder,
-    NetworkRuleBuilder, NetworkSecretAlternative, NetworkSecretKind, NetworkSecretRequirement,
-    NetworkSecretSlot, PolicyLoadError, TailscaleTunnelBuilder,
+    ForwardCertificateProvider, ForwardProtocol, ForwardTls, NetworkAuditBuilder,
+    NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder, NetworkForwardBuilder,
+    NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder, NetworkRuleBuilder,
+    NetworkSecretAlternative, NetworkSecretKind, NetworkSecretRequirement, NetworkSecretSlot,
+    PolicyLoadError, TailscaleTunnelBuilder,
 };

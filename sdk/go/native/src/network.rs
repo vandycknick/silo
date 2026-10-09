@@ -1,6 +1,7 @@
 use libvm::{
-    NetworkAuditBuilder, NetworkCredentialBuilder, NetworkEndpointBuilder, NetworkForwardBuilder,
-    NetworkPolicy, NetworkRuleBuilder, TailscaleTunnelBuilder,
+    ForwardProtocol, ForwardTls, NetworkAuditBuilder, NetworkCredentialBuilder,
+    NetworkEndpointBuilder, NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder,
+    TailscaleTunnelBuilder,
 };
 use serde::Deserialize;
 
@@ -100,14 +101,24 @@ struct Tunnel {
     control_url: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ForwardKind {
+    Host,
+    Tailscale,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Forward {
     name: String,
-    kind: String,
+    kind: ForwardKind,
     tunnel: Option<String>,
     target: Option<String>,
     target_port: Option<u16>,
     listen: Option<String>,
+    #[serde(default)]
+    protocol: ForwardProtocol,
+    tls: Option<ForwardTls>,
 }
 
 #[no_mangle]
@@ -304,11 +315,17 @@ fn apply_tunnel(mut b: TailscaleTunnelBuilder, v: Tunnel) -> TailscaleTunnelBuil
     b
 }
 fn apply_forward(mut b: NetworkForwardBuilder, v: Forward) -> NetworkForwardBuilder {
-    b = match v.kind.as_str() {
-        "host" => b.host(),
-        "tailscale" => v.tunnel.map_or(b.clone(), |x| b.tailscale(x)),
-        _ => b,
+    b = match v.kind {
+        ForwardKind::Host => b.host(),
+        ForwardKind::Tailscale => b.tailscale(),
     };
+    if let Some(tunnel) = v.tunnel {
+        b = b.tunnel(tunnel)
+    }
+    b = b.protocol(v.protocol);
+    if let Some(tls) = v.tls {
+        b = b.tls(tls)
+    }
     if let Some(x) = v.target {
         b = b.target(x)
     }
@@ -327,6 +344,105 @@ mod tests {
 
     use crate::network::silo_network_policy_build;
     use crate::{silo_buffer_free, silo_error_free, SiloBuffer};
+
+    fn forward_abi(request: serde_json::Value) -> Option<serde_json::Value> {
+        let hcl_output = request["output"] == "hcl";
+        let request = serde_json::to_vec(&request).unwrap();
+        let mut output = SiloBuffer {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let error =
+            unsafe { silo_network_policy_build(request.as_ptr(), request.len(), &mut output) };
+        if !error.is_null() {
+            unsafe { silo_error_free(error) };
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(output.ptr, output.len) };
+        let value = if hcl_output {
+            serde_json::Value::String(std::str::from_utf8(bytes).unwrap().to_owned())
+        } else {
+            serde_json::from_slice(bytes).unwrap()
+        };
+        unsafe { silo_buffer_free(output) };
+        Some(value)
+    }
+
+    #[test]
+    fn forward_abi_preserves_unbound_tailscale_and_managed_https() {
+        for protocol in [None, Some("tcp"), Some("https")] {
+            let mut forward = serde_json::json!({
+                "name": "web", "kind": "tailscale", "target": "self",
+                "target_port": 8080, "listen": ":00443"
+            });
+            if let Some(protocol) = protocol {
+                forward["protocol"] = protocol.into();
+            }
+            if protocol == Some("https") {
+                forward["tls"] = serde_json::json!({"provider": "tailscale"});
+            }
+            let config = serde_json::json!({"forwards": [forward]});
+            let result = forward_abi(serde_json::json!({"config": config})).unwrap();
+            assert_eq!(result["forwards"][0]["kind"], "tailscale");
+            assert_eq!(result["forwards"][0]["target"], "self");
+            assert_eq!(result["forwards"][0]["listen"], ":443");
+            assert_eq!(result["forwards"][0]["protocol"], protocol.unwrap_or("tcp"));
+            assert!(result["forwards"][0].get("tunnel").is_none());
+            let slots =
+                forward_abi(serde_json::json!({"config": config, "output": "slots"})).unwrap();
+            assert_eq!(slots["slots"], serde_json::json!([]));
+            assert_eq!(slots["requirements"], serde_json::json!([]));
+            let reparsed = forward_abi(serde_json::json!({"json": result.to_string()})).unwrap();
+            assert_eq!(reparsed, result);
+            let hcl = forward_abi(serde_json::json!({"json": result.to_string(), "output": "hcl"}))
+                .unwrap();
+            let from_hcl = forward_abi(serde_json::json!({"hcl": hcl})).unwrap();
+            assert_eq!(from_hcl["forwards"], result["forwards"]);
+        }
+        let bound = forward_abi(serde_json::json!({"config": {
+            "tunnels": [{"name": "vm"}],
+            "forwards": [{"name": "web", "kind": "tailscale", "tunnel": "vm",
+                "target": "self", "target_port": 8080, "listen": ":443"}]
+        }}))
+        .unwrap();
+        assert_eq!(bound["forwards"][0]["tunnel"], "vm");
+    }
+
+    #[test]
+    fn forward_abi_rejects_invalid_contract() {
+        let base = serde_json::json!({"name": "web", "kind": "tailscale",
+            "target": "self", "target_port": 8080, "listen": ":443"});
+        for (field, value) in [
+            ("kind", serde_json::json!("unknown")),
+            ("protocol", serde_json::json!("udp")),
+            ("protocol", serde_json::json!("https")),
+            ("tls", serde_json::json!({"provider": "tailscale"})),
+            ("tls", serde_json::json!({"provider": "other"})),
+            (
+                "tls",
+                serde_json::json!({"provider": "tailscale", "domain": "evil.example"}),
+            ),
+            ("target_port", serde_json::json!(0)),
+            ("target_port", serde_json::json!(65536)),
+            ("listen", serde_json::json!(":22")),
+            ("listen", serde_json::json!("0.0.0.0:443")),
+            ("listen", serde_json::json!(":65536")),
+            ("tunnel", serde_json::json!("missing")),
+        ] {
+            let mut forward = base.clone();
+            forward[field] = value;
+            assert!(
+                forward_abi(serde_json::json!({"config": {"forwards": [forward]}})).is_none(),
+                "{field}"
+            );
+        }
+        let mut duplicate = base.clone();
+        duplicate["name"] = "duplicate".into();
+        duplicate["listen"] = ":00443".into();
+        assert!(
+            forward_abi(serde_json::json!({"config": {"forwards": [base, duplicate]}})).is_none()
+        );
+    }
 
     #[test]
     fn builds_canonical_policy_through_the_abi() {

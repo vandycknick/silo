@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use libvm::{
     ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult,
-    ExecutionSession, ExecutionStdin, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
-    ImagePullOptions, ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError,
-    Machine, MachineBootReport, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions,
+    ExecutionSession, ExecutionStdin, ForwardCertificateProvider, ForwardProtocol, ForwardTls,
+    ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport, ImagePullOptions,
+    ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError, Machine,
+    MachineBootReport, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions,
     MachineLogOutput, MachineLogSource, MachineLogStream, MachineNetworkBuilder,
     MachineNetworkConfig, MachineProvisionReport, MachineProvisionStepReport, MachineRef,
     MachineRootfs, MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder,
@@ -189,6 +190,42 @@ pub struct NativeNetworkForwardInput {
     pub target_port: Option<u32>,
     pub listen: Option<String>,
     pub tunnel: Option<String>,
+    pub protocol: Option<String>,
+    pub tls: Option<NativeNetworkForwardTlsInput>,
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeNetworkForwardTlsInput {
+    pub provider: String,
+}
+
+impl napi::bindgen_prelude::ValidateNapiValue for NativeNetworkForwardTlsInput {}
+
+impl napi::bindgen_prelude::FromNapiValue for NativeNetworkForwardTlsInput {
+    unsafe fn from_napi_value(
+        env: napi::bindgen_prelude::sys::napi_env,
+        value: napi::bindgen_prelude::sys::napi_value,
+    ) -> Result<Self> {
+        use napi::bindgen_prelude::{
+            JsObjectValue, KeyCollectionMode, KeyConversion, KeyFilter, Object,
+        };
+        let object = unsafe { Object::from_napi_value(env, value)? };
+        let keys = object.get_all_property_names(
+            KeyCollectionMode::OwnOnly,
+            KeyFilter::AllProperties,
+            KeyConversion::NumbersToStrings,
+        )?;
+        let length: u32 = keys.get_named_property("length")?;
+        for index in 0..length {
+            let key: String = keys.get_element(index)?;
+            if key != "provider" {
+                return Err(invalid_arg(format!("unknown forward TLS field {key:?}")));
+            }
+        }
+        Ok(Self {
+            provider: object.get_named_property("provider")?,
+        })
+    }
 }
 
 #[napi(object)]
@@ -1521,6 +1558,24 @@ fn validate_forward_input(input: &NativeNetworkForwardInput) -> Result<()> {
             _ => return Err(invalid_arg(format!("unsupported forward kind {kind:?}"))),
         }
     }
+    if let Some(protocol) = input.protocol.as_deref() {
+        match protocol {
+            "tcp" | "https" => {}
+            _ => {
+                return Err(invalid_arg(format!(
+                    "unsupported forward protocol {protocol:?}"
+                )))
+            }
+        }
+    }
+    if let Some(tls) = &input.tls {
+        if tls.provider != "tailscale" {
+            return Err(invalid_arg(format!(
+                "unsupported forward TLS provider {:?}",
+                tls.provider
+            )));
+        }
+    }
     if let Some(port) = input.target_port {
         validate_u16_port(port, "forward targetPort")?;
     }
@@ -1686,17 +1741,32 @@ fn apply_forward_input(
     mut builder: NetworkForwardBuilder,
     input: NativeNetworkForwardInput,
 ) -> NetworkForwardBuilder {
-    if let Some(kind) = input.kind {
-        builder = match kind.as_str() {
-            "host" => builder.host(),
-            "tailscale" => match input.tunnel.as_deref() {
-                Some(tunnel) => builder.tailscale(tunnel.to_string()),
-                None => builder,
-            },
-            _ => builder,
-        };
-    } else if let Some(tunnel) = input.tunnel.as_deref() {
-        builder = builder.tailscale(tunnel.to_string());
+    match input.kind.as_deref() {
+        Some("host") => builder = builder.host(),
+        Some("tailscale") => builder = builder.tailscale(),
+        None if input.tunnel.is_some() => builder = builder.tailscale(),
+        None => {}
+        Some(_) => unreachable!("forward kind was validated"),
+    }
+    if let Some(tunnel) = input.tunnel {
+        builder = builder.tunnel(tunnel);
+    }
+    if let Some(protocol) = input.protocol {
+        builder = builder.protocol(match protocol.as_str() {
+            "tcp" => ForwardProtocol::Tcp,
+            "https" => ForwardProtocol::Https,
+            _ => unreachable!("forward protocol was validated"),
+        });
+    }
+    if let Some(tls) = input.tls {
+        match tls.provider.as_str() {
+            "tailscale" => {
+                builder = builder.tls(ForwardTls {
+                    provider: ForwardCertificateProvider::Tailscale,
+                })
+            }
+            _ => unreachable!("forward TLS provider was validated"),
+        }
     }
     if let Some(target) = input.target {
         builder = builder.target(target);

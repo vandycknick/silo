@@ -37,6 +37,7 @@ type Logger struct {
 }
 
 type Event struct {
+	Forward      *Forward     `json:"forward,omitempty"`
 	SSH          *SSH         `json:"ssh,omitempty"`
 	DurationMS   *int64       `json:"duration_ms,omitempty"`
 	Version      int          `json:"version"`
@@ -66,6 +67,11 @@ type Event struct {
 	Error        *AuditError  `json:"error,omitempty"`
 	Verdict      string       `json:"verdict"`
 	Reason       string       `json:"reason,omitempty"`
+}
+
+type Forward struct {
+	Name       string `json:"name"`
+	TargetPort uint16 `json:"target_port"`
 }
 
 type SSH struct {
@@ -230,7 +236,13 @@ func (l *Logger) RecordInbound(vmID, runID, networkID string, event netnode.Inbo
 		return
 	}
 	duration := event.Duration.Milliseconds()
-	l.emit(Event{Version: 1, Phase: "end", Family: "inbound", Direction: "inbound", Protocol: "tcp", Timestamp: time.Now().UTC(), PolicyHash: l.policyHash,
+	family, protocol := "inbound", "tcp"
+	var forward *Forward
+	if event.Forward != "" {
+		family, protocol = "forward", event.Protocol
+		forward = &Forward{Name: event.Forward, TargetPort: event.TargetPort}
+	}
+	l.emit(Event{Version: 1, Phase: "end", Family: family, Direction: "inbound", Protocol: protocol, Forward: forward, Timestamp: time.Now().UTC(), PolicyHash: l.policyHash,
 		VMID: vmID, RunID: runID, NetworkID: networkID, SourceIP: event.Peer.Addr().String(), SourcePort: event.Peer.Port(), DestPort: event.Port, Verdict: event.Decision, Reason: event.Reason, DurationMS: &duration})
 }
 

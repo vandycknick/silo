@@ -212,8 +212,12 @@ func validateLabels(labels map[string]string) error {
 type policyAuthority struct {
 	Metadata  map[string]json.RawMessage `json:"metadata"`
 	Tailscale []json.RawMessage          `json:"tailscale"`
-	Forwards  []json.RawMessage          `json:"forwards"`
-	Rules     []struct {
+	Forwards  []struct {
+		Kind   string  `json:"kind"`
+		Target string  `json:"target"`
+		Tunnel *string `json:"tunnel"`
+	} `json:"forwards"`
+	Rules []struct {
 		Tunnel *string `json:"tunnel"`
 	} `json:"rules"`
 }
@@ -228,8 +232,13 @@ func remotePolicy(p *control.Policy) error {
 			return failure("usage", "remote policies cannot declare reserved taild metadata", 2)
 		}
 	}
-	if len(a.Tailscale) > 0 || len(a.Forwards) > 0 {
-		return failure("usage", "remote policies cannot declare tailscale or forwards", 2)
+	if len(a.Tailscale) > 0 {
+		return failure("usage", "remote policies cannot declare tailscale nodes", 2)
+	}
+	for _, f := range a.Forwards {
+		if f.Kind != "tailscale" || f.Target != "self" || f.Tunnel != nil {
+			return failure("usage", "remote policy forwards require tailscale, target self, and no explicit tunnel", 2)
+		}
 	}
 	for _, r := range a.Rules {
 		if r.Tunnel != nil {
@@ -257,6 +266,8 @@ func (s *Service) parseRemotePolicy(ctx context.Context, raw string) (*control.P
 // their order/priority. IP allow rules gain neutral routing, which netd applies
 // only to tailnet destinations; the appended lowest-priority rules exempt the
 // tailnet from default deny without overriding any explicit matching rule.
+// Authored same-VM forwards are bound to the managed node without changing their
+// protocol, TLS configuration, listener, or guest destination.
 func (s *Service) InjectTailnet(ctx context.Context, p *control.Policy, hostname string, owner identity.Principal, controlURL string, requestedTags ...string) (*control.Policy, error) {
 	if _, e := identity.ParsePrincipal(string(owner)); e != nil {
 		return nil, usageDocument()
@@ -292,6 +303,20 @@ func (s *Service) InjectTailnet(ctx context.Context, p *control.Policy, hostname
 	}
 	if e := json.Unmarshal(root["rules"], &rules); e != nil {
 		return nil, e
+	}
+	if raw, ok := root["forwards"]; ok {
+		var forwards []map[string]json.RawMessage
+		if e := json.Unmarshal(raw, &forwards); e != nil {
+			return nil, e
+		}
+		for _, forward := range forwards {
+			forward["tunnel"] = json.RawMessage(`"vm"`)
+		}
+		var e error
+		root["forwards"], e = json.Marshal(forwards)
+		if e != nil {
+			return nil, e
+		}
 	}
 	ip := map[string]bool{}
 	names := map[string]bool{}
@@ -536,6 +561,13 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 		}
 	}
 	if q.policy != nil {
+		var a policyAuthority
+		if e := json.Unmarshal([]byte(q.policy.CanonicalJSON), &a); e != nil {
+			return q, usageDocument()
+		}
+		if len(a.Forwards) > 0 && !q.Tailscale {
+			return q, failure("usage", "policy forwards require --tailscale", 2)
+		}
 		if e := s.checkSecrets(ctx, q.policy); e != nil {
 			return q, e
 		}

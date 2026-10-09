@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -73,7 +74,7 @@ func TestLoadCanonicalPolicyRejectsUnimplementedSessionCapabilities(t *testing.T
 		want string
 	}{
 		{name: "tailscale", body: `{"version":1,"tailscale":[{"name":"prod"},{"name":"other"}]}`, want: "at most one tailscale"},
-		{name: "forwards", body: `{"version":1,"forwards":[{"name":"ssh","kind":"host","target":"127.0.0.1","target_port":22}]}`, want: "forwards are not implemented"},
+		{name: "forwards", body: `{"version":1,"forwards":[{"name":"ssh","kind":"host","target":"127.0.0.1","target_port":22}]}`, want: `unsupported listener kind "host"`},
 		{name: "tunnel rule", body: `{"version":1,"endpoints":[{"kind":"ip","name":"private","family":"ip","transport":"packet-filter","tls":"none","destination_cidrs":["10.0.0.0/8"],"protocol":"any"}],"rules":[{"name":"tunneled","endpoints":["private"],"tunnel":"prod","verdict":"allow"}]}`, want: "requires an existing tailscale tunnel"},
 	}
 	for _, test := range tests {
@@ -1586,5 +1587,209 @@ func assertL4Match(t *testing.T, decision Decision, want L4Match) {
 	}
 	if *decision.MatchedL4 != want {
 		t.Fatalf("expected l4 match %#v, got %#v", want, *decision.MatchedL4)
+	}
+}
+
+func TestForwardCanonicalCompilation(t *testing.T) {
+	tests := []struct {
+		name     string
+		fields   string
+		protocol ForwardProtocol
+	}{
+		{name: "implicit tcp", protocol: ForwardProtocolTCP},
+		{name: "explicit tcp", fields: `,"protocol":"tcp"`, protocol: ForwardProtocolTCP},
+		{name: "https", fields: `,"protocol":"https","tls":{"provider":"tailscale"}`, protocol: ForwardProtocolHTTPS},
+		{name: "explicit tunnel", fields: `,"tunnel":"vm"`, protocol: ForwardProtocolTCP},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := fmt.Sprintf(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[{"name":"web","kind":"tailscale","target":"self","listen":":00443","target_port":8080%s}]}`, test.fields)
+			compiled, err := LoadReader("forward.json", strings.NewReader(source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []Forward{{Name: "web", ListenPort: 443, GuestPort: 8080, Protocol: test.protocol}}
+			if got := compiled.Forwards(); !slices.Equal(got, want) {
+				t.Fatalf("Forwards() = %#v, want %#v", got, want)
+			}
+			if compiled.DefaultAction != ActionAllow {
+				t.Fatal("forwards must not require deny-by-default egress")
+			}
+			copy := compiled.Forwards()
+			copy[0].GuestPort = 1
+			if !slices.Equal(compiled.Forwards(), want) {
+				t.Fatal("caller mutated compiled forwards")
+			}
+		})
+	}
+	var absent *Policy
+	if absent.Forwards() != nil {
+		t.Fatal("nil policy must have no forwards")
+	}
+}
+
+func TestForwardCanonicalRejectsInvalidDeclarations(t *testing.T) {
+	tests := []struct {
+		name    string
+		forward string
+		nodes   string
+		want    string
+	}{
+		{name: "host", forward: `{"kind":"host","target":"self"}`, want: "unsupported listener kind"},
+		{name: "unknown kind", forward: `{"kind":"udp","target":"self"}`, want: "unsupported listener kind"},
+		{name: "cross vm", forward: `{"kind":"tailscale","target":"name:web"}`, want: "unsupported target"},
+		{name: "missing target", forward: `{"kind":"tailscale"}`, want: "unsupported target"},
+		{name: "no node", forward: `{"kind":"tailscale","target":"self"}`, nodes: `[]`, want: "requires exactly one tailscale"},
+		{name: "multiple nodes", forward: `{"kind":"tailscale","target":"self"}`, nodes: `[{"name":"vm"},{"name":"other"}]`, want: "at most one tailscale"},
+		{name: "wrong tunnel", forward: `{"kind":"tailscale","target":"self","tunnel":"other"}`, want: "does not match"},
+		{name: "unknown protocol", forward: `{"kind":"tailscale","target":"self","protocol":"http"}`, want: "unsupported protocol"},
+		{name: "case sensitive protocol", forward: `{"kind":"tailscale","target":"self","protocol":"TCP"}`, want: "unsupported protocol"},
+		{name: "empty explicit protocol", forward: `{"kind":"tailscale","target":"self","protocol":""}`, want: "unsupported protocol"},
+		{name: "null explicit protocol", forward: `{"kind":"tailscale","target":"self","protocol":null}`, want: "unsupported protocol"},
+		{name: "tcp tls", forward: `{"kind":"tailscale","target":"self","tls":{"provider":"tailscale"}}`, want: "tcp forbids tls"},
+		{name: "https no tls", forward: `{"kind":"tailscale","target":"self","protocol":"https"}`, want: "https requires"},
+		{name: "missing provider", forward: `{"kind":"tailscale","target":"self","protocol":"https","tls":{}}`, want: "https requires"},
+		{name: "wrong provider", forward: `{"kind":"tailscale","target":"self","protocol":"https","tls":{"provider":"acme"}}`, want: "https requires"},
+		{name: "unknown tls field", forward: `{"kind":"tailscale","target":"self","protocol":"https","tls":{"provider":"tailscale","domain":"evil.example"}}`, want: "unknown field"},
+		{name: "unknown forward field", forward: `{"kind":"tailscale","target":"self","address":"evil.example"}`, want: "unknown field"},
+		{name: "zero guest port", forward: `{"kind":"tailscale","target":"self","listen":":443","target_port":0}`, want: "target_port"},
+		{name: "overflow guest port", forward: `{"kind":"tailscale","target":"self","listen":":443","target_port":65536}`, want: "uint16"},
+		{name: "negative guest port", forward: `{"kind":"tailscale","target":"self","listen":":443","target_port":-1}`, want: "uint16"},
+	}
+	for _, listen := range []string{"", ":0", ":65536", ":22", ":00022", "443", "0.0.0.0:443", "localhost:443", "[::]:443", ":+443", ":-1", ": 443", ":443 ", ":0x1bb", ":４４３"} {
+		tests = append(tests, struct {
+			name    string
+			forward string
+			nodes   string
+			want    string
+		}{name: "listen " + listen, forward: fmt.Sprintf(`{"kind":"tailscale","target":"self","listen":%q,"target_port":8080}`, listen), want: "forward"})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nodes := test.nodes
+			if nodes == "" {
+				nodes = `[{"name":"vm"}]`
+			}
+			source := fmt.Sprintf(`{"version":1,"tailscale":%s,"forwards":[{"name":"web",%s]}`, nodes, strings.TrimPrefix(test.forward, "{"))
+			_, err := LoadReader("forward.json", strings.NewReader(source))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestForwardDuplicateNormalizedListener(t *testing.T) {
+	_, err := LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[
+		{"name":"raw","kind":"tailscale","target":"self","listen":":00443","target_port":8443},
+		{"name":"web","kind":"tailscale","target":"self","listen":":443","target_port":8080,"protocol":"https","tls":{"provider":"tailscale"}}
+	]}`))
+	if err == nil || !strings.Contains(err.Error(), "duplicate listener port 443") {
+		t.Fatalf("error = %v, want duplicate normalized listener", err)
+	}
+}
+
+func TestForwardNamesAreUniqueAuditIdentifiers(t *testing.T) {
+	for _, name := range []string{"", "web frontend", "web/other", "web\nother"} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[{"name":`+string(encoded)+`,"kind":"tailscale","target":"self","listen":":443","target_port":8080}]}`))
+			if err == nil {
+				t.Fatal("accepted ambiguous forward audit identifier")
+			}
+		})
+	}
+	_, err := LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[
+		{"name":"web","kind":"tailscale","target":"self","listen":":443","target_port":8080},
+		{"name":"web","kind":"tailscale","target":"self","listen":":9443","target_port":9000}
+	]}`))
+	if err == nil {
+		t.Fatal("accepted duplicate forward audit identifiers")
+	}
+}
+
+func TestForwardAttachmentScope(t *testing.T) {
+	for _, protocol := range []ForwardProtocol{ForwardProtocolTCP, ForwardProtocolHTTPS} {
+		t.Run(string(protocol), func(t *testing.T) {
+			fields := ""
+			if protocol == ForwardProtocolHTTPS {
+				fields = `,"protocol":"https","tls":{"provider":"tailscale"}`
+			}
+			source := fmt.Sprintf(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[{"name":"web","kind":"tailscale","target":"self","listen":":443","target_port":8080%s}]}`, fields)
+			compiled, err := LoadReader("forward.json", strings.NewReader(source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, scope := range []AttachmentScope{AttachmentScopeUnknown, AttachmentScopeDedicatedVM, AttachmentScopeSharedNetwork, AttachmentScope(255)} {
+				err := ValidateForwardAttachment(scope, compiled.Forwards())
+				if scope == AttachmentScopeDedicatedVM {
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else if err == nil || err.Error() != `forward "web": target "self" requires a dedicated 1:1 netd attachment` {
+					t.Fatalf("scope %d: error = %v", scope, err)
+				}
+				if err := ValidateForwardAttachment(scope, nil); err != nil {
+					t.Fatalf("empty forwards, scope %d: %v", scope, err)
+				}
+			}
+		})
+	}
+	if err := ValidateForwardAttachment(AttachmentScopeSharedNetwork, []Forward{{Name: "first"}, {Name: "second"}}); err == nil || !strings.Contains(err.Error(), `"first"`) {
+		t.Fatalf("must identify first declaration: %v", err)
+	}
+}
+
+func TestForwardFixturePreservesHTTPS(t *testing.T) {
+	compiled, err := loadHCLFixtureForTest("forward.hcl", []byte(`
+tailscale "vm" {
+  hostname = "web"
+}
+forward "tailscale" "web" {
+  listen = ":9443"
+  target = "self"
+  target_port = 8080
+  protocol = "https"
+  tls {
+    provider = "tailscale"
+  }
+}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Forward{{Name: "web", ListenPort: 9443, GuestPort: 8080, Protocol: ForwardProtocolHTTPS}}
+	if !slices.Equal(compiled.Forwards(), want) {
+		t.Fatalf("fixture forwards = %#v, want %#v", compiled.Forwards(), want)
+	}
+}
+
+func TestForwardMultipleListenersPreserveOrderAndPortBounds(t *testing.T) {
+	compiled, err := LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[
+		{"name":"last-port","kind":"tailscale","target":"self","listen":":65535","target_port":1},
+		{"name":"first-port","kind":"tailscale","target":"self","listen":":1","target_port":65535,"protocol":"https","tls":{"provider":"tailscale"}}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Forward{
+		{Name: "last-port", ListenPort: 65535, GuestPort: 1, Protocol: ForwardProtocolTCP},
+		{Name: "first-port", ListenPort: 1, GuestPort: 65535, Protocol: ForwardProtocolHTTPS},
+	}
+	if !slices.Equal(compiled.Forwards(), want) {
+		t.Fatalf("forwards = %#v, want %#v", compiled.Forwards(), want)
+	}
+	empty, err := LoadReader("empty.json", strings.NewReader(`{"version":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Forwards()) != 0 {
+		t.Fatal("no-forward policy acquired forwards")
+	}
+	if err := ValidateForwardAttachment(AttachmentScopeUnknown, empty.Forwards()); err != nil {
+		t.Fatal(err)
 	}
 }

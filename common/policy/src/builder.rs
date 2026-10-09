@@ -551,6 +551,8 @@ impl NetworkForwardBuilder {
                 target_port: 0,
                 listen: String::new(),
                 tunnel: None,
+                protocol: crate::ForwardProtocol::Tcp,
+                tls: None,
             },
         }
     }
@@ -561,9 +563,24 @@ impl NetworkForwardBuilder {
         self
     }
 
-    pub fn tailscale(mut self, tunnel: impl Into<String>) -> Self {
+    /// Select the tailnet listener independently of its optional node binding.
+    pub fn tailscale(mut self) -> Self {
         self.forward.kind = "tailscale".to_string();
+        self
+    }
+
+    pub fn tunnel(mut self, tunnel: impl Into<String>) -> Self {
         self.forward.tunnel = Some(tunnel.into());
+        self
+    }
+
+    pub fn protocol(mut self, protocol: crate::ForwardProtocol) -> Self {
+        self.forward.protocol = protocol;
+        self
+    }
+
+    pub fn tls(mut self, tls: crate::ForwardTls) -> Self {
+        self.forward.tls = Some(tls);
         self
     }
 
