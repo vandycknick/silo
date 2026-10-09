@@ -27,6 +27,8 @@ export {
   type NetworkEndpointRef,
   type NetworkEndpointSelector,
   type NetworkPolicyDefinitionCallback,
+  type NetworkForwardProtocol,
+  type NetworkForwardTLS,
   type NetworkCredentialRef,
   type TailscaleTunnelRef,
 } from "./network.js";

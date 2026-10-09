@@ -87,12 +87,14 @@ type TailscaleDecl struct {
 }
 
 type NetworkForwardDecl struct {
-	Name       string `json:"name"`
-	Kind       string `json:"kind"`
-	Target     string `json:"target"`
-	TargetPort uint16 `json:"target_port"`
-	Listen     string `json:"listen,omitempty"`
-	Tunnel     string `json:"tunnel,omitempty"`
+	Name       string          `json:"name"`
+	Kind       string          `json:"kind"`
+	Target     string          `json:"target"`
+	TargetPort uint16          `json:"target_port"`
+	Listen     string          `json:"listen,omitempty"`
+	Tunnel     string          `json:"tunnel,omitempty"`
+	Protocol   ForwardProtocol `json:"protocol,omitempty"`
+	TLS        *ForwardTLS     `json:"tls,omitempty"`
 }
 
 func (p networkPolicyFile) metadataCopy() map[string]any {

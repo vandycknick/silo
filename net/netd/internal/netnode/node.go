@@ -36,17 +36,22 @@ type InboundEvent struct {
 	Port             uint16
 	Decision, Reason string
 	Duration         time.Duration
+	Forward          string
+	TargetPort       uint16
+	Protocol         string
 }
 type Options struct {
-	VMID, RunID string
-	Identity    *ExpectedIdentity
-	Ready       func(context.Context) (func(), error)
-	Dir         string
-	Declaration policy.TailscaleDecl
-	Secrets     credentials.Source
-	Guest       Guest
-	Flows       Flows
-	Audit       func(InboundEvent)
+	VMID, RunID     string
+	Identity        *ExpectedIdentity
+	Ready           func(context.Context) (func(), error)
+	Dir             string
+	Declaration     policy.TailscaleDecl
+	Secrets         credentials.Source
+	Guest           Guest
+	Flows           Flows
+	Audit           func(InboundEvent)
+	Forwards        []policy.Forward
+	AttachmentScope policy.AttachmentScope
 }
 
 type Node struct {
@@ -80,9 +85,28 @@ type Node struct {
 	lastLogin           time.Time
 	maintenanceNode     string
 	maintenanceFailed   bool
+	reserved            map[uint16]policy.Forward
+	certSlot            chan struct{}
+	certWake            chan struct{}
+	certIdentity        forwardCertificateIdentity
+	certContext         context.Context
+	certCancel          context.CancelFunc
+	active              map[*admittedConn]struct{}
 }
 
 func New(o Options) (*Node, error) {
+	if err := policy.ValidateForwardAttachment(o.AttachmentScope, o.Forwards); err != nil {
+		return nil, err
+	}
+	o.Forwards = append([]policy.Forward(nil), o.Forwards...)
+	reserved := make(map[uint16]policy.Forward, len(o.Forwards))
+	var certWake chan struct{}
+	for _, f := range o.Forwards {
+		reserved[f.ListenPort] = f
+		if f.Protocol == policy.ForwardProtocolHTTPS && certWake == nil {
+			certWake = make(chan struct{}, 1)
+		}
+	}
 	if o.Declaration.Hostname == "" {
 		o.Declaration.Hostname = o.Declaration.Name
 	}
@@ -98,10 +122,21 @@ func New(o Options) (*Node, error) {
 	if !literalEnrollmentKey(key) && !(o.Identity != nil && o.Identity.Bootstrap == "auth_key" && delegatedKey(key)) {
 		return nil, errors.New("invalid registration credential; OAuth client credentials belong in the client_secret slot")
 	}
-	return &Node{options: o, done: make(chan struct{}), slots: make(chan struct{}, 256), short: make(map[string]string), fullNames: make(map[string]struct{}), knownShort: make(map[string]struct{}), knownSuffixes: make(map[string]struct{}), provenance: make(map[netip.Addr]time.Time), quarantined: make(map[netip.Addr]time.Time), server: &tsnet.Server{
+	return &Node{options: o, reserved: reserved, certSlot: make(chan struct{}, 1), certWake: certWake, done: make(chan struct{}), slots: make(chan struct{}, 256), short: make(map[string]string), fullNames: make(map[string]struct{}), knownShort: make(map[string]struct{}), knownSuffixes: make(map[string]struct{}), provenance: make(map[netip.Addr]time.Time), quarantined: make(map[netip.Addr]time.Time), server: &tsnet.Server{
 		Dir: o.Dir, Hostname: o.Declaration.Hostname, AdvertiseTags: append([]string(nil), o.Declaration.Tags...), Ephemeral: o.Declaration.Ephemeral,
 		ControlURL: o.Declaration.ControlURL,
 		UserLogf:   func(format string, args ...any) { slog.Info("tailscale", "message", fmt.Sprintf(format, args...)) },
+		Logf: func(format string, args ...any) {
+			level := slog.LevelDebug
+			// Keep ACME progress visible with netd's default info-level logger.
+			// Other embedded backend diagnostics remain debug-only.
+			if strings.HasPrefix(format, "cert(") {
+				level = slog.LevelInfo
+			}
+			if slog.Default().Enabled(context.Background(), level) {
+				slog.Log(context.Background(), level, "tailscale backend", "message", fmt.Sprintf(format, args...))
+			}
+		},
 	}}, nil
 }
 
@@ -168,10 +203,17 @@ func (n *Node) run(ctx context.Context) {
 		slog.Warn("tailscale local client failed", "error", err)
 		return
 	}
-	n.server.RegisterFallbackTCPHandler(n.Fallback)
 	n.mu.Lock()
 	n.client = client
 	n.mu.Unlock()
+	closeForwards, err := n.startForwards(ctx)
+	if err != nil {
+		slog.Warn("tailscale forwards unavailable", "error", err)
+		return
+	}
+	defer closeForwards()
+	defer n.startCertificateMaintenance(ctx)()
+	n.server.RegisterFallbackTCPHandler(n.Fallback)
 	if n.options.Ready != nil {
 		closeDoor, err := n.options.Ready(ctx)
 		if err != nil {
@@ -295,6 +337,7 @@ func (n *Node) observe(s *ipnstate.Status) {
 	}
 	n.suffix = suffix
 	n.running = running
+	n.observeCertificateIdentityLocked(s)
 	n.publish(n.snapshot(s))
 }
 
@@ -405,65 +448,23 @@ func (n *Node) LocalClient() (*local.Client, error) {
 	return n.client, nil
 }
 func (n *Node) relay(src, dst netip.AddrPort, in net.Conn) {
-	start := time.Now()
 	event := InboundEvent{Peer: src, Port: dst.Port(), Decision: "deny"}
-	tracked := false
-	defer func() {
-		_ = in.Close()
-		event.Duration = time.Since(start)
-		if n.options.Audit != nil {
-			n.options.Audit(event)
-		}
-		if tracked {
-			n.relays.Done()
-		}
-	}()
-	n.mu.Lock()
-	if n.closed || !n.started {
-		n.mu.Unlock()
-		event.Reason = "session_closed"
-		return
-	}
-	n.relays.Add(1)
-	tracked = true
-	ctx := n.ctx
-	allowed := n.options.Identity == nil || n.running
-	n.mu.Unlock()
-	if !allowed {
-		event.Reason = "node_identity_unverified"
-		return
-	}
+	reason := ""
 	if dst.Port() == 22 {
-		event.Reason = "ssh_reserved"
+		reason = "ssh_reserved"
+	}
+	if forward, ok := n.reserved[dst.Port()]; ok {
+		reason = "forward_unavailable"
+		event.Forward = forward.Name
+		event.TargetPort = forward.GuestPort
+		event.Protocol = string(forward.Protocol)
+	}
+	conn := n.admit(in, event, reason)
+	if conn == nil {
 		return
 	}
-	select {
-	case n.slots <- struct{}{}:
-		defer func() { <-n.slots }()
-	default:
-		event.Reason = "connection_limit"
-		return
-	}
-	if n.options.Flows == nil || !n.options.Flows.Start() {
-		event.Reason = "session_draining"
-		return
-	}
-	defer n.options.Flows.Done()
-	if n.options.Guest == nil {
-		event.Reason = "guest_unattached"
-		return
-	}
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	out, err := n.options.Guest.DialGuest(dialCtx, dst.Port())
-	cancel()
-	if err != nil {
-		event.Reason = "guest_connection_failed"
-		return
-	}
-	defer out.Close()
-	event.Decision = "allow"
-	event.Reason = "connected"
-	Relay(ctx, in, out)
+	defer conn.Close()
+	n.relayGuest(conn, dst.Port())
 }
 
 // Relay preserves TCP half closes and actively closes both sockets on shutdown.

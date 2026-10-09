@@ -133,8 +133,8 @@ func compileNetworkPolicy(filename string, document networkPolicyFile) (*Policy,
 		}
 		compiled.tailscale = &decl
 	}
-	if len(document.Forwards) > 0 {
-		return nil, compileLoadError(filename, "Unsupported network forwards", "forwards are not implemented by netd")
+	if err := compiled.compileForwards(document.Forwards); err != nil {
+		return nil, compileLoadError(filename, "Invalid network forward", err.Error())
 	}
 	for _, endpoint := range document.Endpoints {
 		if err := compiled.addEndpointDecl(endpoint); err != nil {

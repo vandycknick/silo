@@ -82,14 +82,7 @@ type fixtureTailscale struct {
 	ControlURL string   `json:"control_url,omitempty"`
 }
 
-type fixtureForward struct {
-	Name       string `json:"name"`
-	Kind       string `json:"kind"`
-	Target     string `json:"target"`
-	TargetPort uint16 `json:"target_port"`
-	Listen     string `json:"listen"`
-	Tunnel     string `json:"tunnel,omitempty"`
-}
+type fixtureForward = policy.NetworkForwardDecl
 
 type fixtureBlock struct {
 	kind   string
@@ -389,9 +382,20 @@ func parseFixtureTailscale(filename string, block fixtureBlock) (fixtureTailscal
 }
 
 func parseFixtureForward(filename string, block fixtureBlock) (fixtureForward, error) {
-	attrs := fixtureAttrs(block.body)
-	targetPort, _ := strconv.ParseUint(strings.TrimSpace(attrs["target_port"]), 10, 16)
-	return fixtureForward{Name: block.label2, Kind: block.label1, Listen: fixtureOptionalString(filename, attrs["listen"]), Target: fixtureOptionalString(filename, attrs["target"]), TargetPort: uint16(targetPort), Tunnel: fixtureRefName(attrs["tunnel"])}, nil
+	attrs := fixtureAttrs(removeNestedFixtureBlocks(block.body))
+	targetPort, err := strconv.ParseUint(strings.TrimSpace(attrs["target_port"]), 10, 16)
+	if err != nil {
+		return fixtureForward{}, fmt.Errorf("%s: invalid target_port: %w", filename, err)
+	}
+	forward := fixtureForward{Name: block.label2, Kind: block.label1, Listen: fixtureOptionalString(filename, attrs["listen"]), Target: fixtureOptionalString(filename, attrs["target"]), TargetPort: uint16(targetPort), Tunnel: fixtureRefName(attrs["tunnel"]), Protocol: policy.ForwardProtocol(fixtureOptionalString(filename, attrs["protocol"]))}
+	for _, nested := range nestedFixtureBlocks(block.body) {
+		if nested.kind != "tls" || forward.TLS != nil {
+			return fixtureForward{}, fmt.Errorf("%s: expected one tls block", filename)
+		}
+		tlsAttrs := fixtureAttrs(nested.body)
+		forward.TLS = &policy.ForwardTLS{Provider: policy.ForwardCertificateProvider(fixtureOptionalString(filename, tlsAttrs["provider"]))}
+	}
+	return forward, nil
 }
 
 func fixtureAttrs(body string) map[string]string {

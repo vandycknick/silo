@@ -423,6 +423,10 @@ pub struct ForwardDecl {
     pub target_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<Ref>,
+    #[serde(default)]
+    pub protocol: crate::ForwardProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::ForwardTls>,
     pub order: usize,
 }
 

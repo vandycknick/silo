@@ -111,6 +111,55 @@ Netd verifies the owner, exact hostname and tailnet against taild-injected reser
 policy metadata before allowing tailnet guest traffic. User policies cannot supply
 that metadata. Use a matching updated netd/runtime with this taild build.
 
+Dedicated VM policies may expose guest services with
+[`forward "tailscale"`](user-quickstart.md#expose-a-guest-service-over-tailnet-https).
+Both operator and principal documents use `target = "self"` and omit `tunnel`;
+taild owns the node binding. VM creation with such a policy requires
+`--tailscale`, even when the policy comes from a template. Shared and unknown
+netd attachment scopes reject self before networking resources are created.
+This does not enable named-network launches or host/cross-VM policy forwards.
+
+For HTTPS, enable MagicDNS and HTTPS certificates on the actual tailnet and
+authorize browser peers on the VM listener port. Certificates are obtained and
+renewed through the node's local Tailscale backend, retained in its persistent
+state, and never passed to the guest. Protect and retain that state across
+stop/start. Custom certificate domains and backend HTTPS are not supported.
+The application listens on its guest interface, serves plaintext HTTP, and
+must be configured for its external URL/proxy as appropriate.
+
+For nodes with HTTPS forwards, netd starts certificate acquisition when the
+verified node identity becomes eligible, and checks again hourly. Background
+attempts have a two-minute budget. Reconnection or an eligible identity change
+triggers an immediate check; loss of eligibility cancels the old identity's work.
+All HTTPS listeners share the node's acquisition slot and Tailscale disk cache.
+Requests require at least 24 hours of remaining validity, so renewal stays
+synchronous inside netd-owned work instead of starting an unbounded-context
+background renewal in the embedded backend.
+
+A cold TLS handshake may wait up to one minute for certificate acquisition,
+including time waiting for another acquisition. The HTTP server's header/TLS
+handshake deadline is 75 seconds; keepalive idle timeout remains 60 seconds.
+A disconnected browser does not cancel provisioning, but identity loss or node
+shutdown does. Shutdown joins the maintenance worker and serving owners.
+A slow background acquisition can outlast the first client's deadline, so the
+first request can still fail while a later request succeeds. These context
+budgets do not make the pinned backend's internal locks context-aware.
+
+Certificates and keys live under the node's `tailscale/certs/` directory:
+`<exact-node-DNS>.crt`, `<exact-node-DNS>.key`, and `acme-account.key.pem`.
+Do not delete this state to retry issuance. Netd records backend `cert(...)`
+progress at info level, other embedded backend diagnostics at debug level, and
+certificate acquisition failures with the DNS name, source and elapsed duration.
+Successful acquisition calls are debug-level diagnostics and may be cache hits,
+not new issuance. No private keys or PEM are included in these diagnostics.
+
+Configured ports fail closed rather than falling back to same-port forwarding.
+Netd audit records use family `forward`, direction `inbound`, protocol
+`tcp`/`https`, and `forward: {name, target_port}`; `destination_port` is the
+tailnet listener. Records are terminal connection events, not HTTP access logs.
+TLS success alone does not report successful guest contact. Node status and
+`policy show` do not certify listener/backend health.
+
 ### Live status file (version 1)
 
 Netd atomically replaces `<machine>/tailscale.status.json` with mode 0600. It is a
@@ -219,6 +268,12 @@ details is recorded. Automated offline tests do not establish real tailnet behav
 - [ ] G1: guest SSH certificate/user isolation, native fallback and OpenSSH matrix.
 - [ ] G2: actual user-owned enrollment, OAuth consent, tag provisioning, exact DNS,
   peer SSH, node replacement and reauthentication on the configured tailnet.
+- [ ] G2-HTTPS: create a VM through the lobby with managed HTTPS 443 → guest
+  HTTP 8080 and TCP 18080 → 8080. Verify public certificate chain/hostname,
+  exact DNS, streaming/WebSocket behavior, denied-peer access, and stop/start
+  identity retention. Cancel active TLS/stream/upgrade traffic during stop and
+  verify shutdown joins. Exercise certificate acquisition cancellation against
+  the real backend; local generated certificates do not qualify this gate.
 - [ ] G3: one week unattended on a real systemd test host, no manual repair.
 
 Record skips honestly when KVM, logind, credentials or another architecture are

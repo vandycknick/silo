@@ -174,6 +174,7 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 
 	intelligencePool := registry.NewIntelligencePool(nil)
 	vmSession, err := session.New(session.Spec{
+		AttachmentScope:   policy.AttachmentScopeDedicatedVM,
 		VMID:              cfg.Metadata.VMID,
 		RunID:             cfg.Metadata.RunID,
 		NetworkID:         cfg.Metadata.NetworkID,

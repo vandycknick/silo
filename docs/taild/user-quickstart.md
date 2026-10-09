@@ -139,6 +139,83 @@ Direct VM sessions use a short-lived per-machine certificate.
 Tailnet ACLs still control network access. Published guest-port
 hints create no host listener and are not an inbound firewall.
 
+## Expose a guest service over tailnet HTTPS
+
+Network-policy forwards are separate from machine/vsock forwards and guest-port
+publish hints. On a dedicated 1:1 netd attachment, `target = "self"` selects that
+netd's attached VM. Shared/multi-VM and unknown attachment scopes reject it,
+even with only one VM currently attached. Bridge is a topology, not an attachment
+scope; named-network launches remain unsupported.
+
+Save this policy as `web-forward.hcl`:
+
+```hcl
+forward "tailscale" "web" {
+  listen      = ":443"
+  target      = "self"
+  target_port = 8080
+  protocol    = "https"
+  tls {
+    provider = "tailscale"
+  }
+}
+```
+
+Use a template that starts an HTTP service on guest `0.0.0.0:8080` or its
+interface IP, not just loopback. The forward does not start the application.
+Uploading a policy requires `template.manage`; creation needs `vm.create`
+and inspection needs `vm.read`.
+
+```sh
+ssh silo policy create web-forward < web-forward.hcl
+ssh silo create --name web --template web --policy web-forward --tailscale
+ssh silo show web
+```
+
+Use fresh names if these resources already exist. Open `https://<full-VM-DNS>/`
+using the verified DNS name from `show`. The node's readiness is not a
+per-forward health check. A forward-bearing policy requires `--tailscale`,
+including when inherited from a template. Remote documents omit `tunnel`:
+taild supplies and binds the managed node. User-authored Tailscale declarations,
+explicit tunnel references, host forwards, and cross-VM selectors remain
+forbidden through the lobby.
+
+Netd terminates TLS and proxies plain HTTP to guest 8080, preserving streaming
+and WebSocket upgrades. Enable MagicDNS and HTTPS certificates in the tailnet,
+and grant the intended browser peers access to the VM on TCP 443. Certificate
+acquisition/renewal uses the embedded node's persisted Tailscale state; no
+Tailscale daemon, certificate, or private key is installed in the VM. Public
+certificate-transparency logs disclose the node's certificate hostname.
+
+No deny-by-default egress policy is required. HTTPS requires the explicit
+`tls.provider = "tailscale"` block; port 443 alone does not enable TLS.
+Certificates use the exact node DNS name, not a custom domain or short alias.
+Configure the application's public URL and trusted-proxy settings as needed.
+
+For raw TCP, including guest-owned TLS passthrough, use `protocol = "tcp"`
+(also the default) and omit `tls`:
+
+```hcl
+forward "tailscale" "database" {
+  listen      = ":15432"
+  target      = "self"
+  target_port = 5432
+}
+```
+
+This maps tailnet 15432 to guest 5432 without interpreting traffic. A TCP
+forward on 443 to guest 8443 instead passes TLS through unchanged, leaving
+certificates to the guest. Managed HTTPS also works on alternate ports such as
+`:9443`, with clients using `https://<full-VM-DNS>:9443/`.
+
+Listeners must be `:<decimal port>` in 1–65535, excluding reserved SSH port 22.
+Duplicate listener ports are rejected, regardless of protocol. Configured ports
+stay reserved when TLS, enrollment, listener startup, or the backend fails;
+they never downgrade to the generic same-port guest relay. Other ports retain
+that relay behavior, subject to tailnet grants. Broad existing grants can still
+permit direct access to other guest services. No host 443 listener, public
+Funnel, UDP forward, arbitrary target, or guest HTTPS upstream is enabled.
+
 The native guest SSH fallback does not implement SFTP or SSH port forwarding.
 Use a guest image with OpenSSH for those workflows, and qualify the exact client
 and forwarding requests against that image. Images with OpenSSH use that server

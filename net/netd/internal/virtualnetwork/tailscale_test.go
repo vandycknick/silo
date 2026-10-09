@@ -23,7 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
 
-func TestActualGvisorGuestDialAndFallbackAdmission(t *testing.T) {
+func TestForwardActualGvisorGuestDialAndFallbackAdmission(t *testing.T) {
 	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}, TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol}})
 	defer s.Close()
 	if err := s.CreateNIC(1, loopback.New()); err != nil {
@@ -46,6 +46,21 @@ func TestActualGvisorGuestDialAndFallbackAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
+	decoy, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Addr: addr, Port: 18080}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoy.Close()
+	decoyContact := make(chan bool, 1)
+	go func() {
+		c, err := decoy.Accept()
+		if err != nil {
+			decoyContact <- false
+			return
+		}
+		c.Close()
+		decoyContact <- true
+	}()
 	go func() {
 		c, err := ln.Accept()
 		if err == nil {
@@ -57,7 +72,7 @@ func TestActualGvisorGuestDialAndFallbackAdmission(t *testing.T) {
 	}()
 	events := make(chan netnode.InboundEvent, 260)
 	flows := packet.NewFlowTracker()
-	node, err := netnode.New(netnode.Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "silo-offline-guest", ControlURL: "http://127.0.0.1:1"}, Guest: guest, Flows: flows, Audit: func(e netnode.InboundEvent) { events <- e }})
+	node, err := netnode.New(netnode.Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "silo-offline-guest", ControlURL: "http://127.0.0.1:1"}, AttachmentScope: policy.AttachmentScopeDedicatedVM, Forwards: []policy.Forward{{Name: "raw", ListenPort: 18080, GuestPort: 8080, Protocol: policy.ForwardProtocolTCP}}, Guest: guest, Flows: flows, Audit: func(e netnode.InboundEvent) { events <- e }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +81,7 @@ func TestActualGvisorGuestDialAndFallbackAdmission(t *testing.T) {
 	for _, tc := range []struct {
 		port uint16
 		want string
-	}{{8080, "connected"}, {22, "ssh_reserved"}, {8081, "guest_connection_failed"}} {
+	}{{8080, "connected"}, {22, "ssh_reserved"}, {8081, "guest_connection_failed"}, {18080, "forward_unavailable"}} {
 		// A real host TCP leg carries the production fallback handler into gonet.
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -108,6 +123,10 @@ func TestActualGvisorGuestDialAndFallbackAdmission(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("missing audit")
 		}
+	}
+	decoy.Close()
+	if <-decoyContact {
+		t.Fatal("reserved forward listener fell through to same-port guest decoy")
 	}
 	// Hold 256 real guest connections, then prove admission rejects the 257th.
 	held, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Addr: addr, Port: 8082}, ipv4.ProtocolNumber)

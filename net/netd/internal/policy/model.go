@@ -63,6 +63,7 @@ func (r Ref) zero() bool {
 
 type Policy struct {
 	tailscale   *TailscaleDecl
+	forwards    []Forward
 	diagnostics []Diagnostic
 	metadata    map[string]any
 	registry    *Registry

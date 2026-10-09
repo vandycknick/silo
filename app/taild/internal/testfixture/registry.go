@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -45,17 +46,27 @@ func (r *Registry) Allowed() string {
 	return host + "/fixture"
 }
 
-func OCIRegistry(t *testing.T, rootfs string) *Registry {
+// GuestFile adds a regular file to the fixture image without changing rootfs.
+type GuestFile struct {
+	Path string
+	Mode int64
+	Data []byte
+}
+
+func OCIRegistry(t *testing.T, rootfs string, extra ...GuestFile) *Registry {
 	t.Helper()
 	var archive bytes.Buffer
 	tw := tar.NewWriter(&archive)
+	existing := make(map[string]byte)
 	if rootfs == "" {
 		for _, dir := range []string{"etc", "bin", "home", "root", "tmp", "var", "var/lib", "proc", "sys", "dev", "run"} {
+			existing[dir] = tar.TypeDir
 			if e := tw.WriteHeader(&tar.Header{Name: dir, Typeflag: tar.TypeDir, Mode: 0755}); e != nil {
 				t.Fatal(e)
 			}
 		}
 		for name, data := range map[string]string{"etc/passwd": "root:x:0:0:root:/root:/bin/bash\n", "etc/group": "root:x:0:\n"} {
+			existing[name] = tar.TypeReg
 			if e := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(data))}); e != nil {
 				t.Fatal(e)
 			}
@@ -91,6 +102,7 @@ func OCIRegistry(t *testing.T, rootfs string) *Registry {
 				return e
 			}
 			header.Name = filepath.ToSlash(name)
+			existing[header.Name] = header.Typeflag
 			if e = tw.WriteHeader(header); e != nil {
 				return e
 			}
@@ -111,6 +123,9 @@ func OCIRegistry(t *testing.T, rootfs string) *Registry {
 		if e != nil {
 			t.Fatal(e)
 		}
+	}
+	if e := appendGuestFiles(tw, existing, extra); e != nil {
+		t.Fatal(e)
 	}
 	if e := tw.Close(); e != nil {
 		t.Fatal(e)
@@ -201,4 +216,42 @@ func OCIRegistry(t *testing.T, rootfs string) *Registry {
 	t.Setenv("SSL_CERT_DIR", t.TempDir())
 	r.Reference = strings.TrimPrefix(server.URL, "https://") + "/fixture/rootfs:latest"
 	return r
+}
+
+// Validate the complete set before writing: neither duplicate entries nor
+// traversal through a rootfs symlink may redirect an added file.
+func appendGuestFiles(tw *tar.Writer, existing map[string]byte, files []GuestFile) error {
+	seen := make(map[string]byte, len(existing)+len(files))
+	for name, kind := range existing {
+		seen[name] = kind
+	}
+	for _, file := range files {
+		name := file.Path
+		if name == "" || name == "." || path.IsAbs(name) || path.Clean(name) != name || strings.Contains(name, "\\") || strings.ContainsRune(name, '\x00') || name == ".." || strings.HasPrefix(name, "../") {
+			return fmt.Errorf("unsafe guest archive path %q", name)
+		}
+		if _, ok := seen[name]; ok {
+			return fmt.Errorf("duplicate guest archive path %q", name)
+		}
+		if file.Mode < 0 || file.Mode & ^int64(0777) != 0 {
+			return fmt.Errorf("invalid guest file mode for %q", name)
+		}
+		seen[name] = tar.TypeReg
+	}
+	for _, file := range files {
+		for parent := path.Dir(file.Path); parent != "."; parent = path.Dir(parent) {
+			if kind, ok := seen[parent]; ok && kind != tar.TypeDir {
+				return fmt.Errorf("guest archive parent %q is not a directory", parent)
+			}
+		}
+	}
+	for _, file := range files {
+		if err := tw.WriteHeader(&tar.Header{Name: file.Path, Typeflag: tar.TypeReg, Mode: file.Mode, Size: int64(len(file.Data))}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(file.Data); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -198,6 +198,8 @@ export interface NativeNetworkForwardInput {
   targetPort?: number;
   listen?: string;
   tunnel?: string;
+  protocol?: "tcp" | "https";
+  tls?: { provider: "tailscale" };
 }
 
 export interface NativeExecutionOptionsInput {

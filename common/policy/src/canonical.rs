@@ -444,6 +444,37 @@ pub struct TailscaleTunnel {
     pub control_url: Option<String>,
 }
 
+/// Transport for a network-policy forward. Port 443 does not imply TLS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProtocol {
+    #[default]
+    Tcp,
+    Https,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardCertificateProvider {
+    Tailscale,
+}
+
+/// HTTPS termination is available only for a same-VM Tailscale forward.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardTls {
+    pub provider: ForwardCertificateProvider,
+}
+
+/// A listener and explicit guest destination declaration.
+///
+/// `target = "self"` selects the VM attached to a dedicated 1:1 netd instance,
+/// not guest or host loopback. Parsing is context-free; runtime attachment
+/// validation must reject self in shared or unknown scope. Tailscale/self
+/// listeners use `:<decimal port>` (1–65535, except reserved SSH port 22).
+/// TCP is byte-preserving; HTTPS requires Tailscale-managed TLS and proxies
+/// plaintext HTTP to `target_port`. Neither kind nor port implies HTTPS.
+/// A self declaration may omit its tunnel until the runtime binds its node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkForward {
@@ -455,10 +486,66 @@ pub struct NetworkForward {
     pub listen: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<String>,
+    #[serde(default)]
+    pub protocol: ForwardProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<ForwardTls>,
 }
 
 impl NetworkForward {
-    fn normalize(&mut self) {}
+    fn normalize(&mut self) {
+        if self.kind == "tailscale" && self.target == "self" {
+            if let Ok(Some(port)) = validate_forward_transport(
+                &self.kind,
+                &self.target,
+                self.protocol,
+                self.tls.as_ref(),
+                &self.listen,
+            ) {
+                self.listen = format!(":{port}");
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_forward_transport(
+    kind: &str,
+    target: &str,
+    protocol: ForwardProtocol,
+    tls: Option<&ForwardTls>,
+    listen: &str,
+) -> Result<Option<u16>, String> {
+    match protocol {
+        ForwardProtocol::Tcp if tls.is_some() => {
+            return Err("TCP forwards cannot configure TLS".into());
+        }
+        ForwardProtocol::Https => {
+            if kind != "tailscale" || target != "self" {
+                return Err("HTTPS forwards require Tailscale target self".into());
+            }
+            if tls.is_none() {
+                return Err("HTTPS forwards require tls.provider = tailscale".into());
+            }
+        }
+        ForwardProtocol::Tcp => {}
+    }
+    if kind != "tailscale" || target != "self" {
+        return Ok(None);
+    }
+    let digits = listen
+        .strip_prefix(':')
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "Tailscale/self listen must be :<decimal port>".to_string())?;
+    let port = digits
+        .parse::<u16>()
+        .map_err(|_| "forward listen port must be between 1 and 65535".to_string())?;
+    if port == 0 || port == 22 {
+        return Err(
+            "forward listen port must be between 1 and 65535, excluding reserved SSH port 22"
+                .into(),
+        );
+    }
+    Ok(Some(port))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -700,6 +787,8 @@ fn lower_forward(forward: &ForwardDecl) -> NetworkForward {
         target_port: forward.target_port,
         listen: forward.listen.clone(),
         tunnel: forward.tunnel.as_ref().map(|tunnel| tunnel.name.clone()),
+        protocol: forward.protocol,
+        tls: forward.tls.clone(),
     }
 }
 
@@ -1222,6 +1311,7 @@ impl PolicyValidator {
 
     fn validate_forwards(&mut self, forwards: &[NetworkForward], tunnels: &BTreeSet<String>) {
         let mut names = BTreeSet::new();
+        let mut listeners = BTreeSet::new();
         for forward in forwards {
             self.validate_name("forward", &forward.name);
             if !names.insert(forward.name.clone()) {
@@ -1247,6 +1337,14 @@ impl PolicyValidator {
                                 format!("forward {} references tunnel {tunnel_name}", forward.name),
                             );
                         }
+                    } else if forward.target != "self" {
+                        self.error(
+                            "missing forward tunnel",
+                            format!(
+                                "forward {} requires a tunnel unless its target is self",
+                                forward.name
+                            ),
+                        );
                     }
                 }
                 _ => self.error(
@@ -1266,14 +1364,36 @@ impl PolicyValidator {
                     ),
                 );
             }
-            if !valid_target_selector(&forward.target) {
+            if !(valid_target_selector(&forward.target)
+                || (forward.kind == "tailscale" && forward.target == "self"))
+            {
                 self.error(
                     "invalid forward target selector",
                     format!(
-                        "forward {} target must start with name:, id:, or label:",
+                        "forward {} target must start with name:, id:, or label:, or be self for Tailscale",
                         forward.name
                     ),
                 );
+            }
+            match validate_forward_transport(
+                &forward.kind,
+                &forward.target,
+                forward.protocol,
+                forward.tls.as_ref(),
+                &forward.listen,
+            ) {
+                Ok(Some(port)) if !listeners.insert(port) => self.error(
+                    "duplicate forward listener",
+                    format!(
+                        "forward {} duplicates Tailscale listener :{port}",
+                        forward.name
+                    ),
+                ),
+                Err(detail) => self.error(
+                    "invalid forward transport",
+                    format!("forward {}: {detail}", forward.name),
+                ),
+                _ => {}
             }
         }
     }
