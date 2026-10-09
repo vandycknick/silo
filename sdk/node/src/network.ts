@@ -16,6 +16,10 @@ const nativeAddonPath = "../native/index.cjs";
 
 type BuilderCallback<T> = (builder: T) => T | void;
 export type NetworkPolicyDefinitionCallback = (policy: NetworkPolicyDefinition) => void;
+export type NetworkForwardProtocol = "tcp" | "https";
+export interface NetworkForwardTLS {
+  provider: "tailscale";
+}
 
 function applyBuilder<T>(builder: T, configure: BuilderCallback<T>): T {
   return configure(builder) ?? builder;
@@ -660,9 +664,26 @@ export class NetworkForwardDefinitionBuilder {
     return this;
   }
 
-  tailscale(tunnel: TailscaleTunnelRef): this {
+  tailscale(): this {
     this.input.kind = "tailscale";
+    return this;
+  }
+
+  tunnel(tunnel: TailscaleTunnelRef): this {
     this.input.tunnel = tunnel.name;
+    return this;
+  }
+
+  protocol(protocol: NetworkForwardProtocol): this {
+    this.input.protocol = protocol;
+    return this;
+  }
+
+  tls(tls: NetworkForwardTLS): this {
+    if (tls.provider !== "tailscale" || Object.keys(tls).some((key) => key !== "provider")) {
+      throw new TypeError("forward TLS requires only provider: tailscale");
+    }
+    this.input.tls = { ...tls };
     return this;
   }
 
@@ -682,7 +703,7 @@ export class NetworkForwardDefinitionBuilder {
   }
 
   toNative(): NativeNetworkForwardInput {
-    return { ...this.input };
+    return { ...this.input, tls: this.input.tls && { ...this.input.tls } };
   }
 }
 
@@ -975,9 +996,26 @@ export class NetworkForwardBuilder {
     return this;
   }
 
-  tailscale(tunnel: string): this {
+  tailscale(): this {
     this.input.kind = "tailscale";
+    return this;
+  }
+
+  tunnel(tunnel: string): this {
     this.input.tunnel = assertNonEmptyString(tunnel, "tunnel");
+    return this;
+  }
+
+  protocol(protocol: NetworkForwardProtocol): this {
+    this.input.protocol = protocol;
+    return this;
+  }
+
+  tls(tls: NetworkForwardTLS): this {
+    if (tls.provider !== "tailscale" || Object.keys(tls).some((key) => key !== "provider")) {
+      throw new TypeError("forward TLS requires only provider: tailscale");
+    }
+    this.input.tls = { ...tls };
     return this;
   }
 
@@ -997,7 +1035,7 @@ export class NetworkForwardBuilder {
   }
 
   toNative(): NativeNetworkForwardInput {
-    return { ...this.input };
+    return { ...this.input, tls: this.input.tls && { ...this.input.tls } };
   }
 }
 

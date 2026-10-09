@@ -82,6 +82,30 @@ await diskMachine.remove();
 await policyMachine.remove();
 ```
 
+## Tailnet policy forwards
+
+Network-policy forwards are separate from machine-scoped forwards. For a
+dedicated 1:1 VM network, expose a guest HTTP service with managed tailnet HTTPS:
+
+```ts
+const policy = NetworkPolicy.define((p) => {
+  p.forward("web").tailscale().target("self").targetPort(8080).listen(":443")
+    .protocol("https").tls({ provider: "tailscale" });
+});
+```
+
+The fluent equivalent uses `.forward("web", f => f.tailscale()...)`. Listener
+selection and binding are separate: use `.tailscale().tunnel(tunnelRef)` in the
+definition API or `.tailscale().tunnel("vm")` in the fluent API when declaring
+an explicit node. This example creates a reusable unbound policy. Managed SSH
+policies omit the binding; the lobby supplies it. A local launch still needs
+exactly one declared Tailscale node and its enrollment/state configuration.
+An omitted protocol means raw TCP, even on port 443; TCP cannot carry a `tls`
+configuration. HTTPS terminates at netd and forwards plaintext HTTP to the guest
+interface, where the service must listen (not only on loopback). `self` requires
+a dedicated attachment; shared/unknown scopes reject it. Managed certificates
+require certificate-enabled tailnet DNS, not a certificate secret in the guest.
+
 ## Lifecycle And Process Data
 
 `create()` materializes an image and persists a stopped machine. `start()` boots

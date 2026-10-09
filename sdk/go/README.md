@@ -27,6 +27,13 @@ Loading the small Go FFI bridge is separate from runtime installation. It may ma
 
 `Open` accepts `WithHome` to select the Silo home holding all persistent state (default `SILO_HOME`, else `~/.silo`; generated sockets always live under `/tmp/silo-<euid>`), `WithRuntimeRoot` to select one complete runtime installation, and `WithSupervisorPath` to override only the `silo-vmm` executable.
 
+Manager-integrated callers can instead use `WithRuntimeComponents(RuntimeComponents{...})`
+to pin the exact `SupervisorPath`, `NetdPath`, `KernelPath`, `InitramfsPath`,
+`AgentPath`, and `AssetDir` selected by their manager. All six paths are required,
+absolute, and natively validated/canonicalized. This bypasses ambient component
+discovery and cannot be combined with `WithRuntimeRoot` or `WithSupervisorPath`.
+It does not install assets or change the native bridge's version/ABI checks.
+
 Development checkouts deliberately contain no release archive digests or embedded bridge binaries.
 From the repository root, build the staged runtime and bridge and run an example with one command:
 
@@ -38,6 +45,23 @@ The target selects the current host paths and exports the development-only bridg
 overrides automatically. Set `PROFILE=release`, `KERNEL_PATH`, or the other standard Make options
 when needed.
 
+## Machine-scoped credentials
+
+The SDK supports plain secret writes through the runtime's selected secret store:
+
+```go
+if err := machine.SetSecret(ctx, "tailscale.vm.auth_key", authKey); err != nil {
+    return err
+}
+if _, err := machine.Start(ctx); err != nil { return err }
+```
+
+`DeleteSecret(ctx, name)` removes a machine-scoped key. Reserved `silo.*`
+infrastructure keys cannot be changed through these methods. The default file store
+accepts UTF-8 values. Values are not written to machine configuration or returned by
+inspection. Running helpers retain their launch-time secret snapshot; this API is
+not a live command channel. Use the matching ABI 1 bridge and runtime.
+
 ## Sizes
 
 Memory and disk sizes use explicit units at the call site:
@@ -48,6 +72,24 @@ silo.WithRootDiskSize(silo.Gigabytes(40))
 ```
 
 Decimal (`Gigabytes`) and binary (`Gibibytes`) constructors are intentionally distinct.
+
+## Tailnet policy forwards
+
+`NetworkPolicyConfig.Forwards` configures network-policy listeners, independently
+of machine-scoped forwards. `NetworkForward.Protocol` defaults to
+`NetworkForwardTCP`; port 443 does not imply TLS. Use `NetworkForwardHTTPS` with
+`TLS: &NetworkForwardTLS{Provider: NetworkForwardTLSTailscale}` for managed
+HTTPS termination. This shape requires `Kind: NetworkForwardTailscale`,
+`Target` pointing to `"self"`, a listen address such as `":443"`, and the guest's
+HTTP `TargetPort`. The guest service must listen on its interface or wildcard
+address, not only loopback.
+
+`Tunnel` may be omitted for a same-VM forward; managed SSH policy injection
+supplies it. A local launch still needs exactly one declared Tailscale node and
+its enrollment/state configuration; explicit bindings must reference that node.
+These forwards require a dedicated 1:1 network attachment; shared/unknown scopes
+reject `self`. TCP cannot configure TLS. Managed certificates require an
+eligible tailnet node but introduce no certificate secret requirement.
 
 ## Forwards and guest publications
 
@@ -73,6 +115,11 @@ to private networks. SDK session-scoped forward handles are not yet exposed.
 
 ## Execution
 
+Machine creation provisions no guest account unless `WithGuestUser` is supplied.
+Default sessions use root when `MachineData.GuestUser` is nil, or the machine's
+persisted account when present. Session-level user options override that default.
+Existing machines retain their stored account. See [explicit guest provisioning](examples/guest-user.md).
+
 Non-zero guest exit status is an `ExecutionResult`, not a Go error. Errors report validation, transport, runtime, or lifecycle failures. Output byte methods preserve arbitrary bytes; string methods perform ordinary Go byte-to-string conversion.
 
 Streaming `Recv` methods return `io.EOF` at the finite end. Only one `Recv`, `Wait`, or `Collect` may be active for an execution session. Closing a session or stream unblocks its active receiver. Lifecycle and image mutations observe context cancellation before entering native work, then run to completion because those `libvm` futures are not yet documented as cancellation-safe.
@@ -92,3 +139,49 @@ if silo.IsErrorKind(err, silo.ErrorMachineNotFound) { /* ... */ }
 Call `Close` on runtimes, machines, execution sessions, stdin handles, and log streams. Closing a runtime does not stop machines, and closing a machine handle does not stop or remove persisted machine state.
 
 See `examples/` for complete flows and `PARITY.md` for Node SDK capability coverage.
+## Redacted policy secret checks
+
+`Runtime.CheckPolicySecrets(ctx, policy, machine, overrides)` uses the public Rust
+start resolver without exposing values or mutating secrets. Empty `machine` checks
+prospective creation against Home; an existing reference uses Machine then Home.
+Nonempty overrides replace the complete store-derived set, as at Start. The typed
+result is `ready`, `missing` (slots, backing keys, alternative requirements), or
+`unavailable` (selected slot/key and stable error category). Corrupt JSON, wrong
+projection types and empty selected values never masquerade as absent secrets.
+The older `PolicySecretsReady` boolean API remains available. This uses an optional
+operation on the existing runtime-query entry point.
+
+The current native bridge requires ABI **1**, the initial unreleased baseline for
+the complete bridge contract. The ABI number tracks binary compatibility, independently
+of the product version. Mismatched ABIs are rejected before symbols are resolved.
+Rebuild the bridge and reassemble target-local SDK
+bundles together. `NativeABIVersion` is the required numeric ABI constant,
+available without loading the bridge.
+`VerifiedNativeABIVersion()` loads and checks the exact product/ABI and returns
+the actual bridge ABI without opening a runtime or starting a VM.
+
+The attachment contract also requires
+`silo_attachment_cancellation_signal`. Go owns the scoped signal subscription and
+forwards supported notifications through the token's native channel. Each Attach
+or AttachShell temporarily enables forwarding of inherited ignored signals and
+restores those dispositions on return, while preserving application subscribers.
+The Go path installs no cached Tokio process handlers; standalone Rust attachments
+retain their narrow native-listener mode. Cancellation joins the native call before
+freeing its token or restoring the Go subscription.
+
+## Stateless CLI creation planning
+
+`ParseMachineMemory(input string) (ByteSize, error)` and
+`ParseRootDiskSize(input string) (ByteSize, error)` use the Rust CLI's integer
+unit parser. Units `m/mb/mib/g/gb/gib` are case-insensitive and binary for both
+operations; surrounding whitespace and whitespace between quantity and unit are
+accepted. `8gb`, `8GB`, `8g`, and `8GiB` all return `8 << 30` bytes; `512mb`
+returns `512 << 20`. Zero, fractions, negatives, missing units, and overflow fail.
+Memory is limited to u32 MiB; disks are limited to u64 bytes. Explicit decimal
+constructors such as `Gigabytes` and `Megabytes` retain their decimal semantics.
+
+`ProposeMachineName() (string, error)` uses the existing Silo Rust generator,
+returning an adjective-noun-fourhex proposal without an owner prefix. It does not
+check availability or reserve the name. These APIs load the bridge but never open
+a runtime, home, database, or network connection. Validation errors contain safe
+reasons rather than echoing input; callers can add their appropriate flag context.

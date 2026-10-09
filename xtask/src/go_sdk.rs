@@ -103,14 +103,61 @@ pub fn run_example(context: &BuildContext<'_>, example: &str) -> Result<(), GoSd
     Ok(())
 }
 
+pub fn qualify_bridge(context: &BuildContext<'_>) -> Result<(), GoSdkError> {
+    let version = read_string(&context.workspace_root.join("VERSION"))?
+        .trim()
+        .to_string();
+    if !crate::version::is_semver(&version) {
+        return invalid(
+            &context.workspace_root.join("VERSION"),
+            "version must contain exactly three numeric components",
+        );
+    }
+    let source = context
+        .target_dir
+        .join(context.profile.directory())
+        .join(context.host.go_ffi_library());
+    require_regular_file(&source)?;
+    if context.profile == crate::profiles::Profile::Release
+        && context.host != crate::targets::HostTarget::MacosArm64
+    {
+        let mut audit = Command::new("python3");
+        audit
+            .arg(
+                context
+                    .workspace_root
+                    .join("packaging/silo-taild/elf_audit.py"),
+            )
+            .arg("--target")
+            .arg(context.host.runtime_target())
+            .arg(&source);
+        command::run(audit)?;
+    }
+    let destination = crate::archive::packages_root(context.target_dir, context.profile)
+        .join(version)
+        .join(context.host.runtime_target())
+        .join("go-ffi")
+        .join(context.host.go_ffi_library());
+    create_parent(&destination)?;
+    copy_file(&source, &destination)?;
+    let digest = sha256(&destination)?;
+    write_file(
+        &append_suffix(&destination, ".sha256")?,
+        format!("{digest}  {}\n", context.host.go_ffi_library()).as_bytes(),
+    )
+}
+
 pub fn assemble(workspace_root: &Path, packages_root: &Path) -> Result<(), GoSdkError> {
     let version_path = workspace_root.join("VERSION");
     let version = read_string(&version_path)?.trim().to_string();
-    if version.is_empty() {
-        return invalid(&version_path, "version is empty");
+    if !crate::version::is_semver(&version) {
+        return invalid(
+            &version_path,
+            "version must contain exactly three numeric components",
+        );
     }
 
-    validate_release_inputs(packages_root, &version)?;
+    validate_release_inputs(packages_root, &version, &TARGETS)?;
 
     let mut runtime_digests = Vec::with_capacity(TARGETS.len());
     for target in &TARGETS {
@@ -159,13 +206,19 @@ pub fn assemble(workspace_root: &Path, packages_root: &Path) -> Result<(), GoSdk
     );
     write_file(
         &workspace_root.join("sdk/go/runtime_metadata.go"),
-        metadata.as_bytes(),
+        metadata
+            .replace("version: Version", &format!("version: {version:?}"))
+            .as_bytes(),
     )
 }
 
-fn validate_release_inputs(packages_root: &Path, version: &str) -> Result<(), GoSdkError> {
+fn validate_release_inputs(
+    packages_root: &Path,
+    version: &str,
+    targets: &[Target],
+) -> Result<(), GoSdkError> {
     let mut missing = Vec::new();
-    for target in &TARGETS {
+    for target in targets {
         let target_root = packages_root.join(version).join(target.name);
         let archive = target_root.join(format!("silo-runtime-{version}-{}.tar.zst", target.name));
         let bridge = target_root.join("go-ffi").join(target.bridge_input);
@@ -207,23 +260,38 @@ fn runtime_digest<'a>(digests: &'a [(&str, String)], target: &str) -> Result<&'a
 }
 
 fn verified_digest(path: &Path) -> Result<String, GoSdkError> {
+    require_regular_file(path)?;
     let actual = sha256(path)?;
     let sidecar_path = append_suffix(path, ".sha256")?;
+    require_regular_file(&sidecar_path)?;
     let sidecar = read_string(&sidecar_path)?;
-    let expected = sidecar
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| GoSdkError::Invalid {
-            path: sidecar_path.clone(),
-            reason: "checksum sidecar is empty".to_string(),
-        })?;
-    if !expected.eq_ignore_ascii_case(&actual) {
+    let fields: Vec<_> = sidecar.split_whitespace().collect();
+    if fields.len() != 2 || Some(fields[1]) != path.file_name().and_then(|name| name.to_str()) {
+        return invalid(
+            &sidecar_path,
+            "checksum sidecar must contain only digest and exact basename",
+        );
+    }
+    let expected = fields[0];
+    if expected != actual {
         return invalid(
             path,
             format!("SHA-256 sidecar declares {expected}, calculated {actual}"),
         );
     }
     Ok(actual)
+}
+
+fn require_regular_file(path: &Path) -> Result<(), GoSdkError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| GoSdkError::Io {
+        action: "read qualification metadata",
+        path: path.into(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return invalid(path, "qualified input must be a regular non-symlink file");
+    }
+    Ok(())
 }
 
 fn sha256(path: &Path) -> Result<String, GoSdkError> {
@@ -404,6 +472,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_version_path_traversal_before_input_lookup() {
+        let repository = TestDirectory::new("unsafe-version");
+        let packages = TestDirectory::new("unsafe-version-packages");
+        fs::write(repository.path().join("VERSION"), "../outside\n").unwrap();
+        let error = assemble(repository.path(), packages.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::go_sdk::GoSdkError::Invalid { path, .. }
+                if path == repository.path().join("VERSION")
+        ));
+    }
+
+    #[test]
     fn explains_missing_release_inputs() {
         let repository = TestDirectory::new("missing-repository");
         let packages = TestDirectory::new("missing-packages");
@@ -439,10 +520,39 @@ mod tests {
             .join("0.1.0")
             .join(target.name)
             .join(format!("silo-runtime-0.1.0-{}.tar.zst", target.name));
-        fs::write(append_for_test(&archive), "0000  archive\n").expect("write sidecar");
+        fs::write(
+            append_for_test(&archive),
+            format!("0000  {}\n", archive.file_name().unwrap().to_string_lossy()),
+        )
+        .expect("write sidecar");
 
         let error = assemble(repository.path(), packages.path()).expect_err("reject sidecar");
         assert!(error.to_string().contains("SHA-256 sidecar"));
+    }
+
+    #[test]
+    fn rejects_symlinked_inputs_and_noncanonical_sidecars() {
+        let directory = TestDirectory::new("sidecar-contract");
+        let file = directory.path().join("bridge.so");
+        write_qualified(&file, b"actual bytes");
+        let digest = sha256(&file).unwrap();
+        for contents in [
+            format!("{digest}  ../bridge.so\n"),
+            format!("{digest}  bridge.so unexpected\n"),
+            format!("{}  bridge.so\n", digest.to_uppercase()),
+        ] {
+            fs::write(append_for_test(&file), contents).unwrap();
+            assert!(crate::go_sdk::verified_digest(&file).is_err());
+        }
+        write_qualified(&file, b"actual bytes");
+        let link = directory.path().join("link.so");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(crate::go_sdk::verified_digest(&link).is_err());
+        fs::remove_file(append_for_test(&file)).unwrap();
+        let sidecar = directory.path().join("real-sidecar");
+        fs::write(&sidecar, format!("{digest}  bridge.so\n")).unwrap();
+        std::os::unix::fs::symlink(sidecar, append_for_test(&file)).unwrap();
+        assert!(crate::go_sdk::verified_digest(&file).is_err());
     }
 
     fn write_qualified(path: &Path, contents: &[u8]) {

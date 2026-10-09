@@ -105,6 +105,8 @@ pub struct Runtime {
     supervisor: VmSupervisor,
     image_pull_policy: ImagePullPolicy,
     image_progress: Option<ImageProgressSender>,
+    secret_store: Arc<dyn silo_secrets::SecretStore>,
+    secret_provider: Option<crate::HostCommand>,
 }
 
 /// Identity for one concrete silo-vmm run.
@@ -171,9 +173,14 @@ impl Runtime {
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let supervisor =
-            VmSupervisor::new(paths.clone(), components.supervisor.clone(), virt_backend);
+        let supervisor = VmSupervisor::new(
+            paths.clone(),
+            components.supervisor().to_path_buf(),
+            virt_backend,
+        );
         let runtime = Self {
+            secret_store: Arc::new(silo_secrets::FileStore::new(paths.home())),
+            secret_provider: None,
             paths,
             store,
             lock_manager,
@@ -192,6 +199,173 @@ impl Runtime {
     /// Returns the Silo home holding this runtime's persistent state.
     pub fn local_home(&self) -> &Path {
         self.paths.home()
+    }
+
+    /// Read-only readiness using the start resolver. No values or signing material are returned.
+    /// Without a machine reference only Home secrets participate.
+    pub async fn policy_secrets_ready(
+        &self,
+        policy: &silo_policy::NetworkPolicy,
+        machine: Option<&MachineRef>,
+    ) -> Result<bool, LibVmError> {
+        Ok(matches!(
+            self.check_policy_secrets(policy, machine, &EgressCredentials::default())
+                .await?,
+            crate::policy_secrets::PolicySecretsCheck::Ready
+        ))
+    }
+
+    /// Resolves prospective Home or existing Machine/Home secrets without mutation.
+    /// Missing alternatives and unavailable/corrupt projections are distinct, redacted results.
+    pub async fn check_policy_secrets(
+        &self,
+        policy: &silo_policy::NetworkPolicy,
+        machine: Option<&MachineRef>,
+        explicit: &EgressCredentials,
+    ) -> Result<crate::policy_secrets::PolicySecretsCheck, LibVmError> {
+        let id = match machine {
+            Some(reference) => Some(self.get_machine(reference).await?.machine_id()),
+            None => None,
+        };
+        let network = ModelMachineNetworkConfig::Private {
+            policy: Some(policy.clone()),
+            publish: None,
+        };
+        crate::policy_secrets::diagnostic(crate::secrets::resolve_for_scope(
+            self.secret_store(),
+            &network,
+            id,
+            "readiness",
+            explicit,
+            None,
+            "readiness",
+        ))
+    }
+
+    pub(crate) async fn lock_machine_names(&self) -> Result<std::fs::File, LibVmError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _home = crate::paths::OwnedDirectory::open_root(self.local_home())?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(self.local_home().join("machine-names.lock"))?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+
+    pub(crate) fn validate_tailscale_vsock(
+        &self,
+        network: &ModelMachineNetworkConfig,
+        spec: &VmSpec,
+    ) -> Result<bool, LibVmError> {
+        let present = matches!(network, ModelMachineNetworkConfig::Private { policy: Some(policy), .. } if !policy.tailscale().is_empty());
+        if present && !spec.vsock.as_ref().is_some_and(|vsock| vsock.enabled) {
+            return Err(LibVmError::NetworkRuntime {
+                reference: "tailscale".into(),
+                message: "Tailscale requires vsock.enabled (CLI: --vsock)".into(),
+            });
+        }
+        Ok(present)
+    }
+
+    pub(crate) fn ensure_tailscale_directory(&self, id: MachineId) -> Result<(), LibVmError> {
+        let missing =
+            || std::io::Error::other("Tailscale state requires an existing machine directory");
+        let root = crate::paths::OwnedDirectory::open_existing_root(self.local_home())?
+            .ok_or_else(missing)?;
+        let machines = root.open_dir("machines")?.ok_or_else(missing)?;
+        let machine = machines.open_dir(&id.to_string())?.ok_or_else(missing)?;
+        machine.ensure_dir("tailscale")?;
+        Ok(())
+    }
+
+    /// Uses this store to resolve policy secrets for future starts.
+    pub fn with_secret_store(mut self, store: Arc<dyn silo_secrets::SecretStore>) -> Self {
+        self.secret_store = store;
+        self
+    }
+
+    /// Configures the host command used to refresh resolved OAuth records.
+    pub fn with_secret_provider(mut self, command: crate::HostCommand) -> Self {
+        self.secret_provider = Some(command);
+        self
+    }
+
+    pub(crate) fn secret_store(&self) -> &dyn silo_secrets::SecretStore {
+        self.secret_store.as_ref()
+    }
+
+    pub(crate) fn secret_store_arc(&self) -> Arc<dyn silo_secrets::SecretStore> {
+        Arc::clone(&self.secret_store)
+    }
+
+    pub(crate) fn resolve_secrets(
+        &self,
+        config: &MachineConfig,
+        run_id: &str,
+        explicit: &EgressCredentials,
+    ) -> Result<crate::secrets::ResolvedSecrets, LibVmError> {
+        crate::secrets::resolve_for_start(
+            self.secret_store(),
+            &config.network,
+            config.id,
+            run_id,
+            explicit,
+            self.secret_provider.as_ref(),
+            &config.name,
+        )
+    }
+
+    pub(crate) fn resolve_machine_secrets(
+        &self,
+        config: &MachineConfig,
+        run_id: &str,
+        explicit: &EgressCredentials,
+    ) -> Result<crate::secrets::ResolvedSecrets, LibVmError> {
+        let mut resolved = self.resolve_secrets(config, run_id, explicit)?;
+        let pair =
+            crate::ssh_ca::resolve(self.secret_store(), config.id, false).map_err(|error| {
+                LibVmError::MachinePreparationFailed {
+                    reference: config.name.clone(),
+                    message: format!("resolve machine SSH CA: {error}"),
+                }
+            })?;
+        resolved.ssh_trusted_ca = Some(pair.public);
+        resolved
+            .infrastructure
+            .push((crate::ssh_ca::PRIVATE.into(), pair.private));
+        if matches!(&config.network, crate::store::models::MachineNetworkConfig::Private { policy: Some(policy), .. } if policy.has_https_interception())
+        {
+            let pair = crate::host::certificates::resolve(
+                self.secret_store(),
+                &self.paths,
+                &self.networking.netd,
+            )
+            .map_err(|error| LibVmError::MachinePreparationFailed {
+                reference: config.name.clone(),
+                message: format!("resolve home TLS CA: {error}"),
+            })?;
+            resolved.tls_certificate = Some(pair.certificate.clone());
+            resolved.infrastructure.push((
+                crate::host::certificates::CERTIFICATE.into(),
+                silo_secrets::SecretBytes::new(pair.certificate.into_bytes()),
+            ));
+            resolved
+                .infrastructure
+                .push((crate::host::certificates::PRIVATE.into(), pair.private));
+        }
+        Ok(resolved)
     }
 
     /// Returns the local image directory.
@@ -232,10 +406,6 @@ impl Runtime {
         self
     }
 
-    pub(crate) fn load_guest_ssh_keypair(&self) -> eyre::Result<crate::host::SshKeyPair> {
-        guest_agent::load_or_generate_guest_ssh_keypair(&self.paths)
-    }
-
     pub(crate) fn local_paths(&self) -> &LocalPaths {
         &self.paths
     }
@@ -263,8 +433,8 @@ impl Runtime {
     ) -> Result<ResolvedBootAssets, LibVmError> {
         boot_assets::resolve_boot_assets(
             BootAssetOverrides { kernel, initramfs },
-            &self.components.kernel,
-            &self.components.initramfs,
+            self.components.kernel(),
+            self.components.initramfs(),
         )
     }
 
@@ -1139,7 +1309,7 @@ impl Runtime {
         &self,
         config: &MachineConfig,
         run_id: &str,
-        egress_credentials: &EgressCredentials,
+        egress_credentials: &crate::secrets::ResolvedSecrets,
     ) -> Result<VmmNetworkAttachment, LibVmError> {
         prepare_network_runtime(
             &self.paths,
@@ -1147,7 +1317,7 @@ impl Runtime {
             config,
             run_id,
             &self.networking,
-            &self.components.netd,
+            self.components.netd(),
             egress_credentials,
         )
         .await
@@ -1166,6 +1336,8 @@ impl Runtime {
         config: &MachineConfig,
         network: &VmmNetworkAttachment,
         resize_rootfs: bool,
+        ssh_trusted_ca: &str,
+        tls_certificate: Option<&str>,
     ) -> Result<crate::supervisor::VmmLaunchInputs, LibVmError> {
         let prepare = || -> eyre::Result<crate::supervisor::VmmLaunchInputs> {
             let rosetta_intent = self
@@ -1184,16 +1356,16 @@ impl Runtime {
 
             let agent_enabled = config.guest.agent.enabled();
             if let Some(agent_path) =
-                boot_assets::resolve_agent(&config.guest.agent, &self.components.agent)?
+                boot_assets::resolve_agent(&config.guest.agent, self.components.agent())?
             {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
-                    paths: &self.paths,
                     machine_name: &config.name,
                     spec: &launch_spec,
                     network,
-                    networking: &self.networking,
                     resize_rootfs,
                     user: config.guest.user.as_ref(),
+                    ssh_trusted_ca,
+                    tls_certificate,
                 })?;
                 agent_config.validate().context("validate agent config")?;
                 let serialized =
@@ -1220,7 +1392,7 @@ impl Runtime {
             Ok(crate::supervisor::VmmLaunchInputs {
                 agent_enabled,
                 rosetta_intent,
-                asset_directory: self.components.asset_dir.clone(),
+                asset_directory: self.components.asset_dir().to_path_buf(),
             })
         };
 
@@ -1392,60 +1564,106 @@ impl Runtime {
             }
             issues.push(MachineIssue::new(MachineIssueComponent::Network, error));
         }
-        let (status, boot_report, provision_report) =
-            if runtime_status.is_running() && observation == MachineObservation::Observed {
-                match self.supervisor.client(config.id).status().await {
-                    Ok(response) => {
-                        let (boot_report, provision_report) = response
+        let (status, boot_report, provision_report) = if runtime_status.is_running()
+            && observation == MachineObservation::Observed
+        {
+            let response = self
+                .supervisor
+                .client(config.id)
+                .status()
+                .await
+                .and_then(|response| {
+                    validate_host_status_identity(
+                        &response,
+                        config.id,
+                        runtime_status.run_id.as_deref(),
+                    )
+                    .map(|()| response)
+                    .map_err(crate::supervisor::VmmClientError::from)
+                });
+            match response {
+                Ok(mut response) => {
+                    let listener =
+                        response
                             .agent
                             .as_ref()
                             .and_then(|agent| match agent.mode.as_ref() {
                                 Some(protocol::v1::host_agent::Mode::Enabled(enabled)) => enabled
                                     .status
                                     .as_ref()
-                                    .and_then(|status| status.report.as_ref()),
+                                    .and_then(|status| status.report.as_ref())
+                                    .and_then(|report| report.ssh.as_ref()),
                                 _ => None,
-                            })
-                            .map(|report| {
-                                (
-                                    report
-                                        .boot
-                                        .clone()
-                                        .map(crate::machine::MachineBootReport::from_protocol),
-                                    report
-                                        .provisioning
-                                        .clone()
-                                        .map(crate::machine::MachineProvisionReport::from_protocol),
-                                )
-                            })
-                            .unwrap_or((None, None));
-                        (
-                            MachineStatus::from_protocol(response),
-                            boot_report,
-                            provision_report,
-                        )
+                            });
+                    if let Some(listener) = listener {
+                        if listener.config_verified && listener.kex_verified {
+                            let pin = ssh_key::PublicKey::from_openssh(&listener.host_public_key)
+                                .map_err(eyre::Report::from)
+                                .and_then(|key| {
+                                    utils::ssh::verify_host_key_pin(&config.machine_dir, &key)
+                                        .map_err(eyre::Report::from)
+                                });
+                            if let Err(error) = pin {
+                                issues.push(MachineIssue::new(
+                                    MachineIssueComponent::Telemetry,
+                                    format!("SSH host key verification: {error}"),
+                                ));
+                                if let Some(readiness) = response.readiness.as_mut() {
+                                    readiness.ready = Some(false);
+                                }
+                            }
+                        }
                     }
-                    Err(message) => {
-                        issues.push(MachineIssue::new(
-                            MachineIssueComponent::Telemetry,
-                            &message,
-                        ));
-                        (
-                            MachineStatus::running_with_message(format!(
-                                "silo-vmm get_status failed: {message}"
-                            )),
-                            None,
-                            None,
-                        )
-                    }
+                    let (boot_report, provision_report) = response
+                        .agent
+                        .as_ref()
+                        .and_then(|agent| match agent.mode.as_ref() {
+                            Some(protocol::v1::host_agent::Mode::Enabled(enabled)) => enabled
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.report.as_ref()),
+                            _ => None,
+                        })
+                        .map(|report| {
+                            (
+                                report
+                                    .boot
+                                    .clone()
+                                    .map(crate::machine::MachineBootReport::from_protocol),
+                                report
+                                    .provisioning
+                                    .clone()
+                                    .map(crate::machine::MachineProvisionReport::from_protocol),
+                            )
+                        })
+                        .unwrap_or((None, None));
+                    (
+                        MachineStatus::from_protocol(response),
+                        boot_report,
+                        provision_report,
+                    )
                 }
-            } else {
-                (
-                    MachineStatus::from_machine_state(state.status, state.last_error.clone()),
-                    None,
-                    None,
-                )
-            };
+                Err(message) => {
+                    issues.push(MachineIssue::new(
+                        MachineIssueComponent::Telemetry,
+                        &message,
+                    ));
+                    (
+                        MachineStatus::running_with_message(format!(
+                            "silo-vmm get_status failed: {message}"
+                        )),
+                        None,
+                        None,
+                    )
+                }
+            }
+        } else {
+            (
+                MachineStatus::from_machine_state(state.status, state.last_error.clone()),
+                None,
+                None,
+            )
+        };
 
         let rootfs = match self.store.machine_rootfs(config.id).await {
             Ok(rootfs) => rootfs,
@@ -1841,6 +2059,36 @@ fn runtime_exit_matches(status: &VmmExitStatus, state: Option<&MachineState>) ->
         && state.vmm_pid == Some(status.pid)
 }
 
+fn validate_host_status_identity(
+    status: &protocol::v1::HostStatus,
+    machine: MachineId,
+    run: Option<&str>,
+) -> Result<(), String> {
+    let observed_machine = status
+        .machine_id
+        .as_deref()
+        .ok_or("monitor status omitted machine_id")?
+        .parse::<MachineId>()
+        .map_err(|_| "monitor status has invalid machine_id")?;
+    if observed_machine != machine {
+        return Err("monitor status belongs to another machine".into());
+    }
+    let observed_run = status
+        .run_id
+        .as_deref()
+        .ok_or("monitor status omitted run_id")?
+        .parse::<crate::MachineRunId>()
+        .map_err(|_| "monitor status has invalid run_id")?;
+    let expected_run = run
+        .ok_or("running machine has no expected run_id")?
+        .parse::<crate::MachineRunId>()
+        .map_err(|_| "running machine has invalid expected run_id")?;
+    if observed_run != expected_run {
+        return Err("monitor status belongs to another run".into());
+    }
+    Ok(())
+}
+
 fn exit_observed_event(status: &VmmExitStatus) -> (bool, Option<String>) {
     let _ = status.exited_at;
     match status.outcome {
@@ -1961,6 +2209,39 @@ fn apply_resolved_boot_assets(spec: &mut VmSpec, boot_assets: ResolvedBootAssets
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_monitor_status_requires_expected_machine_and_launch_run() {
+        let machine = crate::store::models::MachineId::new();
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut status = protocol::v1::HostStatus {
+            machine_id: Some(machine.to_string()),
+            run_id: Some(run.clone()),
+            monitor: Some(protocol::v1::MonitorSnapshot {
+                instance_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        crate::runtime::core::validate_host_status_identity(&status, machine, Some(&run)).unwrap();
+        assert!(crate::runtime::core::validate_host_status_identity(
+            &status,
+            crate::store::models::MachineId::new(),
+            Some(&run)
+        )
+        .is_err());
+        assert!(crate::runtime::core::validate_host_status_identity(
+            &status,
+            machine,
+            Some(&uuid::Uuid::new_v4().to_string())
+        )
+        .is_err());
+        status.run_id = None;
+        assert!(
+            crate::runtime::core::validate_host_status_identity(&status, machine, Some(&run))
+                .unwrap_err()
+                .contains("run_id")
+        );
+    }
     use crate::lock_manager::LockId;
     use crate::paths::LocalPaths;
     use crate::runtime::core::{
@@ -2080,7 +2361,13 @@ mod tests {
         };
 
         let error = runtime
-            .prepare_vmm_launch_inputs(&config, &crate::network::VmmNetworkAttachment::None, false)
+            .prepare_vmm_launch_inputs(
+                &config,
+                &crate::network::VmmNetworkAttachment::None,
+                false,
+                "",
+                None,
+            )
             .expect_err("reject ineligible durable contract");
         assert!(error.to_string().contains("installed default guest agent"));
         assert!(!error.to_string().contains("kernel"));
@@ -2262,8 +2549,8 @@ mod tests {
                 kernel: Some(&override_kernel),
                 initramfs: None,
             },
-            &components.kernel,
-            &components.initramfs,
+            components.kernel(),
+            components.initramfs(),
         )
         .expect("resolve assets");
 
@@ -2281,7 +2568,7 @@ mod tests {
         assert_eq!(
             crate::runtime::boot_assets::resolve_agent(
                 &crate::machine::MachineAgent::Default,
-                &components.agent,
+                components.agent(),
             )
             .expect("resolve default agent"),
             Some(
@@ -3875,7 +4162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_with_returns_forced_machine_exit() {
+    async fn kill_with_persists_generation_for_fenced_removal() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -3937,6 +4224,25 @@ mod tests {
         assert_eq!(exit.outcome, MachineExitOutcome::Forced);
         assert_eq!(exit.machine.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);
+        let stale = machine_handle(&runtime, machine.id)
+            .remove_after_run(
+                uuid::Uuid::new_v4()
+                    .to_string()
+                    .parse()
+                    .expect("parse stale run"),
+            )
+            .await
+            .expect_err("different run must not remove the machine");
+        assert!(matches!(stale, LibVmError::MachineStaleGeneration { .. }));
+        machine_handle(&runtime, machine.id)
+            .remove_after_run(expected_run_id.parse().expect("parse killed run"))
+            .await
+            .expect("confirmed killed run remains removable");
+        assert!(runtime
+            .machine_config(machine.id)
+            .await
+            .expect("inspect removed machine")
+            .is_none());
     }
 
     #[tokio::test]
@@ -4618,9 +4924,21 @@ mod tests {
 
         drop(lifetime_lock);
 
-        let released = inspect_machine(&runtime, MachineRef::id(machine.id))
-            .await
-            .expect("inspect abandoned start");
+        // Parallel std::process forks can briefly retain the original CLOEXEC
+        // descriptor until exec. Require release, without assuming zero fork time.
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let released = inspect_machine(&runtime, MachineRef::id(machine.id))
+                    .await
+                    .expect("inspect abandoned start");
+                if released.status.label() == "error" {
+                    break released;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("lifetime lock must release after concurrent exec");
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -5374,6 +5692,7 @@ mod tests {
             .local_paths()
             .create_machine_data_dir(id)
             .expect("create owned machine data root");
+        crate::ssh_ca::resolve(runtime.secret_store(), id, true).expect("create test machine CA");
         std::fs::write(config.machine_dir.join("data.txt"), b"machine data")
             .expect("write machine data");
         runtime

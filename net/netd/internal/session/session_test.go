@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +50,34 @@ func TestSessionRunAfterCloseClosesConnection(t *testing.T) {
 	}
 	if _, err := client.Write([]byte("probe")); err == nil {
 		t.Fatal("connection remained open after closed session rejected Run")
+	}
+}
+
+func TestSessionNewAndCloseBeforeStartNeverInitializeNode(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := config.Parse(testConfigArgs(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := policy.LoadReader("test.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm","hostname":"no-start","control_url":"http://127.0.0.1:1"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Spec{VMID: "vm", RunID: "run", NetworkID: "net", Policy: p, Stack: cfg.Stack, TailscaleStateDir: dir, VsockMux: filepath.Join(dir, "vsock.sock")}, Shared{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("New initialized node state: %v %v", entries, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.Start()
+	entries, err = os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("Start after Close initialized node: %v %v", entries, err)
 	}
 }
 
@@ -136,4 +165,35 @@ func testDirectory(t *testing.T, path string) *logfile.Directory {
 		}
 	})
 	return directory
+}
+
+func TestForwardSessionAttachmentScopeBeforeNetworking(t *testing.T) {
+	for _, shape := range []struct{ protocol, tls string }{{"tcp", ""}, {"https", `,"tls":{"provider":"tailscale"}`}} {
+		p, err := policy.LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm","hostname":"no-start","control_url":"http://127.0.0.1:1"}],"forwards":[{"name":"web","kind":"tailscale","target":"self","listen":":443","target_port":8080,"protocol":"`+shape.protocol+`"`+shape.tls+`}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, scope := range []policy.AttachmentScope{policy.AttachmentScopeUnknown, policy.AttachmentScopeSharedNetwork, policy.AttachmentScopeDedicatedVM} {
+			dir := t.TempDir()
+			cfg, err := config.Parse(testConfigArgs(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, err := New(Spec{VMID: "vm", RunID: "run", NetworkID: "net", Policy: p, Stack: cfg.Stack, TailscaleStateDir: dir, VsockMux: filepath.Join(dir, "vsock.sock"), AttachmentScope: scope}, Shared{})
+			if scope == policy.AttachmentScopeDedicatedVM {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := s.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), `target "self" requires a dedicated 1:1`) {
+				t.Fatalf("scope %v: %v", scope, err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("created state before start: %v %v", entries, err)
+			}
+		}
+	}
 }

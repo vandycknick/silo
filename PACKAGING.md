@@ -1,5 +1,133 @@
 # Packaging Silo for Distribution
 
+## Integrated native product packages
+
+`make build` produces the CLI, silod, taild and its adjacent native Go bridge
+alongside the ordinary runtime assets. Taild builds directly from `app/taild`
+with the source SDK and generated management-module replacements. Its build
+ensures the bridge once, uses `CGO_ENABLED=1`, and never assembles or installs a
+standalone SDK distribution. This graph supports native Linux and macOS.
+Netd's `CGO_ENABLED=0` recipe must not be used for taild.
+
+`make archive` stages the release runtime, produces runtime-only and portable
+archives, and qualifies the existing bridge for independent standalone SDK
+assembly. Linux release CGO uses native `/usr/bin` compiler/linker tools; macOS
+uses the existing Xcode/deployment-target configuration. Cross compilation is
+not native runtime qualification.
+
+Both runtime roots include `runtime-manifest.json`: `{version, target, files}`.
+Version equals the exact SDK product version. Targets are `linux-amd64-gnu`,
+`linux-arm64-gnu`, or `darwin-arm64`, matching SDK runtime identifiers. Files are
+the complete current bin/assets inventory mapped to lowercase SHA-256 digests;
+manifest metadata is never a made-up constant. Stage validation rejects unexpected
+entries/symlinks and verifies manifest bytes against current components and VERSION.
+Qualified standalone SDK releases still embed runtime archive checksums and
+bridge bytes through `make assemble-go-sdk`. Those APIs remain supported.
+The integrated product instead loads the canonical adjacent sidecar, verifies
+its ABI/product version and uses the exact manager-selected six components.
+`make version-check` also checks the standalone SDK bundle cache-version constant.
+
+Portable archives on both operating systems include `bin/silo`, `bin/silod`,
+`bin/taild` and `bin/libsilo_go_ffi.so` (or `.dylib`). Runtime-only SDK archives
+contain VMM/netd/guest assets, never those frontends or bridge. Product archives
+include only useful `share/silo-taild/examples`, not standalone units, sysusers,
+configuration or acceptance tooling. Existing installed standalone state is
+not removed or migrated.
+
+Generated `LICENSES/taild` material comes from the exact Go module graph;
+missing license material is fatal. Review `modules.json`, SBOM and provenance.
+Runtime notices retain the locked libkrun revision, vendored signal-registry
+attribution and Apache license. Product provenance records actual helper and
+bridge hashes. These are archive outputs, not distro-package/signature claims.
+
+For bounded cold builds, build release components separately and inspect any
+timeout instead of blindly retrying. `make taild PROFILE=release` already
+builds its bridge dependency. After coordinated `make stage PROFILE=release`:
+
+```sh
+make runtime-archive PROFILE=release
+make qualify-go-bridge PROFILE=release
+make portable-archive
+CGO_ENABLED=1 go -C app/taild build \
+  -o "$PWD/target/artifact-driver" ../../packaging/silo-taild/kvm.go
+python3 packaging/silo-taild/verify-artifact.py \
+  target/packages/0.1.0/linux-amd64-gnu/silo-0.1.0-linux-amd64-gnu.tar.zst \
+  target/packages/0.1.0/linux-amd64-gnu/silo-runtime-0.1.0-linux-amd64-gnu.tar.zst \
+  --driver "$PWD/target/artifact-driver"
+```
+
+Use the source VERSION and native target. Build the acceptance driver in the
+same native release toolchain as the product; a Nix-linked observation tool
+cannot execute with `/nix` hidden.
+
+The verifier extracts real archives into fresh canonical Home/config roots,
+starts the packaged silod and taild, observes the mapped sidecar and checks
+exact six-component selection over the real management API. It creates no SDK
+installation/cache. Missing bridge, malformed library, dependency, ABI and
+version failures leave core inventory usable. Missing shared guest assets leave
+the core status RPC ready but correctly prevent operations needing that runtime.
+Only disposable extracted copies are damaged by negative cases.
+
+Historical 2026-10-01 standalone SDK memory runs passed release guests at 256MiB
+(agent 10,444,032 bytes) and debug guests at 1GiB (agent 173,188,384 bytes).
+They do not qualify the newly integrated product, other workloads or architectures.
+Debug archives/bridges use `target/packages-debug`, separate from release
+outputs, with build profile recorded in provenance.
+
+Linux release commands use verified `/usr/bin` C tools, clear Nix wrapper flags,
+and give CGO `-B/usr/bin` to select native assembler/linker subprograms. An absolute
+CC alone is insufficient because GCC otherwise searches PATH for `as`/`ld`.
+Artifact acceptance checks dynamic loaders/search paths and runs without inherited
+loader overrides. The host must supply `libgcc_s.so.1` and its normal glibc libraries.
+Provenance records the actual module-selected Go toolchains and native compiler.
+
+Release archiving and bridge qualification fail closed on the native ELF audit:
+standard interpreter, no RPATH/RUNPATH or absolute DT_NEEDED entries, complete
+dependency resolution using the designated system loader with its cache disabled
+and only native system library directories, and imported GLIBC versions no newer
+than ADR0012's 2.39 floor. GNU host linker subprograms are pinned for Rust as well
+as CGO. Do not repair a too-new ABI by merely removing an interpreter/search path
+or copying an arbitrary system library closure.
+
+With available rootless user/mount namespaces, the verifier hides `/nix` while
+preserving the service UID. `--require-no-nix` makes that isolation mandatory.
+`--audit-only` still starts real helpers and verifies mapping/RPC admission, but
+omits negative artifact mutations. Neither mode implies VM boot, live tailnet
+authentication or host reboot qualification.
+
+Hosted Go lanes run the native bridge/control tests; VM-fixture tests retain
+their explicit disk/rootfs and execution opt-ins. The separate package lanes
+require actual helper startup and bridge mapping. Neither substitutes for the
+native VM, live-tailnet or shutdown qualification scenarios.
+
+On native macOS, pass `--app /absolute/path/Silo.app` after `make app`. The app
+contains taild and the bridge under `Contents/Helpers`, and complete notices
+under `Contents/Resources`. The dylib is signed first, then executables and the
+outer app, all with the selected identity. Only silo-vmm receives virtualization
+entitlements; library validation is not disabled. Nested certificate identity
+is checked, and `Silo.app.provenance.json` records actual post-sign bytes outside
+the sealed bundle. Ad-hoc validation is not Developer-ID qualification.
+
+For real KVM/HVF guest execution, the source acceptance driver connects to an
+already-running packaged manager with isolated Home and an absolute disposable
+bootable Linux disk. Lifecycle uses management RPC; guest exec uses an exact-ID
+SDK handle with authoritative `GetRuntimeInfo` paths, not a guessed runtime root:
+
+```sh
+SILO_E2E_VM=1 target/artifact-driver \
+  --endpoint /absolute/path/control.sock \
+  --home /absolute/path/isolated-state \
+  --config-dir /absolute/path/isolated-config/silo \
+  --bridge /absolute/path/product/bin/libsilo_go_ffi.so \
+  --components-root /absolute/path/product \
+  --disk /absolute/path/disposable-linux.ext4 --memory-mib 1024
+```
+
+For an app, use its canonical root and `Contents/Helpers/libsilo_go_ffi.dylib`.
+The driver refuses oversized agents at 256MiB; that size screen alone is not
+memory qualification. Native macOS/HVF/Developer-ID, real tailnet credentials
+and permitted login1/reboot access remain separate platform gates.
+
 This guide is for Silo contributors and downstream package maintainers. It
 describes how to build the package formats that exist in this source tree, how
 those formats relate to the canonical runtime payload, and where to find their

@@ -23,6 +23,7 @@ pub enum Component {
     Initramfs,
     Rprobe,
     GoFfi,
+    Taild,
 }
 
 pub struct BuildContext<'a> {
@@ -52,6 +53,8 @@ pub enum ComponentError {
     MissingVmmBinary { path: std::path::PathBuf },
     #[error("rprobe must be built natively on Linux ARM64")]
     UnsupportedRprobeHost,
+    #[error(transparent)]
+    Version(#[from] crate::version::VersionError),
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -62,6 +65,7 @@ pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         Component::Netd,
         Component::Agent,
         Component::Init,
+        Component::Taild,
     ] {
         build_component(component, context)?;
     }
@@ -83,6 +87,7 @@ pub fn build_component(
         Component::Initramfs => build_initramfs(context),
         Component::Rprobe => build_rprobe(context),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
+        Component::Taild => build_taild(context),
     }
 }
 
@@ -275,6 +280,66 @@ fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     ]);
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
+    Ok(())
+}
+
+fn build_taild(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    crate::version::check(context.workspace_root)?;
+    build_component(Component::GoFfi, context)?;
+
+    let source = context.workspace_root.join("app/taild");
+    let output_dir = context.target_dir.join(context.profile.directory());
+    fs::create_dir_all(&output_dir).map_err(|source| ComponentError::CreateOutputDirectory {
+        path: output_dir.clone(),
+        source,
+    })?;
+    let output = output_dir.join("taild");
+    let go_program = release::tool("go")?;
+    let (goos, goarch) = context.host.go_target();
+    let mut go = Command::new(&go_program);
+    go.current_dir(&source)
+        .args(["build", "-mod=readonly", "-trimpath", "-buildvcs=false"]);
+    release::configure_command(
+        &mut go,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
+    go.env("CGO_ENABLED", "1")
+        .env("GOOS", goos)
+        .env("GOARCH", goarch)
+        .env_remove("SILO_GO_FFI_PATH");
+    if context.profile == Profile::Release {
+        go.args(["-ldflags", "-s -w"]);
+    }
+    go.arg("-o").arg(&output).arg("./cmd/taild");
+    command::run(go)?;
+    if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
+        release::set_macos_build_version(&output)?;
+    }
+
+    let mut notices = Command::new("python3");
+    notices
+        .arg(
+            context
+                .workspace_root
+                .join("packaging/silo-taild/licenses.py"),
+        )
+        .arg(&source)
+        .arg(context.target_dir.join("taild-licenses"))
+        .arg(go_program);
+    release::configure_command(
+        &mut notices,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
+    notices
+        .env("CGO_ENABLED", "1")
+        .env("GOOS", goos)
+        .env("GOARCH", goarch)
+        .env_remove("SILO_GO_FFI_PATH");
+    command::run(notices)?;
     Ok(())
 }
 

@@ -57,6 +57,9 @@ func (d *TCPDispatcher) Register(endpointType EndpointType, handler TCPHandler) 
 }
 
 func (d *TCPDispatcher) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, decision hooks.RouteDecision) (EndpointType, bool, error) {
+	if decision.Tunnel != nil {
+		return "", false, nil
+	}
 	if d == nil {
 		return "", false, nil
 	}

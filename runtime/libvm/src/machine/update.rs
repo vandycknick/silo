@@ -43,6 +43,8 @@ pub enum MachineUserUpdate {
 pub struct MachineUpdate {
     /// New machine name.
     pub name: Option<String>,
+    /// Replacement labels, committed atomically with the name and settings.
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
     /// New CPU count.
     pub cpus: Option<u8>,
     /// New memory size.
@@ -76,9 +78,23 @@ impl MachineUpdate {
         Self::default()
     }
 
+    /// Rejects a deferred network-builder error before transporting or applying
+    /// this update. Machine-dependent validation still runs during `update`.
+    pub fn validate_network(&self) -> Result<(), &str> {
+        match self.network_error.as_deref() {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+
     /// Sets the machine name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    pub fn labels(mut self, labels: std::collections::BTreeMap<String, String>) -> Self {
+        self.labels = Some(labels);
         self
     }
 
@@ -178,6 +194,7 @@ impl MachineUpdate {
     /// Returns true when no settings are present.
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
+            && self.labels.is_none()
             && self.cpus.is_none()
             && self.memory.is_none()
             && self.root_disk_size.is_none()

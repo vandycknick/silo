@@ -1,6 +1,6 @@
 # Node to Go SDK parity
 
-This inventory is completed alongside implementation. A checked item has a public Go symbol, native bridge path, and test coverage. `libvm` APIs absent from the public Node facade are intentionally excluded.
+This inventory is completed alongside implementation. A checked item has a public Go symbol, native bridge path, and test coverage. It also includes the public libvm service-consumer contracts added in phase 7.
 
 | Node facade | Go facade | Native operation | Coverage | State |
 |---|---|---|---|---|
@@ -19,6 +19,18 @@ This inventory is completed alongside implementation. A checked item has a publi
 | `inspect` | `Machine.Inspect` | `silo_machine_inspect` | lifecycle tests | implemented |
 | `start` | `Machine.Start` | `silo_machine_start` | lifecycle tests | implemented |
 | `stop` | `Machine.Stop` | `silo_machine_stop` | lifecycle tests | implemented |
+| stopped resource/name/label updates | `Machine.Update` | `silo_machine_update` | actual native temp-home contracts and native KVM | implemented |
+| stopped node-state lifecycle exclusion | `Machine.LeaseNodeState`, `NodeStateLease.Close` | `silo_machine_lease_node_state`, `silo_node_state_lease_free`, Rust `Machine::lease_node_state` | actual Rust SQLite and cross-process public SDK Start/Update/Remove busy, Inspect safe, release/update/remove | implemented |
+| stop options | `Machine.StopWith` | `silo_machine_stop_with` | same-run Rust escalation and native KVM | implemented |
+| guest provisioning readiness | `Machine.WaitReady` | polling `silo_machine_inspect` | terminal errors and native KVM | implemented |
+| generic launch generation | `MachineData.RunID` / fenced `WaitReady` | `VmMonitorService` protobuf `run_id` + inspect DTO | preserved readers, expected machine/run fencing and real native gRPC/KVM | implemented |
+| explicit guest account provisioning | `WithGuestUser`, `ParseGuestUser` / `MachineData.GuestUser` | create/update/inspect DTO | absent account/root default, explicit account persistence and real guest uid/gid | implemented |
+| PTY size / TERM | `WithExecInitialPTYSize` / `WithExecTerm` | execution request DTO | actual guest stty/TERM | implemented |
+| Tailscale identity settings | `MachineData.Network.Tailscale` | inspect DTO | stopped create/update and 0700 cleanup | implemented |
+| resilient inventory | `Runtime.Inventory` | `silo_runtime_query` | real healthy/broken records | implemented |
+| HCL parse/validation/rendering | `ParseNetworkPolicyHCL`, `ValidateNetworkPolicyHCL`, `NetworkPolicy.HCL` | Rust policy parser/formatter | actual native round trips | implemented |
+| secret requirements/readiness | `NetworkPolicy.SecretMetadata`, `Runtime.PolicySecretsReady` | Rust slots and start resolver | real stores, precedence and optional keys | implemented |
+| redacted secret diagnostics | `Runtime.CheckPolicySecrets` | `silo_runtime_query` operation `check_policy_secrets`, public Rust `Runtime::check_policy_secrets` | actual native missing alternatives vs corrupt/type/empty projections, Machine/Home precedence, whole-set overrides, AWS profile, optional auth key | implemented |
 | `remove` | `Machine.Remove` | `silo_machine_remove` | lifecycle tests | implemented |
 | `exec` | `Machine.Exec` | `silo_machine_exec` | execution tests | implemented |
 | `shell` | `Machine.Shell` | `silo_machine_shell` | execution tests | implemented |
@@ -44,4 +56,4 @@ This inventory is completed alongside implementation. A checked item has a publi
 | machine/image/process/status types | corresponding Go read models | response DTO conversion | conversion tests | implemented |
 | `SiloError` | `silo.Error` | exhaustive native error DTO | error tests | implemented |
 
-Go-only packaging APIs (`InstallRuntime`, `InstalledRuntime`, and `ByteSize`) have no Node equivalent and exist to satisfy the Go transport contract in ADR 0012.
+Go-only packaging APIs (`InstallRuntime`, `InstalledRuntime`, and `ByteSize`) have no Node equivalent and exist to satisfy the Go transport contract in ADR 0012. The current bridge requires ABI 1, the initial unreleased baseline including machine-scoped `SetSecret`/`DeleteSecret`, stateless planning, node-state leases and cancellable attachments; mismatched ABIs are rejected before resolving API symbols. The `NativeABIVersion` constant reports the requirement and `VerifiedNativeABIVersion()` returns the actual checked bridge ABI. `ParseMachineMemory`, `ParseRootDiskSize`, and `ProposeMachineName` delegate to public `libvm::planning` functions through the strict `silo_planning_query` entrypoint. Size units match CLI binary semantics (8gb is 8 GiB); explicit decimal ByteSize constructors remain decimal. Proposals use the existing adjective-noun-fourhex generator and reserve nothing. No planning query opens runtime state or uses the network. Tailscale checks cover stopped creation and launch arguments. Starting a Tailscale policy requires netd support.

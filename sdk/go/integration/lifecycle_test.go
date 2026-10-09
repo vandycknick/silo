@@ -33,7 +33,7 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	machine, err := runtime.CreateMachine(ctx, silo.OCIImage(image), silo.WithName("go-sdk-e2e"), silo.WithCPUs(1), silo.WithMemory(silo.Gibibytes(1)), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
+	machine, err := runtime.CreateMachine(ctx, silo.OCIImage(image), silo.WithName("go-sdk-e2e"), silo.WithCPUs(1), silo.WithMemory(silo.Gibibytes(1)), silo.WithRootDiskSize(silo.Gibibytes(1)), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +69,21 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	session, err := machine.Spawn(ctx, "/bin/cat", nil, silo.WithExecStdinPipe())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if session.Stdin() != nil {
+		t.Fatal("stdin exposed before Started observation")
+	}
+	for {
+		event, e := session.Recv(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if event.Kind == silo.ExecutionEventStarted {
+			break
+		}
+		if event.Kind == silo.ExecutionEventTerminal {
+			t.Fatal("cat ended before Started")
+		}
 	}
 	stdin := session.Stdin()
 	if stdin == nil {

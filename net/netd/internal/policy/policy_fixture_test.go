@@ -313,12 +313,26 @@ func parseFixtureTailscale(filename string, block fixtureBlock) (TailscaleDecl, 
 }
 
 func parseFixtureForward(filename string, block fixtureBlock) (NetworkForwardDecl, error) {
-	attrs := fixtureAttrs(block.body)
-	if unknown := unknownFixtureAttrs(attrs, "listen", "target", "target_port", "tunnel"); len(unknown) > 0 {
+	attrs := fixtureAttrs(removeNestedFixtureBlocks(block.body))
+	if unknown := unknownFixtureAttrs(attrs, "listen", "target", "target_port", "tunnel", "protocol"); len(unknown) > 0 {
 		return NetworkForwardDecl{}, fixtureLoadError(filename, "Unsupported argument", unsupportedFixtureArgumentDetail(unknown))
 	}
-	targetPort, _ := strconv.ParseUint(strings.TrimSpace(attrs["target_port"]), 10, 16)
-	return NetworkForwardDecl{Name: block.label2, Kind: block.label1, Listen: fixtureOptionalString(filename, attrs["listen"]), Target: fixtureOptionalString(filename, attrs["target"]), TargetPort: uint16(targetPort), Tunnel: fixtureRefName(attrs["tunnel"])}, nil
+	targetPort, err := strconv.ParseUint(strings.TrimSpace(attrs["target_port"]), 10, 16)
+	if err != nil {
+		return NetworkForwardDecl{}, fixtureLoadError(filename, "Invalid target port", err.Error())
+	}
+	forward := NetworkForwardDecl{Name: block.label2, Kind: block.label1, Listen: fixtureOptionalString(filename, attrs["listen"]), Target: fixtureOptionalString(filename, attrs["target"]), TargetPort: uint16(targetPort), Tunnel: fixtureRefName(attrs["tunnel"]), Protocol: ForwardProtocol(fixtureOptionalString(filename, attrs["protocol"]))}
+	for _, nested := range nestedFixtureBlocks(block.body) {
+		if nested.kind != "tls" || forward.TLS != nil {
+			return NetworkForwardDecl{}, fixtureLoadError(filename, "Unsupported block", "expected one tls block")
+		}
+		tlsAttrs := fixtureAttrs(nested.body)
+		if unknown := unknownFixtureAttrs(tlsAttrs, "provider"); len(unknown) > 0 {
+			return NetworkForwardDecl{}, fixtureLoadError(filename, "Unsupported argument", unsupportedFixtureArgumentDetail(unknown))
+		}
+		forward.TLS = &ForwardTLS{Provider: ForwardCertificateProvider(fixtureOptionalString(filename, tlsAttrs["provider"]))}
+	}
+	return forward, nil
 }
 
 func fixtureAttrs(body string) map[string]string {

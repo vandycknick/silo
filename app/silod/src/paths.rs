@@ -10,11 +10,11 @@ pub(crate) struct SystemPaths {
 }
 
 impl SystemPaths {
-    pub(crate) fn from_env() -> eyre::Result<Self> {
-        Ok(Self {
-            published: DaemonPaths::from_env()?,
+    pub(crate) fn from_host(host: &libvm::HostPaths) -> Self {
+        Self {
+            published: DaemonPaths::new(host.home()),
             run_root: libvm::HostPaths::run_root(),
-        })
+        }
     }
 
     #[cfg(test)]
@@ -47,13 +47,25 @@ impl SystemPaths {
     pub(crate) fn lifetime_lock(&self) -> PathBuf {
         self.published.lifetime_lock()
     }
-    pub(crate) fn status(&self) -> PathBuf {
-        self.published.status()
-    }
     pub(crate) fn log(&self) -> PathBuf {
         self.published.log()
     }
     pub(crate) fn docker_socket(&self) -> PathBuf {
         self.published.docker_socket()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SystemPaths;
+
+    #[test]
+    fn selected_host_home_is_shared_with_the_published_layout() {
+        let host = libvm::HostPaths::new("/srv/silo-home", "/srv/config/silo");
+        let paths = SystemPaths::from_host(&host);
+        assert_eq!(paths.home(), host.home());
+        assert_eq!(paths.record(), host.home().join("daemon/daemon.json"));
+        assert_eq!(paths.log(), host.home().join("logs/daemon/daemon.log"));
+        assert_eq!(paths.run_root(), libvm::HostPaths::run_root());
     }
 }

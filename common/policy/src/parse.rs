@@ -570,6 +570,14 @@ impl<'a> DocumentBuilder<'a> {
         }
         let kind = labels[0].clone();
         let name = labels[1].clone();
+        if name == "silo" {
+            self.error_at(
+                block_position,
+                "Reserved credential name",
+                "credential name silo is reserved for generated secrets",
+            );
+            return;
+        }
         if !valid_identifier(&name) {
             let position = self
                 .locator
@@ -948,6 +956,14 @@ impl<'a> DocumentBuilder<'a> {
             return;
         }
         let name = labels[0].clone();
+        if name == "silo" {
+            self.error_at(
+                block_position,
+                "Reserved tailscale name",
+                "tailscale name silo is reserved for generated secrets",
+            );
+            return;
+        }
         if !valid_identifier(&name) {
             let position = self
                 .locator
@@ -957,6 +973,17 @@ impl<'a> DocumentBuilder<'a> {
                 position,
                 "Invalid tailscale name",
                 format!("tailscale \"{name}\" name must use a traversal identifier"),
+            );
+            return;
+        }
+        if let Some(first) = self.tailscale.first() {
+            self.error_at(
+                block_position,
+                "Multiple tailscale blocks",
+                format!(
+                    "at most one tailscale declaration is allowed: {:?} and {:?}",
+                    first.name, name
+                ),
             );
             return;
         }
@@ -972,9 +999,19 @@ impl<'a> DocumentBuilder<'a> {
         let mut tags = Vec::new();
         let mut hostname = String::new();
         let mut control_url = String::new();
+        let mut ephemeral = false;
         for structure in block.body().iter() {
             match structure {
                 Structure::Attribute(attribute) => match attribute.key() {
+                    "ephemeral" => match decode_bool(attribute.expr()) {
+                        Ok(value) => ephemeral = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid tailscale ephemeral",
+                            detail,
+                        ),
+                    },
                     "tags" => match decode_string_list(attribute.expr()) {
                         Ok(value) => tags = value,
                         Err(detail) => self.attr_error(
@@ -1029,6 +1066,7 @@ impl<'a> DocumentBuilder<'a> {
 
         self.tailscale.push(TailscaleDecl {
             name,
+            ephemeral,
             tags,
             hostname,
             control_url,
@@ -1081,66 +1119,147 @@ impl<'a> DocumentBuilder<'a> {
         let mut target = None;
         let mut target_port = None;
         let mut tunnel = None;
+        let mut protocol = crate::ForwardProtocol::Tcp;
+        let mut tls = None;
+        let mut tls_seen = false;
         for structure in block.body().iter() {
             match structure {
-                Structure::Attribute(attribute) => match attribute.key() {
-                    "listen" => match decode_string(attribute.expr()) {
-                        Ok(value) => listen = value,
-                        Err(detail) => self.attr_error(
+                Structure::Attribute(attribute) => {
+                    match attribute.key() {
+                        "protocol" => match decode_string(attribute.expr()).and_then(|value| {
+                            match value.as_str() {
+                                "tcp" => Ok(crate::ForwardProtocol::Tcp),
+                                "https" => Ok(crate::ForwardProtocol::Https),
+                                _ => Err("protocol must be tcp or https".to_string()),
+                            }
+                        }) {
+                            Ok(value) => protocol = value,
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid forward protocol",
+                                detail,
+                            ),
+                        },
+                        "listen" => match decode_string(attribute.expr()) {
+                            Ok(value) => listen = value,
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid forward listen",
+                                detail,
+                            ),
+                        },
+                        "target" => match decode_string(attribute.expr()) {
+                            Ok(value) => target = Some(value),
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid forward target",
+                                detail,
+                            ),
+                        },
+                        "target_port" => match decode_u16(attribute.expr()) {
+                            Ok(value) => target_port = Some(value),
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid forward target_port",
+                                detail,
+                            ),
+                        },
+                        "tunnel" => match decode_ref(attribute.expr()) {
+                            Ok(value) => tunnel = Some(value),
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid forward tunnel",
+                                detail,
+                            ),
+                        },
+                        key => self.attr_error(
                             attribute,
                             block_position.line,
-                            "Invalid forward listen",
-                            detail,
+                            "Unsupported argument",
+                            format!("An argument named \"{key}\" is not expected here."),
                         ),
-                    },
-                    "target" => match decode_string(attribute.expr()) {
-                        Ok(value) => target = Some(value),
-                        Err(detail) => self.attr_error(
-                            attribute,
-                            block_position.line,
-                            "Invalid forward target",
-                            detail,
-                        ),
-                    },
-                    "target_port" => match decode_u16(attribute.expr()) {
-                        Ok(value) => target_port = Some(value),
-                        Err(detail) => self.attr_error(
-                            attribute,
-                            block_position.line,
-                            "Invalid forward target_port",
-                            detail,
-                        ),
-                    },
-                    "tunnel" => match decode_ref(attribute.expr()) {
-                        Ok(value) => tunnel = Some(value),
-                        Err(detail) => self.attr_error(
-                            attribute,
-                            block_position.line,
-                            "Invalid forward tunnel",
-                            detail,
-                        ),
-                    },
-                    key => self.attr_error(
-                        attribute,
-                        block_position.line,
-                        "Unsupported argument",
-                        format!("An argument named \"{key}\" is not expected here."),
-                    ),
-                },
+                    }
+                }
                 Structure::Block(child) => {
                     let position = self.locator.find_block_after(
                         child.identifier(),
                         &block_labels(child),
                         block_position.line,
                     );
-                    self.error_at(
-                        position,
-                        "Unsupported block",
-                        format!(
-                            "Blocks of type \"{}\" are not expected here.",
-                            child.identifier()
-                        ),
-                    );
+                    if child.identifier() != "tls" {
+                        self.error_at(
+                            position,
+                            "Unsupported block",
+                            format!(
+                                "Blocks of type \"{}\" are not expected here.",
+                                child.identifier()
+                            ),
+                        );
+                        continue;
+                    }
+                    if tls_seen || !block_labels(child).is_empty() {
+                        self.error_at(
+                            position,
+                            "Invalid forward TLS",
+                            "tls requires one unlabelled block",
+                        );
+                    }
+                    tls_seen = true;
+                    let mut provider = None;
+                    for structure in child.body().iter() {
+                        match structure {
+                            Structure::Attribute(attribute) if attribute.key() == "provider" => {
+                                match decode_string(attribute.expr()) {
+                                    Ok(value) if value == "tailscale" => {
+                                        if provider.is_some() {
+                                            self.attr_error(
+                                                attribute,
+                                                position.line,
+                                                "Invalid forward TLS",
+                                                "duplicate TLS provider",
+                                            );
+                                        }
+                                        provider =
+                                            Some(crate::ForwardCertificateProvider::Tailscale);
+                                    }
+                                    _ => self.attr_error(
+                                        attribute,
+                                        position.line,
+                                        "Invalid forward TLS",
+                                        "provider must be tailscale",
+                                    ),
+                                }
+                            }
+                            Structure::Attribute(attribute) => self.attr_error(
+                                attribute,
+                                position.line,
+                                "Unsupported argument",
+                                format!(
+                                    "An argument named \"{}\" is not expected here.",
+                                    attribute.key()
+                                ),
+                            ),
+                            Structure::Block(_) => self.error_at(
+                                position,
+                                "Unsupported block",
+                                "TLS does not accept nested blocks",
+                            ),
+                        }
+                    }
+                    if let Some(provider) = provider {
+                        tls = Some(crate::ForwardTls { provider });
+                    } else {
+                        self.error_at(
+                            position,
+                            "Missing TLS provider",
+                            "tls requires provider = tailscale",
+                        );
+                    }
                 }
             }
         }
@@ -1161,7 +1280,7 @@ impl<'a> DocumentBuilder<'a> {
             );
             return;
         };
-        if kind == "tailscale" && tunnel.is_none() {
+        if kind == "tailscale" && target != "self" && tunnel.is_none() {
             self.error_at(
                 block_position,
                 "Missing forward tunnel",
@@ -1176,6 +1295,8 @@ impl<'a> DocumentBuilder<'a> {
             target,
             target_port,
             tunnel,
+            protocol,
+            tls,
             order: self.forwards.len(),
         });
     }
@@ -1371,15 +1492,54 @@ impl<'a> DocumentBuilder<'a> {
         }
 
         let forwards_snapshot = self.forwards.clone();
+        let mut listeners = HashSet::new();
         for forward in &forwards_snapshot {
-            if !valid_target_selector(&forward.target) {
+            if !(valid_target_selector(&forward.target)
+                || (forward.kind == "tailscale" && forward.target == "self"))
+            {
                 self.error_at(
                     Position { line: 1, column: 1 },
                     "Invalid forward",
                     format!(
-                        "forward \"{}\".\"{}\" target must start with name:, id:, or label:",
+                        "forward \"{}\".\"{}\" target must start with name:, id:, or label:, or be self for Tailscale",
                         forward.kind, forward.name
                     ),
+                );
+            }
+            if forward.target_port == 0 {
+                self.error_at(
+                    Position { line: 1, column: 1 },
+                    "Invalid forward",
+                    "target_port must be greater than zero",
+                );
+            }
+            match crate::canonical::validate_forward_transport(
+                &forward.kind,
+                &forward.target,
+                forward.protocol,
+                forward.tls.as_ref(),
+                &forward.listen,
+            ) {
+                Ok(Some(port)) if !listeners.insert(port) => self.error_at(
+                    Position { line: 1, column: 1 },
+                    "Duplicate forward listener",
+                    format!(
+                        "forward {} duplicates Tailscale listener :{port}",
+                        forward.name
+                    ),
+                ),
+                Err(detail) => self.error_at(
+                    Position { line: 1, column: 1 },
+                    "Invalid forward transport",
+                    detail,
+                ),
+                _ => {}
+            }
+            if forward.kind == "host" && forward.tunnel.is_some() {
+                self.error_at(
+                    Position { line: 1, column: 1 },
+                    "Invalid forward",
+                    "host forwards cannot reference a tunnel",
                 );
             }
             if let Some(tunnel) = &forward.tunnel {
@@ -1743,7 +1903,27 @@ fn parse_port(value: &str) -> Result<u16, String> {
 }
 
 fn decode_ref(expression: &Expression) -> Result<Ref, String> {
-    ref_from_text(&expression.to_string())
+    let Expression::Traversal(traversal) = expression else {
+        return Err("expected two-part reference like https.github or https[\"1github\"]".into());
+    };
+    let Expression::Variable(kind) = &traversal.expr else {
+        return Err("reference must start with a kind identifier".into());
+    };
+    let name = match traversal.operators.as_slice() {
+        [hcl::expr::TraversalOperator::GetAttr(name)] => name.to_string(),
+        [hcl::expr::TraversalOperator::LegacyIndex(name)] => name.to_string(),
+        [hcl::expr::TraversalOperator::Index(Expression::String(name))] => name.clone(),
+        _ => {
+            return Err(
+                "reference must contain exactly one attribute or literal string index".into(),
+            )
+        }
+    };
+    let kind = kind.to_string();
+    if !valid_identifier(&kind) || !valid_identifier(&name) {
+        return Err("reference must use valid kind and declaration names".into());
+    }
+    Ok(Ref { kind, name })
 }
 
 fn decode_ref_list(expression: &Expression) -> Result<Vec<Ref>, String> {
@@ -1754,22 +1934,6 @@ fn decode_ref_list(expression: &Expression) -> Result<Vec<Ref>, String> {
         return Err("expected at least one reference".to_owned());
     }
     values.iter().map(decode_ref).collect()
-}
-
-fn ref_from_text(value: &str) -> Result<Ref, String> {
-    let text = value.trim();
-    let Some((kind, name)) = text.split_once('.') else {
-        return Err("expected two-part reference like https.github".to_owned());
-    };
-    if name.contains('.') || !valid_identifier(kind) || !valid_identifier(name) {
-        return Err(format!(
-            "reference \"{text}\" must use traversal identifiers"
-        ));
-    }
-    Ok(Ref {
-        kind: kind.to_owned(),
-        name: name.to_owned(),
-    })
 }
 
 fn valid_identifier(value: &str) -> bool {

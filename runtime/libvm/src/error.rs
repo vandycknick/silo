@@ -5,6 +5,19 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
+    #[error("network secret slot {slot:?}, store key {key:?}: {code}")]
+    SecretResolution {
+        slot: String,
+        key: String,
+        code: String,
+    },
+    #[error("missing required network secret material for {reference}: {requirements:?}; store keys {keys:?}")]
+    MissingNetworkSecrets {
+        reference: String,
+        requirements: Vec<crate::NetworkSecretRequirement>,
+        policy: Box<crate::NetworkPolicy>,
+        keys: Vec<String>,
+    },
     #[error("could not resolve the Silo home from SILO_HOME or HOME")]
     HomeUnavailable,
 
@@ -247,6 +260,8 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::SecretResolution { .. } => "SecretResolution",
+            Self::MissingNetworkSecrets { .. } => "MissingNetworkSecrets",
             Self::HomeUnavailable => "HomeUnavailable",
             Self::ConfigDirUnavailable => "ConfigDirUnavailable",
             Self::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",

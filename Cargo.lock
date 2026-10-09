@@ -83,6 +83,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "ssh-key",
 ]
 
 [[package]]
@@ -675,13 +676,18 @@ dependencies = [
  "libvm",
  "nix 0.31.3",
  "reqwest",
+ "secrets",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "silo-config",
+ "silo-vm-control",
  "silod-spec",
+ "ssh-key",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tonic",
  "utils",
  "uuid",
  "vm-spec",
@@ -2622,6 +2628,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.0",
  "bytes",
+ "chrono",
  "cpio",
  "disk-image",
  "eyre",
@@ -2639,6 +2646,7 @@ dependencies = [
  "rcgen",
  "russh",
  "rustix",
+ "secrets",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2652,9 +2660,13 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tower",
+ "tracing",
+ "url",
  "utils",
  "uuid",
  "vm-spec",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -3527,6 +3539,7 @@ version = "0.1.0"
 dependencies = [
  "cel",
  "hcl-rs",
+ "secrets",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4372,6 +4385,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrets"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4563,8 +4588,6 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
@@ -4590,6 +4613,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-config"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "libvm",
+ "nix 0.31.3",
+ "serde",
+ "serde_yaml_ng",
+ "silod-spec",
+ "tempfile",
+]
+
+[[package]]
 name = "silo-go-ffi"
 version = "0.1.0"
 dependencies = [
@@ -4598,6 +4634,7 @@ dependencies = [
  "libvm",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "vm-spec",
@@ -4627,6 +4664,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-vm-control"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "forward-spec",
+ "hyper-util",
+ "libvm",
+ "nix 0.31.3",
+ "policy",
+ "prost",
+ "prost-types",
+ "secrets",
+ "serde_json",
+ "silod-spec",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "uuid",
+ "vm-spec",
+]
+
+[[package]]
 name = "silo-vmm"
 version = "0.1.0"
 dependencies = [
@@ -4650,6 +4712,7 @@ dependencies = [
  "protocol",
  "rand",
  "rprobe",
+ "russh",
  "serde",
  "serde_json",
  "test-utils",
@@ -4678,16 +4741,32 @@ dependencies = [
  "clap",
  "disk-image",
  "eyre",
+ "futures",
+ "hyper-util",
+ "libc",
  "libvm",
  "nix 0.31.3",
+ "parking_lot",
+ "prost",
+ "prost-types",
+ "secrets",
  "serde",
  "serde_json",
+ "silo-config",
+ "silo-vm-control",
  "silod-spec",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "tracing",
  "utils",
  "uuid",
  "vm-spec",
+ "zeroize",
 ]
 
 [[package]]
@@ -4695,9 +4774,17 @@ name = "silod-spec"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protoc-bin-vendored",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "utils",
  "uuid",
 ]
 
@@ -5719,6 +5806,11 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "ssh-key",
+ "tempfile",
+]
 
 [[package]]
 name = "uuid"
@@ -6331,9 +6423,11 @@ dependencies = [
  "clap",
  "cpio",
  "flate2",
+ "protoc-bin-vendored",
  "rustix",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 

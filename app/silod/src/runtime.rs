@@ -230,3 +230,72 @@ fn stop_options() -> MachineStopOptions {
         .timeout(Duration::from_secs(60))
         .force_after_timeout(Duration::from_secs(5))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::SystemRuntime;
+    use libvm::{MachineStartOptions, NetworkPolicy, RuntimeConfig};
+
+    #[tokio::test]
+    async fn real_vm_starts_bearer_policy_from_default_home_store() {
+        if std::env::var("SILO_E2E_KVM").as_deref() != Ok("1") {
+            eprintln!("SKIPPED: SILO_E2E_KVM=1 is required for the silod real-VM secret test");
+            return;
+        }
+        assert!(
+            std::path::Path::new("/dev/kvm").exists(),
+            "SILO_E2E_KVM=1 requires /dev/kvm"
+        );
+        let root = match std::env::var_os("SILO_TEST_RUNTIME_ROOT") {
+            Some(root) => root,
+            None => {
+                eprintln!("SKIPPED: SILO_TEST_RUNTIME_ROOT is required");
+                return;
+            }
+        };
+        let image = match std::env::var("SILO_TEST_IMAGE") {
+            Ok(image) => image,
+            Err(_) => {
+                eprintln!("SKIPPED: SILO_TEST_IMAGE is required");
+                return;
+            }
+        };
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("secrets.json"),
+            br#"{"bearer_token.api.token":{"type":"plain","value":"synthetic-silod-secret"}}"#,
+        )
+        .unwrap();
+        let mut service =
+            SystemRuntime::connect(RuntimeConfig::local(home.path()).with_runtime_root(root))
+                .await
+                .unwrap();
+        let policy = NetworkPolicy::from_json_str(r#"{"version":1,"endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],"credentials":[{"name":"api","kind":"bearer_token","endpoint":"api"}],"rules":[{"endpoints":["api"],"credential":"api","verdict":"allow"}]}"#).unwrap();
+        let created = service
+            .runtime
+            .machine()
+            .name("silod-secret-e2e")
+            .image(image)
+            .vsock(true)
+            .network(|network| network.private().policy(policy))
+            .create()
+            .await
+            .unwrap();
+        let machine = service.machine(&created.id()).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            machine
+                .start_with_options(MachineStartOptions::new())
+                .await?;
+            machine.wait_ready(std::time::Duration::from_secs(90)).await
+        })
+        .await;
+        let stopped = machine.stop().await;
+        let removed = service.remove_machine(&created.id()).await;
+        assert_eq!(
+            result.unwrap().unwrap().outcome,
+            libvm::MachineReadinessOutcome::Ready
+        );
+        stopped.unwrap();
+        removed.unwrap();
+    }
+}

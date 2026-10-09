@@ -38,3 +38,5 @@ and review standards for new and substantially revised records.
 | 0016 | Forwarding: machine- and session-scoped vsock forwards and guest-requested netd publications | Draft | 2026-09-01 | `docs/adr/0016-vsock-forwards-and-netd-publications.md` |
 | 0017 | Single host state root                                        | Accepted    | 2026-09-24 | `docs/adr/0017-single-host-state-root.md`        |
 | 0018 | silo-vmm contract                                           | Accepted    | 2026-09-24 | `docs/adr/0018-silo-vmm-contract.md`           |
+| 0019 | Optional tailnet service through the public Go SDK | Accepted | 2026-10-01 | `docs/adr/0019-optional-tailnet-service.md` |
+| 0020 | Netd owns the VM tailnet node and relays guest SSH | Accepted | 2026-10-01 | `docs/adr/0020-netd-tailnet-identity.md` |

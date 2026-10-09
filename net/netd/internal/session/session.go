@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/vandycknick/silo/net/netd/internal/config"
 	"github.com/vandycknick/silo/net/netd/internal/credentials"
@@ -18,21 +21,25 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/gateway/publication"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 	"github.com/vandycknick/silo/net/netd/internal/logfile"
+	"github.com/vandycknick/silo/net/netd/internal/netnode"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"github.com/vandycknick/silo/net/netd/internal/registry"
+	"github.com/vandycknick/silo/net/netd/internal/sshdoor"
 	"github.com/vandycknick/silo/net/netd/internal/virtualnetwork"
 )
 
 type Spec struct {
-	VMID         string
-	RunID        string
-	NetworkID    string
-	CaptureFile  *os.File
-	Stack        config.NetworkConfig
-	Policy       *policy.Policy
-	CACert       string
-	CAKey        string
-	GuestPublish config.PublishBind
+	TailscaleStateDir string
+	VsockMux          string
+	VMID              string
+	RunID             string
+	NetworkID         string
+	CaptureFile       *os.File
+	Stack             config.NetworkConfig
+	Policy            *policy.Policy
+	GuestPublish      config.PublishBind
+	Secrets           credentials.Source
+	AttachmentScope   policy.AttachmentScope
 }
 
 type Shared struct {
@@ -41,6 +48,7 @@ type Shared struct {
 }
 
 type Session struct {
+	node    *netnode.Node
 	ctx     context.Context
 	cancel  context.CancelFunc
 	flows   *packet.FlowTracker
@@ -66,6 +74,9 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 	if spec.Policy == nil {
 		return nil, errors.New("session policy is required")
 	}
+	if err := policy.ValidateForwardAttachment(spec.AttachmentScope, spec.Policy.Forwards()); err != nil {
+		return nil, err
+	}
 	if spec.Policy.HasRegistries() && shared.Intelligence == nil {
 		return nil, errors.New("registry policy requires shared package intelligence")
 	}
@@ -77,13 +88,72 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 		return nil, err
 	}
 	route := router.New(spec.Policy, shared.Audit)
-	credentialManager, err := credentials.NewManagerFromEnvironment()
-	if err != nil {
-		cancel()
-		return nil, err
+	if spec.Secrets == nil {
+		spec.Secrets = credentials.NewStatic(nil, nil)
+	}
+	credentialManager := credentials.NewManager(spec.Secrets)
+	result := &Session{ctx: lifetimeCtx, cancel: cancel, flows: flows, runDone: make(chan struct{})}
+	if decl := spec.Policy.Tailscale(); decl != nil {
+		expected, err := netnode.ParseIdentity(spec.Policy.Metadata())
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		if err := config.ValidateTailscale(&config.Config{TailscaleStateDir: spec.TailscaleStateDir, VsockMux: spec.VsockMux}, spec.Policy); err != nil {
+			cancel()
+			return nil, err
+		}
+		result.node, err = netnode.New(netnode.Options{VMID: spec.VMID, RunID: spec.RunID, Identity: expected, Dir: spec.TailscaleStateDir, Declaration: *decl, Secrets: spec.Secrets, Guest: result, Flows: flows, Forwards: spec.Policy.Forwards(), AttachmentScope: spec.AttachmentScope,
+			Ready: func(ctx context.Context) (func(), error) {
+				ca, ok := spec.Secrets.Lookup("silo.ssh_ca.private_key")
+				if !ok {
+					return nil, errors.New("machine SSH CA missing")
+				}
+				// libvm supplies the machine's tailscale directory. SSH identity
+				// and immutable pins are siblings, never inside replaceable state.
+				setup, cancel := context.WithTimeout(ctx, 30*time.Second)
+				door, err := sshdoor.New(setup, filepath.Join(filepath.Dir(spec.TailscaleStateDir), "ssh"), spec.VsockMux, ca, func(event sshdoor.Event) { shared.Audit.RecordInboundSSH(spec.VMID, spec.RunID, spec.NetworkID, event) })
+				cancel()
+				if err != nil {
+					return nil, err
+				}
+				door.Verify = result.node.VerifyAccess
+				if expected != nil {
+					door.Owner = expected.Owner
+				}
+				client, err := result.node.LocalClient()
+				if err != nil {
+					door.Close()
+					return nil, err
+				}
+				listener, err := result.node.Listen("tcp", ":22")
+				if err != nil {
+					door.Close()
+					return nil, err
+				}
+				doorCtx, stop := context.WithCancel(ctx)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					if err := door.Serve(doorCtx, listener, client); err != nil {
+						slog.Warn("SSH front door stopped", "error", err)
+					}
+					door.Close()
+				}()
+				return func() { stop(); listener.Close(); <-done }, nil
+			},
+			Audit: func(event netnode.InboundEvent) {
+				shared.Audit.RecordInbound(spec.VMID, spec.RunID, spec.NetworkID, event)
+			},
+		})
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		route.SetTunnel(result.node)
 	}
 	dispatcher := packet.NewTCPDispatcher()
-	httpsProxy, err := forwarder.NewHTTPSProxy(route, spec.CACert, spec.CAKey, credentialManager)
+	httpsProxy, err := forwarder.NewHTTPSProxy(route, spec.Secrets, credentialManager)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -92,7 +162,7 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 	if httpsProxy != nil {
 		certificateAuthority = httpsProxy.CertificateAuthority()
 	} else if route.HasRegistries() {
-		certificateAuthority, err = forwarder.LoadCertificateAuthority(spec.CACert, spec.CAKey)
+		certificateAuthority, err = forwarder.LoadCertificateAuthority(spec.Secrets)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -136,13 +206,23 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 		return nil, err
 	}
 	captureFile = nil
-	return &Session{
-		ctx:     lifetimeCtx,
-		cancel:  cancel,
-		flows:   flows,
-		network: network,
-		runDone: make(chan struct{}),
-	}, nil
+	result.network = network
+	if result.node != nil {
+		network.SetBeforeClose(result.node.Close)
+	}
+	return result, nil
+}
+
+// Start is called only after the existing worker startup report succeeds.
+func (s *Session) Start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed && s.node != nil {
+		s.node.Start(s.ctx)
+	}
+}
+func (s *Session) DialGuest(ctx context.Context, port uint16) (net.Conn, error) {
+	return s.network.DialGuest(ctx, port)
 }
 
 func publicationOptions(spec Spec, auditLog *audit.Logger) (virtualnetwork.PublicationOptions, error) {

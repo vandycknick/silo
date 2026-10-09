@@ -1,0 +1,13 @@
+version: "1"
+description: Daily driver
+image: ghcr.io/vandycknick/silo/devbox:latest
+resources: {cpus: 4, memory: 8GiB}
+disk_size: 20GiB
+vsock: true
+network:
+  kind: private
+  policy_ref: dev-egress
+  # Discovery hints only. Tailnet ACLs control inbound access to ALL guest ports.
+  # This creates no host listeners and does not restrict inbound ports.
+  publish: [8080]
+labels: {team: runtime}

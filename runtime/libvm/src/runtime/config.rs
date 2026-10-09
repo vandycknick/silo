@@ -2,6 +2,7 @@ use std::env::consts::OS;
 use std::path::{Component, Path, PathBuf};
 
 use crate::paths::{default_run_root, ensure_run_root, resolve_default_home, LocalRoots};
+use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::store::models::DbConfig;
 use crate::LibVmError;
 
@@ -29,6 +30,8 @@ pub struct RuntimeConfig {
     pub runtime_root: Option<PathBuf>,
     /// Portable runtime root bundled by an SDK frontend.
     pub bundled_runtime_root: Option<PathBuf>,
+    /// Exact component selection; use `with_runtime_components` to set it.
+    pub(crate) runtime_components: Option<ResolvedRuntimeComponents>,
     /// Explicit override of silo-vmm's virtualization backend.
     pub virt_backend: Option<VirtBackendOverride>,
 }
@@ -73,12 +76,14 @@ impl RuntimeConfig {
 
     /// Sets the silo-vmm executable path used to launch machines.
     pub fn with_supervisor_path(mut self, supervisor_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.supervisor_path = Some(supervisor_path.into());
         self
     }
 
     /// Sets the netd executable path used for userspace networking.
     pub fn with_netd_path(mut self, netd_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.netd_path = Some(netd_path.into());
         self
     }
@@ -91,31 +96,55 @@ impl RuntimeConfig {
 
     /// Sets the default kernel path.
     pub fn with_kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.kernel_path = Some(kernel_path.into());
         self
     }
 
     /// Sets the default initramfs path.
     pub fn with_initramfs_path(mut self, initramfs_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.initramfs_path = Some(initramfs_path.into());
         self
     }
 
     /// Sets the default guest agent path.
     pub fn with_agent_path(mut self, agent_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.agent_path = Some(agent_path.into());
         self
     }
 
     /// Sets an explicit portable runtime root.
     pub fn with_runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.runtime_root = Some(runtime_root.into());
         self
     }
 
     /// Sets a portable runtime root bundled by an SDK frontend.
     pub fn with_bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.bundled_runtime_root = Some(bundled_runtime_root.into());
+        self
+    }
+
+    /// Resolves native components without opening a runtime or its state store.
+    pub fn resolve_components(&self) -> Result<ResolvedRuntimeComponents, LibVmError> {
+        resolve_components(self)
+    }
+
+    /// Pins an exact snapshot, replacing earlier runtime discovery selectors.
+    /// Later component/root setters discard this snapshot and resume discovery.
+    pub fn with_runtime_components(mut self, components: ResolvedRuntimeComponents) -> Self {
+        self.supervisor_path = None;
+        self.netd_path = None;
+        self.kernel_path = None;
+        self.initramfs_path = None;
+        self.agent_path = None;
+        self.runtime_root = None;
+        self.bundled_runtime_root = None;
+        self.runtime_components = Some(components);
         self
     }
 
@@ -263,9 +292,9 @@ pub struct NetdRuntimeConfig {
     pub subnet: String,
     /// Whether packet capture should be enabled.
     pub pcap: bool,
-    /// Optional TLS CA certificate path.
+    /// Optional operator CA certificate import input, checked against the Home store.
     pub tls_ca_cert: Option<PathBuf>,
-    /// Optional TLS CA key path.
+    /// Optional operator CA key import input, never passed to netd or the guest.
     pub tls_ca_key: Option<PathBuf>,
 }
 
@@ -298,7 +327,9 @@ impl NetdRuntimeConfig {
         self
     }
 
-    /// Sets both TLS CA paths.
+    /// Imports a TLS CA into the selected Home secret store on the first
+    /// intercepting start. Repeated imports must equal the stored pair;
+    /// conflicts fail without replacing existing trust.
     pub fn with_tls_ca(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
         self.tls_ca_cert = Some(cert.into());
         self.tls_ca_key = Some(key.into());

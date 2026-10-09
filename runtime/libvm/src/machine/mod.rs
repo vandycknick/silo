@@ -10,9 +10,11 @@ mod logs;
 mod memory;
 mod mounts;
 mod name_generator;
+mod node_status;
 mod process;
 mod reference;
 pub(crate) mod root_disk;
+mod secrets;
 mod session;
 mod start;
 mod streams;
@@ -30,7 +32,7 @@ pub use inspect::{
     MachineBootMode, MachineBootReport, MachineData, MachineInventoryEntry, MachineIssue,
     MachineIssueComponent, MachineObservation, MachineProvisionFailurePolicy,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
-    MachineProvisionStepStatus, MachineRootfs, MachineStatus,
+    MachineProvisionStepStatus, MachineRootfs, MachineStatus, MachineTailscale,
 };
 pub use lifecycle_options::{
     MachineExit, MachineExitOutcome, MachineKillOptions, MachineRunId, MachineStart,
@@ -41,18 +43,23 @@ pub use logs::{
 };
 pub use memory::Memory;
 pub use mounts::resolve_mount_location;
+pub use node_status::{
+    MachineNetworkObservation, MachineNetworkObservationIssue, MachineNodeObservation,
+    MachineNodeState, MachineNodeStatus,
+};
 pub use process::{MachineRetention, ProcessConfig};
 pub use reference::MachineRef;
 pub(crate) use session::launch_failure_reason;
 pub use session::{
-    ExecutionControl, ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason,
-    ExecutionLost, ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
-    ExecutionResult, ExecutionSession, ExecutionStdin, SshExitStatus, SshShellOptions,
-    SshShellOptionsBuilder, StdinMode,
+    AttachmentSignal, ExecutionControl, ExecutionEvent, ExecutionLaunchFailure,
+    ExecutionLaunchFailureReason, ExecutionLost, ExecutionLostReason, ExecutionOptions,
+    ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult, ExecutionSession, ExecutionStdin,
+    SshExitStatus, SshShellOptions, SshShellOptionsBuilder, StdinMode,
 };
+pub(crate) use start::SecretProvider;
 pub use start::{
     EgressCredentials, EgressSecret, Entrypoint, HostCommand, LaunchCredentials,
-    MachineStartOptions, OAuthRefreshHook,
+    MachineStartOptions,
 };
 pub use streams::{
     FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,
@@ -68,7 +75,8 @@ pub use streams::{
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
     MachineNetworkInterfaceMetrics, MachineProvisionOverallStatus, MachineProvisioningReport,
     MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
-    MachineStaleReason, MachineSystemInfo, MachineVmSnapshot, MachineVmState,
+    MachineSshBackend, MachineSshListenerReport, MachineStaleReason, MachineSystemInfo,
+    MachineVmSnapshot, MachineVmState,
 };
 pub use update::{GuestPublishUpdate, MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 

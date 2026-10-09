@@ -1,7 +1,6 @@
 //! Control of the separate `silod` daemon: locating it, validating what the CLI
 //! would ask of it, registering it with the native service manager, and reading
 //! what it publishes. The interface is `silod_spec`; no daemon code runs here.
-pub(crate) mod config;
 pub(crate) mod docker;
 pub(crate) mod service;
 

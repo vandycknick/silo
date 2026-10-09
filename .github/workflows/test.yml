@@ -28,18 +28,21 @@ jobs:
     outputs:
       node: ${{ steps.result.outputs.node }}
       go: ${{ steps.result.outputs.go }}
+      netd: ${{ steps.result.outputs.netd }}
+      taild: ${{ steps.result.outputs.taild }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - name: Detect SDK-relevant changes
+      - name: Detect SDK and netd changes
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             node:
+              - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -48,9 +51,11 @@ jobs:
               - 'flake.lock'
               - 'flake.nix'
               - 'runtime/libvm/**'
+              - 'common/policy/**'
               - 'specs/**'
               - 'sdk/node/**'
             go:
+              - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -58,21 +63,59 @@ jobs:
               - 'VERSION'
               - 'flake.lock'
               - 'flake.nix'
+              - 'nix/**'
               - 'runtime/libvm/**'
+              - 'common/policy/**'
               - 'specs/**'
               - 'sdk/go/**'
               - 'xtask/**'
+            netd:
+              - '.github/workflows/test.yml'
+              - 'net/netd/**'
+              - 'common/policy/**'
+              - 'flake.lock'
+              - 'flake.nix'
+              - 'nix/**'
+            taild:
+              - 'vendor/signal-hook-registry/**'
+              - '.github/workflows/test.yml'
+              - '.github/workflows/release-tip.yml'
+              - 'packaging/silo-taild/**'
+              - 'PACKAGING.md'
+              - 'nix/**'
+              - 'app/taild/**'
+              - 'app/silod/**'
+              - 'app/cli/**'
+              - 'common/config/**'
+              - 'common/vm-control/**'
+              - 'sdk/go/**'
+              - 'runtime/**'
+              - 'guest/**'
+              - 'virt/**'
+              - 'net/netd/**'
+              - 'common/policy/**'
+              - 'common/secrets/**'
+              - 'Makefile'
+              - 'xtask/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'VERSION'
+              - 'specs/**'
+              - 'flake.lock'
+              - 'flake.nix'
 
-      - name: Select SDK checks
+      - name: Select checks
         id: result
         env:
           NODE_CHANGED: ${{ steps.filter.outputs.node }}
           GO_CHANGED: ${{ steps.filter.outputs.go }}
+          NETD_CHANGED: ${{ steps.filter.outputs.netd }}
+          TAILD_CHANGED: ${{ steps.filter.outputs.taild }}
         run: |
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            printf 'node=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            printf 'node=true\ngo=true\nnetd=true\ntaild=true\n' >> "$GITHUB_OUTPUT"
           else
-            printf 'node=%s\ngo=%s\n' "$NODE_CHANGED" "$GO_CHANGED" >> "$GITHUB_OUTPUT"
+            printf 'node=%s\ngo=%s\nnetd=%s\ntaild=%s\n' "$NODE_CHANGED" "$GO_CHANGED" "$NETD_CHANGED" "$TAILD_CHANGED" >> "$GITHUB_OUTPUT"
           fi
 
   # Clippy and Cargo tests stay per-OS: the workspace has platform-only
@@ -263,10 +306,173 @@ jobs:
             "context"
             "github.com/vandycknick/silo/sdk/go"
           )
-          func main() { _, _ = silo.InstalledRuntime(); _ = context.Background() }
+          func contracts(runtime *silo.Runtime, machine *silo.Machine, policy *silo.NetworkPolicy) {
+            ctx := context.Background()
+            name := "exact"
+            labels := map[string]string{"io.silo.taild.name": name}
+            _, _ = machine.Update(ctx, silo.MachineUpdate{Name: &name, Labels: &labels})
+            _, _ = machine.StopWith(ctx, silo.StopOptions{Force: true})
+            _, _ = machine.WaitReady(ctx, 1)
+            _, _ = runtime.Inventory(ctx)
+            _, _ = runtime.PolicySecretsReady(ctx, policy, "")
+            _, _ = silo.ParseNetworkPolicyHCL(`tailscale "vm" { ephemeral = false }`)
+            _, _ = policy.HCL()
+            _, _ = policy.SecretMetadata()
+            _ = silo.WithGuestUser("silo", 1000, 1000, "/home/silo")
+            _ = silo.WithExecInitialPTYSize(24, 80)
+            _ = silo.WithExecTerm("xterm")
+          }
+          func main() { _, _ = silo.InstalledRuntime(); _ = contracts }
           EOF
           nix develop "$GITHUB_WORKSPACE#ci" --command go mod tidy
           nix develop "$GITHUB_WORKSPACE#ci" --command go build ./...
+
+  netd:
+    name: netd (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.netd == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: auto
+      GOFLAGS: -mod=readonly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+          - platform: macos-arm64
+            runner: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Verify netd toolchain
+        run: nix develop .#ci --command go -C net/netd version
+
+      - name: Check netd formatting
+        run: |
+          files="$(nix develop .#ci --command gofmt -l net/netd)"
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Vet netd
+        run: nix develop .#ci --command go -C net/netd vet ./...
+
+      - name: Test netd with race detector
+        run: nix develop .#ci --command go -C net/netd test -race -count=1 -timeout=4m ./...
+
+  taild:
+    name: taild (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.taild == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64-gnu
+            runner: ubuntu-24.04
+            library: libsilo_go_ffi.so
+          - platform: darwin-arm64
+            runner: macos-26
+            library: libsilo_go_ffi.dylib
+    env:
+      CGO_ENABLED: '1'
+      GOTOOLCHAIN: auto
+      GOFLAGS: -mod=readonly
+      SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ matrix.library }}
+      SILO_TEST_RUNTIME_ROOT: ${{ github.workspace }}/target/silo-runtime/${{ matrix.platform }}/release
+      SILO_RUNTIME_DIR: ${{ github.workspace }}/target/silo-runtime/${{ matrix.platform }}/release
+      SILO_TEST_BIN_DIR: ${{ github.workspace }}/target/debug
+      SILO_TEST_CLI: ${{ github.workspace }}/target/debug/silo
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop .#ci --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          shared-key: workspace
+          cache-bin: false
+          save-if: false
+      - name: Build integrated development product and release runtime fixtures
+        timeout-minutes: 25
+        run: |
+          nix develop --command make build
+          nix develop --command make stage PROFILE=release
+      - name: Check taild formatting
+        run: |
+          files="$(nix develop .#ci --command gofmt -l app/taild)"
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+      - name: Vet taild
+        run: nix develop .#ci --command go -C app/taild vet ./...
+      - name: Test taild with actual bridge and race detector
+        # VM-fixture tests retain their explicit host/rootfs opt-in. The package
+        # lane separately requires real helper startup and native bridge loading.
+        run: nix develop .#ci --command go -C app/taild test -p 1 -race -count=1 -timeout=4m -v ./...
+
+  taild-package:
+    name: taild package (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.taild == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64-gnu
+            runner: ubuntu-24.04
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Build integrated native product and portable package
+        run: nix develop .#release --command make archive
+      - name: Build native management and exact-ID acceptance driver
+        run: nix develop .#release --command go -C app/taild build -o "$GITHUB_WORKSPACE/target/artifact-driver" ../../packaging/silo-taild/kvm.go
+      - name: Exercise packaged executable without development overrides
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
+        run: |
+          version="$(tr -d '\n' < VERSION)"
+          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "target/packages/$version/$PLATFORM/silo-$version-$PLATFORM.tar.zst" "target/packages/$version/$PLATFORM/silo-runtime-$version-$PLATFORM.tar.zst"
+      - name: Build and admit actual signed native app
+        if: ${{ matrix.platform == 'darwin-arm64' }}
+        env:
+          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
+        run: |
+          nix develop .#release --command make app
+          version="$(tr -d '\n' < VERSION)"
+          output="target/packages/$version/darwin-arm64"
+          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "$output/silo-$version-darwin-arm64.tar.zst" "$output/silo-runtime-$version-darwin-arm64.tar.zst" --app "$output/Silo.app" --audit-only
 
   summary:
     name: Summary
@@ -276,6 +482,9 @@ jobs:
       - checks
       - node-sdk
       - go-sdk
+      - netd
+      - taild
+      - taild-package
     runs-on: ubuntu-24.04
     steps:
       - name: Require successful checks

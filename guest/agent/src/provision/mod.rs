@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent_spec::{AgentSshConfig, ProvisionConfig};
+use agent_spec::ProvisionConfig;
 use eyre::{eyre, Context};
 use protocol::v1::{
     ProvisionFailurePolicy as ProtoProvisionFailurePolicy, ProvisionOverallStatus, ProvisionReport,
@@ -22,7 +22,7 @@ mod mounts;
 mod network;
 mod resize;
 mod rosetta;
-mod ssh;
+pub(crate) mod ssh;
 mod timezone;
 mod user;
 mod userdata;
@@ -41,7 +41,6 @@ pub(crate) fn prepare_early_provisioning(
 
 pub fn run_provisioning(
     config: &ProvisionConfig,
-    ssh_config: &AgentSshConfig,
     process_supervisor: &ProcessSupervisor,
     early: &EarlyProvisioning,
 ) -> eyre::Result<ProvisionReport> {
@@ -53,7 +52,7 @@ pub fn run_provisioning(
         let elapsed = started.elapsed();
         return Ok(ProvisionReport {
             status: Some(ProvisionOverallStatus::Skipped as i32),
-            started_at: Some(started_at.clone()),
+            started_at: Some(started_at),
             finished_at: Some(timestamp_after(&started_at, elapsed)),
             duration: Some(proto_duration(elapsed)),
             steps: Vec::new(),
@@ -64,7 +63,7 @@ pub fn run_provisioning(
     let context = ProvisionContext::new(process_supervisor.clone());
     tracing::info!("guest reconciliation starting");
 
-    let plan = provisioners(config, ssh_config, early)?;
+    let plan = provisioners(config, early)?;
     let mut run = ProvisionRun::default();
     run.run(&context, plan);
 
@@ -91,7 +90,6 @@ pub fn run_provisioning(
 
 fn provisioners<'a>(
     config: &'a ProvisionConfig,
-    ssh_config: &'a AgentSshConfig,
     early: &'a EarlyProvisioning,
 ) -> eyre::Result<ProvisionerPlan<'a>> {
     let mut provisioners: Vec<BoxedProvisioner<'a>> =
@@ -101,7 +99,6 @@ fn provisioners<'a>(
         Box::new(timezone::Timezone::init(&config.timezone)),
         Box::new(locale::Locale::init(&config.locale)),
         Box::new(user::Users::init(&config.users)),
-        Box::new(ssh::AuthorizedKeys::init(&ssh_config.authorized_users)),
         Box::new(ca::CertificateAuthority::init(
             &config.certificate_authority,
         )),
@@ -124,7 +121,6 @@ impl ProvisionerId {
     const TIMEZONE: Self = Self("timezone");
     const LOCALE: Self = Self("locale");
     const USERS: Self = Self("users");
-    const SSH_AUTHORIZED_KEYS: Self = Self("ssh_authorized_keys");
     const CERTIFICATE_AUTHORITY: Self = Self("certificate_authority");
     const RESIZE_ROOTFS: Self = Self("resize_rootfs");
     const MOUNTS: Self = Self("mounts");
@@ -518,7 +514,7 @@ impl ProvisionRun {
         let elapsed = started.elapsed();
         ProvisionReport {
             status: Some(status as i32),
-            started_at: Some(started_at.clone()),
+            started_at: Some(started_at),
             finished_at: Some(timestamp_after(&started_at, elapsed)),
             duration: Some(proto_duration(elapsed)),
             steps: self.steps,
@@ -1159,23 +1155,17 @@ mod tests {
     #[test]
     fn built_in_provisioner_plan_is_valid() {
         let config = agent_spec::ProvisionConfig::default();
-        let ssh_config = agent_spec::AgentSshConfig::default();
 
-        provisioners(
-            &config,
-            &ssh_config,
-            &crate::provision::EarlyProvisioning::default(),
-        )
-        .expect("built-in provisioner plan should be valid");
+        provisioners(&config, &crate::provision::EarlyProvisioning::default())
+            .expect("built-in provisioner plan should be valid");
     }
 
     #[test]
     fn network_provisioner_is_first_without_static_network_config() {
         let config = agent_spec::ProvisionConfig::default();
-        let ssh_config = agent_spec::AgentSshConfig::default();
 
         let early = crate::provision::EarlyProvisioning::default();
-        let plan = provisioners(&config, &ssh_config, &early).expect("build provisioner plan");
+        let plan = provisioners(&config, &early).expect("build provisioner plan");
         let network = plan.provisioners.first().expect("network provisioner");
 
         assert_eq!(network.id(), ProvisionerId::NETWORK);
@@ -1201,10 +1191,9 @@ mod tests {
             }),
             ..agent_spec::ProvisionConfig::default()
         };
-        let ssh_config = agent_spec::AgentSshConfig::default();
 
         let early = crate::provision::EarlyProvisioning::default();
-        let plan = provisioners(&config, &ssh_config, &early).expect("build provisioner plan");
+        let plan = provisioners(&config, &early).expect("build provisioner plan");
         let network = plan.provisioners.first().expect("network provisioner");
 
         assert_eq!(network.id(), ProvisionerId::NETWORK);
@@ -1214,10 +1203,9 @@ mod tests {
     #[test]
     fn root_filesystem_resize_failure_fails_boot() {
         let config = agent_spec::ProvisionConfig::default();
-        let ssh_config = agent_spec::AgentSshConfig::default();
 
         let early = crate::provision::EarlyProvisioning::default();
-        let plan = provisioners(&config, &ssh_config, &early).expect("build provisioner plan");
+        let plan = provisioners(&config, &early).expect("build provisioner plan");
         let resize = plan
             .provisioners
             .iter()

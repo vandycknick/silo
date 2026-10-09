@@ -15,16 +15,17 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::status::StatusPublisher;
 use eyre::{bail, Context as _};
 use libvm::{
     MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification, MachineMemoryReclaimReport,
     MachineReadinessOutcome, MachineStatus,
 };
 use nix::fcntl::{Flock, FlockArg};
-use silod_spec::status::{DaemonPhase, DaemonStatus, MemoryReclaimOutcome};
-use tokio::signal::unix::{signal, Signal, SignalKind};
+use silod_spec::status::{MemoryReclaimOutcome, SystemPhase, SystemStatus};
+use std::sync::Arc;
 use tokio::time::Instant;
-use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{DesiredSystem, SystemBackend};
 use crate::engine::{
@@ -33,7 +34,7 @@ use crate::engine::{
 };
 use crate::paths::SystemPaths;
 use crate::provision::ensure_system_machine;
-use crate::record::{write_record, DaemonRecord};
+use crate::record::DaemonRecord;
 use crate::runtime::{SystemMachine, SystemRuntime};
 
 /// Engine health probe cadence.
@@ -71,27 +72,12 @@ impl LifetimeLock {
     }
 }
 
-/// SIGINT and SIGTERM, registered once for the process lifetime. A signal that
-/// arrives while the supervisor is busy (mid-upgrade, say) is kept and observed at
-/// the next `recv`, rather than lost between short-lived listeners.
-struct Shutdown {
-    interrupt: Signal,
-    terminate: Signal,
-}
+/// The main process owns signals and retains cancellation through long operations.
+struct Shutdown(CancellationToken);
 
 impl Shutdown {
-    fn listen() -> eyre::Result<Self> {
-        Ok(Self {
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
-        })
-    }
-
     async fn recv(&mut self) {
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-        }
+        self.0.cancelled().await;
     }
 }
 
@@ -114,13 +100,9 @@ enum UpdateOutcome {
 }
 
 /// A fresh status for this process, before any configuration is known.
-pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<DaemonStatus> {
-    Ok(DaemonStatus {
-        schema: 1,
-        generation: Uuid::new_v4(),
-        pid: std::process::id(),
-        process_start: process_start_identity()?,
-        phase: DaemonPhase::PreparingStorage,
+pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<SystemStatus> {
+    Ok(SystemStatus {
+        phase: SystemPhase::PreparingStorage,
         machine_id: None,
         run_id: None,
         image_digest: None,
@@ -149,47 +131,52 @@ pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<DaemonStatus>
 /// Reports a failure that ends this silod process.
 pub(crate) fn publish_failure(
     paths: &SystemPaths,
-    status: &mut DaemonStatus,
+    publisher: &StatusPublisher,
+    status: &mut SystemStatus,
     error: &eyre::Report,
 ) -> eyre::Result<()> {
-    status.phase = DaemonPhase::Failed;
+    status.phase = SystemPhase::Failed;
     status.last_error = Some(error_summary(&error_causes(error)));
-    publish(paths, status)?;
+    publish(publisher, status)?;
     append_log(paths, &format!("system daemon failed: {error:#}"))
 }
 
 struct Supervisor {
     paths: SystemPaths,
+    publisher: Arc<StatusPublisher>,
     desired: DesiredSystem,
     runtime_config: libvm::RuntimeConfig,
     /// Connected on the first startup attempt that gets that far; kept thereafter.
     runtime: Option<SystemRuntime>,
-    status: DaemonStatus,
+    status: SystemStatus,
     /// Manifests that failed qualification, validation, or their first boot in this
     /// process. Not retried until silod restarts.
     rejected: BTreeSet<String>,
     next_update_check: Instant,
 }
 
-/// Runs until SIGINT/SIGTERM. The caller holds the lifetime lock.
+/// Runs until the daemon owner requests detachment. The caller holds the lifetime lock.
 pub(crate) async fn serve(
     paths: SystemPaths,
     desired: DesiredSystem,
-    mut status: DaemonStatus,
+    mut status: SystemStatus,
+    cancellation: CancellationToken,
+    publisher: Arc<StatusPublisher>,
 ) -> eyre::Result<()> {
-    let mut shutdown = Shutdown::listen()?;
+    let mut shutdown = Shutdown(cancellation);
     let host_reclaim = desired.config.backend == SystemBackend::Krun;
     status.configured_image = Some(desired.image.clone());
     status.memory_bytes = Some(desired.config.memory_bytes);
     status.docker_socket = desired.config.docker_socket.display().to_string();
     status.host_memory_reclaim_requested = host_reclaim;
     status.host_memory_reclaim_effective = initial_host_memory_reclaim_effective(host_reclaim);
-    publish(&paths, &mut status)?;
+    publish(&publisher, &mut status)?;
     append_log(&paths, "preparing installation storage")?;
     let mut supervisor = Supervisor {
         runtime_config: libvm::RuntimeConfig::local(paths.home())
             .with_virt_backend(desired.config.backend.runtime_override()),
         paths,
+        publisher,
         desired,
         runtime: None,
         status,
@@ -198,7 +185,12 @@ pub(crate) async fn serve(
     };
     let result = supervisor.run(&mut shutdown).await;
     if let Err(error) = &result {
-        publish_failure(&supervisor.paths, &mut supervisor.status, error)?;
+        publish_failure(
+            &supervisor.paths,
+            &supervisor.publisher,
+            &mut supervisor.status,
+            error,
+        )?;
     }
     result
 }
@@ -227,6 +219,7 @@ impl Supervisor {
                     &self.paths,
                     &self.desired,
                     &mut self.status,
+                    &self.publisher,
                 );
                 tokio::pin!(attempt);
                 tokio::select! {
@@ -250,10 +243,10 @@ impl Supervisor {
             failed_attempts = failed_attempts.saturating_add(1);
             let delay = startup_retry_delay(failed_attempts);
             let causes = error_causes(&error);
-            self.status.phase = DaemonPhase::Retrying;
+            self.status.phase = SystemPhase::Retrying;
             self.status.last_error = Some(error_summary(&causes));
             self.status.restart_count = failed_attempts;
-            publish(&self.paths, &mut self.status)?;
+            publish(&self.publisher, &mut self.status)?;
             append_log(
                 &self.paths,
                 &format!(
@@ -335,17 +328,17 @@ impl Supervisor {
             match probe_docker_socket(&self.desired.config.docker_socket) {
                 Ok(()) => {
                     consecutive_failures = 0;
-                    if self.status.phase != DaemonPhase::Ready {
-                        self.status.phase = DaemonPhase::Ready;
+                    if self.status.phase != SystemPhase::Ready {
+                        self.status.phase = SystemPhase::Ready;
                         self.status.last_error = None;
-                        publish(&self.paths, &mut self.status)?;
+                        publish(&self.publisher, &mut self.status)?;
                     }
                 }
                 Err(error) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    self.status.phase = DaemonPhase::Degraded;
+                    self.status.phase = SystemPhase::Degraded;
                     self.status.last_error = Some(error.to_string());
-                    publish(&self.paths, &mut self.status)?;
+                    publish(&self.publisher, &mut self.status)?;
                     if consecutive_failures >= 3 {
                         append_log(&self.paths, "Docker health failed three consecutive probes")?;
                     }
@@ -371,7 +364,7 @@ impl Supervisor {
             }
         }
         if changed {
-            publish(&self.paths, &mut self.status)?;
+            publish(&self.publisher, &mut self.status)?;
         }
         Ok(())
     }
@@ -399,7 +392,7 @@ impl Supervisor {
             }
         };
         self.status.update_error = None;
-        publish(&self.paths, &mut self.status)?;
+        publish(&self.publisher, &mut self.status)?;
         let Some(image) = image else {
             return Ok(UpdateOutcome::Unchanged);
         };
@@ -449,8 +442,8 @@ impl Supervisor {
         }
 
         // From here the engine is down until the new or the restored VM is Ready.
-        self.status.phase = DaemonPhase::Upgrading;
-        publish(&self.paths, &mut self.status)?;
+        self.status.phase = SystemPhase::Upgrading;
+        publish(&self.publisher, &mut self.status)?;
         append_log(
             &self.paths,
             &format!("upgrading the system VM to {}", image.selected_reference),
@@ -495,15 +488,15 @@ impl Supervisor {
             self.rejected.insert(digest);
         }
         self.status.update_error = Some(format!("{what}: {}", error_summary(&error_causes(error))));
-        publish(&self.paths, &mut self.status)?;
+        publish(&self.publisher, &mut self.status)?;
         append_log(&self.paths, &format!("{what}: {error:#}"))
     }
 
     fn detach(&mut self) -> eyre::Result<()> {
         // Restarting the management process is not a request to stop the VM.
         // `silo daemon stop` separately invokes silod --stop after service exit.
-        self.status.phase = DaemonPhase::Stopped;
-        publish(&self.paths, &mut self.status)?;
+        self.status.phase = SystemPhase::Stopped;
+        publish(&self.publisher, &mut self.status)?;
         append_log(&self.paths, "system daemon detached; VM remains running")
     }
 }
@@ -513,7 +506,8 @@ impl Supervisor {
 /// The caller holds the lifetime lock.
 pub(crate) async fn stop_installation(
     paths: &SystemPaths,
-    mut status: DaemonStatus,
+    mut status: SystemStatus,
+    publisher: &StatusPublisher,
 ) -> eyre::Result<()> {
     if let Some(record) = DaemonRecord::load(paths)? {
         let config = libvm::RuntimeConfig::local(paths.home())
@@ -530,8 +524,8 @@ pub(crate) async fn stop_installation(
             runtime.machine(&machine.id).await?.stop().await?;
         }
     }
-    status.phase = DaemonPhase::Stopped;
-    publish(paths, &mut status)?;
+    status.phase = SystemPhase::Stopped;
+    publish(publisher, &mut status)?;
     append_log(paths, "system VM stopped")
 }
 
@@ -548,7 +542,8 @@ async fn attempt(
     runtime_config: &libvm::RuntimeConfig,
     paths: &SystemPaths,
     desired: &DesiredSystem,
-    status: &mut DaemonStatus,
+    status: &mut SystemStatus,
+    publisher: &StatusPublisher,
 ) -> eyre::Result<Active> {
     if runtime.is_none() {
         *runtime = Some(SystemRuntime::connect(runtime_config.clone()).await?);
@@ -562,8 +557,8 @@ async fn attempt(
         append_log(paths, "recovering an interrupted system image upgrade")?;
         crate::upgrade::recover(runtime, paths).await?;
     }
-    status.phase = DaemonPhase::Creating;
-    publish(paths, status)?;
+    status.phase = SystemPhase::Creating;
+    publish(publisher, status)?;
     let (record, machine_data) = ensure_system_machine(runtime, paths, desired).await?;
     status.machine_id = Some(machine_data.id.clone());
     status.image_digest = machine_data
@@ -578,22 +573,22 @@ async fn attempt(
             .ok_or_else(|| eyre::eyre!("the running system VM reports no run ID"))?,
         MachineStatus::Stopping { .. } => bail!("recorded system VM is stopping; wait and retry"),
         _ => {
-            status.phase = DaemonPhase::StartingVm;
-            publish(paths, status)?;
+            status.phase = SystemPhase::StartingVm;
+            publish(publisher, status)?;
             let options = libvm::MachineStartOptions::new();
             machine.start_with_options(options).await?.run_id
         }
     };
     status.run_id = Some(run_id.to_string());
     status.actual_backend = machine.metrics().await?.actual_backend;
-    status.phase = DaemonPhase::WaitingGuest;
-    publish(paths, status)?;
+    status.phase = SystemPhase::WaitingGuest;
+    publish(publisher, status)?;
     let readiness = machine.wait_ready(READY_TIMEOUT).await?;
     if readiness.outcome != MachineReadinessOutcome::Ready {
         bail!("system guest readiness ended with {:?}", readiness.outcome);
     }
-    status.phase = DaemonPhase::ActivatingEngine;
-    publish(paths, status)?;
+    status.phase = SystemPhase::ActivatingEngine;
+    publish(publisher, status)?;
     activate(
         &machine,
         &desired.config,
@@ -604,9 +599,9 @@ async fn attempt(
     // Activation returns once the guest units are up; the host-side socket forward
     // becomes live shortly after the guest half exists, so poll rather than probe once.
     wait_docker_socket(&desired.config.docker_socket, ENGINE_REACHABLE_TIMEOUT).await?;
-    status.phase = DaemonPhase::Ready;
+    status.phase = SystemPhase::Ready;
     status.last_error = None;
-    publish(paths, status)?;
+    publish(publisher, status)?;
     append_log(paths, "system Docker engine ready")?;
     Ok(Active {
         machine,
@@ -632,16 +627,16 @@ fn parse_reclaim_outcome(value: &str) -> Option<MemoryReclaimOutcome> {
     })
 }
 
-fn publish(paths: &SystemPaths, status: &mut DaemonStatus) -> eyre::Result<()> {
+fn publish(publisher: &StatusPublisher, status: &mut SystemStatus) -> eyre::Result<()> {
     status.updated_at = now();
-    write_record(&paths.status(), status)
+    publisher.set_system(status.clone())
 }
 
 /// Copies the agent's latest guest memory reclaim report into the status. Returns
 /// whether it describes a run the status did not have yet. Guest memory reclaim
 /// itself runs inside the guest agent; the daemon only observes it.
 fn apply_guest_memory_reclaim(
-    status: &mut DaemonStatus,
+    status: &mut SystemStatus,
     report: &MachineMemoryReclaimReport,
 ) -> bool {
     let finished_at = chrono::DateTime::<chrono::Utc>::from(report.finished_at).to_rfc3339();
@@ -674,7 +669,7 @@ fn describe_guest_memory_reclaim(report: &MachineMemoryReclaimReport) -> String 
 /// whether anything changed. A missing report leaves the status untouched, so
 /// backends that never report keep the initial "unknown" state.
 fn apply_host_memory_reclaim(
-    status: &mut DaemonStatus,
+    status: &mut SystemStatus,
     report: Option<&MachineHostMemoryReclaim>,
 ) -> bool {
     let Some(report) = report else {
@@ -758,23 +753,16 @@ pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn process_start_identity() -> eyre::Result<String> {
-    #[cfg(target_os = "linux")]
-    {
-        silod_spec::process::start_time(std::process::id())?
-            .ok_or_else(|| eyre::eyre!("missing own process start time"))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(format!("pid-{}-{}", std::process::id(), now()))
-    }
+pub(crate) fn process_start_identity() -> eyre::Result<String> {
+    silod_spec::process::start_time(std::process::id())?
+        .ok_or_else(|| eyre::eyre!("missing own process start time"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use silod_spec::status::{DaemonStatus, MemoryReclaimOutcome};
+    use silod_spec::status::{MemoryReclaimOutcome, SystemStatus};
 
     use crate::supervisor::{
         apply_guest_memory_reclaim, describe_guest_memory_reclaim, error_causes, error_summary,
@@ -796,9 +784,25 @@ mod tests {
         let mut status = crate::supervisor::initial_status(&paths.docker_socket()).expect("status");
         status.machine_id = Some("existing-vm".into());
         status.run_id = Some("existing-run".into());
+        let host = libvm::HostPaths::new(paths.home().to_path_buf(), temp.path().join("config"));
+        let features = silo_config::FeatureSelection {
+            system: true,
+            tailscale: false,
+        };
+        let publisher = std::sync::Arc::new(
+            crate::status::StatusPublisher::new(
+                &host,
+                uuid::Uuid::new_v4(),
+                features,
+                "test".into(),
+                Some(status.clone()),
+            )
+            .expect("publisher"),
+        );
         let mut supervisor = crate::supervisor::Supervisor {
             runtime_config: libvm::RuntimeConfig::local(paths.home()),
             paths,
+            publisher,
             desired,
             runtime: None,
             status,
@@ -812,7 +816,7 @@ mod tests {
         assert_eq!(supervisor.status.run_id.as_deref(), Some("existing-run"));
         assert_eq!(
             supervisor.status.phase,
-            silod_spec::status::DaemonPhase::Stopped
+            silod_spec::status::SystemPhase::Stopped
         );
     }
 
@@ -856,10 +860,7 @@ mod tests {
 
     #[test]
     fn guest_reclaim_report_is_applied_once_per_run() {
-        let mut status: DaemonStatus = serde_json::from_value(serde_json::json!({
-            "schema": 1,
-            "generation": "12345678-1234-1234-1234-123456789abc",
-            "pid": 42,
+        let mut status: SystemStatus = serde_json::from_value(serde_json::json!({
             "phase": "ready",
             "machine_id": null,
             "run_id": null,

@@ -421,6 +421,7 @@ fn agent_status(identity: &Identity, state: AgentStatusState) -> AgentStatus {
                 ..GuestBootReport::default()
             }),
             provisioning: None,
+            ssh: None,
         }),
     }
 }

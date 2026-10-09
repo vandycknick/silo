@@ -1,14 +1,15 @@
 //! `status.json`: live silod state, republished atomically on every change.
 //!
-//! Unlike silod's installation record this is not strict: a newer or older silod
-//! may have written it, and a field a reader does not know must not stop `status`,
-//! `up`, or `down` from working. New fields must default.
+//! Unknown fields are tolerated so newer writers remain readable. Schema 2 has
+//! explicit core and optional-component readiness; legacy appliance-only status
+//! must be diagnosed as restart-required by the controller, never as core Ready.
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DaemonPhase {
+pub enum SystemPhase {
     PreparingStorage,
     Creating,
     StartingVm,
@@ -32,7 +33,59 @@ pub struct DaemonStatus {
     /// [`crate::process::start_time`] of `pid` on Linux; opaque elsewhere.
     #[serde(default)]
     pub process_start: String,
-    pub phase: DaemonPhase,
+    pub core: CorePhase,
+    pub home: PathBuf,
+    pub control_endpoint: PathBuf,
+    pub updated_at: String,
+    pub last_error: Option<String>,
+    pub system: Option<SystemStatus>,
+    pub tailscale: ComponentStatus,
+    pub configuration_identity: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorePhase {
+    Starting,
+    Ready,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentState {
+    Disabled,
+    Starting,
+    NeedsAuth,
+    Ready,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownProtection {
+    Active,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentStatus {
+    pub enabled: bool,
+    pub state: ComponentState,
+    pub diagnostic: Option<String>,
+    pub approval_url: Option<String>,
+    pub dns_name: Option<String>,
+    pub restart_count: u32,
+    pub shutdown_protection: ShutdownProtection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemStatus {
+    pub phase: SystemPhase,
     pub machine_id: Option<String>,
     pub run_id: Option<String>,
     pub image_digest: Option<String>,
@@ -103,20 +156,29 @@ pub enum MemoryReclaimOutcome {
 
 #[cfg(test)]
 mod tests {
-    use crate::status::{DaemonPhase, DaemonStatus};
+    use crate::status::{SystemPhase, SystemStatus};
 
     #[test]
-    fn minimal_status_from_an_older_writer_defaults_newer_fields() {
-        let status: DaemonStatus = serde_json::from_value(serde_json::json!({
+    fn legacy_appliance_status_cannot_be_read_as_core_ready() {
+        let legacy = serde_json::json!({
             "schema": 1, "generation": "d823458f-090b-48c3-87d4-33daf76c0000",
             "pid": 1, "phase": "ready", "machine_id": null, "run_id": null,
+            "image_digest": null, "docker_socket": "/tmp/test.sock",
+            "updated_at": "2026-01-01T00:00:00Z", "last_error": null, "restart_count": 0,
+        });
+        assert!(serde_json::from_value::<crate::status::DaemonStatus>(legacy).is_err());
+    }
+
+    #[test]
+    fn minimal_system_status_defaults_newer_fields() {
+        let status: SystemStatus = serde_json::from_value(serde_json::json!({
+            "phase": "ready", "machine_id": null, "run_id": null,
             "image_digest": null, "docker_socket": "/tmp/test.sock",
             "updated_at": "2026-01-01T00:00:00Z", "last_error": null, "restart_count": 0,
             "field_from_a_newer_silod": true,
         }))
         .expect("lenient status");
-        assert_eq!(status.phase, DaemonPhase::Ready);
-        assert_eq!(status.process_start, "");
+        assert_eq!(status.phase, SystemPhase::Ready);
         assert!(status.memory_reclaim_outcome.is_none());
         assert!(status.update_checked_at.is_none());
         assert!(!status.host_memory_reclaim_requested);
@@ -126,12 +188,12 @@ mod tests {
     #[test]
     fn phases_use_snake_case() {
         assert_eq!(
-            serde_json::to_value(DaemonPhase::PreparingStorage).expect("serialize"),
+            serde_json::to_value(SystemPhase::PreparingStorage).expect("serialize"),
             "preparing_storage"
         );
         assert_eq!(
-            serde_json::from_value::<DaemonPhase>("upgrading".into()).expect("parse"),
-            DaemonPhase::Upgrading
+            serde_json::from_value::<SystemPhase>("upgrading".into()).expect("parse"),
+            SystemPhase::Upgrading
         );
     }
 }

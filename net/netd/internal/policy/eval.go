@@ -15,16 +15,20 @@ func (p *Policy) EvaluateFlow(flow Flow) Decision {
 		return Decision{Action: ActionAllow, Layer: DecisionLayerFlow, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedFlow: flow}
 	}
 	for _, rule := range p.rulesByFamily[EndpointFamilyIP] {
+		if rule.Tunnel != nil && !flow.TailnetDestination {
+			continue
+		}
 		endpoint, l4Match := p.matchIPRule(rule, flow)
 		if endpoint == nil {
 			continue
 		}
 		return Decision{
+			Tunnel:                    rule.Tunnel,
 			Action:                    rule.Verdict,
 			Layer:                     DecisionLayerFlow,
 			Source:                    DecisionSourceRule,
 			DefaultAction:             p.DefaultAction,
-			ClassificationOpportunity: rule.Verdict == ActionAllow && p.CanClassify(flow),
+			ClassificationOpportunity: rule.Tunnel == nil && rule.Verdict == ActionAllow && p.CanClassify(flow),
 			RuleName:                  rule.Name,
 			Reason:                    rule.Reason,
 			EndpointKind:              "ip",

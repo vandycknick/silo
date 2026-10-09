@@ -58,6 +58,10 @@ pub struct MachineHandle {
     pub machine: Machine,
 }
 
+pub struct NodeStateLeaseHandle {
+    pub _lease: libvm::node_state::NodeStateLease,
+}
+
 #[repr(C)]
 pub struct MachineHandleList {
     pub ptr: *mut *mut MachineHandle,

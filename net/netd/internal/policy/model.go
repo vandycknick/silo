@@ -62,6 +62,8 @@ func (r Ref) zero() bool {
 }
 
 type Policy struct {
+	tailscale   *TailscaleDecl
+	forwards    []Forward
 	diagnostics []Diagnostic
 	metadata    map[string]any
 	registry    *Registry
@@ -154,6 +156,7 @@ type Credential struct {
 }
 
 type Rule struct {
+	Tunnel     *Ref
 	Name       string
 	Family     EndpointFamily
 	Endpoints  []Ref
@@ -174,11 +177,12 @@ type httpCondition struct {
 }
 
 type Flow struct {
-	Protocol   string
-	SourceIP   net.IP
-	SourcePort uint16
-	DestIP     net.IP
-	DestPort   uint16
+	TailnetDestination bool
+	Protocol           string
+	SourceIP           net.IP
+	SourcePort         uint16
+	DestIP             net.IP
+	DestPort           uint16
 }
 
 type HTTPRequest struct {
@@ -217,6 +221,7 @@ type PackageFacts struct {
 }
 
 type Decision struct {
+	Tunnel                    *Ref
 	Action                    Action
 	Layer                     DecisionLayer
 	Source                    DecisionSource

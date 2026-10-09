@@ -29,14 +29,18 @@ mod initramfs_overlay;
 mod lock_manager;
 mod machine;
 mod network;
+pub mod node_state;
 mod paths;
+pub mod planning;
 mod runtime;
+mod secrets;
+mod ssh_ca;
 mod store;
 mod supervisor;
 mod utils;
 
 pub use crate::error::LibVmError;
-pub use crate::host::{ensure_certificate_authority, CertificateAuthority};
+pub mod policy_secrets;
 pub use crate::image::{
     ImageBuilder, ImageCacheState, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress,
     ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,
@@ -44,9 +48,9 @@ pub use crate::image::{
     OciImageConfigMetadata, Platform, ResolvedOciImage,
 };
 pub use crate::machine::{
-    resolve_mount_location, EgressCredentials, EgressSecret, Entrypoint, ExecutionControl,
-    ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason, ExecutionLost,
-    ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
+    resolve_mount_location, AttachmentSignal, EgressCredentials, EgressSecret, Entrypoint,
+    ExecutionControl, ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason,
+    ExecutionLost, ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
     ExecutionResult, ExecutionSession, ExecutionStdin, FileWriteDisposition, GuestBuilder,
     GuestPublishUpdate, HostCommand, LaunchCredentials, Machine, MachineAgent,
     MachineAgentConnection, MachineAgentConnectionState, MachineAgentIdentity,
@@ -64,14 +68,16 @@ pub use crate::machine::{
     MachineLoadAverageMetrics, MachineLogChunk, MachineLogOptions, MachineLogOutput,
     MachineLogSource, MachineLogStream, MachineMemoryMetrics, MachineMemoryReclaimReport,
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
-    MachineNetworkInterfaceMetrics, MachineObservation, MachineProvisionFailurePolicy,
-    MachineProvisionOverallStatus, MachineProvisionReport, MachineProvisionStatus,
-    MachineProvisionStepReport, MachineProvisionStepStatus, MachineProvisioningReport,
-    MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
-    MachineRef, MachineRetention, MachineRootfs, MachineRunId, MachineStaleReason, MachineStart,
-    MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineUpdate,
-    MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions,
-    Memory, NetworkPolicyUpdate, OAuthRefreshHook, ProcessConfig, SshExitStatus, SshShellOptions,
+    MachineNetworkInterfaceMetrics, MachineNetworkObservation, MachineNetworkObservationIssue,
+    MachineNodeObservation, MachineNodeState, MachineNodeStatus, MachineObservation,
+    MachineProvisionFailurePolicy, MachineProvisionOverallStatus, MachineProvisionReport,
+    MachineProvisionStatus, MachineProvisionStepReport, MachineProvisionStepStatus,
+    MachineProvisioningReport, MachineReadiness, MachineReadinessOutcome, MachineReadinessReason,
+    MachineReadinessState, MachineRef, MachineRetention, MachineRootfs, MachineRunId,
+    MachineSshBackend, MachineSshListenerReport, MachineStaleReason, MachineStart,
+    MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineTailscale,
+    MachineUpdate, MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState,
+    MachineWaitOptions, Memory, NetworkPolicyUpdate, ProcessConfig, SshExitStatus, SshShellOptions,
     SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
@@ -80,8 +86,8 @@ pub use crate::network::{
 };
 pub use crate::paths::HostPaths;
 pub use crate::runtime::{
-    NetdRuntimeConfig, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
-    RuntimeNetworkingConfig, VirtBackendOverride,
+    NetdRuntimeConfig, ReadOnlyRuntime, ResolvedRuntimeComponents, Runtime, RuntimeBuilder,
+    RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride,
 };
 pub use crate::supervisor::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use forward_spec::{
@@ -89,8 +95,9 @@ pub use forward_spec::{
     ForwardShape, UnixMode,
 };
 pub use silo_policy::{
-    NetworkAuditBuilder, NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder,
-    NetworkForwardBuilder, NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder,
-    NetworkRuleBuilder, NetworkSecretAlternative, NetworkSecretKind, NetworkSecretRequirement,
-    NetworkSecretSlot, PolicyLoadError, TailscaleTunnelBuilder,
+    ForwardCertificateProvider, ForwardProtocol, ForwardTls, NetworkAuditBuilder,
+    NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder, NetworkForwardBuilder,
+    NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder, NetworkRuleBuilder,
+    NetworkSecretAlternative, NetworkSecretKind, NetworkSecretRequirement, NetworkSecretSlot,
+    PolicyLoadError, TailscaleTunnelBuilder,
 };

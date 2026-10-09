@@ -3,14 +3,16 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use silod_spec::paths::DaemonPaths;
-use silod_spec::status::{DaemonPhase, DaemonStatus};
+use silod_spec::status::{CorePhase, DaemonStatus, SystemPhase};
 
 fn command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_silod"));
     command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("SILO_HOME", home.join("ignored-home"))
+        .env("SILO_HOME", home.join("runtime-home"))
         .env("SILO_VIRT_BACKEND", "not-a-daemon-setting")
         .env("SILO_RUNTIME_DIR", home.join("missing-runtime"));
     command
@@ -39,76 +41,72 @@ impl Drop for Process {
 }
 
 #[test]
-fn help_and_check_do_not_read_cli_config_or_create_state() {
+fn malformed_shared_configuration_is_rejected_without_creating_state() {
     let root = tempfile::tempdir().expect("temporary home");
     unreadable_cli_config(root.path());
-    let help = command(root.path()).arg("--help").output().expect("help");
-    assert!(help.status.success());
-    let help = String::from_utf8_lossy(&help.stdout);
-    assert!(help.contains("silod [OPTIONS]"));
-    assert!(help.contains("--system-cpus"));
-    assert!(help.contains("--check"));
-    assert!(!help.contains("Commands:"));
-
-    let valid = command(root.path())
-        .args(["--check", "--system-cpus", "2"])
-        .output()
-        .expect("check");
-    assert!(valid.status.success(), "{valid:?}");
-    let invalid = command(root.path())
-        .args(["--check", "--system-cpus", "0"])
-        .output()
-        .expect("check");
-    assert!(!invalid.status.success());
-    let error = String::from_utf8_lossy(&invalid.stderr);
-    assert!(error.contains("cpus must be greater than zero"), "{error}");
+    let original = std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config");
+    let check = command(root.path()).arg("--check").output().expect("check");
+    assert_eq!(check.status.code(), Some(2));
+    assert_eq!(
+        std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config"),
+        original
+    );
+    assert!(!root.path().join("runtime-home").exists());
     assert!(!root.path().join(".silo").exists());
-    assert!(!root.path().join("ignored-home").exists());
-
-    for argument in ["--home", "--state", "service", "start", "stop", "upgrade"] {
-        assert!(!command(root.path())
-            .arg(argument)
-            .output()
-            .expect("reject management interface")
-            .status
-            .success());
-    }
 }
 
 #[test]
-fn invalid_configuration_is_published_as_a_failure() {
+fn invalid_system_configuration_exits_two_before_startup() {
     if nix::unistd::geteuid().is_root() {
         return;
     }
     let root = tempfile::tempdir().expect("temporary home");
     let output = command(root.path())
+        .arg("--system-enabled=true")
         .args(["--system-memory", "1MiB"])
         .output()
         .expect("serve");
-    assert!(!output.status.success());
-    let status = read_status(&DaemonPaths::for_user_home(root.path())).expect("status");
-    assert_eq!(status.phase, DaemonPhase::Failed);
-    assert!(status
-        .last_error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("at least 128MiB"));
-    assert!(!root.path().join(".silo/daemon/daemon.json").exists());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least 128MiB"));
+    assert!(!root.path().join("runtime-home").exists());
 }
 
 #[test]
-fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
+fn daemon_keeps_core_ready_through_system_retry_and_log_failure() {
     // The daemon intentionally refuses root. This test exercises the same entrypoint
     // under an ordinary user, as in the host CI lanes.
     if nix::unistd::geteuid().is_root() {
         return;
     }
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(std::env::temp_dir().join(format!(
+            "silo-control-fixture-{}.lock",
+            nix::unistd::geteuid()
+        )))
+        .expect("fixture lock");
+    let _fixture = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .expect("use an idle dedicated test UID");
+    let existing = Command::new("pgrep")
+        .args(["-x", "silod"])
+        .output()
+        .expect("check live silod");
+    assert_eq!(
+        existing.status.code(),
+        Some(1),
+        "live silod found; use an idle dedicated test UID"
+    );
     let root = tempfile::tempdir().expect("temporary home");
-    unreadable_cli_config(root.path());
     // A genuinely missing runtime prevents any VM launch or registry access, while
     // exercising real startup, status publication, retry, and signal handling.
     let mut child = Process(
         command(root.path())
+            .arg("--system-enabled=true")
             .args([
                 "--system-image",
                 "registry.invalid/unused:test",
@@ -128,11 +126,15 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
             .spawn()
             .expect("spawn daemon"),
     );
-    let paths = DaemonPaths::for_user_home(root.path());
+    let paths = DaemonPaths::new(root.path().join("runtime-home"));
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = read_status(&paths) {
-            if status.phase == DaemonPhase::Retrying {
+            if status
+                .system
+                .as_ref()
+                .is_some_and(|system| system.phase == SystemPhase::Retrying)
+            {
                 break status;
             }
         }
@@ -143,22 +145,24 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
         assert!(Instant::now() < deadline, "daemon did not reach retrying");
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(status
+    assert_eq!(status.core, CorePhase::Ready);
+    let system = status.system.as_ref().expect("enabled system");
+    assert!(system
         .last_error
         .as_deref()
         .unwrap_or_default()
         .contains("missing-runtime"));
     assert_eq!(status.pid, child.0.id());
     assert_eq!(
-        status.configured_image.as_deref(),
+        system.configured_image.as_deref(),
         Some("registry.invalid/unused:test")
     );
-    assert_eq!(status.memory_bytes, Some(1024 * 1024 * 1024));
+    assert_eq!(system.memory_bytes, Some(1024 * 1024 * 1024));
     assert_eq!(
-        status.docker_socket,
+        system.docker_socket,
         paths.docker_socket().display().to_string()
     );
-    assert!(!root.path().join("ignored-home").exists());
+    assert!(!root.path().join(".silo").exists());
 
     // A second daemon for the same installation refuses to start.
     let second = command(root.path()).output().expect("second daemon");
@@ -169,7 +173,54 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
     assert!(!stop.status.success());
     assert!(String::from_utf8_lossy(&stop.stderr).contains("another Silo system daemon"));
 
-    // SIGTERM during startup retries is a clean, reported stop.
+    // Losing the optional system's log must not tear down the core API.
+    std::fs::remove_file(paths.log()).expect("remove fixture log");
+    std::fs::create_dir(paths.log()).expect("block optional log writes");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            child.0.try_wait().expect("poll daemon").is_none(),
+            "optional logging failure killed core"
+        );
+        if read_status(&paths).is_some_and(|status| {
+            status.core == CorePhase::Ready
+                && status
+                    .system
+                    .is_some_and(|system| system.phase == SystemPhase::Failed)
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "system did not report failure");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let endpoint = status.control_endpoint;
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async move {
+            let channel = tonic::transport::Endpoint::from_static("http://localhost")
+                .connect_with_connector(tower::service_fn(move |_| {
+                    let endpoint = endpoint.clone();
+                    async move {
+                        tokio::net::UnixStream::connect(endpoint)
+                            .await
+                            .map(hyper_util::rt::TokioIo::new)
+                    }
+                }))
+                .await
+                .expect("core connection");
+            let response =
+                silod_spec::daemon::v1::daemon_service_client::DaemonServiceClient::new(channel)
+                    .get_status(())
+                    .await
+                    .expect("working core after system failure")
+                    .into_inner();
+            assert_eq!(
+                response.core,
+                silod_spec::daemon::v1::CorePhase::Ready as i32
+            );
+        });
+
+    // SIGTERM after optional failure is still a clean, reported stop.
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(child.0.id()).expect("pid")),
         nix::sys::signal::Signal::SIGTERM,
@@ -178,8 +229,8 @@ fn daemon_retries_startup_and_stops_cleanly_in_the_fixed_home() {
     let exit = child.0.wait().expect("wait");
     assert!(exit.success(), "{exit:?}");
     assert_eq!(
-        read_status(&paths).expect("status").phase,
-        DaemonPhase::Stopped
+        read_status(&paths).expect("status").core,
+        CorePhase::Stopped
     );
 }
 
@@ -191,7 +242,8 @@ fn stop_without_an_installation_reports_stopped() {
     let root = tempfile::tempdir().expect("temporary home");
     let output = command(root.path()).arg("--stop").output().expect("stop");
     assert!(output.status.success(), "{output:?}");
-    let status = read_status(&DaemonPaths::for_user_home(root.path())).expect("status");
-    assert_eq!(status.phase, DaemonPhase::Stopped);
-    assert!(!root.path().join(".silo/daemon/daemon.json").exists());
+    let status = read_status(&DaemonPaths::new(root.path().join("runtime-home"))).expect("status");
+    assert_eq!(status.core, CorePhase::Stopped);
+    assert_eq!(status.system.unwrap().phase, SystemPhase::Stopped);
+    assert!(!root.path().join("runtime-home/daemon/daemon.json").exists());
 }

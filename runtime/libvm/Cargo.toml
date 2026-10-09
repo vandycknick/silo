@@ -8,6 +8,7 @@ agent-spec = { path = "../../specs/agent-spec" }
 disk-image = { path = "../../common/disk-image" }
 forward-spec = { path = "../../specs/forward-spec" }
 silo_policy = { package = "policy", path = "../../common/policy" }
+silo_secrets = { package = "secrets", path = "../../common/secrets" }
 oci = { path = "../oci" }
 protocol = { path = "../../specs/protocol" }
 vm-spec = { path = "../../specs/vm-spec" }
@@ -15,6 +16,7 @@ utils = { path = "../../common/utils" }
 async-trait = "0.1.91"
 base64 = "0.23.0"
 bytes = "1.12.1"
+chrono.workspace = true
 cpio = "0.4.1"
 eyre = "0.6.12"
 getrandom = "0.4.3"
@@ -23,6 +25,7 @@ libc = "0.2.189"
 rcgen = "0.14.8"
 rustix = { version = "1.1.4", features = ["event", "process"] }
 russh = "0.62.4"
+tracing = "0.1.44"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
@@ -38,6 +41,9 @@ tonic = { version = "0.14.6", features = ["transport"] }
 tower = "0.5.3"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 prost-types = "0.14.4"
+zeroize.workspace = true
+url = "2.5.8"
+x509-parser = "0.18.0"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils" }

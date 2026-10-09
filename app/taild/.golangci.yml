@@ -1,0 +1,52 @@
+version: "2"
+
+# Run from app/taild: golangci-lint run ./...
+# gofmt and go vet stay separate CI steps; this adds the checks they lack.
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - unconvert
+    - errorlint
+    - nilerr
+    - bodyclose
+    - copyloopvar
+    - intrange
+    - usestdlibvars
+    - misspell
+    - gocritic
+  settings:
+    errcheck:
+      # Closing a reader or listener on the way out is never actionable here.
+      # Every write whose failure matters is checked explicitly in the code.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net.Listener).Close
+        - (net.Conn).Close
+        - (*net/http.Response).Body.Close
+    staticcheck:
+      checks:
+        - all
+        # Package and symbol comments explain intent in this repo; they do not
+        # restate names. Leave their form to review.
+        - -ST1000
+        - -ST1003
+        - -ST1020
+        - -ST1021
+        - -ST1022
+  exclusions:
+    rules:
+      # Tests may lean on unchecked Close and literal status codes.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - usestdlibvars
+
+formatters:
+  enable:
+    - gofmt

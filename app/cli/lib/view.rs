@@ -55,6 +55,7 @@ pub struct MachineView {
     pub agent_mode: String,
     pub image: String,
     pub network: MachineNetworkConfig,
+    pub tailscale: Option<libvm::MachineTailscale>,
     pub created_at: i64,
     pub modified_at: i64,
     pub started_at: Option<i64>,
@@ -131,6 +132,7 @@ impl MachineView {
         let hardware = data.spec.hardware.as_ref();
         Self {
             id: data.id.clone(),
+            tailscale: data.tailscale.clone(),
             name: data.name.clone(),
             state: if data.observation == libvm::MachineObservation::Observed {
                 state_label(&data.status)

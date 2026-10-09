@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 silod-spec = { path = "../../specs/silod-spec" }
+silo-config = { path = "../../common/config" }
+silo-vm-control = { path = "../../common/vm-control" }
+secrets = { path = "../../common/secrets" }
 libvm = { path = "../../runtime/libvm" }
 vm-spec = { path = "../../specs/vm-spec" }
 utils = { path = "../../common/utils" }
@@ -17,12 +20,24 @@ disk-image = { path = "../../common/disk-image" }
 clap = { version = "4.6.4", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-nix = { version = "0.31.3", features = ["fs", "user"] }
+nix = { version = "0.31.3", features = ["fs", "user", "signal"] }
 chrono = "0.4.45"
 eyre = "0.6.12"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "signal", "net", "process"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+tonic = { version = "0.14.6", features = ["transport"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+zeroize = { workspace = true }
+tracing = "0.1.44"
+futures = "0.3.33"
+libc = "0.2.189"
+prost-types = "0.14.4"
+prost = "0.14.4"
+parking_lot = "0.12.5"
+tower = "0.5.3"
 
 [dev-dependencies]
-nix = { version = "0.31.3", features = ["signal"] }
 tempfile = "3.27.0"
+hyper-util = "0.1.20"
+tonic-prost = "0.14.6"

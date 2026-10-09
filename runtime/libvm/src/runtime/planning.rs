@@ -8,7 +8,6 @@ use crate::image::{
     oci::{cached_resolved_oci_image, image_error, resolve_oci_image_from_registry},
     ImagePullPolicy, ResolvedOciImage,
 };
-use crate::machine::generate_machine_name;
 use crate::runtime::RuntimeConfig;
 use crate::store::ReadOnlyStore;
 use crate::LibVmError;
@@ -46,7 +45,7 @@ impl ReadOnlyRuntime {
 
     /// Generates a proposed name without reserving it.
     pub fn propose_machine_name(&self) -> Result<String, LibVmError> {
-        generate_machine_name()
+        crate::planning::propose_machine_name()
     }
 
     /// Resolves OCI metadata without writing cache or durable state.

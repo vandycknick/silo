@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -16,21 +17,23 @@ import (
 )
 
 type Config struct {
-	Daemonize    bool
-	StartupFD    int
-	ExitFD       int
-	ListenVfkit  string
-	LogDirFD     int
-	RuntimeDirFD int
-	PIDFile      string
-	LogFile      string
-	AuditLogFile string
-	CaptureFile  string
-	Stack        NetworkConfig
-	PolicyFile   string
-	TLS          TLSConfig
-	Metadata     Metadata
-	GuestPublish PublishBind
+	TailscaleStateDir string
+	VsockMux          string
+	Daemonize         bool
+	StartupFD         int
+	ExitFD            int
+	SecretsFD         int
+	ListenVfkit       string
+	LogDirFD          int
+	RuntimeDirFD      int
+	PIDFile           string
+	LogFile           string
+	AuditLogFile      string
+	CaptureFile       string
+	Stack             NetworkConfig
+	PolicyFile        string
+	Metadata          Metadata
+	GuestPublish      PublishBind
 }
 
 type PublishBind string
@@ -39,11 +42,6 @@ const (
 	PublishBindLoopback PublishBind = "loopback"
 	PublishBindAny      PublishBind = "any"
 )
-
-type TLSConfig struct {
-	CACert string
-	CAKey  string
-}
 
 type Metadata struct {
 	VMID      string
@@ -83,10 +81,13 @@ func Parse(args []string) (*Config, error) {
 	var subnet, staticLease, guestPublish string
 
 	flags := flag.NewFlagSet("netd", flag.ContinueOnError)
+	flags.StringVar(&cfg.TailscaleStateDir, "tailscale-state-dir", "", "existing persistent node state directory")
+	flags.StringVar(&cfg.VsockMux, "vsock-mux", "", "guest vsock mux path")
 	flags.SetOutput(io.Discard)
 	flags.BoolVar(&cfg.Daemonize, "daemonize", false, "launch a detached worker and exit")
 	flags.IntVar(&cfg.StartupFD, "startup-fd", -1, "inherited worker startup report writer")
 	flags.IntVar(&cfg.ExitFD, "exit-fd", -1, "inherited VM lifetime pipe reader")
+	flags.IntVar(&cfg.SecretsFD, "secrets-fd", -1, "inherited secret frame pipe reader")
 	flags.StringVar(&cfg.ListenVfkit, "listen-vfkit", "", "unixgram socket used by vfkit-compatible applications")
 	flags.StringVar(&subnet, "subnet", "192.168.127.0/24", "guest network subnet")
 	flags.StringVar(&staticLease, "static-lease", "", "guest DHCP lease in IP=MAC form")
@@ -97,8 +98,6 @@ func Parse(args []string) (*Config, error) {
 	flags.StringVar(&cfg.AuditLogFile, "audit-log-file", "", "write audit records to this file")
 	flags.StringVar(&cfg.CaptureFile, "pcap", "", "capture network traffic to a pcap file")
 	flags.StringVar(&cfg.PolicyFile, "policy-file", "", "canonical network policy JSON file")
-	flags.StringVar(&cfg.TLS.CACert, "tls-ca-cert", "", "CA certificate used for HTTPS interception")
-	flags.StringVar(&cfg.TLS.CAKey, "tls-ca-key", "", "CA private key used for HTTPS interception")
 	flags.StringVar(&cfg.Metadata.VMID, "vm-id", "", "VM identifier added to flow logs")
 	flags.StringVar(&cfg.Metadata.RunID, "run-id", "", "run identifier added to flow logs")
 	flags.StringVar(&cfg.Metadata.NetworkID, "network-id", "", "network identifier added to flow logs")
@@ -109,8 +108,18 @@ func Parse(args []string) (*Config, error) {
 	if flags.NArg() != 0 {
 		return cfg, errors.New("netd does not accept positional arguments")
 	}
-	if cfg.StartupFD < -1 || cfg.ExitFD < -1 {
-		return cfg, errors.New("optional inherited descriptors must be -1 or above stderr")
+	seen := map[int]bool{}
+	for _, fd := range []int{cfg.LogDirFD, cfg.RuntimeDirFD, cfg.StartupFD, cfg.ExitFD, cfg.SecretsFD} {
+		if fd == -1 {
+			continue
+		}
+		if fd < 3 || seen[fd] {
+			return cfg, errors.New("inherited descriptors must be -1 or distinct and above stderr")
+		}
+		seen[fd] = true
+	}
+	if cfg.PolicyFile != "" && cfg.SecretsFD == -1 {
+		return cfg, errors.New("--policy-file requires --secrets-fd")
 	}
 	if cfg.Daemonize && (cfg.StartupFD < 3 || cfg.ExitFD < 3) {
 		return cfg, errors.New("--daemonize requires --startup-fd and --exit-fd above stderr")
@@ -119,12 +128,10 @@ func Parse(args []string) (*Config, error) {
 		return cfg, errors.New("--startup-fd and --exit-fd must be supplied together")
 	}
 	if cfg.StartupFD >= 0 {
-		seen := map[int]bool{}
 		for _, fd := range []int{cfg.LogDirFD, cfg.RuntimeDirFD, cfg.StartupFD, cfg.ExitFD} {
-			if fd < 3 || seen[fd] {
+			if fd < 3 {
 				return cfg, errors.New("managed descriptors must be distinct and above stderr")
 			}
-			seen[fd] = true
 		}
 	}
 	if cfg.ListenVfkit == "" {
@@ -183,9 +190,6 @@ func Parse(args []string) (*Config, error) {
 		return cfg, err
 	}
 	cfg.Stack = stack
-	if (cfg.TLS.CACert == "") != (cfg.TLS.CAKey == "") {
-		return cfg, errors.New("--tls-ca-cert and --tls-ca-key must be provided together")
-	}
 	return cfg, nil
 }
 
@@ -210,12 +214,32 @@ func LoadPolicy(cfg *Config) (*policy.Policy, error) {
 	if err != nil {
 		return nil, err
 	}
-	if compiledPolicy.HasHTTPS() || compiledPolicy.HasRegistries() {
-		if cfg.TLS.CACert == "" || cfg.TLS.CAKey == "" {
-			return nil, errors.New("--tls-ca-cert and --tls-ca-key are required when policy contains TLS-terminating endpoints")
-		}
+	if err := ValidateTailscale(cfg, compiledPolicy); err != nil {
+		return nil, err
 	}
 	return compiledPolicy, nil
+}
+
+func ValidateTailscale(cfg *Config, p *policy.Policy) error {
+	if p.Tailscale() == nil {
+		if cfg.TailscaleStateDir != "" || cfg.VsockMux != "" {
+			return errors.New("tailscale flags require a tailscale declaration")
+		}
+		return nil
+	}
+	if cfg.TailscaleStateDir == "" || cfg.VsockMux == "" {
+		return errors.New("tailscale requires --tailscale-state-dir and --vsock-mux")
+	}
+	info, err := os.Stat(cfg.TailscaleStateDir)
+	if err != nil || !info.IsDir() {
+		return errors.New("--tailscale-state-dir must be an existing directory")
+	}
+	// The VMM creates the mux later; only its parent must already exist.
+	info, err = os.Stat(filepath.Dir(cfg.VsockMux))
+	if err != nil || !info.IsDir() {
+		return errors.New("--vsock-mux parent must be an existing directory")
+	}
+	return nil
 }
 
 func stackConfig(subnetText, staticLease string) (NetworkConfig, error) {

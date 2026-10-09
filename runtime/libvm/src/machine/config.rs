@@ -27,6 +27,8 @@ impl Machine {
         }
         let runtime = self.runtime();
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
+        runtime.validate_machine_data_dir(&config)?;
+        let _node_state = crate::node_state::acquire(&config)?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
             return Err(LibVmError::MachineAlreadyRunning {
@@ -40,6 +42,7 @@ impl Machine {
             })?;
 
         let previous_spec = config.spec.clone();
+        runtime.validate_tailscale_vsock(&config.network, &spec)?;
         config.spec = spec;
         config.modified_at = now_unix();
         write_machine_config(&config.machine_dir, &config.name, &config.spec)?;
@@ -65,6 +68,8 @@ impl Machine {
         let network = network.into();
         runtime.validate_machine_network_config(&network).await?;
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
+        runtime.validate_machine_data_dir(&config)?;
+        let _node_state = crate::node_state::acquire(&config)?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
             return Err(LibVmError::MachineAlreadyRunning {
@@ -72,6 +77,9 @@ impl Machine {
             });
         }
         config.network = network;
+        if runtime.validate_tailscale_vsock(&config.network, &config.spec)? {
+            runtime.ensure_tailscale_directory(config.id)?;
+        }
         config.modified_at = now_unix();
         runtime.save_machine_config(&config).await?;
         runtime.machine_inspect_data(config).await
@@ -80,10 +88,10 @@ impl Machine {
     /// Applies partial settings updates to a stopped machine.
     pub async fn update(&self, update: MachineUpdate) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
-        if let Some(reason) = update.network_error.as_ref() {
+        if let Err(reason) = update.validate_network() {
             return Err(LibVmError::InvalidMachineUpdate {
                 reference: self.id(),
-                reason: reason.clone(),
+                reason: reason.to_owned(),
             });
         }
         let replacement_network: Option<ModelMachineNetworkConfig> =
@@ -140,7 +148,14 @@ impl Machine {
         }
 
         let machine_id = self.machine_id();
+        let _name_lock = if update.name.is_some() {
+            Some(runtime.lock_machine_names().await?)
+        } else {
+            None
+        };
         let (_lock, mut config) = runtime.lock_machine_config(machine_id).await?;
+        runtime.validate_machine_data_dir(&config)?;
+        let _node_state = crate::node_state::acquire(&config)?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
             return Err(LibVmError::MachineAlreadyRunning {
@@ -150,6 +165,14 @@ impl Machine {
 
         if let Some(new_name) = update.name {
             if new_name != config.name {
+                crate::machine::reference::validate_new_machine_name(&new_name)?;
+                if runtime.validate_tailscale_vsock(&config.network, &config.spec)? {
+                    return Err(LibVmError::InvalidMachineUpdate {
+                        reference: config.name.clone(),
+                        reason: "cannot rename a machine with a current Tailscale declaration"
+                            .into(),
+                    });
+                }
                 if let Some(existing) = runtime.machine_config_by_name(&new_name).await? {
                     if existing.id != machine_id {
                         return Err(LibVmError::InvalidMachineUpdate {
@@ -160,6 +183,10 @@ impl Machine {
                 }
                 config.name = new_name;
             }
+        }
+
+        if let Some(labels) = update.labels {
+            config.labels = labels;
         }
 
         if let Some(size_bytes) = update.root_disk_size {
@@ -232,6 +259,9 @@ impl Machine {
             };
         }
 
+        if runtime.validate_tailscale_vsock(&config.network, &config.spec)? {
+            runtime.ensure_tailscale_directory(config.id)?;
+        }
         config.modified_at = now_unix();
         if spec_changed {
             config
@@ -298,5 +328,104 @@ fn apply_guest_publish_update(
         ModelMachineNetworkConfig::Named { name } => Err(format!(
             "guest publication updates require a private network attachment, but machine uses named network {name:?}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{ImageSource, MachineUpdate, Runtime, RuntimeNetworkingConfig};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[tokio::test]
+    async fn stopped_tailscale_update_and_exact_atomic_name_contract() {
+        let home = tempfile::tempdir().unwrap();
+        let disk = home.path().join("root.raw");
+        std::fs::write(&disk, b"root-disk").unwrap();
+        let runtime = Runtime::open(
+            crate::paths::LocalPaths::new(home.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .unwrap();
+        let policy =
+            crate::NetworkPolicy::from_hcl_str("tailscale \"vm\" { ephemeral = true }").unwrap();
+        let missing = runtime
+            .machine()
+            .name("missing-vsock")
+            .image_source(ImageSource::disk(&disk))
+            .network(|n| n.policy(policy.clone()))
+            .create()
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("vsock"));
+        let machine = runtime
+            .machine()
+            .name("exact")
+            .image_source(ImageSource::disk(&disk))
+            .vsock(true)
+            .network(|n| n.policy(policy.clone()))
+            .create()
+            .await
+            .unwrap();
+        let data = machine.inspect().await.unwrap();
+        let state = data.tailscale.unwrap();
+        assert_eq!(state.hostname, "exact");
+        assert!(state.ephemeral);
+        assert_eq!(
+            std::fs::metadata(&state.state_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(machine
+            .update(MachineUpdate::new().vsock(false))
+            .await
+            .is_err());
+        assert!(machine
+            .replace_config(vm_spec::VmSpec::current())
+            .await
+            .is_err());
+        assert!(machine
+            .update(MachineUpdate::new().name("renamed").clear_network_policy())
+            .await
+            .is_err());
+        assert!(runtime
+            .machine()
+            .name("exact")
+            .image_source(ImageSource::disk(&disk))
+            .create()
+            .await
+            .is_err());
+        machine
+            .update(MachineUpdate::new().clear_network_policy())
+            .await
+            .unwrap();
+        let labels = BTreeMap::from([("io.silo.taild.name".into(), "renamed".into())]);
+        let data = machine
+            .update(MachineUpdate::new().name("renamed").labels(labels.clone()))
+            .await
+            .unwrap();
+        assert_eq!(data.name, "renamed");
+        assert_eq!(data.labels, labels);
+        assert!(machine
+            .update(MachineUpdate::new().root_disk_size(1))
+            .await
+            .is_err());
+        std::fs::remove_dir(&state.state_dir).unwrap();
+        symlink(home.path(), &state.state_dir).unwrap();
+        assert!(machine
+            .update(MachineUpdate::new().set_network_policy(policy.clone()))
+            .await
+            .is_err());
+        std::fs::remove_file(&state.state_dir).unwrap();
+        machine
+            .update(MachineUpdate::new().set_network_policy(policy))
+            .await
+            .unwrap();
+        machine.remove().await.unwrap();
+        assert!(!state.state_dir.exists());
     }
 }

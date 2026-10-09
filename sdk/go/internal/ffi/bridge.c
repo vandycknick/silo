@@ -17,6 +17,8 @@ DECLARE_FFI(buffer_free);
 DECLARE_FFI(error_free);
 DECLARE_FFI(runtime_open);
 DECLARE_FFI(runtime_free);
+DECLARE_FFI(runtime_query);
+DECLARE_FFI(planning_query);
 DECLARE_FFI(runtime_machine_create);
 DECLARE_FFI(runtime_machine_get);
 DECLARE_FFI(runtime_machines);
@@ -27,13 +29,24 @@ DECLARE_FFI(machine_free);
 DECLARE_FFI(machine_id);
 DECLARE_FFI(machine_inspect);
 DECLARE_FFI(machine_start);
+DECLARE_FFI(machine_lease_node_state);
+DECLARE_FFI(node_state_lease_free);
 DECLARE_FFI(machine_stop);
+DECLARE_FFI(machine_update);
+DECLARE_FFI(machine_stop_with);
 DECLARE_FFI(machine_remove);
+DECLARE_FFI(machine_secret);
 DECLARE_FFI(machine_exec);
 DECLARE_FFI(machine_shell);
 DECLARE_FFI(machine_spawn);
 DECLARE_FFI(machine_attach);
 DECLARE_FFI(machine_attach_shell);
+DECLARE_FFI(attachment_cancellation_new);
+DECLARE_FFI(attachment_cancellation_cancel);
+DECLARE_FFI(attachment_cancellation_signal);
+DECLARE_FFI(attachment_cancellation_free);
+DECLARE_FFI(machine_attach_cancellable);
+DECLARE_FFI(machine_attach_shell_cancellable);
 DECLARE_FFI(execution_recv);
 DECLARE_FFI(execution_wait);
 DECLARE_FFI(execution_collect);
@@ -74,7 +87,7 @@ static char *load_symbol(void **target, const char *name) {
     } \
 } while (0)
 
-char *bridge_load(const char *path) {
+char *bridge_load(const char *path, uint32_t expected_abi) {
     if (library != NULL) return NULL;
     library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (library == NULL) {
@@ -83,10 +96,20 @@ char *bridge_load(const char *path) {
     }
     LOAD(ffi_abi_version, "silo_ffi_abi_version");
     LOAD(ffi_sdk_version, "silo_ffi_sdk_version");
+    uint32_t actual_abi = ffi_abi_version();
+    if (actual_abi != expected_abi) {
+        char message[160];
+        snprintf(message, sizeof(message), "native Silo bridge ABI mismatch: bridge ABI %u, SDK requires ABI %u; rebuild the native bridge", actual_abi, expected_abi);
+        dlclose(library);
+        library = NULL;
+        return strdup(message);
+    }
     LOAD(ffi_buffer_free, "silo_buffer_free");
     LOAD(ffi_error_free, "silo_error_free");
     LOAD(ffi_runtime_open, "silo_runtime_open");
     LOAD(ffi_runtime_free, "silo_runtime_free");
+    LOAD(ffi_runtime_query, "silo_runtime_query");
+    LOAD(ffi_planning_query, "silo_planning_query");
     LOAD(ffi_runtime_machine_create, "silo_runtime_machine_create");
     LOAD(ffi_runtime_machine_get, "silo_runtime_machine_get");
     LOAD(ffi_runtime_machines, "silo_runtime_machines");
@@ -97,13 +120,24 @@ char *bridge_load(const char *path) {
     LOAD(ffi_machine_id, "silo_machine_id");
     LOAD(ffi_machine_inspect, "silo_machine_inspect");
     LOAD(ffi_machine_start, "silo_machine_start");
+    LOAD(ffi_machine_lease_node_state, "silo_machine_lease_node_state");
+    LOAD(ffi_node_state_lease_free, "silo_node_state_lease_free");
     LOAD(ffi_machine_stop, "silo_machine_stop");
+    LOAD(ffi_machine_update, "silo_machine_update");
+    LOAD(ffi_machine_stop_with, "silo_machine_stop_with");
     LOAD(ffi_machine_remove, "silo_machine_remove");
+    LOAD(ffi_machine_secret, "silo_machine_secret");
     LOAD(ffi_machine_exec, "silo_machine_exec");
     LOAD(ffi_machine_shell, "silo_machine_shell");
     LOAD(ffi_machine_spawn, "silo_machine_spawn");
     LOAD(ffi_machine_attach, "silo_machine_attach");
     LOAD(ffi_machine_attach_shell, "silo_machine_attach_shell");
+    LOAD(ffi_attachment_cancellation_new, "silo_attachment_cancellation_new");
+    LOAD(ffi_attachment_cancellation_cancel, "silo_attachment_cancellation_cancel");
+    LOAD(ffi_attachment_cancellation_signal, "silo_attachment_cancellation_signal");
+    LOAD(ffi_attachment_cancellation_free, "silo_attachment_cancellation_free");
+    LOAD(ffi_machine_attach_cancellable, "silo_machine_attach_cancellable");
+    LOAD(ffi_machine_attach_shell_cancellable, "silo_machine_attach_shell_cancellable");
     LOAD(ffi_execution_recv, "silo_execution_recv");
     LOAD(ffi_execution_wait, "silo_execution_wait");
     LOAD(ffi_execution_collect, "silo_execution_collect");
@@ -125,6 +159,7 @@ char *bridge_load(const char *path) {
 }
 
 uint32_t bridge_abi_version(void) { return ffi_abi_version(); }
+silo_error *bridge_planning_query(const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_planning_query(request, request_len, out_data); }
 const char *bridge_sdk_version(void) { return ffi_sdk_version(); }
 void bridge_string_free(char *value) { free(value); }
 void bridge_buffer_free(silo_buffer value) { ffi_buffer_free(value); }
@@ -132,6 +167,7 @@ void bridge_error_free(silo_error *error) { ffi_error_free(error); }
 
 silo_error *bridge_runtime_open(const uint8_t *request, size_t request_len, silo_runtime **out_runtime) { return ffi_runtime_open(request, request_len, out_runtime); }
 void bridge_runtime_free(silo_runtime *runtime) { ffi_runtime_free(runtime); }
+silo_error *bridge_runtime_query(const silo_runtime *runtime, const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_runtime_query(runtime, request, request_len, out_data); }
 silo_error *bridge_runtime_machine_create(const silo_runtime *runtime, const uint8_t *request, size_t request_len, silo_machine **out_machine) { return ffi_runtime_machine_create(runtime, request, request_len, out_machine); }
 silo_error *bridge_runtime_machine_get(const silo_runtime *runtime, const uint8_t *reference, size_t reference_len, silo_machine **out_machine) { return ffi_runtime_machine_get(runtime, reference, reference_len, out_machine); }
 silo_error *bridge_runtime_machines(const silo_runtime *runtime, silo_machine_handle_list *out_machines) { return ffi_runtime_machines(runtime, out_machines); }
@@ -142,13 +178,24 @@ void bridge_machine_free(silo_machine *machine) { ffi_machine_free(machine); }
 silo_error *bridge_machine_id(const silo_machine *machine, silo_buffer *out_id) { return ffi_machine_id(machine, out_id); }
 silo_error *bridge_machine_inspect(const silo_machine *machine, silo_buffer *out_data) { return ffi_machine_inspect(machine, out_data); }
 silo_error *bridge_machine_start(const silo_machine *machine, silo_buffer *out_data) { return ffi_machine_start(machine, out_data); }
+silo_error *bridge_machine_lease_node_state(const silo_machine *machine, silo_node_state_lease **out_lease) { return ffi_machine_lease_node_state(machine, out_lease); }
+void bridge_node_state_lease_free(silo_node_state_lease *lease) { ffi_node_state_lease_free(lease); }
 silo_error *bridge_machine_stop(const silo_machine *machine, silo_buffer *out_data) { return ffi_machine_stop(machine, out_data); }
+silo_error *bridge_machine_update(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_machine_update(machine, request, request_len, out_data); }
+silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_machine_stop_with(machine, request, request_len, out_data); }
 silo_error *bridge_machine_remove(const silo_machine *machine) { return ffi_machine_remove(machine); }
+silo_error *bridge_machine_secret(const silo_machine *machine, const uint8_t *request, size_t request_len) { return ffi_machine_secret(machine, request, request_len); }
 silo_error *bridge_machine_exec(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output) { return ffi_machine_exec(machine, request, request_len, out_output); }
 silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output) { return ffi_machine_shell(machine, request, request_len, out_output); }
 silo_error *bridge_machine_spawn(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution **out_session) { return ffi_machine_spawn(machine, request, request_len, out_session); }
 silo_error *bridge_machine_attach(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result) { return ffi_machine_attach(machine, request, request_len, out_result); }
 silo_error *bridge_machine_attach_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_status) { return ffi_machine_attach_shell(machine, request, request_len, out_status); }
+silo_error *bridge_attachment_cancellation_new(AttachmentCancellation **out_token) { return ffi_attachment_cancellation_new(out_token); }
+silo_error *bridge_attachment_cancellation_cancel(const AttachmentCancellation *token) { return ffi_attachment_cancellation_cancel(token); }
+silo_error *bridge_attachment_cancellation_signal(const AttachmentCancellation *token, uint32_t signal) { return ffi_attachment_cancellation_signal(token, signal); }
+void bridge_attachment_cancellation_free(AttachmentCancellation *token) { ffi_attachment_cancellation_free(token); }
+silo_error *bridge_machine_attach_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_result) { return ffi_machine_attach_cancellable(machine, request, request_len, token, out_result); }
+silo_error *bridge_machine_attach_shell_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_status) { return ffi_machine_attach_shell_cancellable(machine, request, request_len, token, out_status); }
 silo_error *bridge_execution_recv(const silo_execution *session, silo_execution_event *out_event, _Bool *out_eof) { return ffi_execution_recv(session, out_event, out_eof); }
 silo_error *bridge_execution_wait(const silo_execution *session, silo_buffer *out_result) { return ffi_execution_wait(session, out_result); }
 silo_error *bridge_execution_collect(const silo_execution *session, silo_execution_output *out_output) { return ffi_execution_collect(session, out_output); }

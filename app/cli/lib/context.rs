@@ -3,7 +3,7 @@ use libvm::RuntimeConfig;
 
 use crate::api::machine::AppMachine;
 use crate::api::AppApi;
-use crate::config::GlobalConfig;
+use silo_config::GlobalConfig;
 
 #[derive(Debug)]
 pub struct Context {
@@ -37,11 +37,12 @@ impl Context {
 
     pub(crate) async fn app_api(&mut self) -> eyre::Result<&mut AppApi> {
         if self.api.is_none() {
-            let networking = self.config()?.networking.clone();
+            let networking = self.config()?.networking().clone();
             let runtime_config = RuntimeConfig::from_env()
                 .context("resolve libvm runtime config")?
                 .with_networking(networking);
-            self.api = Some(AppApi::local(runtime_config));
+            let host = libvm::HostPaths::from_env().context("resolve daemon identity paths")?;
+            self.api = Some(AppApi::select(runtime_config, &host).await?);
         }
         self.api
             .as_mut()

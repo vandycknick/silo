@@ -67,6 +67,7 @@ impl Machine {
         let (config, run_id) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
+            let _node_state = crate::node_state::acquire(&config)?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmm_pid_path();
             let exit_status_path = machine_paths.vmm_exit_status_path();
@@ -96,9 +97,13 @@ impl Machine {
             let run_id = run_uuid.to_string();
 
             runtime.request_machine_start(&config, &run_id).await?;
-            let root_disk_resize = match (|| {
-                options.validate_egress_credentials(&config.network, &config.name)?;
-                reconcile_root_disk_size(&config)
+            let (root_disk_resize, mut secrets) = match (|| {
+                let secrets = runtime.resolve_machine_secrets(
+                    &config,
+                    &run_id,
+                    &options.egress_credentials,
+                )?;
+                Ok((reconcile_root_disk_size(&config)?, secrets))
             })() {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -115,7 +120,7 @@ impl Machine {
             };
 
             let resolved_network = match runtime
-                .prepare_machine_network(&config, &run_id, &options.egress_credentials)
+                .prepare_machine_network(&config, &run_id, &secrets)
                 .await
             {
                 Ok(network) => network,
@@ -131,10 +136,18 @@ impl Machine {
                     .await);
                 }
             };
+            secrets.infrastructure.clear();
             let launch_inputs = match runtime.prepare_vmm_launch_inputs(
                 &config,
                 &resolved_network,
                 root_disk_resize == RootDiskResizeOutcome::GuestRequired,
+                secrets.ssh_trusted_ca.as_deref().ok_or_else(|| {
+                    LibVmError::MachinePreparationFailed {
+                        reference: config.name.clone(),
+                        message: "missing resolved SSH CA".into(),
+                    }
+                })?,
+                secrets.tls_certificate.as_deref(),
             ) {
                 Ok(inputs) => inputs,
                 Err(err) => {
@@ -517,7 +530,7 @@ impl Machine {
         options: MachineKillOptions,
     ) -> Result<MachineExit, LibVmError> {
         let runtime = self.runtime();
-        let wait_target = {
+        let exit = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             require_current_run(&config, &status, expected_run_id)?;
@@ -565,17 +578,49 @@ impl Machine {
             }
             runtime.request_machine_stop(config.id, &generation).await?;
 
-            WaitTarget {
-                config,
-                generation,
-                identity,
-                stop_requested: true,
-                forced: true,
+            // SIGKILL prevents the monitor from publishing its own exit record.
+            // Keep lifecycle ownership until death is confirmed and its run
+            // fence is durable, before another start can replace this generation.
+            wait_for_monitor_stop(
+                &identity,
+                &config.name,
+                options.wait_options().timeout_value(),
+            )
+            .await?;
+            let path = runtime.machine_paths(config.id).vmm_exit_status_path();
+            let machine_id = config.id.to_string();
+            let recorded = exit_status::read(&path)?;
+            let mut forced_at = None;
+            if !recorded.as_ref().is_some_and(|status| {
+                status.machine_id == machine_id
+                    && exit_status_matches_generation(status, &generation)
+            }) {
+                if let Some(run_id) = generation.run_id.as_deref() {
+                    forced_at = Some(exit_status::write_forced(
+                        &path,
+                        &machine_id,
+                        run_id,
+                        generation.pid,
+                    )?);
+                }
             }
+            if !runtime
+                .complete_stop_locked(&config, generation.clone(), None)
+                .await?
+            {
+                return Err(LibVmError::MachineNotRunning {
+                    reference: config.name,
+                });
+            }
+            let machine = runtime.machine_inspect_data(config).await?;
+            let mut exit = machine_exit(machine, generation, true, recorded);
+            if let Some(exited_at) = forced_at {
+                exit.exited_at = unix_time(exited_at);
+            }
+            exit
         };
 
-        self.wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
-            .await
+        Ok(exit)
     }
 
     /// Removes a stopped machine's durable records and files.
@@ -596,6 +641,7 @@ impl Machine {
         }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
+        let _node_state = crate::node_state::acquire_lock(&config)?;
         runtime.ensure_no_live_vmm_generation(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
 
@@ -626,9 +672,20 @@ impl Machine {
         }
 
         runtime.cleanup_machine_resources_locked(&config).await?;
+        let scope_error = crate::ssh_ca::delete_scope(runtime.secret_store(), config.id).err();
+        if let Some(error) = &scope_error {
+            tracing::error!(machine = %config.id, %error, "remove machine secret scope");
+        }
         runtime.local_paths().remove_machine_logs_tree(config.id)?;
         runtime.local_paths().remove_machine_data_tree(config.id)?;
-        runtime.remove_machine_records(&config).await
+        runtime.remove_machine_records(&config).await?;
+        if let Some(error) = scope_error {
+            return Err(LibVmError::MachinePreparationFailed {
+                reference: config.name,
+                message: format!("machine removed but secret scope cleanup failed: {error}"),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -698,13 +755,20 @@ async fn finish_failed_start(
         }
     }
     if terminal_transitioned && config.retention == crate::MachineRetention::Ephemeral {
-        let _: Result<(), LibVmError> = async {
+        if let Err(error) = crate::ssh_ca::delete_scope(runtime.secret_store(), config.id) {
+            tracing::error!(machine = %config.id, %error, "delete ephemeral machine secret scope");
+            cleanup_errors.push(format!("delete ephemeral machine secret scope: {error}"));
+        }
+        let cleanup: Result<(), LibVmError> = async {
             runtime.cleanup_machine_resources_locked(config).await?;
             runtime.local_paths().remove_machine_logs_tree(config.id)?;
             runtime.local_paths().remove_machine_data_tree(config.id)?;
             runtime.remove_machine_records(config).await
         }
         .await;
+        if let Err(error) = cleanup {
+            cleanup_errors.push(format!("remove ephemeral machine: {error}"));
+        }
     }
 
     if cleanup_errors.is_empty() {

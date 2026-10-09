@@ -3,9 +3,10 @@ use silo_policy::NetworkPolicy;
 use std::path::Path;
 
 use crate::paths::LocalPaths;
+use crate::secrets::ResolvedSecrets;
 use crate::store::models::MachineConfig;
 use crate::store::DataStore;
-use crate::{EgressCredentials, LibVmError, RuntimeNetworkingConfig};
+use crate::{LibVmError, RuntimeNetworkingConfig};
 
 use super::VmmNetworkAttachment;
 use crate::network::GuestPublish;
@@ -39,7 +40,7 @@ pub(super) struct NetworkDriverContext<'a> {
     pub(super) run_id: &'a str,
     pub(super) config: &'a RuntimeNetworkingConfig,
     pub(super) netd_path: &'a Path,
-    pub(super) egress_credentials: &'a EgressCredentials,
+    pub(super) egress_credentials: &'a ResolvedSecrets,
 }
 
 #[async_trait]
