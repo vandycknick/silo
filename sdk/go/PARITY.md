@@ -35,6 +35,10 @@ This inventory is completed alongside implementation. A checked item has a publi
 | `exec` | `Machine.Exec` | `silo_machine_exec` | execution tests | implemented |
 | `shell` | `Machine.Shell` | `silo_machine_shell` | execution tests | implemented |
 | `spawn` | `Machine.Spawn` | `silo_machine_spawn` | stream tests | implemented |
+| `statFile` | `Machine.StatFile` | `silo_machine_file_stat` | path validation and VM lifecycle metadata | implemented |
+| `createDirectory` | `Machine.CreateDirectory` | `silo_machine_create_directory` | option validation and VM lifecycle | implemented |
+| `uploadFile` | `Machine.UploadFile` | upload open/write/finish/cancel/free ABI | option validation and 300 KiB VM create/replace | implemented |
+| `downloadFile` | `Machine.DownloadFile`, `FileDownload` | download open/read/cancel/free ABI | closed-reader validation and 300 KiB VM round trip | implemented |
 | session `recv` | `ExecutionSession.Recv` | `silo_execution_recv` | stream tests | implemented |
 | session `stdin` | `ExecutionSession.Stdin` | `silo_execution_stdin` | stdin tests | implemented |
 | session `wait` | `ExecutionSession.Wait` | `silo_execution_wait` | stream tests | implemented |

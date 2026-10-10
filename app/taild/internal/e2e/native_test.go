@@ -46,6 +46,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, rootfs)
 	c := daemon.Config(t, registry)
 	c.VM.Defaults.Memory = 1 << 30
+	c.FileTransferLimit = 256 << 20
 	n := daemon.Open(t, c, "native-e2e", 16)
 	r, audit := n.Runtime, n.Audit
 	jobctx, cancel := context.WithCancel(context.Background())
@@ -70,7 +71,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	observerDone := make(chan int, 1)
 	var observerOut, observerErr lockedBuffer
 	go func() {
-		observerDone <- sshd.DispatchSession(observer, s, one, "create --name native-one --provision-user silo:1000:1000:/home/silo", service.IO{Stdout: &observerOut, Stderr: &observerErr})
+		observerDone <- sshd.DispatchSession(observer, s, one, "create --name native-one --image "+registry.Reference+" --provision-user silo:1000:1000:/home/silo", service.IO{Stdout: &observerOut, Stderr: &observerErr})
 	}()
 	select {
 	case <-entered:
@@ -95,7 +96,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	}
 	close(release)
 	daemon.Succeeded(t, s.Jobs, one.Peer, op, nil)
-	op, e = s.Create(ctx, two, service.CreateRequest{Name: "native-two", NoStart: true})
+	op, e = s.Create(ctx, two, service.CreateRequest{Name: "native-two", Image: registry.Reference, NoStart: true})
 	daemon.Succeeded(t, s.Jobs, two.Peer, op, e)
 	for _, caller := range []service.Caller{one, two} {
 		v, e := s.List(ctx, caller.Peer)
@@ -114,13 +115,16 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	ci := principal(c, "tag:ci")
 	ci.Peer.Permissions.Actions = []identity.Action{identity.Create, identity.Read, identity.Exec}
 	ci.Resolve = func(ctx context.Context) (identity.Peer, error) { return ci.Peer, ctx.Err() }
-	op, e = s.Create(ctx, ci, service.CreateRequest{Name: "native-ci"})
+	op, e = s.Create(ctx, ci, service.CreateRequest{Name: "native-ci", Image: registry.Reference})
 	daemon.Succeeded(t, s.Jobs, ci.Peer, op, e)
 	if code, e := s.Shell(ctx, ci, "native-ci", "", service.IO{Stdout: io.Discard, Stderr: io.Discard, Terminal: service.Terminal{Present: true, Window: service.Window{Rows: 24, Columns: 80}}}); code != 4 || service.Categorize(e).Exit != 4 {
 		t.Fatal("create/read/exec-only principal got shell", code, e)
 	}
 	if code, e := s.Exec(ctx, ci, "native-ci", service.ExecRequest{Program: "/bin/id", Args: []string{"-u"}}, service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 0 || e != nil {
 		t.Fatal("create/read/exec principal exec denied", code, e)
+	}
+	if code := sshd.DispatchSession(ctx, s, ci, "cp - native-ci:/root/denied.bin", service.IO{Stdin: strings.NewReader("denied"), Stdout: io.Discard, Stderr: io.Discard}); code != 4 {
+		t.Fatal("exec capability implied vm.files", code)
 	}
 	ci.Peer.Permissions.Actions = append(ci.Peer.Permissions.Actions, identity.Delete, identity.Stop)
 	op, e = s.Remove(ctx, ci, "native-ci", service.RemoveRequest{Force: true})
@@ -135,6 +139,23 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	}
 	if os.Getenv("SILO_NATIVE_ENV") != "" {
 		t.Fatal("guest environment escaped to host")
+	}
+	payload := make([]byte, 300<<10)
+	for i := range payload {
+		payload[i] = byte(i*37 + i/256)
+	}
+	for _, disposition := range []string{"created", "replaced"} {
+		var human bytes.Buffer
+		if code := sshd.DispatchSession(ctx, s, one, "cp - native-one:/root/in.bin", service.IO{Stdin: bytes.NewReader(payload), Stdout: io.Discard, Stderr: &human}); code != 0 || !strings.Contains(human.String(), disposition+", sha256 ") {
+			t.Fatal("upload", code, human.String())
+		}
+	}
+	var copied, copyHuman bytes.Buffer
+	if code := sshd.DispatchSession(ctx, s, one, "cp native-one:/root/in.bin -", service.IO{Stdout: &copied, Stderr: &copyHuman}); code != 0 || !bytes.Equal(copied.Bytes(), payload) {
+		t.Fatal("download round trip", code, copied.Len(), copyHuman.String())
+	}
+	if code := sshd.DispatchSession(ctx, s, one, "cp -n - native-one:/root/in.bin", service.IO{Stdin: bytes.NewReader(payload), Stdout: io.Discard, Stderr: io.Discard}); code != 5 {
+		t.Fatal("no-clobber", code)
 	}
 	var shell bytes.Buffer
 	code, e = s.Shell(ctx, one, "native-one", "", service.IO{Stdin: strings.NewReader("stty size\nprintf 'TERM=%s\\n' \"$TERM\"\nid -u\nexit 3\n"), Stdout: &shell, Stderr: io.Discard, Terminal: service.Terminal{Present: true, Window: service.Window{Rows: 37, Columns: 119}, Term: "s11-terminal"}})

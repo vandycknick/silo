@@ -36,7 +36,7 @@ func (h *createHandler) Flags(f *cmdline.FlagSet) {
 		h.q.Name = v
 		return nil
 	}).Default("generated"))
-	h.image = f.Value("image", "OCI", "OCI reference; cannot be combined with IMAGE.", cmdline.NonEmpty(&h.q.Image))
+	h.image = f.Value("image", "OCI", "OCI reference; cannot be combined with IMAGE.", cmdline.NonEmpty(&h.q.Image)).Default("template image")
 	f.Value("template", "NAME", "Apply a template; explicit options take precedence.", cmdline.NonEmpty(&h.q.Template)).Default("none")
 	f.Value("policy", "NAME", "Named network policy.", cmdline.NonEmpty(&h.q.PolicyRef)).Default("template/configured")
 	f.Value("cpus", "N", "Positive CPU count, 1..255, subject to grants.", cmdline.Count(&h.q.CPUs)).Default("configured")

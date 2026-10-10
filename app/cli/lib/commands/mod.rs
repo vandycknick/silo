@@ -3,6 +3,7 @@ use clap::Subcommand;
 use crate::context::Context;
 
 pub mod cleanup;
+pub mod cp;
 pub mod create;
 pub mod daemon;
 pub mod default;
@@ -39,6 +40,7 @@ pub enum Command {
     Rm(rm::Cmd),
     Shell(shell::Cmd),
     Exec(exec::Cmd),
+    Cp(cp::Cmd),
     Forward(forward::Cmd),
     #[command(visible_alias = "ls")]
     List(list::Cmd),
@@ -65,6 +67,7 @@ impl Command {
             Self::Rm(command) => command.run(context).await,
             Self::Shell(command) => command.run(context).await,
             Self::Exec(command) => command.run(context).await,
+            Self::Cp(command) => command.run(context).await,
             Self::Forward(command) => command.run(context).await,
             Self::List(command) => command.run(context).await,
             Self::Show(command) => command.run(context).await,

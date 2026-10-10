@@ -16,7 +16,7 @@ func Config() config.Config {
 	c.Home = "/fixture/home"
 	c.BridgePath = os.Getenv("SILO_GO_FFI_PATH")
 	c.TemplatesDir, c.PoliciesDir = "/fixture/templates", "/fixture/policies"
-	c.DiskReserve = 1 << 30
+	c.DiskReserve, c.FileTransferLimit = 1<<30, 256<<20
 	c.Shutdown.StopBudget = units.Duration{Duration: 4 * time.Second}
 	c.Shutdown.Margin = units.Duration{Duration: 250 * time.Millisecond}
 	c.Tailnet.Hostname, c.Tailnet.Tag = "silo", "tag:silo"

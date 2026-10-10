@@ -37,9 +37,14 @@ daemon:
     enabled: true
     hostname: silo
     tag: tag:silo
+    file-transfer-limit: 256MiB
     enrollment:
       mode: oauth-app
 ```
+
+`daemon.tailscale.file-transfer-limit` bounds each `cp` upload in bytes and
+defaults to 256 MiB. It accepts an integer byte count or a size such as `256MiB`.
+Downloads are not subject to this upload ceiling.
 
 `up` persists explicitly selected features and leaves other settings intact.
 Core Ready, Tailscale Starting and Tailscale NeedsAuth are distinct states. Pending
@@ -211,6 +216,78 @@ from older configurations; strict configuration loading rejects the removed key.
 Users must supply an OCI image or select a template containing one. Explicit
 images override template images, and both remain subject to the registry allowlist.
 Existing VMs and the separate `daemon.system.image` setting are unchanged.
+
+## Agents: separate management and node tags
+
+An AI agent manages VMs through the lobby with its own tailnet identity, while
+the VMs it creates join the tailnet under a different tag:
+
+- The agent's device carries `tag:ai-bot` and receives the taild capability
+  grant (`github.com/vandycknick/silo/cap/taild`) with the actions it needs, for
+  example `vm.create vm.read vm.start vm.stop vm.delete vm.exec vm.shell vm.logs vm.files`.
+- VMs it creates use `create --tailscale --tag tag:ai-bot-vm`.
+- Never give `tag:ai-bot-vm` the taild grant. A VM's outbound tailnet traffic
+  carries its own node identity (the per-VM netd tsnet node), so a process
+  inside a guest holding that grant could manage sibling VMs as the agent.
+
+Tailscale admin prerequisites:
+
+- The OAuth client behind `tailscale.lobby.client_secret` needs `auth_keys`
+  write scope for `tag:silo` and `tag:ai-bot`. Keys for a tagged caller are
+  minted for its verified owner tag, not for the requested VM tags.
+- ACL `tagOwners` contains `"tag:ai-bot-vm": ["tag:ai-bot"]`, so Tailscale
+  authorizes the advertised VM tag through the owner tag.
+- A grant lets viewers reach the VMs, for example
+  `{"src": ["autogroup:member", "tag:ai-bot"], "dst": ["tag:ai-bot-vm:443"]}`.
+  Add other ports only if the generic same-port guest relay is wanted.
+- MagicDNS and HTTPS certificates are enabled.
+
+Minted keys are not preauthorized. With device approval enabled, a human must
+approve every agent VM node in the admin console, and `show` reports
+`node_diagnostics: device approval required in the Tailscale admin console`.
+Unattended agent workflows need device approval disabled for these nodes.
+
+Silo ships no exposure policy or template. The operator saves, for example,
+`<config_dir>/policies/web-preview.hcl`:
+
+```hcl
+forward "tailscale" "web" {
+  listen      = ":443"
+  target      = "self"
+  target_port = 8080
+  protocol    = "https"
+  tls {
+    provider = "tailscale"
+  }
+}
+```
+
+and `<config_dir>/templates/web.yaml` referencing it:
+
+```yaml
+version: '1'
+image: ghcr.io/example/web-dev:latest
+network: {kind: private, policy_ref: web-preview}
+```
+
+The agent then runs:
+
+```sh
+ssh silo create --name nvd-preview --template web --policy web-preview --tailscale --tag tag:ai-bot-vm
+ssh silo show nvd-preview --json | jq -r '.data.forwards[0].url'
+```
+
+The guest service must listen on `0.0.0.0:8080` (or the guest interface
+address), not loopback: netd dials the guest interface. To change the exposure
+of an existing VM: `ssh silo stop VM`, `ssh silo set VM policy=NAME`,
+`ssh silo start VM`.
+
+Unverified: netd requires the node's actual tags to equal the requested tags
+exactly. Which tag set Tailscale assigns when a key minted for `tag:ai-bot`
+advertises `tag:ai-bot-vm` is not established by this repository's tests.
+Before relying on this setup, create one VM this way and confirm `show --json`
+reaches `node_state: enrolled` rather than `unreadable`, then record the
+observed result here.
 
 ## Restart and shutdown
 

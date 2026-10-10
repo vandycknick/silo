@@ -26,13 +26,14 @@ type Ceilings struct {
 	VMs       uint64 `yaml:"vms_per_principal"`
 }
 type Config struct {
-	TemplatesDir string `yaml:"templates_dir"`
-	PoliciesDir  string `yaml:"policies_dir"`
-	Home         string `yaml:"home"`
-	Components   silo.RuntimeComponents
-	BridgePath   string
-	DiskReserve  units.Size `yaml:"disk_reserve"`
-	Shutdown     struct {
+	TemplatesDir      string `yaml:"templates_dir"`
+	PoliciesDir       string `yaml:"policies_dir"`
+	Home              string `yaml:"home"`
+	Components        silo.RuntimeComponents
+	BridgePath        string
+	DiskReserve       units.Size `yaml:"disk_reserve"`
+	FileTransferLimit units.Size `yaml:"file_transfer_limit"`
+	Shutdown          struct {
 		StopBudget units.Duration `yaml:"stop_budget"`
 		Margin     units.Duration `yaml:"margin"`
 	} `yaml:"shutdown"`

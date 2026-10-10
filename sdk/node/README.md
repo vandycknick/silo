@@ -82,6 +82,27 @@ await diskMachine.remove();
 await policyMachine.remove();
 ```
 
+## Guest files
+
+Running machines expose `statFile`, `createDirectory`, `uploadFile`, and
+`downloadFile`. Guest paths must be absolute. Uploads accept a `Uint8Array` or
+an `AsyncIterable<Uint8Array>` and return `{ disposition, bytes }`; the guest
+atomically creates or replaces the regular file. Optional numeric `mode`
+(at most `0o7777`), `uid`, and `gid` configure uploads or directory creation.
+Omitted metadata preserves an existing file; new files default to `0644`.
+
+```ts
+await machine.createDirectory("/tmp/files", { parents: true });
+await machine.uploadFile("/tmp/files/example", new TextEncoder().encode("hello"));
+const download = await machine.downloadFile("/tmp/files/example");
+const bytes = await download.collect();
+```
+
+Downloads are async iterables of byte chunks. `collect()` buffers the complete
+file; use iteration for large files, or `cancel()` to stop a transfer. Breaking
+iteration cancels it automatically. `statFile()` preserves `sizeBytes` as a
+`bigint` and exposes `modifiedAt` as a `Date`.
+
 ## Tailnet policy forwards
 
 Network-policy forwards are separate from machine-scoped forwards. For a

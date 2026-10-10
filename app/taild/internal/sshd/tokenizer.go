@@ -6,7 +6,8 @@ import (
 )
 
 // Tokenize implements POSIX-style quoting without shell evaluation. Operators
-// and expansion syntax are rejected unquoted; quoted/escaped bytes are literal.
+// and expansion syntax are rejected unquoted before the guest delimiter `--`
+// and are literal after it; quoted/escaped bytes are always literal.
 func Tokenize(line string) ([]string, error) {
 	if len(line) > 16384 {
 		return nil, errors.New("command too long")
@@ -15,11 +16,15 @@ func Tokenize(line string) ([]string, error) {
 	var word strings.Builder
 	quote := byte(0)
 	active := false
+	literal := false
 	flush := func() {
 		if active {
 			tokens = append(tokens, word.String())
 			word.Reset()
 			active = false
+			if !literal && tokens[len(tokens)-1] == "--" {
+				literal = true
+			}
 		}
 	}
 	for i := 0; i < len(line); i++ {
@@ -68,7 +73,11 @@ func Tokenize(line string) ([]string, error) {
 		case ' ', '\t':
 			flush()
 		case '|', '&', ';', '<', '>', '(', ')', '$', '`':
-			return nil, errors.New("shell operators and expansion are not supported")
+			if !literal {
+				return nil, errors.New("shell operators and expansion are not supported before --; when calling through ssh, quote the whole command: ssh silo \"exec VM -- CMD 'ARG'\"")
+			}
+			word.WriteByte(c)
+			active = true
 		default:
 			word.WriteByte(c)
 			active = true

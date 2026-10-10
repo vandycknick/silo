@@ -15,6 +15,8 @@
  */
 typedef struct AttachmentCancellation AttachmentCancellation;
 
+typedef struct silo_download silo_download;
+
 typedef struct silo_execution silo_execution;
 
 typedef struct silo_log silo_log;
@@ -26,6 +28,8 @@ typedef struct silo_node_state_lease silo_node_state_lease;
 typedef struct silo_runtime silo_runtime;
 
 typedef struct silo_stdin silo_stdin;
+
+typedef struct silo_upload silo_upload;
 
 typedef struct {
   uint8_t *ptr;
@@ -156,6 +160,42 @@ silo_error *silo_stdin_write(const silo_stdin *stdin, const uint8_t *data_ptr, s
 silo_error *silo_stdin_close(const silo_stdin *stdin);
 
 void silo_stdin_free(silo_stdin *stdin);
+
+silo_error *silo_machine_file_stat(const silo_machine *machine,
+                                   const uint8_t *request_ptr,
+                                   size_t request_len,
+                                   silo_buffer *out_entry);
+
+silo_error *silo_machine_create_directory(const silo_machine *machine,
+                                          const uint8_t *request_ptr,
+                                          size_t request_len,
+                                          silo_buffer *out_result);
+
+silo_error *silo_machine_upload_open(const silo_machine *machine,
+                                     const uint8_t *request_ptr,
+                                     size_t request_len,
+                                     silo_upload **out_upload);
+
+silo_error *silo_upload_write(const silo_upload *upload, const uint8_t *data_ptr, size_t data_len);
+
+silo_error *silo_upload_finish(const silo_upload *upload, silo_buffer *out_result);
+
+silo_error *silo_upload_cancel(const silo_upload *upload);
+
+void silo_upload_free(silo_upload *upload);
+
+silo_error *silo_machine_download_open(const silo_machine *machine,
+                                       const uint8_t *request_ptr,
+                                       size_t request_len,
+                                       silo_download **out_download);
+
+silo_error *silo_download_read(const silo_download *download,
+                               silo_buffer *out_chunk,
+                               bool *out_eof);
+
+silo_error *silo_download_cancel(const silo_download *download);
+
+void silo_download_free(silo_download *download);
 
 silo_error *silo_images_call(const silo_runtime *runtime,
                              const uint8_t *request_ptr,

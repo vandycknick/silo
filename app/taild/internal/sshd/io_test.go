@@ -43,6 +43,30 @@ func TestInputCancellationPreservesNextCommand(t *testing.T) {
 	}
 }
 
+func TestInputReadContextUsesTransferLifetime(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	input := newInput(t.Context(), reader)
+	source := contextualInput{ctx: t.Context(), input: input}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		var b [1]byte
+		_, err := source.ReadContext(ctx, b[:])
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transfer input did not detach")
+	}
+}
+
 func TestSharedInputCRLFAndGuestData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

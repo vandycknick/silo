@@ -24,7 +24,7 @@ the group and review with policy tests):
     "app": {
       "github.com/vandycknick/silo/cap/taild": [{
         "scope": "own",
-        "actions": ["vm.create", "vm.read", "vm.start", "vm.stop", "vm.delete", "vm.shell", "vm.exec", "vm.logs", "vm.update"],
+        "actions": ["vm.create", "vm.read", "vm.start", "vm.stop", "vm.delete", "vm.shell", "vm.exec", "vm.logs", "vm.files", "vm.update"],
         "limits": {"vms": 3, "cpus": 4, "memory": "8GiB", "disk": "40GiB"}
       }]
     }
@@ -35,6 +35,8 @@ the group and review with policy tests):
 `vm.restart` and `vm.reauth` require both `vm.stop` and `vm.start`; they are not
 standalone grant actions. `template.manage` is a separate optional action. Effective
 limits remain bounded by the operator's configured ceilings.
+`vm.files` permits reading and writing guest files via `cp` and is implied by
+`*`. It is independent of `vm.exec`.
 
 User-owned enrollment must verify the consenting user's identity and exact assigned
 DNS hostname. Tagged provisioning must be explicitly approved for that principal.

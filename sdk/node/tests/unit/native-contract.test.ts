@@ -37,7 +37,7 @@ describe("native addon contract", () => {
     ]) {
       expect(typeof native.NativeExecutionSession.prototype[method]).toBe("function");
     }
-    for (const method of ["spawn", "attach", "attachShell"]) {
+    for (const method of ["spawn", "attach", "attachShell", "statFile", "createDirectory", "uploadFile", "downloadFile"]) {
       expect(typeof native.NativeMachine.prototype[method]).toBe("function");
     }
   });

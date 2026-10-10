@@ -43,6 +43,7 @@ const (
 	ErrorMachineLogSourceUnavailable ErrorKind = "MachineLogSourceUnavailable"
 	ErrorMonitorConnection           ErrorKind = "MonitorConnection"
 	ErrorMonitorProtocol             ErrorKind = "MonitorProtocol"
+	ErrorGuestPathNotFound           ErrorKind = "GuestPathNotFound"
 	ErrorGuestSession                ErrorKind = "GuestSession"
 	ErrorMachinePreparationFailed    ErrorKind = "MachinePreparationFailed"
 	ErrorMachineStartCleanupFailed   ErrorKind = "MachineStartCleanupFailed"

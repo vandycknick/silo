@@ -98,6 +98,7 @@ fn settings(c: &silo_config::tailscale::TailscaleConfig) -> eyre::Result<w::Tail
         sessions_global: c.sessions().global(),
         sessions_per_peer: c.sessions().per_peer(),
         disk_reserve_bytes: c.disk_reserve(),
+        file_transfer_limit_bytes: c.file_transfer_limit(),
         stop_budget: Some(c.shutdown().stop_budget().try_into()?),
         shutdown_margin: Some(c.shutdown().margin().try_into()?),
     })

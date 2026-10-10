@@ -64,6 +64,17 @@ DECLARE_FFI(log_recv);
 DECLARE_FFI(log_close);
 DECLARE_FFI(log_free);
 DECLARE_FFI(network_policy_build);
+DECLARE_FFI(machine_file_stat);
+DECLARE_FFI(machine_create_directory);
+DECLARE_FFI(machine_upload_open);
+DECLARE_FFI(upload_write);
+DECLARE_FFI(upload_finish);
+DECLARE_FFI(upload_cancel);
+DECLARE_FFI(upload_free);
+DECLARE_FFI(machine_download_open);
+DECLARE_FFI(download_read);
+DECLARE_FFI(download_cancel);
+DECLARE_FFI(download_free);
 #undef DECLARE_FFI
 
 static char *load_symbol(void **target, const char *name) {
@@ -155,6 +166,17 @@ char *bridge_load(const char *path, uint32_t expected_abi) {
     LOAD(ffi_log_close, "silo_log_close");
     LOAD(ffi_log_free, "silo_log_free");
     LOAD(ffi_network_policy_build, "silo_network_policy_build");
+    LOAD(ffi_machine_file_stat, "silo_machine_file_stat");
+    LOAD(ffi_machine_create_directory, "silo_machine_create_directory");
+    LOAD(ffi_machine_upload_open, "silo_machine_upload_open");
+    LOAD(ffi_upload_write, "silo_upload_write");
+    LOAD(ffi_upload_finish, "silo_upload_finish");
+    LOAD(ffi_upload_cancel, "silo_upload_cancel");
+    LOAD(ffi_upload_free, "silo_upload_free");
+    LOAD(ffi_machine_download_open, "silo_machine_download_open");
+    LOAD(ffi_download_read, "silo_download_read");
+    LOAD(ffi_download_cancel, "silo_download_cancel");
+    LOAD(ffi_download_free, "silo_download_free");
     return NULL;
 }
 
@@ -213,3 +235,14 @@ silo_error *bridge_log_recv(const silo_log *log, silo_log_chunk *out_chunk, _Boo
 silo_error *bridge_log_close(const silo_log *log) { return ffi_log_close(log); }
 void bridge_log_free(silo_log *log) { ffi_log_free(log); }
 silo_error *bridge_network_policy_build(const uint8_t *request, size_t request_len, silo_buffer *out_policy) { return ffi_network_policy_build(request, request_len, out_policy); }
+silo_error *bridge_machine_file_stat(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_entry) { return ffi_machine_file_stat(machine, request, request_len, out_entry); }
+silo_error *bridge_machine_create_directory(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result) { return ffi_machine_create_directory(machine, request, request_len, out_result); }
+silo_error *bridge_machine_upload_open(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_upload **out_upload) { return ffi_machine_upload_open(machine, request, request_len, out_upload); }
+silo_error *bridge_upload_write(const silo_upload *upload, const uint8_t *data, size_t data_len) { return ffi_upload_write(upload, data, data_len); }
+silo_error *bridge_upload_finish(const silo_upload *upload, silo_buffer *out_result) { return ffi_upload_finish(upload, out_result); }
+silo_error *bridge_upload_cancel(const silo_upload *upload) { return ffi_upload_cancel(upload); }
+void bridge_upload_free(silo_upload *upload) { ffi_upload_free(upload); }
+silo_error *bridge_machine_download_open(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_download **out_download) { return ffi_machine_download_open(machine, request, request_len, out_download); }
+silo_error *bridge_download_read(const silo_download *download, silo_buffer *out_chunk, _Bool *out_eof) { return ffi_download_read(download, out_chunk, out_eof); }
+silo_error *bridge_download_cancel(const silo_download *download) { return ffi_download_cancel(download); }
+void bridge_download_free(silo_download *download) { ffi_download_free(download); }

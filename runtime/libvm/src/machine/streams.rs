@@ -888,6 +888,9 @@ fn monitor_error(reference: String, error: impl Into<VmmClientError>) -> LibVmEr
     match error.into() {
         VmmClientError::Connection(message) => LibVmError::MonitorConnection { reference, message },
         VmmClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
+        VmmClientError::PathNotFound(message) => {
+            LibVmError::GuestPathNotFound { reference, message }
+        }
         VmmClientError::Forward(error) => LibVmError::MonitorProtocol {
             reference,
             message: error.to_string(),

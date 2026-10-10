@@ -60,4 +60,15 @@ silo_error *bridge_log_close(const silo_log *log);
 void bridge_log_free(silo_log *log);
 silo_error *bridge_network_policy_build(const uint8_t *request, size_t request_len, silo_buffer *out_policy);
 
+silo_error *bridge_machine_file_stat(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_entry);
+silo_error *bridge_machine_create_directory(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result);
+silo_error *bridge_machine_upload_open(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_upload **out_upload);
+silo_error *bridge_upload_write(const silo_upload *upload, const uint8_t *data, size_t data_len);
+silo_error *bridge_upload_finish(const silo_upload *upload, silo_buffer *out_result);
+silo_error *bridge_upload_cancel(const silo_upload *upload);
+void bridge_upload_free(silo_upload *upload);
+silo_error *bridge_machine_download_open(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_download **out_download);
+silo_error *bridge_download_read(const silo_download *download, silo_buffer *out_chunk, _Bool *out_eof);
+silo_error *bridge_download_cancel(const silo_download *download);
+void bridge_download_free(silo_download *download);
 #endif

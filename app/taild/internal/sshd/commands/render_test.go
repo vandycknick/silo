@@ -78,3 +78,23 @@ func TestHumanRenderingKeepsJSONSizesAndAddresses(t *testing.T) {
 		t.Fatal("unaligned Unicode columns", got)
 	}
 }
+
+func TestDocumentsPolicyBindingsRendering(t *testing.T) {
+	docs := []service.Document{{
+		Kind: "policy", Name: "preview", Tier: "yours",
+		BoundVMs: []service.BoundVM{
+			{Name: "web", State: silo.MachineStatusRunning},
+			{Name: "web2", State: silo.MachineStatusStopped},
+		},
+	}}
+	if got := renderDocuments("edit", docs); got != "policy preview yours\nweb (running): restart to apply\nweb2 (stopped): run 'set web2 policy=preview' to apply\n" {
+		t.Fatal(got)
+	}
+	if got := renderDocuments("rm", docs); got != "policy preview yours\nweb still references policy preview\nweb2 still references policy preview\n" {
+		t.Fatal(got)
+	}
+	docs[0].BoundVMs = nil
+	if got := renderDocuments("edit", docs); got != "policy preview yours\n" {
+		t.Fatal("empty bindings rendered", got)
+	}
+}

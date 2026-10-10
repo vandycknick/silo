@@ -16,6 +16,7 @@ import {
   sshShellOptionsToNative,
 } from "../../src/convert.js";
 import type { NativeImageHandle, NativeMachineBuilder, NativeMachineData } from "../../src/internal/napi.js";
+import { guestPath, uploadOptionsToNative, directoryOptionsToNative, fileEntryFromNative } from "../../src/files.js";
 
 const policyJson = `{ "version": 1, "metadata": { "source": "test" } }`;
 
@@ -438,6 +439,36 @@ describe("exec option and event validation", () => {
       detachKeys: undefined,
       forwardAgent: true,
     });
+  });
+});
+
+describe("guest file validation", () => {
+  it("rejects empty and relative paths before native calls", () => {
+    for (const path of ["", "tmp/file", "./file"]) {
+      expect(() => guestPath(path)).toThrow("guest paths must be absolute");
+    }
+    expect(guestPath("/tmp/file")).toBe("/tmp/file");
+  });
+
+  it("rejects modes above Unix permission bits before native calls", () => {
+    expect(() => uploadOptionsToNative({ mode: 0o10000 })).toThrow(
+      "mode must be a Unix permission value no greater than 0o7777",
+    );
+    expect(uploadOptionsToNative({ mode: 0o7777 })).toEqual({ mode: 0o7777 });
+    expect(() => directoryOptionsToNative({ mode: 0o10000 })).toThrow(RangeError);
+  });
+
+  it("allows uid without gid, matching the Go facade", () => {
+    expect(directoryOptionsToNative({ uid: 42, parents: true })).toEqual({ uid: 42, parents: true });
+  });
+
+  it("preserves bigint sizes and maps modification timestamps", () => {
+    const entry = fileEntryFromNative({
+      path: "/tmp/file", name: "file", kind: "file", sizeBytes: 9007199254740993n,
+      mode: 0o644, uid: 0, gid: 0, modifiedAtUnixMillis: 1000n,
+    });
+    expect(entry.sizeBytes).toBe(9007199254740993n);
+    expect(entry.modifiedAt).toEqual(new Date(1000));
   });
 });
 

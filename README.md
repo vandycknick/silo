@@ -85,6 +85,20 @@ VM without starting an application workload. Image process settings are retained
 with the machine and provide the default command for `silo exec dev` when no
 command follows `--`.
 
+Copy regular files to and from a running VM:
+
+```bash
+silo cp ./patch.diff dev:/root/patch.diff
+silo cp dev:/root/shot.png ./shot.png
+```
+
+Use `-` for stdin/stdout. Uploads accept `--mode OCTAL`, numeric
+`--owner UID[:GID]`, `--parents` (`-p`), and best-effort (not atomic)
+`--no-clobber` (`-n`). Guest paths must be absolute; prefix local paths
+containing `:` with `./` or `/`. Downloads replace the local target atomically.
+Use `--format json` for a transfer summary, except when downloading to stdout
+(`-`), where stdout carries only file bytes. Human summaries go to stderr.
+
 ## Templates
 
 Templates are reusable machine defaults stored below the Silo configuration

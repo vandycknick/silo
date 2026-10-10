@@ -9,7 +9,7 @@ import (
 )
 
 func TestRegistryIsTheWholeApplication(t *testing.T) {
-	want := []string{"whoami", "version", "help", "ls", "show", "ops", "create", "start", "restart", "stop", "rm", "set", "shell", "exec", "logs", "template", "policy"}
+	want := []string{"whoami", "version", "help", "ls", "show", "ops", "create", "start", "restart", "stop", "rm", "set", "shell", "exec", "cp", "logs", "template", "policy"}
 	if len(all) != len(want) {
 		t.Fatal(len(all), len(want))
 	}
@@ -46,7 +46,7 @@ func TestDeclarationsDriveHelpAndArity(t *testing.T) {
 	for _, c := range all {
 		flags := flagsOf(c)
 		text, ok := detailedHelp([]string{c.Name}, &cfg)
-		if !ok || !strings.Contains(text, "Usage:\n  "+c.Usage) || !strings.Contains(text, "Examples:\n  "+c.Example) {
+		if !ok || !strings.Contains(text, "Usage:\n  "+c.Usage) || !strings.Contains(text, "Examples:\n  "+strings.ReplaceAll(c.Example, "\n", "\n  ")) {
 			t.Fatal(c.Name, ok, text)
 		}
 		if strings.Contains(text, "--json") == c.Streaming {

@@ -11,8 +11,8 @@ var set = Command{
 	Name:      "set",
 	Summary:   "Update a stopped VM.",
 	Usage:     "set VM KEY=VALUE... [OPTIONS]",
-	Arguments: "VM  Exact name or VM ID.\nKEY=VALUE  name, cpus, memory or disk. Sizes are binary.",
-	Example:   "set devbox memory=8gb disk=16GiB",
+	Arguments: "VM  Exact name or VM ID.\nKEY=VALUE  name, cpus, memory, disk or policy. Sizes are binary; policy= clears the policy.",
+	Example:   "set devbox memory=8gb disk=16GiB\nset devbox policy=web-preview",
 	New:       func() Handler { return &setHandler{} },
 }
 
@@ -44,6 +44,12 @@ func (h *setHandler) Run(c *Context, args cmdline.Args) (Result, error) {
 		switch k {
 		case "name":
 			h.q.Name = &v
+		case "policy":
+			if v == "" {
+				h.q.ClearPolicy = true
+			} else {
+				h.q.PolicyRef = &v
+			}
 		case "cpus":
 			var n uint64
 			if e := cmdline.Count(&n)(v); e != nil {
@@ -62,7 +68,7 @@ func (h *setHandler) Run(c *Context, args cmdline.Args) (Result, error) {
 				h.q.Disk = &size
 			}
 		default:
-			return Result{}, usageReason("unknown setting; expected name, cpus, memory or disk")
+			return Result{}, usageReason("unknown setting; expected name, cpus, memory, disk or policy")
 		}
 	}
 	return c.Await(c.Service.Set(c, c.Caller, vm, h.q))

@@ -106,7 +106,9 @@ impl Machine {
 fn map_client_error(reference: String, error: VmmClientError) -> LibVmError {
     match error {
         VmmClientError::Connection(message) => LibVmError::MonitorConnection { reference, message },
-        VmmClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
+        VmmClientError::Protocol(message) | VmmClientError::PathNotFound(message) => {
+            LibVmError::MonitorProtocol { reference, message }
+        }
         VmmClientError::Forward(error) => rejected(reference, error),
     }
 }

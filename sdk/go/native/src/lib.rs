@@ -5,6 +5,7 @@ mod buffer;
 mod dto;
 mod error;
 mod exec;
+mod files;
 mod handles;
 mod images;
 mod logs;

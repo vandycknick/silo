@@ -60,6 +60,33 @@ export interface NativeMachine {
   attach(program: string, args?: string[], options?: NativeExecutionOptionsInput): Promise<NativeExecutionResult>;
   attachShell(options?: NativeSshShellOptionsInput): Promise<NativeSshExitStatus>;
   logs(source: NativeMachineLogSource, options?: NativeMachineLogOptionsInput): Promise<NativeMachineLogHandle>;
+  statFile(path: string): Promise<NativeFileEntry>;
+  createDirectory(path: string, options?: NativeCreateDirectoryOptions): Promise<string>;
+  uploadFile(path: string, options?: NativeUploadOptions): Promise<NativeFileUpload>;
+  downloadFile(path: string): Promise<NativeFileDownload>;
+}
+
+export interface NativeFileEntry {
+  path: string;
+  name: string;
+  kind: string;
+  sizeBytes: bigint;
+  mode: number;
+  uid: number;
+  gid: number;
+  modifiedAtUnixMillis: bigint;
+}
+
+export interface NativeUploadOptions { mode?: number; uid?: number; gid?: number }
+export interface NativeCreateDirectoryOptions extends NativeUploadOptions { parents?: boolean }
+export interface NativeFileUpload {
+  write(data: Uint8Array): Promise<void>;
+  finish(): Promise<string>;
+  cancel(): void;
+}
+export interface NativeFileDownload {
+  read(): Promise<Uint8Array | null>;
+  cancel(): void;
 }
 
 export interface NativeImages {

@@ -23,6 +23,8 @@ pub struct TailscaleConfig {
     sessions: SessionLimits,
     #[serde(deserialize_with = "size")]
     disk_reserve: u64,
+    #[serde(deserialize_with = "size")]
+    file_transfer_limit: u64,
     shutdown: ShutdownSettings,
 }
 impl Default for TailscaleConfig {
@@ -36,6 +38,7 @@ impl Default for TailscaleConfig {
             vm: VmSettings::default(),
             sessions: SessionLimits::default(),
             disk_reserve: 1 << 30,
+            file_transfer_limit: 256 << 20,
             shutdown: ShutdownSettings::default(),
         }
     }
@@ -50,6 +53,7 @@ impl TailscaleConfig {
             &self.vm,
             &self.sessions,
             self.disk_reserve,
+            self.file_transfer_limit,
             &self.shutdown,
         )
     }
@@ -82,6 +86,9 @@ impl TailscaleConfig {
     }
     pub fn disk_reserve(&self) -> u64 {
         self.disk_reserve
+    }
+    pub fn file_transfer_limit(&self) -> u64 {
+        self.file_transfer_limit
     }
     pub fn shutdown(&self) -> &ShutdownSettings {
         &self.shutdown
@@ -398,4 +405,20 @@ fn parse_duration(mut input: &str) -> Result<Duration, &'static str> {
         return Err("invalid duration");
     }
     Ok(Duration::from_nanos(total as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tailscale::TailscaleConfig;
+
+    #[test]
+    fn file_transfer_limit_defaults_and_accepts_sizes() {
+        let defaults: TailscaleConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert_eq!(defaults.file_transfer_limit(), 256 << 20);
+        let sized: TailscaleConfig = serde_yaml_ng::from_str("file-transfer-limit: 8MiB").unwrap();
+        assert_eq!(sized.file_transfer_limit(), 8 << 20);
+        let bytes: TailscaleConfig = serde_yaml_ng::from_str("file-transfer-limit: 123").unwrap();
+        assert_eq!(bytes.file_transfer_limit(), 123);
+        assert!(serde_yaml_ng::from_str::<TailscaleConfig>("file-transfer-limit: 8oops").is_err());
+    }
 }

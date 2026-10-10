@@ -105,6 +105,8 @@ explicit nulls in known fields or action elements are malformed. Explicit zero
 limits remain zero, with additive grants still taking their maximum.
 `vm.restart` is a composite operation requiring **both**
 `vm.stop` and `vm.start`, never separate wildcard grants. No admin scope exists.
+`vm.files` permits reading and writing guest files via `cp` and is implied by
+`*`; `vm.exec` does not imply it.
 Authenticated peers without capabilities can use whoami/help/version.
 Human whoami contains only the verified login and node; `whoami --json` retains
 the capability explanation and full identity diagnostics.
@@ -168,8 +170,10 @@ be drained even by the lobby. No subsystem/port/agent forwarding is enabled.
 Live PTY/resize and capability-propagation behavior remain qualification work.
 
 Grammar is one line with POSIX single/double quotes and backslash escapes.
-No shell expansion, pipelines or redirection. Unquoted shell operators and
-expansion syntax fail validation; quoted/escaped bytes are literal. Empty
+Unquoted shell operators and expansion syntax are rejected before the guest
+delimiter `--` and are literal bytes after it; there is no expansion, pipeline
+or redirection anywhere, and quoted/escaped bytes are always literal. Non-PTY
+`exec` streams the session's stdin to the guest process. Empty
 quoted words are retained. Empty command with PTY opens a prompt; without PTY
 prints help and exits 2. Interactive entry displays only `silo> `, without an
 automatic identity or capability banner. `--json` returns exactly one stdout object with `ok`,
@@ -218,9 +222,19 @@ rm VM [--force] [--yes]
 set VM [name=NAME] [cpus=N] [memory=SIZE] [disk=SIZE]
 shell VM [-u USER]
 exec VM [-u USER] [-w GUEST_DIR] [-e KEY=VALUE]... [-t] -- CMD [ARG]...
+cp [OPTIONS] SRC DST
 logs VM [--follow] [--stream SOURCE] [--output stdout|stderr]
 ops [show op_ULID]
 ```
+
+`cp` transfers regular files between stdin/stdout (`-`) and `VM:/absolute/path`.
+The lobby cannot read local paths: use `ssh silo cp - devbox:/root/x < file`
+or `ssh silo cp devbox:/root/x - > file`. Upload-only options are `--mode OCTAL`,
+`--owner UID[:GID]`, `--parents`/`-p`, and `--no-clobber`/`-n`. New files default
+to 0644; replacement preserves the mode unless specified. No-clobber checks are
+best effort, not atomic. Uploads are bounded by the operator's
+`daemon.tailscale.file-transfer-limit` (default 256 MiB). Transfer summaries and
+SHA-256 digests go to stderr; stdout remains file bytes for downloads.
 
 The positional create argument is always IMAGE. Flags may be interspersed with
 it; positional IMAGE and `--image` are mutually exclusive. An absent name uses
@@ -279,6 +293,11 @@ percentages are not invented. `--no-start` persists a stopped VM. Start never re
 requires a stopped VM; disks only grow. Name and display label update through one
 atomic libvm update through RPC. Any tailscale declaration, even pending enrollment,
 prevents rename.
+`set VM policy=NAME` replaces the persisted policy using the VM owner's namespace
+first, then operator policies. `policy=` clears it, retaining the managed node on
+Tailscale VMs. Policy forwards require a VM created with `--tailscale`.
+Editing a policy document does not update existing VMs; apply it with
+`stop`, `set VM policy=NAME`, then `start`.
 
 Remove refuses running VMs without `--force` (5). Force requires stop permission,
 uses a bounded, exact-run RPC stop, then reauthorizes generation-fenced deletion.
@@ -360,12 +379,14 @@ of these hints. Configure the ACL to restrict inbound ports; this list does not.
 Create resolves the selected principal's template/policy first, then operator
 defaults. Only explicit flags override template values, and `--policy NAME`
 overrides its policy reference. Labels merge with explicit flags winning;
-`io.silo.*` remains reserved. Template/policy names are stamped in immutable
-labels and projected by `show`. Description remains template metadata.
+`io.silo.*` remains reserved. Template/policy names are stamped in reserved
+labels and projected by `show`; `set policy=NAME` updates the policy reference.
+Description remains template metadata.
 
 Policies are HCL parsed and emitted by libvm through silod's `NormalizePolicy` RPC.
-Any Tailscale declaration, rule tunnel reference or forward is prohibited, even
-without `--tailscale`. Production enables the one `Service.VMNodesEnabled` switch.
+User-authored Tailscale declarations and rule tunnel references are prohibited;
+same-VM `tailscale` forwards are the only forwards accepted and require `--tailscale`.
+Production enables the one `Service.VMNodesEnabled` switch.
 Injection retains the entire canonical JSON, supplies the exact
 hostname, verified owner tag (empty for users) and pinned control URL, and appends
 TCP routes for both `100.64.0.0/10` and

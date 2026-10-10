@@ -10,6 +10,7 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	silo "github.com/vandycknick/silo/sdk/go"
 )
 
 func renderList(vms []service.VM) string {
@@ -66,6 +67,16 @@ func renderShow(v service.VM) string {
 	}
 	if v.Policy != "" {
 		text += "Policy: " + safeText(v.Policy) + "\n"
+	}
+	if len(v.Forwards) > 0 {
+		text += "Forwards:\n"
+		for _, f := range v.Forwards {
+			target := f.URL
+			if target == "" {
+				target = fmt.Sprintf(":%d", f.ListenPort)
+			}
+			text += fmt.Sprintf("  %s: %s -> guest %d (%s)\n", safeText(f.Name), safeText(target), f.TargetPort, f.Protocol)
+		}
 	}
 	if len(v.GuestTCPPorts) > 0 {
 		text += fmt.Sprintf("Guest TCP hints (ACL controls access): %v\n", v.GuestTCPPorts)
@@ -158,6 +169,16 @@ func renderDocuments(verb string, docs []service.Document) string {
 		if d.Secrets != nil {
 			for _, slot := range d.Secrets.Slots {
 				fmt.Fprintf(&b, "Secret: %s (key %s, required %t)\n", slot.Name, slot.Source.Key, slot.Required)
+			}
+		}
+		for _, vm := range d.BoundVMs {
+			switch {
+			case verb == "rm":
+				fmt.Fprintf(&b, "%s still references policy %s\n", safeText(vm.Name), safeText(d.Name))
+			case vm.State == silo.MachineStatusRunning:
+				fmt.Fprintf(&b, "%s (%s): restart to apply\n", safeText(vm.Name), vm.State)
+			default:
+				fmt.Fprintf(&b, "%s (%s): run 'set %s policy=%s' to apply\n", safeText(vm.Name), vm.State, safeText(vm.Name), safeText(d.Name))
 			}
 		}
 	}

@@ -309,6 +309,7 @@ func settings(c *config.Config, s *daemonv1.TailscaleSettings) error {
 	}
 	c.Sessions.Global, c.Sessions.PerPeer = int(s.SessionsGlobal), int(s.SessionsPerPeer)
 	c.DiskReserve = units.Size(s.DiskReserveBytes)
+	c.FileTransferLimit = units.Size(s.FileTransferLimitBytes)
 	c.Shutdown.StopBudget = units.Duration{Duration: s.StopBudget.AsDuration()}
 	c.Shutdown.Margin = units.Duration{Duration: s.ShutdownMargin.AsDuration()}
 	return c.Validate()

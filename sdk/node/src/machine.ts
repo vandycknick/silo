@@ -12,6 +12,12 @@ import {
 import { mapNativePromise } from "./errors.js";
 import { ExecutionOutput, ExecutionSession } from "./exec.js";
 import {
+    FileDownload, guestPath, uploadOptionsToNative, directoryOptionsToNative,
+    fileEntryFromNative, directoryDisposition, fileWriteDisposition,
+    type FileEntry, type CreateDirectoryOptions, type DirectoryDisposition,
+    type UploadOptions, type UploadResult,
+} from "./files.js";
+import {
     MachineLogStream,
     machineLogOptionsToNative,
     machineLogSourceToNative,
@@ -39,6 +45,7 @@ import {
     assertPositiveU32,
     assertString,
     assertStringArray,
+    assertUint8Array,
 } from "./validation.js";
 
 /**
@@ -298,6 +305,45 @@ export class Machine {
                 ),
             ),
         );
+    }
+
+    /** Inspect a guest filesystem entry at an absolute path. */
+    async statFile(path: string): Promise<FileEntry> {
+        return fileEntryFromNative(await mapNativePromise(this.native.statFile(guestPath(path))));
+    }
+
+    /** Create a guest directory, optionally including missing parents. */
+    async createDirectory(path: string, options?: CreateDirectoryOptions): Promise<DirectoryDisposition> {
+        return directoryDisposition(await mapNativePromise(
+            this.native.createDirectory(guestPath(path), directoryOptionsToNative(options)),
+        ));
+    }
+
+    /** Stream bytes into an atomically replaced regular guest file. */
+    async uploadFile(path: string, source: Uint8Array | AsyncIterable<Uint8Array>, options?: UploadOptions): Promise<UploadResult> {
+        const upload = await mapNativePromise(this.native.uploadFile(guestPath(path), uploadOptionsToNative(options)));
+        let bytes = 0;
+        try {
+            if (source instanceof Uint8Array) {
+                await mapNativePromise(upload.write(source));
+                bytes = source.byteLength;
+            } else {
+                for await (const chunk of source) {
+                    const data = assertUint8Array(chunk, "chunk");
+                    await mapNativePromise(upload.write(data));
+                    bytes += data.byteLength;
+                }
+            }
+            return { disposition: fileWriteDisposition(await mapNativePromise(upload.finish())), bytes };
+        } catch (error) {
+            upload.cancel();
+            throw error;
+        }
+    }
+
+    /** Open a streaming regular guest file download. */
+    async downloadFile(path: string): Promise<FileDownload> {
+        return new FileDownload(await mapNativePromise(this.native.downloadFile(guestPath(path))));
     }
 
     /** Run a script through the guest shell and capture output. */

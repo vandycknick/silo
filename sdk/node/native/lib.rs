@@ -16,9 +16,10 @@ use libvm::{
     OciImageConfigMetadata, Runtime, RuntimeConfig, SshExitStatus, SshShellOptionsBuilder,
     TailscaleTunnelBuilder,
 };
-use napi::bindgen_prelude::Uint8Array;
+use napi::bindgen_prelude::{BigInt, Uint8Array};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use vm_spec::Mount;
@@ -467,6 +468,71 @@ pub struct NativeMachine {
     inner: Machine,
 }
 
+#[napi(object)]
+pub struct NativeFileEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size_bytes: BigInt,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub modified_at_unix_millis: BigInt,
+}
+
+#[napi(object)]
+#[derive(Default)]
+pub struct NativeUploadOptions {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+#[napi(object)]
+#[derive(Default)]
+pub struct NativeCreateDirectoryOptions {
+    pub parents: Option<bool>,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+type UploadTask =
+    tokio::task::JoinHandle<std::result::Result<libvm::FileWriteDisposition, LibVmError>>;
+type UploadWriter = tokio::io::WriteHalf<tokio::io::SimplexStream>;
+
+#[napi]
+pub struct NativeFileUpload {
+    inner: Mutex<FileUploadState>,
+}
+
+struct FileUploadState {
+    resources: Option<(UploadWriter, UploadTask)>,
+    abort: tokio::task::AbortHandle,
+    cancellation: watch::Sender<bool>,
+    busy: bool,
+    closed: bool,
+}
+
+impl Drop for FileUploadState {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+#[napi]
+pub struct NativeFileDownload {
+    inner: Mutex<FileDownloadState>,
+}
+
+struct FileDownloadState {
+    reader: Option<libvm::MachineFileDownload>,
+    cancellation: watch::Sender<bool>,
+    busy: bool,
+    closed: bool,
+    eof: bool,
+}
+
 #[napi(js_name = "NativeImages")]
 pub struct NativeImages {
     inner: Images,
@@ -831,6 +897,119 @@ impl NativeMachine {
             .map(ssh_exit_status_to_native)
     }
 
+    #[napi(js_name = "statFile")]
+    pub async fn stat_file(&self, path: String) -> Result<NativeFileEntry> {
+        let entry = self
+            .inner
+            .get_file_entry(path)
+            .await
+            .map_err(to_napi_error)?;
+        let modified = entry
+            .modified_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invalid_state(format!("invalid file modification time: {error}")))?;
+        let millis = u64::try_from(modified.as_millis())
+            .map_err(|_| invalid_state("file modification time exceeds u64"))?;
+        let kind = match entry.kind {
+            libvm::MachineEntryKind::File => "file",
+            libvm::MachineEntryKind::Directory => "directory",
+            libvm::MachineEntryKind::Symlink => "symlink",
+            libvm::MachineEntryKind::Fifo => "fifo",
+            libvm::MachineEntryKind::Socket => "socket",
+            libvm::MachineEntryKind::BlockDevice => "block_device",
+            libvm::MachineEntryKind::CharacterDevice => "character_device",
+        };
+        Ok(NativeFileEntry {
+            path: entry.path,
+            name: entry.name,
+            kind: kind.to_owned(),
+            size_bytes: BigInt::from(entry.size_bytes),
+            mode: entry.mode,
+            uid: entry.uid,
+            gid: entry.gid,
+            modified_at_unix_millis: BigInt::from(millis),
+        })
+    }
+
+    #[napi(js_name = "createDirectory")]
+    pub async fn create_directory(
+        &self,
+        path: String,
+        options: Option<NativeCreateDirectoryOptions>,
+    ) -> Result<String> {
+        let options = options.unwrap_or_default();
+        self.inner
+            .create_directory(
+                path,
+                options.parents.unwrap_or(false),
+                options.mode,
+                options.uid,
+                options.gid,
+            )
+            .await
+            .map(|value| match value {
+                libvm::MachineDirectoryCreateDisposition::Created => "created".to_owned(),
+                libvm::MachineDirectoryCreateDisposition::AlreadyExists => {
+                    "already_exists".to_owned()
+                }
+            })
+            .map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "uploadFile")]
+    pub async fn upload_file(
+        &self,
+        path: String,
+        options: Option<NativeUploadOptions>,
+    ) -> Result<NativeFileUpload> {
+        let options = options.unwrap_or_default();
+        let machine = self.inner.clone();
+        let (reader, writer) = tokio::io::simplex(65536);
+        let task = tokio::spawn(async move {
+            machine
+                .upload_file(
+                    libvm::MachineFileUploadOptions {
+                        path,
+                        mode: options.mode,
+                        uid: options.uid,
+                        gid: options.gid,
+                    },
+                    reader,
+                )
+                .await
+        });
+        let abort = task.abort_handle();
+        let (cancellation, _) = watch::channel(false);
+        Ok(NativeFileUpload {
+            inner: Mutex::new(FileUploadState {
+                resources: Some((writer, task)),
+                abort,
+                cancellation,
+                busy: false,
+                closed: false,
+            }),
+        })
+    }
+
+    #[napi(js_name = "downloadFile")]
+    pub async fn download_file(&self, path: String) -> Result<NativeFileDownload> {
+        let reader = self
+            .inner
+            .download_file(path)
+            .await
+            .map_err(to_napi_error)?;
+        let (cancellation, _) = watch::channel(false);
+        Ok(NativeFileDownload {
+            inner: Mutex::new(FileDownloadState {
+                reader: Some(reader),
+                cancellation,
+                busy: false,
+                closed: false,
+                eof: false,
+            }),
+        })
+    }
+
     #[napi]
     pub async fn logs(
         &self,
@@ -851,6 +1030,180 @@ impl NativeMachine {
         Ok(NativeMachineLogHandle {
             inner: Mutex::new(MachineLogHandleState::new(stream)),
         })
+    }
+}
+
+fn file_write_disposition(value: libvm::FileWriteDisposition) -> String {
+    match value {
+        libvm::FileWriteDisposition::Created => "created",
+        libvm::FileWriteDisposition::Replaced => "replaced",
+    }
+    .to_owned()
+}
+
+impl NativeFileUpload {
+    fn begin(&self) -> Result<(UploadWriter, UploadTask, watch::Receiver<bool>)> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file upload lock is poisoned"))?;
+        if state.closed {
+            return Err(invalid_state("file upload is closed"));
+        }
+        if state.busy {
+            return Err(invalid_state("file upload already has an active operation"));
+        }
+        let (writer, task) = state
+            .resources
+            .take()
+            .ok_or_else(|| invalid_state("file upload is closed"))?;
+        state.busy = true;
+        Ok((writer, task, state.cancellation.subscribe()))
+    }
+
+    fn complete(&self, resources: Option<(UploadWriter, UploadTask)>) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file upload lock is poisoned"))?;
+        state.busy = false;
+        if state.closed {
+            return Err(invalid_state("file upload is closed"));
+        }
+        state.closed = resources.is_none();
+        state.resources = resources;
+        Ok(())
+    }
+}
+
+#[napi]
+impl NativeFileUpload {
+    #[napi]
+    pub async fn write(&self, data: Uint8Array) -> Result<()> {
+        let (mut writer, task, mut cancellation) = self.begin()?;
+        let data = data.to_vec();
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(invalid_state("file upload is closed")),
+            result = writer.write_all(&data) => result.map_err(|error| invalid_state(format!("file upload write: {error}"))),
+        };
+        if let Err(error) = result {
+            drop(writer);
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.changed() => Err(invalid_state("file upload is closed")),
+                result = task => match result {
+                    Ok(Err(error)) => Err(to_napi_error(error)),
+                    Err(error) => Err(invalid_state(format!("file upload task: {error}"))),
+                    Ok(Ok(_)) => Err(error),
+                },
+            };
+            self.complete(None)?;
+            return result;
+        }
+        self.complete(Some((writer, task)))
+    }
+
+    #[napi]
+    pub async fn finish(&self) -> Result<String> {
+        let (mut writer, task, mut cancellation) = self.begin()?;
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(invalid_state("file upload is closed")),
+            result = async {
+                // Simplex halves share one stream: dropping the writer does not
+                // signal EOF, only shutdown does. A shutdown failure means the
+                // upload task already ended, and its result says why.
+                let _ = writer.shutdown().await;
+                drop(writer);
+                task.await
+            } => result
+                .map_err(|error| invalid_state(format!("file upload task: {error}")))
+                .and_then(|result| result.map(file_write_disposition).map_err(to_napi_error)),
+        };
+        self.complete(None)?;
+        result
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file upload lock is poisoned"))?;
+        state.closed = true;
+        state.cancellation.send_replace(true);
+        state.abort.abort();
+        state.resources = None;
+        Ok(())
+    }
+}
+
+#[napi]
+impl NativeFileDownload {
+    #[napi]
+    pub async fn read(&self) -> Result<Option<Uint8Array>> {
+        let (mut reader, mut cancellation) = {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| invalid_state("file download lock is poisoned"))?;
+            if state.closed {
+                return Err(invalid_state("file download is closed"));
+            }
+            if state.busy {
+                return Err(invalid_state("file download already has an active read"));
+            }
+            if state.eof {
+                return Ok(None);
+            }
+            let reader = state
+                .reader
+                .take()
+                .ok_or_else(|| invalid_state("file download is closed"))?;
+            state.busy = true;
+            (reader, state.cancellation.subscribe())
+        };
+        let mut bytes = Vec::with_capacity(65536);
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(invalid_state("file download is closed")),
+            result = reader.read_buf(&mut bytes) => result.map_err(|error| invalid_state(format!("file download read: {error}"))),
+        };
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file download lock is poisoned"))?;
+        state.busy = false;
+        if state.closed {
+            return Err(invalid_state("file download is closed"));
+        }
+        match result {
+            Ok(0) => {
+                state.eof = true;
+                Ok(None)
+            }
+            Ok(_) => {
+                state.reader = Some(reader);
+                Ok(Some(bytes.into()))
+            }
+            Err(error) => {
+                state.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file download lock is poisoned"))?;
+        state.closed = true;
+        state.reader = None;
+        state.cancellation.send_replace(true);
+        Ok(())
     }
 }
 
@@ -2277,6 +2630,7 @@ fn to_napi_error(error: LibVmError) -> Error {
         LibVmError::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
         LibVmError::MonitorConnection { .. } => "MonitorConnection",
         LibVmError::MonitorProtocol { .. } => "MonitorProtocol",
+        LibVmError::GuestPathNotFound { .. } => "GuestPathNotFound",
         LibVmError::GuestSession { .. } => "GuestSession",
         LibVmError::MachinePreparationFailed { .. } => "MachinePreparationFailed",
         LibVmError::NetworkRuntime { .. } => "NetworkRuntime",

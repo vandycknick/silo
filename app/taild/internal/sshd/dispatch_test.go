@@ -18,6 +18,15 @@ func TestTokenizer(t *testing.T) {
 		invalid bool
 	}{
 		{"", nil, false}, {"whoami --json", []string{"whoami", "--json"}, false}, {`a '' ""`, []string{"a", "", ""}, false}, {`a 'two words' "three words"`, []string{"a", "two words", "three words"}, false}, {`a\ b "x\"y"`, []string{"a b", `x"y`}, false}, {`a "x\qy"`, []string{"a", `x\qy`}, false}, {`a '$HOME'`, []string{"a", "$HOME"}, false}, {`a $HOME`, nil, true}, {`a; b`, nil, true}, {`a | b`, nil, true}, {"a\nb", nil, true}, {`'open`, nil, true}, {`a\`, nil, true},
+		{"exec vm -- python -c print(123)", []string{"exec", "vm", "--", "python", "-c", "print(123)"}, false},
+		{"exec vm -- a | b $x", []string{"exec", "vm", "--", "a", "|", "b", "$x"}, false},
+		{"exec vm -- sh -c echo\\ hi\\;ls", []string{"exec", "vm", "--", "sh", "-c", "echo hi;ls"}, false},
+		{"exec vm -- python -c \"'print(1, 2)'\"", []string{"exec", "vm", "--", "python", "-c", "'print(1, 2)'"}, false},
+		{"exec vm -- 'open", nil, true},
+		{"exec vm -- a\nb", nil, true},
+		{"create --name a$b -- x", nil, true},
+		{"exec vm --x a|b", nil, true},
+		{"exec vm '--' -- a|b", []string{"exec", "vm", "--", "--", "a|b"}, false},
 	} {
 		got, e := Tokenize(tt.line)
 		if (e != nil) != tt.invalid {

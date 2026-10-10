@@ -125,6 +125,10 @@ pub enum LibVmError {
     #[error("monitor protocol for {reference} failed: {message}")]
     MonitorProtocol { reference: String, message: String },
 
+    /// The guest filesystem reported that a requested path does not exist.
+    #[error("guest path for {reference} not found: {message}")]
+    GuestPathNotFound { reference: String, message: String },
+
     #[error("forward request for {reference} was rejected ({grpc_code:?}, {detail:?}): {reason}")]
     ForwardRejected {
         reference: String,
@@ -288,6 +292,7 @@ impl LibVmError {
             Self::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
             Self::MonitorConnection { .. } => "MonitorConnection",
             Self::MonitorProtocol { .. } => "MonitorProtocol",
+            Self::GuestPathNotFound { .. } => "GuestPathNotFound",
             Self::ForwardRejected { .. } => "ForwardRejected",
             Self::GuestSession { .. } => "GuestSession",
             Self::MachinePreparationFailed { .. } => "MachinePreparationFailed",

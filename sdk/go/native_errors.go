@@ -21,7 +21,7 @@ var nativeErrorKinds = map[string]ErrorKind{
 	"MachineIdAlreadyExists": ErrorMachineIDAlreadyExists, "MachineAlreadyRunning": ErrorMachineAlreadyRunning,
 	"MachineNotRunning": ErrorMachineNotRunning, "MachineStaleGeneration": ErrorMachineStaleGeneration,
 	"MachineLogSourceUnavailable": ErrorMachineLogSourceUnavailable, "MonitorConnection": ErrorMonitorConnection,
-	"MonitorProtocol": ErrorMonitorProtocol, "GuestSession": ErrorGuestSession,
+	"MonitorProtocol": ErrorMonitorProtocol, "GuestPathNotFound": ErrorGuestPathNotFound, "GuestSession": ErrorGuestSession,
 	"MachinePreparationFailed": ErrorMachinePreparationFailed, "MachineStartCleanupFailed": ErrorMachineStartCleanupFailed,
 	"EntrypointLaunchFailed": ErrorEntrypointLaunchFailed, "NetworkRuntime": ErrorNetworkRuntime,
 	"VmMonExecutableNotFound": ErrorVMMonExecutableNotFound, "VmMonExecutableInvalid": ErrorVMMonExecutableInvalid,

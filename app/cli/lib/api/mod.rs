@@ -4,6 +4,7 @@
 //! Rust calls within the CLI process, not a C ABI, FFI surface, or wire protocol.
 
 mod daemon;
+pub(crate) mod files;
 mod local;
 pub(crate) mod machine;
 pub(crate) mod start_options;

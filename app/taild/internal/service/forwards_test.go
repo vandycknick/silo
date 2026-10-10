@@ -7,12 +7,16 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/vandycknick/silo/app/taild/internal/control"
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture/daemon"
+	silo "github.com/vandycknick/silo/sdk/go"
 	w "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const forwardWebPolicy = `forward "tailscale" "web" {
@@ -30,6 +34,69 @@ forward "tailscale" "raw" {
   target_port = 8080
 }
 `
+
+func TestForwardNodeViewConfigurationAndReadiness(t *testing.T) {
+	s := &Service{Enrollment: &enroll.Manager{Pin: state.NodePin{Suffix: "tail.test"}}}
+	d := &control.Snapshot{
+		MachineData: &silo.MachineData{
+			ID: "vm", Name: "web", Labels: map[string]string{},
+			Network: silo.MachineNetwork{Tailscale: &silo.MachineTailscale{Hostname: "web"}},
+			Status:  silo.MachineStatus{Kind: silo.MachineStatusStopped},
+		},
+		PolicyJSON: `{"forwards":[
+			{"kind":"tailscale","name":"web","listen":":443","target":"self","target_port":8080,"protocol":"https"},
+			{"kind":"host","name":"ignored","listen":":80","target_port":80},
+			{"kind":"tailscale","name":"database","listen":":15432","target":"self","target_port":5432},
+			{"kind":"tailscale","name":"alternate","listen":":8443","target":"self","target_port":8080,"protocol":"https"}
+		]}`,
+	}
+	want := []ForwardView{
+		{Name: "web", Protocol: "https", ListenPort: 443, TargetPort: 8080, URL: "https://web.tail.test/"},
+		{Name: "database", Protocol: "tcp", ListenPort: 15432, TargetPort: 5432, URL: "tcp://web.tail.test:15432"},
+		{Name: "alternate", Protocol: "https", ListenPort: 8443, TargetPort: 8080, URL: "https://web.tail.test:8443/"},
+	}
+	if v := s.nodeView(d); !reflect.DeepEqual(v.Forwards, want) {
+		t.Fatal(v.Forwards)
+	}
+	run, node, dns := "run", "node", "web.tail.test"
+	d.RunID = &run
+	d.Status.Kind = silo.MachineStatusRunning
+	d.NetworkObservation = &w.NetworkObservation{Live: &w.NodeStatus{
+		MachineId: "vm", RunId: run, State: w.NodeState_NODE_STATE_READY,
+		NodeId: &node, DnsName: &dns, UpdatedAt: timestamppb.Now(),
+	}}
+	if v := s.nodeView(d); !reflect.DeepEqual(v.Forwards, want) {
+		t.Fatal(v.Forwards)
+	}
+	d.NetworkObservation.Live.KeyExpiry = timestamppb.New(time.Now().Add(-time.Hour))
+	for i := range want {
+		want[i].URL = ""
+	}
+	if v := s.nodeView(d); v.Node != "" || !reflect.DeepEqual(v.Forwards, want) {
+		t.Fatal("expired DNS exposed forward URLs", v)
+	}
+	s.Enrollment = nil
+	d.Status.Kind = silo.MachineStatusStopped
+	if v := s.nodeView(d); !reflect.DeepEqual(v.Forwards, want) {
+		t.Fatal("missing pin exposed forward URLs", v)
+	}
+	d.Network.Tailscale = nil
+	if v := s.nodeView(d); v.Forwards != nil {
+		t.Fatal("non-Tailscale VM exposed forwards", v)
+	}
+	d.Network.Tailscale = &silo.MachineTailscale{Hostname: "web"}
+	for _, raw := range []string{"", "{", `{"forwards":[]}`, `{"forwards":[{"kind":"tailscale","listen":":65536"}]}`} {
+		d.PolicyJSON = raw
+		v := s.nodeView(d)
+		if v.Forwards != nil {
+			t.Fatal(raw, v.Forwards)
+		}
+		b, err := json.Marshal(v)
+		if err != nil || strings.Contains(string(b), `"forwards"`) {
+			t.Fatal("empty forwards not omitted", string(b), err)
+		}
+	}
+}
 
 func TestForwardRemoteDocumentsAuthorityThroughRPC(t *testing.T) {
 	s := actualService(t)
@@ -267,6 +334,28 @@ func TestForwardCreateRetainsBoundPolicyThroughRPC(t *testing.T) {
 			t.Fatal("runtime handoff lost managed binding", data.PolicyJSON)
 		}
 	}
+	v, err := s.Show(ctx, c.Peer, "bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := data.Network.Tailscale.Hostname + ".fixture.test"
+	want := []ForwardView{
+		{Name: "web", Protocol: "https", ListenPort: 443, TargetPort: 8080, URL: "https://" + node + "/"},
+		{Name: "raw", Protocol: "tcp", ListenPort: 18080, TargetPort: 8080, URL: "tcp://" + node + ":18080"},
+	}
+	if !reflect.DeepEqual(v.Forwards, want) {
+		t.Fatal(v.Forwards, want)
+	}
+	inventory, err := s.List(ctx, c.Peer)
+	if err != nil || len(inventory) != 1 || !reflect.DeepEqual(inventory[0].Forwards, want) {
+		t.Fatal(inventory, err)
+	}
+	op, err = s.Create(ctx, c, CreateRequest{Name: "plain", Image: registry.Reference, NoStart: true})
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	v, err = s.Show(ctx, c.Peer, "plain")
+	if err != nil || v.Forwards != nil {
+		t.Fatal(v.Forwards, err)
+	}
 }
 
 func TestForwardRemoteReservedMetadataThroughRPC(t *testing.T) {
@@ -294,5 +383,88 @@ func TestForwardRemoteReservedMetadataThroughRPC(t *testing.T) {
 	}
 	if _, err = s.InjectTailnet(ctx, p, "web", "user:1", ""); Categorize(err).Exit != 2 {
 		t.Fatal("injection accepted reserved metadata", err)
+	}
+}
+
+func TestSetPolicyRetainsManagedNodeThroughRPC(t *testing.T) {
+	registry := testfixture.OCIRegistry(t, "")
+	s := actualService(t)
+	ctx := t.Context()
+	c := domainCaller(s, "user:1")
+	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
+	s.VMNodesEnabled = true
+	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "https://pinned-control.example.test"}}
+	if _, err := s.Documents(ctx, c, "policy", "create", "web", "", forwardWebPolicy); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"bound", "ordinary"} {
+		op, err := s.Create(ctx, c, CreateRequest{Name: name, Image: registry.Reference, Tailscale: name == "bound", NoStart: true})
+		daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	}
+	ref := "web"
+	op, err := s.Set(ctx, c, "bound", SetRequest{PolicyRef: &ref})
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	data, err := s.Runtime.Control.Inspect(ctx, "bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored policyAuthority
+	if err := json.Unmarshal([]byte(data.PolicyJSON), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if data.Labels[PolicyLabel] != ref || len(stored.Forwards) != 2 || len(stored.Tailscale) != 1 || len(stored.Metadata["io.silo.taild.node"]) == 0 {
+		t.Fatal("set lost managed policy", data)
+	}
+	for _, f := range stored.Forwards {
+		if f.Tunnel == nil || *f.Tunnel != "vm" {
+			t.Fatal("unbound forward", data.PolicyJSON)
+		}
+	}
+	op, err = s.Set(ctx, c, "bound", SetRequest{ClearPolicy: true})
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	data, err = s.Runtime.Control.Inspect(ctx, "bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored = policyAuthority{}
+	if err := json.Unmarshal([]byte(data.PolicyJSON), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := data.Labels[PolicyLabel]; exists || len(stored.Forwards) != 0 || len(stored.Tailscale) != 1 || len(stored.Metadata["io.silo.taild.node"]) == 0 {
+		t.Fatal("clear lost node or retained policy", data)
+	}
+	for _, tt := range []struct {
+		ref     string
+		code    string
+		message string
+	}{
+		{"web", "usage", "policy forwards require a VM created with --tailscale"},
+		{"missing", "not_found", "document not found"},
+	} {
+		op, err := s.Set(ctx, c, "ordinary", SetRequest{PolicyRef: &tt.ref})
+		result := daemon.WaitOperation(t, s.Jobs, c.Peer, op, err)
+		if result.Error == nil || result.Error.Code != tt.code {
+			t.Fatal(tt, result)
+		}
+		if tt.message != "" && result.Error.Message != tt.message {
+			t.Fatal(tt, result)
+		}
+	}
+	plain := "plain"
+	if _, err := s.Documents(ctx, c, "policy", "create", plain, "", `settings { default_action = "allow" }`); err != nil {
+		t.Fatal(err)
+	}
+	renamed := "renamed"
+	op, err = s.Set(ctx, c, "ordinary", SetRequest{Name: &renamed, PolicyRef: &plain})
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	data, err = s.Runtime.Control.Inspect(ctx, renamed)
+	if err != nil || data.Labels[PolicyLabel] != plain {
+		t.Fatal(data, err)
+	}
+	op, err = s.Set(ctx, c, renamed, SetRequest{ClearPolicy: true})
+	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	data, err = s.Runtime.Control.Inspect(ctx, renamed)
+	if err != nil || data.PolicyJSON != "" || data.Labels[PolicyLabel] != "" {
+		t.Fatal(data, err)
 	}
 }

@@ -53,13 +53,14 @@ const (
 	Shell          Action = "vm.shell"
 	Exec           Action = "vm.exec"
 	Logs           Action = "vm.logs"
+	Files          Action = "vm.files"
 	Update         Action = "vm.update"
 	TemplateManage Action = "template.manage"
 	Restart        Action = "vm.restart"
 )
 
 func Actions() []Action {
-	return []Action{Create, Read, Start, Stop, Delete, Shell, Exec, Logs, Update, TemplateManage}
+	return []Action{Create, Read, Start, Stop, Delete, Shell, Exec, Logs, Files, Update, TemplateManage}
 }
 
 type Limits struct {

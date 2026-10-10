@@ -455,3 +455,75 @@ func bytePointer(value []byte) *C.uint8_t {
 	}
 	return (*C.uint8_t)(unsafe.Pointer(&value[0]))
 }
+
+type Upload struct{ pointer *C.silo_upload }
+type Download struct{ pointer *C.silo_download }
+
+func (machine *Machine) MachineFileStat(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_file_stat(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+func (machine *Machine) MachineCreateDirectory(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_create_directory(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+func (machine *Machine) MachineUploadOpen(request []byte) (*Upload, error) {
+	var output *C.silo_upload
+	if err := takeError(C.bridge_machine_upload_open(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	if output == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil upload")
+	}
+	return &Upload{pointer: output}, nil
+}
+func (upload *Upload) UploadWrite(data []byte) error {
+	return takeError(C.bridge_upload_write(upload.pointer, bytePointer(data), C.size_t(len(data))))
+}
+func (upload *Upload) UploadFinish() ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_upload_finish(upload.pointer, &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+func (upload *Upload) UploadCancel() error { return takeError(C.bridge_upload_cancel(upload.pointer)) }
+func (upload *Upload) UploadFree() {
+	if upload != nil && upload.pointer != nil {
+		C.bridge_upload_free(upload.pointer)
+		upload.pointer = nil
+	}
+}
+func (machine *Machine) MachineDownloadOpen(request []byte) (*Download, error) {
+	var output *C.silo_download
+	if err := takeError(C.bridge_machine_download_open(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	if output == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil download")
+	}
+	return &Download{pointer: output}, nil
+}
+func (download *Download) DownloadRead() ([]byte, bool, error) {
+	var output C.silo_buffer
+	var eof C._Bool
+	if err := takeError(C.bridge_download_read(download.pointer, &output, &eof)); err != nil {
+		return nil, false, err
+	}
+	return copyBuffer(output), bool(eof), nil
+}
+func (download *Download) DownloadCancel() error {
+	return takeError(C.bridge_download_cancel(download.pointer))
+}
+func (download *Download) DownloadFree() {
+	if download != nil && download.pointer != nil {
+		C.bridge_download_free(download.pointer)
+		download.pointer = nil
+	}
+}

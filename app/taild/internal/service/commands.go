@@ -14,6 +14,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/control"
+	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
@@ -101,6 +102,7 @@ type VM struct {
 	ApprovalURL         string                 `json:"approval_url,omitempty"`
 	Template            string                 `json:"template,omitempty"`
 	Policy              string                 `json:"policy,omitempty"`
+	Forwards            []ForwardView          `json:"forwards,omitempty"`
 	GuestTCPPorts       []uint16               `json:"guest_tcp_ports,omitempty"`
 	ID                  string                 `json:"id"`
 	Name                string                 `json:"name"`
@@ -114,6 +116,14 @@ type VM struct {
 	Created             time.Time              `json:"created"`
 	Image               string                 `json:"image"`
 	Labels              map[string]string      `json:"labels"`
+}
+
+type ForwardView struct {
+	Name       string `json:"name"`
+	Protocol   string `json:"protocol"`
+	ListenPort uint16 `json:"listen_port"`
+	TargetPort uint16 `json:"target_port"`
+	URL        string `json:"url,omitempty"`
 }
 
 func project(d *silo.MachineData) VM {
@@ -720,10 +730,12 @@ func (s *Service) PreflightRemove(ctx context.Context, c Caller, ref string, for
 
 // SetRequest carries only the settings to change; nil leaves a value alone.
 type SetRequest struct {
-	Name   *string
-	CPUs   *uint8
-	Memory *silo.ByteSize
-	Disk   *silo.ByteSize
+	Name        *string
+	CPUs        *uint8
+	Memory      *silo.ByteSize
+	Disk        *silo.ByteSize
+	PolicyRef   *string
+	ClearPolicy bool
 }
 
 // reauthorize checks the action against a fresh identity observation. Long
@@ -888,7 +900,7 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 	})
 }
 func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (jobs.Operation, error) {
-	if q.Name == nil && q.CPUs == nil && q.Memory == nil && q.Disk == nil {
+	if q.Name == nil && q.CPUs == nil && q.Memory == nil && q.Disk == nil && q.PolicyRef == nil && !q.ClearPolicy {
 		return jobs.Operation{}, failure("usage", "set requires a setting", 2)
 	}
 	if q.Name != nil && !config.ValidName(*q.Name) {
@@ -923,6 +935,65 @@ func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (
 			defer release()
 		}
 		u := &w.MachineUpdate{}
+		var labels map[string]string
+		if q.PolicyRef != nil || q.ClearPolicy || (q.Name != nil && *q.Name != d.Name) {
+			labels = maps.Clone(d.Labels)
+		}
+		if q.PolicyRef != nil || q.ClearPolicy {
+			owner := identity.Principal(d.Labels[runtime.OwnerLabel])
+			var policy *control.Policy
+			if q.PolicyRef != nil {
+				docs, e := s.documentsFor(ctx, "policy", "show", *q.PolicyRef, owner, "")
+				if e != nil {
+					return e
+				}
+				policy, e = s.parseRemotePolicy(ctx, docs[0].Content)
+				if e != nil {
+					return e
+				}
+				var authority policyAuthority
+				if e := json.Unmarshal([]byte(policy.CanonicalJSON), &authority); e != nil {
+					return Categorize(e)
+				}
+				if len(authority.Forwards) > 0 && d.Network.Tailscale == nil {
+					return failure("usage", "policy forwards require a VM created with --tailscale", 2)
+				}
+				if e := s.checkSecrets(ctx, policy); e != nil {
+					return e
+				}
+			}
+			if d.Network.Tailscale != nil {
+				var tags []string
+				if raw := d.Labels[runtime.TagsLabel]; raw != "" {
+					if e := json.Unmarshal([]byte(raw), &tags); e != nil {
+						return Categorize(e)
+					}
+				}
+				controlURL := s.Config.Tailnet.ControlURL
+				if s.Enrollment != nil {
+					controlURL = s.Enrollment.Pin.ControlURL
+				}
+				var e error
+				policy, e = s.InjectTailnet(ctx, policy, d.Network.Tailscale.Hostname, owner, controlURL, tags...)
+				if e == nil {
+					policy, e = s.bindNodeIdentity(ctx, policy, owner, tags, enroll.Mode(d.Labels[runtime.ModeLabel]))
+				}
+				if e != nil {
+					return e
+				}
+			}
+			if policy == nil {
+				u.Policy = &w.PolicyUpdate{Update: &w.PolicyUpdate_Clear{Clear: &emptypb.Empty{}}}
+			} else {
+				u.Policy = &w.PolicyUpdate{Update: &w.PolicyUpdate_Set{Set: policy.CanonicalJSON}}
+			}
+			if q.PolicyRef != nil {
+				labels[PolicyLabel] = *q.PolicyRef
+			} else {
+				delete(labels, PolicyLabel)
+			}
+			u.Labels = &w.StringMap{Values: labels}
+		}
 		if q.CPUs != nil {
 			value := uint32(*q.CPUs)
 			u.Cpus = &value
@@ -948,7 +1019,6 @@ func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (
 				return runtime.ErrNameTaken
 			}
 			defer release()
-			labels := maps.Clone(d.Labels)
 			labels[runtime.NameLabel] = *q.Name
 			u.Name = q.Name
 			u.Labels = &w.StringMap{Values: labels}

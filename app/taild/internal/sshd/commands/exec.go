@@ -7,10 +7,10 @@ import (
 
 var exec = Command{
 	Name:      "exec",
-	Summary:   "Run a guest command; arguments after -- are literal.",
+	Summary:   "Run a guest command; arguments after -- are literal bytes (no shell).",
 	Usage:     "exec VM [OPTIONS] -- CMD...",
-	Arguments: "VM  Exact name or VM ID.\nCMD...  Guest program and arguments after --.",
-	Example:   "exec devbox -- uname -a",
+	Arguments: "VM  Exact name or VM ID.\nCMD...  Guest program and arguments after --. Without -t, stdin is streamed to the process and closed on EOF.",
+	Example:   "exec devbox -- uname -a\nexec devbox -- python3 - < edit.py\nssh silo \"exec devbox -- python3 -c 'print(1, 2)'\"",
 	Streaming: true,
 	New:       func() Handler { return &execHandler{q: service.ExecRequest{Env: map[string]string{}}} },
 }

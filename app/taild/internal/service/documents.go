@@ -415,6 +415,12 @@ type Document struct {
 	Content  string                      `json:"content,omitempty"`
 	Template *Template                   `json:"template,omitempty"`
 	Secrets  *silo.NetworkSecretMetadata `json:"secrets,omitempty"`
+	BoundVMs []BoundVM                   `json:"bound_vms,omitempty"`
+}
+
+type BoundVM struct {
+	Name  string                 `json:"name"`
+	State silo.MachineStatusKind `json:"state"`
 }
 
 func (s *Service) validateDocument(ctx context.Context, kind, raw string) (Document, error) {
@@ -504,7 +510,22 @@ func (s *Service) Documents(ctx context.Context, c Caller, kind, verb, name stri
 	if e != nil {
 		return nil, e
 	}
-	return s.documentsFor(ctx, kind, verb, name, principal, raw)
+	docs, e := s.documentsFor(ctx, kind, verb, name, principal, raw)
+	if e != nil {
+		return nil, e
+	}
+	if kind == "policy" && (verb == "edit" || verb == "rm") {
+		vms, e := s.List(ctx, c.Peer)
+		if e != nil {
+			return nil, e
+		}
+		for _, vm := range vms {
+			if vm.Policy == name && vm.Owner == principal {
+				docs[0].BoundVMs = append(docs[0].BoundVMs, BoundVM{Name: vm.Name, State: vm.State})
+			}
+		}
+	}
+	return docs, nil
 }
 func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRequest) (CreateRequest, error) {
 	owner, e := selectedOwner(p, q.Owner)

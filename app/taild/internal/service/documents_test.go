@@ -586,3 +586,81 @@ func TestPolicyDocumentOwnershipAndOperatorPrecedenceThroughRPC(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDocumentsPolicyBoundVMsThroughRPC(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		name := "stopped"
+		if running {
+			name = "running"
+		}
+		t.Run(name, func(t *testing.T) {
+			rootfs := ""
+			if running {
+				if os.Getenv("SILO_E2E_KVM") != "1" {
+					t.Skip("SILO_E2E_KVM=1 required")
+				}
+				rootfs = testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true)
+			}
+			registry := testfixture.OCIRegistry(t, rootfs)
+			s := actualService(t)
+			ctx := t.Context()
+			c := domainCaller(s, "user:1")
+			s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
+			for _, ref := range []string{"web", "unrelated"} {
+				if _, err := s.Documents(ctx, c, "policy", "create", ref, "", `settings { default_action = "allow" }`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, q := range []CreateRequest{
+				{Name: "web", Image: registry.Reference, PolicyRef: "web", NoStart: !running},
+				{Name: "web2", Image: registry.Reference, PolicyRef: "web", NoStart: true},
+				{Name: "other", Image: registry.Reference, PolicyRef: "unrelated", NoStart: true},
+				{Name: "foreign", Image: registry.Reference, PolicyRef: "web", NoStart: true},
+			} {
+				caller := c
+				if q.Name == "foreign" {
+					caller = domainCaller(s, "user:2")
+					if _, err := s.Documents(ctx, caller, "policy", "create", "web", "", `settings { default_action = "allow" }`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				op, err := s.Create(ctx, caller, q)
+				daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
+			}
+			if running {
+				t.Cleanup(func() {
+					op, err := s.Stop(context.Background(), c, "web", StopRequest{Force: true})
+					daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+				})
+				ref := "web"
+				op, err := s.Set(ctx, c, "web", SetRequest{PolicyRef: &ref})
+				result := daemon.WaitOperation(t, s.Jobs, c.Peer, op, err)
+				if result.Error == nil || result.Error.Code != "conflict" || result.Error.Message != "set requires a stopped VM" {
+					t.Fatal(result)
+				}
+			}
+			before, err := s.Runtime.Control.Inspect(ctx, "web")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, verb := range []string{"edit", "rm"} {
+				docs, err := s.Documents(ctx, c, "policy", verb, "web", "", `settings { default_action = "deny" }`)
+				if err != nil || len(docs) != 1 {
+					t.Fatal(docs, err)
+				}
+				want := []BoundVM{{Name: "web", State: silo.MachineStatusStopped}, {Name: "web2", State: silo.MachineStatusStopped}}
+				if running {
+					want[0].State = silo.MachineStatusRunning
+				}
+				slices.SortFunc(docs[0].BoundVMs, func(a, b BoundVM) int { return strings.Compare(a.Name, b.Name) })
+				if !reflect.DeepEqual(docs[0].BoundVMs, want) {
+					t.Fatal("incorrect bindings", docs[0].BoundVMs)
+				}
+				after, err := s.Runtime.Control.Inspect(ctx, "web")
+				if err != nil || after.PolicyJSON != before.PolicyJSON || !reflect.DeepEqual(after.Labels, before.Labels) {
+					t.Fatal("document write mutated VM", after, err)
+				}
+			}
+		})
+	}
+}

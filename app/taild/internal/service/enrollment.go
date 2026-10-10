@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -166,7 +168,9 @@ func (s *Service) nodeView(d *control.Snapshot) VM {
 		return v
 	}
 	if d.Status.Kind == silo.MachineStatusRunning {
-		return s.liveNodeView(d, v)
+		v = s.liveNodeView(d, v)
+		v.Forwards = s.forwardViews(d, v.Node)
+		return v
 	}
 	v.NodeState = state.NodeState(string(d.Status.Kind))
 	v.Node = s.nodeDNS(d.MachineData)
@@ -176,7 +180,54 @@ func (s *Service) nodeView(d *control.Snapshot) VM {
 			setExpiry(&v, timestamp(o.KeyExpiry), o.ObservedAt.AsTime(), true)
 		}
 	}
+	v.Forwards = s.forwardViews(d, v.Node)
 	return v
+}
+
+func (s *Service) forwardViews(d *control.Snapshot, node string) []ForwardView {
+	if d.Network.Tailscale == nil {
+		return nil
+	}
+	var policy struct {
+		Forwards []struct {
+			Name       string `json:"name"`
+			Kind       string `json:"kind"`
+			Target     string `json:"target"`
+			TargetPort uint16 `json:"target_port"`
+			Listen     string `json:"listen"`
+			Protocol   string `json:"protocol"`
+		} `json:"forwards"`
+	}
+	if err := json.Unmarshal([]byte(d.PolicyJSON), &policy); err != nil {
+		return nil
+	}
+	var forwards []ForwardView
+	for _, f := range policy.Forwards {
+		if f.Kind != "tailscale" || !strings.HasPrefix(f.Listen, ":") {
+			continue
+		}
+		port, err := strconv.ParseUint(strings.TrimPrefix(f.Listen, ":"), 10, 16)
+		if err != nil || port == 0 {
+			continue
+		}
+		protocol := f.Protocol
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		view := ForwardView{Name: f.Name, Protocol: protocol, ListenPort: uint16(port), TargetPort: f.TargetPort}
+		if node != "" {
+			if protocol == "https" {
+				view.URL = fmt.Sprintf("https://%s:%d/", node, port)
+				if port == 443 {
+					view.URL = "https://" + node + "/"
+				}
+			} else {
+				view.URL = fmt.Sprintf("tcp://%s:%d", node, port)
+			}
+		}
+		forwards = append(forwards, view)
+	}
+	return forwards
 }
 
 func sameTags(requested, actual []string) bool {

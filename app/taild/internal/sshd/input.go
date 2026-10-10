@@ -432,6 +432,12 @@ func (r contextualInput) Read(buf []byte) (int, error) {
 	return r.readLocked(buf)
 }
 
+// ReadContext lets a transfer bind the shared input to its authorization lifetime.
+func (r contextualInput) ReadContext(ctx context.Context, buf []byte) (int, error) {
+	r.ctx = ctx
+	return r.Read(buf)
+}
+
 func (r contextualInput) readLocked(buf []byte) (int, error) {
 	s := r.input
 	if len(buf) == 0 {

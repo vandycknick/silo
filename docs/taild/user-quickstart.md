@@ -172,8 +172,17 @@ ssh silo create --name web --template web --policy web-forward --tailscale
 ssh silo show web
 ```
 
-Use fresh names if these resources already exist. Open `https://<full-VM-DNS>/`
-using the verified DNS name from `show`. The node's readiness is not a
+To change an existing VM's exposure, stop it, replace its persisted policy, and
+start it again (requires `vm.stop`, `vm.update`, and `vm.start`):
+
+```sh
+ssh silo stop web && ssh silo set web policy=web-forward && ssh silo start web
+```
+
+Editing the policy document alone never updates existing VMs.
+
+Use fresh names if these resources already exist. Open the `url` reported under
+`forwards` in `show --json`. The node's readiness is not a
 per-forward health check. A forward-bearing policy requires `--tailscale`,
 including when inherited from a template. Remote documents omit `tunnel`:
 taild supplies and binds the managed node. User-authored Tailscale declarations,
