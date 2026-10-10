@@ -21,6 +21,8 @@ struct ExecRequest {
     program: Option<String>,
     script: Option<String>,
     #[serde(default)]
+    ssh_shell: bool,
+    #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     additional_args: Vec<String>,
@@ -252,6 +254,9 @@ unsafe fn collected(
         }
         *out_output = SiloExecutionOutput::empty();
         let request = decode_request(request_ptr, request_len)?;
+        if request.ssh_shell {
+            return Err(invalid_argument("SSH shells require streaming spawn"));
+        }
         let output = if shell {
             let script = request
                 .script
@@ -297,18 +302,31 @@ pub unsafe extern "C" fn silo_machine_spawn(
         }
         *out_session = ptr::null_mut();
         let request = decode_request(request_ptr, request_len)?;
-        let program = request
-            .program
-            .clone()
-            .ok_or_else(|| invalid_argument("spawn requires program"))?;
-        let args = request.args.clone();
-        let session = machine
-            .context
-            .tokio
-            .block_on(machine.machine.spawn_with(program, |builder| {
-                apply_options(builder.args(args), request)
-            }))
-            .map_err(error_from_libvm)?;
+        let session = if request.ssh_shell {
+            if request.program.is_some() || request.script.is_some() || !request.args.is_empty() {
+                return Err(invalid_argument(
+                    "SSH shell cannot specify a program, script or arguments",
+                ));
+            }
+            machine.context.tokio.block_on(
+                machine
+                    .machine
+                    .spawn_ssh_shell_with(|builder| apply_options(builder, request)),
+            )
+        } else {
+            let program = request
+                .program
+                .clone()
+                .ok_or_else(|| invalid_argument("spawn requires program"))?;
+            let args = request.args.clone();
+            machine
+                .context
+                .tokio
+                .block_on(machine.machine.spawn_with(program, |builder| {
+                    apply_options(builder.args(args), request)
+                }))
+        }
+        .map_err(error_from_libvm)?;
         let control = session.control();
         *out_session = Box::into_raw(Box::new(ExecutionHandle {
             context: Arc::clone(&machine.context),

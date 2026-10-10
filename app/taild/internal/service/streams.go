@@ -101,7 +101,7 @@ func (s *Service) Shell(ctx context.Context, c Caller, ref, user string, streams
 	if !streams.Terminal.Present {
 		return 2, failure("usage", "shell requires a PTY; use ssh -t", 2)
 	}
-	return s.execute(ctx, c, ref, identity.Shell, ExecRequest{User: user, TTY: true, Program: "/bin/sh", Args: []string{"-l"}}, streams)
+	return s.execute(ctx, c, ref, identity.Shell, ExecRequest{User: user, TTY: true}, streams)
 }
 func (s *Service) Exec(ctx context.Context, c Caller, ref string, q ExecRequest, streams IO) (int, error) {
 	return s.execute(ctx, c, ref, identity.Exec, q, streams)
@@ -113,7 +113,7 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 	if streams.Stderr == nil {
 		streams.Stderr = io.Discard
 	}
-	if q.Program == "" || len(q.Program) > 4096 || strings.ContainsRune(q.Program, 0) || len(q.Args) > 256 || len(q.Env) > 64 || !text(q.User) || !text(q.Directory) {
+	if (action == identity.Exec && q.Program == "") || len(q.Program) > 4096 || strings.ContainsRune(q.Program, 0) || len(q.Args) > 256 || len(q.Env) > 64 || !text(q.User) || !text(q.Directory) {
 		return 2, failure("usage", "invalid execution request", 2)
 	}
 	for _, arg := range q.Args {
@@ -160,23 +160,22 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 			q.User = "root"
 		}
 	}
-	account, e := guestIdentity(ctx, m, q.User, d.GuestUser)
-	if e != nil {
-		return Categorize(e).Exit, Categorize(e)
+	opts := []silo.ExecOption{silo.WithExecUser(q.User), silo.WithExecTTY(q.TTY), silo.WithExecStdinPipe()}
+	if action == identity.Exec {
+		account, err := guestIdentity(ctx, m, q.User, d.GuestUser)
+		if err != nil {
+			return Categorize(err).Exit, Categorize(err)
+		}
+		env := map[string]string{}
+		if account.name != "" {
+			env = map[string]string{"HOME": account.home, "USER": account.name, "LOGNAME": account.name, "SHELL": account.shell}
+		}
+		maps.Copy(env, q.Env)
+		if q.Directory == "" {
+			q.Directory = account.home
+		}
+		opts = append(opts, silo.WithExecWorkingDirectory(q.Directory), silo.WithExecEnv(env))
 	}
-	env := map[string]string{}
-	if account.name != "" {
-		env = map[string]string{"HOME": account.home, "USER": account.name, "LOGNAME": account.name, "SHELL": account.shell}
-	}
-	maps.Copy(env, q.Env)
-	q.Env = env
-	if q.Directory == "" {
-		q.Directory = account.home
-	}
-	if action == identity.Shell {
-		q.Program = account.shell
-	}
-	opts := []silo.ExecOption{silo.WithExecUser(q.User), silo.WithExecTTY(q.TTY), silo.WithExecWorkingDirectory(q.Directory), silo.WithExecEnv(maps.Clone(q.Env)), silo.WithExecStdinPipe()}
 	if q.TTY {
 		w := streams.Terminal.Window
 		if w.Rows == 0 || w.Columns == 0 {
@@ -191,7 +190,12 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 		}
 		opts = append(opts, silo.WithExecInitialPTYSize(w.Rows, w.Columns), silo.WithExecTerm(term))
 	}
-	exec, e := m.Spawn(ctx, q.Program, q.Args, opts...)
+	var exec *silo.ExecutionSession
+	if action == identity.Shell {
+		exec, e = m.SpawnSSHShell(ctx, opts...)
+	} else {
+		exec, e = m.Spawn(ctx, q.Program, q.Args, opts...)
+	}
 	if e != nil {
 		return Categorize(e).Exit, Categorize(e)
 	}

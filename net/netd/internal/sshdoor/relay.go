@@ -47,6 +47,20 @@ func Relay(ctx context.Context, down, up ssh.Conn, downChannels, upChannels <-ch
 			}
 		}()
 		for r := range in {
+			// Host-key updates belong to one SSH transport. In particular,
+			// proofs sign that transport's session ID, not the other leg's.
+			// This door has its own host key; guest keys must not be enrolled
+			// as keys for the door, in either direction.
+			switch r.Type {
+			case "hostkeys-00@openssh.com", "hostkeys-prove-00@openssh.com", "hostkeys", "hostkeys-prove":
+				if r.WantReply {
+					if err := r.Reply(false, nil); err != nil {
+						cancel()
+						return
+					}
+				}
+				continue
+			}
 			var forward struct {
 				Address string
 				Port    uint32

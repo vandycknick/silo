@@ -33,28 +33,14 @@ pub(crate) fn constrain_external_listener() -> eyre::Result<()> {
     {
         eyre::bail!("unknown external SSH socket listener configuration");
     }
+    // Accept=yes always instantiates the matching template. Triggers contains
+    // live instances, so it may be empty before the first accepted connection.
+    // A template itself cannot be queried with `systemctl show`; load an
+    // inspection instance without starting it.
+    let unit = "sshd-vsock@.service";
+    let inspection = "sshd-vsock@silo-policy-check.service";
     let output = Command::new("systemctl")
-        .args([
-            "show",
-            "sshd-vsock.socket",
-            "--property=Triggers",
-            "--value",
-        ])
-        .output()?;
-    if !output.status.success() {
-        eyre::bail!("cannot identify external SSH vsock listener");
-    }
-    let units = String::from_utf8(output.stdout)?;
-    let units: Vec<_> = units.split_whitespace().collect();
-    if units.len() != 1 {
-        eyre::bail!("unknown external SSH vsock listener");
-    }
-    let unit = units[0];
-    if unit != "sshd-vsock.service" && unit != "sshd-vsock@.service" {
-        eyre::bail!("unsupported external SSH service {unit}");
-    }
-    let output = Command::new("systemctl")
-        .args(["show", unit, "--property=ExecStart", "--value"])
+        .args(["show", inspection, "--property=ExecStart", "--value"])
         .output()?;
     let command = String::from_utf8(output.stdout)?;
     if !output.status.success()
@@ -76,14 +62,14 @@ pub(crate) fn constrain_external_listener() -> eyre::Result<()> {
         eyre::bail!("cannot reload constrained external SSH listener");
     }
     let output = Command::new("systemctl")
-        .args(["show", unit, "--property=ExecStart", "--value"])
+        .args(["show", inspection, "--property=ExecStart", "--value"])
         .output()?;
     let actual = String::from_utf8(output.stdout)?;
     if !output.status.success() || !exclusive_external_command(&actual) {
         eyre::bail!("external SSH listener override did not take effect");
     }
     let output = Command::new("systemctl")
-        .args(["show", unit, "--property=ExecStartPre", "--value"])
+        .args(["show", inspection, "--property=ExecStartPre", "--value"])
         .output()?;
     if !output.status.success() || !exclusive_sshd_command(&String::from_utf8(output.stdout)?, "-t")
     {

@@ -64,8 +64,12 @@ pub(crate) fn install_watcher(
     failed: Arc<AtomicBool>,
 ) -> notify::Result<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        if result.is_err() {
-            failed.store(true, Ordering::Release);
+        match result {
+            // Scanning this directory generates access events on Linux. Feeding
+            // those back into discovery would keep the supervisor busy forever.
+            Ok(event) if event.kind.is_access() && !event.need_rescan() => return,
+            Err(_) => failed.store(true, Ordering::Release),
+            Ok(_) => {}
         }
         let _ = dirty.try_send(());
     })?;
@@ -153,20 +157,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_reports_real_directory_changes_through_a_bounded_signal() {
+    async fn watcher_discovers_socket_creation_rename_and_removal() {
         let dir = temp_dir();
         let (dirty_tx, mut dirty_rx) = mpsc::channel(1);
         let failed = Arc::new(AtomicBool::new(false));
-        let _watcher = install_watcher(&dir, dirty_tx, failed).expect("install watcher");
+        let watcher = install_watcher(&dir, dirty_tx, failed).expect("install watcher");
 
-        let _listener =
+        let listener =
             UnixListener::bind(dir.join("vsock.sock_5000")).expect("publish listener socket");
-        tokio::time::timeout(std::time::Duration::from_secs(5), dirty_rx.recv())
-            .await
-            .expect("watch notification deadline")
-            .expect("watch notification");
+        wait_for_ports(&dir, &mut dirty_rx, &[5000]).await;
 
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::rename(dir.join("vsock.sock_5000"), dir.join("vsock.sock_5001"))
+            .expect("rename listener socket");
+        wait_for_ports(&dir, &mut dirty_rx, &[5001]).await;
+
+        std::fs::remove_file(dir.join("vsock.sock_5001")).expect("remove listener socket");
+        wait_for_ports(&dir, &mut dirty_rx, &[]).await;
+
+        drop(watcher);
+        drop(listener);
+        std::fs::remove_dir_all(dir).expect("remove runtime directory");
+    }
+
+    async fn wait_for_ports(
+        dir: &std::path::Path,
+        dirty_rx: &mut mpsc::Receiver<()>,
+        expected: &[u32],
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                dirty_rx.recv().await.expect("watch notification");
+                let ports: Vec<_> = scan(dir, OsStr::new("vsock.sock"))
+                    .expect("scan listeners")
+                    .into_iter()
+                    .map(|(port, _)| port)
+                    .collect();
+                if ports == expected {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("listener discovery deadline");
+    }
+
+    #[tokio::test]
+    async fn scanning_watched_directory_does_not_trigger_discovery() {
+        let dir = temp_dir();
+        let listener =
+            UnixListener::bind(dir.join("vsock.sock_5000")).expect("publish listener socket");
+        let (dirty_tx, mut dirty_rx) = mpsc::channel(1);
+        let failed = Arc::new(AtomicBool::new(false));
+        let watcher = install_watcher(&dir, dirty_tx, failed).expect("install watcher");
+
+        for _ in 0..16 {
+            assert_eq!(
+                scan(&dir, OsStr::new("vsock.sock")).expect("scan listeners"),
+                vec![(5000, dir.join("vsock.sock_5000"))]
+            );
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), dirty_rx.recv())
+                .await
+                .is_err(),
+            "read-only scans must not feed back into discovery"
+        );
+
+        // Prove the quiet watcher still discovers a subsequent real change.
+        let second =
+            UnixListener::bind(dir.join("vsock.sock_5001")).expect("publish second socket");
+        wait_for_ports(&dir, &mut dirty_rx, &[5000, 5001]).await;
+
+        drop(watcher);
+        drop((listener, second));
+        std::fs::remove_dir_all(dir).expect("remove runtime directory");
     }
 
     #[tokio::test]

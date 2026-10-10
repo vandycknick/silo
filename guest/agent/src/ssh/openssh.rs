@@ -2,8 +2,9 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixDatagram;
 use std::path::Path;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use eyre::Context;
@@ -295,13 +296,15 @@ async fn handle_connection_async(stream: VsockStream) -> io::Result<()> {
     let sshd_stdin = stream.as_fd().try_clone_to_owned()?;
     let sshd_stdout = stream.as_fd().try_clone_to_owned()?;
 
-    let mut child = TokioCommand::new(OPENSSH_SERVER_PATH)
-        .args(["-i", "-f", crate::provision::ssh::CONFIG])
-        .stdin(Stdio::from(sshd_stdin))
-        .stdout(Stdio::from(sshd_stdout))
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+    let mut child = TokioCommand::from(inetd_command(
+        Path::new(OPENSSH_SERVER_PATH),
+        Path::new(crate::provision::ssh::CONFIG),
+    ))
+    .stdin(Stdio::from(sshd_stdin))
+    .stdout(Stdio::from(sshd_stdout))
+    .stderr(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()?;
 
     let stderr = child
         .stderr
@@ -312,11 +315,7 @@ async fn handle_connection_async(stream: VsockStream) -> io::Result<()> {
     let status = child.wait().await?;
     stderr_task.await.map_err(io::Error::other)??;
 
-    if status.success() {
-        tracing::debug!(status = %status, "sshd connection handler exited");
-    } else {
-        tracing::warn!(status = %status, "sshd connection handler exited unsuccessfully");
-    }
+    report_connection_exit(status);
 
     Ok(())
 }
@@ -330,9 +329,11 @@ fn handle_connection_blocking(
     let sshd_stdin = stream.as_fd().try_clone_to_owned()?;
     let sshd_stdout = stream.as_fd().try_clone_to_owned()?;
 
-    let mut command = StdCommand::new(OPENSSH_SERVER_PATH);
+    let mut command = inetd_command(
+        Path::new(OPENSSH_SERVER_PATH),
+        Path::new(crate::provision::ssh::CONFIG),
+    );
     command
-        .args(["-i", "-f", crate::provision::ssh::CONFIG])
         .stdin(Stdio::from(sshd_stdin))
         .stdout(Stdio::from(sshd_stdout))
         .stderr(Stdio::piped());
@@ -350,13 +351,55 @@ fn handle_connection_blocking(
         .join()
         .map_err(|_| io::Error::other("sshd stderr logger panicked"))??;
 
-    if status.success() {
-        tracing::debug!(status = %status, "sshd connection handler exited");
-    } else {
-        tracing::warn!(status = %status, "sshd connection handler exited unsuccessfully");
-    }
+    report_connection_exit(status);
 
     Ok(())
+}
+
+fn inetd_command(sshd: &Path, config: &Path) -> StdCommand {
+    let mut command = StdCommand::new(sshd);
+    command.args(["-i", "-f"]).arg(config);
+    command
+}
+
+fn syslog_available_at(path: &Path) -> bool {
+    UnixDatagram::unbound()
+        .and_then(|socket| socket.connect(path))
+        .is_ok()
+}
+
+fn connection_exit_level(status: ExitStatus, syslog_available: bool) -> tracing::Level {
+    if status.success() || (status.code().is_some() && syslog_available) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    }
+}
+
+fn report_connection_exit(status: ExitStatus) {
+    report_connection_exit_at(status, Path::new("/dev/log"));
+}
+
+fn report_connection_exit_at(status: ExitStatus, syslog_path: &Path) {
+    // Connecting tests reachability without sending anything to the logger.
+    // This is only a best-effort availability check, not a delivery guarantee.
+    let syslog_available = syslog_available_at(syslog_path);
+    if connection_exit_level(status, syslog_available) == tracing::Level::DEBUG {
+        tracing::debug!(
+            status = %status,
+            code = status.code(),
+            "sshd connection handler exited"
+        );
+    } else if status.code().is_none() {
+        tracing::warn!(status = %status, "sshd connection handler terminated by signal");
+    } else {
+        tracing::warn!(
+            status = %status,
+            code = status.code(),
+            syslog_available = false,
+            "sshd connection handler exited unsuccessfully; syslog unavailable"
+        );
+    }
 }
 
 fn clear_nonblocking(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
@@ -418,6 +461,235 @@ mod tests {
     use crate::ssh::openssh::{
         assess_runtime_dir, SshdRuntimeDirDisposition, SshdRuntimeDirKind, SSHD_RUNTIME_DIR_MODE,
     };
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixDatagram;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus};
+    use std::sync::{mpsc, Arc};
+
+    fn test_sshd() -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("sshd"))
+            .chain([
+                PathBuf::from("/usr/sbin/sshd"),
+                PathBuf::from("/usr/bin/sshd"),
+            ])
+            .find(|path| {
+                std::fs::metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })
+            .expect("real OpenSSH tests require an installed sshd executable on PATH")
+    }
+
+    #[derive(Clone)]
+    struct LogWriter(mpsc::Sender<Vec<u8>>);
+
+    impl io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .send(bytes.to_vec())
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn exit_log(status: ExitStatus, syslog_path: &Path) -> String {
+        let (sender, receiver) = mpsc::channel();
+        let writer = LogWriter(sender);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::ssh::openssh::report_connection_exit_at(status, syslog_path);
+        });
+        let log = receiver.try_iter().flatten().collect();
+        String::from_utf8(log).unwrap()
+    }
+
+    #[test]
+    fn syslog_requires_a_reachable_datagram_receiver_and_sends_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let absent = home.path().join("absent");
+        assert!(!crate::ssh::openssh::syslog_available_at(&absent));
+        let regular = home.path().join("regular");
+        std::fs::write(&regular, "").unwrap();
+        assert!(!crate::ssh::openssh::syslog_available_at(&regular));
+        let stale = home.path().join("stale");
+        drop(UnixDatagram::bind(&stale).unwrap());
+        assert!(stale.exists());
+        assert!(!crate::ssh::openssh::syslog_available_at(&stale));
+        let live = home.path().join("live");
+        let receiver = UnixDatagram::bind(&live).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        assert!(crate::ssh::openssh::syslog_available_at(&live));
+        assert_eq!(
+            receiver.recv(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "availability checks must not send syslog messages"
+        );
+    }
+
+    #[test]
+    fn real_child_exit_logging_preserves_status_and_conservative_fallback() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let live = home.path().join("live");
+        let _receiver = UnixDatagram::bind(&live).unwrap();
+        let missing = home.path().join("missing");
+        let regular = home.path().join("regular");
+        std::fs::write(&regular, "").unwrap();
+        let stale = home.path().join("stale");
+        drop(UnixDatagram::bind(&stale).unwrap());
+
+        for code in [0, 23, 255] {
+            let status = Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(code));
+            for path in [&live, &missing, &regular, &stale] {
+                let log = exit_log(status, path);
+                let level = if code == 0 || path == &live {
+                    "DEBUG"
+                } else {
+                    "WARN"
+                };
+                assert!(log.contains(level), "{log}");
+                assert!(log.contains(&format!("code={code}")), "{log}");
+                assert!(log.contains(&status.to_string()), "{log}");
+                if level == "WARN" {
+                    assert!(log.contains("syslog_available=false"), "{log}");
+                }
+            }
+        }
+        let status = Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        for path in [&live, &missing] {
+            let log = exit_log(status, path);
+            assert!(log.contains("WARN"), "{log}");
+            assert!(log.contains(&status.to_string()), "{log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn real_sshd_production_invocation_reaps_preauth_kex_disconnect() {
+        use crate::ssh::agent::tests::Client;
+        use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding, PrivateKey};
+        use std::os::fd::OwnedFd;
+        use std::process::Stdio;
+
+        let sshd = test_sshd();
+        let home = tempfile::tempdir().unwrap();
+        let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let host = PrivateKey::from(Ed25519Keypair::from_seed(&[5; 32]));
+        let ca_path = home.path().join("ca.pub");
+        let host_path = home.path().join("host");
+        std::fs::write(&ca_path, ca.public_key().to_openssh().unwrap()).unwrap();
+        host.write_openssh_file(&host_path, LineEnding::LF).unwrap();
+        let config = home.path().join("sshd_config");
+        std::fs::write(
+            &config,
+            crate::provision::ssh::policy(&ca_path, &host_path).replace("UsePAM yes", "UsePAM no"),
+        )
+        .unwrap();
+        crate::ssh::openssh::verify_effective_config(&sshd, &config).unwrap();
+
+        // Use the production command builder: no -e, so OpenSSH's protocol
+        // diagnostics keep their configured syslog destination.
+        let command = crate::ssh::openssh::inetd_command(&sshd, &config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut child = tokio::process::Command::from(command)
+            .stdin(Stdio::from(OwnedFd::from(server.try_clone().unwrap())))
+            .stdout(Stdio::from(OwnedFd::from(server)))
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        client.set_nonblocking(true).unwrap();
+        let stream = tokio::net::TcpStream::from_std(client).unwrap();
+        let handshake = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            russh::client::connect_stream(
+                Arc::new(Default::default()),
+                stream,
+                Client {
+                    key: host.public_key().clone(),
+                },
+            ),
+        )
+        .await
+        .map_err(|error| format!("handshake timeout: {error}"))
+        .and_then(|result| result.map_err(|error| error.to_string()));
+        let client = match handshake {
+            Ok(client) => client,
+            Err(error) => {
+                child.kill().await.unwrap();
+                let output = child.wait_with_output().await.unwrap();
+                panic!(
+                    "preauth KEX failed: {error:?}; {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+        let shutdown = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            client
+                .disconnect(russh::Disconnect::ByApplication, "readiness probe", "en")
+                .await
+                .unwrap();
+            // Join the real connection rather than aborting a server to hide
+            // teardown. The expected disconnect is only accepted after KEX.
+            match client.await {
+                Ok(()) | Err(russh::Error::Disconnect) => {}
+                error => panic!("preauth disconnect join failed: {error:?}"),
+            }
+            child.wait().await.unwrap()
+        })
+        .await;
+        let status = match shutdown {
+            Ok(status) => status,
+            Err(error) => {
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+                panic!("preauth sshd did not exit: {error}");
+            }
+        };
+        assert_eq!(
+            child.try_wait().unwrap(),
+            Some(status),
+            "sshd must be reaped"
+        );
+        // Do not require a particular nonzero OpenSSH version-dependent exit.
+        assert!(
+            status.code().is_some(),
+            "normal preauth disconnect: {status}"
+        );
+        let stderr = child.stderr.take().unwrap();
+        crate::ssh::openssh::log_stderr_async(stderr).await.unwrap();
+        let live = home.path().join("log");
+        let _receiver = UnixDatagram::bind(&live).unwrap();
+        let log = exit_log(status, &live);
+        assert!(log.contains("DEBUG"), "{log}");
+        assert!(log.contains(&status.to_string()), "{log}");
+        let fallback = exit_log(status, &home.path().join("absent"));
+        let level = if status.success() { "DEBUG" } else { "WARN" };
+        assert!(fallback.contains(level), "{fallback}");
+        assert!(fallback.contains(&status.to_string()), "{fallback}");
+    }
 
     #[test]
     fn accepts_secure_sshd_runtime_dir() {
@@ -500,13 +772,7 @@ mod tests {
         use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding, PrivateKey};
         use std::process::Stdio;
         use std::sync::Arc;
-        let sshd = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join("sshd"))
-            .find(|path| path.is_file());
-        let Some(sshd) = sshd else {
-            eprintln!("SKIPPED real sshd authentication: sshd binary unavailable");
-            return;
-        };
+        let sshd = test_sshd();
         let home = tempfile::tempdir().unwrap();
         let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
         let host = PrivateKey::from(Ed25519Keypair::from_seed(&[5; 32]));

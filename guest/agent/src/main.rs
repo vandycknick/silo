@@ -234,6 +234,10 @@ async fn run_agent(
                 agent_server.fail(format!("external SSH listener is not CA-only: {error}"));
                 error
             })?;
+            tracing::info!(
+                port = SSH_VSOCK_PORT,
+                "delegating SSH vsock connections to validated systemd OpenSSH listener"
+            );
             false
         }
         Err(err) => {

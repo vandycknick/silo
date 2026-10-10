@@ -23,6 +23,8 @@ use crate::runtime::core::RuntimeStatus;
 use crate::store::models::MachineRuntimeState;
 use crate::LibVmError;
 
+mod ssh;
+
 const DEFAULT_TERM: &str = "xterm-256color";
 const DEFAULT_ATTACH_DETACH_KEY: u8 = 0x1d;
 const DEFAULT_LOGIN_SHELL_SCRIPT: &str = "exec \"${SHELL:-/bin/bash}\" -l || exec /bin/sh";
@@ -247,7 +249,8 @@ pub struct ExecutionSession {
     input_order: Arc<AsyncMutex<()>>,
     request_closed: Arc<watch::Sender<bool>>,
     pipe_stdin: bool,
-    events: Option<tonic::Streaming<WireExecutionEvent>>,
+    events: Option<ExecutionEvents>,
+    ssh_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Cloneable request-side controls for a live structured execution.
@@ -274,6 +277,32 @@ pub struct ExecutionStdin {
     pipe_stdin: bool,
 }
 
+enum ExecutionEvents {
+    Agent(tonic::Streaming<WireExecutionEvent>),
+    Ssh(mpsc::Receiver<ExecutionEvent>),
+}
+
+impl ExecutionEvents {
+    async fn message(&mut self) -> Result<Option<ExecutionEvent>, tonic::Status> {
+        match self {
+            Self::Agent(events) => events
+                .message()
+                .await
+                .map(|event| event.map(execution_event_from_wire)),
+            Self::Ssh(events) => Ok(events.recv().await),
+        }
+    }
+}
+
+impl Drop for ExecutionSession {
+    fn drop(&mut self) {
+        self.close_requests();
+        if let Some(cancel) = &self.ssh_cancel {
+            cancel.cancel();
+        }
+    }
+}
+
 impl ExecutionSession {
     /// Returns controls that remain usable while another task receives events.
     pub fn control(&self) -> ExecutionControl {
@@ -297,8 +326,7 @@ impl ExecutionSession {
             return Ok(None);
         };
         match events.message().await {
-            Ok(Some(wire)) => {
-                let event = execution_event_from_wire(wire);
+            Ok(Some(event)) => {
                 mark_execution_started(&event, &self.started);
                 if matches!(event, ExecutionEvent::Terminal(_)) {
                     self.close_requests();
@@ -360,6 +388,9 @@ impl ExecutionSession {
     pub fn cancel(&mut self) {
         self.close_requests();
         self.events = None;
+        if let Some(cancel) = &self.ssh_cancel {
+            cancel.cancel();
+        }
     }
 
     pub async fn wait(&mut self) -> Result<ExecutionResult, LibVmError> {
@@ -1023,7 +1054,8 @@ impl Machine {
             input_order: Arc::new(AsyncMutex::new(())),
             request_closed: Arc::new(watch::channel(false).0),
             pipe_stdin,
-            events: Some(events),
+            events: Some(ExecutionEvents::Agent(events)),
+            ssh_cancel: None,
         })
     }
 
@@ -1075,29 +1107,36 @@ impl Machine {
         user: Option<&str>,
         forward_agent: bool,
     ) -> Result<GuestSshClient, LibVmError> {
-        let snapshot = self.inspect().await?;
-        if !snapshot.status.ready() {
-            return Err(guest_session_error(
-                reference,
-                "guest SSH listener is not ready or its host key is not verified",
-            ));
-        }
-        let monitor = self.monitor_status().await?;
-        let verified = match monitor.agent {
-            crate::machine::MachineAgentStatus::Enabled(agent) => {
-                agent.status.is_some_and(|status| {
-                    status.freshness == crate::machine::MachineFreshness::Fresh
-                        && status
-                            .report
-                            .ssh
-                            .is_some_and(|ssh| ssh.config_verified && ssh.kex_verified)
-                })
-            }
-            _ => false,
-        };
-        if !verified {
-            return Err(guest_session_error(reference, "guest SSH listener has no fresh, configuration- and KEX-verified readiness descriptor"));
-        }
+        tokio::time::timeout(
+            SSH_HANDSHAKE_READY_TIMEOUT,
+            self.connect_guest_ssh_inner(reference, user, forward_agent),
+        )
+        .await
+        .map_err(|_| guest_session_error(reference, "SSH connection setup timed out"))?
+    }
+
+    async fn connect_guest_ssh_inner(
+        &self,
+        reference: &str,
+        user: Option<&str>,
+        forward_agent: bool,
+    ) -> Result<GuestSshClient, LibVmError> {
+        let config = self.running_config().await?;
+        let status = self
+            .runtime()
+            .reconcile_machine_runtime_best_effort(&config)
+            .await?;
+        let run_id = current_run_id(reference, &status)?;
+        let expected_key =
+            utils::ssh::read_host_key_pin(self.runtime().machine_paths(self.machine_id()).dir())
+                .map_err(|error| {
+                    guest_session_error(
+                        reference,
+                        format!("guest SSH host key is not pinned: {error}"),
+                    )
+                })?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let guard = ssh::TransportGuard(cancel.clone());
         let agent_socket = resolve_agent_socket(reference, forward_agent)?;
         let user = match user {
             Some(user) => user.to_string(),
@@ -1119,18 +1158,10 @@ impl Machine {
             let stream = self.open_shell_stream().await?;
             match russh::client::connect_stream(
                 Arc::new(russh::client::Config::default()),
-                stream,
+                ssh::CancellableStream::new(stream, cancel.clone()),
                 SshClientHandler {
                     agent_socket: agent_socket.clone(),
-                    expected_key: utils::ssh::read_host_key_pin(
-                        self.runtime().machine_paths(self.machine_id()).dir(),
-                    )
-                    .map_err(|error| {
-                        guest_session_error(
-                            reference,
-                            format!("guest SSH host key is not pinned: {error}"),
-                        )
-                    })?,
+                    expected_key: expected_key.clone(),
                 },
             )
             .await
@@ -1155,9 +1186,20 @@ impl Machine {
                 "SSH public-key authentication failed",
             ));
         }
+        let current = self
+            .runtime()
+            .reconcile_machine_runtime_best_effort(&config)
+            .await?;
+        if current_run_id(reference, &current)? != run_id {
+            return Err(guest_session_error(
+                reference,
+                "machine run changed during SSH setup",
+            ));
+        }
         Ok(GuestSshClient {
             reference: reference.to_string(),
             handle,
+            transport: guard,
         })
     }
 }
@@ -1485,6 +1527,7 @@ fn ssh_signal(signal: Signal) -> Option<russh::Sig> {
 struct GuestSshClient {
     reference: String,
     handle: russh::client::Handle<SshClientHandler>,
+    transport: ssh::TransportGuard,
 }
 #[derive(Clone)]
 struct SshClientHandler {

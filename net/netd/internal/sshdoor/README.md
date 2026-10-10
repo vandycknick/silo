@@ -24,8 +24,15 @@ use fresh Ed25519 keys, the requested login principal, now-60s to now+300s and
 PTY/agent/port-forwarding extensions, without X11. The machine CA is parsed once.
 
 The raw SSH connections relay channel opens in both directions, ordered channel
-and global requests (including reply payloads), data and stderr. Both output
-pumps finish before EOF; exit requests drain before close. `SILO_PEER` is injected
+and global requests (including reply payloads), data and stderr, except for
+transport-local host-key updates. `hostkeys-00@openssh.com` and
+`hostkeys-prove-00@openssh.com` (and the `hostkeys` / `hostkeys-prove` names) never
+cross either SSH leg: no-reply messages are ignored; requests requiring a reply
+receive failure locally. Proof signatures bind the originating SSH session ID,
+so relaying them would fail verification on the other leg. Guest keys must not
+be enrolled as keys for the door. The door host key, immutable guest pin and
+certificate authentication remain separate and unchanged.
+Both output pumps finish before EOF; exit requests drain before close. `SILO_PEER` is injected
 once immediately before shell/exec/subsystem, and client attempts to set it are
 rejected before or after execution. Each leg receives a keepalive every 30s;
 an unanswered keepalive closes the connection after 10s. Shutdown closes and
@@ -44,6 +51,14 @@ internal SFTP and a Unix framing endpoint. Their TCP front listener and explicit
 already-authorized identity exist only in `_test.go`. They do not qualify WhoIs.
 `SILO_TEST_SSH_200MB=1` enables the actual 200MB scp/SFTP/hash exercise; defaults
 use smaller binary transfers. Missing rsync/other client binaries skip explicitly.
+Missing `sshd` fails local-fixture qualification rather than skipping it.
+`TestRealOpenSSHUpdateHostKeysStopsAtDoor` also requires the OpenSSH `ssh`
+client: it starts with the known front key and a different guest key, enables
+`UpdateHostKeys=yes`, and checks successful commands, absence of bad-signature
+warnings, unchanged front known_hosts and explicit proof rejection.
+`TestRelayGlobalHostKeyBoundaryBothDirections` uses real TCP SSH connections to
+check both directions, all four host-key request names, no-reply suppression,
+and unchanged generic global request/reply payloads.
 
 `TestNativeKVMRelayCore` requires `SILO_E2E_KVM=1`,
 `SILO_TEST_SSH_MACHINE_DIR` and `SILO_TEST_SSH_MUX` for an already-running native

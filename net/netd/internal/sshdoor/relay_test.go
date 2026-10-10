@@ -92,7 +92,7 @@ func localFixture(t *testing.T, extra ...string) *fixture {
 	t.Helper()
 	sshd, err := exec.LookPath("sshd")
 	if err != nil {
-		t.Skip("SKIPPED: sshd binary absent")
+		t.Fatal("qualification requires sshd in PATH: ", err)
 	}
 	u, err := user.Current()
 	if err != nil {
@@ -213,6 +213,185 @@ func (f *fixture) client(t *testing.T) *ssh.Client {
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+func TestRealOpenSSHUpdateHostKeysStopsAtDoor(t *testing.T) {
+	client, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Fatal("qualification requires OpenSSH ssh in PATH: ", err)
+	}
+	f := localFixture(t)
+	host, port, err := net.SplitHostPort(f.address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := []byte(fmt.Sprintf("[%s]:%s %s", host, port, ssh.MarshalAuthorizedKey(f.door.host.PublicKey())))
+	knownPath := filepath.Join(f.dir, "front_known_hosts")
+	if err := os.WriteFile(knownPath, known, 0600); err != nil {
+		t.Fatal(err)
+	}
+	guestKey, err := os.ReadFile(filepath.Join(f.dir, "ssh/known_host"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(guestKey, ssh.MarshalAuthorizedKey(f.door.host.PublicKey())) {
+		t.Fatal("fixture must have different front and guest host keys")
+	}
+	for range 2 {
+		ctx, cancel := context.WithTimeout(f.ctx, 15*time.Second)
+		cmd := exec.CommandContext(ctx, client, "-F", "/dev/null", "-vv",
+			"-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+			"-o", "UpdateHostKeys=yes", "-o", "UserKnownHostsFile="+knownPath,
+			"-o", "GlobalKnownHostsFile=/dev/null", "-p", port, "-l", f.user, host,
+			"printf HOSTKEY_BOUNDARY_OK")
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		cancel()
+		if err != nil || stdout.String() != "HOSTKEY_BOUNDARY_OK" {
+			t.Fatalf("OpenSSH command: %v; stdout=%q stderr=%s", err, stdout.String(), stderr.String())
+		}
+		log := strings.ToLower(stderr.String())
+		if strings.Contains(log, "bad signature") || strings.Contains(log, "invalid signature") || strings.Contains(log, "server gave bad signature") {
+			t.Fatalf("session-bound proof crossed the door: %s", stderr.String())
+		}
+		got, err := os.ReadFile(knownPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, known) {
+			t.Fatalf("front known_hosts changed (guest keys must not be enrolled): %s", got)
+		}
+	}
+	c := f.client(t)
+	key, _, _, _, err := ssh.ParseAuthorizedKey(guestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"hostkeys-prove-00@openssh.com", "hostkeys-prove"} {
+		ok, payload, err := c.SendRequest(name, true, ssh.Marshal(struct{ Key string }{string(key.Marshal())}))
+		if err != nil || ok || len(payload) != 0 {
+			t.Fatalf("%s must fail locally without proof: ok=%v payload=%x err=%v", name, ok, payload, err)
+		}
+	}
+}
+
+// Actual TCP SSH transports expose raw global streams on both sides, allowing
+// assertions about messages that must never arrive and exact reply payloads.
+func TestRelayGlobalHostKeyBoundaryBothDirections(t *testing.T) {
+	type endpoint struct {
+		conn     ssh.Conn
+		channels <-chan ssh.NewChannel
+		requests <-chan *ssh.Request
+	}
+	pair := func() (endpoint, endpoint) {
+		t.Helper()
+		key, _ := testKey(t)
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		serverResult := make(chan endpoint, 1)
+		serverError := make(chan error, 1)
+		go func() {
+			raw, err := listener.Accept()
+			if err != nil {
+				serverError <- err
+				return
+			}
+			raw.SetDeadline(time.Now().Add(10 * time.Second))
+			config := &ssh.ServerConfig{NoClientAuth: true}
+			config.AddHostKey(key)
+			conn, channels, requests, err := ssh.NewServerConn(raw, config)
+			if err != nil {
+				raw.Close()
+				serverError <- err
+				return
+			}
+			serverResult <- endpoint{conn, channels, requests}
+		}()
+		raw, err := net.DialTimeout("tcp", listener.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.SetDeadline(time.Now().Add(10 * time.Second))
+		conn, channels, requests, err := ssh.NewClientConn(raw, listener.Addr().String(),
+			&ssh.ClientConfig{User: "fixture", HostKeyCallback: ssh.FixedHostKey(key.PublicKey())})
+		if err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		select {
+		case server := <-serverResult:
+			t.Cleanup(func() { server.conn.Close() })
+			return endpoint{conn, channels, requests}, server
+		case err := <-serverError:
+			t.Fatal(err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("SSH server handshake timed out")
+		}
+		return endpoint{}, endpoint{}
+	}
+	downClient, downServer := pair()
+	upClient, upServer := pair()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Relay(ctx, downServer.conn, upClient.conn, downServer.channels, upClient.channels,
+			downServer.requests, upClient.requests, Identity{}, NewLimits())
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	for _, direction := range []struct {
+		name     string
+		from, to endpoint
+	}{{"downstream", downClient, upServer}, {"upstream", upServer, downClient}} {
+		t.Run(direction.name, func(t *testing.T) {
+			for _, name := range []string{"hostkeys-00@openssh.com", "hostkeys-prove-00@openssh.com", "hostkeys", "hostkeys-prove"} {
+				ok, payload, err := direction.from.conn.SendRequest(name, true, []byte("must-not-cross"))
+				if err != nil || ok || len(payload) != 0 {
+					t.Fatalf("%s: ok=%v payload=%x err=%v", name, ok, payload, err)
+				}
+				if _, _, err := direction.from.conn.SendRequest(name, false, []byte("ignored-advertisement")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Ordered generic requests are also barriers: any leaked host-key
+			// message would be the next request read at the opposite endpoint.
+			for _, reply := range []struct{ want, ok bool }{{false, false}, {true, true}, {true, false}} {
+				var replyPayload []byte
+				if reply.ok {
+					replyPayload = []byte{255, 0, 2}
+				}
+				result := make(chan error, 1)
+				go func() {
+					ok, payload, err := direction.from.conn.SendRequest("fixture-global@example.com", reply.want, []byte{0, 1, 255})
+					if err == nil && reply.want && (ok != reply.ok || !bytes.Equal(payload, replyPayload)) {
+						err = fmt.Errorf("reply lost: ok=%v payload=%x", ok, payload)
+					}
+					result <- err
+				}()
+				select {
+				case r := <-direction.to.requests:
+					if r == nil || r.Type != "fixture-global@example.com" || r.WantReply != reply.want || !bytes.Equal(r.Payload, []byte{0, 1, 255}) {
+						t.Fatalf("unexpected relayed request: %+v", r)
+					}
+					if reply.want {
+						if err := r.Reply(reply.ok, replyPayload); err != nil {
+							t.Fatal(err)
+						}
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("generic request did not relay")
+				}
+				if err := <-result; err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func TestRealOpenSSHExecBinaryAndPTY(t *testing.T) {

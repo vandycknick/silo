@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use prost_types::Timestamp;
@@ -14,6 +14,8 @@ use tokio::sync::watch;
 
 const TIMESTAMP_MIN_SECONDS: i64 = -62_135_596_800;
 const TIMESTAMP_MAX_SECONDS: i64 = 253_402_300_799;
+const SSH_VERIFICATION_VALIDITY: Duration = Duration::from_secs(65);
+const SSH_VERIFICATION_PENDING: &str = "SSH listener verification pending";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
@@ -27,6 +29,8 @@ pub(crate) enum StoreError {
     IdentityMismatch,
     #[error("unable to calculate observation freshness deadline")]
     Clock,
+    #[error("SSH verification epoch exhausted")]
+    SshEpochExhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +44,29 @@ pub(crate) enum WaitOutcome {
 pub(crate) struct ReadyAgentIdentity {
     pub(crate) instance_id: uuid::Uuid,
     pub(crate) boot_id: uuid::Uuid,
+}
+
+/// Host-owned identity of one eligible listener. Epochs prevent A→B→A races.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SshVerificationTarget {
+    pub(crate) epoch: u64,
+    pub(crate) identity: ReadyAgentIdentity,
+    pub(crate) backend: String,
+    pub(crate) port: u32,
+    pub(crate) host_public_key: String,
+}
+
+#[derive(Debug, Clone)]
+enum SshVerificationOutcome {
+    Pending,
+    Verified { deadline: Instant },
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct SshVerification {
+    target: Arc<SshVerificationTarget>,
+    outcome: SshVerificationOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +97,8 @@ struct State {
     agent_services: Vec<String>,
     stopping: bool,
     last_log_snapshot: Option<StateLogSnapshot>,
+    ssh_epoch: u64,
+    ssh_verification: Option<SshVerification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +160,8 @@ impl InstanceStore {
             agent_services: Vec::new(),
             stopping: false,
             last_log_snapshot: None,
+            ssh_epoch: 0,
+            ssh_verification: None,
         };
         state.last_log_snapshot = Some(state_log_snapshot(&state, Instant::now()));
         Self {
@@ -192,6 +223,48 @@ impl InstanceStore {
             .lock()
             .map(|state| readiness(&state, Instant::now()))
             .map_err(|_| StoreError::Poisoned)
+    }
+
+    pub(crate) fn ssh_verification_target(
+        &self,
+    ) -> Result<Option<Arc<SshVerificationTarget>>, StoreError> {
+        let state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
+        Ok(state
+            .ssh_verification
+            .as_ref()
+            .filter(|verification| ssh_target_matches(&state, &verification.target, Instant::now()))
+            .map(|verification| Arc::clone(&verification.target)))
+    }
+
+    pub(crate) fn complete_ssh_verification(
+        &self,
+        target: &SshVerificationTarget,
+        result: Result<(), String>,
+    ) -> Result<(), StoreError> {
+        self.mutate_if(|state| {
+            let now = Instant::now();
+            if !state.ssh_verification.as_ref().is_some_and(|verification| {
+                verification.target.as_ref() == target && ssh_target_matches(state, target, now)
+            }) {
+                return Ok(false);
+            }
+            let outcome = match result {
+                Ok(()) => SshVerificationOutcome::Verified {
+                    deadline: now
+                        .checked_add(SSH_VERIFICATION_VALIDITY)
+                        .ok_or(StoreError::Clock)?,
+                },
+                Err(message) => SshVerificationOutcome::Failed(truncate(
+                    message,
+                    protocol::MAX_DIAGNOSTIC_BYTES,
+                )),
+            };
+            let Some(verification) = state.ssh_verification.as_mut() else {
+                return Ok(false);
+            };
+            verification.outcome = outcome;
+            Ok(true)
+        })
     }
 
     pub(crate) fn has_identity(&self) -> Result<bool, StoreError> {
@@ -267,9 +340,18 @@ impl InstanceStore {
         let report = status
             .report
             .ok_or_else(|| StoreError::Validation("report is required".to_string()))?;
+        // Keep the guest report intact, but never consume its kex_verified testimony.
         let observation = observation(report, freshness)?;
 
         self.mutate(|state| {
+            // A new receipt cannot revive evidence whose previous receipt expired.
+            if state
+                .status
+                .as_ref()
+                .is_some_and(|status| status.deadline <= Instant::now())
+            {
+                invalidate_ssh_verification(state)?;
+            }
             if let Some(current) = &state.identity {
                 if current.instance_id != identity.instance_id
                     || current.boot_id != identity.boot_id
@@ -330,6 +412,7 @@ impl InstanceStore {
                 state.status = None;
                 state.metrics = None;
                 state.agent_services.clear();
+                invalidate_ssh_verification(&mut state)?;
                 Err(StoreError::IdentityMismatch)
             } else {
                 state.metrics = Some(observation);
@@ -355,13 +438,26 @@ impl InstanceStore {
         &self,
         update: impl FnOnce(&mut State) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
+        self.mutate_if(|state| {
+            update(state)?;
+            Ok(true)
+        })
+    }
+
+    fn mutate_if(
+        &self,
+        update: impl FnOnce(&mut State) -> Result<bool, StoreError>,
+    ) -> Result<(), StoreError> {
         let (before, after) = {
             let mut state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
             let before = state
                 .last_log_snapshot
                 .clone()
                 .unwrap_or_else(|| state_log_snapshot(&state, Instant::now()));
-            update(&mut state)?;
+            if !update(&mut state)? {
+                return Ok(());
+            }
+            refresh_ssh_verification(&mut state, Instant::now())?;
             let after = state_log_snapshot(&state, Instant::now());
             state.last_log_snapshot = Some(after.clone());
             (before, after)
@@ -431,8 +527,130 @@ fn ready_agent_identity_from_snapshot(snapshot: &StateLogSnapshot) -> Option<Rea
 }
 
 fn ready_agent_identity(state: &State, now: Instant) -> Option<ReadyAgentIdentity> {
-    let snapshot = state_log_snapshot(state, now);
-    ready_agent_identity_from_snapshot(&snapshot)
+    if !readiness_detail(state, now).0 {
+        return None;
+    }
+    identity_from_state(state)
+}
+
+fn identity_from_state(state: &State) -> Option<ReadyAgentIdentity> {
+    let identity = state.identity.as_ref()?;
+    Some(ReadyAgentIdentity {
+        instance_id: uuid::Uuid::parse_str(identity.instance_id.as_deref()?).ok()?,
+        boot_id: uuid::Uuid::parse_str(identity.boot_id.as_deref()?).ok()?,
+    })
+}
+
+fn eligible_ssh(state: &State, now: Instant) -> Option<&protocol::v1::SshListenerReport> {
+    if !state.agent_enabled
+        || state.vm_state != VmState::Running
+        || state.stopping
+        || state.connection.state != Some(AgentConnectionState::Responsive as i32)
+    {
+        return None;
+    }
+    let status = state.status.as_ref()?;
+    if status.deadline <= now || status.value.state != Some(AgentStatusState::Ready as i32) {
+        return None;
+    }
+    status.value.ssh.as_ref().filter(|ssh| ssh.config_verified)
+}
+
+fn ssh_target_matches(state: &State, target: &SshVerificationTarget, now: Instant) -> bool {
+    state.ssh_epoch == target.epoch
+        && identity_from_state(state).as_ref() == Some(&target.identity)
+        && eligible_ssh(state, now).is_some_and(|ssh| {
+            ssh.backend == target.backend
+                && ssh.port == target.port
+                && ssh.host_public_key == target.host_public_key
+        })
+}
+
+fn invalidate_ssh_verification(state: &mut State) -> Result<(), StoreError> {
+    if state.ssh_verification.is_some() {
+        state.ssh_epoch = state
+            .ssh_epoch
+            .checked_add(1)
+            .ok_or(StoreError::SshEpochExhausted)?;
+        state.ssh_verification = None;
+    }
+    Ok(())
+}
+
+fn refresh_ssh_verification(state: &mut State, now: Instant) -> Result<(), StoreError> {
+    if state
+        .ssh_verification
+        .as_ref()
+        .is_some_and(|verification| ssh_target_matches(state, &verification.target, now))
+    {
+        return Ok(());
+    }
+    invalidate_ssh_verification(state)?;
+    let Some(ssh) = eligible_ssh(state, now) else {
+        return Ok(());
+    };
+    let Some(identity) = identity_from_state(state) else {
+        return Ok(());
+    };
+    let epoch = state
+        .ssh_epoch
+        .checked_add(1)
+        .ok_or(StoreError::SshEpochExhausted)?;
+    let target = Arc::new(SshVerificationTarget {
+        epoch,
+        identity,
+        backend: ssh.backend.clone(),
+        port: ssh.port,
+        host_public_key: ssh.host_public_key.clone(),
+    });
+    state.ssh_epoch = epoch;
+    state.ssh_verification = Some(SshVerification {
+        target,
+        outcome: SshVerificationOutcome::Pending,
+    });
+    Ok(())
+}
+
+/// Borrow the guest report, overriding only host-derived SSH readiness.
+struct EffectiveStatus<'a> {
+    state: Option<i32>,
+    code: Option<&'a str>,
+    message: Option<&'a str>,
+    kex_verified: bool,
+}
+
+fn effective_status<'a>(
+    state: &'a State,
+    report: &'a AgentStatusReport,
+    now: Instant,
+) -> EffectiveStatus<'a> {
+    let verification = state
+        .ssh_verification
+        .as_ref()
+        .filter(|verification| ssh_target_matches(state, &verification.target, now));
+    let kex_verified = verification.is_some_and(|verification| {
+        matches!(verification.outcome, SshVerificationOutcome::Verified { deadline } if deadline > now)
+    });
+    if report.state == Some(AgentStatusState::Ready as i32) && report.ssh.is_some() && !kex_verified
+    {
+        let message = match verification.map(|verification| &verification.outcome) {
+            Some(SshVerificationOutcome::Failed(message)) => message.as_str(),
+            _ => SSH_VERIFICATION_PENDING,
+        };
+        EffectiveStatus {
+            state: Some(AgentStatusState::Starting as i32),
+            code: Some("SSH_NOT_READY"),
+            message: Some(message),
+            kex_verified,
+        }
+    } else {
+        EffectiveStatus {
+            state: report.state,
+            code: report.code.as_deref(),
+            message: report.message.as_deref(),
+            kex_verified,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -472,7 +690,10 @@ fn observation<T>(value: T, freshness: Duration) -> Result<Observation<T>, Store
 fn state_log_snapshot(state: &State, now: Instant) -> StateLogSnapshot {
     let (ready, readiness_reason) = readiness_detail(state, now);
     let identity = state.identity.as_ref();
-    let report = state.status.as_ref().map(|status| &status.value);
+    let report = state
+        .status
+        .as_ref()
+        .map(|status| effective_status(state, &status.value, now));
     StateLogSnapshot {
         machine_id: state.machine_id.clone(),
         name: state.name.clone(),
@@ -487,10 +708,15 @@ fn state_log_snapshot(state: &State, now: Instant) -> StateLogSnapshot {
         agent_version: identity.and_then(|identity| identity.version.clone()),
         agent_boot_id: identity.and_then(|identity| identity.boot_id.clone()),
         agent_status: report
+            .as_ref()
             .and_then(|report| report.state)
             .and_then(|value| AgentStatusState::try_from(value).ok()),
-        agent_code: report.and_then(|report| report.code.clone()),
-        agent_message: report.and_then(|report| report.message.clone()),
+        agent_code: report
+            .as_ref()
+            .and_then(|report| report.code.map(str::to_owned)),
+        agent_message: report
+            .as_ref()
+            .and_then(|report| report.message.map(str::to_owned)),
         ready,
         readiness_reason,
     }
@@ -621,11 +847,6 @@ fn validate_status_report(report: &AgentStatusReport) -> Result<(), StoreError> 
             || russh::keys::PublicKey::from_openssh(&ssh.host_public_key).is_err()
         {
             return Err(invalid("invalid SSH listener descriptor"));
-        }
-        if report.state == Some(AgentStatusState::Ready as i32) && !ssh.kex_verified {
-            return Err(invalid(
-                "SSH listener has not completed host-origin KEX verification",
-            ));
         }
     }
     validate_timestamp("status.observed_at", report.observed_at.as_ref())?;
@@ -1059,13 +1280,7 @@ fn readiness(state: &State, now: Instant) -> WaitOutcome {
     if matches!(state.vm_state, VmState::Stopped | VmState::Failed) {
         return WaitOutcome::Terminal;
     }
-    let ready = state.vm_state == VmState::Running
-        && (!state.agent_enabled
-            || state.status.as_ref().is_some_and(|status| {
-                !state.stopping
-                    && status.deadline > now
-                    && status.value.state == Some(AgentStatusState::Ready as i32)
-            }));
+    let ready = readiness_detail(state, now).0;
     if ready {
         WaitOutcome::Ready
     } else {
@@ -1145,12 +1360,20 @@ fn status_observation(
     status: &Observation<AgentStatusReport>,
     now: Instant,
 ) -> AgentStatusObservation {
+    let effective = effective_status(state, &status.value, now);
+    let mut report = status.value.clone();
+    report.state = effective.state;
+    report.code = effective.code.map(str::to_owned);
+    report.message = effective.message.map(str::to_owned);
+    if let Some(ssh) = &mut report.ssh {
+        ssh.kex_verified = effective.kex_verified;
+    }
     AgentStatusObservation {
         received_at: Some(timestamp(status.received_at)),
         stale_at: Some(timestamp(status.stale_at)),
         freshness: Some(freshness(state, status.deadline, now) as i32),
         stale_reason: stale_reason(state, status.deadline, now).map(|reason| reason as i32),
-        report: Some(status.value.clone()),
+        report: Some(report),
     }
 }
 
@@ -1180,16 +1403,16 @@ fn readiness_detail(state: &State, now: Instant) -> (bool, ReadinessReason) {
             Some(status) if state.stopping || status.deadline <= now => {
                 (false, ReadinessReason::AgentStatusStale)
             }
-            Some(status) if status.value.state == Some(AgentStatusState::Starting as i32) => {
-                (false, ReadinessReason::GuestStarting)
-            }
-            Some(status) if status.value.state == Some(AgentStatusState::Failed as i32) => {
-                (false, ReadinessReason::GuestFailed)
-            }
-            Some(status) if status.value.state == Some(AgentStatusState::Ready as i32) => {
-                (true, ReadinessReason::GuestReportedReady)
-            }
-            _ => (false, ReadinessReason::AgentUnavailable),
+            Some(status) => match effective_status(state, &status.value, now)
+                .state
+                .and_then(|value| AgentStatusState::try_from(value).ok())
+            {
+                Some(AgentStatusState::Starting) => (false, ReadinessReason::GuestStarting),
+                Some(AgentStatusState::Failed) => (false, ReadinessReason::GuestFailed),
+                Some(AgentStatusState::Ready) => (true, ReadinessReason::GuestReportedReady),
+                _ => (false, ReadinessReason::AgentUnavailable),
+            },
+            None => (false, ReadinessReason::AgentUnavailable),
         },
     }
 }
@@ -1274,14 +1497,382 @@ mod tests {
             config_verified: true,
             kex_verified: false,
         });
-        assert!(crate::state::validate_status_report(&report).is_err());
+        assert!(crate::state::validate_status_report(&report).is_ok());
         report.state = Some(AgentStatusState::Starting as i32);
         assert!(crate::state::validate_status_report(&report).is_ok());
         report.ssh.as_mut().unwrap().kex_verified = true;
         report.state = Some(AgentStatusState::Ready as i32);
         assert!(crate::state::validate_status_report(&report).is_ok());
+        report.ssh.as_mut().unwrap().config_verified = false;
+        assert!(crate::state::validate_status_report(&report).is_err());
+        report.ssh.as_mut().unwrap().config_verified = true;
+        report.ssh.as_mut().unwrap().backend = "unsupported".into();
+        assert!(crate::state::validate_status_report(&report).is_err());
+        report.ssh.as_mut().unwrap().backend = "native".into();
+        report.ssh.as_mut().unwrap().port = 23;
+        assert!(crate::state::validate_status_report(&report).is_err());
+        report.ssh.as_mut().unwrap().port = 22;
         report.ssh.as_mut().unwrap().host_public_key = "corrupt".into();
         assert!(crate::state::validate_status_report(&report).is_err());
+    }
+
+    const SSH_INSTANCE: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn ssh_status(seed: u8) -> AgentStatus {
+        let mut status = ready_status(SSH_INSTANCE);
+        let key = russh::keys::PrivateKey::from(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]),
+        );
+        status.report.as_mut().unwrap().ssh = Some(protocol::v1::SshListenerReport {
+            backend: "openssh".into(),
+            port: 22,
+            host_public_key: key.public_key().to_openssh().unwrap(),
+            config_verified: true,
+            // Deliberately untrusted guest testimony.
+            kex_verified: true,
+        });
+        status
+    }
+
+    fn ssh_store() -> InstanceStore {
+        let store = new_instance_store("machine-1".into(), "ssh-test".into(), true);
+        store.set_vm_state(VmState::Running, "running").unwrap();
+        store
+            .observe_status(ssh_status(1), Duration::from_secs(300))
+            .unwrap();
+        store
+    }
+
+    fn projected_report(store: &InstanceStore) -> AgentStatusReport {
+        let status = store.status().unwrap();
+        let Some(protocol::v1::host_agent::Mode::Enabled(agent)) = status.agent.unwrap().mode
+        else {
+            panic!("enabled agent required");
+        };
+        agent.status.unwrap().report.unwrap()
+    }
+
+    fn metrics_for(instance: &str) -> protocol::v1::AgentMetrics {
+        protocol::v1::AgentMetrics {
+            agent_instance_id: Some(instance.into()),
+            report: Some(protocol::v1::AgentMetricReport {
+                observed_at: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+                snapshot: Some(protocol::v1::MetricSnapshot::default()),
+            }),
+        }
+    }
+
+    #[test]
+    fn host_evidence_controls_every_readiness_projection_and_notifications() {
+        let store = ssh_store();
+        let target = store.ssh_verification_target().unwrap().unwrap();
+        let mut generation = store.subscribe();
+        let mut identity = store.subscribe_ready_agent_identity();
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+        assert!(store.ready_agent_identity().is_err());
+        assert!(identity.borrow().is_none());
+        let pending = projected_report(&store);
+        assert_eq!(pending.state, Some(AgentStatusState::Starting as i32));
+        assert_eq!(pending.code.as_deref(), Some("SSH_NOT_READY"));
+        assert_eq!(
+            pending.message.as_deref(),
+            Some(crate::state::SSH_VERIFICATION_PENDING)
+        );
+        assert!(!pending.ssh.unwrap().kex_verified);
+        assert_eq!(
+            logged_snapshot(&store).agent_status,
+            Some(AgentStatusState::Starting)
+        );
+        let mut unverified_guest = ssh_status(1);
+        unverified_guest
+            .report
+            .as_mut()
+            .unwrap()
+            .ssh
+            .as_mut()
+            .unwrap()
+            .kex_verified = false;
+        store
+            .observe_status(unverified_guest, Duration::from_secs(300))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &target,
+            &store.ssh_verification_target().unwrap().unwrap()
+        ));
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+
+        store.complete_ssh_verification(&target, Ok(())).unwrap();
+        assert!(generation.has_changed().unwrap());
+        generation.borrow_and_update();
+        assert!(identity.has_changed().unwrap());
+        assert_eq!(
+            identity.borrow_and_update().as_ref(),
+            Some(&target.identity)
+        );
+        assert_eq!(store.ready_agent_identity().unwrap(), target.identity);
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+        let verified = projected_report(&store);
+        assert_eq!(verified.state, Some(AgentStatusState::Ready as i32));
+        assert!(verified.ssh.unwrap().kex_verified);
+        assert!(logged_snapshot(&store).ready);
+
+        let error = "é".repeat(protocol::MAX_DIAGNOSTIC_BYTES);
+        store
+            .complete_ssh_verification(&target, Err(error))
+            .unwrap();
+        let failed = projected_report(&store);
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+        assert!(!failed.ssh.unwrap().kex_verified);
+        assert!(failed.message.unwrap().len() <= protocol::MAX_DIAGNOSTIC_BYTES);
+        assert!(identity.borrow().is_none());
+        store
+            .observe_status(ssh_status(1), Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+        assert_eq!(
+            projected_report(&store).code.as_deref(),
+            Some("SSH_NOT_READY")
+        );
+    }
+
+    #[test]
+    fn verification_completion_preserves_guest_receipts_and_metrics() {
+        let store = ssh_store();
+        store
+            .observe_metrics(metrics_for(SSH_INSTANCE), Duration::from_secs(300))
+            .unwrap();
+        let before = store.state.lock().expect("state lock").clone();
+        let target = store.ssh_verification_target().unwrap().unwrap();
+        store.complete_ssh_verification(&target, Ok(())).unwrap();
+        store
+            .complete_ssh_verification(&target, Err("probe failed".into()))
+            .unwrap();
+        let after = store.state.lock().expect("state lock");
+        let old = before.status.as_ref().unwrap();
+        let new = after.status.as_ref().unwrap();
+        assert_eq!(old.value, new.value);
+        assert_eq!(old.received_at, new.received_at);
+        assert_eq!(old.stale_at, new.stale_at);
+        assert_eq!(old.deadline, new.deadline);
+        assert_eq!(before.connection, after.connection);
+        let old = before.metrics.as_ref().unwrap();
+        let new = after.metrics.as_ref().unwrap();
+        assert_eq!(old.value, new.value);
+        assert_eq!(old.received_at, new.received_at);
+        assert_eq!(old.stale_at, new.stale_at);
+        assert_eq!(old.deadline, new.deadline);
+    }
+
+    #[test]
+    fn identical_heartbeats_and_metrics_reuse_target_and_do_not_renew_evidence() {
+        let store = ssh_store();
+        let target = store.ssh_verification_target().unwrap().unwrap();
+        store.complete_ssh_verification(&target, Ok(())).unwrap();
+        let deadline = {
+            let state = store.state.lock().expect("state lock");
+            let crate::state::SshVerificationOutcome::Verified { deadline } =
+                state.ssh_verification.as_ref().unwrap().outcome
+            else {
+                panic!("verified");
+            };
+            deadline
+        };
+        let mut heartbeat = ssh_status(1);
+        heartbeat
+            .report
+            .as_mut()
+            .unwrap()
+            .observed_at
+            .as_mut()
+            .unwrap()
+            .seconds = 2;
+        heartbeat
+            .report
+            .as_mut()
+            .unwrap()
+            .ssh
+            .as_mut()
+            .unwrap()
+            .kex_verified = false;
+        store
+            .observe_status(heartbeat, Duration::from_secs(300))
+            .unwrap();
+        store
+            .observe_metrics(metrics_for(SSH_INSTANCE), Duration::from_secs(300))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &target,
+            &store.ssh_verification_target().unwrap().unwrap()
+        ));
+        let state = store.state.lock().expect("state lock");
+        assert!(crate::state::readiness_detail(&state, deadline - Duration::from_nanos(1)).0);
+        assert!(!crate::state::readiness_detail(&state, deadline).0);
+        assert_eq!(
+            crate::state::readiness(&state, deadline),
+            WaitOutcome::TimedOut
+        );
+        assert!(!crate::state::state_log_snapshot(&state, deadline).ready);
+        assert!(crate::state::ready_agent_identity(&state, deadline).is_none());
+        let report =
+            crate::state::status_observation(&state, state.status.as_ref().unwrap(), deadline)
+                .report
+                .unwrap();
+        assert_eq!(report.code.as_deref(), Some("SSH_NOT_READY"));
+        assert!(!report.ssh.unwrap().kex_verified);
+        let crate::state::SshVerificationOutcome::Verified {
+            deadline: unchanged,
+        } = state.ssh_verification.as_ref().unwrap().outcome
+        else {
+            panic!("verified");
+        };
+        assert_eq!(unchanged, deadline);
+    }
+
+    #[test]
+    fn listener_and_identity_replacements_reject_old_completions_including_a_b_a() {
+        let store = ssh_store();
+        let original = store.ssh_verification_target().unwrap().unwrap();
+        store.complete_ssh_verification(&original, Ok(())).unwrap();
+        for replacement in [
+            ssh_status(2),
+            {
+                let mut status = ssh_status(1);
+                status
+                    .report
+                    .as_mut()
+                    .unwrap()
+                    .ssh
+                    .as_mut()
+                    .unwrap()
+                    .backend = "native".into();
+                status
+            },
+            {
+                let mut status = ssh_status(1);
+                status.identity.as_mut().unwrap().boot_id =
+                    Some("00000000-0000-4000-8000-000000000003".into());
+                status
+            },
+            {
+                let mut status = ssh_status(1);
+                status.identity.as_mut().unwrap().instance_id =
+                    Some("00000000-0000-4000-8000-000000000003".into());
+                status
+            },
+            ssh_status(1),
+        ] {
+            let prior = store.ssh_verification_target().unwrap().unwrap();
+            store
+                .observe_status(replacement, Duration::from_secs(300))
+                .unwrap();
+            let current = store.ssh_verification_target().unwrap().unwrap();
+            assert!(current.epoch > prior.epoch);
+            let generation = store.subscribe();
+            store.complete_ssh_verification(&original, Ok(())).unwrap();
+            store.complete_ssh_verification(&prior, Ok(())).unwrap();
+            assert!(!generation.has_changed().unwrap());
+            assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+        }
+    }
+
+    #[test]
+    fn ineligible_transitions_revoke_evidence_without_repeated_epoch_churn() {
+        for transition in 0..7 {
+            let store = ssh_store();
+            let target = store.ssh_verification_target().unwrap().unwrap();
+            store.complete_ssh_verification(&target, Ok(())).unwrap();
+            match transition {
+                0 => store.agent_failure("connection lost").unwrap(),
+                1 => store.agent_connecting().unwrap(),
+                2 => store.set_vm_state(VmState::Stopping, "stopping").unwrap(),
+                3 => {
+                    let mut status = ssh_status(1);
+                    status.report.as_mut().unwrap().ssh = None;
+                    store
+                        .observe_status(status, Duration::from_secs(300))
+                        .unwrap();
+                    // The generic no-SSH status contract is unchanged.
+                    assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+                }
+                4 | 5 => {
+                    let mut status = ssh_status(1);
+                    let report = status.report.as_mut().unwrap();
+                    report.state = Some(if transition == 4 {
+                        AgentStatusState::Starting
+                    } else {
+                        AgentStatusState::Failed
+                    } as i32);
+                    report.code = Some("GUEST_DIAGNOSTIC".into());
+                    report.message = Some("preserve the raw diagnostic".into());
+                    store
+                        .observe_status(status, Duration::from_secs(300))
+                        .unwrap();
+                    let projected = projected_report(&store);
+                    assert_eq!(projected.code, Some("GUEST_DIAGNOSTIC".into()));
+                    assert_eq!(
+                        projected.message,
+                        Some("preserve the raw diagnostic".into())
+                    );
+                }
+                6 => assert!(matches!(
+                    store.observe_metrics(
+                        metrics_for("00000000-0000-4000-8000-000000000003"),
+                        Duration::from_secs(300),
+                    ),
+                    Err(StoreError::IdentityMismatch)
+                )),
+                _ => unreachable!(),
+            }
+            assert!(store.ssh_verification_target().unwrap().is_none());
+            let generation = store.subscribe();
+            store.complete_ssh_verification(&target, Ok(())).unwrap();
+            assert!(!generation.has_changed().unwrap());
+            let epoch = store.state.lock().expect("state lock").ssh_epoch;
+            store.agent_connecting().unwrap();
+            store.agent_failure("still unavailable").unwrap();
+            assert_eq!(store.state.lock().expect("state lock").ssh_epoch, epoch);
+        }
+    }
+
+    #[test]
+    fn expired_status_cannot_be_revived_by_completion_or_a_new_receipt() {
+        let store = ssh_store();
+        let target = store.ssh_verification_target().unwrap().unwrap();
+        store.complete_ssh_verification(&target, Ok(())).unwrap();
+        store
+            .state
+            .lock()
+            .expect("state lock")
+            .status
+            .as_mut()
+            .unwrap()
+            .deadline = Instant::now();
+        assert!(store.ssh_verification_target().unwrap().is_none());
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+        let generation = store.subscribe();
+        store.complete_ssh_verification(&target, Ok(())).unwrap();
+        assert!(!generation.has_changed().unwrap());
+        store
+            .observe_status(ssh_status(1), Duration::from_secs(300))
+            .unwrap();
+        let replacement = store.ssh_verification_target().unwrap().unwrap();
+        assert!(replacement.epoch > target.epoch);
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+    }
+
+    #[test]
+    fn epoch_exhaustion_is_an_error_not_wrapping_or_reusing_evidence() {
+        let store = ssh_store();
+        store.state.lock().expect("state lock").ssh_epoch = u64::MAX;
+        assert!(matches!(
+            store.agent_failure("invalidate"),
+            Err(StoreError::SshEpochExhausted)
+        ));
+        assert!(store.ssh_verification_target().unwrap().is_none());
+        assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
     }
 
     fn logged_snapshot(store: &InstanceStore) -> StateLogSnapshot {

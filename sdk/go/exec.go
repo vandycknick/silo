@@ -28,6 +28,7 @@ type execConfig struct {
 	TTY            *bool             `json:"tty,omitempty"`
 	Term           *string           `json:"term,omitempty"`
 	InitialPTYSize *ptySizeWire      `json:"initial_pty_size,omitempty"`
+	SSHShell       bool              `json:"ssh_shell,omitempty"`
 	error          error
 }
 type ExecOption func(*execConfig)
@@ -243,7 +244,39 @@ func (m *Machine) Spawn(ctx context.Context, program string, args []string, opts
 	if err != nil {
 		return nil, err
 	}
-	if err = validateContext(ctx); err != nil {
+	return m.spawn(ctx, request)
+}
+
+// SpawnSSHShell opens a certificate-authenticated login shell over guest vsock
+// port 22. It uses the existing immutable host-key pin, not agent readiness or
+// the guest process RPC. The SSH listener must remain available independently
+// for this to work during an agent outage.
+//
+// The shell has a PTY and streaming stdin. User, terminal type, initial PTY size
+// and SSH environment requests are supported; execution-only options such as
+// working directory, arguments and timeout are rejected. SSH environment
+// requests remain subject to the guest server's policy.
+func (m *Machine) SpawnSSHShell(ctx context.Context, opts ...ExecOption) (*ExecutionSession, error) {
+	tty := true
+	config := execConfig{SSHShell: true, TTY: &tty, PipeStdin: true, Env: map[string]string{}}
+	for _, option := range opts {
+		if option == nil {
+			return nil, newError(ErrorInvalidArgument, "", "SSH shell option must not be nil")
+		}
+		option(&config)
+	}
+	if config.error != nil {
+		return nil, config.error
+	}
+	request, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	return m.spawn(ctx, request)
+}
+
+func (m *Machine) spawn(ctx context.Context, request []byte) (*ExecutionSession, error) {
+	if err := validateContext(ctx); err != nil {
 		return nil, err
 	}
 	m.mutex.RLock()
