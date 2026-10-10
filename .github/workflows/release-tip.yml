@@ -234,37 +234,37 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Download Linux amd64 core artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-linux-amd64-gnu-core
           path: target/packages/${{ needs.prepare.outputs.version }}/linux-amd64-gnu
 
       - name: Download Linux arm64 core artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-linux-arm64-gnu-core
           path: target/packages/${{ needs.prepare.outputs.version }}/linux-arm64-gnu
 
       - name: Download macOS arm64 core artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-darwin-arm64-core
           path: target/packages/${{ needs.prepare.outputs.version }}/darwin-arm64
 
       - name: Download Linux amd64 native SDK artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-linux-amd64-gnu-sdk-native
           path: target/packages/${{ needs.prepare.outputs.version }}/linux-amd64-gnu
 
       - name: Download Linux arm64 native SDK artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-linux-arm64-gnu-sdk-native
           path: target/packages/${{ needs.prepare.outputs.version }}/linux-arm64-gnu
 
       - name: Download macOS arm64 native SDK artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-darwin-arm64-sdk-native
           path: target/packages/${{ needs.prepare.outputs.version }}/darwin-arm64
@@ -307,19 +307,19 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Download Linux amd64 native SDK artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-linux-amd64-gnu-sdk-native
           path: target/packages/${{ needs.prepare.outputs.version }}/linux-amd64-gnu
 
       - name: Download Linux arm64 native SDK artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-linux-arm64-gnu-sdk-native
           path: target/packages/${{ needs.prepare.outputs.version }}/linux-arm64-gnu
 
       - name: Download macOS arm64 native SDK artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: silo-darwin-arm64-sdk-native
           path: target/packages/${{ needs.prepare.outputs.version }}/darwin-arm64
