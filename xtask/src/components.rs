@@ -193,8 +193,13 @@ pub fn test_integration(
     command::run(cargo)?;
 
     let mut go = Command::new("go");
-    go.current_dir(workspace_root.join("net/netd"))
-        .args(["test", "-race", "./..."]);
+    go.current_dir(workspace_root.join("net/netd")).arg("test");
+    // The darwin/arm64 race runtime slows netd's gVisor stack by orders of
+    // magnitude, past every real-time budget; Linux hosts carry the race lane.
+    if host != HostTarget::MacosArm64 {
+        go.arg("-race");
+    }
+    go.arg("./...");
     command::run(go)
 }
 
