@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import stat
 import subprocess
 import time
@@ -109,3 +110,30 @@ def test_cli_with_other_home_fails_closed(
     assert "silod is bound to another Home/config root" in result.stderr
     dry_run = silo.run("create", basic_image, "--dry-run", "--format", "json", env=env)
     assert dry_run.returncode == 0
+
+
+def test_daemon_managed_disk_create_update_remove(
+    daemon: Silod, silo: Silo, workspace: Workspace, basic_image: str,
+) -> None:
+    daemon.start()
+    daemon.wait_core("ready")
+    source = silo.create(
+        "disk-a", basic_image, "--cpus", "1", "--memory", "512mb",
+        "--network", "none",
+    )
+    assert source["state"] == "stopped"
+    disk = workspace.root / "disk.img"
+    shutil.copyfile(source["rootfs"]["root_disk_path"], disk)
+    created = silo.create(
+        "disk-b", f"disk:{disk}", "--cpus", "2", "--no-agent",
+        "--label", "k=v", "--network", "none",
+    )
+    assert created["state"] == "stopped"
+    assert created["resources"]["cpus"] == 2
+    assert created["labels"] == {"k": "v"}
+    assert created["rootfs"]["source_kind"] == "disk"
+    silo.run("set", "disk-b", "cpus=1")
+    assert silo.show("disk-b")["resources"]["cpus"] == 1
+    silo.rm("disk-b")
+    assert silo.run("show", "disk-b", expect=1).returncode == 1
+    assert [machine["name"] for machine in silo.ls()] == ["disk-a"]

@@ -22,6 +22,12 @@ ALPINE_SHA256: dict[str, str] = {
 APK_SHA256: dict[tuple[str, str, str], str] = {
     ("ca-certificates", "20260909-r0", "x86_64"): "21cbb1f7b825c7fee9fe469e0ee18f61da7fe62075796daf8c94b5da74b355d3",
     ("ca-certificates", "20260909-r0", "aarch64"): "e229a539af3c7c9042ffd359089305fa9e98bd778a6b53e6cb077be5506d9526",
+    ("iproute2-ss", "6.11.0-r0", "x86_64"): "2dd321b88e0509b41c308fa9481929b3073260c12e21b3b1d55bfe5d0bb1c302",
+    ("iproute2-ss", "6.11.0-r0", "aarch64"): "212fb91f158d087ce6ce68a4aac5edc7c971b29fa457daee69703bfdc104a6cb",
+    ("libmnl", "1.0.5-r2", "x86_64"): "0de58a7968c96825f7ad1205ae0d18dd4d96c37db9dca31fee4727f6b08bc308",
+    ("libmnl", "1.0.5-r2", "aarch64"): "a746622c068d36803f62a208b9cd4480565b55a5e1290d475599f94822ae0c24",
+    ("libcap2", "2.78-r0", "x86_64"): "a2160f94232206985c3656fe4108bb7b25cf56cfda83b8488791b225cc6e7ed1",
+    ("libcap2", "2.78-r0", "aarch64"): "7ca70d1d6d2822b108efd9c5909be8d7ffa86031c9dea1c775dd19439d812f52",
 }
 
 
@@ -285,4 +291,18 @@ CA_TRUST = ImageSpec(
     remove=BASIC.remove,
     append=BASIC.append,
     packages=(ApkPackage("ca-certificates", "20260909-r0"),),
+)
+
+
+IPROUTE = ImageSpec(
+    name="iproute",
+    files=BASIC.files,
+    dirs=BASIC.dirs,
+    remove=BASIC.remove,
+    append=BASIC.append,
+    packages=(
+        ApkPackage("libmnl", "1.0.5-r2"),
+        ApkPackage("libcap2", "2.78-r0"),
+        ApkPackage("iproute2-ss", "6.11.0-r0"),
+    ),
 )

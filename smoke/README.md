@@ -104,9 +104,15 @@ verified against the per-architecture hashes in `APK_SHA256`, and their payload
 is laid down before `files`. `CA_TRUST` is BASIC plus `ca-certificates`, which
 gives the guest the `update-ca-certificates` trust backend the agent needs when
 a private network policy installs a certificate authority. Adding a package
-means pinning its hashes for both architectures.
+means pinning its hashes for both architectures. `IPROUTE` adds `iproute2-ss`
+(with `libmnl` and `libcap2`) so a guest can list vsock listeners with
+`ss --vsock`; pins come from the v3.21 APKINDEX `P`/`V`/`D` fields and the
+SHA-256 of the downloaded archives.
 
-Linux trusts the registry through the workspace's `SSL_CERT_FILE`. On macOS,
+Linux trusts the registry through the workspace's `SSL_CERT_FILE`, which points
+at `<workspace>/ca-bundle.pem`: the host's CA bundle plus the suite CA, because
+that variable replaces (not extends) the trust store for Go and rustls consumers
+and `netd` still has to verify public upstreams. On macOS,
 the Rust OCI client's platform verifier ignores that variable. Trust the stable
 suite CA once in your login keychain after it has been generated (preflight
 prints the instruction):

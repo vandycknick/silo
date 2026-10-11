@@ -25,7 +25,6 @@ def test_bearer_policy_machine_starts_ready(silo: Silo, workspace: Workspace, ca
     assert stat.S_IMODE(secrets.stat().st_mode) == 0o600
     policy = workspace.root / "policy.json"
     policy.write_text('{"version":1,"endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],"credentials":[{"name":"api","kind":"bearer_token","endpoint":"api"}],"rules":[{"endpoints":["api"],"credential":"api","verdict":"allow"}]}')
-    assert json.loads(policy.read_text())["endpoints"][0]["hosts"] == ["example.com"]
     name = "policy-vm"
     silo.create(name, ca_trust_image, "--cpus", "1", "--memory", "512mb", "--vsock", "--network", "private", "--network-policy", str(policy))
     try:
@@ -38,11 +37,17 @@ def test_bearer_policy_machine_starts_ready(silo: Silo, workspace: Workspace, ca
     assert ready["state"] == "running"
     assert ready["ready"] is True
     assert silo.run("logs", name, "--stream", "network-audit").returncode == 0
-    # Upstream availability is outside this boot/audit qualification.
-    silo.exec(name, "wget", "--no-check-certificate", "-T", "15", "-O", "/dev/null", "https://example.com", expect=None)
+    # Upstream availability is outside this qualification; the audit record proves the guest
+    # trusted the injected CA (the request was decrypted) and the policy selected the credential.
+    silo.exec(name, "wget", "-T", "15", "-O", "/dev/null", "https://example.com", expect=None)
     audit = silo.run("logs", name, "--stream", "network-audit")
-    assert audit.returncode == 0
-    assert audit.stdout != ""
+    records = [json.loads(line) for line in audit.stdout.splitlines() if line.startswith("{")]
+    http = [record for record in records if record.get("family") == "http"]
+    assert len(http) == 1, records
+    assert http[0]["http"]["request"]["host"] == "example.com"
+    assert http[0]["policy"] == {"endpoint_kind": "https", "endpoint_name": "api"}
+    assert http[0]["credential"]["status"] == "selected"
+    assert http[0]["verdict"] == "allow"
     silo.stop(name)
     assert silo.show(name)["state"] == "stopped"
     silo.rm(name)

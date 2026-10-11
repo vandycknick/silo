@@ -37,10 +37,9 @@ def test_go_and_node_examples_against_vm(silo: Silo, workspace: Workspace, basic
     machine_id = silo.wait_ready(name)["id"]
     env = workspace.env(SILO_GO_FFI_PATH=str(bridge))
     example: Path = workspace.root / "shell-example"
-    # The compiler fetches public modules, not the suite's private OCI registry, and
-    # reuses the host's module/build caches instead of filling the throwaway HOME.
+    # Reuse the host's module/build caches instead of filling the throwaway HOME.
     modcache, gocache = subprocess.run(["go", "env", "GOMODCACHE", "GOCACHE"], capture_output=True, text=True, check=True, timeout=30).stdout.split()
-    build_env = workspace.env(SILO_GO_FFI_PATH=str(bridge), SSL_CERT_FILE="", SSL_CERT_DIR="", GOMODCACHE=modcache, GOCACHE=gocache)
+    build_env = workspace.env(SILO_GO_FFI_PATH=str(bridge), GOMODCACHE=modcache, GOCACHE=gocache)
     _run(workspace, ["go", "-C", "sdk/go", "build", "-o", str(example), "./examples/shell"], build_env, 0, "go-build")
     go_result = _run(workspace, [str(example), machine_id], env, 7, "go-shell")
     assert "embedded:silo" in go_result.stdout

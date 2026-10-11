@@ -1,5 +1,5 @@
 use crate::control::{socket, ControlState, Service};
-use libvm::{HostPaths, Runtime, RuntimeConfig};
+use libvm::HostPaths;
 use silo_config::GlobalConfig;
 use silod_spec::daemon::v1 as w;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -124,88 +124,6 @@ async fn stale_helper_and_public_stopping_requests_rejected() {
         uuid::Uuid::new_v4().to_string().parse().unwrap(),
     );
     assert!(state.admit(&request, false).await.is_err());
-}
-/// Real stopped disk lifecycle. Explicit assets and a real Linux root disk are required;
-/// this test never synthesizes a VMM or a disk image.
-#[tokio::test]
-#[ignore = "requires SILO_TEST_RUNTIME_ROOT and SILO_TEST_DISK_IMAGE"]
-async fn native_disk_create_inspect_update_remove() {
-    use w::machine_service_server::MachineService;
-    let root = tempfile::tempdir().unwrap();
-    let state = state(root.path());
-    let runtime_root = std::env::var_os("SILO_TEST_RUNTIME_ROOT").expect("SILO_TEST_RUNTIME_ROOT");
-    let config = RuntimeConfig::local(state.host.home()).with_runtime_root(runtime_root);
-    state
-        .components
-        .set(config.resolve_components().unwrap())
-        .unwrap();
-    let runtime = Runtime::new(config).await.unwrap();
-    state.runtime.set(runtime).unwrap();
-    let state = Service(state);
-    let disk = std::path::PathBuf::from(
-        std::env::var_os("SILO_TEST_DISK_IMAGE").expect("SILO_TEST_DISK_IMAGE"),
-    )
-    .canonicalize()
-    .unwrap();
-    let config = w::NormalizedMachineCreate {
-        name: Some("control-disk".into()),
-        process: Some(w::ProcessConfig::default()),
-        retention: w::Retention::Persistent as i32,
-        network: Some(w::ResolvedNetwork {
-            attachment: Some(w::resolved_network::Attachment::None(())),
-        }),
-        agent: Some(w::Agent {
-            mode: Some(w::agent::Mode::None(())),
-        }),
-        cpus: Some(2),
-        memory_bytes: Some(512 * 1024 * 1024),
-        ..Default::default()
-    };
-    let response = state
-        .create_machine(Request::new(w::CreateMachineRequest {
-            configuration: Some(config),
-            source: Some(w::create_machine_request::Source::DiskPath(
-                silo_vm_control::path_to_wire(&disk),
-            )),
-        }))
-        .await
-        .unwrap();
-    use futures::StreamExt;
-    let mut stream = response.into_inner();
-    let mut created = None;
-    while let Some(event) = stream.next().await {
-        if let Some(w::create_machine_event::Event::Machine(machine)) = event.unwrap().event {
-            created = Some(machine);
-        }
-    }
-    let created = created.unwrap();
-    let reference = w::MachineRef {
-        reference: Some(w::machine_ref::Reference::Id(created.id.clone())),
-    };
-    let inspected = state
-        .inspect_machine(Request::new(reference.clone()))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(inspected.name, "control-disk");
-    assert_eq!(inspected.spec.unwrap().hardware.unwrap().cpus, Some(2));
-    state
-        .update_machine(Request::new(w::UpdateMachineRequest {
-            machine: Some(reference.clone()),
-            update: Some(w::MachineUpdate {
-                name: Some("control-renamed".into()),
-                labels: Some(w::StringMap::default()),
-                ..Default::default()
-            }),
-        }))
-        .await
-        .unwrap();
-    state
-        .remove_machine(Request::new(w::RemoveMachineRequest {
-            machine: Some(reference),
-        }))
-        .await
-        .unwrap();
 }
 
 #[tokio::test]

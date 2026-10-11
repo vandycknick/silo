@@ -274,26 +274,23 @@ the current listener descriptor and process tree, not the client command name.
 
 ## Isolated Real KVM Qualification
 
-`runtime/libvm/tests/ssh_verification.rs` covers the agent-owned listener, systemd-owned listener, and systemd socket failure/recovery. The ownership controls in userdata are test-only. Each case uses a temporary Silo home, a machine-local copy of a disposable disk, one vCPU, 1 GiB, vsock, and no guest network. No existing VM or writable disk should be reused.
+Real-VM SSH qualification lives in the Python smoke suite, not in `cargo test`.
+See [the smoke suite README](../../smoke/README.md) for prerequisites, isolated
+workspaces, image configuration, and retained failure evidence.
 
-Required inputs:
+The `test_ssh_distros.py` cases qualify certificate login and persistent host keys
+across two boots using the images selected by `SILO_SMOKE_DISTRO_IMAGES`.
+The `test_ssh_systemd_owned.py` cases qualify agent-owned and systemd-owned
+vsock listeners, continued readiness, idle host CPU and descriptor usage, and
+socket failure/recovery using `SILO_SMOKE_SYSTEMD_IMAGE`.
 
-- Accessible `/dev/kvm`.
-- `SILO_TEST_RUNTIME_ROOT` pointing at a freshly built/staged **release** runtime (normally `target/silo-runtime/<runtime-target>/release`).
-- `SILO_TEST_DISK_IMAGE` pointing at a disposable systemd/OpenSSH base image with `systemd-ssh-generator`, `sshd`, `systemctl`, `journalctl`, `systemd-run`, `ss`, and `timeout`.
-
-An unset `SILO_E2E_KVM` skips these gated cases; missing prerequisites after explicitly enabling qualification fail the case. A skipped case is not qualification evidence. Run each case separately, setting the artifact variables first:
+Build and stage the runtime first, then select the SSH cases:
 
 ```bash
-SILO_E2E_KVM=1 cargo test -p libvm --test ssh_verification ssh_verification_agent_owned_real_kvm -- --exact --nocapture
-SILO_E2E_KVM=1 cargo test -p libvm --test ssh_verification ssh_verification_systemd_owned_real_kvm -- --exact --nocapture
-SILO_E2E_KVM=1 cargo test -p libvm --test ssh_verification ssh_verification_failure_recovery_real_kvm -- --exact --nocapture
+make stage
+make smoke SMOKE_ARGS="-k 'ssh_distros or ssh_systemd_owned'"
 ```
 
-The healthy cases observe 135 seconds of continued host readiness and fresh status/metrics. The agent-owned case unmasks and attempts the generated socket after readiness to demonstrate the expected EADDRINUSE loss without disrupting its sole agent-owned listener. The systemd-owned case establishes systemd ownership before the agent's bind. Each exercises certificate SSH outside the idle sample; inspections use the agent exec API, not additional SSH sessions.
-
-The recovery case creates and verifies a `systemd-run` timer to restart the socket after 75 seconds, then stops the socket through root exec. It requires `SSH_NOT_READY` within 65 seconds with fresh guest receipts, and recovery on the normal cadence within 140 seconds. It does not attempt a new SSH session while deliberately unhealthy.
-
-Evidence includes listener/process/descriptor snapshots, status and metrics receipt times, readiness transitions, and guest journal output for manual probe accounting without relying on OpenSSH log prose. Host `/proc/<pid>/stat` tick deltas are normalized to one core using `getconf CLK_TCK`, with main-thread context-switch deltas and supervisor/worker children and descriptor counts. Sustained supervisor CPU above 1% of one core fails qualification and requires profiling; compare actual idle measurements to the prior 0.02–0.03% baseline rather than claiming these changes solve interactive stalls.
-
-Each exercise is bounded to 210 seconds plus bounded stop handling, including on errors. Failed fixture artifacts are retained after teardown with `ssh-qualification.log`; successful fixtures are removed. Do not roll out or profile these changes on existing VMs without a separately coordinated restart.
+Image-dependent cases skip explicitly when their configured images are absent.
+A skipped case is not qualification evidence. Do not roll out or profile these
+changes on existing VMs without a separately coordinated restart.

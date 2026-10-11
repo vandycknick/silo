@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -12,6 +13,19 @@ from .config import RUN_ROOT_PARENT, SmokeConfig
 
 if TYPE_CHECKING:
     from .daemon import Silod
+
+
+def _system_trust_bundle() -> bytes:
+    """The host's CA bundle, so netd and SDK builds can still reach public TLS endpoints.
+
+    The suite CA is appended to it: `SSL_CERT_FILE` replaces the trust store for Go and
+    rustls-native-certs consumers instead of extending it.
+    """
+    cafile = ssl.get_default_verify_paths().cafile
+    for candidate in (cafile, "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"):
+        if candidate and Path(candidate).is_file():
+            return Path(candidate).read_bytes().rstrip(b"\n") + b"\n"
+    return b""
 
 
 class Workspace:
@@ -24,15 +38,15 @@ class Workspace:
         self.config_home = self.root / "config"
         self.run_root = self.root / "run"
         self.evidence = self.root / "evidence"
-        self._no_certs = self.root / "no-certs"
-        self._registry_ca = registry_ca.resolve()
+        self._trust_bundle = self.root / "ca-bundle.pem"
         self._machines: list[str] = []
         self._daemons: list[Silod] = []
         self._record_lock = threading.Lock()
         assert len(os.fsencode(self.run_root / "machines" / ("x" * 36) / "vsock.sock")) < 100
-        for directory in (self.user_home, self.silo_home, self.config_home, self.run_root, self.evidence, self._no_certs):
+        for directory in (self.user_home, self.silo_home, self.config_home, self.run_root, self.evidence):
             directory.mkdir(mode=0o700)
             directory.chmod(0o700)
+        self._trust_bundle.write_bytes(_system_trust_bundle() + registry_ca.read_bytes())
 
     def env(self, **overrides: str) -> dict[str, str]:
         environment = {
@@ -43,8 +57,7 @@ class Workspace:
             "SILO_RUN_ROOT": str(self.run_root),
             "SILO_RUNTIME_DIR": str(self.config.runtime_dir),
             "SILO_VIRT_BACKEND": self.config.backend,
-            "SSL_CERT_FILE": str(self._registry_ca),
-            "SSL_CERT_DIR": str(self._no_certs),
+            "SSL_CERT_FILE": str(self._trust_bundle),
             "TERM": "dumb", "NO_COLOR": "1", "RUST_LOG": "info",
         }
         for key, value in overrides.items():
