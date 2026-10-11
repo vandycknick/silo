@@ -587,9 +587,11 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("secure log");
     }
 
+    /// A stand-in monitor process. A bare `sleep` (no shell loop) dies with the
+    /// kill, so nothing inherits the test's stdout and lingers past the test.
     fn spawn_producer() -> Child {
-        Command::new("sh")
-            .args(["-c", "while :; do sleep 1; done"])
+        Command::new("sleep")
+            .arg("600")
             .spawn()
             .expect("spawn producer")
     }

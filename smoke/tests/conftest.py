@@ -52,6 +52,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def config(pytestconfig: pytest.Config) -> SmokeConfig:
     try:
         resolved = smoke_config.resolve(pytestconfig)
+        preflight.sweep_orphans()
         pytestconfig.stash[_LIVE_MARK] = preflight.check(resolved)
     except SmokeEnvironmentError as error:
         pytest.fail(str(error), pytrace=False)

@@ -73,6 +73,7 @@ impl Drop for TestEnv {
                 .unwrap_or_else(PoisonError::into_inner),
         );
         if machines.is_empty() {
+            kill_monitors_under(&self.run_root);
             return;
         }
         let cleanup = std::thread::Builder::new()
@@ -102,7 +103,52 @@ impl Drop for TestEnv {
         if let Ok(cleanup) = cleanup {
             let _ = cleanup.join();
         }
+        // Last resort for a test that died mid-flight (a panic while it still held
+        // every descriptor, say): the graceful path above needs a control socket, so
+        // anything still registered in a pidfile under our private run root gets the
+        // signal treatment before the temp dir vanishes and orphans it for good.
+        kill_monitors_under(&self.run_root);
     }
+}
+
+fn kill_monitors_under(run_root: &Path) {
+    let Ok(machines) = std::fs::read_dir(run_root.join("machines")) else {
+        return;
+    };
+    for entry in machines.flatten() {
+        let Ok(contents) = std::fs::read_to_string(entry.path().join("vm.pid")) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<i32>() else {
+            continue;
+        };
+        // The monitor unlinks its pidfile on a clean exit, so a stale file after a
+        // SIGKILL may name a recycled pid: only signal a silo-vmm that was started
+        // for this run root.
+        let pid = Pid::from_raw(pid);
+        let ours = process_args(pid).is_some_and(|args| {
+            args.contains("silo-vmm") && args.contains(&run_root.display().to_string())
+        });
+        if ours {
+            eprintln!("killing leaked silo-vmm {pid} under {}", run_root.display());
+            let _ = kill(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+fn process_args(pid: Pid) -> Option<String> {
+    if cfg!(target_os = "linux") {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        return Some(String::from_utf8_lossy(&raw).replace('\0', " "));
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn short_temp_dir() -> tempfile::TempDir {
@@ -309,6 +355,41 @@ async fn dropping_test_environment_stops_a_running_monitor() {
     drop(env);
 
     assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+}
+
+#[tokio::test]
+async fn dropping_test_environment_sweeps_a_monitor_the_graceful_path_cannot_reach() {
+    let env = test_env("drop-sweep", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-drop-sweep").await;
+    start_ready(&machine).await;
+    let pid_path = env
+        .run_root
+        .join("machines")
+        .join(machine.id())
+        .join("vm.pid");
+    let pid = std::fs::read_to_string(pid_path)
+        .expect("read silo-vmm pid")
+        .trim()
+        .parse::<i32>()
+        .expect("parse silo-vmm pid");
+    assert!(kill(Pid::from_raw(pid), None).is_ok());
+
+    // Forget the handle the way a panicking test effectively does, so only the
+    // pidfile sweep knows about the monitor.
+    env.machines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    drop(machine);
+    drop(env);
+
+    for _ in 0..50 {
+        if kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("silo-vmm {pid} survived the fixture sweep");
 }
 
 #[tokio::test]

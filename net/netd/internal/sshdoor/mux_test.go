@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -13,7 +12,7 @@ import (
 func TestMuxFramingAndCancellation(t *testing.T) {
 	for _, response := range []string{"OK 12345\nSSH-2.0-buffered\r\n", "OK 0\n", "OK 01\n", "OK -1\n", "NO 22\n", "OK 1 trailing\n"} {
 		t.Run(response, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "mux")
+			path := muxSocketPath(t)
 			l, err := net.Listen("unix", path)
 			if err != nil {
 				t.Fatal(err)
@@ -53,7 +52,7 @@ func TestMuxFramingAndCancellation(t *testing.T) {
 			<-done
 		})
 	}
-	path := filepath.Join(t.TempDir(), "mux")
+	path := muxSocketPath(t)
 	l, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatal(err)

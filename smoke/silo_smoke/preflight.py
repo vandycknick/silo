@@ -6,9 +6,12 @@ from pathlib import Path
 import platform
 import shlex
 import shutil
+import signal
 import subprocess
+import time
 import warnings
 
+from . import procs
 from .config import RUN_ROOT_PARENT, SmokeConfig
 from .errors import SmokeEnvironmentError
 
@@ -73,6 +76,49 @@ def check(config: SmokeConfig) -> LiveDaemonMark | None:
     except FileNotFoundError:
         return None
     return LiveDaemonMark(path, stat.st_ino, stat.st_mtime_ns)
+
+
+def _orphaned_processes() -> list[tuple[int, str]]:
+    """Processes still referencing a `silo-smoke-*` workspace that no longer exists.
+
+    A run killed mid-test (Ctrl-C twice, a crashed runner) skips workspace cleanup, so
+    its silo-vmm and netd outlive the directory they were started for. A living
+    workspace is never touched: another smoke session may own it.
+    """
+    listing = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, check=False)
+    prefix = f"{RUN_ROOT_PARENT}/silo-smoke-"
+    orphans: list[tuple[int, str]] = []
+    for line in listing.stdout.splitlines():
+        pid_text, _, args = line.strip().partition(" ")
+        if not pid_text.isdigit() or int(pid_text) == os.getpid() or prefix not in args:
+            continue
+        roots = {token[: token.index("/", len(prefix))] for token in args.split() if token.startswith(prefix) and "/" in token[len(prefix):]}
+        if roots and not any(Path(root).exists() for root in roots):
+            orphans.append((int(pid_text), args))
+    return orphans
+
+
+def sweep_orphans() -> list[int]:
+    """Terminate VM processes left behind by interrupted runs; returns the pids swept."""
+    orphans = _orphaned_processes()
+    for pid, _ in orphans:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    survivors = [pid for pid, _ in orphans]
+    while survivors and time.monotonic() < deadline:
+        time.sleep(0.1)
+        survivors = [pid for pid in survivors if procs.alive(pid)]
+    for pid in survivors:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    for pid, args in orphans:
+        print(f"swept orphaned smoke process {pid}: {args[:120]}")
+    return [pid for pid, _ in orphans]
 
 
 def live_daemon_unchanged(mark: LiveDaemonMark | None) -> bool:
