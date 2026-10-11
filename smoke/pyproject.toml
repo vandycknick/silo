@@ -1,0 +1,22 @@
+[project]
+name = "silo-smoke"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+  "daemon: starts a private silod",
+  "system: needs SILO_SMOKE_SYSTEM_IMAGE",
+  "sdk: runs SDK example programs",
+  "linux_only: requires Linux",
+  "macos_only: requires macOS",
+  "slow: extended real-VM qualification",
+  "live: requires internet access and explicit selection",
+]

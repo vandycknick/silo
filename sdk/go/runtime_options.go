@@ -36,7 +36,8 @@ func WithRuntimeComponents(value RuntimeComponents) RuntimeOption {
 type RuntimeOption func(*runtimeConfig)
 
 // WithHome selects the Silo home holding all persistent state. It defaults to
-// SILO_HOME, else ~/.silo; generated sockets always live under /tmp/silo-<uid>.
+// SILO_HOME, else ~/.silo; generated sockets live under /tmp/silo-<euid> unless
+// SILO_RUN_ROOT (absolute) overrides it.
 func WithHome(path string) RuntimeOption {
 	return func(config *runtimeConfig) { config.Home = path }
 }

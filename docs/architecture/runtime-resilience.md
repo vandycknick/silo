@@ -139,21 +139,14 @@ Focused process tests use the real netd binary and actual child processes. The
 real-host smoke tests require built/signed runtime components and disposable VMs:
 
 ```sh
-make cli silod silo-vmm netd
-
-# Use an immutable cached root disk; create clones, never boot the source.
-SILO_SMOKE_DISK=/path/to/cached/rootfs.img \
-  python3 scripts/smoke/netd_lifetime.py
-
-# Requires a compatible system image; an existing image cache may be COW-cloned.
-SILO_SMOKE_SYSTEM_IMAGE=registry/system@sha256:... \
-SILO_SMOKE_CACHE=/path/to/images \
-  python3 scripts/smoke/silod_restart.py
+make stage && make smoke SMOKE_ARGS="-k 'netd_lifetime or daemon'"
 ```
 
-These are dependency-free Python scripts. Both isolate HOME/config/state and stop
-their test VMs on completion; failed runs retain evidence under `/tmp`. They cover
-real helper reaping, normal/VMM-crash EOF shutdown, netd-crash survival, suspended
+The suite isolates HOME/config/state and generated sockets, stops its test VMs,
+and retains evidence on failure. See [smoke/README.md](../../smoke/README.md)
+for prerequisites, image configuration, and evidence paths. It covers real
+helper reaping, normal/VMM-crash EOF shutdown, netd-crash survival, suspended
 monitor timeouts, partial plain/JSON inventory, historical logs, strict runtime
-validation, and adoption of the same VMM/netd generation across silod restart.
+validation, and adoption of the same VMM/netd generation across silod restart
+(requires `SILO_SMOKE_SYSTEM_IMAGE`).
 Run on each supported host platform; success on macOS is not Linux verification.

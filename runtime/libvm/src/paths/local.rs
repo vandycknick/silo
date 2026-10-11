@@ -20,9 +20,12 @@ const LOCKS_DIR_NAME: &str = "locks";
 /// ```text
 /// <home>/            persistent state (~/.silo or SILO_HOME)
 ///   state.db  machines/<id>/  logs/machines/<id>/  images/  keys/
-/// <run_root>/        generated sockets, pidfiles, locks (/tmp/silo-<euid>)
+/// <run_root>/        generated sockets, pidfiles, locks
 ///   machines/<id>/  networks/<nid>/  locks/
 /// ```
+///
+/// Generated state defaults to `/tmp/silo-<euid>` unless `SILO_RUN_ROOT`
+/// (absolute) overrides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalRoots {
     home: PathBuf,

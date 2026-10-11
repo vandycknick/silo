@@ -53,6 +53,8 @@ let
       pkgs.docker
       pkgs.docker-credential-helpers
       pkgs.grpcurl
+      pkgs.uv
+      pkgs.openssl
     ];
   workspaceHook = ''
     workspace_root="$(pwd -P)"

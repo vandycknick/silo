@@ -13,6 +13,8 @@ endif
 CARGO_TARGET_DIR ?= $(CURDIR)/target
 ##? EXAMPLE=name: Select the Go SDK example for `make go-sdk-example` (default: basic).
 EXAMPLE ?= basic
+##? SMOKE_ARGS=...: Extra pytest arguments for make smoke.
+SMOKE_ARGS ?=
 override CARGO_TARGET_DIR := $(abspath $(CARGO_TARGET_DIR))
 export CARGO_TARGET_DIR
 
@@ -79,6 +81,17 @@ APPDIR ?= /Applications
 BINDIR ?= /usr/local/bin
 
 # Derived commands and arguments
+HOST_OS := $(shell uname -s)
+HOST_ARCH := $(shell uname -m)
+ifeq ($(HOST_OS)/$(HOST_ARCH),Linux/x86_64)
+RUNTIME_TARGET := linux-amd64-gnu
+else ifeq ($(HOST_OS)/$(HOST_ARCH),Linux/aarch64)
+RUNTIME_TARGET := linux-arm64-gnu
+else ifeq ($(HOST_OS)/$(HOST_ARCH),Darwin/arm64)
+RUNTIME_TARGET := darwin-arm64
+else
+$(error unsupported host)
+endif
 XTASK := CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo run --locked -p xtask --
 KERNEL_ARGS := --reference "$(KERNEL_REFERENCE)"
 ifneq ($(strip $(KERNEL_PATH)),)
@@ -150,7 +163,7 @@ install: ## Install the macOS release application and CLI symlink.
 	$(XTASK) install --appdir "$(APPDIR)" --bindir "$(BINDIR)" $(APP_ARGS) $(RUNTIME_ARGS)
 
 ##@ Quality
-.PHONY: fmt clippy test test-unit test-integration version-check
+.PHONY: fmt clippy test test-unit test-integration smoke version-check
 fmt: ## Format workspace source code.
 	$(XTASK) fmt
 
@@ -172,6 +185,9 @@ test-unit: ## Run unit tests for all host-supported workspace components.
 
 test-integration: ## Run integration tests for all host-supported workspace components.
 	$(XTASK) test-integration
+
+smoke: ## Run the real-VM smoke test suite against the staged PROFILE runtime (needs KVM/HVF; not CI).
+	cd smoke && SILO_SMOKE_BIN_DIR="$(CARGO_TARGET_DIR)/$(PROFILE)" SILO_SMOKE_RUNTIME_DIR="$(CARGO_TARGET_DIR)/silo-runtime/$(RUNTIME_TARGET)/$(PROFILE)" uv run pytest $(SMOKE_ARGS)
 
 version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check

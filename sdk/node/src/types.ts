@@ -13,7 +13,8 @@ export type KeyValueMap = Record<string, string>;
 export interface RuntimeOpenOptions {
   /**
    * Silo home holding all persistent state. Defaults to `SILO_HOME`, else
-   * `~/.silo`. Generated sockets always live under `/tmp/silo-<uid>`.
+   * `~/.silo`. Generated sockets live under `/tmp/silo-<euid>` unless
+   * `SILO_RUN_ROOT` (absolute) overrides it.
    */
   home?: string;
   /** Explicit `silo-vmm` override. Remaining components use centralized discovery. */

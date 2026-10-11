@@ -163,7 +163,7 @@ pub(crate) async fn up(
     spinner: &mut Spinner,
 ) -> eyre::Result<DaemonStatus> {
     reject_root()?;
-    let _lock = OperationLock::acquire(&controller_lock_path())?;
+    let _lock = OperationLock::acquire(&controller_lock_path()?)?;
     verify_native_owned(&service.native_service_path)?;
     verify_running_home(
         &service.native_service_path,
@@ -218,7 +218,7 @@ pub(crate) async fn up(
 pub(crate) fn down(paths: &DaemonPaths, executable: &Path) -> eyre::Result<()> {
     reject_root()?;
     let mut spinner = Spinner::start("Stopping", "system daemon");
-    let _lock = OperationLock::acquire(&controller_lock_path())?;
+    let _lock = OperationLock::acquire(&controller_lock_path()?)?;
     let native_path = native_service_path()?;
     verify_native_owned(&native_path)?;
     verify_home_for_down(&native_path, paths)?;
@@ -505,7 +505,7 @@ async fn wait_ready(
 
 async fn verify_core_api(status: &DaemonStatus, host: &libvm::HostPaths) -> eyre::Result<bool> {
     eyre::ensure!(
-        status.control_endpoint == libvm::HostPaths::run_root().join("silod/control.sock"),
+        status.control_endpoint == libvm::HostPaths::run_root()?.join("silod/control.sock"),
         "silod control endpoint does not match the per-user endpoint"
     );
     let check = tokio::time::timeout(Duration::from_secs(2), async {
@@ -803,8 +803,8 @@ fn verify_native_owned(native_service_path: &Path) -> eyre::Result<()> {
 }
 
 /// A service manager has one registration per UID, even when Silo Home changes.
-fn controller_lock_path() -> PathBuf {
-    libvm::HostPaths::run_root().join("silod-controller.lock")
+fn controller_lock_path() -> eyre::Result<PathBuf> {
+    Ok(libvm::HostPaths::run_root()?.join("silod-controller.lock"))
 }
 
 fn verify_running_home(path: &Path, home: &Path, running: bool) -> eyre::Result<()> {
@@ -1494,8 +1494,10 @@ mod tests {
             .expect("permissions");
         assert!(crate::daemon::service::OperationLock::acquire(&path).is_err());
         assert_eq!(
-            crate::daemon::service::controller_lock_path(),
-            libvm::HostPaths::run_root().join("silod-controller.lock")
+            crate::daemon::service::controller_lock_path().unwrap(),
+            libvm::HostPaths::run_root()
+                .unwrap()
+                .join("silod-controller.lock")
         );
     }
 

@@ -14,6 +14,8 @@ use crate::LibVmError;
 const HOME_DIR_NAME: &str = ".silo";
 /// Overrides the Silo home; must be absolute.
 pub(crate) const SILO_HOME_ENV: &str = "SILO_HOME";
+/// Overrides the generated runtime state root; must be absolute.
+pub(crate) const SILO_RUN_ROOT_ENV: &str = "SILO_RUN_ROOT";
 
 /// Resolves the Silo home: `SILO_HOME`, else `$HOME/.silo`.
 pub(crate) fn resolve_default_home() -> Result<PathBuf, LibVmError> {
@@ -25,13 +27,19 @@ pub(crate) fn resolve_default_home() -> Result<PathBuf, LibVmError> {
         .ok_or(LibVmError::HomeUnavailable)
 }
 
-/// The run root for generated sockets, pidfiles and locks. It is fixed and
-/// independent of the home directory so Unix socket paths stay well inside
-/// `sun_path` no matter how long the home path is. macOS spells it through
-/// `/private/tmp` because `/tmp` is a symlink there, and published endpoints
-/// must be canonical paths.
-pub(crate) fn default_run_root() -> PathBuf {
-    PathBuf::from(format!("{RUN_ROOT_PARENT}/silo-{}", geteuid().as_raw()))
+/// The run root for generated sockets, pidfiles and locks, independent of home.
+/// Defaults to a short per-user path so Unix socket paths stay inside `sun_path`.
+/// `SILO_RUN_ROOT` overrides it and must be absolute and canonical (use
+/// `/private/tmp/...` on macOS), and short enough that
+/// `<root>/machines/<uuid>/vsock.sock` fits inside `sun_path`.
+pub(crate) fn default_run_root() -> Result<PathBuf, LibVmError> {
+    if let Some(root) = env_absolute_path(SILO_RUN_ROOT_ENV)? {
+        return Ok(root);
+    }
+    Ok(PathBuf::from(format!(
+        "{RUN_ROOT_PARENT}/silo-{}",
+        geteuid().as_raw()
+    )))
 }
 
 #[cfg(target_os = "macos")]
@@ -214,6 +222,23 @@ mod tests {
         let Some(mode) = std::env::var_os("SILO_PATHS_TEST_PROBE") else {
             return;
         };
+        if mode == "run-root" {
+            let expected = std::env::var_os("SILO_EXPECT_RUN_ROOT").expect("expected run root");
+            let root = default_run_root().expect("resolve run root");
+            println!("{}", root.display());
+            assert_eq!(root, PathBuf::from(expected));
+            return;
+        }
+        if mode == "reject-run-root" {
+            assert!(matches!(
+                default_run_root().expect_err("reject relative run root"),
+                LibVmError::RelativeEnvironmentPath {
+                    name: "SILO_RUN_ROOT",
+                    path
+                } if path == Path::new("relative/run")
+            ));
+            return;
+        }
         if mode == "reject" {
             assert!(matches!(
                 resolve_default_home().expect_err("reject home"),
@@ -227,7 +252,7 @@ mod tests {
             PathBuf::from(expected_home)
         );
         assert_eq!(
-            default_run_root(),
+            default_run_root().expect("resolve default run root"),
             std::fs::canonicalize(RUN_ROOT_PARENT)
                 .expect("canonical run root parent")
                 .join(format!("silo-{}", geteuid().as_raw()))
@@ -245,6 +270,23 @@ mod tests {
             command.env(name, value);
         }
         command.status().expect("run environment probe").success()
+    }
+
+    #[test]
+    fn run_root_honors_absolute_override_and_rejects_relative_override() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let run_root = temp.path().join("run");
+        assert!(probe(
+            "run-root",
+            [
+                ("SILO_RUN_ROOT", run_root.clone()),
+                ("SILO_EXPECT_RUN_ROOT", run_root),
+            ]
+        ));
+        assert!(probe(
+            "reject-run-root",
+            [("SILO_RUN_ROOT", PathBuf::from("relative/run"))]
+        ));
     }
 
     #[test]

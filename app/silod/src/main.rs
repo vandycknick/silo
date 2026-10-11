@@ -94,7 +94,7 @@ async fn run(args: Args) -> eyre::Result<()> {
     let host = configuration(libvm::HostPaths::from_env().map_err(Into::into))?;
     // Validate before creating daemon state or service locks.
     let global = configuration(GlobalConfig::load_from(&host))?;
-    let paths = SystemPaths::from_host(&host);
+    let paths = SystemPaths::from_host(&host)?;
     let overrides = merge_system_overrides(
         configuration(global.daemon_overrides())?,
         args.system.into_overrides(),
@@ -120,7 +120,7 @@ async fn run(args: Args) -> eyre::Result<()> {
     };
     let configuration_identity = configuration(global.daemon_identity(features))?;
     let host = configuration(silo_config::prepare_host_paths(&host))?;
-    let paths = SystemPaths::from_host(&host);
+    let paths = SystemPaths::from_host(&host)?;
     let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
     let socket_ownership = if args.stop {
         None

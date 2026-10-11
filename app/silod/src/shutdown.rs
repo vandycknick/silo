@@ -30,7 +30,7 @@ pub(crate) async fn run() -> eyre::Result<()> {
     }
 
     let host = silo_config::prepare_host_paths(&host)?;
-    let paths = SystemPaths::from_host(&host);
+    let paths = SystemPaths::from_host(&host)?;
     let _lifetime = LifetimeLock::acquire(&paths.lifetime_lock())?;
     let ownership = SocketOwnership::acquire()?;
     // Both ownership domains are held before touching status or the endpoint.

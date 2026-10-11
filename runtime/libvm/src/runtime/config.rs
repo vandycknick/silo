@@ -11,8 +11,8 @@ use crate::LibVmError;
 #[non_exhaustive]
 pub struct RuntimeConfig {
     /// Silo home holding all persistent state. `None` resolves `SILO_HOME`,
-    /// else `~/.silo`. Generated sockets, pidfiles and locks always live under
-    /// `/tmp/silo-<euid>`.
+    /// else `~/.silo`. Generated sockets, pidfiles and locks live under
+    /// `/tmp/silo-<euid>` unless `SILO_RUN_ROOT` (absolute) overrides it.
     pub home: Option<PathBuf>,
     /// Networking configuration for locally started machines.
     pub networking: RuntimeNetworkingConfig,
@@ -172,7 +172,7 @@ impl RuntimeConfig {
 
     /// Both runtime roots; creates and validates the run root.
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
-        let run_root = default_run_root();
+        let run_root = default_run_root()?;
         ensure_run_root(&run_root)?;
         Ok(LocalRoots::with_roots(self.resolve_home()?, run_root))
     }
@@ -459,7 +459,7 @@ mod tests {
             .expect("open fresh runtime");
         let machine_id = MachineId::new();
         let machine = runtime.local_paths().machine(machine_id);
-        let run_root = crate::paths::default_run_root();
+        let run_root = crate::paths::default_run_root().expect("resolve run root");
         assert_eq!(runtime.local_home(), home);
         assert!(home.join("state.db").is_file());
         assert_eq!(runtime.local_paths().roots().run_root(), run_root);

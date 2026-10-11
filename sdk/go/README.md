@@ -25,7 +25,7 @@ defer runtime.Close()
 
 Loading the small Go FFI bridge is separate from runtime installation. It may materialize embedded bridge bytes under `~/.silo/cache/go-ffi`, but it never accesses the network.
 
-`Open` accepts `WithHome` to select the Silo home holding all persistent state (default `SILO_HOME`, else `~/.silo`; generated sockets always live under `/tmp/silo-<euid>`), `WithRuntimeRoot` to select one complete runtime installation, and `WithSupervisorPath` to override only the `silo-vmm` executable.
+`Open` accepts `WithHome` to select the Silo home holding all persistent state (default `SILO_HOME`, else `~/.silo`; generated sockets live under `/tmp/silo-<euid>` unless `SILO_RUN_ROOT` (absolute) overrides it), `WithRuntimeRoot` to select one complete runtime installation, and `WithSupervisorPath` to override only the `silo-vmm` executable.
 
 Manager-integrated callers can instead use `WithRuntimeComponents(RuntimeComponents{...})`
 to pin the exact `SupervisorPath`, `NetdPath`, `KernelPath`, `InitramfsPath`,

@@ -16,11 +16,13 @@ it stores no root paths.
   `logs/machines/<id>/` (durable machine logs and exit records),
   `logs/daemon/`, `images/`, `keys/`, `secrets.json`, and `run/` for
   fixed-name control sockets such as `docker.sock`.
-- Run root is always `/tmp/silo-<euid>` (`/private/tmp/silo-<euid>` on macOS,
+- Run root defaults to `/tmp/silo-<euid>` (`/private/tmp/silo-<euid>` on macOS,
   where `/tmp` is a symlink), created `0700` and checked for owner
-  and symlinks. It holds sockets, PID files, locks, and network runtime state.
-  A fixed short root keeps Unix socket paths under the `sun_path` limit (104
-  bytes on macOS, 108 on Linux) regardless of how long the home path is.
+  and symlinks. `SILO_RUN_ROOT` overrides it with an absolute, canonical path.
+  It holds sockets, PID files, locks, and network runtime state. The default
+  short root keeps Unix socket paths under the `sun_path` limit (104 bytes on
+  macOS, 108 on Linux) regardless of how long the home path is; an override must
+  keep `<root>/machines/<uuid>/vsock.sock` inside that limit.
 
 Schema compatibility is owned by SQLite migrations. `db_config` has no schema
 version column.

@@ -305,7 +305,7 @@ mod tests {
 
         assert!(machines.is_empty());
         assert!(home.join("state.db").is_file());
-        assert!(libvm::HostPaths::run_root().is_dir());
+        assert!(libvm::HostPaths::run_root().unwrap().is_dir());
         assert!(!temp.path().join(".docker").exists());
         assert!(!temp.path().join("native-service").exists());
     }

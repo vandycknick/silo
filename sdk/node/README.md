@@ -13,7 +13,8 @@ separate krun binary). `Runtime.open({ supervisorPath })` replaces only
 `silo-vmm`; the remaining components must still resolve from the same
 centralized discovery contract. `Runtime.open({ home })` selects the Silo home
 that holds all persistent state; it defaults to `SILO_HOME`, else `~/.silo`.
-Generated sockets always live under `/tmp/silo-<euid>`. The retained component overrides (`SILO_VMM_PATH`, `NETD_BIN`,
+Generated sockets live under `/tmp/silo-<euid>` unless `SILO_RUN_ROOT` (absolute)
+overrides it. The retained component overrides (`SILO_VMM_PATH`, `NETD_BIN`,
 and `SILO_ASSET_DIR`) and portable-root override
 (`SILO_RUNTIME_DIR`) remain available to `libvm`.
 

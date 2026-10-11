@@ -12,8 +12,11 @@ const CONFIG_FILE_NAME: &str = "config.yaml";
 ///                          (default ~/.config/silo)
 /// <home>/                  all persistent state (SILO_HOME, else ~/.silo);
 ///                          <home>/config.yaml is the fallback config file
-/// /tmp/silo-<euid>/        generated sockets, pidfiles and locks
+/// <run_root>/             generated sockets, pidfiles and locks
 /// ```
+///
+/// Run root defaults to `/tmp/silo-<euid>` (`/private/tmp` on macOS), unless
+/// `SILO_RUN_ROOT` (absolute) overrides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPaths {
     home: PathBuf,
@@ -78,9 +81,10 @@ impl HostPaths {
         Ok(home.join("logs").join(component))
     }
 
-    /// Root for generated sockets, pidfiles and locks. Fixed so socket paths
-    /// stay inside `sun_path` regardless of the home path's length.
-    pub fn run_root() -> PathBuf {
+    /// Root for generated sockets, pidfiles and locks. Defaults to a short
+    /// per-user path; `SILO_RUN_ROOT` may override it with an absolute,
+    /// canonical path short enough for generated sockets to fit in `sun_path`.
+    pub fn run_root() -> Result<PathBuf, LibVmError> {
         default_run_root()
     }
 }

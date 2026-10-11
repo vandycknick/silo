@@ -29,7 +29,7 @@ impl StatusPublisher {
                 process_start: process_start_identity()?,
                 core: CorePhase::Starting,
                 home: host.home().into(),
-                control_endpoint: libvm::HostPaths::run_root().join("silod/control.sock"),
+                control_endpoint: libvm::HostPaths::run_root()?.join("silod/control.sock"),
                 updated_at: now(),
                 last_error: None,
                 system,

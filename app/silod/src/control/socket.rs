@@ -25,7 +25,7 @@ pub(crate) struct SocketOwnership {
 }
 impl SocketOwnership {
     pub(crate) fn acquire() -> eyre::Result<Self> {
-        let root = HostPaths::run_root();
+        let root = HostPaths::run_root()?;
         private_directory(&root)?;
         Self::acquire_at(root.join("silod"))
     }

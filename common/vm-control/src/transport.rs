@@ -33,7 +33,7 @@ pub async fn probe(host: &HostPaths, admission: Admission) -> eyre::Result<Optio
     probe_at(
         host,
         admission,
-        HostPaths::run_root().join("silod/control.sock"),
+        HostPaths::run_root()?.join("silod/control.sock"),
     )
     .await
 }
