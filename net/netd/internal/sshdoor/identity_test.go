@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -176,5 +177,39 @@ func TestCARejectsEncryptedWrongTypeAndTrailingMaterial(t *testing.T) {
 	}
 	if _, err := parseCA(pem.EncodeToMemory(block)); err == nil {
 		t.Fatal("non-Ed25519 CA accepted")
+	}
+}
+
+// Every relay connection takes known_host.lock, so concurrent first connects
+// race to create it. Darwin's openat(O_CREAT) hands race losers a spurious
+// ENOENT; the lock must still be admitted to every caller.
+func TestConcurrentFirstLockCreationAdmitsEveryCaller(t *testing.T) {
+	dir, err := openSSHDir(filepath.Join(t.TempDir(), "ssh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	for trial := range 200 {
+		name := fmt.Sprintf("race-%d.lock", trial)
+		start := make(chan struct{})
+		var callers sync.WaitGroup
+		for range 8 {
+			callers.Add(1)
+			go func() {
+				defer callers.Done()
+				<-start
+				l, err := lock(context.Background(), dir, name)
+				if err != nil {
+					t.Errorf("trial %d: %v", trial, err)
+					return
+				}
+				l.Close()
+			}()
+		}
+		close(start)
+		callers.Wait()
+		if t.Failed() {
+			return
+		}
 	}
 }

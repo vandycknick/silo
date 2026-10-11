@@ -196,6 +196,15 @@ pub fn mock_vmm_binary() -> &'static Path {
             "expected mock-enabled silo-vmm binary at {}",
             binary.display()
         );
+        // Cargo uplifts binaries by copying, so every build leaves a fresh
+        // inode. macOS policy-scans the first exec of a new executable inode
+        // for about a second; pay it here, not inside a timed launch.
+        let warm = std::process::Command::new(&binary)
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("failed to execute the mock-enabled silo-vmm");
+        assert!(warm.success(), "mock-enabled silo-vmm --help failed");
         binary
     })
 }

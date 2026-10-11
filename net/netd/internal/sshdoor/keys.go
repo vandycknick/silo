@@ -78,7 +78,7 @@ func openSSHDir(dir string) (*os.File, error) {
 }
 
 func openPrivate(dir *os.File, name string, flags int) (*os.File, error) {
-	fd, err := unix.Openat(int(dir.Fd()), name, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	fd, err := openat(dir, name, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +89,30 @@ func openPrivate(dir *os.File, name string, flags int) (*os.File, error) {
 		return nil, errors.New("SSH file must be an owner-owned regular file mode 0600")
 	}
 	return f, nil
+}
+
+// Darwin's openat(O_CREAT) without O_EXCL hands every loser of a concurrent
+// create race a spurious ENOENT (golang/go#81246, FB24592276). O_EXCL creates
+// and plain opens of an existing name are unaffected, so create-or-open is
+// spelled as those two steps. ENOENT after EEXIST means the name was removed
+// in between; retrying is bounded so an unlink loop cannot spin us forever.
+func openat(dir *os.File, name string, flags int) (int, error) {
+	if flags&unix.O_CREAT == 0 || flags&unix.O_EXCL != 0 {
+		return unix.Openat(int(dir.Fd()), name, flags, 0600)
+	}
+	var err error
+	for range 8 {
+		var fd int
+		fd, err = unix.Openat(int(dir.Fd()), name, flags|unix.O_EXCL, 0600)
+		if !errors.Is(err, unix.EEXIST) {
+			return fd, err
+		}
+		fd, err = unix.Openat(int(dir.Fd()), name, flags&^unix.O_CREAT, 0)
+		if !errors.Is(err, unix.ENOENT) {
+			return fd, err
+		}
+	}
+	return -1, err
 }
 
 func lock(ctx context.Context, dir *os.File, name string) (*os.File, error) {
