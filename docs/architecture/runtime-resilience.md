@@ -148,5 +148,6 @@ for prerequisites, image configuration, and evidence paths. It covers real
 helper reaping, normal/VMM-crash EOF shutdown, netd-crash survival, suspended
 monitor timeouts, partial plain/JSON inventory, historical logs, strict runtime
 validation, and adoption of the same VMM/netd generation across silod restart
-(requires `SILO_SMOKE_SYSTEM_IMAGE`).
+(pulls `ghcr.io/vandycknick/silo/system:dev` unless `SILO_SMOKE_SYSTEM_IMAGE`
+overrides it).
 Run on each supported host platform; success on macOS is not Linux verification.

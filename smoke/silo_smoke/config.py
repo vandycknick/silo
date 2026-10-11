@@ -11,6 +11,12 @@ from .errors import SmokeEnvironmentError
 
 RUN_ROOT_PARENT = "/private/tmp" if platform.system() == "Darwin" else "/tmp"
 REPO = Path(__file__).resolve().parents[2]
+# Published multi-arch images every lane can rely on: the appliance comes from
+# .github/workflows/system-image.yml (the same dev default silod uses), the Arch
+# image is the README quickstart image (systemd init, no OpenSSH, so the agent's
+# native SSH backend serves logins).
+DEFAULT_SYSTEM_IMAGE = "ghcr.io/vandycknick/silo/system:dev"
+DEFAULT_DISTRO_IMAGES = f"arch=ghcr.io/vandycknick/archlinux:latest,system={DEFAULT_SYSTEM_IMAGE}"
 
 
 def runtime_target() -> str:
@@ -63,6 +69,14 @@ def _path(config: pytest.Config, option: str, variable: str, default: Path) -> P
     return Path(value).expanduser().resolve() if value else default.resolve()
 
 
+def _published(variable: str, default: str) -> str | None:
+    """Published image references default on; an empty value opts out."""
+    value = os.environ.get(variable)
+    if value is None:
+        return default
+    return value.strip() or None
+
+
 def resolve(pytestconfig: pytest.Config) -> SmokeConfig:
     backend = pytestconfig.getoption("--backend") or os.environ.get("SILO_SMOKE_BACKEND", "krun")
     if backend not in {"krun", "vz"}:
@@ -70,7 +84,7 @@ def resolve(pytestconfig: pytest.Config) -> SmokeConfig:
     if backend == "vz" and platform.system() != "Darwin":
         raise SmokeEnvironmentError("The vz backend requires macOS; use --backend krun on Linux")
     distro_images: dict[str, str] = {}
-    for entry in filter(None, os.environ.get("SILO_SMOKE_DISTRO_IMAGES", "").split(",")):
+    for entry in filter(None, (_published("SILO_SMOKE_DISTRO_IMAGES", DEFAULT_DISTRO_IMAGES) or "").split(",")):
         label, separator, reference = entry.partition("=")
         label, reference = label.strip(), reference.strip()
         if not separator or not label or not reference or label in distro_images:
@@ -83,7 +97,7 @@ def resolve(pytestconfig: pytest.Config) -> SmokeConfig:
         backend=backend,
         cache_dir=_path(pytestconfig, "--cache-dir", "SILO_SMOKE_CACHE", Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "silo-smoke"),
         keep=bool(keep) if keep is not None else os.environ.get("SILO_SMOKE_KEEP") == "1",
-        system_image=os.environ.get("SILO_SMOKE_SYSTEM_IMAGE") or None,
+        system_image=_published("SILO_SMOKE_SYSTEM_IMAGE", DEFAULT_SYSTEM_IMAGE),
         distro_images=distro_images,
         systemd_image=os.environ.get("SILO_SMOKE_SYSTEMD_IMAGE") or None,
         curl_image=os.environ.get("SILO_SMOKE_CURL_IMAGE") or None,

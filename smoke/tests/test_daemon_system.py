@@ -24,9 +24,10 @@ def _identity(workspace: Workspace) -> tuple[str, str, str, str]:
     return machine_id, vmm, run_id, netd
 
 
+@pytest.mark.usefixtures("pulled_images")
 def test_graceful_restart_adopts_running_appliance(daemon: Silod, workspace: Workspace, config: SmokeConfig) -> None:
     if config.system_image is None:
-        pytest.skip("SILO_SMOKE_SYSTEM_IMAGE not set")
+        pytest.skip("SILO_SMOKE_SYSTEM_IMAGE is empty")
     args = (
         "--system-enabled=true", "--system-image", config.system_image,
         "--system-backend", config.backend, "--system-cpus", "1",
@@ -36,10 +37,9 @@ def test_graceful_restart_adopts_running_appliance(daemon: Silod, workspace: Wor
     )
     try:
         daemon.start(*args)
-        status = daemon.wait_system("ready", 150)
+        daemon.wait_system("ready", 150)
         before = _identity(workspace)
         _, vmm, _, netd = before
-        restarts = status["system"]["restart_count"]
         assert daemon.terminate() == 0
         assert daemon.wait_core("stopped")["core"] == "stopped"
         assert procs.alive(int(vmm)) is True
@@ -48,7 +48,8 @@ def test_graceful_restart_adopts_running_appliance(daemon: Silod, workspace: Wor
         daemon.start(*args)
         restarted = daemon.wait_system("ready", 60)
         assert _identity(workspace) == before
-        assert restarted["system"]["restart_count"] == restarts
+        # restart_count is per process: the adopting daemon must reach ready first try.
+        assert restarted["system"]["restart_count"] == 0
         assert daemon.terminate() == 0
         assert daemon.wait_core("stopped")["core"] == "stopped"
         assert daemon.stop_installation().returncode == 0

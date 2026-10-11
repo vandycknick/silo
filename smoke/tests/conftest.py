@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-import os
 import platform
 
 from pluggy import Result
 import pytest
 
-from silo_smoke import config as smoke_config, images, preflight
+from silo_smoke import config as smoke_config, image_cache, images, preflight
 from silo_smoke.cli import Silo, Vm
 from silo_smoke.config import SmokeConfig
 from silo_smoke.daemon import Silod
@@ -34,13 +33,17 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) ->
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     system = platform.system()
+    try:
+        system_image = smoke_config.resolve(config).system_image
+    except SmokeEnvironmentError:
+        system_image = None
     for item in items:
         if item.get_closest_marker("linux_only") and system != "Linux":
             item.add_marker(pytest.mark.skip(reason="requires Linux"))
         if item.get_closest_marker("macos_only") and system != "Darwin":
             item.add_marker(pytest.mark.skip(reason="requires macOS"))
-        if item.get_closest_marker("system") and not os.environ.get("SILO_SMOKE_SYSTEM_IMAGE"):
-            item.add_marker(pytest.mark.skip(reason="SILO_SMOKE_SYSTEM_IMAGE not set"))
+        if item.get_closest_marker("system") and system_image is None:
+            item.add_marker(pytest.mark.skip(reason="SILO_SMOKE_SYSTEM_IMAGE is empty"))
         if item.get_closest_marker("live") and "live" not in config.getoption("-m"):
             item.add_marker(pytest.mark.skip(reason="select -m live to run internet-dependent tests"))
 
@@ -103,3 +106,15 @@ def vm(silo: Silo, basic_image: str) -> Generator[Vm, None, None]:
 @pytest.fixture
 def daemon(workspace: Workspace) -> Silod:
     return Silod(workspace)
+
+
+@pytest.fixture
+def pulled_images(workspace: Workspace, config: SmokeConfig) -> Generator[None, None, None]:
+    """Seed the workspace with previously pulled published images and keep what it pulls."""
+    seeded = image_cache.seed(config.cache_dir, workspace.silo_home)
+    workspace.record("image-cache", f"seeded {len(seeded)} cached tag(s) from {config.cache_dir}\n")
+    try:
+        yield
+    finally:
+        if image_cache.persist(config.cache_dir, workspace.silo_home):
+            workspace.record("image-cache", f"persisted new pulls to {config.cache_dir}\n")

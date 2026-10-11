@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import selectors
 import shlex
 import shutil
@@ -10,19 +11,25 @@ import time
 
 import pytest
 
+from silo_smoke import config as smoke_config
 from silo_smoke.cli import Silo
 from silo_smoke.config import SmokeConfig
+from silo_smoke.errors import SmokeEnvironmentError
 from silo_smoke.procs import free_port
 from silo_smoke.workspace import Workspace
 
-
-if not os.environ.get("SILO_SMOKE_DISTRO_IMAGES"):
-    pytest.skip("SILO_SMOKE_DISTRO_IMAGES not set", allow_module_level=True)
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "distro_label" in metafunc.fixturenames:
-        labels = [entry.partition("=")[0].strip() for entry in os.environ["SILO_SMOKE_DISTRO_IMAGES"].split(",")]
+        try:
+            labels = list(smoke_config.resolve(metafunc.config).distro_images)
+        except SmokeEnvironmentError:
+            labels = []
+        if not labels:
+            metafunc.parametrize("distro_label", [pytest.param("none", marks=pytest.mark.skip(reason="SILO_SMOKE_DISTRO_IMAGES is empty"))])
+            return
         metafunc.parametrize("distro_label", labels, ids=labels)
 
 
@@ -65,6 +72,7 @@ def _negative_auth(silo: Silo, workspace: Workspace, name: str, key: str) -> Non
 
 
 @pytest.mark.slow
+@pytest.mark.usefixtures("pulled_images")
 def test_distro_certificate_two_boots(
     distro_label: str, config: SmokeConfig, silo: Silo, workspace: Workspace,
 ) -> None:
@@ -107,8 +115,15 @@ def test_distro_certificate_two_boots(
         login = silo.shell(name, "printf 'certificate-session %s\\n' ok; exit 7\n", user="root", expect=7)
         assert "certificate-session ok" in login.stdout
         assert login.stderr == ""
-        if distro_label != "system":
+        if silo.exec(name, "test", "-x", "/usr/sbin/sshd", expect=None).returncode == 0:
+            # OpenSSH served the login (agent-owned `sshd -i` or systemd's socket); it logs
+            # the accepted certificate through syslog, so the journal must carry it.
             journal = silo.exec(name, "sh", "-c", "journalctl --no-pager -b | grep 'silo:cli:' | grep 'CA ED25519'")
             assert "silo:cli:" in journal.stdout
+        else:
+            # No OpenSSH in the image: the agent's native backend served it and logs to serial.
+            serial = ANSI.sub("", silo.run("logs", name, "--stream", "serial").stdout)
+            assert "native SSH certificate authentication succeeded" in serial, serial[-2000:]
+            assert 'key_id="silo:cli:' in serial
         silo.stop(name)
         assert silo.show(name)["state"] == "stopped"

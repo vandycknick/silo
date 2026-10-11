@@ -33,8 +33,8 @@ profile; use the corresponding pytest options to override them.
 | `SILO_SMOKE_BACKEND` | `--backend krun\|vz` | `krun`; `vz` requires macOS |
 | `SILO_SMOKE_CACHE` | `--cache-dir` | `${XDG_CACHE_HOME:-~/.cache}/silo-smoke` |
 | `SILO_SMOKE_KEEP` | `--keep` | `1` retains workspaces even on success |
-| `SILO_SMOKE_SYSTEM_IMAGE` | none | Appliance OCI reference; unset skips system tests |
-| `SILO_SMOKE_DISTRO_IMAGES` | none | Optional Phase F distro refs: `ubuntu=oci-ref,fedora=oci-ref`; unset skips distro tests |
+| `SILO_SMOKE_SYSTEM_IMAGE` | none | Appliance OCI reference; defaults to `ghcr.io/vandycknick/silo/system:dev` (the silod dev default); set it empty to skip system tests |
+| `SILO_SMOKE_DISTRO_IMAGES` | none | `label=oci-ref` list for the SSH distro lane; defaults to `arch=ghcr.io/vandycknick/archlinux:latest,system=<system image>`; set it empty to skip |
 | `SILO_SMOKE_SYSTEMD_IMAGE` | none | Optional Phase F systemd image with vsock SSH socket activation |
 | `SILO_SMOKE_CURL_IMAGE` | none | Optional Phase F image containing curl for live secret-provider tests |
 
@@ -46,8 +46,13 @@ checks. Phase F also uses `slow` for long-running checks and `live` for
 internet-dependent tests. Live tests require explicit selection with `-m live`.
 
 The SDK lane skips when Go, Node, the built Node SDK or the Go FFI library is
-missing. System tests skip with `SILO_SMOKE_SYSTEM_IMAGE not set` when no image
-is configured. On macOS, daemon-managed VMs use krun even when direct CLI tests
+missing. The system and distro lanes pull their published default images from
+ghcr.io; `SILO_SMOKE_SYSTEM_IMAGE= SILO_SMOKE_DISTRO_IMAGES= make smoke` runs
+fully offline. Pulled images are kept under `<cache>/images` (the same store
+layout as `<SILO_HOME>/images`): tests that boot published images seed their
+private Silo Home from it and write new pulls back, so only the first run
+downloads anything. The systemd-owned SSH lane and the curl image have no
+published default; nothing in this repository builds them yet. On macOS, daemon-managed VMs use krun even when direct CLI tests
 select vz.
 
 ## Isolation and evidence
