@@ -139,6 +139,37 @@ fn guest_error(stderr: &str) -> String {
     }
 }
 
+/// Creates the directory the host half of the docker forward binds into. silo-vmm
+/// refuses to bind under a missing, symlinked or foreign-owned parent, so a fresh
+/// home has to grow `run/` before the system VM starts; `silo daemon up` does the
+/// same in its preflight, but bare `silod` must not depend on it.
+pub(crate) fn ensure_docker_socket_parent(socket: &Path) -> eyre::Result<()> {
+    let parent = socket
+        .parent()
+        .ok_or_else(|| eyre::eyre!("Docker socket {} has no parent", socket.display()))?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => bail!(
+            "Docker socket directory {} must be a directory, not a symlink or file",
+            parent.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .with_context(|| format!("create {}", parent.display()))
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))
+        }
+        Err(error) => Err(error).with_context(|| format!("inspect {}", parent.display())),
+    }
+}
+
 pub(crate) async fn wait_docker_socket(path: &Path, timeout: Duration) -> eyre::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_error = None;
@@ -186,7 +217,7 @@ pub(crate) fn probe_docker_socket(path: &Path) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::config::{ResolvedShare, ResolvedSystemConfig};
-    use crate::engine::{activation_request, guest_error};
+    use crate::engine::{activation_request, ensure_docker_socket_parent, guest_error};
 
     #[test]
     fn guest_errors_collapse_to_distinct_lines() {
@@ -314,5 +345,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("actual machine has 0 shares, configuration requires 1"));
+    }
+
+    #[test]
+    fn docker_socket_parent_is_created_private_and_never_a_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let socket = temp.path().join("home/run/docker.sock");
+        ensure_docker_socket_parent(&socket).expect("create run directory");
+        let run = socket.parent().expect("parent");
+        assert!(run.is_dir());
+        assert_eq!(
+            std::fs::metadata(run).expect("meta").permissions().mode() & 0o777,
+            0o700
+        );
+        ensure_docker_socket_parent(&socket).expect("existing directory is accepted");
+
+        let linked = temp.path().join("linked/docker.sock");
+        std::fs::create_dir_all(temp.path().join("elsewhere")).expect("target");
+        std::os::unix::fs::symlink(temp.path().join("elsewhere"), temp.path().join("linked"))
+            .expect("symlink");
+        let error = ensure_docker_socket_parent(&linked).expect_err("symlink parent must fail");
+        assert!(error.to_string().contains("not a symlink or file"));
     }
 }

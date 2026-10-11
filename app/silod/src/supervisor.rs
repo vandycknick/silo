@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{DesiredSystem, SystemBackend};
 use crate::engine::{
-    activate, probe_docker_socket, stop_engine, wait_docker_socket, ENGINE_REACHABLE_TIMEOUT,
-    READY_TIMEOUT,
+    activate, ensure_docker_socket_parent, probe_docker_socket, stop_engine, wait_docker_socket,
+    ENGINE_REACHABLE_TIMEOUT, READY_TIMEOUT,
 };
 use crate::paths::SystemPaths;
 use crate::provision::ensure_system_machine;
@@ -559,6 +559,7 @@ async fn attempt(
     }
     status.phase = SystemPhase::Creating;
     publish(publisher, status)?;
+    ensure_docker_socket_parent(&desired.config.docker_socket)?;
     let (record, machine_data) = ensure_system_machine(runtime, paths, desired).await?;
     status.machine_id = Some(machine_data.id.clone());
     status.image_digest = machine_data
