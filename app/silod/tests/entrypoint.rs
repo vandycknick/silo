@@ -40,6 +40,33 @@ impl Drop for Process {
     }
 }
 
+/// Sibling tests in this binary run concurrently and spawn short-lived silod
+/// children of this process. Only a daemon this process did not start can
+/// contend for the per-UID run root.
+fn foreign_silod_running() -> bool {
+    let listed = Command::new("pgrep")
+        .args(["-x", "silod"])
+        .output()
+        .expect("check live silod");
+    assert!(
+        matches!(listed.status.code(), Some(0 | 1)),
+        "pgrep failed: {listed:?}"
+    );
+    let ours = std::process::id().to_string();
+    String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .any(|pid| {
+            // A process that exits before ps observes it cannot contend either.
+            Command::new("ps")
+                .args(["-o", "ppid=", "-p", pid])
+                .output()
+                .is_ok_and(|parent| {
+                    parent.status.success()
+                        && String::from_utf8_lossy(&parent.stdout).trim() != ours
+                })
+        })
+}
+
 #[test]
 fn malformed_shared_configuration_is_rejected_without_creating_state() {
     let root = tempfile::tempdir().expect("temporary home");
@@ -92,13 +119,8 @@ fn daemon_keeps_core_ready_through_system_retry_and_log_failure() {
         .expect("fixture lock");
     let _fixture = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
         .expect("use an idle dedicated test UID");
-    let existing = Command::new("pgrep")
-        .args(["-x", "silod"])
-        .output()
-        .expect("check live silod");
-    assert_eq!(
-        existing.status.code(),
-        Some(1),
+    assert!(
+        !foreign_silod_running(),
         "live silod found; use an idle dedicated test UID"
     );
     let root = tempfile::tempdir().expect("temporary home");

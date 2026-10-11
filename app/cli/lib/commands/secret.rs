@@ -1604,6 +1604,8 @@ mod tests {
                         }
                         Err(e) => panic!("{e}"),
                     };
+                    // BSD sockets inherit O_NONBLOCK from the listener; Linux does not.
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(3)))
                         .unwrap();
