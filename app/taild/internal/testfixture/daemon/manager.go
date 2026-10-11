@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,42 +18,26 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// launchManager excludes every fixture sharing the fixed per-UID endpoint.
-// The lock is held until the child has been reaped, not just until readiness.
 func launchManager(t *testing.T, c config.Config) (*control.Client, config.Config) {
 	t.Helper()
 	bin := testfixture.Path(t, "SILO_TEST_BIN_DIR", true)
-	lock, err := os.OpenFile(fmt.Sprintf("/tmp/silo-control-fixture-%d.lock", os.Getuid()), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = lock.Close()
-		t.Fatal("use an idle dedicated test UID and serialized packages:", err)
-	}
-	release := func() { _ = unix.Flock(int(lock.Fd()), unix.LOCK_UN); _ = lock.Close() }
-	if err := exec.Command("pgrep", "-u", fmt.Sprint(os.Getuid()), "-x", "silod").Run(); err == nil {
-		release()
-		t.Fatal("live silod found; fixture never adopts an existing daemon")
-	}
+	runRoot := testfixture.ShortTempDir(t)
+	t.Setenv("SILO_RUN_ROOT", runRoot)
 	home, err := filepath.EvalSymlinks(c.Home)
 	if err != nil {
-		release()
 		t.Fatal(err)
 	}
 	configRoot := t.TempDir()
 	configDir := filepath.Join(configRoot, "silo")
 	if err := os.MkdirAll(configDir, 0700); err != nil {
-		release()
 		t.Fatal(err)
 	}
 	configDir, err = filepath.EvalSymlinks(configDir)
 	if err != nil {
-		release()
 		t.Fatal(err)
 	}
 	command := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false")
-	command.Env = []string{"HOME=" + home, "SILO_HOME=" + home, "XDG_CONFIG_HOME=" + configRoot, "PATH=" + os.Getenv("PATH"), "SILO_RUNTIME_DIR=" + filepath.Dir(c.Components.AssetDir)}
+	command.Env = []string{"HOME=" + home, "SILO_HOME=" + home, "XDG_CONFIG_HOME=" + configRoot, "PATH=" + os.Getenv("PATH"), "SILO_RUNTIME_DIR=" + filepath.Dir(c.Components.AssetDir), "SILO_RUN_ROOT=" + runRoot}
 	for _, key := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
 		if value := os.Getenv(key); value != "" {
 			command.Env = append(command.Env, key+"="+value)
@@ -62,13 +45,11 @@ func launchManager(t *testing.T, c config.Config) (*control.Client, config.Confi
 	}
 	command.Stderr = os.Stderr
 	if err := command.Start(); err != nil {
-		release()
 		t.Fatal(err)
 	}
 	exited := make(chan error, 1)
 	go func() { exited <- command.Wait() }()
 	stop := func() {
-		defer release()
 		_ = command.Process.Signal(unix.SIGTERM)
 		select {
 		case err := <-exited:
@@ -85,7 +66,7 @@ func launchManager(t *testing.T, c config.Config) (*control.Client, config.Confi
 	t.Cleanup(stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	endpoint := testfixture.ControlEndpoint(t)
+	endpoint := filepath.Join(runRoot, "silod", "control.sock")
 	var client *control.Client
 	var status *w.DaemonStatus
 	for {

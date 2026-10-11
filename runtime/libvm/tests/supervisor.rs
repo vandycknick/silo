@@ -58,7 +58,7 @@ fn write_runtime_root(root: &Path) -> PathBuf {
 
 struct TestEnv {
     _temp: tempfile::TempDir,
-    /// The fixed generated-state root every runtime uses.
+    /// This fixture's private generated-state root.
     run_root: std::path::PathBuf,
     runtime: Runtime,
     disk: PathBuf,
@@ -105,13 +105,24 @@ impl Drop for TestEnv {
     }
 }
 
+fn short_temp_dir() -> tempfile::TempDir {
+    let parent = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    tempfile::Builder::new()
+        .prefix("silo-sv-")
+        .tempdir_in(parent)
+        .expect("create short temp dir")
+}
+
 async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
-    // The mock backend and runtime both create Unix sockets below these roots.
-    // Keep them short enough for macOS's 104-byte sockaddr_un limit.
-    let temp = tempfile::Builder::new()
-        .prefix("silo-test")
-        .tempdir_in("/tmp")
-        .expect("create short temp dir");
+    test_env_in(short_temp_dir(), name, scenario).await
+}
+
+async fn test_env_in(temp: tempfile::TempDir, name: &str, scenario: &Scenario) -> TestEnv {
+    let run_root = temp.path().join("run");
     let runtime_root = write_runtime_root(&temp.path().join("runtime"));
     let scenario_path = temp.path().join(format!("{name}-scenario.json"));
     scenario.write_to(&scenario_path).expect("write scenario");
@@ -122,6 +133,7 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
     let runtime = Runtime::new(
         RuntimeConfig::local(temp.path().join("home"))
             .with_runtime_root(&runtime_root)
+            .with_run_root(&run_root)
             .with_mock_vmm(&scenario_path),
     )
     .await
@@ -129,7 +141,7 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
 
     TestEnv {
         _temp: temp,
-        run_root: libvm::HostPaths::run_root().unwrap(),
+        run_root,
         runtime,
         disk,
         machines: Mutex::new(Vec::new()),
@@ -537,13 +549,14 @@ async fn inbound_connection_before_agent_ready_is_parked_then_served() {
 
 #[tokio::test]
 async fn inbound_refusal_closes_host_connection_without_bytes() {
-    let target = PathBuf::from("/tmp/refused-forward-target.sock");
+    let temp = short_temp_dir();
+    let target = temp.path().join("refused.sock");
     let mut scenario = Scenario::default();
     scenario
         .forward
         .refuse_targets
         .push(format!("unix:{}", target.display()));
-    let env = test_env("forward-refused", &scenario).await;
+    let env = test_env_in(temp, "forward-refused", &scenario).await;
     let machine = create_machine(&env, "integration-forward-refused").await;
     let listen = env._temp.path().join("refused-listen.sock");
     set_forwards(&machine, vec![inbound_unix(&listen, &target)]).await;

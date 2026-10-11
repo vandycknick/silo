@@ -81,7 +81,7 @@ func TestActualUnregisteredNodeStrictAdapterCannotReachHostListener(t *testing.T
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	s := &tsnet.Server{Dir: t.TempDir(), Hostname: "silo-offline-adapter", ControlURL: "http://127.0.0.1:1", UserLogf: t.Logf}
+	s := &tsnet.Server{Dir: t.TempDir(), Hostname: "silo-offline-adapter", ControlURL: "http://" + offlineEndpoint(t), UserLogf: t.Logf}
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestDNSProvenanceCapacityIsAtomicAndQuarantineExpires(t *testing.T) {
 
 func TestActualNodeStartCloseOwnershipAndDisconnectedDial(t *testing.T) {
 	for i := 0; i < 5; i++ {
-		n := newTestNode(t, Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "offline-owner", ControlURL: "http://127.0.0.1:1"}})
+		n := newTestNode(t, Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "offline-owner", ControlURL: "http://" + offlineEndpoint(t)}})
 		n.Start(context.Background())
 		_, reason, err := n.DialTCP(context.Background(), netip.MustParseAddrPort("100.64.0.1:80"))
 		if err == nil || reason != "tunnel_not_connected" {
@@ -367,7 +367,7 @@ func TestRejectDiscoveryKeysBeforeServerConstructionAndOutbound(t *testing.T) {
 		t.Fatal("rejected key made an outbound OAuth connection")
 	}
 	for _, key := range []string{"", "tskey-auth-synthetic-literal_key"} {
-		n := newTestNode(t, Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "literal-key-close", ControlURL: "http://127.0.0.1:1"}, Secrets: credentials.NewStatic(map[string][]byte{"vm.tailscale.auth_key": []byte(key)}, nil)})
+		n := newTestNode(t, Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "literal-key-close", ControlURL: "http://" + offlineEndpoint(t)}, Secrets: credentials.NewStatic(map[string][]byte{"vm.tailscale.auth_key": []byte(key)}, nil)})
 		n.Start(context.Background())
 		deadline := time.Now().Add(2 * time.Second)
 		for {

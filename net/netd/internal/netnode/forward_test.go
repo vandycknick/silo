@@ -123,7 +123,7 @@ func TestForwardTCPGuestPortAndHalfClose(t *testing.T) {
 	}
 }
 func TestForwardReservedFallbackNeverDialsGuest(t *testing.T) {
-	guest := &forwardGuest{address: "127.0.0.1:1"}
+	guest := &forwardGuest{address: offlineEndpoint(t)}
 	n, events := forwardNode(t, guest)
 	n.reserved = map[uint16]policy.Forward{18080: {Name: "raw", ListenPort: 18080, GuestPort: 8080, Protocol: policy.ForwardProtocolTCP}}
 	client, in := socketPair(t)
@@ -300,7 +300,7 @@ func TestForwardHTTPSProxyAuthorityHeadersStreamingAndUpgrade(t *testing.T) {
 	}
 }
 func TestForwardHTTPSGuestRefusalAndHandshakeFailure(t *testing.T) {
-	guest := &forwardGuest{address: "127.0.0.1:1"}
+	guest := &forwardGuest{address: refusedEndpoint(t)}
 	n, events := forwardNode(t, guest)
 	addr, client, cleanup := localForwardTLS(t, n)
 	defer cleanup()
@@ -448,7 +448,7 @@ func TestForwardAdmissionSharedLimitDrainingAndAcceptRecovery(t *testing.T) {
 }
 
 func TestForwardPartialBindRollbackAndReservation(t *testing.T) {
-	n := newTestNode(t, Options{Dir: t.TempDir(), AttachmentScope: policy.AttachmentScopeDedicatedVM, Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "offline-forward", ControlURL: "http://127.0.0.1:1"}, Forwards: []policy.Forward{{Name: "first", ListenPort: 18080, GuestPort: 8080, Protocol: policy.ForwardProtocolTCP}, {Name: "collision", ListenPort: 18080, GuestPort: 8081, Protocol: policy.ForwardProtocolTCP}}})
+	n := newTestNode(t, Options{Dir: t.TempDir(), AttachmentScope: policy.AttachmentScopeDedicatedVM, Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "offline-forward", ControlURL: "http://" + offlineEndpoint(t)}, Forwards: []policy.Forward{{Name: "first", ListenPort: 18080, GuestPort: 8080, Protocol: policy.ForwardProtocolTCP}, {Name: "collision", ListenPort: 18080, GuestPort: 8081, Protocol: policy.ForwardProtocolTCP}}})
 	if err := n.server.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +515,7 @@ func TestForwardForceCloseStalledTLSAndTerminalAudit(t *testing.T) {
 }
 
 func TestForwardCertificateRealLocalClientCancellationAndClosedNode(t *testing.T) {
-	n := newTestNode(t, Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "offline-cert", ControlURL: "http://127.0.0.1:1"}})
+	n := newTestNode(t, Options{Dir: t.TempDir(), Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "offline-cert", ControlURL: "http://" + offlineEndpoint(t)}})
 	n.Start(context.Background())
 	defer n.Close()
 	deadline := time.Now().Add(5 * time.Second)
@@ -746,7 +746,7 @@ func TestForwardForceCloseActiveStreamAndUpgrade(t *testing.T) {
 }
 
 func TestForwardProductionTLSFailureNeverContactsGuest(t *testing.T) {
-	guest := &forwardGuest{address: "127.0.0.1:1"}
+	guest := &forwardGuest{address: offlineEndpoint(t)}
 	n, events := forwardNode(t, guest)
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

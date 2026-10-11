@@ -2,7 +2,6 @@ package control
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,8 +15,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// Requires real silod, not a gRPC echo fixture. Run actual-daemon packages -p1
-// under an idle dedicated UID with explicit installed runtime/bin directories.
+// Requires real silod with explicit installed runtime/bin directories.
 func TestActualAdmittedTransportRefusesReplacement(t *testing.T) {
 	if os.Getenv("SILO_TEST_CONTROL_REPLACEMENT") != "1" {
 		t.Skip("requires explicit real-daemon replacement admission")
@@ -26,28 +24,17 @@ func TestActualAdmittedTransportRefusesReplacement(t *testing.T) {
 	if !filepath.IsAbs(bin) || !filepath.IsAbs(runtimeDir) {
 		t.Fatal("absolute SILO_TEST_BIN_DIR and SILO_RUNTIME_DIR required")
 	}
-	lock, err := os.OpenFile(fmt.Sprintf("/tmp/silo-control-fixture-%d.lock", os.Getuid()), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		t.Fatal("actual-daemon packages require -p1 and an idle UID", err)
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	if exec.Command("pgrep", "-u", fmt.Sprint(os.Getuid()), "-x", "silod").Run() == nil {
-		t.Fatal("live silod; use idle dedicated UID")
-	}
+	runRoot := testfixture.ShortTempDir(t)
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint := testfixture.ControlEndpoint(t)
+	endpoint := filepath.Join(runRoot, "silod", "control.sock")
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	start := func() (*Client, *daemonv1.DaemonStatus, func()) {
 		cmd := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false")
-		cmd.Env = []string{"HOME=" + root, "SILO_HOME=" + filepath.Join(root, "state"), "XDG_CONFIG_HOME=" + filepath.Join(root, "config"), "PATH=" + os.Getenv("PATH"), "SILO_RUNTIME_DIR=" + runtimeDir}
+		cmd.Env = []string{"HOME=" + root, "SILO_HOME=" + filepath.Join(root, "state"), "XDG_CONFIG_HOME=" + filepath.Join(root, "config"), "PATH=" + os.Getenv("PATH"), "SILO_RUNTIME_DIR=" + runtimeDir, "SILO_RUN_ROOT=" + runRoot}
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)

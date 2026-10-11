@@ -1,7 +1,9 @@
 use std::env::consts::OS;
 use std::path::{Component, Path, PathBuf};
 
-use crate::paths::{default_run_root, ensure_run_root, resolve_default_home, LocalRoots};
+use crate::paths::{
+    absolute_path, default_run_root, ensure_run_root, resolve_default_home, LocalRoots,
+};
 use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::store::models::DbConfig;
 use crate::LibVmError;
@@ -28,6 +30,9 @@ pub struct RuntimeConfig {
     pub agent_path: Option<PathBuf>,
     /// Explicit portable runtime root.
     pub runtime_root: Option<PathBuf>,
+    /// Explicit generated-state root, overriding `SILO_RUN_ROOT`.
+    /// Must be absolute and short enough for machine Unix socket paths.
+    pub run_root: Option<PathBuf>,
     /// Portable runtime root bundled by an SDK frontend.
     pub bundled_runtime_root: Option<PathBuf>,
     /// Exact component selection; use `with_runtime_components` to set it.
@@ -122,6 +127,13 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets the generated-state root for sockets, pidfiles and locks.
+    /// Must be absolute and short enough for machine Unix socket paths.
+    pub fn with_run_root(mut self, run_root: impl Into<PathBuf>) -> Self {
+        self.run_root = Some(run_root.into());
+        self
+    }
+
     /// Sets a portable runtime root bundled by an SDK frontend.
     pub fn with_bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
         self.runtime_components = None;
@@ -172,7 +184,10 @@ impl RuntimeConfig {
 
     /// Both runtime roots; creates and validates the run root.
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
-        let run_root = default_run_root()?;
+        let run_root = match &self.run_root {
+            Some(path) => absolute_path("run_root", path.clone().into_os_string())?,
+            None => default_run_root()?,
+        };
         ensure_run_root(&run_root)?;
         Ok(LocalRoots::with_roots(self.resolve_home()?, run_root))
     }
@@ -339,6 +354,8 @@ impl NetdRuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::store::models::MachineId;
     use crate::store::Store;
     use crate::{LibVmError, Runtime, RuntimeConfig, VirtBackendOverride};
@@ -486,5 +503,42 @@ mod tests {
         );
         drop(store);
         Runtime::new(config).await.expect("reopen runtime");
+    }
+
+    #[tokio::test]
+    async fn runtime_uses_explicit_run_root_override() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let run_root = temp.path().join("run");
+        let runtime_root = complete_runtime_root(temp.path());
+        let config = RuntimeConfig::local(temp.path().join("home"))
+            .with_runtime_root(runtime_root)
+            .with_run_root(&run_root);
+
+        let runtime = Runtime::new(config).await.expect("open fresh runtime");
+        assert_eq!(runtime.local_paths().roots().run_root(), run_root);
+        assert_eq!(
+            std::fs::metadata(&run_root)
+                .expect("read run root metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn explicit_run_root_must_be_absolute() {
+        let err = RuntimeConfig::local("/tmp/silo-home")
+            .with_run_root("relative/run")
+            .resolve_roots()
+            .expect_err("relative run root should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::RelativeEnvironmentPath {
+                name: "run_root",
+                ..
+            }
+        ));
     }
 }

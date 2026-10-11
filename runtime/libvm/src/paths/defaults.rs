@@ -107,7 +107,7 @@ pub(crate) fn env_absolute_path(name: &'static str) -> Result<Option<PathBuf>, L
     }
 }
 
-fn absolute_path(name: &'static str, value: OsString) -> Result<PathBuf, LibVmError> {
+pub(crate) fn absolute_path(name: &'static str, value: OsString) -> Result<PathBuf, LibVmError> {
     let path = PathBuf::from(value);
     if path.is_absolute() {
         Ok(path)

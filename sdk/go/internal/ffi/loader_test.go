@@ -10,6 +10,7 @@ import (
 )
 
 func TestLoadDevelopmentBridge(t *testing.T) {
+	t.Setenv("SILO_HOME", t.TempDir())
 	path := os.Getenv("SILO_GO_FFI_PATH")
 	if path == "" && os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
 		t.Skip("neither SILO_GO_FFI_PATH nor SILO_TEST_EMBEDDED_FFI is set")
@@ -69,6 +70,7 @@ func actualBridgePath(t *testing.T) string {
 	if os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
 		t.Skip("actual bridge or qualified embedded fixture required")
 	}
+	t.Setenv("SILO_HOME", t.TempDir())
 	path, err := bundle.Path()
 	if err != nil {
 		t.Fatal(err)

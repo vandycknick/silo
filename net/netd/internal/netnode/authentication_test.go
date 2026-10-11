@@ -50,7 +50,7 @@ func TestTaggedBootstrapUsesOwnerAuthorityNotRequestedTags(t *testing.T) {
 func TestPersistedIdentityDoesNotRedeemBootstrapAgain(t *testing.T) {
 	dir := t.TempDir()
 	private := key.NewNode()
-	pin := fixturePin{Tailnet: "fixture", Suffix: "tail.test", ControlURL: "http://127.0.0.1:1"}
+	pin := fixturePin{Tailnet: "fixture", Suffix: "tail.test", ControlURL: "http://" + offlineEndpoint(t)}
 	profileFixture(t, dir, "dev", "existing-node", pin, private, nil)
 	n, err := New(Options{Dir: dir, Declaration: policy.TailscaleDecl{Name: "vm", Hostname: "dev", ControlURL: pin.ControlURL}, Secrets: credentials.NewStatic(map[string][]byte{"vm.tailscale.auth_key": []byte("tskey-auth-already-used")}, nil)})
 	if err != nil {

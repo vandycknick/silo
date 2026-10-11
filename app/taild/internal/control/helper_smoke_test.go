@@ -30,18 +30,9 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 	if !filepath.IsAbs(bin) || !filepath.IsAbs(rootfs) {
 		t.Fatal("absolute SILO_TEST_BIN_DIR and SILO_TEST_ROOTFS required")
 	}
-	lock, err := os.OpenFile(filepath.Join(os.TempDir(), fmt.Sprintf("silo-control-fixture-%d.lock", os.Getuid())), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		t.Fatal("use an idle dedicated test UID:", err)
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	if err := exec.Command("pgrep", "-x", "silod").Run(); err == nil {
-		t.Fatal("live silod found; use an idle dedicated test UID")
-	}
+	runRoot := testfixture.ShortTempDir(t)
+	t.Setenv("SILO_RUN_ROOT", runRoot)
+	endpoint := filepath.Join(runRoot, "silod", "control.sock")
 
 	blocked, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -58,8 +49,8 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configuration), 0600); err != nil {
 		t.Fatal(err)
 	}
-	environment := []string{"HOME=" + home, "SILO_HOME=" + filepath.Join(home, "state"), "XDG_CONFIG_HOME=" + filepath.Join(home, "config"), "PATH=" + os.Getenv("PATH")}
-	for _, key := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
+	environment := []string{"HOME=" + home, "SILO_HOME=" + filepath.Join(home, "state"), "XDG_CONFIG_HOME=" + filepath.Join(home, "config"), "PATH=" + os.Getenv("PATH"), "SILO_RUN_ROOT=" + runRoot}
+	for _, key := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "SILO_RUNTIME_DIR"} {
 		if value := os.Getenv(key); value != "" {
 			environment = append(environment, key+"="+value)
 		}
@@ -137,7 +128,7 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 				t.Fatalf("daemon exited during startup: %v", err)
 			default:
 			}
-			client, err := New(testfixture.ControlEndpoint(t), "")
+			client, err := New(endpoint, "")
 			if err == nil {
 				probe, cancel := context.WithTimeout(ctx, time.Second)
 				status, err := client.Daemon.GetStatus(probe, &emptypb.Empty{})
@@ -156,9 +147,15 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
-			output, err := exec.Command("pgrep", "-P", strconv.Itoa(daemon.Process.Pid), "-x", "taild").Output()
+			output, err := exec.Command("ps", "--ppid", strconv.Itoa(daemon.Process.Pid), "-o", "pid=,comm=").Output()
 			if err == nil {
-				ids := strings.Fields(string(output))
+				var ids []string
+				for _, line := range strings.Split(string(output), "\n") {
+					fields := strings.Fields(line)
+					if len(fields) == 2 && fields[1] == "taild" {
+						ids = append(ids, fields[0])
+					}
+				}
 				if len(ids) > 1 {
 					t.Fatalf("multiple helper children: %s", output)
 				}

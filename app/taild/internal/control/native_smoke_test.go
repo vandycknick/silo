@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -23,7 +22,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// This opt-in fixture runs a real daemon, OCI registry and KVM guest under an idle UID.
+// This opt-in fixture runs a real daemon, OCI registry and KVM guest.
 func TestNativeControlLifecycle(t *testing.T) {
 	if os.Getenv("SILO_E2E_KVM") != "1" {
 		t.Skip("requires explicit KVM admission")
@@ -33,24 +32,14 @@ func TestNativeControlLifecycle(t *testing.T) {
 	if !filepath.IsAbs(bin) || !filepath.IsAbs(rootfs) {
 		t.Fatal("absolute SILO_TEST_BIN_DIR and SILO_TEST_ROOTFS required")
 	}
-	lock, err := os.OpenFile(filepath.Join(os.TempDir(), fmt.Sprintf("silo-control-fixture-%d.lock", os.Getuid())), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		t.Fatal("use an idle dedicated test UID:", err)
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	if err := exec.Command("pgrep", "-x", "silod").Run(); err == nil {
-		t.Fatal("live silod found; use an idle dedicated test UID")
-	}
+	runRoot := testfixture.ShortTempDir(t)
+	t.Setenv("SILO_RUN_ROOT", runRoot)
 	registry := testfixture.OCIRegistry(t, rootfs)
 	home := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	command := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false", "--system-image=registry.invalid/disabled:test")
-	command.Env = []string{"HOME=" + home, "SILO_HOME=" + filepath.Join(home, "state"), "XDG_CONFIG_HOME=" + filepath.Join(home, "config"), "PATH=" + os.Getenv("PATH")}
+	command.Env = []string{"HOME=" + home, "SILO_HOME=" + filepath.Join(home, "state"), "XDG_CONFIG_HOME=" + filepath.Join(home, "config"), "PATH=" + os.Getenv("PATH"), "SILO_RUN_ROOT=" + runRoot}
 	for _, key := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "SILO_RUNTIME_DIR"} {
 		if value := os.Getenv(key); value != "" {
 			command.Env = append(command.Env, key+"="+value)
@@ -110,7 +99,8 @@ func TestNativeControlLifecycle(t *testing.T) {
 			t.Error("daemon failed to drain")
 		}
 	}()
-	endpoint := testfixture.ControlEndpoint(t)
+	endpoint := filepath.Join(runRoot, "silod", "control.sock")
+	var err error
 	var client *Client
 	for {
 		client, err = New(endpoint, "")

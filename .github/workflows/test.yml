@@ -211,7 +211,7 @@ jobs:
           SILO_RUNTIME_DIR: ${{ github.workspace }}/target/silo-runtime/${{ matrix.target }}/debug
           SILO_TEST_BIN_DIR: ${{ github.workspace }}/target/debug
           SILO_TEST_CLI: ${{ github.workspace }}/target/debug/silo
-        run: nix develop .#ci --command go -C app/taild test -p 1 -race -count=1 -timeout=4m -v ./...
+        run: nix develop .#ci --command go -C app/taild test -race -count=1 -timeout=4m -v ./...
 
   node-sdk:
     name: Node SDK (${{ matrix.platform }})

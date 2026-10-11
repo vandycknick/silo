@@ -23,7 +23,7 @@ defer runtime.Close()
 
 `InstallRuntime` downloads the exact SDK-version archive for the current target, checks its compiled SHA-256 digest, rejects unsafe archive entries, and atomically installs it under `~/.silo/runtimes/<version>/<target>` (`$SILO_HOME/runtimes/...` when `SILO_HOME` is set). Use `WithRuntimeArchive` for an exact offline archive or `WithRuntimeMirror` to replace only the download origin.
 
-Loading the small Go FFI bridge is separate from runtime installation. It may materialize embedded bridge bytes under `~/.silo/cache/go-ffi`, but it never accesses the network.
+Loading the small Go FFI bridge is separate from runtime installation. It may materialize embedded bridge bytes under `~/.silo/cache/go-ffi` (`$SILO_HOME/cache/go-ffi` when `SILO_HOME` is set), but it never accesses the network.
 
 `Open` accepts `WithHome` to select the Silo home holding all persistent state (default `SILO_HOME`, else `~/.silo`; generated sockets live under `/tmp/silo-<euid>` unless `SILO_RUN_ROOT` (absolute) overrides it), `WithRuntimeRoot` to select one complete runtime installation, and `WithSupervisorPath` to override only the `silo-vmm` executable.
 

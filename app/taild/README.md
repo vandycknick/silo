@@ -464,6 +464,11 @@ CGO_ENABLED=1 SILO_GO_FFI_PATH=/absolute/path/libsilo_go_ffi.so \
 go -C app/taild vet ./...
 ```
 
+Daemon fixtures create a private mode-0700 run root under `/tmp` (`/private/tmp`
+on macOS) and pass its absolute path through `SILO_RUN_ROOT` to silod, the CLI
+and the in-process SDK. They can run alongside the developer's daemon and across
+packages without serialization.
+
 Unit/domain tests cover grants, authorization, grammar and quotas. Real local
 integration uses files/rotation, public SDK runtime validation/inventory,
 local HTTP OAuth protocol/cancellation, and SSH channel command dispatch below

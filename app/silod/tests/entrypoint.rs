@@ -5,6 +5,18 @@ use std::time::{Duration, Instant};
 use silod_spec::paths::DaemonPaths;
 use silod_spec::status::{CorePhase, DaemonStatus, SystemPhase};
 
+#[cfg(target_os = "macos")]
+const RUN_ROOT_PARENT: &str = "/private/tmp";
+#[cfg(not(target_os = "macos"))]
+const RUN_ROOT_PARENT: &str = "/tmp";
+
+fn temporary_home() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("silod-e2e-")
+        .tempdir_in(RUN_ROOT_PARENT)
+        .expect("temporary home")
+}
+
 fn command(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_silod"));
     command
@@ -13,6 +25,7 @@ fn command(home: &std::path::Path) -> Command {
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("SILO_HOME", home.join("runtime-home"))
+        .env("SILO_RUN_ROOT", home.join("run"))
         .env("SILO_VIRT_BACKEND", "not-a-daemon-setting")
         .env("SILO_RUNTIME_DIR", home.join("missing-runtime"));
     command
@@ -40,36 +53,9 @@ impl Drop for Process {
     }
 }
 
-/// Sibling tests in this binary run concurrently and spawn short-lived silod
-/// children of this process. Only a daemon this process did not start can
-/// contend for the per-UID run root.
-fn foreign_silod_running() -> bool {
-    let listed = Command::new("pgrep")
-        .args(["-x", "silod"])
-        .output()
-        .expect("check live silod");
-    assert!(
-        matches!(listed.status.code(), Some(0 | 1)),
-        "pgrep failed: {listed:?}"
-    );
-    let ours = std::process::id().to_string();
-    String::from_utf8_lossy(&listed.stdout)
-        .split_whitespace()
-        .any(|pid| {
-            // A process that exits before ps observes it cannot contend either.
-            Command::new("ps")
-                .args(["-o", "ppid=", "-p", pid])
-                .output()
-                .is_ok_and(|parent| {
-                    parent.status.success()
-                        && String::from_utf8_lossy(&parent.stdout).trim() != ours
-                })
-        })
-}
-
 #[test]
 fn malformed_shared_configuration_is_rejected_without_creating_state() {
-    let root = tempfile::tempdir().expect("temporary home");
+    let root = temporary_home();
     unreadable_cli_config(root.path());
     let original = std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config");
     let check = command(root.path()).arg("--check").output().expect("check");
@@ -87,7 +73,7 @@ fn invalid_system_configuration_exits_two_before_startup() {
     if nix::unistd::geteuid().is_root() {
         return;
     }
-    let root = tempfile::tempdir().expect("temporary home");
+    let root = temporary_home();
     let output = command(root.path())
         .arg("--system-enabled=true")
         .args(["--system-memory", "1MiB"])
@@ -105,25 +91,7 @@ fn daemon_keeps_core_ready_through_system_retry_and_log_failure() {
     if nix::unistd::geteuid().is_root() {
         return;
     }
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
-        .open(std::env::temp_dir().join(format!(
-            "silo-control-fixture-{}.lock",
-            nix::unistd::geteuid()
-        )))
-        .expect("fixture lock");
-    let _fixture = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
-        .expect("use an idle dedicated test UID");
-    assert!(
-        !foreign_silod_running(),
-        "live silod found; use an idle dedicated test UID"
-    );
-    let root = tempfile::tempdir().expect("temporary home");
+    let root = temporary_home();
     // A genuinely missing runtime prevents any VM launch or registry access, while
     // exercising real startup, status publication, retry, and signal handling.
     let mut child = Process(
@@ -175,6 +143,13 @@ fn daemon_keeps_core_ready_through_system_retry_and_log_failure() {
         .unwrap_or_default()
         .contains("missing-runtime"));
     assert_eq!(status.pid, child.0.id());
+    assert_eq!(
+        status.control_endpoint,
+        root.path()
+            .join("run/silod/control.sock")
+            .display()
+            .to_string()
+    );
     assert_eq!(
         system.configured_image.as_deref(),
         Some("registry.invalid/unused:test")
@@ -261,7 +236,7 @@ fn stop_without_an_installation_reports_stopped() {
     if nix::unistd::geteuid().is_root() {
         return;
     }
-    let root = tempfile::tempdir().expect("temporary home");
+    let root = temporary_home();
     let output = command(root.path()).arg("--stop").output().expect("stop");
     assert!(output.status.success(), "{output:?}");
     let status = read_status(&DaemonPaths::new(root.path().join("runtime-home"))).expect("status");

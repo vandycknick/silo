@@ -3,6 +3,7 @@ package netnode
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,43 @@ import (
 )
 
 type fixturePin struct{ Tailnet, Suffix, ControlURL string }
+
+func offlineEndpoint(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		listener.Close()
+		<-done
+	})
+	return listener.Addr().String()
+}
+
+func refusedEndpoint(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return endpoint
+}
 
 func profileFixture(t *testing.T, dir, name, id string, pin fixturePin, private key.NodePrivate, tags []string) {
 	t.Helper()
