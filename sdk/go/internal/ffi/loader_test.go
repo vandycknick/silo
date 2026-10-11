@@ -9,19 +9,13 @@ import (
 	"github.com/vandycknick/silo/sdk/go/internal/bundle"
 )
 
-func TestLoadDevelopmentBridge(t *testing.T) {
+func TestLoadAttachmentControlSymbols(t *testing.T) {
 	t.Setenv("SILO_HOME", t.TempDir())
-	path := os.Getenv("SILO_GO_FFI_PATH")
-	if path == "" && os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
-		t.Skip("neither SILO_GO_FFI_PATH nor SILO_TEST_EMBEDDED_FFI is set")
-	}
+	path := actualBridgePath(t)
 	if err := Load("0.1.0", 1); err != nil {
 		t.Fatalf("Load() failed: %v", err)
 	}
-}
-
-func TestLoadAttachmentControlSymbols(t *testing.T) {
-	if err := load(actualBridgePath(t), "0.1.0", 1); err != nil {
+	if err := load(path, "0.1.0", 1); err != nil {
 		t.Fatal(err)
 	}
 	token, err := NewAttachmentCancellation()

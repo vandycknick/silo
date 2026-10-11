@@ -74,18 +74,16 @@ describe("image inspection", () => {
 });
 
 describe("runtime options", () => {
-  it("passes through supported runtime options", () => {
-    expect(
-      runtimeOptionsToNative({
-        home: "/tmp/silo",
-      }),
-    ).toMatchObject({
-      home: "/tmp/silo",
-    });
-  });
-
-  it("does not reject extra runtime option fields", () => {
-    const options: RuntimeOpenOptions & { bogus: string } = { home: "/tmp/silo", bogus: "nope" };
+  it.each([
+    {
+      name: "passes through supported runtime options",
+      options: { home: "/tmp/silo" },
+    },
+    {
+      name: "does not reject extra runtime option fields",
+      options: { home: "/tmp/silo", bogus: "nope" } satisfies RuntimeOpenOptions & { bogus: string },
+    },
+  ])("$name", ({ options }) => {
     expect(runtimeOptionsToNative(options)).toMatchObject({ home: "/tmp/silo" });
   });
 });

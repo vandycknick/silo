@@ -12,6 +12,7 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/config"
 	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
+	"golang.org/x/sys/unix"
 )
 
 func TestSessionShutdownStopsVirtualNetwork(t *testing.T) {
@@ -151,11 +152,11 @@ func testDirectory(t *testing.T, path string) *logfile.Directory {
 	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	file, err := os.Open(path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	directory, err := logfile.OpenDirectory(int(file.Fd()))
+	directory, err := logfile.OpenDirectory(fd)
 	if err != nil {
 		t.Fatal(err)
 	}

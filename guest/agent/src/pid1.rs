@@ -704,17 +704,21 @@ mod tests {
     }
 
     #[test]
-    fn input_event_device_name_filter_accepts_event_devices() {
-        assert!(is_input_event_device_name(OsStr::new("event0")));
-        assert!(is_input_event_device_name(OsStr::new("event12")));
-    }
-
-    #[test]
-    fn input_event_device_name_filter_rejects_non_event_devices() {
-        assert!(!is_input_event_device_name(OsStr::new("event")));
-        assert!(!is_input_event_device_name(OsStr::new("eventx")));
-        assert!(!is_input_event_device_name(OsStr::new("event0.old")));
-        assert!(!is_input_event_device_name(OsStr::new("mouse0")));
+    fn input_event_device_name_filter() {
+        for (name, expected) in [
+            ("event0", true),
+            ("event12", true),
+            ("event", false),
+            ("eventx", false),
+            ("event0.old", false),
+            ("mouse0", false),
+        ] {
+            assert_eq!(
+                is_input_event_device_name(OsStr::new(name)),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]

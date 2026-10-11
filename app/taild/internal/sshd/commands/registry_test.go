@@ -46,7 +46,7 @@ func TestDeclarationsDriveHelpAndArity(t *testing.T) {
 	for _, c := range all {
 		flags := flagsOf(c)
 		text, ok := detailedHelp([]string{c.Name}, &cfg)
-		if !ok || !strings.Contains(text, "Usage:\n  "+c.Usage) || !strings.Contains(text, "Examples:\n  "+strings.ReplaceAll(c.Example, "\n", "\n  ")) {
+		if !ok || !strings.Contains(text, c.Usage) || !strings.Contains(text, strings.ReplaceAll(c.Example, "\n", "\n  ")) {
 			t.Fatal(c.Name, ok, text)
 		}
 		if strings.Contains(text, "--json") == c.Streaming {

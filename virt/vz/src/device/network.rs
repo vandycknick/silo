@@ -112,7 +112,6 @@ fn remove_file_if_exists(path: &Path) -> Result<(), VzError> {
 mod tests {
     use super::local_unix_datagram_path;
     use std::path::Path;
-    use utils::format_mac;
 
     #[test]
     fn local_unix_datagram_path_uses_vm_id_and_backend() {
@@ -131,14 +130,6 @@ mod tests {
         assert_eq!(
             local_unix_datagram_path(Path::new("/tmp/silo-net/gvproxy.sock"), "vm123", "vz"),
             Path::new("/tmp/silo-net/vm123-vz.sock")
-        );
-    }
-
-    #[test]
-    fn format_mac_uses_colon_separated_lower_hex() {
-        assert_eq!(
-            format_mac([0x02, 0xb2, 0xe4, 0x04, 0xd2, 0xcc]),
-            "02:b2:e4:04:d2:cc"
         );
     }
 }

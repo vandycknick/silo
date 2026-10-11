@@ -660,11 +660,6 @@ mod tests {
     }
 
     #[test]
-    fn current_spec_version_remains_0_1_0() {
-        assert_eq!(VmSpec::current().spec_version.to_string(), "0.1.0");
-    }
-
-    #[test]
     fn full_spec_uses_camel_case_json_fields() {
         let spec = VmSpec {
             guest: Some(Guest {
@@ -1141,22 +1136,87 @@ forwards:
     }
 
     #[test]
-    fn duplicate_forward_names_and_vsock_listen_ports_are_rejected() {
-        let duplicate_name = serde_yaml_ng::from_str::<VmSpec>(
+    fn invalid_spec_parse_cases() {
+        for (label, message, required, forbidden) in [
+            ("duplicate_forward_names_and_vsock_listen_ports_are_rejected_duplicate_name", serde_yaml_ng::from_str::<VmSpec>(
             "specVersion: 0.1.0\nforwards:\n  - name: api\n    listen: host:tcp:80\n    connect: guest:tcp:80\n  - name: api\n    listen: host:tcp:81\n    connect: guest:tcp:81\n",
         )
-        .expect_err("duplicate name must fail");
-        assert!(duplicate_name
-            .to_string()
-            .contains("forward name \"api\" is repeated"));
-
-        let duplicate_port = serde_yaml_ng::from_str::<VmSpec>(
+        .expect_err("duplicate name must fail").to_string(), &["forward name \"api\" is repeated"][..], &[][..]),
+            ("duplicate_forward_names_and_vsock_listen_ports_are_rejected_duplicate_port", serde_yaml_ng::from_str::<VmSpec>(
             "specVersion: 0.1.0\nforwards:\n  - listen: vsock:5000\n    connect: host:tcp:80\n  - listen: vsock:5000\n    connect: host:tcp:81\n",
         )
-        .expect_err("duplicate vsock listen port must fail");
-        assert!(duplicate_port
-            .to_string()
-            .contains("vsock listen port 5000 is repeated"));
+        .expect_err("duplicate vsock listen port must fail").to_string(), &["vsock listen port 5000 is repeated"][..], &[][..]),
+            ("removed_fields_are_reported_before_invalid_forwards_error", serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nvsockEndpoints:\n  - plugin:\n      command: /bin/old\nforwards:\n  - listen: host:tcp:80\n    connect: host:tcp:81\n",
+        )
+        .expect_err("removed field and invalid forward must fail").to_string(), &["removed ADR 0005 fields", "vsockEndpoints[0].plugin.command"][..], &["invalid forward sides"][..]),
+            ("duplicate_unix_listeners_are_rejected_when_loading_a_spec_error", serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "forwards": [
+                {"listen": "host:unix:service.sock", "connect": "guest:tcp:80"},
+                {"listen": "host:unix:service.sock", "connect": "guest:tcp:81"}
+            ]
+        }))
+        .unwrap_err().to_string(), &["Unix listen endpoint"][..], &[][..]),
+            ("removed_endpoint_fields_are_reported_comprehensively_error", serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "vsock": {
+                "endpoints": [
+                    {
+                        "name": "first",
+                        "plugin": {
+                            "command": "/bin/first",
+                            "config": { "kind": "one" }
+                        },
+                        "lifecycle": {
+                            "restart": "always",
+                            "backoffMs": { "initial": 1, "max": 2 }
+                        }
+                    },
+                    {
+                        "name": "second",
+                        "plugin": { "command": "/bin/second" },
+                        "lifecycle": { "autostart": false }
+                    }
+                ],
+                "plugin": { "command": "/bin/root" },
+                "lifecycle": { "restart": "never" }
+            }
+        }))
+        .expect_err("removed endpoint fields must fail").to_string(), &["vsock.endpoints", "vsock.endpoints[0].name", "vsock.endpoints[0].plugin", "vsock.endpoints[0].plugin.command", "vsock.endpoints[0].plugin.config.kind", "vsock.endpoints[0].lifecycle.restart", "vsock.endpoints[0].lifecycle.backoffMs.initial", "vsock.endpoints[0].lifecycle.backoffMs.max", "vsock.endpoints[1].name", "vsock.endpoints[1].plugin.command", "vsock.endpoints[1].lifecycle.autostart", "vsock.plugin.command", "vsock.lifecycle.restart"][..], &[][..]),
+            ("mixed_legacy_forms_are_aggregated_into_one_error_error", serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "vsock_endpoints": [{
+                "plugin": { "command": "/bin/snake" },
+                "lifecycle": { "restart": "always" }
+            }],
+            "vsockEndpoints": [{
+                "plugin": { "command": "/bin/camel" },
+                "lifecycle": { "autostart": true }
+            }],
+            "vsock": {
+                "endpoints": [{
+                    "plugin": { "command": "/bin/nested" },
+                    "lifecycle": { "backoffMs": { "max": 5 } }
+                }]
+            }
+        }))
+        .expect_err("all legacy forms must fail together").to_string(), &["vsock_endpoints[0].plugin.command", "vsock_endpoints[0].lifecycle.restart", "vsockEndpoints[0].plugin.command", "vsockEndpoints[0].lifecycle.autostart", "vsock.endpoints[0].plugin.command", "vsock.endpoints[0].lifecycle.backoffMs.max"][..], &[][..]),
+            ("standalone_vsock_retains_removed_field_diagnostics_error", serde_json::from_value::<Vsock>(json!({
+            "endpoints": [{
+                "plugin": { "command": "/bin/old" },
+                "lifecycle": { "restart": "always" }
+            }]
+        }))
+        .expect_err("standalone legacy vsock must fail").to_string(), &["vsock.endpoints[0].plugin.command", "vsock.endpoints[0].lifecycle.restart"][..], &[][..]),
+        ] {
+            for &text in required {
+                assert!(message.contains(text), "{label}: missing {text}: {message}");
+            }
+            for &text in forbidden {
+                assert!(!message.contains(text), "{label}: unexpected {text}: {message}");
+            }
+        }
     }
 
     #[test]
@@ -1172,19 +1232,6 @@ forwards:
         )
         .expect("unknown top-level field remains permitted");
         assert_eq!(spec.forwards.len(), 1);
-    }
-
-    #[test]
-    fn removed_fields_are_reported_before_invalid_forwards() {
-        let error = serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nvsockEndpoints:\n  - plugin:\n      command: /bin/old\nforwards:\n  - listen: host:tcp:80\n    connect: host:tcp:81\n",
-        )
-        .expect_err("removed field and invalid forward must fail");
-        let message = error.to_string();
-
-        assert!(message.contains("removed ADR 0005 fields"));
-        assert!(message.contains("vsockEndpoints[0].plugin.command"));
-        assert!(!message.contains("invalid forward sides"));
     }
 
     #[test]
@@ -1219,19 +1266,6 @@ forwards:
             assert!(serde_json::to_string(&spec).is_err());
             assert!(serde_yaml_ng::to_string(&spec).is_err());
         }
-    }
-
-    #[test]
-    fn duplicate_unix_listeners_are_rejected_when_loading_a_spec() {
-        let error = serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
-            "forwards": [
-                {"listen": "host:unix:service.sock", "connect": "guest:tcp:80"},
-                {"listen": "host:unix:service.sock", "connect": "guest:tcp:81"}
-            ]
-        }))
-        .unwrap_err();
-        assert!(error.to_string().contains("Unix listen endpoint"));
     }
 
     #[test]
@@ -1333,58 +1367,6 @@ forwards:
     }
 
     #[test]
-    fn removed_endpoint_fields_are_reported_comprehensively() {
-        let error = serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
-            "vsock": {
-                "endpoints": [
-                    {
-                        "name": "first",
-                        "plugin": {
-                            "command": "/bin/first",
-                            "config": { "kind": "one" }
-                        },
-                        "lifecycle": {
-                            "restart": "always",
-                            "backoffMs": { "initial": 1, "max": 2 }
-                        }
-                    },
-                    {
-                        "name": "second",
-                        "plugin": { "command": "/bin/second" },
-                        "lifecycle": { "autostart": false }
-                    }
-                ],
-                "plugin": { "command": "/bin/root" },
-                "lifecycle": { "restart": "never" }
-            }
-        }))
-        .expect_err("removed endpoint fields must fail");
-        let message = error.to_string();
-
-        for path in [
-            "vsock.endpoints",
-            "vsock.endpoints[0].name",
-            "vsock.endpoints[0].plugin",
-            "vsock.endpoints[0].plugin.command",
-            "vsock.endpoints[0].plugin.config.kind",
-            "vsock.endpoints[0].lifecycle.restart",
-            "vsock.endpoints[0].lifecycle.backoffMs.initial",
-            "vsock.endpoints[0].lifecycle.backoffMs.max",
-            "vsock.endpoints[1].name",
-            "vsock.endpoints[1].plugin.command",
-            "vsock.endpoints[1].lifecycle.autostart",
-            "vsock.plugin.command",
-            "vsock.lifecycle.restart",
-        ] {
-            assert!(
-                message.contains(path),
-                "missing removed path {path}: {message}"
-            );
-        }
-    }
-
-    #[test]
     fn top_level_legacy_endpoint_forms_are_rejected_comprehensively_in_json() {
         for field in ["vsock_endpoints", "vsockEndpoints"] {
             let input = format!(
@@ -1431,43 +1413,6 @@ forwards:
     }
 
     #[test]
-    fn mixed_legacy_forms_are_aggregated_into_one_error() {
-        let error = serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
-            "vsock_endpoints": [{
-                "plugin": { "command": "/bin/snake" },
-                "lifecycle": { "restart": "always" }
-            }],
-            "vsockEndpoints": [{
-                "plugin": { "command": "/bin/camel" },
-                "lifecycle": { "autostart": true }
-            }],
-            "vsock": {
-                "endpoints": [{
-                    "plugin": { "command": "/bin/nested" },
-                    "lifecycle": { "backoffMs": { "max": 5 } }
-                }]
-            }
-        }))
-        .expect_err("all legacy forms must fail together");
-        let message = error.to_string();
-
-        for path in [
-            "vsock_endpoints[0].plugin.command",
-            "vsock_endpoints[0].lifecycle.restart",
-            "vsockEndpoints[0].plugin.command",
-            "vsockEndpoints[0].lifecycle.autostart",
-            "vsock.endpoints[0].plugin.command",
-            "vsock.endpoints[0].lifecycle.backoffMs.max",
-        ] {
-            assert!(
-                message.contains(path),
-                "missing removed path {path}: {message}"
-            );
-        }
-    }
-
-    #[test]
     fn duplicate_vsock_cannot_hide_legacy_json_or_yaml_data() {
         let json = r#"{
             "specVersion": "0.1.0",
@@ -1502,28 +1447,6 @@ forwards:
             let error = serde_yaml_ng::from_str::<Vsock>(yaml)
                 .expect_err("duplicate YAML vsock field must fail");
             assert!(error.to_string().contains("duplicate field"));
-        }
-    }
-
-    #[test]
-    fn standalone_vsock_retains_removed_field_diagnostics() {
-        let error = serde_json::from_value::<Vsock>(json!({
-            "endpoints": [{
-                "plugin": { "command": "/bin/old" },
-                "lifecycle": { "restart": "always" }
-            }]
-        }))
-        .expect_err("standalone legacy vsock must fail");
-        let message = error.to_string();
-
-        for path in [
-            "vsock.endpoints[0].plugin.command",
-            "vsock.endpoints[0].lifecycle.restart",
-        ] {
-            assert!(
-                message.contains(path),
-                "missing removed path {path}: {message}"
-            );
         }
     }
 

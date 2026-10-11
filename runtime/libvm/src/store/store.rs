@@ -728,51 +728,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_and_retention_survive_sqlite_reopen() {
-        let (_dir, paths) = temp_paths();
-        let db = Store::new(&paths).await.expect("open db");
-        let id = MachineId::new();
-        let mut environment = BTreeMap::new();
-        environment.insert("ZED".to_string(), "last".to_string());
-        environment.insert("ALPHA".to_string(), "first".to_string());
-        let machine = MachineConfig {
-            id,
-            lock_id: LockId::from(42),
-            name: "reopen-stage-two".to_string(),
-            spec: sample_vm_spec(),
-            retention: crate::MachineRetention::Ephemeral,
-            process: crate::ProcessConfig {
-                entrypoint: Some(Vec::new()),
-                command: Some(vec!["/bin/echo".to_string(), "hello".to_string()]),
-                environment,
-                working_directory: "/workspace".to_string(),
-                user: Some("1000:1000".to_string()),
-            },
-            template_name: Some("rust-worker".to_string()),
-            agent_mode: Some(crate::MachineAgent::Disabled),
-            machine_dir: paths.machine(id).dir().to_path_buf(),
-            created_at: 1,
-            modified_at: 1,
-            image_ref: "test-image:latest".to_string(),
-            root_disk_size: None,
-            labels: BTreeMap::new(),
-            metadata: BTreeMap::new(),
-            network: MachineNetworkConfig::default(),
-            guest: crate::machine::MachineGuestConfig::default(),
-        };
-        seed_machine(&db, &machine).await;
-        db.pool.close().await;
-
-        let reopened = Store::open(&paths.state_db_path())
-            .await
-            .expect("reopen db");
-        assert_eq!(
-            reopened.machine_config(id).await.expect("read config"),
-            Some(machine)
-        );
-    }
-
-    #[tokio::test]
     async fn list_machines_sorted_by_name() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");

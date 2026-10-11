@@ -8,13 +8,29 @@ import (
 	"testing"
 )
 
-func TestVerifiedNativeABIVersion(t *testing.T) {
-	if os.Getenv("SILO_GO_FFI_PATH") == "" && os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
-		t.Skip("actual native bridge or qualified embedded bridge required")
+func TestNativeABIVersion(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{name: "constant", run: func(t *testing.T) {
+			const got uint32 = NativeABIVersion
+			if got != 1 {
+				t.Fatalf("required ABI = %d", got)
+			}
+		}},
+		{name: "verified bridge", run: func(t *testing.T) {
+			if os.Getenv("SILO_GO_FFI_PATH") == "" && os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
+				t.Skip("actual native bridge or qualified embedded bridge required")
+			}
+			actual, err := VerifiedNativeABIVersion()
+			if err != nil || actual != NativeABIVersion {
+				t.Fatalf("verified ABI = %d, %v; required %d", actual, err, NativeABIVersion)
+			}
+		}},
 	}
-	actual, err := VerifiedNativeABIVersion()
-	if err != nil || actual != NativeABIVersion {
-		t.Fatalf("verified ABI = %d, %v; required %d", actual, err, NativeABIVersion)
+	for _, test := range tests {
+		t.Run(test.name, test.run)
 	}
 }
 
@@ -38,12 +54,5 @@ func TestRejectsIncompatibleNativeBridge(t *testing.T) {
 	command.Env = append(os.Environ(), "SILO_ABI_MISMATCH_CHILD=1", "SILO_GO_FFI_PATH="+incompatible)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, output)
-	}
-}
-
-func TestNativeABIVersionConstant(t *testing.T) {
-	const got uint32 = NativeABIVersion
-	if got != 1 {
-		t.Fatalf("required ABI = %d", got)
 	}
 }

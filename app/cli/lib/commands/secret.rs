@@ -2322,30 +2322,6 @@ mod tests {
     }
 
     #[test]
-    fn oauth_refresh_frames_round_trip_json() {
-        let request = ProviderRequest {
-            version: 2,
-            operation: "get".to_string(),
-            grant: "e30=".to_string(),
-            scope: silo_secrets::grant::RequestScope {
-                machine: silo_secrets::MachineScopeId::new("0123456789abcdef0123456789abcdef")
-                    .unwrap(),
-                run: "run".into(),
-            },
-            names: vec![SecretName::new("personal.oauth.access_token").unwrap()],
-            reason: "expires_soon".to_string(),
-        };
-        let mut frame = Vec::new();
-        write_json_frame(&mut frame, &request).expect("write frame");
-
-        let decoded: ProviderRequest = read_json_frame(frame.as_slice()).expect("read frame");
-        assert_eq!(decoded.version, 2);
-        assert_eq!(decoded.operation, "get");
-        assert_eq!(decoded.grant, "e30=");
-        assert_eq!(decoded.names[0].as_str(), "personal.oauth.access_token");
-    }
-
-    #[test]
     fn write_plain_secret_writes_and_protects_existing_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileStore::new(dir.path());

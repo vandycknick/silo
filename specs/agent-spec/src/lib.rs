@@ -606,15 +606,6 @@ provision:
     }
 
     #[test]
-    fn removed_forward_config_is_rejected() {
-        let error =
-            serde_yaml_ng::from_str::<AgentConfig>("forward:\n  enabled: true\n  port: 4000\n")
-                .expect_err("removed forward config must be rejected");
-
-        assert!(error.to_string().contains("unknown field `forward`"));
-    }
-
-    #[test]
     fn userdata_run_defaults_to_once() {
         let raw = r#"
 provision:
@@ -837,8 +828,18 @@ provision:
     }
 
     #[test]
-    fn deserialization_rejects_non_ip_dns_server() {
-        let json = r#"{
+    fn invalid_agent_config_parse_cases() {
+        for (label, result, expected) in [
+            (
+                "removed_forward",
+                serde_yaml_ng::from_str::<AgentConfig>("forward:\n  enabled: true\n  port: 4000\n")
+                    .map_err(|err| err.to_string()),
+                Some("unknown field `forward`"),
+            ),
+            (
+                "non_ip_dns_server",
+                serde_json::from_str::<AgentConfig>(
+                    r#"{
             "provision": {
                 "network": {
                     "interfaces": [{
@@ -852,9 +853,17 @@ provision:
                     }]
                 }
             }
-        }"#;
-
-        serde_json::from_str::<AgentConfig>(json).expect_err("invalid DNS server must fail");
+        }"#,
+                )
+                .map_err(|err| err.to_string()),
+                None,
+            ),
+        ] {
+            let message = result.expect_err(label);
+            if let Some(text) = expected {
+                assert!(message.contains(text), "{label}: {message}");
+            }
+        }
     }
 
     fn valid_network_config() -> NetworkConfig {

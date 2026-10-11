@@ -28,6 +28,10 @@ fn parse_number(value: &str, line: usize) -> Result<u64, CoverageError> {
 pub fn parse_lcov(input: &str) -> Result<CoverageFiles, CoverageError> {
     let mut files = CoverageFiles::new();
     let mut lines: BTreeMap<String, BTreeMap<u64, u64>> = BTreeMap::new();
+    // Rust unit tests live at the bottom of the file they test (`mod tests`), so
+    // the first `::tests::` function start marks where test code begins; counting
+    // those lines would let a folded or deleted test move the file's percentage.
+    let mut test_start: BTreeMap<String, u64> = BTreeMap::new();
     let mut current = None;
     for (index, record) in input.lines().map(str::trim).enumerate() {
         let row = index + 1;
@@ -39,6 +43,17 @@ pub fn parse_lcov(input: &str) -> Result<CoverageFiles, CoverageError> {
             current = Some(file);
         } else if record == "end_of_record" {
             current = None;
+        } else if let Some(value) = record.strip_prefix("FN:") {
+            let file = current
+                .ok_or_else(|| CoverageError::parse(row, "LCOV FN outside source record"))?;
+            let (line, name) = value
+                .split_once(',')
+                .ok_or_else(|| CoverageError::parse(row, format!("invalid LCOV FN: {record}")))?;
+            if format!("{:#}", rustc_demangle::demangle(name)).contains("::tests::") {
+                let line = parse_number(line, row)?;
+                let start = test_start.entry(file.to_owned()).or_insert(line);
+                *start = (*start).min(line);
+            }
         } else if let Some(value) = record.strip_prefix("FNDA:") {
             let file = current
                 .ok_or_else(|| CoverageError::parse(row, "LCOV FNDA outside source record"))?;
@@ -88,9 +103,11 @@ pub fn parse_lcov(input: &str) -> Result<CoverageFiles, CoverageError> {
         }
     }
     for (file, counts) in lines {
+        let limit = test_start.get(&file).copied().unwrap_or(u64::MAX);
+        let production = counts.iter().filter(|(line, _)| **line < limit);
         files.entry(file).or_default().lines = (
-            counts.values().filter(|hits| **hits > 0).count() as u64,
-            counts.len() as u64,
+            production.clone().filter(|(_, hits)| **hits > 0).count() as u64,
+            production.count() as u64,
         );
     }
     Ok(files)
@@ -459,6 +476,17 @@ mod tests {
         ));
         assert!(parse_lcov("SF:").is_err());
         assert!(parse_lcov("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn lcov_line_totals_stop_at_the_first_rust_test_function() {
+        // Production lines 1-4 (3 of 4 hit); the tests module starts at line 5.
+        let files = parse_lcov(
+            "SF:a.rs\nFN:1,_RNvCs7ssUw5X5CQd_5utils10format_mac\nFN:8,_RNvNtCs7ssUw5X5CQd_5utils5tests12formats_mac\nFN:5,_RNvNtCs7ssUw5X5CQd_5utils5tests6helper\nDA:1,1\nDA:2,0\nDA:3,1\nDA:4,1\nDA:5,1\nDA:6,1\nDA:8,1\nend_of_record\nSF:b.rs\nFN:1,f\nDA:1,1\nDA:2,0\nend_of_record\n",
+        )
+        .unwrap();
+        assert_eq!(files["a.rs"].lines, (3, 4));
+        assert_eq!(files["b.rs"].lines, (1, 2));
     }
 
     #[test]

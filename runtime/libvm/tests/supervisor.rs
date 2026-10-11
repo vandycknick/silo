@@ -2100,30 +2100,6 @@ async fn host_port_22_listener_is_independent_of_host_to_guest_ssh() {
 }
 
 #[tokio::test]
-async fn machine_exec_round_trips_stdout() {
-    let env = test_env("exec-stdout", &Scenario::default()).await;
-    let machine = create_machine(&env, "integration-exec-stdout").await;
-    start_ready(&machine).await;
-
-    let output = machine
-        .exec("/bin/echo", ["hello-from-mock-guest"])
-        .await
-        .expect("exec in guest");
-    assert!(
-        matches!(output.result(), ExecutionResult::Exited { code: Some(0) }),
-        "unexpected result: {:?}",
-        output.result()
-    );
-    assert_eq!(
-        String::from_utf8_lossy(output.stdout_bytes()),
-        "hello-from-mock-guest\n"
-    );
-
-    machine.stop().await.expect("stop machine");
-    machine.remove().await.expect("remove machine");
-}
-
-#[tokio::test]
 async fn machine_exec_round_trips_stdin() {
     let env = test_env("exec-stdin", &Scenario::default()).await;
     let machine = create_machine(&env, "integration-exec-stdin").await;

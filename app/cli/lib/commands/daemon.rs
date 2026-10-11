@@ -515,84 +515,27 @@ mod tests {
     }
 
     #[test]
-    fn host_memory_reclaim_status_keeps_requested_and_effective_axes_separate() {
-        for (requested, effective, expected) in [
-            (false, Some(false), "requested off; effective off"),
-            (false, Some(true), "requested off; effective on"),
-            (
-                false,
-                None,
-                "requested off; effective unknown (not yet reported by the VM backend)",
-            ),
-            (true, Some(false), "requested auto; effective off"),
-            (true, Some(true), "requested auto; effective on"),
-            (
-                true,
-                None,
-                "requested auto; effective unknown (not yet reported by the VM backend)",
-            ),
-        ] {
-            assert_eq!(
-                format_host_memory_reclaim(requested, effective, None, None),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn host_memory_reclaim_status_appends_probe_and_advised_bytes_once_reported() {
-        assert_eq!(
-            format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)),
-            "requested auto; effective on (probe passed); 6MiB advised free since VM start"
-        );
-        assert_eq!(
-            format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)),
-            "requested auto; effective off (probe failed); 0B advised free since VM start"
-        );
-        // Counters are only meaningful alongside a reported effective state.
-        assert_eq!(
-            format_host_memory_reclaim(true, None, None, Some(10)),
-            "requested auto; effective unknown (not yet reported by the VM backend)"
-        );
-    }
-
-    #[test]
-    fn guest_reclaim_clause_names_mode_outcome_and_measured_delta() {
+    fn status_wording_cases() {
         use silod_spec::status::MemoryReclaimOutcome;
 
-        assert_eq!(
-            crate::commands::daemon::format_guest_reclaim(
-                Some("gradual"),
-                MemoryReclaimOutcome::Partial,
-                Some(512 * 1024 * 1024),
-                "2 minutes ago".to_string(),
-            ),
-            "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"
-        );
-        assert_eq!(
-            crate::commands::daemon::format_guest_reclaim(
-                Some("dropcache"),
-                MemoryReclaimOutcome::Failed,
-                Some(7),
-                "just now".to_string(),
-            ),
-            "; last idle cache drop reclaim in the guest failed just now"
-        );
-        assert_eq!(
-            crate::commands::daemon::format_guest_reclaim(
-                None,
-                MemoryReclaimOutcome::Nothing,
-                Some(0),
-                "just now".to_string(),
-            ),
-            "; last idle gradual reclaim in the guest found nothing reclaimable just now, guest cache fell by 0B"
-        );
-    }
-
-    #[test]
-    fn missing_actual_backend_is_reported_as_unknown() {
-        assert_eq!(format_actual_backend(None), "unknown");
-        assert_eq!(format_actual_backend(Some("krun")), "krun");
+        for (label, actual, expected) in [
+            ("off_off", format_host_memory_reclaim(false, Some(false), None, None), "requested off; effective off"),
+            ("off_on", format_host_memory_reclaim(false, Some(true), None, None), "requested off; effective on"),
+            ("off_unknown", format_host_memory_reclaim(false, None, None, None), "requested off; effective unknown (not yet reported by the VM backend)"),
+            ("auto_off", format_host_memory_reclaim(true, Some(false), None, None), "requested auto; effective off"),
+            ("auto_on", format_host_memory_reclaim(true, Some(true), None, None), "requested auto; effective on"),
+            ("auto_unknown", format_host_memory_reclaim(true, None, None, None), "requested auto; effective unknown (not yet reported by the VM backend)"),
+            ("passed_probe", format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)), "requested auto; effective on (probe passed); 6MiB advised free since VM start"),
+            ("failed_probe", format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)), "requested auto; effective off (probe failed); 0B advised free since VM start"),
+            ("unreported_counter", format_host_memory_reclaim(true, None, None, Some(10)), "requested auto; effective unknown (not yet reported by the VM backend)"),
+            ("partial_gradual", crate::commands::daemon::format_guest_reclaim(Some("gradual"), MemoryReclaimOutcome::Partial, Some(512 * 1024 * 1024), "2 minutes ago".to_string()), "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"),
+            ("failed_dropcache", crate::commands::daemon::format_guest_reclaim(Some("dropcache"), MemoryReclaimOutcome::Failed, Some(7), "just now".to_string()), "; last idle cache drop reclaim in the guest failed just now"),
+            ("nothing_default", crate::commands::daemon::format_guest_reclaim(None, MemoryReclaimOutcome::Nothing, Some(0), "just now".to_string()), "; last idle gradual reclaim in the guest found nothing reclaimable just now, guest cache fell by 0B"),
+            ("unknown_backend", format_actual_backend(None).to_string(), "unknown"),
+            ("krun_backend", format_actual_backend(Some("krun")).to_string(), "krun"),
+        ] {
+            assert_eq!(actual, expected, "{label}");
+        }
     }
 
     #[test]

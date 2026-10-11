@@ -894,71 +894,50 @@ endpoint "ip" "private" {
 
 }
 
-func TestIPEndpointExactTCPPortMatches(t *testing.T) {
+func TestIPEndpointExactL4PortMatches(t *testing.T) {
 	t.Parallel()
-	compiled := loadPolicy(t, `
+	tests := []struct {
+		name              string
+		protocol          string
+		endpoint          string
+		port              uint16
+		missProtocol      string
+		missPort          uint16
+		checkMissMetadata bool
+	}{
+		{name: "tcp", protocol: "tcp", endpoint: "private", port: 443, missProtocol: "tcp", missPort: 444, checkMissMetadata: true},
+		{name: "udp", protocol: "udp", endpoint: "dns", port: 53, missProtocol: "tcp", missPort: 53},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			compiled := loadPolicy(t, fmt.Sprintf(`
 settings {
   default_action = "deny"
 }
-
-endpoint "ip" "private" {
+endpoint "ip" "%s" {
   destination = ["10.0.0.0/8"]
-  protocol = "tcp"
-  ports = [443]
+  protocol = "%s"
+  ports = [%d]
 }
-
-rule "allow-private" {
-  endpoint = ip.private
+rule "allow-%s" {
+  endpoint = ip.%s
   verdict = "allow"
 }
-`)
-
-	decision := compiled.EvaluateFlow(l4Flow("tcp", 443))
-	if decision.Action != ActionAllow || decision.RuleName != "allow-private" {
-		t.Fatalf("expected tcp 443 allow, got %#v", decision)
+`, test.endpoint, test.protocol, test.port, test.endpoint, test.endpoint))
+			decision := compiled.EvaluateFlow(l4Flow(test.protocol, test.port))
+			if decision.Action != ActionAllow || decision.RuleName != "allow-"+test.endpoint {
+				t.Fatalf("expected %s %d allow, got %#v", test.protocol, test.port, decision)
+			}
+			assertL4Match(t, decision, L4Match{EndpointProtocol: test.protocol, DestPort: test.port, PortRange: PortRange{Start: test.port, End: test.port}, Kind: L4MatchExactPort})
+			decision = compiled.EvaluateFlow(l4Flow(test.missProtocol, test.missPort))
+			if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault {
+				t.Fatalf("expected %s %d default deny, got %#v", test.missProtocol, test.missPort, decision)
+			}
+			if test.checkMissMetadata && decision.MatchedL4 != nil {
+				t.Fatalf("default decision must not carry l4 metadata, got %#v", decision.MatchedL4)
+			}
+		})
 	}
-	assertL4Match(t, decision, L4Match{EndpointProtocol: "tcp", DestPort: 443, PortRange: PortRange{Start: 443, End: 443}, Kind: L4MatchExactPort})
-
-	decision = compiled.EvaluateFlow(l4Flow("tcp", 444))
-	if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault {
-		t.Fatalf("expected tcp 444 default deny, got %#v", decision)
-	}
-	if decision.MatchedL4 != nil {
-		t.Fatalf("default decision must not carry l4 metadata, got %#v", decision.MatchedL4)
-	}
-
-}
-
-func TestIPEndpointExactUDPPortMatches(t *testing.T) {
-	t.Parallel()
-	compiled := loadPolicy(t, `
-settings {
-  default_action = "deny"
-}
-
-endpoint "ip" "dns" {
-  destination = ["10.0.0.0/8"]
-  protocol = "udp"
-  ports = [53]
-}
-
-rule "allow-dns" {
-  endpoint = ip.dns
-  verdict = "allow"
-}
-`)
-
-	decision := compiled.EvaluateFlow(l4Flow("udp", 53))
-	if decision.Action != ActionAllow || decision.RuleName != "allow-dns" {
-		t.Fatalf("expected udp 53 allow, got %#v", decision)
-	}
-	assertL4Match(t, decision, L4Match{EndpointProtocol: "udp", DestPort: 53, PortRange: PortRange{Start: 53, End: 53}, Kind: L4MatchExactPort})
-
-	decision = compiled.EvaluateFlow(l4Flow("tcp", 53))
-	if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault {
-		t.Fatalf("expected tcp 53 to miss udp endpoint, got %#v", decision)
-	}
-
 }
 
 func TestIPEndpointPortRangesAreInclusive(t *testing.T) {
@@ -1849,32 +1828,6 @@ func TestForwardAttachmentScope(t *testing.T) {
 	}
 	if err := ValidateForwardAttachment(AttachmentScopeSharedNetwork, []Forward{{Name: "first"}, {Name: "second"}}); err == nil || !strings.Contains(err.Error(), `"first"`) {
 		t.Fatalf("must identify first declaration: %v", err)
-	}
-
-}
-
-func TestForwardFixturePreservesHTTPS(t *testing.T) {
-	t.Parallel()
-	compiled, err := loadHCLFixtureForTest("forward.hcl", []byte(`
-tailscale "vm" {
-  hostname = "web"
-}
-forward "tailscale" "web" {
-  listen = ":9443"
-  target = "self"
-  target_port = 8080
-  protocol = "https"
-  tls {
-    provider = "tailscale"
-  }
-}
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []Forward{{Name: "web", ListenPort: 9443, GuestPort: 8080, Protocol: ForwardProtocolHTTPS}}
-	if !slices.Equal(compiled.Forwards(), want) {
-		t.Fatalf("fixture forwards = %#v, want %#v", compiled.Forwards(), want)
 	}
 
 }

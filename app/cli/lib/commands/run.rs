@@ -710,34 +710,37 @@ mod tests {
     }
 
     #[test]
-    fn run_help_explains_detached_lifecycle_and_idle_vms() {
+    fn detached_lifecycle_wording_cases() {
         let mut command = Cli::command();
         let run = command
             .find_subcommand_mut("run")
             .expect("run subcommand exists");
         let help = run.render_long_help().to_string();
-
-        assert!(help.contains("The VM stops when that workload exits"));
-        assert!(help.contains("The VM still stops when the workload exits"));
-        assert!(help.contains("Without --name, the generated VM is removed after exit"));
-        assert!(help.contains("silo create --name dev ubuntu:26.04 && silo start dev"));
-    }
-
-    #[test]
-    fn detached_launch_hints_explain_workload_and_retention() {
-        assert_eq!(
-            detached_default_workload_hint(true),
-            Some("No command followed `--`; running the resolved default workload.")
-        );
-        assert_eq!(detached_default_workload_hint(false), None);
-        assert_eq!(
-            detached_lifecycle_hint(MachineRetention::Ephemeral),
-            "VM lifetime follows the detached workload; the VM will be removed after it exits."
-        );
-        assert_eq!(
-            detached_lifecycle_hint(MachineRetention::Persistent),
-            "VM lifetime follows the detached workload; the stopped VM will be retained."
-        );
+        for (label, text) in [
+            ("workload_exit", "The VM stops when that workload exits"),
+            (
+                "detached_exit",
+                "The VM still stops when the workload exits",
+            ),
+            (
+                "generated_retention",
+                "Without --name, the generated VM is removed after exit",
+            ),
+            (
+                "idle_vm",
+                "silo create --name dev ubuntu:26.04 && silo start dev",
+            ),
+        ] {
+            assert!(help.contains(text), "{label}: {help}");
+        }
+        for (label, actual, expected) in [
+            ("default_workload", detached_default_workload_hint(true), Some("No command followed `--`; running the resolved default workload.")),
+            ("explicit_workload", detached_default_workload_hint(false), None),
+            ("ephemeral", Some(detached_lifecycle_hint(MachineRetention::Ephemeral)), Some("VM lifetime follows the detached workload; the VM will be removed after it exits.")),
+            ("persistent", Some(detached_lifecycle_hint(MachineRetention::Persistent)), Some("VM lifetime follows the detached workload; the stopped VM will be retained.")),
+        ] {
+            assert_eq!(actual, expected, "{label}");
+        }
     }
 
     #[test]

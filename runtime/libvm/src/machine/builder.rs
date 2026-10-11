@@ -1015,6 +1015,45 @@ mod tests {
             .await
             .expect("create machine");
         let id = machine.machine_id();
+        let original_config = store
+            .machine_config(id)
+            .await
+            .expect("read original config")
+            .expect("machine config exists");
+        let seeded_id = MachineId::new();
+        let seeded_config = crate::store::models::MachineConfig {
+            id: seeded_id,
+            lock_id: crate::lock_manager::LockId::from(42),
+            name: "reopen-stage-two".to_string(),
+            spec: VmSpec {
+                hardware: Some(Hardware {
+                    cpus: Some(2),
+                    memory: Some(1024),
+                    nested_virtualization: Some(false),
+                    rosetta: Some(false),
+                }),
+                ..VmSpec::current()
+            },
+            retention: MachineRetention::Ephemeral,
+            process: process.clone(),
+            template_name: Some("rust-worker".to_string()),
+            agent_mode: Some(crate::MachineAgent::Disabled),
+            machine_dir: paths.machine(seeded_id).dir().to_path_buf(),
+            created_at: 1,
+            modified_at: 1,
+            image_ref: "test-image:latest".to_string(),
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+            guest: crate::machine::MachineGuestConfig::default(),
+        };
+        let mut seeded_state = crate::runtime::core::stopped_machine_state(seeded_id, None);
+        seeded_state.updated_at = 1;
+        store
+            .add_machine(&seeded_config, &seeded_state)
+            .await
+            .expect("insert seeded machine");
         drop(machine);
         drop(runtime);
         drop(store);
@@ -1027,12 +1066,30 @@ mod tests {
             .await
             .expect("read durable config")
             .expect("machine config exists");
-        assert_eq!(config.retention, MachineRetention::Ephemeral);
-        assert_eq!(config.process, process);
-        assert_eq!(config.template_name.as_deref(), Some("rust-worker"));
-        assert_eq!(config.agent_mode, Some(crate::MachineAgent::Disabled));
-        assert_eq!(config.spec.forwards, vec![forward]);
-        assert!(config.spec.vsock.expect("vsock config").enabled);
+        for (label, expected) in [("builder", original_config), ("seeded", seeded_config)] {
+            assert_eq!(
+                reopened.machine_config(expected.id).await.expect(label),
+                Some(expected),
+                "{label}: whole config after sqlite reopen"
+            );
+        }
+        assert_eq!(config.retention, MachineRetention::Ephemeral, "builder");
+        assert_eq!(config.process, process, "builder");
+        assert_eq!(
+            config.template_name.as_deref(),
+            Some("rust-worker"),
+            "builder"
+        );
+        assert_eq!(
+            config.agent_mode,
+            Some(crate::MachineAgent::Disabled),
+            "builder"
+        );
+        assert_eq!(config.spec.forwards, vec![forward], "builder");
+        assert!(
+            config.spec.vsock.expect("builder: vsock config").enabled,
+            "builder"
+        );
     }
 
     #[tokio::test]

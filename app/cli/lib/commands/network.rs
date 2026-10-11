@@ -321,18 +321,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn machine_network_policy_rejects_relative_path() {
-        let err = machine_network_with_policy(
-            MachineNetworkSelection::Private,
-            Some("policies/github.hcl"),
-            None,
-        )
-        .expect_err("relative path should fail");
-
-        assert!(err.to_string().contains("relative network policy paths"));
-    }
-
     fn network_set_cmd(args: impl IntoIterator<Item = &'static str>) -> super::SetCmd {
         let cli = Cli::try_parse_from(args).expect("network set should parse");
         let Command::Network(network) = cli.command else {

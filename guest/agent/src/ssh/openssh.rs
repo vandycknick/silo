@@ -692,78 +692,75 @@ mod tests {
     }
 
     #[test]
-    fn accepts_secure_sshd_runtime_dir() {
-        let disposition =
-            assess_runtime_dir(SshdRuntimeDirKind::Directory, 0, 0, SSHD_RUNTIME_DIR_MODE)
-                .expect("secure directory");
+    fn assesses_sshd_runtime_directory() {
+        use SshdRuntimeDirDisposition::{Chmod0755, Ready};
+        use SshdRuntimeDirKind::{Directory, Other, Symlink};
 
-        assert_eq!(disposition, SshdRuntimeDirDisposition::Ready);
-    }
-
-    #[test]
-    fn repairs_sshd_runtime_dir_mode() {
-        let disposition = assess_runtime_dir(SshdRuntimeDirKind::Directory, 0, 0, 0o700)
-            .expect("directory with repairable mode");
-
-        assert_eq!(disposition, SshdRuntimeDirDisposition::Chmod0755);
-    }
-
-    #[test]
-    fn rejects_group_writable_sshd_runtime_dir() {
-        let err = assess_runtime_dir(SshdRuntimeDirKind::Directory, 0, 0, 0o775)
-            .expect_err("group writable directory must fail");
-
-        assert!(err.to_string().contains("group/world-writable"));
-    }
-
-    #[test]
-    fn rejects_world_writable_sshd_runtime_dir() {
-        let err = assess_runtime_dir(SshdRuntimeDirKind::Directory, 0, 0, 0o777)
-            .expect_err("world writable directory must fail");
-
-        assert!(err.to_string().contains("group/world-writable"));
-    }
-
-    #[test]
-    fn rejects_non_root_sshd_runtime_dir_owner() {
-        let err = assess_runtime_dir(
-            SshdRuntimeDirKind::Directory,
-            1000,
-            0,
-            SSHD_RUNTIME_DIR_MODE,
-        )
-        .expect_err("non-root owner must fail");
-
-        assert!(err.to_string().contains("root:root"));
-    }
-
-    #[test]
-    fn rejects_non_root_sshd_runtime_dir_group() {
-        let err = assess_runtime_dir(
-            SshdRuntimeDirKind::Directory,
-            0,
-            1000,
-            SSHD_RUNTIME_DIR_MODE,
-        )
-        .expect_err("non-root group must fail");
-
-        assert!(err.to_string().contains("root:root"));
-    }
-
-    #[test]
-    fn rejects_symlink_sshd_runtime_dir() {
-        let err = assess_runtime_dir(SshdRuntimeDirKind::Symlink, 0, 0, SSHD_RUNTIME_DIR_MODE)
-            .expect_err("symlink must fail");
-
-        assert!(err.to_string().contains("symlink"));
-    }
-
-    #[test]
-    fn rejects_non_directory_sshd_runtime_dir() {
-        let err = assess_runtime_dir(SshdRuntimeDirKind::Other, 0, 0, SSHD_RUNTIME_DIR_MODE)
-            .expect_err("non-directory must fail");
-
-        assert!(err.to_string().contains("directory"));
+        for (label, kind, uid, gid, mode, expected) in [
+            ("secure", Directory, 0, 0, SSHD_RUNTIME_DIR_MODE, Ok(Ready)),
+            ("repairable_mode", Directory, 0, 0, 0o700, Ok(Chmod0755)),
+            (
+                "group_writable",
+                Directory,
+                0,
+                0,
+                0o775,
+                Err("group/world-writable"),
+            ),
+            (
+                "world_writable",
+                Directory,
+                0,
+                0,
+                0o777,
+                Err("group/world-writable"),
+            ),
+            (
+                "non_root_owner",
+                Directory,
+                1000,
+                0,
+                SSHD_RUNTIME_DIR_MODE,
+                Err("root:root"),
+            ),
+            (
+                "non_root_group",
+                Directory,
+                0,
+                1000,
+                SSHD_RUNTIME_DIR_MODE,
+                Err("root:root"),
+            ),
+            (
+                "symlink",
+                Symlink,
+                0,
+                0,
+                SSHD_RUNTIME_DIR_MODE,
+                Err("symlink"),
+            ),
+            (
+                "non_directory",
+                Other,
+                0,
+                0,
+                SSHD_RUNTIME_DIR_MODE,
+                Err("directory"),
+            ),
+        ] {
+            let result = assess_runtime_dir(kind, uid, gid, mode);
+            match expected {
+                Ok(disposition) => assert_eq!(
+                    result.unwrap_or_else(|err| panic!("{label}: {err}")),
+                    disposition,
+                    "{label}"
+                ),
+                Err(message) => {
+                    let err = result.expect_err(label);
+                    assert!(err.to_string().contains(message), "{label}: {err}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
