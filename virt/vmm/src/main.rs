@@ -142,6 +142,7 @@ fn main() -> eyre::Result<()> {
         run_id = %args.run_id,
         "silo-vmm generation started"
     );
+    raise_open_file_limit();
     let exit_runner = match exit_runner {
         Some(Ok(runner)) => Some(runner),
         Some(Err(error)) => {
@@ -178,6 +179,46 @@ fn write_serial_generation_boundary(
     )
     .map_err(eyre::Report::from)?;
     file.flush().map_err(eyre::Report::from)
+}
+
+/// Every forwarded connection costs the monitor two descriptors and the public
+/// capacity is above a thousand sessions, so an inherited 1024 soft limit
+/// (the usual shell default) starves forwards with EMFILE long before the
+/// capacity accounting kicks in. Go runtimes raise the soft limit to the hard
+/// limit on startup for the same reason; do the same here. macOS reports an
+/// unlimited hard limit it will not actually grant, so fall back to its
+/// per-process ceiling when the first attempt is refused.
+fn raise_open_file_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    const MACOS_PER_PROCESS_CEILING: u64 = 10240;
+    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok(limits) => limits,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the open file limit");
+            return;
+        }
+    };
+    if soft >= hard {
+        return;
+    }
+    let candidates = [hard, hard.min(MACOS_PER_PROCESS_CEILING)];
+    for target in candidates {
+        match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+            Ok(()) => {
+                tracing::debug!(from = soft, to = target, "raised the open file limit");
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(%error, target, "open file limit not accepted");
+            }
+        }
+    }
+    tracing::warn!(
+        soft,
+        hard,
+        "open file limit left at the inherited soft value"
+    );
 }
 
 async fn run(
@@ -412,7 +453,30 @@ mod tests {
 
     use clap::Parser;
 
-    use crate::{write_serial_generation_boundary, Args};
+    use crate::{raise_open_file_limit, write_serial_generation_boundary, Args};
+
+    #[test]
+    fn startup_raises_the_soft_open_file_limit_to_the_hard_limit() {
+        use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("read limits");
+        let lowered = 1024.min(hard);
+        setrlimit(Resource::RLIMIT_NOFILE, lowered, hard).expect("lower the soft limit");
+        assert_eq!(getrlimit(Resource::RLIMIT_NOFILE).expect("read").0, lowered);
+
+        raise_open_file_limit();
+
+        let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).expect("read raised limits");
+        let expected = if cfg!(target_os = "macos") {
+            hard.min(10240)
+        } else {
+            hard
+        };
+        assert!(
+            soft == expected || (cfg!(target_os = "macos") && soft == hard),
+            "soft {soft} should reach {expected} (hard {hard})"
+        );
+    }
 
     #[test]
     fn serial_generation_boundary_is_stable_and_identifiable() {

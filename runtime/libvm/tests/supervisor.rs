@@ -700,8 +700,25 @@ async fn pending_forward_parking_is_bounded_and_expires_after_park_timeout() {
     machine.remove().await.expect("remove machine");
 }
 
+/// This test process itself holds every one of the 1006 client sockets, so it
+/// needs more than the 1024 soft limit most shells inherit; the monitor raises
+/// its own limit at startup and is not the constraint here.
+fn ensure_open_file_limit(minimum: u64) {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("read open file limits");
+    assert!(
+        hard >= minimum,
+        "capacity test needs an open file hard limit of at least {minimum}, got {hard}"
+    );
+    if soft < minimum {
+        setrlimit(Resource::RLIMIT_NOFILE, hard, hard).expect("raise the open file soft limit");
+    }
+}
+
 #[tokio::test]
 async fn mux_and_forward_streams_share_public_capacity_and_leave_headroom() {
+    ensure_open_file_limit(4096);
     let env = test_env("forward-capacity", &Scenario::default()).await;
     let machine = env
         .runtime
