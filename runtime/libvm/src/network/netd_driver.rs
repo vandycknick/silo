@@ -1549,9 +1549,20 @@ os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
             let start = std::time::Instant::now();
             let future = prepare_netd_runtime(&context, &request);
             if mode == "cancel" {
-                assert!(tokio::time::timeout(Duration::from_millis(150), future)
-                    .await
-                    .is_err());
+                // Cancel once the child is running so the reap check observes a
+                // real process; interpreter startup on macOS can exceed 150ms.
+                tokio::pin!(future);
+                while !marker.exists() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(4),
+                        "startup child never ran"
+                    );
+                    if let Ok(result) =
+                        tokio::time::timeout(Duration::from_millis(10), &mut future).await
+                    {
+                        panic!("stalled startup completed: {}", result.is_ok());
+                    }
+                }
             } else {
                 let error = future
                     .await
