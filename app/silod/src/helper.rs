@@ -461,8 +461,10 @@ mod tests {
     #[test]
     fn siblings_reject_links_writable_and_nonexecutable_files() {
         let root = tempfile::tempdir().unwrap();
-        let exe = root.path().join("silod");
-        let target = root.path().join("taild");
+        // Callers pass a canonical executable; macOS temp dirs sit behind /var.
+        let package = root.path().canonicalize().unwrap();
+        let exe = package.join("silod");
+        let target = package.join("taild");
         std::fs::write(&target, b"binary").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(sibling(&exe, "taild", true).unwrap(), target);
@@ -470,7 +472,7 @@ mod tests {
         assert!(sibling(&exe, "taild", true).is_err());
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(sibling(&exe, "taild", true).is_err());
-        symlink(&target, root.path().join("linked")).unwrap();
+        symlink(&target, package.join("linked")).unwrap();
         assert!(sibling(&exe, "linked", false).is_err());
     }
     #[test]
