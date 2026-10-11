@@ -2,10 +2,22 @@
 package testfixture
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// ControlEndpoint is silod's published per-UID control socket. silod spells
+// it canonically, and /tmp is a symlink to /private/tmp on macOS.
+func ControlEndpoint(t *testing.T) string {
+	t.Helper()
+	tmp, err := filepath.EvalSymlinks("/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(tmp, fmt.Sprintf("silo-%d", os.Getuid()), "silod", "control.sock")
+}
 
 // Unavailable permits optional developer fixtures but never required CI skips.
 func Unavailable(t *testing.T, reason string) {

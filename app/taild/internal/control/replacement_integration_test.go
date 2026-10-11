@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	silo "github.com/vandycknick/silo/sdk/go"
 	daemonv1 "github.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1"
 	"golang.org/x/sys/unix"
@@ -41,7 +42,7 @@ func TestActualAdmittedTransportRefusesReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint := fmt.Sprintf("/tmp/silo-%d/silod/control.sock", os.Getuid())
+	endpoint := testfixture.ControlEndpoint(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	start := func() (*Client, *daemonv1.DaemonStatus, func()) {

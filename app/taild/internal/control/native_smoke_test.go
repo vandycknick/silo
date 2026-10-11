@@ -110,7 +110,7 @@ func TestNativeControlLifecycle(t *testing.T) {
 			t.Error("daemon failed to drain")
 		}
 	}()
-	endpoint := fmt.Sprintf("/tmp/silo-%d/silod/control.sock", os.Getuid())
+	endpoint := testfixture.ControlEndpoint(t)
 	var client *Client
 	for {
 		client, err = New(endpoint, "")

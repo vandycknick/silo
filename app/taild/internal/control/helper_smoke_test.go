@@ -137,7 +137,7 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 				t.Fatalf("daemon exited during startup: %v", err)
 			default:
 			}
-			client, err := New(fmt.Sprintf("/tmp/silo-%d/silod/control.sock", os.Getuid()), "")
+			client, err := New(testfixture.ControlEndpoint(t), "")
 			if err == nil {
 				probe, cancel := context.WithTimeout(ctx, time.Second)
 				status, err := client.Daemon.GetStatus(probe, &emptypb.Empty{})

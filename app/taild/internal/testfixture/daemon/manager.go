@@ -85,7 +85,7 @@ func launchManager(t *testing.T, c config.Config) (*control.Client, config.Confi
 	t.Cleanup(stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	endpoint := fmt.Sprintf("/tmp/silo-%d/silod/control.sock", os.Getuid())
+	endpoint := testfixture.ControlEndpoint(t)
 	var client *control.Client
 	var status *w.DaemonStatus
 	for {
