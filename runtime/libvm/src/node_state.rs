@@ -3,14 +3,22 @@ use crate::lock_manager::MachineLifetimeLock;
 use crate::machine::Machine;
 use crate::store::models::MachineConfig;
 use crate::LibVmError;
+use std::time::{Duration, Instant};
 
 #[must_use = "the node-state lease releases when dropped"]
 pub struct NodeStateLease {
     _lock: MachineLifetimeLock,
 }
 
-pub(crate) fn acquire(config: &MachineConfig) -> Result<NodeStateLease, LibVmError> {
-    let lease = acquire_lock(config)?;
+/// A fork elsewhere in this process briefly shares every open lock description
+/// with the child until its exec closes CLOEXEC descriptors, so a just-released
+/// lease can read as held for a few milliseconds. Real holders keep the lease
+/// far longer than this grace.
+const FORK_WINDOW_GRACE: Duration = Duration::from_millis(250);
+const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+pub(crate) async fn acquire(config: &MachineConfig) -> Result<NodeStateLease, LibVmError> {
+    let lease = acquire_lock(config).await?;
     // Directory artifacts are fences too, including transactions from older writers.
     // A process crash releases flock, but must not authorize starting/updating
     // an identity mid-transaction. Explicit removal may discard abandoned state.
@@ -34,13 +42,21 @@ pub(crate) fn acquire(config: &MachineConfig) -> Result<NodeStateLease, LibVmErr
     Ok(lease)
 }
 
-pub(crate) fn acquire_lock(config: &MachineConfig) -> Result<NodeStateLease, LibVmError> {
-    let lock = MachineLifetimeLock::try_acquire(&config.machine_dir.join("node-state.lock"))?
-        .ok_or_else(|| LibVmError::InvalidMachineUpdate {
-            reference: config.name.clone(),
-            reason: "node state busy".into(),
-        })?;
-    Ok(NodeStateLease { _lock: lock })
+pub(crate) async fn acquire_lock(config: &MachineConfig) -> Result<NodeStateLease, LibVmError> {
+    let path = config.machine_dir.join("node-state.lock");
+    let deadline = Instant::now() + FORK_WINDOW_GRACE;
+    loop {
+        if let Some(lock) = MachineLifetimeLock::try_acquire(&path)? {
+            return Ok(NodeStateLease { _lock: lock });
+        }
+        if Instant::now() >= deadline {
+            return Err(LibVmError::InvalidMachineUpdate {
+                reference: config.name.clone(),
+                reason: "node state busy".into(),
+            });
+        }
+        tokio::time::sleep(RETRY_INTERVAL).await;
+    }
 }
 
 impl Machine {
@@ -51,7 +67,7 @@ impl Machine {
         let (_config_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
         // Recovery must be able to lease a fenced machine without mutating it.
-        let lease = acquire_lock(&config)?;
+        let lease = acquire_lock(&config).await?;
         runtime.ensure_no_live_vmm_generation(&config).await?;
         if runtime
             .reconcile_machine_runtime_locked(&config)

@@ -28,7 +28,7 @@ impl Machine {
         let runtime = self.runtime();
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
-        let _node_state = crate::node_state::acquire(&config)?;
+        let _node_state = crate::node_state::acquire(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
             return Err(LibVmError::MachineAlreadyRunning {
@@ -69,7 +69,7 @@ impl Machine {
         runtime.validate_machine_network_config(&network).await?;
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
-        let _node_state = crate::node_state::acquire(&config)?;
+        let _node_state = crate::node_state::acquire(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
             return Err(LibVmError::MachineAlreadyRunning {
@@ -155,7 +155,7 @@ impl Machine {
         };
         let (_lock, mut config) = runtime.lock_machine_config(machine_id).await?;
         runtime.validate_machine_data_dir(&config)?;
-        let _node_state = crate::node_state::acquire(&config)?;
+        let _node_state = crate::node_state::acquire(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
             return Err(LibVmError::MachineAlreadyRunning {

@@ -67,7 +67,7 @@ impl Machine {
         let (config, run_id) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
-            let _node_state = crate::node_state::acquire(&config)?;
+            let _node_state = crate::node_state::acquire(&config).await?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmm_pid_path();
             let exit_status_path = machine_paths.vmm_exit_status_path();
@@ -641,7 +641,7 @@ impl Machine {
         }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
-        let _node_state = crate::node_state::acquire_lock(&config)?;
+        let _node_state = crate::node_state::acquire_lock(&config).await?;
         runtime.ensure_no_live_vmm_generation(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
 

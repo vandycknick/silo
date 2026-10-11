@@ -123,7 +123,7 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
 
     TestEnv {
         _temp: temp,
-        run_root: std::path::PathBuf::from(format!("/tmp/silo-{}", nix::unistd::geteuid())),
+        run_root: libvm::HostPaths::run_root(),
         runtime,
         disk,
         machines: Mutex::new(Vec::new()),
