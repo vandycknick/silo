@@ -17,10 +17,10 @@ pub(crate) use crate::krun::config::{
 };
 pub(crate) use crate::krun::error::KrunBackendError;
 #[cfg(target_os = "linux")]
-pub(crate) use crate::krun::host::{
-    check_host, check_host_with_vm_creation, KvmHostError, KvmHostInfo,
-};
+pub(crate) use crate::krun::host::check_host;
 #[cfg(target_os = "macos")]
 pub(crate) use crate::krun::host::{check_host, HvfHostError, HvfHostInfo};
 pub(crate) use crate::krun::rosetta::{RosettaLaunchConfig, RosettaProfileId};
-pub(crate) use crate::krun::status::{HostMemoryReclaimQualification, HostMemoryReclaimStatus};
+#[cfg(target_os = "macos")]
+pub(crate) use crate::krun::status::HostMemoryReclaimQualification;
+pub(crate) use crate::krun::status::HostMemoryReclaimStatus;

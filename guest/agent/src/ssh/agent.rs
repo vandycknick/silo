@@ -649,6 +649,12 @@ struct ProcessLaunch {
     output: Arc<russh::ChannelWriteHalf<Msg>>,
 }
 
+struct SessionChannel {
+    connection_id: u64,
+    channel: ChannelId,
+    handle: russh::server::Handle,
+}
+
 impl ProcessLaunch {
     fn spawn(
         self,
@@ -663,9 +669,11 @@ impl ProcessLaunch {
             self.spawn_pty(
                 command,
                 &pty,
-                connection_id,
-                channel,
-                handle,
+                SessionChannel {
+                    connection_id,
+                    channel,
+                    handle,
+                },
                 runtime,
                 process_supervisor,
             )
@@ -785,12 +793,15 @@ impl ProcessLaunch {
         self,
         mut command: Command,
         pty: &PtyRequest,
-        connection_id: u64,
-        channel: ChannelId,
-        handle: russh::server::Handle,
+        session: SessionChannel,
         runtime: RuntimeHandle,
         process_supervisor: ProcessSupervisor,
     ) -> eyre::Result<ActiveProcess> {
+        let SessionChannel {
+            connection_id,
+            channel,
+            handle,
+        } = session;
         let openpty = open_session_pty(pty).context("open SSH session pty")?;
         let master = File::from(openpty.master);
         let reader = master.try_clone().context("clone SSH pty reader")?;
@@ -2029,7 +2040,7 @@ pub(crate) mod tests {
             }
             client.disconnect(russh::Disconnect::ByApplication, "done", "en").await.unwrap();
             drop(client);
-            let _ = server.await.unwrap();
+            server.await.unwrap();
         }).await.expect("native output drain must finish");
     }
 

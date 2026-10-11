@@ -35,7 +35,7 @@ impl OwnedDirectory {
         fs::create_dir_all(parent).map_err(|error| invalid(path, error))?;
 
         let created = match fs::DirBuilder::new()
-            .mode(u32::from(PRIVATE_DIRECTORY_MODE.bits()))
+            .mode(PRIVATE_DIRECTORY_MODE.bits())
             .create(path)
         {
             Ok(()) => true,

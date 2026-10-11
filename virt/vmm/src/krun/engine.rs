@@ -21,18 +21,22 @@ pub struct Resources<'a> {
 
 /// Process-local controls, not a reusable VM or a process lifecycle handle.
 #[derive(Clone)]
-pub struct Control(std::sync::Arc<libkrun::VmmHandle>);
+pub struct Control {
+    #[cfg(target_os = "macos")]
+    handle: std::sync::Arc<libkrun::VmmHandle>,
+}
 
 impl Control {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn request_shutdown(&self) -> Result<(), Error> {
-        self.0
+        self.handle
             .shutdown()
             .map_err(|source| libkrun_error("request shutdown", source))
     }
 
     #[cfg(target_os = "macos")]
     pub fn host_memory_reclaim(&self) -> crate::krun::HostMemoryReclaimStatus {
-        host_memory_reclaim_status(&self.0)
+        host_memory_reclaim_status(&self.handle)
     }
 }
 
@@ -299,10 +303,15 @@ pub fn run_process(
     let vmm = builder
         .build()
         .map_err(|source| libkrun_error("build VMM", source))?;
+    #[cfg(target_os = "macos")]
     let handle = vmm
         .handle()
         .map_err(|source| libkrun_error("obtain VMM control handle", source))?;
-    on_built(Control(std::sync::Arc::new(handle))).map_err(Error::PostBuild)?;
+    on_built(Control {
+        #[cfg(target_os = "macos")]
+        handle: std::sync::Arc::new(handle),
+    })
+    .map_err(Error::PostBuild)?;
     vmm.run();
     Err(Error::EventLoopTerminated)
 }

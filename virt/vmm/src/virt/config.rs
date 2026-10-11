@@ -22,10 +22,12 @@ struct MachineIdentifierState {
 }
 
 impl MachineIdentifier {
+    #[cfg(any(target_os = "macos", test))]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MachineIdentifierState {
@@ -39,6 +41,7 @@ impl MachineIdentifier {
         self.lock().bytes.clone()
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn is_empty(&self) -> bool {
         self.lock().bytes.is_empty()
     }
@@ -49,6 +52,7 @@ impl MachineIdentifier {
         self.lock().generated
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn set_generated_bytes(&self, bytes: Vec<u8>) {
         let mut state = self.lock();
         state.bytes = bytes;
