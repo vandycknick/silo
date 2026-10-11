@@ -24,7 +24,12 @@ def _terminal(workspace: Workspace, vm: Vm, *argv: str) -> Iterator[PtyCommand]:
 
 
 def test_tty_resize_input_and_exit(workspace: Workspace, vm: Vm) -> None:
-    script = "sleep .2; stty size; printf 'READY\\n'; IFS= read -r v; printf 'INPUT:%s\\n' \"$v\"; stty size; exit 7"
+    # The window change travels host -> CLI -> agent asynchronously, so the guest polls
+    # for it instead of racing the input that follows; `wait()` bounds the poll.
+    script = (
+        "sleep .2; stty size; printf 'READY\\n'; IFS= read -r v; printf 'INPUT:%s\\n' \"$v\"; "
+        "while [ \"$(stty size)\" = '37 119' ]; do sleep .05; done; stty size; exit 7"
+    )
     with _terminal(workspace, vm, "/bin/sh", "-c", script) as command:
         command.wait_for(b"READY\r\n")
         command.resize(41, 127)
