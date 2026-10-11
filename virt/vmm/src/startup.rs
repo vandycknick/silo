@@ -355,16 +355,6 @@ pub async fn init(
         .transpose()?;
     let mux_filename =
         vm_spec::effective_vsock_filename(spec.vsock.as_ref()).and_then(|path| path.to_str());
-    let forwards = crate::forward::ForwardTable::prepare_machine(
-        &spec.forwards,
-        runtime.runtime_dir(),
-        mux_filename,
-    )
-    .await?;
-    if !guest_services_enabled {
-        forwards.set_agent_availability(crate::forward::GuestHalfAvailability::Unsupported);
-    }
-
     let machine_config = vm_spec_machine_config(VmSpecInputs {
         name,
         id: machine_id,
@@ -376,11 +366,22 @@ pub async fn init(
         rosetta_intent,
         prepared_rosetta,
     })?;
-    let machine = create_virtual_machine(
+    let (machine, park_timeout) = create_virtual_machine(
         selected_backend,
         start_request.virt_backend.as_ref(),
         machine_config.config,
     )?;
+    let forwards = crate::forward::ForwardTable::prepare_machine(
+        &spec.forwards,
+        runtime.runtime_dir(),
+        mux_filename,
+        park_timeout,
+    )
+    .await?;
+    if !guest_services_enabled {
+        forwards.set_agent_availability(crate::forward::GuestHalfAvailability::Unsupported);
+    }
+
     primary_machine.set(machine.clone());
     let serial_console = machine.serial();
     serial_console
@@ -627,7 +628,7 @@ fn create_virtual_machine(
     kind: crate::virt::BackendKind,
     request: Option<&crate::start_request::VirtBackendRequest>,
     config: crate::virt::VmConfig,
-) -> eyre::Result<VirtualMachine> {
+) -> eyre::Result<(VirtualMachine, std::time::Duration)> {
     #[cfg(feature = "mock-backend")]
     let config = {
         let mut config = config;
@@ -640,7 +641,8 @@ fn create_virtual_machine(
     };
     #[cfg(not(feature = "mock-backend"))]
     let _ = request;
-    Ok(VirtualMachine::with_backend(kind, config)?)
+    let park_timeout = config.park_timeout();
+    Ok((VirtualMachine::with_backend(kind, config)?, park_timeout))
 }
 
 fn secure_machine_dir(path: &std::path::Path) -> eyre::Result<()> {

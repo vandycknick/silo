@@ -12,7 +12,7 @@ use crate::forward::{ForwardEntry, GuestHalfAvailability};
 use crate::virt::VirtualMachine;
 
 const MAX_PARKED_PER_FORWARD: usize = 64;
-const PARK_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const PARK_TIMEOUT: Duration = Duration::from_secs(30);
 const FORWARD_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Parked {
@@ -24,6 +24,7 @@ pub(crate) async fn serve(
     listener: OwnedHostListener,
     entry: Arc<ForwardEntry>,
     machine: VirtualMachine,
+    park_timeout: Duration,
 ) {
     let mut availability = entry.availability.subscribe();
     let mut parked = VecDeque::<Parked>::new();
@@ -34,7 +35,7 @@ pub(crate) async fn serve(
         tokio::select! {
             _ = entry.shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
-                Ok(stream) => admit(stream, &entry, &machine, &availability, &mut parked, &mut connections).await,
+                Ok(stream) => admit(stream, &entry, &machine, &availability, &mut parked, &mut connections, park_timeout).await,
                 Err(error) => tracing::warn!(forward = %entry.name, %error, "forward accept failed"),
             },
             changed = availability.changed() => {
@@ -91,6 +92,7 @@ async fn admit(
     availability: &tokio::sync::watch::Receiver<GuestHalfAvailability>,
     parked: &mut VecDeque<Parked>,
     connections: &mut JoinSet<()>,
+    park_timeout: Duration,
 ) {
     let current = availability.borrow().clone();
     match current {
@@ -100,7 +102,7 @@ async fn admit(
         GuestHalfAvailability::Unknown if parked.len() < MAX_PARKED_PER_FORWARD => {
             parked.push_back(Parked {
                 stream,
-                deadline: Instant::now() + PARK_TIMEOUT,
+                deadline: Instant::now() + park_timeout,
             });
         }
         GuestHalfAvailability::Unknown | GuestHalfAvailability::Unsupported => {
@@ -163,4 +165,17 @@ async fn handle_connection(
     crate::vsock::relay::relay(&mut client, &mut guest, lifetime)
         .await
         .map_err(eyre::Report::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn park_timeout_default_is_thirty_seconds() {
+        assert_eq!(
+            crate::forward::inbound::PARK_TIMEOUT,
+            Duration::from_secs(30)
+        );
+    }
 }

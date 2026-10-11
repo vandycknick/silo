@@ -142,35 +142,19 @@ pub fn clippy(
     command::run(rprobe)
 }
 
+#[derive(Clone, Copy)]
+enum TestSuite {
+    Unit,
+    Integration,
+    All,
+}
+
 pub fn test_units(
     workspace_root: &Path,
     target_dir: &Path,
     host: HostTarget,
 ) -> Result<(), command::CommandError> {
-    let mut cargo = standard_cargo_command(workspace_root, target_dir);
-    cargo.args([
-        "test",
-        "--locked",
-        "--workspace",
-        "--lib",
-        "--bins",
-        "--all-features",
-    ]);
-    for member in host.workspace_excludes() {
-        cargo.args(["--exclude", member]);
-    }
-    command::run(cargo)?;
-
-    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
-    rprobe.args([
-        "test",
-        "--locked",
-        "-p",
-        "rprobe",
-        "--lib",
-        "--no-default-features",
-    ]);
-    command::run(rprobe)
+    run_tests(workspace_root, target_dir, host, TestSuite::Unit)
 }
 
 pub fn test_integration(
@@ -178,29 +162,99 @@ pub fn test_integration(
     target_dir: &Path,
     host: HostTarget,
 ) -> Result<(), command::CommandError> {
+    run_tests(workspace_root, target_dir, host, TestSuite::Integration)
+}
+
+pub fn test_all(
+    workspace_root: &Path,
+    target_dir: &Path,
+    host: HostTarget,
+) -> Result<(), command::CommandError> {
+    run_tests(workspace_root, target_dir, host, TestSuite::All)
+}
+
+fn run_tests(
+    workspace_root: &Path,
+    target_dir: &Path,
+    host: HostTarget,
+    suite: TestSuite,
+) -> Result<(), command::CommandError> {
+    let ci = std::env::var("CI").is_ok_and(|value| value == "true");
+    if !matches!(suite, TestSuite::Unit) {
+        let mut build = standard_cargo_command(workspace_root, target_dir);
+        build.args([
+            "build",
+            "--locked",
+            "-p",
+            "silo-vmm",
+            "--features",
+            "mock-backend",
+        ]);
+        command::run(build)?;
+    }
+    command::run(workspace_test_command(
+        workspace_root,
+        target_dir,
+        host,
+        suite,
+        ci,
+    ))?;
+
+    if !matches!(suite, TestSuite::Integration) {
+        command::run(rprobe_test_command(workspace_root, target_dir, ci))?;
+    }
+    if !matches!(suite, TestSuite::Unit) {
+        let mut go = Command::new("go");
+        go.current_dir(workspace_root.join("net/netd")).arg("test");
+        // The darwin/arm64 race runtime slows netd's gVisor stack by orders of
+        // magnitude, past every real-time budget; Linux hosts carry the race lane.
+        if host != HostTarget::MacosArm64 {
+            go.arg("-race");
+        }
+        go.arg("./...");
+        command::run(go)?;
+    }
+    Ok(())
+}
+
+fn nextest_command(workspace_root: &Path, target_dir: &Path, ci: bool) -> Command {
     let mut cargo = standard_cargo_command(workspace_root, target_dir);
-    cargo.args([
-        "test",
-        "--locked",
-        "--workspace",
-        "--test",
-        "*",
-        "--all-features",
-    ]);
+    cargo.args(["nextest", "run", "--locked"]);
+    if ci {
+        cargo.args(["--profile", "ci"]);
+    }
+    cargo
+}
+
+fn workspace_test_command(
+    workspace_root: &Path,
+    target_dir: &Path,
+    host: HostTarget,
+    suite: TestSuite,
+    ci: bool,
+) -> Command {
+    let mut cargo = nextest_command(workspace_root, target_dir, ci);
+    cargo.arg("--workspace");
+    if !matches!(suite, TestSuite::Integration) {
+        cargo.args(["--lib", "--bins"]);
+    }
+    if !matches!(suite, TestSuite::Unit) {
+        cargo.arg("--tests").env(
+            "SILO_TEST_MOCK_VMM_BINARY",
+            target_dir.join("debug/silo-vmm"),
+        );
+    }
+    cargo.arg("--all-features");
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
-    command::run(cargo)?;
+    cargo
+}
 
-    let mut go = Command::new("go");
-    go.current_dir(workspace_root.join("net/netd")).arg("test");
-    // The darwin/arm64 race runtime slows netd's gVisor stack by orders of
-    // magnitude, past every real-time budget; Linux hosts carry the race lane.
-    if host != HostTarget::MacosArm64 {
-        go.arg("-race");
-    }
-    go.arg("./...");
-    command::run(go)
+fn rprobe_test_command(workspace_root: &Path, target_dir: &Path, ci: bool) -> Command {
+    let mut cargo = nextest_command(workspace_root, target_dir, ci);
+    cargo.args(["-p", "rprobe", "--lib", "--no-default-features"]);
+    cargo
 }
 
 fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), ComponentError> {
@@ -465,7 +519,10 @@ pub(crate) fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -
 
 #[cfg(test)]
 mod tests {
-    use crate::components::{build_rprobe, BuildContext, ComponentError};
+    use crate::components::{
+        build_rprobe, rprobe_test_command, workspace_test_command, BuildContext, ComponentError,
+        TestSuite,
+    };
     use crate::profiles::Profile;
     use crate::targets::HostTarget;
     use std::path::Path;
@@ -483,6 +540,81 @@ mod tests {
                 build_rprobe(&context),
                 Err(ComponentError::UnsupportedRprobeHost)
             ));
+        }
+    }
+
+    #[test]
+    fn workspace_nextest_preserves_suite_targets_and_host_exclusions() {
+        for host in [
+            HostTarget::MacosArm64,
+            HostTarget::LinuxX86_64,
+            HostTarget::LinuxArm64,
+        ] {
+            for (suite, targets, mock_vmm) in [
+                (TestSuite::Unit, vec!["--lib", "--bins"], false),
+                (TestSuite::Integration, vec!["--tests"], true),
+                (TestSuite::All, vec!["--lib", "--bins", "--tests"], true),
+            ] {
+                let command = workspace_test_command(
+                    Path::new("/workspace"),
+                    Path::new("/build"),
+                    host,
+                    suite,
+                    false,
+                );
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                let mut expected = vec!["nextest", "run", "--locked", "--workspace"];
+                expected.extend(targets);
+                expected.push("--all-features");
+                for member in host.workspace_excludes() {
+                    expected.extend(["--exclude", member]);
+                }
+                assert_eq!(args, expected);
+                assert_eq!(command.get_current_dir(), Some(Path::new("/workspace")));
+                let env: Vec<_> = command.get_envs().collect();
+                assert!(env.contains(&(
+                    std::ffi::OsStr::new("CARGO_TARGET_DIR"),
+                    Some(std::ffi::OsStr::new("/build")),
+                )));
+                assert_eq!(
+                    env.iter()
+                        .find(|(key, _)| *key == "SILO_TEST_MOCK_VMM_BINARY")
+                        .and_then(|(_, value)| *value),
+                    mock_vmm.then_some(std::ffi::OsStr::new("/build/debug/silo-vmm")),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nextest_ci_profile_applies_to_workspace_and_rprobe() {
+        for ci in [false, true] {
+            let rprobe = rprobe_test_command(Path::new("."), Path::new("target"), ci);
+            let args: Vec<_> = rprobe.get_args().map(|arg| arg.to_str().unwrap()).collect();
+            let mut expected = vec!["nextest", "run", "--locked"];
+            if ci {
+                expected.extend(["--profile", "ci"]);
+            }
+            expected.extend(["-p", "rprobe", "--lib", "--no-default-features"]);
+            assert_eq!(args, expected);
+
+            for suite in [TestSuite::Unit, TestSuite::Integration, TestSuite::All] {
+                let command = workspace_test_command(
+                    Path::new("."),
+                    Path::new("target"),
+                    HostTarget::LinuxX86_64,
+                    suite,
+                    ci,
+                );
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                assert_eq!(args.windows(2).any(|pair| pair == ["--profile", "ci"]), ci);
+            }
         }
     }
 }

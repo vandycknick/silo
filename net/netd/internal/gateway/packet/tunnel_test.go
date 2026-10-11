@@ -25,6 +25,7 @@ import (
 )
 
 func TestActualGvisorSelectedUDPTunnelIsRejectedAndAudited(t *testing.T) {
+	t.Parallel()
 	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}, TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol}})
 	defer s.Close()
 	if err := s.CreateNIC(1, loopback.New()); err != nil {
@@ -88,9 +89,11 @@ func TestActualGvisorSelectedUDPTunnelIsRejectedAndAudited(t *testing.T) {
 	if _, err := conn.Read(make([]byte, 64)); err == nil {
 		t.Fatal("UDP tunnel delivered data")
 	}
+
 }
 
 func TestActualGvisorTailnetNATCannotEscapeToHostTCP(t *testing.T) {
+	t.Parallel()
 	host, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -162,4 +165,5 @@ func TestActualGvisorTailnetNATCannotEscapeToHostTCP(t *testing.T) {
 		conn.Close()
 		t.Fatal("tailnet NAT escaped to a listening host TCP socket")
 	}
+
 }

@@ -19,6 +19,7 @@ import (
 )
 
 func TestRecordFlowWritesIPAuditRecord(t *testing.T) {
+	t.Parallel()
 	compiled := loadRouterPolicy(t, `
 endpoint "ip" "web" {
   destination = ["203.0.113.10/32"]
@@ -80,9 +81,11 @@ rule "deny-web" {
 	assertAuditDoesNotContain(t, auditPath, "bytes_in")
 	assertAuditDoesNotContain(t, auditPath, "bytes_out")
 	assertAuditDoesNotContain(t, auditPath, "packets")
+
 }
 
 func TestDecideDoesNotAuditBeforeTerminalPath(t *testing.T) {
+	t.Parallel()
 	compiled := loadRouterPolicy(t, `
 settings {
   default_action = "deny"
@@ -100,9 +103,11 @@ settings {
 		t.Fatal(err)
 	}
 	assertNoAuditRecords(t, auditPath)
+
 }
 
 func TestRecordFlowWritesIPv6AuditRecord(t *testing.T) {
+	t.Parallel()
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	auditLog := testAuditLogger(t, auditPath, "")
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("2001:db8::10"), SourcePort: 49152, DestIP: net.ParseIP("2001:db8::20"), DestPort: 443}
@@ -123,9 +128,11 @@ func TestRecordFlowWritesIPv6AuditRecord(t *testing.T) {
 	if event.PolicyHash != "" {
 		t.Fatalf("implicit default policy should omit policy_hash: %#v", event)
 	}
+
 }
 
 func TestRecordFlowWritesExplicitAllowAuditRecord(t *testing.T) {
+	t.Parallel()
 	compiled := loadRouterPolicy(t, `
 endpoint "ip" "api" {
   destination = ["203.0.113.20/32"]
@@ -158,9 +165,11 @@ rule "allow-api" {
 	if event.Policy == nil || event.Policy.RuleName != "allow-api" || event.Policy.EndpointKind != "ip" || event.Policy.EndpointName != "api" {
 		t.Fatalf("unexpected explicit allow policy metadata: %#v", event)
 	}
+
 }
 
 func TestRecordFlowWritesClassificationHandoffAuditRecord(t *testing.T) {
+	t.Parallel()
 	compiled := loadRouterPolicy(t, `
 settings {
   default_action = "deny"
@@ -193,9 +202,11 @@ endpoint "http" "metadata" {
 	if event.Policy != nil {
 		t.Fatalf("default classification handoff should not include policy metadata: %#v", event)
 	}
+
 }
 
 func TestRecordFlowWritesTerminalErrorMetadata(t *testing.T) {
+	t.Parallel()
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
 	tests := []struct {
 		name       string
@@ -242,9 +253,11 @@ func TestRecordFlowWritesTerminalErrorMetadata(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestRecordFlowWritesTunnelMetadataWhenPresent(t *testing.T) {
+	t.Parallel()
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	auditLog := testAuditLogger(t, auditPath, "")
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
@@ -259,9 +272,11 @@ func TestRecordFlowWritesTunnelMetadataWhenPresent(t *testing.T) {
 	if event.Tunnel == nil || event.Tunnel.Kind != "tailscale" || event.Tunnel.Name != "prod" {
 		t.Fatalf("unexpected tunnel metadata: %#v", event)
 	}
+
 }
 
 func TestRecordFlowWritesDefaultActionAuditRecords(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		policy      string
@@ -297,9 +312,11 @@ func TestRecordFlowWritesDefaultActionAuditRecords(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestRouterExposesHTTPAndHTTPSPortResolution(t *testing.T) {
+	t.Parallel()
 	compiled := loadRouterPolicy(t, `
 endpoint "http" "metadata" {
   hosts = ["metadata.internal:8080"]
@@ -333,6 +350,7 @@ endpoint "https" "proxmox" {
 	if route.MatchHTTPSAuthority("203.0.113.10", authority) {
 		t.Fatal("did not expect default-port authority to match non-default raw IP binding")
 	}
+
 }
 
 func testAuditLogger(t *testing.T, path, policyHash string) *audit.Logger {

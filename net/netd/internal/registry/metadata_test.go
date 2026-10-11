@@ -8,6 +8,7 @@ import (
 )
 
 func TestFilterNPMMetadataRemovesYoungVersionsAndTags(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{
   "name":"example",
   "dist-tags":{"latest":"2.0.0","stable":"1.0.0"},
@@ -47,9 +48,11 @@ func TestFilterNPMMetadataRemovesYoungVersionsAndTags(t *testing.T) {
 	if result.Suppressed != 1 {
 		t.Fatalf("suppressed versions = %d", result.Suppressed)
 	}
+
 }
 
 func TestFilterNPMMetadataReturnsEmptySuccessWhenAllVersionsAreYoung(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{
   "name":"example",
   "dist-tags":{"latest":"1.0.0"},
@@ -77,9 +80,11 @@ func TestFilterNPMMetadataReturnsEmptySuccessWhenAllVersionsAreYoung(t *testing.
 	if !result.Modified || result.Suppressed != 1 || len(filtered.Versions) != 0 || len(filtered.DistTags) != 0 {
 		t.Fatalf("all-young metadata = %#v, %s", result, result.Body)
 	}
+
 }
 
 func TestFilterNPMExactManifestPassesThrough(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{"name":"example","version":"1.0.0","dist":{"tarball":"https://registry.npmjs.org/example/-/example-1.0.0.tgz"}}`)
 	result, err := npmRepository{}.filterMetadata(MetadataInput{
 		Body:             body,
@@ -98,9 +103,11 @@ func TestFilterNPMExactManifestPassesThrough(t *testing.T) {
 	if result.Modified || string(result.Body) != string(body) {
 		t.Fatalf("exact manifest changed: %#v", result)
 	}
+
 }
 
 func TestFilterPyPISimpleJSONRemovesYoungArtifactsAndVersions(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{
   "name":"example",
   "versions":["1.0.0","2.0.0"],
@@ -136,9 +143,11 @@ func TestFilterPyPISimpleJSONRemovesYoungArtifactsAndVersions(t *testing.T) {
 	if len(filtered.Files) != 1 || len(filtered.Versions) != 1 || filtered.Versions[0] != "1.0.0" {
 		t.Fatalf("filtered metadata = %s", result.Body)
 	}
+
 }
 
 func TestFilterPyPISimpleJSONCountsOneSuppressedRelease(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{
   "name":"example",
   "versions":["1.0.0"],
@@ -171,9 +180,11 @@ func TestFilterPyPISimpleJSONCountsOneSuppressedRelease(t *testing.T) {
 	if result.Suppressed != 1 {
 		t.Fatalf("suppressed releases = %#v", result)
 	}
+
 }
 
 func TestFilterPyPISimpleJSONIndexesRelativeArtifactURLs(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{
   "name":"example",
   "versions":["1.0.0"],
@@ -219,9 +230,11 @@ func TestFilterPyPISimpleJSONIndexesRelativeArtifactURLs(t *testing.T) {
 	if _, ok := artifacts.Lookup("pypi.org", "/packages/example-1.0.0.zip.metadata"); ok {
 		t.Fatal("unadvertised core metadata path was indexed")
 	}
+
 }
 
 func TestFilterPyPISimpleHTMLRemovesYoungLinks(t *testing.T) {
+	t.Parallel()
 	body := []byte(`<!doctype html><html><body>
 <a href="https://files.pythonhosted.org/packages/example-1.0.0.tar.gz" data-upload-time="2020-01-01T00:00:00Z" data-core-metadata="sha256=abc">example-1.0.0.tar.gz</a>
 <a href="https://files.pythonhosted.org/packages/example-2.0.0-py3-none-any.whl" data-upload-time="2026-07-15T11:00:00Z" data-dist-info-metadata="true">example-2.0.0-py3-none-any.whl</a>
@@ -255,9 +268,11 @@ func TestFilterPyPISimpleHTMLRemovesYoungLinks(t *testing.T) {
 			t.Fatalf("core metadata path %q was not indexed", artifactPath)
 		}
 	}
+
 }
 
 func TestFilterPyPISimpleHTMLKeepsUnrecognizedLinks(t *testing.T) {
+	t.Parallel()
 	body := []byte(`<!doctype html><html><body>
 <a href="https://pypi.org/project/example/">project page</a>
 <a href="https://files.pythonhosted.org/packages/example-1.0.0.tar.gz">example-1.0.0.tar.gz</a>
@@ -281,9 +296,11 @@ func TestFilterPyPISimpleHTMLKeepsUnrecognizedLinks(t *testing.T) {
 	if result.Modified || string(result.Body) != string(body) {
 		t.Fatalf("unrecognized link changed metadata: %s", result.Body)
 	}
+
 }
 
 func TestFilterPyPIProjectJSONRemovesYoungReleasesAndURLs(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{
 	"info":{"name":"example","version":"2.0.0","release_url":"https://pypi.org/project/example/2.0.0/","requires_dist":["denied-dependency"],"requires_python":">=3.13"},
   "releases":{
@@ -337,9 +354,11 @@ func TestFilterPyPIProjectJSONRemovesYoungReleasesAndURLs(t *testing.T) {
 	if !ok || metadata.Version != "2.0.0" {
 		t.Fatalf("project core metadata cache = %#v, %v", metadata, ok)
 	}
+
 }
 
 func TestFilterPyPIProjectJSONUsesEarliestReleaseFileTimestamp(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{
   "info":{"name":"example","version":"1.0.0"},
   "releases":{"1.0.0":[
@@ -371,9 +390,11 @@ func TestFilterPyPIProjectJSONUsesEarliestReleaseFileTimestamp(t *testing.T) {
 	if result.Modified || result.Suppressed != 0 || string(result.Body) != string(body) {
 		t.Fatalf("old release was filtered: %#v", result)
 	}
+
 }
 
 func TestPyPIFilenameVersion(t *testing.T) {
+	t.Parallel()
 	tests := map[string]string{
 		"foo_bar-1.2.3-py3-none-any.whl": "1.2.3",
 		"foo-bar-1.2.3.tar.gz":           "1.2.3",
@@ -384,6 +405,7 @@ func TestPyPIFilenameVersion(t *testing.T) {
 			t.Errorf("pypiFilenameVersion(%q) = %q, want %q", filename, version, expected)
 		}
 	}
+
 }
 
 func ageVersions(young ...string) AgeLookup {

@@ -12,6 +12,7 @@ import (
 )
 
 func TestTableUsesRealListenersAndTracksScope(t *testing.T) {
+	t.Parallel()
 	networkStack := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
@@ -68,6 +69,7 @@ func TestTableUsesRealListenersAndTracksScope(t *testing.T) {
 	if len(table.All()) != 0 {
 		t.Fatalf("unexpose did not empty table: %#v", table.All())
 	}
+
 }
 
 func freeLoopbackAddress(t *testing.T) string {

@@ -9,6 +9,7 @@ import (
 )
 
 func TestLogRedactionIncludesAttrsErrorsAndLoginURL(t *testing.T) {
+	t.Parallel()
 	var out bytes.Buffer
 	log := slog.New(New(slog.NewJSONHandler(&out, nil), "opaque-secret"))
 	log.With("config", "/etc/silo/config.yaml").Info("UserLogf tskey-auth-secret", "error", errors.New("https://secret:password@control.test/token?access_token=secret /home/operator/private opaque-secret"), "login", "https://login.tailscale.com/a/valid-login-link")
@@ -23,4 +24,5 @@ func TestLogRedactionIncludesAttrsErrorsAndLoginURL(t *testing.T) {
 	if Text(url) != url {
 		t.Fatal("local operator approval URL hidden")
 	}
+
 }

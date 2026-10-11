@@ -7,6 +7,7 @@ import (
 )
 
 func TestIsExpectedCreateEndpointError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  tcpip.Error
@@ -26,4 +27,5 @@ func TestIsExpectedCreateEndpointError(t *testing.T) {
 			}
 		})
 	}
+
 }

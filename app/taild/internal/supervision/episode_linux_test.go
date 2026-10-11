@@ -52,10 +52,15 @@ func pipeEOF(t *testing.T, reader *os.File, within time.Duration) {
 	}
 }
 
+// SILO_TEST_STRESS=1 exercises all 12 repetitions per mode instead of one.
 func TestReturnedFDUsesCurrentEpisodeDuringBlockedAcquisition(t *testing.T) {
+	repetitions := 1
+	if os.Getenv("SILO_TEST_STRESS") == "1" {
+		repetitions = 12
+	}
 	for _, mode := range []string{"before-deadline", "after-deadline", "cancelled-request"} {
 		t.Run(mode, func(t *testing.T) {
-			for range 12 {
+			for range repetitions {
 				i, gate, receipts, events, ctx := episodeFixture(t, 40*time.Millisecond)
 				deliverEpisode(t, ctx, receipts, events, 11, true)
 				deliverEpisode(t, ctx, receipts, events, 12, false)
@@ -112,8 +117,13 @@ func TestReturnedFDUsesCurrentEpisodeDuringBlockedAcquisition(t *testing.T) {
 	}
 }
 
+// SILO_TEST_STRESS=1 exercises all 100 recoveries instead of five.
 func TestLatestCancelledEpisodeRecoversAfterOlderWorkerRetires(t *testing.T) {
-	for range 100 {
+	iterations := 5
+	if os.Getenv("SILO_TEST_STRESS") == "1" {
+		iterations = 100
+	}
+	for range iterations {
 		i, gate, receipts, events, ctx := episodeFixture(t, time.Second)
 		home := t.TempDir()
 		deliverEpisode(t, ctx, receipts, events, 11, true)

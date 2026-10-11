@@ -3,6 +3,7 @@ package policy
 import "testing"
 
 func TestPackageFacetCondition(t *testing.T) {
+	t.Parallel()
 	registry := BuiltinRegistry()
 	condition, err := compileCondition(
 		registry,
@@ -47,18 +48,22 @@ func TestPackageFacetCondition(t *testing.T) {
 	if activation[celVariableName("package", "malware_reason")] != "" {
 		t.Fatalf("optional field was not zero-filled: %#v", activation[celVariableName("package", "malware_reason")])
 	}
+
 }
 
 func TestPackageFacetRequiresDeclaredFields(t *testing.T) {
+	t.Parallel()
 	_, err := buildFacetActivation(BuiltinRegistry(), EndpointFamilyPackage, facetValues{
 		"package": {"ecosystem": "npm"},
 	})
 	if err == nil {
 		t.Fatal("incomplete package facet was accepted")
 	}
+
 }
 
 func TestFacetRewritePreservesStringLiterals(t *testing.T) {
+	t.Parallel()
 	prepared, err := prepareConditionSource(
 		BuiltinRegistry(),
 		FamilyDefinition{Family: EndpointFamilyPackage, Facets: []string{"package"}},
@@ -70,4 +75,5 @@ func TestFacetRewritePreservesStringLiterals(t *testing.T) {
 	if prepared != `__silo_package_name == "package.age_hours"` {
 		t.Fatalf("prepared condition = %q", prepared)
 	}
+
 }

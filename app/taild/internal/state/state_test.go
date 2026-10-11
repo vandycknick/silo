@@ -18,6 +18,7 @@ import (
 )
 
 func TestAuditRotationConcurrentRealFiles(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	a, e := OpenAudit(home, 1024, 100)
 	if e != nil {
@@ -72,8 +73,10 @@ func TestAuditRotationConcurrentRealFiles(t *testing.T) {
 	if len(seen) != 160 {
 		t.Fatalf("lost events: %d", len(seen))
 	}
+
 }
 func TestPrivateAtomicFiles(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	if e := PrivateDir(filepath.Join(home, "taild")); e != nil {
 		t.Fatal(e)
@@ -92,9 +95,11 @@ func TestPrivateAtomicFiles(t *testing.T) {
 	if e = PinTailnet(home, "other"); e == nil {
 		t.Fatal("tailnet change accepted")
 	}
+
 }
 
 func TestExclusiveHomeLock(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	first, e := LockHome(home)
 	if e != nil {
@@ -112,6 +117,7 @@ func TestExclusiveHomeLock(t *testing.T) {
 		t.Fatal(e)
 	}
 	second.Close()
+
 }
 
 func writeNode(t *testing.T, dir, hostname string) {
@@ -139,6 +145,7 @@ func writeNode(t *testing.T, dir, hostname string) {
 	}
 }
 func TestProfileState(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "tailscale")
 	if e := PrivateDir(dir); e != nil {
 		t.Fatal(e)
@@ -162,9 +169,11 @@ func TestProfileState(t *testing.T) {
 	if _, s := ReadNode(dir, "dev", "user:123", nil); s != Unreadable {
 		t.Fatal(s)
 	}
+
 }
 
 func TestPublicProfilePinControlTailnetAndStableID(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "tailscale")
 	writeNode(t, dir, "dev")
 	st, e := store.NewFileStore(t.Logf, filepath.Join(dir, "tailscaled.state"))
@@ -200,9 +209,11 @@ func TestPublicProfilePinControlTailnetAndStableID(t *testing.T) {
 			t.Fatal("foreign pin accepted", bad, s)
 		}
 	}
+
 }
 
 func TestHomeControlPinCannotChangeControlOrSuffix(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	if e := PrivateDir(filepath.Join(home, "taild")); e != nil {
 		t.Fatal(e)
@@ -225,4 +236,5 @@ func TestHomeControlPinCannotChangeControlOrSuffix(t *testing.T) {
 	if e := PinNodeControl(home, pin); e == nil {
 		t.Fatal("foreign DNS suffix accepted")
 	}
+
 }

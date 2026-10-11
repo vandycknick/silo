@@ -8,6 +8,7 @@ import (
 )
 
 func TestFinalizerRunsForCancellationBeforeCallback(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	r := New(ctx, 4)
@@ -33,4 +34,5 @@ func TestFinalizerRunsForCancellationBeforeCallback(t *testing.T) {
 	if called.Load() {
 		t.Fatal("cancelled queued callback ran")
 	}
+
 }

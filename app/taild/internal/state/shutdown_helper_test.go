@@ -10,6 +10,7 @@ import (
 )
 
 func TestHelperLeaseIsIndependentAndCancellationWaitsForRelease(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	daemon, err := LockHome(home)
 	if err != nil {
@@ -39,4 +40,5 @@ func TestHelperLeaseIsIndependentAndCancellationWaitsForRelease(t *testing.T) {
 	if err := WaitShutdownHelpers(ctx, home); err != nil {
 		t.Fatal("released helper prevented recovery", err)
 	}
+
 }

@@ -7,6 +7,7 @@ import (
 )
 
 func TestShutdownGateRejectsRecoveryFromOlderEpisode(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	gate := &ShutdownGate{}
 	old := gate.Seal()
@@ -20,9 +21,11 @@ func TestShutdownGateRejectsRecoveryFromOlderEpisode(t *testing.T) {
 	if cleared, err := gate.Recover(home, current); err != nil || !cleared || gate.Pending() || ShutdownPending(home) {
 		t.Fatal("verified current recovery failed", cleared, err)
 	}
+
 }
 
 func TestMarkerFailureDoesNotUndoMemorySeal(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	if err := os.Mkdir(filepath.Join(home, "taild"), 0755); err != nil {
 		t.Fatal(err)
@@ -35,4 +38,5 @@ func TestMarkerFailureDoesNotUndoMemorySeal(t *testing.T) {
 	if !gate.Pending() || ShutdownPending(home) {
 		t.Fatal("memory seal lost or test did not isolate marker failure")
 	}
+
 }

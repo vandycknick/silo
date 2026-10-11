@@ -9,6 +9,7 @@ import (
 )
 
 func TestCapabilities(t *testing.T) {
+	t.Parallel()
 	defaults := Limits{5, 8, 32 << 30, 200 << 30}
 	for _, tt := range []struct {
 		name, raw string
@@ -49,9 +50,11 @@ func TestCapabilities(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestCapabilityLimitTypesAndDefaults(t *testing.T) {
+	t.Parallel()
 	defaults := Limits{5, 8, 32 << 30, 200 << 30}
 	for _, tt := range []struct {
 		name, raw string
@@ -95,8 +98,10 @@ func TestCapabilityLimitTypesAndDefaults(t *testing.T) {
 			})
 		}
 	}
+
 }
 func TestWhoIsIdentity(t *testing.T) {
+	t.Parallel()
 	w := &apitype.WhoIsResponse{Node: &tailcfg.Node{StableID: "node-1", Name: "peer"}, UserProfile: &tailcfg.UserProfile{ID: 123, LoginName: "root"}}
 	p, e := FromWhoIs(w, "cap", Limits{}, nil)
 	if e != nil || len(p.Principals) != 1 || p.Principals[0] != "user:123" {
@@ -118,4 +123,5 @@ func TestWhoIsIdentity(t *testing.T) {
 			t.Fatalf("accepted %q", s)
 		}
 	}
+
 }

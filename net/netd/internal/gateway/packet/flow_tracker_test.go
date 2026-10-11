@@ -7,6 +7,7 @@ import (
 )
 
 func TestFlowTrackerDrainsActiveFlowsAndRejectsNewFlows(t *testing.T) {
+	t.Parallel()
 	tracker := NewFlowTracker()
 	if !tracker.Start() {
 		t.Fatal("first flow was rejected")
@@ -37,9 +38,11 @@ func TestFlowTrackerDrainsActiveFlowsAndRejectsNewFlows(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for flow drain")
 	}
+
 }
 
 func TestFlowTrackerWaitHonorsDeadline(t *testing.T) {
+	t.Parallel()
 	tracker := NewFlowTracker()
 	if !tracker.Start() {
 		t.Fatal("flow was rejected")
@@ -50,4 +53,5 @@ func TestFlowTrackerWaitHonorsDeadline(t *testing.T) {
 		t.Fatal("expected drain deadline error")
 	}
 	tracker.Done()
+
 }

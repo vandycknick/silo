@@ -12,6 +12,7 @@ import (
 )
 
 func TestRestartRegistryIsEmptyAndShutdownJoins(t *testing.T) {
+	t.Parallel()
 	r := New(context.Background(), 1)
 	if e := r.Wait(context.Background()); e != nil {
 		t.Fatal(e)
@@ -19,6 +20,7 @@ func TestRestartRegistryIsEmptyAndShutdownJoins(t *testing.T) {
 	if !r.closing {
 		t.Fatal("registry did not seal")
 	}
+
 }
 
 func peer(owner identity.Principal) identity.Peer {
@@ -44,6 +46,7 @@ func finished(t *testing.T, r *Registry, p identity.Peer, id string) Operation {
 	}
 }
 func TestCanonicalCryptoULID(t *testing.T) {
+	t.Parallel()
 	now := time.UnixMilli(1770000000123)
 	seen := map[string]bool{}
 	alphabet := "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -81,8 +84,10 @@ func TestCanonicalCryptoULID(t *testing.T) {
 	if base32.NewEncoding(alphabet).EncodeToString(make([]byte, 5)) != "00000000" {
 		t.Fatal("alphabet mismatch")
 	}
+
 }
 func TestDetachedSerializationAdmissionVisibilityAndExpiry(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := New(ctx, 2)
@@ -143,8 +148,10 @@ func TestDetachedSerializationAdmissionVisibilityAndExpiry(t *testing.T) {
 	if _, e = r.Submit("late", "vm", "user:1", func(context.Context, func(string)) error { return nil }); e == nil {
 		t.Fatal("shutdown accepted work")
 	}
+
 }
 func TestDaemonCancellationReleasesQueuedLock(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	r := New(ctx, 2)
 	entered := make(chan struct{})
@@ -171,4 +178,5 @@ func TestDaemonCancellationReleasesQueuedLock(t *testing.T) {
 	if r.active != 0 || len(r.locks) != 0 {
 		t.Fatal("lock/admission leak")
 	}
+
 }

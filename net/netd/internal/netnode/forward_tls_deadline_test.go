@@ -56,6 +56,10 @@ func localForwardTLSCallback(t *testing.T, n *Node, callback func(*tls.ClientHel
 }
 
 func TestForwardTLSCertificateDelayBeyondOldHeaderDeadline(t *testing.T) {
+	originalTimeout := forwardReadHeaderTimeout
+	forwardReadHeaderTimeout = 3 * time.Second
+	t.Cleanup(func() { forwardReadHeaderTimeout = originalTimeout })
+
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host != "example.com" || r.URL.Path != "/after-certificate" {
 			t.Errorf("unexpected backend request: host=%q path=%q", r.Host, r.URL.Path)
@@ -72,7 +76,7 @@ func TestForwardTLSCertificateDelayBeyondOldHeaderDeadline(t *testing.T) {
 			t.Errorf("unexpected SNI: %q", hello.ServerName)
 		}
 		started := time.Now()
-		timer := time.NewTimer(31 * time.Second)
+		timer := time.NewTimer(1500 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -83,6 +87,7 @@ func TestForwardTLSCertificateDelayBeyondOldHeaderDeadline(t *testing.T) {
 		}
 	})
 	defer cleanup()
+	client.Timeout = 5 * time.Second
 
 	res, err := client.Get("https://example.com/after-certificate")
 	if err != nil {
@@ -93,7 +98,7 @@ func TestForwardTLSCertificateDelayBeyondOldHeaderDeadline(t *testing.T) {
 	if err != nil || res.StatusCode != http.StatusCreated || string(body) != "certificate-delay-backend" {
 		t.Fatalf("backend response: status=%d body=%q err=%v", res.StatusCode, body, err)
 	}
-	if delay := <-elapsed; delay <= 30*time.Second || delay >= 75*time.Second {
+	if delay := <-elapsed; delay <= 1200*time.Millisecond || delay >= 3*time.Second {
 		t.Fatalf("certificate callback delay %s is outside regression window", delay)
 	}
 	if guest.calls.Load() != 1 || guest.port.Load() != 8080 {
@@ -107,6 +112,12 @@ func TestForwardTLSCertificateDelayBeyondOldHeaderDeadline(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("missing terminal event after delayed handshake")
+	}
+}
+
+func TestForwardReadHeaderTimeoutDefault(t *testing.T) {
+	if forwardReadHeaderTimeout != 75*time.Second {
+		t.Fatalf("forward header timeout = %s, want 75s", forwardReadHeaderTimeout)
 	}
 }
 

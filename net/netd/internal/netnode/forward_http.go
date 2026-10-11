@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// forwardReadHeaderTimeout includes certificate acquisition during the TLS handshake.
+var forwardReadHeaderTimeout = 75 * time.Second
+
 type forwardLeaseKey struct{}
 type forwardTransport struct {
 	node      *Node
@@ -197,7 +200,7 @@ func (n *Node) serveForwardTLS(ctx context.Context, listener *admissionListener,
 	})
 	// Allow the bounded status lookup and serialized certificate acquisition to
 	// finish before net/http's shared TLS-handshake/header deadline expires.
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 75 * time.Second, IdleTimeout: 60 * time.Second,
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: forwardReadHeaderTimeout, IdleTimeout: 60 * time.Second,
 		BaseContext: func(net.Listener) context.Context { return ctx },
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			lease := tlsLease(c)

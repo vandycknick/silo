@@ -9,6 +9,7 @@ import (
 )
 
 func TestAllow(t *testing.T) {
+	t.Parallel()
 	p := identity.Peer{Principals: []identity.Principal{"user:12"}, NodeID: "node", ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: []identity.Action{identity.Read, identity.Start}}}
 	for _, tt := range []struct {
 		a     identity.Action
@@ -35,4 +36,5 @@ func TestAllow(t *testing.T) {
 	if e := Allow(p, identity.Read, nil); e == nil {
 		t.Fatal("unverified peer accepted")
 	}
+
 }

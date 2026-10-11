@@ -31,6 +31,18 @@ krun runtime binary. Runtime packages ship it as `bin/silo-vmm` (or
 `Contents/Helpers/silo-vmm` in `Silo.app`). See the
 [silo-vmm architecture and qualification notes](docs/architecture/silo-vmm.md).
 
+## Development tests
+
+Run `make test` inside `nix develop` for the host-supported Rust suites and netd
+tests. Rust tests use cargo-nextest with process isolation and a single workspace
+pass; integration tests share a prebuilt mock `silo-vmm`. `make test-unit` runs
+Rust unit tests only, while `make test-integration` runs Rust integration tests
+and netd tests. Both Rust unit commands also test rprobe without default features.
+
+With `CI=true`, nextest uses the `ci` profile and writes JUnit results under
+`target/nextest/ci/junit.xml` (under `CARGO_TARGET_DIR` when overridden).
+Real-VM qualification is separate; see the [smoke suite](smoke/README.md).
+
 ## CLI
 
 Build the CLI locally:

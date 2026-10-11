@@ -8,6 +8,7 @@ import (
 )
 
 func TestForwardFixturePreservesProtocolAndTLS(t *testing.T) {
+	t.Parallel()
 	compiled, err := LoadPolicyFromString("forward.hcl", `
 tailscale "vm" {
   hostname = "web"
@@ -38,4 +39,5 @@ forward "tailscale" "raw" {
 	if !slices.Equal(compiled.Forwards(), want) {
 		t.Fatalf("forwards = %#v, want %#v", compiled.Forwards(), want)
 	}
+
 }

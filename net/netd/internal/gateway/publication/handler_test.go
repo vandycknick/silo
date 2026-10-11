@@ -19,6 +19,7 @@ import (
 )
 
 func TestHandlerAcceptsPodmanShapeAndReportsConflicts(t *testing.T) {
+	t.Parallel()
 	table := NewTable(newRecordingForwarder())
 	server := httptest.NewServer(Handler(table, Policy{Bind: BindAny, GuestIP: netip.MustParseAddr("192.168.127.2")}, nil))
 	t.Cleanup(server.Close)
@@ -46,9 +47,11 @@ func TestHandlerAcceptsPodmanShapeAndReportsConflicts(t *testing.T) {
 
 	response = postJSON(t, server.URL+"/services/forwarder/unexpose", `{"local":":8080","protocol":"tcp"}`)
 	assertResponse(t, response, http.StatusOK, "")
+
 }
 
 func TestHandlerEnforcesBindAndProtocolPolicy(t *testing.T) {
+	t.Parallel()
 	table := NewTable(newRecordingForwarder())
 	server := httptest.NewServer(Handler(table, Policy{Bind: BindLoopback, GuestIP: netip.MustParseAddr("192.168.127.2")}, nil))
 	t.Cleanup(server.Close)
@@ -63,9 +66,11 @@ func TestHandlerEnforcesBindAndProtocolPolicy(t *testing.T) {
 	if len(table.All()) != 0 {
 		t.Fatalf("denied requests reached the publication table: %#v", table.All())
 	}
+
 }
 
 func TestHandlerReturnsBindFailureText(t *testing.T) {
+	t.Parallel()
 	forwarder := newRecordingForwarder()
 	forwarder.exposeErr = errors.New("listen tcp 127.0.0.1:8080: address already in use")
 	table := NewTable(forwarder)
@@ -77,9 +82,11 @@ func TestHandlerReturnsBindFailureText(t *testing.T) {
 	if len(table.All()) != 0 {
 		t.Fatalf("failed bind entered the publication table: %#v", table.All())
 	}
+
 }
 
 func TestSessionRouteFlushesAndReleasesOnDisconnectWithAudit(t *testing.T) {
+	t.Parallel()
 	var auditOutput bytes.Buffer
 	auditLog := audit.New(&auditOutput, "sha256:test")
 	table := NewTable(newRecordingForwarder())
@@ -145,6 +152,7 @@ func TestSessionRouteFlushesAndReleasesOnDisconnectWithAudit(t *testing.T) {
 	if events[2].Phase != "released" || events[2].Publication.Local != "127.0.0.1:8081" {
 		t.Fatalf("unexpected released audit event: %#v", events[2])
 	}
+
 }
 
 func postJSON(t *testing.T, url, body string) *http.Response {

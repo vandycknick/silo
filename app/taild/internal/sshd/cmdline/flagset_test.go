@@ -7,6 +7,7 @@ import (
 )
 
 func TestFlagSetStrictness(t *testing.T) {
+	t.Parallel()
 	var force, start bool
 	var cpus uint64
 	var owner, name string
@@ -63,9 +64,11 @@ func TestFlagSetStrictness(t *testing.T) {
 	if _, e := parse("--timeout", "tskey-secret"); e == nil || strings.Contains(e.Error(), "tskey") {
 		t.Fatal(e)
 	}
+
 }
 
 func TestArgsShapes(t *testing.T) {
+	t.Parallel()
 	if v, e := (Args{Positional: []string{"vm"}}).One("VM"); e != nil || v != "vm" {
 		t.Fatal(v, e)
 	}
@@ -84,9 +87,11 @@ func TestArgsShapes(t *testing.T) {
 	if !IsFlag("--x") || !IsFlag("-x") || IsFlag("x") {
 		t.Fatal("IsFlag")
 	}
+
 }
 
 func TestDeclarationDrivesArityAndHelp(t *testing.T) {
+	t.Parallel()
 	var b bool
 	var s string
 	f := NewFlagSet()
@@ -102,10 +107,12 @@ func TestDeclarationDrivesArityAndHelp(t *testing.T) {
 	if _, e := f.Parse([]string{"-d", "/tmp"}); e != nil || s != "/tmp" {
 		t.Fatal(e, s)
 	}
+
 }
 
 // Diagnostics name the option and the shape of the problem, never the value.
 func TestUsageDiagnosticsRedacted(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		args []string
 		want string
@@ -131,4 +138,5 @@ func TestUsageDiagnosticsRedacted(t *testing.T) {
 			t.Fatal(tc.args, err)
 		}
 	}
+
 }

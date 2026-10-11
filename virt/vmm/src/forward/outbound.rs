@@ -191,10 +191,14 @@ mod tests {
             "guest:tcp:0".parse().unwrap(),
             forward_spec::Endpoint::Host(forward_spec::Address::Tcp(host.local_addr().unwrap())),
         );
-        let table =
-            ForwardTable::prepare_machine(&[forward], std::path::Path::new("/unused"), None)
-                .await
-                .unwrap();
+        let table = ForwardTable::prepare_machine(
+            &[forward],
+            std::path::Path::new("/unused"),
+            None,
+            crate::forward::inbound::PARK_TIMEOUT,
+        )
+        .await
+        .unwrap();
         let entry = table.entries().remove(0);
         let identity = crate::state::ReadyAgentIdentity {
             instance_id: uuid::Uuid::new_v4(),

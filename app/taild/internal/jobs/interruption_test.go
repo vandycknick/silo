@@ -9,6 +9,7 @@ import (
 )
 
 func TestHostShutdownInterruptionRestoresOnlyFutureAdmission(t *testing.T) {
+	t.Parallel()
 	r := New(context.Background(), 2)
 	started := make(chan struct{})
 	op, err := r.Submit("create", "dev", "user:1", func(ctx context.Context, progress func(string)) error { close(started); <-ctx.Done(); return ctx.Err() })
@@ -40,4 +41,5 @@ func TestHostShutdownInterruptionRestoresOnlyFutureAdmission(t *testing.T) {
 	if got := r.List(p); len(got) != 2 || got[1].State != "succeeded" {
 		t.Fatal(got)
 	}
+
 }

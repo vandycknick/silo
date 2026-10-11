@@ -9,6 +9,7 @@ import (
 )
 
 func TestCompletionIsAnImmutableJobSnapshot(t *testing.T) {
+	t.Parallel()
 	r := New(t.Context(), 1)
 	peer := identity.Peer{Principals: []identity.Principal{"user:7"}}
 	result := &Completion{VMID: "id", Name: "original", ApprovalURL: "https://login.tailscale.com/a/example"}
@@ -31,4 +32,5 @@ func TestCompletionIsAnImmutableJobSnapshot(t *testing.T) {
 	if err != nil || second.Completion.Name != "original" {
 		t.Fatal(second, err)
 	}
+
 }

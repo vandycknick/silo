@@ -7,6 +7,7 @@ import (
 )
 
 func TestRepositoryCatalogScopesHostsAndFeedPaths(t *testing.T) {
+	t.Parallel()
 	catalog, err := NewCatalog([]string{"npm"})
 	if err != nil {
 		t.Fatal(err)
@@ -38,9 +39,11 @@ func TestRepositoryCatalogScopesHostsAndFeedPaths(t *testing.T) {
 	if !slices.Equal(hosts, want) {
 		t.Fatalf("repository hosts = %#v, want %#v", hosts, want)
 	}
+
 }
 
 func TestRepositoryAdaptersOwnRequestClassification(t *testing.T) {
+	t.Parallel()
 	catalog := DefaultCatalog()
 	npm, ok := catalog.RepositoryForEcosystem(EcosystemNPM)
 	if !ok {
@@ -62,18 +65,22 @@ func TestRepositoryAdaptersOwnRequestClassification(t *testing.T) {
 	if feeds := pypi.FeedPaths(); feeds.Malware != "malware_pypi.json" || feeds.Release != "releases/pypi.json" {
 		t.Fatalf("PyPI feeds = %#v", feeds)
 	}
+
 }
 
 func TestRepositoryCatalogRejectsUnknownAndDuplicateNames(t *testing.T) {
+	t.Parallel()
 	if _, err := NewCatalog([]string{"rubygems"}); err == nil {
 		t.Fatal("unknown repository was accepted")
 	}
 	if _, err := NewCatalog([]string{"npm", "npm"}); err == nil {
 		t.Fatal("duplicate repository was accepted")
 	}
+
 }
 
 func TestRepositoryAdaptersPassThroughUnsupportedMetadataTypes(t *testing.T) {
+	t.Parallel()
 	catalog := DefaultCatalog()
 	for _, ecosystem := range []Ecosystem{EcosystemNPM, EcosystemPyPI} {
 		repository, ok := catalog.RepositoryForEcosystem(ecosystem)
@@ -90,9 +97,11 @@ func TestRepositoryAdaptersPassThroughUnsupportedMetadataTypes(t *testing.T) {
 			t.Fatalf("repository %q pass-through = %#v, %v", ecosystem, result, err)
 		}
 	}
+
 }
 
 func TestRepositoryAdaptersPassThroughMalformedMetadata(t *testing.T) {
+	t.Parallel()
 	for _, ecosystem := range []Ecosystem{EcosystemNPM, EcosystemPyPI} {
 		repository, ok := DefaultCatalog().RepositoryForEcosystem(ecosystem)
 		if !ok {
@@ -108,9 +117,11 @@ func TestRepositoryAdaptersPassThroughMalformedMetadata(t *testing.T) {
 			t.Fatalf("repository %q malformed pass-through = %#v, %v", ecosystem, result, err)
 		}
 	}
+
 }
 
 func TestRepositoryAdaptersPrepareMetadataHeaders(t *testing.T) {
+	t.Parallel()
 	catalog := DefaultCatalog()
 	npm, _ := catalog.RepositoryForEcosystem(EcosystemNPM)
 	npmHeader := http.Header{
@@ -133,4 +144,5 @@ func TestRepositoryAdaptersPrepareMetadataHeaders(t *testing.T) {
 	if pypiHeader.Get("Accept") == "" || pypiHeader.Get("If-None-Match") != "" || pypiHeader.Get("If-Modified-Since") != "" {
 		t.Fatalf("PyPI metadata headers = %#v", pypiHeader)
 	}
+
 }

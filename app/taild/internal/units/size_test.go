@@ -6,6 +6,7 @@ import (
 )
 
 func TestExactSizes(t *testing.T) {
+	t.Parallel()
 	for _, v := range []struct {
 		s string
 		n uint64
@@ -24,9 +25,11 @@ func TestExactSizes(t *testing.T) {
 			t.Fatal(s)
 		}
 	}
+
 }
 
 func TestSizeStringPicksLargestExactUnit(t *testing.T) {
+	t.Parallel()
 	for _, v := range []struct {
 		size Size
 		want string
@@ -35,9 +38,11 @@ func TestSizeStringPicksLargestExactUnit(t *testing.T) {
 			t.Fatalf("%d: %q, want %q", uint64(v.size), got, v.want)
 		}
 	}
+
 }
 
 func TestDurationRequiresUnit(t *testing.T) {
+	t.Parallel()
 	var d Duration
 	if e := d.UnmarshalText([]byte("250ms")); e != nil || d.Duration != 250*time.Millisecond {
 		t.Fatal(d, e)
@@ -47,4 +52,5 @@ func TestDurationRequiresUnit(t *testing.T) {
 			t.Fatal(s)
 		}
 	}
+
 }

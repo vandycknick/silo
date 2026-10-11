@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -57,5 +59,35 @@ func TestForwardGuestFileArchive(t *testing.T) {
 	}
 	if _, err := tr.Next(); err != io.EOF {
 		t.Fatal(err)
+	}
+}
+
+func TestRegistryImageCacheKeysIncludeRootfsAndSortedGuestFiles(t *testing.T) {
+	rootfs := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rootfs, "base"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	files := []GuestFile{{Path: "z", Mode: 0644, Data: []byte("last")}, {Path: "a", Mode: 0755, Data: []byte("first")}}
+	first := cachedRegistryImage(t, rootfs, files)
+	reordered := cachedRegistryImage(t, rootfs, []GuestFile{files[1], files[0]})
+	if &first.archive[0] != &reordered.archive[0] || &first.layer[0] != &reordered.layer[0] || &first.config[0] != &reordered.config[0] || &first.manifest[0] != &reordered.manifest[0] {
+		t.Fatal("equivalent files did not reuse the cached image")
+	}
+	if files[0].Path != "z" {
+		t.Fatal("cache sorting changed the caller's files")
+	}
+	for _, changed := range [][]GuestFile{
+		{{Path: "z", Mode: 0600, Data: []byte("last")}, files[1]},
+		{{Path: "z", Mode: 0644, Data: []byte("changed")}, files[1]},
+		{{Path: "other", Mode: 0644, Data: []byte("last")}, files[1]},
+	} {
+		image := cachedRegistryImage(t, rootfs, changed)
+		if bytes.Equal(first.manifest, image.manifest) {
+			t.Fatal("changed guest file reused the original image")
+		}
+	}
+	other := cachedRegistryImage(t, t.TempDir(), files)
+	if bytes.Equal(first.manifest, other.manifest) {
+		t.Fatal("different rootfs reused the original image")
 	}
 }

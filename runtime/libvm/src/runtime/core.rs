@@ -5064,8 +5064,15 @@ mod tests {
             .is_some());
         assert!(config.machine_dir.exists());
 
-        let recovered_at = recovered.updated_at;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let recovered_at = recovered.updated_at - 10;
+        reopened
+            .store
+            .save_machine_state(&MachineState {
+                updated_at: recovered_at,
+                ..recovered
+            })
+            .await
+            .expect("persist distinct recovered timestamp");
         reopened
             .reconcile_machine_runtime_best_effort(&config)
             .await

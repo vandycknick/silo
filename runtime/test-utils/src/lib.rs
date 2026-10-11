@@ -136,6 +136,8 @@ pub struct ForwardScenario {
     pub refuse_targets: Vec<String>,
     /// Omit GuestForwardService from health discovery.
     pub unsupported: bool,
+    /// Override the pending inbound connection parking timeout in milliseconds.
+    pub park_timeout_ms: Option<u64>,
 }
 
 impl Scenario {

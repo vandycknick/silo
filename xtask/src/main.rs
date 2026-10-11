@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::components::{
-    build_all, build_component, clippy, format, test_integration, test_units, BuildContext,
-    Component,
+    build_all, build_component, clippy, format, test_all, test_integration, test_units,
+    BuildContext, Component,
 };
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel::KernelOptions;
@@ -361,8 +361,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Commands::Test => {
             let host = HostTarget::current()?;
-            test_units(&workspace_root, &target_dir, host)?;
-            test_integration(&workspace_root, &target_dir, host)?;
+            test_all(&workspace_root, &target_dir, host)?;
         }
         Commands::Coverage => {
             let host = HostTarget::current()?;

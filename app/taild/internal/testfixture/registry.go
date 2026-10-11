@@ -24,7 +24,9 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,7 +66,38 @@ func RequireRegistryTrust(t *testing.T) {
 	}
 }
 
-func OCIRegistry(t *testing.T, rootfs string, extra ...GuestFile) *Registry {
+type registryImage struct {
+	archive  []byte
+	layer    []byte
+	config   []byte
+	manifest []byte
+}
+
+type registryImageKey struct {
+	rootfs string
+	extra  [sha256.Size]byte
+}
+
+var registryImages sync.Map
+
+func cachedRegistryImage(t *testing.T, rootfs string, extra []GuestFile) registryImage {
+	t.Helper()
+	files := append([]GuestFile(nil), extra...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	encoded, err := json.Marshal(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := registryImageKey{rootfs: rootfs, extra: sha256.Sum256(encoded)}
+	if cached, ok := registryImages.Load(key); ok {
+		return cached.(registryImage)
+	}
+	image := buildRegistryImage(t, rootfs, files)
+	cached, _ := registryImages.LoadOrStore(key, image)
+	return cached.(registryImage)
+}
+
+func buildRegistryImage(t *testing.T, rootfs string, extra []GuestFile) registryImage {
 	t.Helper()
 	var archive bytes.Buffer
 	tw := tar.NewWriter(&archive)
@@ -162,8 +195,17 @@ func OCIRegistry(t *testing.T, rootfs string, extra ...GuestFile) *Registry {
 	if e != nil {
 		t.Fatal(e)
 	}
+	return registryImage{archive: archive.Bytes(), layer: layer.Bytes(), config: config, manifest: manifest}
+}
+
+func OCIRegistry(t *testing.T, rootfs string, extra ...GuestFile) *Registry {
+	t.Helper()
+	image := cachedRegistryImage(t, rootfs, extra)
+	config, manifest := image.config, image.manifest
+	digest := func(b []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(b)) }
+	const media = "application/vnd.oci.image.manifest.v1+json"
 	r := &Registry{}
-	blobs := map[string][]byte{digest(config): config, digest(layer.Bytes()): layer.Bytes()}
+	blobs := map[string][]byte{digest(config): config, digest(image.layer): image.layer}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.Requests.Add(1)
 		w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")

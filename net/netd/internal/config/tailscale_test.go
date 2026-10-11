@@ -9,6 +9,7 @@ import (
 )
 
 func TestTailscaleFlagsExactlyWhenDeclared(t *testing.T) {
+	t.Parallel()
 	p, err := policy.LoadReader("test.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}]}`))
 	if err != nil {
 		t.Fatal(err)
@@ -33,4 +34,5 @@ func TestTailscaleFlagsExactlyWhenDeclared(t *testing.T) {
 	if err := ValidateTailscale(cfg, p); err == nil {
 		t.Fatal("missing mux parent accepted")
 	}
+
 }

@@ -469,6 +469,14 @@ on macOS) and pass its absolute path through `SILO_RUN_ROOT` to silod, the CLI
 and the in-process SDK. They can run alongside the developer's daemon and across
 packages without serialization.
 
+Independent unit tests run in parallel; tests with process-wide logging or
+environment changes remain serial. OCI fixtures cache image bytes by rootfs
+path and sorted extra-file contents while keeping each registry server and CA
+private. Rootfs inputs must remain unchanged while reused in the same test
+process. Shutdown episode tests run one repetition per acquisition mode and five
+recoveries by default; set `SILO_TEST_STRESS=1` for 12 repetitions per mode and
+100 recoveries.
+
 Unit/domain tests cover grants, authorization, grammar and quotas. Real local
 integration uses files/rotation, public SDK runtime validation/inventory,
 local HTTP OAuth protocol/cancellation, and SSH channel command dispatch below

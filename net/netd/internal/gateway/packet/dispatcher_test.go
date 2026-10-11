@@ -26,6 +26,7 @@ func (h *recordingTCPHandler) HandleTCP(_ context.Context, inbound net.Conn, _ h
 }
 
 func TestTCPDispatcherSelectsProtocolOnSharedPort(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		payload  []byte
@@ -79,4 +80,5 @@ func TestTCPDispatcherSelectsProtocolOnSharedPort(t *testing.T) {
 			}
 		})
 	}
+
 }

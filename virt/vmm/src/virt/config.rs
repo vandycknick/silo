@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::virt::error::VirtError;
 
@@ -230,6 +231,18 @@ impl VmConfig {
     #[cfg(feature = "mock-backend")]
     pub fn mock(&self) -> &MockOptions {
         &self.mock
+    }
+
+    pub(crate) fn park_timeout(&self) -> Duration {
+        #[cfg(feature = "mock-backend")]
+        if let Some(path) = self.mock().scenario.as_deref() {
+            if let Ok(scenario) = test_utils::Scenario::load(path) {
+                if let Some(timeout_ms) = scenario.forward.park_timeout_ms {
+                    return Duration::from_millis(timeout_ms);
+                }
+            }
+        }
+        crate::forward::inbound::PARK_TIMEOUT
     }
 
     /// Set the mock scenario path on an already-built config (used when the

@@ -13,6 +13,7 @@ import (
 )
 
 func TestTCPForwarderKeepsIPv4AndIPv6WildcardListenersIndependent(t *testing.T) {
+	t.Parallel()
 	networkStack := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
@@ -47,6 +48,7 @@ func TestTCPForwarderKeepsIPv4AndIPv6WildcardListenersIndependent(t *testing.T) 
 		t.Fatal(err)
 	}
 	assertDialFails(t, "tcp6", fmt.Sprintf("[::1]:%d", port))
+
 }
 
 func freeDualStackPort(t *testing.T) int {

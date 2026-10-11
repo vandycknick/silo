@@ -667,9 +667,10 @@ async fn unsupported_agent_closes_forward_without_changing_readiness() {
 }
 
 #[tokio::test]
-async fn pending_forward_parking_is_bounded_and_expires_after_thirty_seconds() {
+async fn pending_forward_parking_is_bounded_and_expires_after_park_timeout() {
     let mut scenario = Scenario::default();
-    scenario.agent.ready_delay_ms = Some(40_000);
+    scenario.forward.park_timeout_ms = Some(2000);
+    scenario.agent.ready_delay_ms = Some(10_000);
     let env = test_env("forward-parking-limit", &scenario).await;
     let machine = create_machine(&env, "integration-forward-parking-limit").await;
     let listen = env._temp.path().join("parking-limit.sock");
@@ -691,9 +692,9 @@ async fn pending_forward_parking_is_bounded_and_expires_after_thirty_seconds() {
     assert_closed_without_bytes(&mut overflow).await;
 
     let started = std::time::Instant::now();
-    assert_closed_without_bytes_within(&mut parked[0], Duration::from_secs(35)).await;
-    assert!(started.elapsed() >= Duration::from_secs(27));
-    assert!(started.elapsed() <= Duration::from_secs(35));
+    assert_closed_without_bytes_within(&mut parked[0], Duration::from_secs(5)).await;
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+    assert!(started.elapsed() <= Duration::from_secs(5));
 
     machine.stop().await.expect("stop machine");
     machine.remove().await.expect("remove machine");
@@ -907,11 +908,52 @@ async fn outbound_agent_restart_reopens_listener_and_unknown_token_is_rejected()
     )
     .await;
     start_ready(&machine).await;
+    let initial_instance = match machine
+        .monitor_status()
+        .await
+        .expect("initial monitor status")
+        .agent
+    {
+        MachineAgentStatus::Enabled(agent) => {
+            agent.identity.expect("initial agent identity").instance_id
+        }
+        MachineAgentStatus::Disabled => panic!("mock guest agent must be enabled"),
+    };
 
     let listen = machine_tcp_bound(&machine).await;
     let mut first = connect_tcp_eventually(listen).await;
     assert_echo(&mut first, b"before-restart").await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let inspected = machine.inspect().await.expect("inspect restarted agent");
+            let status = machine
+                .monitor_status()
+                .await
+                .expect("restarted monitor status");
+            let restarted = match status.agent {
+                MachineAgentStatus::Enabled(agent) => agent
+                    .identity
+                    .is_some_and(|identity| identity.instance_id != initial_instance),
+                MachineAgentStatus::Disabled => false,
+            };
+            let forwards = machine
+                .list_forwards()
+                .await
+                .expect("list restarted forwards");
+            if inspected.status.ready()
+                && restarted
+                && !forwards.is_empty()
+                && forwards
+                    .iter()
+                    .all(|forward| forward.state == MachineForwardState::Active)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("agent restart must restore the outbound listener");
     let listen = machine_tcp_bound(&machine).await;
     let mut second = connect_tcp_eventually(listen).await;
     assert_echo(&mut second, b"after-restart").await;
@@ -1043,7 +1085,7 @@ async fn session_forward_lifecycle_is_the_response_stream_and_port_zero_sessions
     assert_ne!(first_bound, second_bound);
     drop(second);
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let mut client = TcpStream::connect(first_bound)
         .await
         .expect("silent session remains alive");
