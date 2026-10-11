@@ -125,6 +125,7 @@ func removalDispatch(t *testing.T, ctx context.Context, s *service.Service, call
 }
 
 func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "removal-decisions", "user:7")
@@ -211,6 +212,7 @@ func TestRemovalOpenSSHNativeDecisions(t *testing.T) {
 }
 
 func TestRemovalOpenSSHNativePreflightAndIdentity(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "removal-preflight", "user:7")
@@ -280,6 +282,7 @@ func TestRemovalOpenSSHNativePreflightAndIdentity(t *testing.T) {
 }
 
 func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "removal-pin", "user:7")
@@ -333,6 +336,7 @@ func TestRemovalOpenSSHNativePinnedID(t *testing.T) {
 }
 
 func TestRemovalOpenSSHNativePTY(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "removal-pty", "user:7")

@@ -48,6 +48,7 @@ func TestRealMarkerFailureStillDeniesSynchronousMutations(t *testing.T) {
 }
 
 func TestActualSDKCreateInterruptedByMemoryGateWhenMarkerWriteFails(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	// The real daemon must inherit the registry's ephemeral CA at startup.
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)

@@ -7,9 +7,11 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestNativeCreateProvisionUserParser(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "guest-user-parser", "user:7")

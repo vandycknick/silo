@@ -167,6 +167,7 @@ func TestCLIHelpWithoutNativeBridge(t *testing.T) {
 }
 
 func TestCLINativeGeneratedResourcesAndOpenSSHExit(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "cli-ux", "user:7")

@@ -6,9 +6,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestOpenSSHSpinnerUsesActualImagePullAndClearsBeforePrompt(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "spinner", "user:7")

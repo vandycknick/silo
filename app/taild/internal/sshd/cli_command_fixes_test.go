@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestCLIYesFalseOpenSSHNative(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "yes-parser", "user:7")
@@ -54,6 +56,7 @@ func TestCLIYesFalseOpenSSHNative(t *testing.T) {
 }
 
 func TestCLILogDefaultsActualSerialFile(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "logs-default", "user:7")

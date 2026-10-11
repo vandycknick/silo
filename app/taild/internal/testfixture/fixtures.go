@@ -19,6 +19,18 @@ func ControlEndpoint(t *testing.T) string {
 	return filepath.Join(tmp, fmt.Sprintf("silo-%d", os.Getuid()), "silod", "control.sock")
 }
 
+// TempDir is t.TempDir spelled canonically. Production configuration paths
+// are canonical (bootstrap rejects anything else) and document stores walk
+// them with O_NOFOLLOW, while macOS temp roots sit behind /tmp and /var links.
+func TempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // Unavailable permits optional developer fixtures but never required CI skips.
 func Unavailable(t *testing.T, reason string) {
 	t.Helper()

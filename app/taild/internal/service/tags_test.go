@@ -12,6 +12,7 @@ import (
 )
 
 func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	// Install fixture TLS trust before the real daemon inherits its environment.
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)

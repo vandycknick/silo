@@ -24,9 +24,9 @@ import (
 func Config(t *testing.T, registry *testfixture.Registry) config.Config {
 	t.Helper()
 	c := testfixture.Config()
-	c.Home = t.TempDir()
-	c.TemplatesDir = t.TempDir()
-	c.PoliciesDir = t.TempDir()
+	c.Home = testfixture.TempDir(t)
+	c.TemplatesDir = testfixture.TempDir(t)
+	c.PoliciesDir = testfixture.TempDir(t)
 	c.Components = testfixture.Components(testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true))
 	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 256 << 20, Disk: 1 << 30}
 	if registry != nil {

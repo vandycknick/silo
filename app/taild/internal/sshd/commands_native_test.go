@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestActualSDKCRLFCommandRemovalConfirmation(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "crlf-native", "user:7")
@@ -47,6 +49,7 @@ func TestActualSDKCRLFCommandRemovalConfirmation(t *testing.T) {
 }
 
 func TestNativeCreateRequiresImageAndHonorsTemplateOverrides(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "image-admission", "user:7")

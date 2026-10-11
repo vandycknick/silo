@@ -12,9 +12,11 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/state"
+	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestRemovalOpenSSHLocalTailscaleAndStoppedShow(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
 	s, caller, registry := nativeService(t, "local-removal", "user:7")

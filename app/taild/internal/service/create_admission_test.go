@@ -69,6 +69,7 @@ func TestCreateAdmissionFinalizerWithActualHome(t *testing.T) {
 }
 
 func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s, sdk := actualNativeService(t)
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}

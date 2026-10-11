@@ -102,7 +102,7 @@ func TestForwardRemoteDocumentsAuthorityThroughRPC(t *testing.T) {
 	s := actualService(t)
 	ctx := t.Context()
 	c := domainCaller(s, "user:1")
-	s.Config.PoliciesDir = t.TempDir()
+	s.Config.PoliciesDir = testfixture.TempDir(t)
 	// Free-standing documents are valid without enrollment or a deployment scope.
 	for _, verb := range []string{"validate", "create", "show"} {
 		docs, err := s.Documents(ctx, c, "policy", verb, "web", "", forwardWebPolicy)
@@ -253,7 +253,7 @@ func TestForwardCreateRequiresTailscaleBeforeWorkThroughRPC(t *testing.T) {
 	ctx := t.Context()
 	c := domainCaller(s, "user:1")
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
-	s.Config.PoliciesDir = t.TempDir()
+	s.Config.PoliciesDir = testfixture.TempDir(t)
 	for name, raw := range map[string]string{"web": forwardWebPolicy, "plain": `settings { default_action = "allow" }`} {
 		if _, err := s.Documents(ctx, c, "policy", "create", name, "", raw); err != nil {
 			t.Fatal(err)
@@ -306,6 +306,7 @@ func TestForwardCreateRequiresTailscaleBeforeWorkThroughRPC(t *testing.T) {
 }
 
 func TestForwardCreateRetainsBoundPolicyThroughRPC(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	ctx := t.Context()
@@ -387,6 +388,7 @@ func TestForwardRemoteReservedMetadataThroughRPC(t *testing.T) {
 }
 
 func TestSetPolicyRetainsManagedNodeThroughRPC(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	ctx := t.Context()

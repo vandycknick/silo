@@ -76,8 +76,8 @@ func TestPrincipalDocumentsRealFilesTiersAndReload(t *testing.T) {
 	s := actualService(t)
 	ctx := context.Background()
 	one, two := domainCaller(s, "user:1"), domainCaller(s, "user:2")
-	s.Config.TemplatesDir = t.TempDir()
-	s.Config.PoliciesDir = t.TempDir()
+	s.Config.TemplatesDir = testfixture.TempDir(t)
+	s.Config.PoliciesDir = testfixture.TempDir(t)
 	operator := filepath.Join(s.Config.TemplatesDir, "dev.yaml")
 	own, _, _ := s.documentPaths("template", "user:1")
 	probe, probeErr := documentDir(own, filepath.Join(s.Config.Home, "taild"), true)
@@ -360,7 +360,7 @@ rule "plugin-rule" {
 		t.Fatal("accepted injected authority as remote policy")
 	}
 	// Omitting --tailscale cannot bypass remote authority checks on operator files.
-	s.Config.PoliciesDir = t.TempDir()
+	s.Config.PoliciesDir = testfixture.TempDir(t)
 	if e = os.WriteFile(filepath.Join(s.Config.PoliciesDir, "evil.hcl"), []byte(hcl), 0644); e != nil {
 		t.Fatal(e)
 	}
@@ -370,6 +370,7 @@ rule "plugin-rule" {
 }
 
 func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
@@ -480,6 +481,7 @@ func TestShippedOperatorExamplesThroughRPC(t *testing.T) {
 }
 
 func TestTemplateCreationOverridesAndStampedAuthority(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	// Install fixture TLS trust before the real daemon inherits its environment.
 	fixture := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
@@ -556,7 +558,7 @@ credential "aws_credential" "prod" {
 func TestPolicyDocumentOwnershipAndOperatorPrecedenceThroughRPC(t *testing.T) {
 	s := actualService(t)
 	ctx := context.Background()
-	s.Config.PoliciesDir = t.TempDir()
+	s.Config.PoliciesDir = testfixture.TempDir(t)
 	if err := os.WriteFile(filepath.Join(s.Config.PoliciesDir, "egress.hcl"), []byte(`settings { default_action = "deny" }`), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -588,6 +590,7 @@ func TestPolicyDocumentOwnershipAndOperatorPrecedenceThroughRPC(t *testing.T) {
 }
 
 func TestDocumentsPolicyBoundVMsThroughRPC(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	for _, running := range []bool{false, true} {
 		name := "stopped"
 		if running {

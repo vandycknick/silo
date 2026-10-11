@@ -84,6 +84,7 @@ func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 	}
 }
 func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
@@ -209,6 +210,7 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 }
 
 func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
@@ -273,6 +275,7 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 }
 
 func TestCreateCountRevokedDuringActualPull(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
@@ -311,6 +314,7 @@ func TestCreateCountRevokedDuringActualPull(t *testing.T) {
 }
 
 func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
 	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}

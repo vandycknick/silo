@@ -13,6 +13,7 @@ import (
 )
 
 func TestActualManagementAdapters(t *testing.T) {
+	testfixture.RequireRegistryTrust(t)
 	root := testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
 	registry := testfixture.OCIRegistry(t, "")
 	c := testfixture.Config()

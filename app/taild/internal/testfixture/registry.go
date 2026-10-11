@@ -53,6 +53,17 @@ type GuestFile struct {
 	Data []byte
 }
 
+// RequireRegistryTrust skips a test whose real silod must pull from this
+// fixture. Trust in the ephemeral CA reaches silod only through SSL_CERT_FILE,
+// which its rustls platform verifier honors on Linux; on macOS it consults
+// the keychain alone, so the pull fails TLS verification.
+func RequireRegistryTrust(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("silod verifies registries against the macOS keychain only; the fixture CA reaches it through SSL_CERT_FILE")
+	}
+}
+
 func OCIRegistry(t *testing.T, rootfs string, extra ...GuestFile) *Registry {
 	t.Helper()
 	var archive bytes.Buffer
