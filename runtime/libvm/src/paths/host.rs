@@ -152,15 +152,11 @@ mod tests {
     }
 
     #[test]
-    fn control_sockets_live_in_home_and_generated_state_in_tmp() {
+    fn control_sockets_live_in_home() {
         let paths = HostPaths::new("/Users/me/.silo", "/Users/me/.config/silo");
         assert_eq!(
             paths.control_socket_dir(),
             std::path::PathBuf::from("/Users/me/.silo/run")
-        );
-        assert_eq!(
-            HostPaths::run_root(),
-            std::path::PathBuf::from(format!("/tmp/silo-{}", nix::unistd::geteuid()))
         );
     }
 }

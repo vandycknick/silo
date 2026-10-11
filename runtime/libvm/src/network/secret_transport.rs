@@ -363,7 +363,8 @@ mod tests {
     #[tokio::test]
     async fn real_closed_reader_reports_epipe() {
         let (reader, writer) = pipe();
-        let mut child = Command::new("/bin/true").stdin(reader).spawn().unwrap();
+        // macOS ships true(1) only in /usr/bin; let PATH resolve it on both hosts.
+        let mut child = Command::new("true").stdin(reader).spawn().unwrap();
         assert!(child.wait().unwrap().success());
         let error = write_frame(
             writer,

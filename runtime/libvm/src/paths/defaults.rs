@@ -27,10 +27,17 @@ pub(crate) fn resolve_default_home() -> Result<PathBuf, LibVmError> {
 
 /// The run root for generated sockets, pidfiles and locks. It is fixed and
 /// independent of the home directory so Unix socket paths stay well inside
-/// `sun_path` no matter how long the home path is.
+/// `sun_path` no matter how long the home path is. macOS spells it through
+/// `/private/tmp` because `/tmp` is a symlink there, and published endpoints
+/// must be canonical paths.
 pub(crate) fn default_run_root() -> PathBuf {
-    PathBuf::from(format!("/tmp/silo-{}", geteuid().as_raw()))
+    PathBuf::from(format!("{RUN_ROOT_PARENT}/silo-{}", geteuid().as_raw()))
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) const RUN_ROOT_PARENT: &str = "/private/tmp";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const RUN_ROOT_PARENT: &str = "/tmp";
 
 pub(crate) fn ensure_run_root(path: &Path) -> Result<(), LibVmError> {
     let parent = path
@@ -111,7 +118,7 @@ mod tests {
     use nix::unistd::geteuid;
 
     use crate::paths::defaults::{
-        absolute_path, default_run_root, ensure_run_root, resolve_default_home,
+        absolute_path, default_run_root, ensure_run_root, resolve_default_home, RUN_ROOT_PARENT,
     };
     use crate::LibVmError;
 
@@ -221,7 +228,9 @@ mod tests {
         );
         assert_eq!(
             default_run_root(),
-            PathBuf::from(format!("/tmp/silo-{}", geteuid().as_raw()))
+            std::fs::canonicalize(RUN_ROOT_PARENT)
+                .expect("canonical run root parent")
+                .join(format!("silo-{}", geteuid().as_raw()))
         );
     }
 

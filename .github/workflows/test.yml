@@ -28,7 +28,6 @@ jobs:
     outputs:
       node: ${{ steps.result.outputs.node }}
       go: ${{ steps.result.outputs.go }}
-      netd: ${{ steps.result.outputs.netd }}
       taild: ${{ steps.result.outputs.taild }}
     steps:
       - name: Check out repository
@@ -36,7 +35,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Detect SDK and netd changes
+      - name: Detect SDK and taild changes
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
@@ -69,19 +68,10 @@ jobs:
               - 'specs/**'
               - 'sdk/go/**'
               - 'xtask/**'
-            netd:
-              - '.github/workflows/test.yml'
-              - 'net/netd/**'
-              - 'common/policy/**'
-              - 'flake.lock'
-              - 'flake.nix'
-              - 'nix/**'
             taild:
               - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
-              - '.github/workflows/release-tip.yml'
               - 'packaging/silo-taild/**'
-              - 'PACKAGING.md'
               - 'nix/**'
               - 'app/taild/**'
               - 'app/silod/**'
@@ -109,24 +99,24 @@ jobs:
         env:
           NODE_CHANGED: ${{ steps.filter.outputs.node }}
           GO_CHANGED: ${{ steps.filter.outputs.go }}
-          NETD_CHANGED: ${{ steps.filter.outputs.netd }}
           TAILD_CHANGED: ${{ steps.filter.outputs.taild }}
         run: |
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            printf 'node=true\ngo=true\nnetd=true\ntaild=true\n' >> "$GITHUB_OUTPUT"
+            printf 'node=true\ngo=true\ntaild=true\n' >> "$GITHUB_OUTPUT"
           else
-            printf 'node=%s\ngo=%s\nnetd=%s\ntaild=%s\n' "$NODE_CHANGED" "$GO_CHANGED" "$NETD_CHANGED" "$TAILD_CHANGED" >> "$GITHUB_OUTPUT"
+            printf 'node=%s\ngo=%s\ntaild=%s\n' "$NODE_CHANGED" "$GO_CHANGED" "$TAILD_CHANGED" >> "$GITHUB_OUTPUT"
           fi
 
-  # Clippy and Cargo tests stay per-OS: the workspace has platform-only
-  # crates (virt/vz on macOS, libkrun in silo-vmm on both hosts) that a single lane
-  # would silently stop covering. Platform-independent style and
-  # consistency checks run once, on the Linux cell.
-  checks:
-    name: Checks (${{ matrix.platform }})
+  # Clippy, Cargo, netd and taild tests stay per-OS: the workspace has
+  # platform-only crates (virt/vz on macOS, libkrun in silo-vmm on both hosts)
+  # and Go build tags that a single lane would silently stop covering.
+  # Platform-independent style and consistency checks run once, on the Linux
+  # cell. Portable packaging is qualified by release-tip.yml, not here.
+  core:
+    name: Core (${{ matrix.platform }})
     needs: changes
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -134,9 +124,13 @@ jobs:
           - platform: linux
             runner: ubuntu-24.04
             primary: true
+            target: linux-amd64-gnu
+            ffi_library: libsilo_go_ffi.so
           - platform: macos
             runner: macos-26
             primary: false
+            target: darwin-arm64
+            ffi_library: libsilo_go_ffi.dylib
 
     steps:
       - name: Check out repository
@@ -163,7 +157,12 @@ jobs:
 
       - name: Check Go formatting
         if: ${{ matrix.primary }}
-        run: test -z "$(nix develop .#ci --command gofmt -l sdk/go)"
+        run: |
+          files="$(nix develop .#ci --command gofmt -l sdk/go app/taild)"
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
 
       - name: Check versions
         if: ${{ matrix.primary }}
@@ -174,8 +173,45 @@ jobs:
 
       # Cargo integration discovery includes tests/krun_worker.rs on both hosts.
       # These real-process boundary tests need no successful hypervisor admission.
+      # make test also race-tests net/netd; make fmt gofmt-checks it.
       - name: Run host-aware tests, including the private silo-vmm worker boundary
         run: nix develop .#ci --command make test
+
+      - name: Vet netd
+        env:
+          GOTOOLCHAIN: auto
+          GOFLAGS: -mod=readonly
+        run: nix develop .#ci --command go -C net/netd vet ./...
+
+      # Guest components cross-compile with cargo-zigbuild, which only the
+      # default shell carries. The debug stage reuses the artifacts make test
+      # already built; any complete stage satisfies the taild fixtures.
+      - name: Build and stage the integrated development product
+        if: needs.changes.outputs.taild == 'true'
+        run: nix develop --command make stage
+
+      - name: Vet taild
+        if: needs.changes.outputs.taild == 'true'
+        env:
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: auto
+          GOFLAGS: -mod=readonly
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ matrix.ffi_library }}
+        run: nix develop .#ci --command go -C app/taild vet ./...
+
+      - name: Test taild with actual bridge and race detector
+        if: needs.changes.outputs.taild == 'true'
+        # VM-fixture tests retain their explicit host/rootfs opt-in.
+        env:
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: auto
+          GOFLAGS: -mod=readonly
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ matrix.ffi_library }}
+          SILO_TEST_RUNTIME_ROOT: ${{ github.workspace }}/target/silo-runtime/${{ matrix.target }}/debug
+          SILO_RUNTIME_DIR: ${{ github.workspace }}/target/silo-runtime/${{ matrix.target }}/debug
+          SILO_TEST_BIN_DIR: ${{ github.workspace }}/target/debug
+          SILO_TEST_CLI: ${{ github.workspace }}/target/debug/silo
+        run: nix develop .#ci --command go -C app/taild test -p 1 -race -count=1 -timeout=4m -v ./...
 
   node-sdk:
     name: Node SDK (${{ matrix.platform }})
@@ -233,9 +269,9 @@ jobs:
         include:
           # Every cell builds the native bridge and runs the full suite;
           # platform-independent checks run only on the primary cell.
-          # saves_cache marks the cells with no Checks counterpart on the same
+          # saves_cache marks the cells with no Core counterpart on the same
           # architecture, which therefore have to populate the shared cache
-          # themselves instead of restoring one Checks already wrote.
+          # themselves instead of restoring one Core already wrote.
           - platform: linux-amd64
             runner: ubuntu-24.04
             primary: true
@@ -258,7 +294,7 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      # Checks builds the whole workspace in the same dev profile, so its cache
+      # Core builds the whole workspace in the same dev profile, so its cache
       # is a superset of what the bridge needs. Share it rather than keeping a
       # second copy, and let only one job per architecture write it.
       - name: Cache Rust build outputs
@@ -327,164 +363,14 @@ jobs:
           nix develop "$GITHUB_WORKSPACE#ci" --command go mod tidy
           nix develop "$GITHUB_WORKSPACE#ci" --command go build ./...
 
-  netd:
-    name: netd (${{ matrix.platform }})
-    needs: changes
-    if: needs.changes.outputs.netd == 'true'
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
-    env:
-      GOTOOLCHAIN: auto
-      GOFLAGS: -mod=readonly
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-amd64
-            runner: ubuntu-24.04
-          - platform: macos-arm64
-            runner: macos-26
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-
-      - name: Verify netd toolchain
-        run: nix develop .#ci --command go -C net/netd version
-
-      - name: Check netd formatting
-        run: |
-          files="$(nix develop .#ci --command gofmt -l net/netd)"
-          if [ -n "$files" ]; then
-            printf '%s\n' "$files"
-            exit 1
-          fi
-
-      - name: Vet netd
-        run: nix develop .#ci --command go -C net/netd vet ./...
-
-      - name: Test netd with race detector
-        run: nix develop .#ci --command go -C net/netd test -race -count=1 -timeout=4m ./...
-
-  taild:
-    name: taild (${{ matrix.platform }})
-    needs: changes
-    if: needs.changes.outputs.taild == 'true'
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-amd64-gnu
-            runner: ubuntu-24.04
-            library: libsilo_go_ffi.so
-          - platform: darwin-arm64
-            runner: macos-26
-            library: libsilo_go_ffi.dylib
-    env:
-      CGO_ENABLED: '1'
-      GOTOOLCHAIN: auto
-      GOFLAGS: -mod=readonly
-      SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ matrix.library }}
-      SILO_TEST_RUNTIME_ROOT: ${{ github.workspace }}/target/silo-runtime/${{ matrix.platform }}/release
-      SILO_RUNTIME_DIR: ${{ github.workspace }}/target/silo-runtime/${{ matrix.platform }}/release
-      SILO_TEST_BIN_DIR: ${{ github.workspace }}/target/debug
-      SILO_TEST_CLI: ${{ github.workspace }}/target/debug/silo
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-        with:
-          cmd-format: nix develop .#ci --command {0}
-          workspaces: . -> target
-          prefix-key: test
-          shared-key: workspace
-          cache-bin: false
-          save-if: false
-      - name: Build integrated development product and release runtime fixtures
-        timeout-minutes: 25
-        run: |
-          nix develop --command make build
-          nix develop --command make stage PROFILE=release
-      - name: Check taild formatting
-        run: |
-          files="$(nix develop .#ci --command gofmt -l app/taild)"
-          if [ -n "$files" ]; then
-            printf '%s\n' "$files"
-            exit 1
-          fi
-      - name: Vet taild
-        run: nix develop .#ci --command go -C app/taild vet ./...
-      - name: Test taild with actual bridge and race detector
-        # VM-fixture tests retain their explicit host/rootfs opt-in. The package
-        # lane separately requires real helper startup and native bridge loading.
-        run: nix develop .#ci --command go -C app/taild test -p 1 -race -count=1 -timeout=4m -v ./...
-
-  taild-package:
-    name: taild package (${{ matrix.platform }})
-    needs: changes
-    if: needs.changes.outputs.taild == 'true'
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-amd64-gnu
-            runner: ubuntu-24.04
-          - platform: linux-arm64-gnu
-            runner: ubuntu-24.04-arm
-          - platform: darwin-arm64
-            runner: macos-26
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      - name: Build integrated native product and portable package
-        run: nix develop .#release --command make archive
-      - name: Build native management and exact-ID acceptance driver
-        run: nix develop .#release --command go -C app/taild build -o "$GITHUB_WORKSPACE/target/artifact-driver" ../../packaging/silo-taild/kvm.go
-      - name: Exercise packaged executable without development overrides
-        env:
-          PLATFORM: ${{ matrix.platform }}
-          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
-        run: |
-          version="$(tr -d '\n' < VERSION)"
-          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "target/packages/$version/$PLATFORM/silo-$version-$PLATFORM.tar.zst" "target/packages/$version/$PLATFORM/silo-runtime-$version-$PLATFORM.tar.zst"
-      - name: Build and admit actual signed native app
-        if: ${{ matrix.platform == 'darwin-arm64' }}
-        env:
-          SILO_ARTIFACT_DRIVER: ${{ github.workspace }}/target/artifact-driver
-        run: |
-          nix develop .#release --command make app
-          version="$(tr -d '\n' < VERSION)"
-          output="target/packages/$version/darwin-arm64"
-          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "$output/silo-$version-darwin-arm64.tar.zst" "$output/silo-runtime-$version-darwin-arm64.tar.zst" --app "$output/Silo.app" --audit-only
-
   summary:
     name: Summary
     if: always()
     needs:
       - changes
-      - checks
+      - core
       - node-sdk
       - go-sdk
-      - netd
-      - taild
-      - taild-package
     runs-on: ubuntu-24.04
     steps:
       - name: Require successful checks

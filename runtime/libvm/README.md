@@ -343,7 +343,8 @@ A local runtime has two roots (see
   `SILO_HOME` overrides it and must be absolute. Pass an explicit home with
   `RuntimeConfig::local(home)` or `RuntimeBuilder::home(..)`, and read the
   resolved value back with `Runtime::local_home()`.
-- The **run root** is always `/tmp/silo-<effective-uid>` and holds generated
+- The **run root** is always `/tmp/silo-<effective-uid>` (spelled canonically as
+  `/private/tmp/silo-<effective-uid>` on macOS) and holds generated
   sockets, pidfiles, and locks. A fixed short root keeps Unix socket paths under
   the `sun_path` limit regardless of the home path. Its final directory must be
   a non-symlink directory owned by the effective user with exact mode `0700`.

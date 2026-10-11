@@ -96,7 +96,7 @@ omits negative artifact mutations. Neither mode implies VM boot, live tailnet
 authentication or host reboot qualification.
 
 Hosted Go lanes run the native bridge/control tests; VM-fixture tests retain
-their explicit disk/rootfs and execution opt-ins. The separate package lanes
+their explicit disk/rootfs and execution opt-ins. The release-tip package lanes
 require actual helper startup and bridge mapping. Neither substitutes for the
 native VM, live-tailnet or shutdown qualification scenarios.
 

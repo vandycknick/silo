@@ -173,7 +173,7 @@ func TestManagedWorkerIsAdoptedAndExitsOnOwnerEOF(t *testing.T) {
 					t.Fatal("worker did not report secrets failure")
 				}
 				if mode == "tailscale-oauth" || mode == "tailscale-wif" {
-					if !strings.Contains(report.Error, "literal tskey-auth-") || strings.Contains(report.Error, "private-key-sentinel") {
+					if !strings.Contains(report.Error, "invalid registration credential") || strings.Contains(report.Error, "private-key-sentinel") {
 						t.Fatal("credential rejection was missing or leaked material")
 					}
 					entries, err := os.ReadDir(filepath.Join(root, "tailscale"))

@@ -167,8 +167,10 @@ func TestForwardActualGvisorGuestDialAndFallbackAdmission(t *testing.T) {
 		if i < 256 {
 			select {
 			case <-accepted:
+			case e := <-events:
+				t.Fatalf("guest connection %d denied: %+v", i, e)
 			case <-ctx.Done():
-				t.Fatal("guest admission timed out")
+				t.Fatalf("guest admission %d timed out", i)
 			}
 		} else {
 			client.SetReadDeadline(time.Now().Add(time.Second))

@@ -194,7 +194,7 @@ pub fn test_integration(
 
     let mut go = Command::new("go");
     go.current_dir(workspace_root.join("net/netd"))
-        .args(["test", "./..."]);
+        .args(["test", "-race", "./..."]);
     command::run(go)
 }
 

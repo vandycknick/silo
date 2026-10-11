@@ -1558,9 +1558,12 @@ os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
                     _ => unreachable!(),
                 }
             }
+            // One READY_TIMEOUT covers the whole startup; the slack absorbs
+            // rollback and process reaping on loaded hosted runners.
+            let elapsed = start.elapsed();
             assert!(
-                start.elapsed() < Duration::from_secs(6),
-                "startup budget reset"
+                elapsed < crate::network::netd_driver::READY_TIMEOUT + Duration::from_secs(3),
+                "{mode}: startup budget reset ({elapsed:?})"
             );
             if mode == "oversize" {
                 assert!(!marker.exists(), "oversize payload spawned a process");

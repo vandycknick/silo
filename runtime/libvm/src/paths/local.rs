@@ -487,7 +487,7 @@ mod tests {
         let uid = nix::unistd::geteuid().as_raw();
         let roots = LocalRoots::with_roots(
             "/Users/a-rather-long-account-name/.silo",
-            format!("/tmp/silo-{uid}"),
+            format!("{}/silo-{uid}", crate::paths::defaults::RUN_ROOT_PARENT),
         );
         let paths = LocalPaths::from_roots(roots);
         let machine_socket = paths.machine(MachineId::new()).vmm_socket_path();

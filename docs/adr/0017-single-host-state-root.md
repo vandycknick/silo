@@ -35,7 +35,9 @@ All persistent Silo state lives under one directory, the **Silo home**:
 
 Generated runtime state (per-machine and per-network sockets, pidfiles, locks)
 lives under a fixed **run root**, `/tmp/silo-<euid>`, created with mode 0700 and
-checked for ownership and against symlinks, exactly as before.
+checked for ownership and against symlinks, exactly as before. macOS spells it
+`/private/tmp/silo-<euid>`, the canonical form of its symlinked `/tmp`, so
+published endpoints such as the silod control socket are canonical paths.
 
 Configuration is the one exception to the single root. The config directory is
 `$XDG_CONFIG_HOME/silo` (default `~/.config/silo`) and holds `config.yaml`,
