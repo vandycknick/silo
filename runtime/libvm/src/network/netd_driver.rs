@@ -1443,6 +1443,15 @@ netd log: /tmp/silo/netd.log";
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
 
+        // macOS /usr/bin/python3 is an xcrun shim that runs the interpreter as
+        // its own child. Rollback kills only the direct child, so the fixture
+        // must exec the real interpreter to be the process it claims to be.
+        let interpreter = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", "import sys; print(sys.executable, end='')"])
+            .output()
+            .unwrap();
+        assert!(interpreter.status.success());
+        let interpreter = std::path::PathBuf::from(String::from_utf8(interpreter.stdout).unwrap());
         for mode in ["reject", "epipe", "stall", "cancel", "oversize"] {
             let temp = tempfile::Builder::new()
                 .prefix("s2-")
@@ -1488,7 +1497,7 @@ netd log: /tmp/silo/netd.log";
             let marker = temp.path().join("spawned");
             let received = temp.path().join("received");
             let script = format!(
-                r#"#!/usr/bin/python3
+                r#"#!{interpreter}
 import os,sys,time,json,fcntl
 a=sys.argv[1:]
 def flag(name): return a[a.index(name)+1]
@@ -1520,6 +1529,7 @@ open({received:?},'wb').write(data)
 report={{'pid':os.getpid(),'vm_id':flag('--vm-id'),'run_id':flag('--run-id'),'network_id':flag('--network-id'),'ready':False,'error':'transport-only rejection'}}
 os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
 "#,
+                interpreter = interpreter.display(),
                 marker = marker.to_str().unwrap(),
                 received = received.to_str().unwrap()
             );
@@ -1558,11 +1568,9 @@ os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
                     _ => unreachable!(),
                 }
             }
-            // One READY_TIMEOUT covers the whole startup; the slack absorbs
-            // rollback and process reaping on loaded hosted runners.
             let elapsed = start.elapsed();
             assert!(
-                elapsed < crate::network::netd_driver::READY_TIMEOUT + Duration::from_secs(3),
+                elapsed < Duration::from_secs(6),
                 "{mode}: startup budget reset ({elapsed:?})"
             );
             if mode == "oversize" {
