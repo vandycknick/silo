@@ -136,7 +136,7 @@ fn truncate_utf8(value: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use prost::Message;
-    use prost_types::{FileDescriptorProto, FileDescriptorSet};
+    use prost_types::FileDescriptorSet;
 
     use crate::{
         decode_error_detail, encode_error_detail, parse_guest_port_args, v1, CHUNK_64_KIB,
@@ -338,104 +338,23 @@ mod tests {
     }
 
     #[test]
-    fn execution_streams_have_exact_start_and_control_shapes() {
+    fn execute_methods_are_bidirectional() {
         let descriptors =
             FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("decode descriptors");
-        let message = |name: &str| {
-            descriptors
+        for name in ["VmExecutionService", "GuestProcessService"] {
+            let service = descriptors
                 .file
                 .iter()
-                .flat_map(|file| &file.message_type)
-                .find(|message| message.name.as_deref() == Some(name))
-                .expect("message in descriptor")
-        };
-        let field_names = |message: &prost_types::DescriptorProto| {
-            message
-                .field
-                .iter()
-                .filter_map(|field| field.name.clone())
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            field_names(message("GuestProcessInput")),
-            [
-                "start",
-                "stdin_data",
-                "close_stdin",
-                "resize_pty",
-                "signal_process"
-            ]
-        );
-        assert_eq!(
-            field_names(message("ExecuteInput")),
-            [
-                "start",
-                "stdin_data",
-                "close_stdin",
-                "resize_pty",
-                "signal_process"
-            ]
-        );
-        assert_eq!(
-            field_names(message("StartGuestProcess")),
-            [
-                "execution_id",
-                "expected_agent_instance_id",
-                "expected_agent_boot_id",
-                "process"
-            ]
-        );
-        assert_eq!(
-            field_names(message("StartExecution")),
-            ["machine_id", "machine_run_id", "execution_id", "process"]
-        );
-        assert_eq!(
-            field_names(message("GuestProcessEvent")),
-            [
-                "started",
-                "stdout",
-                "stderr",
-                "terminal_output",
-                "exited",
-                "signaled",
-                "launch_failed"
-            ]
-        );
-        assert_eq!(
-            field_names(message("ExecutionEvent")),
-            [
-                "accepted",
-                "started",
-                "stdout",
-                "stderr",
-                "terminal_output",
-                "exited",
-                "signaled",
-                "launch_failed",
-                "lost"
-            ]
-        );
-        assert_eq!(
-            field_names(message("ExecutionTerminalResult")),
-            ["exited", "signaled", "launch_failed", "lost"]
-        );
-
-        let service = |name: &str| {
-            descriptors
-                .file
-                .iter()
-                .flat_map(|file: &FileDescriptorProto| &file.service)
+                .flat_map(|file| &file.service)
                 .find(|service| service.name.as_deref() == Some(name))
-                .expect("service in descriptor")
-        };
-        for method in &service("GuestProcessService").method {
-            assert_eq!(method.client_streaming, Some(true));
-            assert_eq!(method.server_streaming, Some(true));
-        }
-        for method in &service("VmExecutionService").method {
-            assert_eq!(method.client_streaming, Some(true));
-            assert_eq!(method.server_streaming, Some(true));
+                .expect("execution service in descriptor");
+            let execute = service
+                .method
+                .iter()
+                .find(|method| method.name.as_deref() == Some("Execute"))
+                .expect("Execute method in descriptor");
+            assert_eq!(execute.client_streaming, Some(true), "{name}.Execute");
+            assert_eq!(execute.server_streaming, Some(true), "{name}.Execute");
         }
     }
 

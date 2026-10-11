@@ -42,7 +42,21 @@ The normal health-detection window is up to **60 + 5 seconds**. Failed checks re
 
 The probe sends a local SSH disconnect and joins the connection task after KEX. Cancellation closes its owned transport before another attempt can start. Pin locking is nonblocking; a contended lock is a failed check at the normal cadence. Filesystem syscalls already in progress cannot be canceled, so a timed-out pin job is drained before a replacement attempt. The readiness budget does not promise five-second termination of every OS syscall.
 
-Actual authenticated SSH sessions continue to check the host pin and use certificate authentication. Cached readiness is not a replacement for those session security checks.
+Actual authenticated SSH sessions check the existing immutable host pin and use
+certificate authentication. Cached readiness is not a replacement for those
+session security checks, nor a gate on already-pinned SSH access. `silo shell`,
+libvm `shell`, and taild Shell use SSH over `VmAccessService.OpenSsh` to vsock 22,
+without guest identity/process RPC. They require a Running, non-stopping VM
+generation, the prior pin, a matching server key and an accepted user certificate.
+There is no interactive first-use pinning.
+
+An independently owned listener, such as systemd OpenSSH, can remain usable when
+the guest agent is unavailable. An agent-owned listener cannot survive its owner
+stopping. Initial provisioning and pin establishment still require their normal
+readiness flow; this does not relax the health-probe policy above.
+Use `exec`, `spawn` or `exec_script` for agent RPC execution instead. See the
+[execution guide](../../runtime/libvm/README.md#execution) for API selection and
+local versus caller-supplied terminal ownership.
 
 ## OpenSSH Connection Diagnostics
 
@@ -75,6 +89,26 @@ If the process tree contains `sshd`, `sshd-session`, or `/usr/bin/sshd -D`, that
 ```
 
 `russh` cannot produce `sshd-session` processes. If they are present, OpenSSH handled the session.
+
+SSHD marks login shells with a leading dash in `argv[0]`, such as `-sh`.
+The Silo rescue multicall binary recognizes `-sh`, `-ash` and `-dash`, preserves
+that login name for `$0`, and loads login profiles. An `applet not found: -sh`
+error indicates an older rescue executable in the guest rootfs; updating the
+initramfs alone does not replace that rootfs executable. Rescue qualification
+fixtures must contain the multicall binary from the current build.
+
+## Native Session I/O Lifetime
+
+The native server drains both process output streams through window-aware SSH
+writes before sending exit status, EOF and channel close. Child exit alone is
+not evidence that the final output has reached the SSH queue. Stdout/stderr
+reader completion belongs to the exit waiter, not independent detached threads.
+
+Channel close or connection loss cancels descriptor-readiness and SSH
+flow-control waits. Input EOF only closes input; it does not cancel output.
+PTY master duplicates share nonblocking flags, so both readers and the input
+writer use readiness-aware I/O. This keeps output drain and cancellation correct
+without timer polling or blocking a runtime thread on a PTY write.
 
 ## Forcing The Native Backend (Diagnostic Only)
 
@@ -232,7 +266,11 @@ listening for SSH vsock connections port=22
 native SSH backend is ready
 ```
 
-The native backend owns the Silo shell path. If a shell still shows `sshd-session`, verify that you connected through `silo shell` and not direct network SSH.
+These logs identify the native backend as the owner of vsock 22 for that run.
+The CLI command does not select the SSH server implementation: `silo shell` and
+taild Shell can also reach an agent-managed OpenSSH backend or the validated
+systemd-owned listener. An `sshd-session` process is valid in those cases. Check
+the current listener descriptor and process tree, not the client command name.
 
 ## Isolated Real KVM Qualification
 

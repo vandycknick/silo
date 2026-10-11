@@ -37,16 +37,22 @@ DECLARE_FFI(machine_stop_with);
 DECLARE_FFI(machine_remove);
 DECLARE_FFI(machine_secret);
 DECLARE_FFI(machine_exec);
-DECLARE_FFI(machine_shell);
+DECLARE_FFI(machine_exec_script);
 DECLARE_FFI(machine_spawn);
-DECLARE_FFI(machine_attach);
-DECLARE_FFI(machine_attach_shell);
+DECLARE_FFI(machine_shell);
 DECLARE_FFI(attachment_cancellation_new);
 DECLARE_FFI(attachment_cancellation_cancel);
 DECLARE_FFI(attachment_cancellation_signal);
 DECLARE_FFI(attachment_cancellation_free);
-DECLARE_FFI(machine_attach_cancellable);
-DECLARE_FFI(machine_attach_shell_cancellable);
+DECLARE_FFI(machine_shell_cancellable);
+DECLARE_FFI(ssh_attachment_new);
+DECLARE_FFI(ssh_attachment_write);
+DECLARE_FFI(ssh_attachment_close_stdin);
+DECLARE_FFI(ssh_attachment_read);
+DECLARE_FFI(ssh_attachment_resize);
+DECLARE_FFI(ssh_attachment_signal);
+DECLARE_FFI(ssh_attachment_cancel);
+DECLARE_FFI(ssh_attachment_free);
 DECLARE_FFI(execution_recv);
 DECLARE_FFI(execution_wait);
 DECLARE_FFI(execution_collect);
@@ -139,16 +145,22 @@ char *bridge_load(const char *path, uint32_t expected_abi) {
     LOAD(ffi_machine_remove, "silo_machine_remove");
     LOAD(ffi_machine_secret, "silo_machine_secret");
     LOAD(ffi_machine_exec, "silo_machine_exec");
-    LOAD(ffi_machine_shell, "silo_machine_shell");
+    LOAD(ffi_machine_exec_script, "silo_machine_exec_script");
     LOAD(ffi_machine_spawn, "silo_machine_spawn");
-    LOAD(ffi_machine_attach, "silo_machine_attach");
-    LOAD(ffi_machine_attach_shell, "silo_machine_attach_shell");
+    LOAD(ffi_machine_shell, "silo_machine_shell");
     LOAD(ffi_attachment_cancellation_new, "silo_attachment_cancellation_new");
     LOAD(ffi_attachment_cancellation_cancel, "silo_attachment_cancellation_cancel");
     LOAD(ffi_attachment_cancellation_signal, "silo_attachment_cancellation_signal");
     LOAD(ffi_attachment_cancellation_free, "silo_attachment_cancellation_free");
-    LOAD(ffi_machine_attach_cancellable, "silo_machine_attach_cancellable");
-    LOAD(ffi_machine_attach_shell_cancellable, "silo_machine_attach_shell_cancellable");
+    LOAD(ffi_machine_shell_cancellable, "silo_machine_shell_cancellable");
+    LOAD(ffi_ssh_attachment_new, "silo_ssh_attachment_new");
+    LOAD(ffi_ssh_attachment_write, "silo_ssh_attachment_write");
+    LOAD(ffi_ssh_attachment_close_stdin, "silo_ssh_attachment_close_stdin");
+    LOAD(ffi_ssh_attachment_read, "silo_ssh_attachment_read");
+    LOAD(ffi_ssh_attachment_resize, "silo_ssh_attachment_resize");
+    LOAD(ffi_ssh_attachment_signal, "silo_ssh_attachment_signal");
+    LOAD(ffi_ssh_attachment_cancel, "silo_ssh_attachment_cancel");
+    LOAD(ffi_ssh_attachment_free, "silo_ssh_attachment_free");
     LOAD(ffi_execution_recv, "silo_execution_recv");
     LOAD(ffi_execution_wait, "silo_execution_wait");
     LOAD(ffi_execution_collect, "silo_execution_collect");
@@ -208,16 +220,22 @@ silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t 
 silo_error *bridge_machine_remove(const silo_machine *machine) { return ffi_machine_remove(machine); }
 silo_error *bridge_machine_secret(const silo_machine *machine, const uint8_t *request, size_t request_len) { return ffi_machine_secret(machine, request, request_len); }
 silo_error *bridge_machine_exec(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output) { return ffi_machine_exec(machine, request, request_len, out_output); }
-silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output) { return ffi_machine_shell(machine, request, request_len, out_output); }
+silo_error *bridge_machine_exec_script(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output) { return ffi_machine_exec_script(machine, request, request_len, out_output); }
 silo_error *bridge_machine_spawn(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution **out_session) { return ffi_machine_spawn(machine, request, request_len, out_session); }
-silo_error *bridge_machine_attach(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result) { return ffi_machine_attach(machine, request, request_len, out_result); }
-silo_error *bridge_machine_attach_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_status) { return ffi_machine_attach_shell(machine, request, request_len, out_status); }
+silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_status) { return ffi_machine_shell(machine, request, request_len, out_status); }
 silo_error *bridge_attachment_cancellation_new(AttachmentCancellation **out_token) { return ffi_attachment_cancellation_new(out_token); }
 silo_error *bridge_attachment_cancellation_cancel(const AttachmentCancellation *token) { return ffi_attachment_cancellation_cancel(token); }
 silo_error *bridge_attachment_cancellation_signal(const AttachmentCancellation *token, uint32_t signal) { return ffi_attachment_cancellation_signal(token, signal); }
 void bridge_attachment_cancellation_free(AttachmentCancellation *token) { ffi_attachment_cancellation_free(token); }
-silo_error *bridge_machine_attach_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_result) { return ffi_machine_attach_cancellable(machine, request, request_len, token, out_result); }
-silo_error *bridge_machine_attach_shell_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_status) { return ffi_machine_attach_shell_cancellable(machine, request, request_len, token, out_status); }
+silo_error *bridge_machine_shell_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, const SshAttachmentHandle *attachment, silo_buffer *out_status) { return ffi_machine_shell_cancellable(machine, request, request_len, token, attachment, out_status); }
+silo_error *bridge_ssh_attachment_new(const silo_machine *machine, const AttachmentCancellation *token, uint16_t rows, uint16_t columns, SshAttachmentHandle **out_handle) { return ffi_ssh_attachment_new(machine, token, rows, columns, out_handle); }
+silo_error *bridge_ssh_attachment_write(const SshAttachmentHandle *handle, const uint8_t *data, size_t len) { return ffi_ssh_attachment_write(handle, data, len); }
+silo_error *bridge_ssh_attachment_close_stdin(const SshAttachmentHandle *handle) { return ffi_ssh_attachment_close_stdin(handle); }
+silo_error *bridge_ssh_attachment_read(const SshAttachmentHandle *handle, _Bool stderr, silo_buffer *out_buffer, _Bool *out_eof) { return ffi_ssh_attachment_read(handle, stderr, out_buffer, out_eof); }
+silo_error *bridge_ssh_attachment_resize(const SshAttachmentHandle *handle, uint16_t rows, uint16_t columns) { return ffi_ssh_attachment_resize(handle, rows, columns); }
+silo_error *bridge_ssh_attachment_signal(const SshAttachmentHandle *handle, uint32_t signal) { return ffi_ssh_attachment_signal(handle, signal); }
+silo_error *bridge_ssh_attachment_cancel(const SshAttachmentHandle *handle) { return ffi_ssh_attachment_cancel(handle); }
+void bridge_ssh_attachment_free(SshAttachmentHandle *handle) { ffi_ssh_attachment_free(handle); }
 silo_error *bridge_execution_recv(const silo_execution *session, silo_execution_event *out_event, _Bool *out_eof) { return ffi_execution_recv(session, out_event, out_eof); }
 silo_error *bridge_execution_wait(const silo_execution *session, silo_buffer *out_result) { return ffi_execution_wait(session, out_result); }
 silo_error *bridge_execution_collect(const silo_execution *session, silo_execution_output *out_output) { return ffi_execution_collect(session, out_output); }

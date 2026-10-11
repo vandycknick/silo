@@ -1,19 +1,13 @@
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nix::sys::signal::Signal;
 use protocol::v1::execute_input::Message as ExecuteMessage;
 use protocol::v1::execution_event::Event as ExecutionWireEvent;
 use protocol::v1::{
     CloseStdin, EnvironmentVariable, ExecuteInput, ExecutionEvent as WireExecutionEvent, PipeStdio,
     ProcessSpec, PtyStdio, ResizePty, SignalProcess, StartExecution, StdinData, TerminalSize,
 };
-use russh::client::Msg as ClientMsg;
-use russh::{Channel, ChannelMsg, ChannelWriteHalf};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -23,96 +17,15 @@ use crate::runtime::core::RuntimeStatus;
 use crate::store::models::MachineRuntimeState;
 use crate::LibVmError;
 
-mod ssh;
+pub(super) mod host;
+pub(super) mod ssh;
+use ssh::DEFAULT_TERM;
 
-const DEFAULT_TERM: &str = "xterm-256color";
-const DEFAULT_ATTACH_DETACH_KEY: u8 = 0x1d;
-const DEFAULT_LOGIN_SHELL_SCRIPT: &str = "exec \"${SHELL:-/bin/bash}\" -l || exec /bin/sh";
 const EXECUTION_REQUEST_QUEUE_CAPACITY: usize = 64;
 const EXECUTION_CHUNK_SIZE: usize = protocol::CHUNK_64_KIB;
-const SSH_HANDSHAKE_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const SSH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-/// Explicit controls for an attachment whose embedding runtime owns host signals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachmentSignal {
-    Hangup,
-    Interrupt,
-    Quit,
-    Terminate,
-    User1,
-    User2,
-    WindowChange,
-}
-
-impl AttachmentSignal {
-    /// Accepts only supported Linux guest signal numbers (WINCH requests resize).
-    pub fn from_linux(signal: u32) -> Option<Self> {
-        match signal {
-            1 => Some(Self::Hangup),
-            2 => Some(Self::Interrupt),
-            3 => Some(Self::Quit),
-            15 => Some(Self::Terminate),
-            10 => Some(Self::User1),
-            12 => Some(Self::User2),
-            28 => Some(Self::WindowChange),
-            _ => None,
-        }
-    }
-
-    fn host(self) -> Signal {
-        match self {
-            Self::Hangup => Signal::SIGHUP,
-            Self::Interrupt => Signal::SIGINT,
-            Self::Quit => Signal::SIGQUIT,
-            Self::Terminate => Signal::SIGTERM,
-            Self::User1 => Signal::SIGUSR1,
-            Self::User2 => Signal::SIGUSR2,
-            Self::WindowChange => Signal::SIGWINCH,
-        }
-    }
-}
-
-enum AttachmentSignals {
-    Host {
-        resize: tokio::signal::unix::Signal,
-        forwarders: HostSignalForwarders,
-    },
-    External(mpsc::Receiver<AttachmentSignal>),
-}
-
-impl AttachmentSignals {
-    fn new(
-        reference: &str,
-        external: Option<mpsc::Receiver<AttachmentSignal>>,
-        ssh: bool,
-    ) -> Result<Self, LibVmError> {
-        if let Some(receiver) = external {
-            return Ok(Self::External(receiver));
-        }
-        let resize = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-            .map_err(|error| {
-                guest_session_error(reference, format!("listen for terminal resize: {error}"))
-            })?;
-        let forwarders = HostSignalForwarders::listen(
-            reference,
-            forwardable_signals().filter(|signal| !ssh || ssh_signal(*signal).is_some()),
-        )?;
-        Ok(Self::Host { resize, forwarders })
-    }
-
-    async fn recv(&mut self) -> Option<AttachmentSignal> {
-        match self {
-            Self::External(receiver) => receiver.recv().await,
-            Self::Host { resize, forwarders } => tokio::select! {
-                value = resize.recv() => value.map(|()| AttachmentSignal::WindowChange),
-                value = forwarders.recv() => value.and_then(guest_signal).and_then(AttachmentSignal::from_linux),
-            },
-        }
-    }
-}
-
-/// Options for one structured guest process execution.
+/// RPC options shared by exec, spawn and exec_script. Guest failures are reported
+/// through structured results; see the [execution examples](crate).
 #[derive(Debug, Clone)]
 pub struct ExecutionOptions {
     pub args: Vec<String>,
@@ -126,12 +39,15 @@ pub struct ExecutionOptions {
     pub initial_pty_size: Option<(u16, u16)>,
 }
 
+/// Builds owned RPC process options. Setters replace scalar values and append argv
+/// and environment entries. See [execution examples](crate).
 #[derive(Debug, Default)]
 pub struct ExecutionOptionsBuilder {
     options: ExecutionOptions,
 }
 
-/// Structured process stdin mode.
+/// Owned initial RPC stdin policy. Bytes are sent before Started, followed by pipe
+/// EOF; Pipe exposes Started-gated live input. See [execution examples](crate).
 #[derive(Debug, Clone, Default)]
 pub enum StdinMode {
     #[default]
@@ -140,7 +56,8 @@ pub enum StdinMode {
     Bytes(Vec<u8>),
 }
 
-/// The exact terminal result reported by silo-vmm.
+/// RPC terminal outcome, distinct from SSH status. Launch and transport loss are
+/// not fabricated process exits. See [execution examples](crate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
     Exited { code: Option<u32> },
@@ -149,6 +66,8 @@ pub enum ExecutionResult {
     Lost(ExecutionLost),
 }
 
+/// Guest RPC process launch failure with categorized reason and optional detail.
+/// See [execution examples](crate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionLaunchFailure {
     pub reason: ExecutionLaunchFailureReason,
@@ -165,6 +84,7 @@ impl std::fmt::Display for ExecutionLaunchFailure {
     }
 }
 
+/// Categorized RPC launch failure; not an SSH protocol status. See [examples](crate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionLaunchFailureReason {
     Unspecified,
@@ -179,12 +99,15 @@ pub enum ExecutionLaunchFailureReason {
     CancelledBeforeStart,
 }
 
+/// RPC fencing or stream loss, rather than a successful process outcome.
+/// See [execution examples](crate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionLost {
     pub reason: ExecutionLostReason,
     pub message: Option<String>,
 }
 
+/// Categorized host/guest RPC stream loss. See [execution examples](crate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionLostReason {
     Unspecified,
@@ -196,7 +119,8 @@ pub enum ExecutionLostReason {
     VmmonExited,
 }
 
-/// One event from the host execution service.
+/// Ordered RPC event. Receive Started before accessing live stdin; keep receiving
+/// through Terminal. See [execution examples](crate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionEvent {
     Accepted,
@@ -207,7 +131,8 @@ pub enum ExecutionEvent {
     Terminal(ExecutionResult),
 }
 
-/// Captured structured execution output.
+/// Buffered RPC output and its structured terminal result. Byte accessors borrow
+/// the captured data; text accessors validate UTF-8. See [examples](crate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionOutput {
     result: ExecutionResult,
@@ -217,117 +142,99 @@ pub struct ExecutionOutput {
 }
 
 impl ExecutionOutput {
+    /// Borrows the RPC terminal result. See [execution examples](crate).
     pub fn result(&self) -> &ExecutionResult {
         &self.result
     }
+    /// Borrows captured pipe stdout bytes. See [execution examples](crate).
     pub fn stdout_bytes(&self) -> &[u8] {
         &self.stdout
     }
+    /// Borrows captured pipe stderr bytes. See [execution examples](crate).
     pub fn stderr_bytes(&self) -> &[u8] {
         &self.stderr
     }
+    /// Borrows captured RPC PTY output bytes. See [execution examples](crate).
     pub fn terminal_output_bytes(&self) -> &[u8] {
         &self.terminal_output
     }
+    /// Copies captured stdout as UTF-8, returning a decoding error for binary data.
+    /// See [execution examples](crate).
     pub fn stdout(&self) -> Result<String, std::string::FromUtf8Error> {
         String::from_utf8(self.stdout.clone())
     }
+    /// Copies captured stderr as UTF-8, returning a decoding error for binary data.
+    /// See [execution examples](crate).
     pub fn stderr(&self) -> Result<String, std::string::FromUtf8Error> {
         String::from_utf8(self.stderr.clone())
     }
+    /// Copies captured RPC PTY output as UTF-8, rejecting invalid encoding.
+    /// See [execution examples](crate).
     pub fn terminal_output(&self) -> Result<String, std::string::FromUtf8Error> {
         String::from_utf8(self.terminal_output.clone())
     }
 }
 
-/// A live bidirectional structured execution call.
+/// Owned live RPC call. Terminal/error/cancel/drop closes requests and invalidates
+/// cloned controls. It is not reconnectable. See [execution examples](crate).
 pub struct ExecutionSession {
-    reference: String,
-    requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
-    input_open: Arc<AtomicBool>,
-    started: Arc<AtomicBool>,
-    input_order: Arc<AsyncMutex<()>>,
-    request_closed: Arc<watch::Sender<bool>>,
-    pipe_stdin: bool,
-    events: Option<ExecutionEvents>,
-    ssh_cancel: Option<tokio_util::sync::CancellationToken>,
+    control: ExecutionControl,
+    events: Option<tonic::Streaming<WireExecutionEvent>>,
 }
 
-/// Cloneable request-side controls for a live structured execution.
+/// Cloneable request-side controls for a live RPC call; terminal/cancel/drop
+/// invalidates them. See [execution examples](crate).
 #[derive(Clone)]
 pub struct ExecutionControl {
+    state: Arc<ExecutionControlState>,
+}
+
+struct ExecutionControlState {
     reference: String,
-    requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
-    input_open: Arc<AtomicBool>,
-    started: Arc<AtomicBool>,
-    input_order: Arc<AsyncMutex<()>>,
-    request_closed: Arc<watch::Sender<bool>>,
+    requests: Mutex<Option<mpsc::Sender<ExecuteInput>>>,
+    input_open: AtomicBool,
+    started: AtomicBool,
+    input_order: AsyncMutex<()>,
+    request_closed: watch::Sender<bool>,
     pipe_stdin: bool,
 }
 
-/// Cloneable writer for a structured execution's stdin or PTY input.
+/// Cloneable RPC stdin writer. Obtain it only after receiving Started; see the
+/// [execution guide](crate). Session completion invalidates surviving writers.
 #[derive(Clone)]
 pub struct ExecutionStdin {
-    reference: String,
-    requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
-    input_open: Arc<AtomicBool>,
-    started: Arc<AtomicBool>,
-    input_order: Arc<AsyncMutex<()>>,
-    request_closed: Arc<watch::Sender<bool>>,
-    pipe_stdin: bool,
-}
-
-enum ExecutionEvents {
-    Agent(tonic::Streaming<WireExecutionEvent>),
-    Ssh(mpsc::Receiver<ExecutionEvent>),
-}
-
-impl ExecutionEvents {
-    async fn message(&mut self) -> Result<Option<ExecutionEvent>, tonic::Status> {
-        match self {
-            Self::Agent(events) => events
-                .message()
-                .await
-                .map(|event| event.map(execution_event_from_wire)),
-            Self::Ssh(events) => Ok(events.recv().await),
-        }
-    }
+    control: ExecutionControl,
 }
 
 impl Drop for ExecutionSession {
     fn drop(&mut self) {
         self.close_requests();
-        if let Some(cancel) = &self.ssh_cancel {
-            cancel.cancel();
-        }
     }
 }
 
 impl ExecutionSession {
     /// Returns controls that remain usable while another task receives events.
+    /// Clones one shared RPC control handle; session completion invalidates it.
+    /// See [execution examples](crate).
     pub fn control(&self) -> ExecutionControl {
-        ExecutionControl {
-            reference: self.reference.clone(),
-            requests: Arc::clone(&self.requests),
-            input_open: Arc::clone(&self.input_open),
-            started: Arc::clone(&self.started),
-            input_order: Arc::clone(&self.input_order),
-            request_closed: Arc::clone(&self.request_closed),
-            pipe_stdin: self.pipe_stdin,
-        }
+        self.control.clone()
     }
 
     /// Returns a stdin writer while the request half remains open.
+    /// Returns None before Started or after input/request closure. See [examples](crate).
     pub fn stdin(&self) -> Option<ExecutionStdin> {
-        self.control().stdin()
+        self.control.stdin()
     }
+    /// Receives one RPC event, advancing Started gating. Caller errors propagate;
+    /// other transport errors become Lost. Completion closes controls. See [examples](crate).
     pub async fn recv(&mut self) -> Result<Option<ExecutionEvent>, LibVmError> {
         let Some(events) = self.events.as_mut() else {
             return Ok(None);
         };
         match events.message().await {
             Ok(Some(event)) => {
-                mark_execution_started(&event, &self.started);
+                let event = execution_event_from_wire(event);
+                mark_execution_started(&event, &self.control.state.started);
                 if matches!(event, ExecutionEvent::Terminal(_)) {
                     self.close_requests();
                     self.events = None;
@@ -344,7 +251,7 @@ impl ExecutionSession {
                 self.close_requests();
                 if caller_status(error.code()) {
                     Err(guest_session_error(
-                        &self.reference,
+                        &self.control.state.reference,
                         format!("execution request failed: {error}"),
                     ))
                 } else {
@@ -360,39 +267,49 @@ impl ExecutionSession {
     }
 
     /// Writes bytes to the process stdin or PTY.
+    /// Requires Started and open input; serializes chunks with EOF. Errors propagate.
+    /// See [execution examples](crate).
     pub async fn write_stdin(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
-        self.control().write_stdin(data).await
+        self.control.write_stdin(data).await
     }
 
     /// Sends EOF to the process stdin while keeping the execution call open.
+    /// Requires Started and pipe stdin; concurrent closes emit at most one EOF.
+    /// See [execution examples](crate).
     pub async fn close_stdin(&self) -> Result<(), LibVmError> {
-        self.control().close_stdin().await
+        self.control.close_stdin().await
     }
 
     /// Resizes the process PTY.
+    /// Requires Started; request closure or guest rejection fails. See [examples](crate).
     pub async fn resize_pty(&self, rows: u16, columns: u16) -> Result<(), LibVmError> {
-        self.control().resize_pty(rows, columns).await
+        self.control.resize_pty(rows, columns).await
     }
 
     /// Delivers a positive Linux signal number to the process group.
+    /// Accepts Linux signals 1..=64. A valid pre-Started signal closes requests
+    /// without waiting for launch. See [execution examples](crate).
     pub async fn signal(&self, signal: u32) -> Result<(), LibVmError> {
-        self.control().signal(signal).await
+        self.control.signal(signal).await
     }
 
     /// Finishes the request half of the bidirectional call.
+    /// Invalidates clones and wakes blocked sends, but retains the response stream.
+    /// See [execution examples](crate).
     pub fn close_requests(&self) {
-        self.control().close_requests();
+        self.control.close_requests();
     }
 
     /// Cancels the complete bidirectional call, including the response stream.
+    /// Drops the response stream and closes requests. This requests cancellation,
+    /// not an awaited guest-process join. See [execution examples](crate).
     pub fn cancel(&mut self) {
         self.close_requests();
         self.events = None;
-        if let Some(cancel) = &self.ssh_cancel {
-            cancel.cancel();
-        }
     }
 
+    /// Receives through terminal status, discarding output. Missing status is an error;
+    /// this does not reconnect or impose a deadline. See [execution examples](crate).
     pub async fn wait(&mut self) -> Result<ExecutionResult, LibVmError> {
         while let Some(event) = self.recv().await? {
             if let ExecutionEvent::Terminal(result) = event {
@@ -400,11 +317,13 @@ impl ExecutionSession {
             }
         }
         Err(guest_session_error(
-            &self.reference,
+            &self.control.state.reference,
             "execution ended without a terminal result",
         ))
     }
 
+    /// Buffers all output through terminal status. Missing status is an error and
+    /// output is unbounded by this method. See [execution examples](crate).
     pub async fn collect(&mut self) -> Result<ExecutionOutput, LibVmError> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -426,7 +345,7 @@ impl ExecutionSession {
             }
         }
         Err(guest_session_error(
-            &self.reference,
+            &self.control.state.reference,
             "execution ended without a terminal result",
         ))
     }
@@ -434,49 +353,51 @@ impl ExecutionSession {
 
 impl ExecutionControl {
     /// Returns a stdin writer while the request half remains open.
+    /// Returns None before Started or after input/request closure. See [examples](crate).
     pub fn stdin(&self) -> Option<ExecutionStdin> {
-        self.requests.lock().ok()?.as_ref()?;
-        if !self.started.load(Ordering::Acquire) || !self.input_open.load(Ordering::Acquire) {
+        self.state.requests.lock().ok()?.as_ref()?;
+        if !self.state.started.load(Ordering::Acquire)
+            || !self.state.input_open.load(Ordering::Acquire)
+        {
             return None;
         }
         Some(ExecutionStdin {
-            reference: self.reference.clone(),
-            requests: Arc::clone(&self.requests),
-            input_open: Arc::clone(&self.input_open),
-            started: Arc::clone(&self.started),
-            input_order: Arc::clone(&self.input_order),
-            request_closed: Arc::clone(&self.request_closed),
-            pipe_stdin: self.pipe_stdin,
+            control: self.clone(),
         })
     }
 
     /// Writes bytes to the process stdin or PTY.
+    /// Requires Started/open input; ordered chunking prevents EOF overtaking a write.
+    /// Live empty writes send an empty data message. See [execution examples](crate).
     pub async fn write_stdin(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
         self.send_stdin_data(data.into()).await
     }
 
     /// Sends EOF to pipe stdin while leaving the response stream open.
+    /// Requires Started and pipe stdin; only one concurrent close can succeed.
+    /// Closed requests/input and PTY mode return errors. See [examples](crate).
     pub async fn close_stdin(&self) -> Result<(), LibVmError> {
-        if !self.pipe_stdin {
+        if !self.state.pipe_stdin {
             return Err(guest_session_error(
-                &self.reference,
+                &self.state.reference,
                 "explicit EOF is only valid for pipe stdin",
             ));
         }
-        let _order = self.input_order.lock().await;
+        let _order = self.state.input_order.lock().await;
         self.ensure_started()?;
-        if !self.input_open.load(Ordering::Acquire) {
+        if !self.state.input_open.load(Ordering::Acquire) {
             return Err(guest_session_error(
-                &self.reference,
+                &self.state.reference,
                 "execution input is closed",
             ));
         }
         self.send(ExecuteMessage::CloseStdin(CloseStdin {})).await?;
-        self.input_open.store(false, Ordering::Release);
+        self.state.input_open.store(false, Ordering::Release);
         Ok(())
     }
 
     /// Resizes the process PTY.
+    /// Requires Started; request closure or guest rejection fails. See [examples](crate).
     pub async fn resize_pty(&self, rows: u16, columns: u16) -> Result<(), LibVmError> {
         self.ensure_started()?;
         self.send(ExecuteMessage::ResizePty(ResizePty {
@@ -489,14 +410,19 @@ impl ExecutionControl {
     }
 
     /// Delivers a Linux signal number to the process group.
+    /// Accepts Linux numbers 1..=64; rejects invalid numbers without side effects.
+    /// Before Started, closes requests to cancel launch. See [examples](crate).
     pub async fn signal(&self, signal: u32) -> Result<(), LibVmError> {
         if !(1..=64).contains(&signal) {
             return Err(guest_session_error(
-                &self.reference,
+                &self.state.reference,
                 "signal must be a Linux signal number from 1 through 64",
             ));
         }
-        if !self.started.load(Ordering::Acquire) {
+        if *self.state.request_closed.borrow() {
+            return Err(self.closed_request_error());
+        }
+        if !self.state.started.load(Ordering::Acquire) {
             self.close_requests();
             return Ok(());
         }
@@ -507,171 +433,87 @@ impl ExecutionControl {
     }
 
     /// Finishes the request half without closing process stdin.
+    /// Invalidates shared input and wakes pending sends; does not drop responses.
+    /// See [execution examples](crate).
     pub fn close_requests(&self) {
-        self.request_closed.send_replace(true);
-        if let Ok(mut requests) = self.requests.lock() {
+        self.state.request_closed.send_replace(true);
+        if let Ok(mut requests) = self.state.requests.lock() {
             requests.take();
         }
-        self.input_open.store(false, Ordering::Release);
+        self.state.input_open.store(false, Ordering::Release);
     }
 
     async fn send(&self, message: ExecuteMessage) -> Result<(), LibVmError> {
         let requests = self
+            .state
             .requests
             .lock()
             .map_err(|_| {
-                guest_session_error(&self.reference, "execution request lock is poisoned")
+                guest_session_error(&self.state.reference, "execution request lock is poisoned")
             })?
             .clone();
-        let Some(requests) = requests else {
-            return Err(guest_session_error(
-                &self.reference,
-                "execution request stream is closed",
-            ));
-        };
-        let mut request_closed = self.request_closed.subscribe();
+        let requests = requests.ok_or_else(|| self.closed_request_error())?;
+        let mut request_closed = self.state.request_closed.subscribe();
         if *request_closed.borrow() {
-            return Err(guest_session_error(
-                &self.reference,
-                "execution request stream is closed",
-            ));
+            return Err(self.closed_request_error());
         }
         tokio::select! {
             biased;
-            _ = request_closed.changed() => Err(guest_session_error(
-                &self.reference,
-                "execution request stream is closed",
-            )),
-            result = requests.send(ExecuteInput { message: Some(message) }) => result.map_err(|_| {
-                guest_session_error(&self.reference, "execution request stream is closed")
-            }),
+            _ = request_closed.changed() => Err(self.closed_request_error()),
+            result = requests.send(ExecuteInput { message: Some(message) }) =>
+                result.map_err(|_| self.closed_request_error()),
         }
     }
 
+    fn closed_request_error(&self) -> LibVmError {
+        guest_session_error(&self.state.reference, "execution request stream is closed")
+    }
+
     async fn send_stdin_data(&self, data: Vec<u8>) -> Result<(), LibVmError> {
-        let _order = self.input_order.lock().await;
+        let _order = self.state.input_order.lock().await;
         self.ensure_started()?;
-        if !self.input_open.load(Ordering::Acquire) {
+        if !self.state.input_open.load(Ordering::Acquire) {
             return Err(guest_session_error(
-                &self.reference,
+                &self.state.reference,
                 "execution input is closed",
             ));
         }
         if data.is_empty() {
             return self
                 .send(ExecuteMessage::StdinData(StdinData {
-                    data: Vec::new().into(),
+                    data: bytes::Bytes::new(),
                 }))
                 .await;
         }
-        for chunk in data.chunks(EXECUTION_CHUNK_SIZE) {
-            self.send(ExecuteMessage::StdinData(StdinData {
-                data: chunk.to_vec().into(),
-            }))
-            .await?;
+        for data in stdin_chunks(data) {
+            self.send(ExecuteMessage::StdinData(StdinData { data }))
+                .await?;
         }
         Ok(())
     }
 
     fn ensure_started(&self) -> Result<(), LibVmError> {
-        if self.started.load(Ordering::Acquire) {
+        if self.state.started.load(Ordering::Acquire) {
             return Ok(());
         }
         Err(guest_session_error(
-            &self.reference,
+            &self.state.reference,
             "execution has not started",
         ))
     }
 }
 
 impl ExecutionStdin {
+    /// Writes binary input with the same Started and ordering guarantees as controls.
+    /// Closed/not-started input fails; writes serialize with EOF. See [examples](crate).
     pub async fn write(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
-        let _order = self.input_order.lock().await;
-        self.ensure_started()?;
-        if !self.input_open.load(Ordering::Acquire) {
-            return Err(guest_session_error(
-                &self.reference,
-                "execution input is closed",
-            ));
-        }
-        let data = data.into();
-        if data.is_empty() {
-            return self
-                .send(ExecuteMessage::StdinData(StdinData {
-                    data: Vec::new().into(),
-                }))
-                .await;
-        }
-        for chunk in data.chunks(EXECUTION_CHUNK_SIZE) {
-            self.send(ExecuteMessage::StdinData(StdinData {
-                data: chunk.to_vec().into(),
-            }))
-            .await?;
-        }
-        Ok(())
+        self.control.write_stdin(data).await
     }
 
+    /// Sends pipe EOF exactly once; PTY EOF is not a pipe operation.
+    /// Closed/not-started input and PTY mode fail. See [execution examples](crate).
     pub async fn close(&self) -> Result<(), LibVmError> {
-        if !self.pipe_stdin {
-            return Err(guest_session_error(
-                &self.reference,
-                "explicit EOF is only valid for pipe stdin",
-            ));
-        }
-        let _order = self.input_order.lock().await;
-        self.ensure_started()?;
-        if !self.input_open.load(Ordering::Acquire) {
-            return Err(guest_session_error(
-                &self.reference,
-                "execution input is closed",
-            ));
-        }
-        self.send(ExecuteMessage::CloseStdin(CloseStdin {})).await?;
-        self.input_open.store(false, Ordering::Release);
-        Ok(())
-    }
-
-    async fn send(&self, message: ExecuteMessage) -> Result<(), LibVmError> {
-        let requests = self
-            .requests
-            .lock()
-            .map_err(|_| {
-                guest_session_error(&self.reference, "execution request lock is poisoned")
-            })?
-            .clone();
-        let Some(requests) = requests else {
-            return Err(guest_session_error(
-                &self.reference,
-                "execution request stream is closed",
-            ));
-        };
-        let mut request_closed = self.request_closed.subscribe();
-        if *request_closed.borrow() {
-            return Err(guest_session_error(
-                &self.reference,
-                "execution request stream is closed",
-            ));
-        }
-        tokio::select! {
-            biased;
-            _ = request_closed.changed() => Err(guest_session_error(
-                &self.reference,
-                "execution request stream is closed",
-            )),
-            result = requests.send(ExecuteInput { message: Some(message) }) => result.map_err(|_| {
-                guest_session_error(&self.reference, "execution request stream is closed")
-            }),
-        }
-    }
-
-    fn ensure_started(&self) -> Result<(), LibVmError> {
-        if self.started.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        Err(guest_session_error(
-            &self.reference,
-            "execution has not started",
-        ))
+        self.control.close_stdin().await
     }
 }
 
@@ -692,14 +534,20 @@ impl Default for ExecutionOptions {
 }
 
 impl ExecutionOptionsBuilder {
+    /// Sets initial PTY rows/columns; used only with tty. Later calls replace the size.
+    /// See [execution examples](crate).
     pub fn initial_pty_size(mut self, rows: u16, columns: u16) -> Self {
         self.options.initial_pty_size = Some((rows, columns));
         self
     }
+    /// Appends one literal argv element, without shell interpretation.
+    /// See [execution examples](crate).
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.options.args.push(arg.into());
         self
     }
+    /// Appends literal argv elements in iterator order, without shell interpretation.
+    /// See [execution examples](crate).
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -708,18 +556,26 @@ impl ExecutionOptionsBuilder {
         self.options.args.extend(args.into_iter().map(Into::into));
         self
     }
+    /// Sets the guest working directory; failures remain launch outcomes.
+    /// See [execution examples](crate).
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.options.cwd = Some(cwd.into());
         self
     }
+    /// Sets the guest user, overriding the configured default execution user.
+    /// See [execution examples](crate).
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.options.user = Some(user.into());
         self
     }
+    /// Appends one guest environment entry, without shell quoting.
+    /// See [execution examples](crate).
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.options.env.push((key.into(), value.into()));
         self
     }
+    /// Appends guest environment entries in iterator order.
+    /// See [execution examples](crate).
     pub fn envs<I, K, V>(mut self, vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -731,108 +587,55 @@ impl ExecutionOptionsBuilder {
             .extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
+    /// Sets the collected execution timeout, applied after startup. Spawn ignores
+    /// this as a deadline; manage the live session explicitly.
+    /// See [execution examples](crate).
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.options.timeout = Some(timeout);
         self
     }
+    /// Selects null pipe stdin (the default). PTY input policy remains separate.
+    /// See [execution examples](crate).
     pub fn stdin_null(mut self) -> Self {
         self.options.stdin = StdinMode::Null;
         self
     }
+    /// Selects live stdin. Access it only after receiving Started.
+    /// See [execution examples](crate).
     pub fn stdin_pipe(mut self) -> Self {
         self.options.stdin = StdinMode::Pipe;
         self
     }
+    /// Moves initial bytes into the request stream before Started, then sends pipe
+    /// EOF. Later stdin setters replace this owned payload.
+    /// See [execution examples](crate).
     pub fn stdin_bytes(mut self, data: impl Into<Vec<u8>>) -> Self {
         self.options.stdin = StdinMode::Bytes(data.into());
         self
     }
+    /// Selects RPC PTY versus pipe stdio. Pipe-only CloseStdin is invalid for a PTY.
+    /// See [execution examples](crate).
     pub fn tty(mut self, enabled: bool) -> Self {
         self.options.tty = enabled;
         self
     }
+    /// Sets the RPC PTY TERM value; used only with tty.
+    /// See [execution examples](crate).
     pub fn term(mut self, term: impl Into<String>) -> Self {
         self.options.term = term.into();
         self
     }
+    /// Consumes this builder into owned RPC process options.
+    /// See [execution examples](crate).
     pub fn build(self) -> ExecutionOptions {
         self.options
     }
 }
 
-/// SSH-only shell attachment options. Agent forwarding is intentionally kept here.
-#[derive(Debug, Clone)]
-pub struct SshShellOptions {
-    pub cwd: Option<String>,
-    pub user: Option<String>,
-    pub env: Vec<(String, String)>,
-    pub term: String,
-    pub detach_keys: Option<String>,
-    pub forward_agent: bool,
-    best_effort_cwd: bool,
-}
-
-#[derive(Debug, Default)]
-pub struct SshShellOptionsBuilder {
-    options: SshShellOptions,
-}
-
-impl Default for SshShellOptions {
-    fn default() -> Self {
-        Self {
-            cwd: None,
-            user: None,
-            env: Vec::new(),
-            term: std::env::var("TERM").unwrap_or_else(|_| DEFAULT_TERM.to_string()),
-            detach_keys: None,
-            forward_agent: false,
-            best_effort_cwd: false,
-        }
-    }
-}
-impl SshShellOptionsBuilder {
-    pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
-        self.options.cwd = Some(cwd.into());
-        self
-    }
-    pub fn user(mut self, user: impl Into<String>) -> Self {
-        self.options.user = Some(user.into());
-        self
-    }
-    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.options.env.push((key.into(), value.into()));
-        self
-    }
-    pub fn term(mut self, term: impl Into<String>) -> Self {
-        self.options.term = term.into();
-        self
-    }
-    pub fn detach_keys(mut self, keys: impl Into<String>) -> Self {
-        self.options.detach_keys = Some(keys.into());
-        self
-    }
-    pub fn forward_agent(mut self, enabled: bool) -> Self {
-        self.options.forward_agent = enabled;
-        self
-    }
-    #[doc(hidden)]
-    pub fn best_effort_cwd(mut self) -> Self {
-        self.options.best_effort_cwd = true;
-        self
-    }
-    pub fn build(self) -> SshShellOptions {
-        self.options
-    }
-}
-
-/// SSH shell exit status, used only by SSH shell attachment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SshExitStatus {
-    pub code: i32,
-    pub success: bool,
-}
-
 impl Machine {
+    /// Runs literal argv through agent RPC and collects output. Shell syntax is not
+    /// interpreted. Requires a running guest execution service; startup errors propagate.
+    /// See the [literal argv example](crate).
     pub async fn exec<I, S>(
         &self,
         program: impl Into<String>,
@@ -845,6 +648,8 @@ impl Machine {
         self.exec_with(program, |options| options.args(args)).await
     }
 
+    /// Configures literal argv RPC execution and buffers its result/output. A timeout
+    /// applies only after startup; timeout cancels the session. See [examples](crate).
     pub async fn exec_with(
         &self,
         program: impl Into<String>,
@@ -869,6 +674,9 @@ impl Machine {
         }
     }
 
+    /// Starts a caller-driven agent RPC execution. Consume Started before writing
+    /// input, and keep consuming through terminal status. Drop invalidates controls
+    /// and requests cancellation; see the [spawn example](crate).
     pub async fn spawn<I, S>(
         &self,
         program: impl Into<String>,
@@ -881,6 +689,9 @@ impl Machine {
         self.spawn_with(program, |options| options.args(args)).await
     }
 
+    /// Configures a live agent RPC execution, including optional PTY. The timeout
+    /// option does not create a spawn deadline. Startup errors propagate; session
+    /// completion or drop invalidates controls. See [execution examples](crate).
     pub async fn spawn_with(
         &self,
         program: impl Into<String>,
@@ -893,10 +704,19 @@ impl Machine {
         .await
     }
 
-    pub async fn shell(&self, script: impl Into<String>) -> Result<ExecutionOutput, LibVmError> {
-        self.shell_with(script, |options| options).await
+    /// Collects `/bin/sh -l -c SCRIPT` through agent RPC. Login startup files apply;
+    /// the caller is responsible for shell injection safety. Never concatenate
+    /// untrusted input. See the [script example](crate).
+    pub async fn exec_script(
+        &self,
+        script: impl Into<String>,
+    ) -> Result<ExecutionOutput, LibVmError> {
+        self.exec_script_with(script, |options| options).await
     }
-    pub async fn shell_with(
+    /// Configures the existing `/bin/sh -l -c SCRIPT` RPC convenience. Arguments
+    /// configured here precede the convenience arguments. Timeout starts after
+    /// startup; guest outcomes stay structured. See [execution examples](crate).
+    pub async fn exec_script_with(
         &self,
         script: impl Into<String>,
         configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
@@ -904,77 +724,6 @@ impl Machine {
         self.exec_with("/bin/sh", |options| {
             configure(options).arg("-l").arg("-c").arg(script.into())
         })
-        .await
-    }
-
-    pub async fn attach<I, S>(
-        &self,
-        program: impl Into<String>,
-        args: I,
-    ) -> Result<ExecutionResult, LibVmError>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.attach_with(program, |options| options.args(args))
-            .await
-    }
-
-    pub async fn attach_with(
-        &self,
-        program: impl Into<String>,
-        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
-    ) -> Result<ExecutionResult, LibVmError> {
-        self.attach_with_signal_source(program.into(), configure, None)
-            .await
-    }
-
-    /// Attaches using embedding-owned signals, without installing host handlers.
-    pub async fn attach_with_signals(
-        &self,
-        program: impl Into<String>,
-        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
-        signals: mpsc::Receiver<AttachmentSignal>,
-    ) -> Result<ExecutionResult, LibVmError> {
-        self.attach_with_signal_source(program.into(), configure, Some(signals))
-            .await
-    }
-
-    async fn attach_with_signal_source(
-        &self,
-        program: String,
-        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
-        signals: Option<mpsc::Receiver<AttachmentSignal>>,
-    ) -> Result<ExecutionResult, LibVmError> {
-        let options = configure(ExecutionOptionsBuilder::default())
-            .stdin_pipe()
-            .tty(true)
-            .build();
-        let mut session = self.start_execution(program, options).await?;
-        attach_execution_stdio(&mut session, signals).await
-    }
-
-    pub async fn attach_shell(&self) -> Result<SshExitStatus, LibVmError> {
-        self.attach_shell_with(|options| options).await
-    }
-    pub async fn attach_shell_with(
-        &self,
-        configure: impl FnOnce(SshShellOptionsBuilder) -> SshShellOptionsBuilder,
-    ) -> Result<SshExitStatus, LibVmError> {
-        let options = configure(SshShellOptionsBuilder::default()).build();
-        self.attach_ssh_shell(options, None).await
-    }
-
-    /// Attaches an SSH shell using embedding-owned signals and resize notifications.
-    pub async fn attach_shell_with_signals(
-        &self,
-        configure: impl FnOnce(SshShellOptionsBuilder) -> SshShellOptionsBuilder,
-        signals: mpsc::Receiver<AttachmentSignal>,
-    ) -> Result<SshExitStatus, LibVmError> {
-        self.attach_ssh_shell(
-            configure(SshShellOptionsBuilder::default()).build(),
-            Some(signals),
-        )
         .await
     }
 
@@ -994,7 +743,7 @@ impl Machine {
         let run_id = current_run_id(&config.name, &status)?;
         apply_default_execution_user(&mut options, config.guest.user.as_ref());
         let reference = config.name;
-        let stdin = options.stdin.clone();
+        let stdin = std::mem::take(&mut options.stdin);
         let tty = options.tty;
         let pipe_stdin = !tty && matches!(stdin, StdinMode::Pipe | StdinMode::Bytes(_));
         let input_open = match &stdin {
@@ -1002,7 +751,7 @@ impl Machine {
             StdinMode::Pipe => true,
             StdinMode::Bytes(_) => false,
         };
-        let process = process_spec(program, options);
+        let process = process_spec(program, options, pipe_stdin);
         let (requests, receiver) = mpsc::channel(EXECUTION_REQUEST_QUEUE_CAPACITY);
         let execution_id = Uuid::new_v4();
         requests
@@ -1023,188 +772,58 @@ impl Machine {
             .await
             .map_err(|error| guest_session_error(&reference, error.to_string()))?;
         if let StdinMode::Bytes(data) = stdin {
-            for chunk in data.chunks(EXECUTION_CHUNK_SIZE) {
-                requests
-                    .send(ExecuteInput {
-                        message: Some(ExecuteMessage::StdinData(StdinData {
-                            data: chunk.to_vec().into(),
-                        })),
-                    })
-                    .await
-                    .map_err(|_| {
-                        guest_session_error(&reference, "execution request stream is closed")
-                    })?;
-            }
-            if pipe_stdin {
-                requests
-                    .send(ExecuteInput {
-                        message: Some(ExecuteMessage::CloseStdin(CloseStdin {})),
-                    })
-                    .await
-                    .map_err(|_| {
-                        guest_session_error(&reference, "execution request stream is closed")
-                    })?;
-            }
+            send_initial_stdin(&requests, &reference, data, pipe_stdin).await?;
         }
         Ok(ExecutionSession {
-            reference,
-            requests: Arc::new(Mutex::new(Some(requests))),
-            input_open: Arc::new(AtomicBool::new(input_open)),
-            started: Arc::new(AtomicBool::new(false)),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin,
-            events: Some(ExecutionEvents::Agent(events)),
-            ssh_cancel: None,
-        })
-    }
-
-    async fn attach_ssh_shell(
-        &self,
-        options: SshShellOptions,
-        signals: Option<mpsc::Receiver<AttachmentSignal>>,
-    ) -> Result<SshExitStatus, LibVmError> {
-        let reference = self.inspect().await?.name;
-        let client = self
-            .connect_guest_ssh(&reference, options.user.as_deref(), options.forward_agent)
-            .await?;
-        let mut channel = open_session_channel(&client).await?;
-        let (columns, rows) = current_terminal_size();
-        channel
-            .request_pty(true, &options.term, columns, rows, 0, 0, &[])
-            .await
-            .map_err(|error| ssh_error(&reference, "request PTY", error))?;
-        wait_channel_success(&mut channel, &reference, "request PTY").await?;
-        if options.forward_agent {
-            request_agent_forward(&mut channel, &reference).await?;
-        }
-        if options.cwd.is_some() || !options.env.is_empty() {
-            channel
-                .exec(true, ssh_shell_command(&options)?)
-                .await
-                .map_err(|error| ssh_error(&reference, "send shell exec request", error))?;
-            wait_channel_success(&mut channel, &reference, "shell exec request").await?;
-        } else {
-            channel
-                .request_shell(true)
-                .await
-                .map_err(|error| ssh_error(&reference, "request shell", error))?;
-            wait_channel_success(&mut channel, &reference, "request shell").await?;
-        }
-        attach_ssh_stdio(
-            reference,
-            channel,
-            detach_sequence(options.detach_keys.as_deref())?,
-            client,
-            signals,
-        )
-        .await
-    }
-
-    async fn connect_guest_ssh(
-        &self,
-        reference: &str,
-        user: Option<&str>,
-        forward_agent: bool,
-    ) -> Result<GuestSshClient, LibVmError> {
-        tokio::time::timeout(
-            SSH_HANDSHAKE_READY_TIMEOUT,
-            self.connect_guest_ssh_inner(reference, user, forward_agent),
-        )
-        .await
-        .map_err(|_| guest_session_error(reference, "SSH connection setup timed out"))?
-    }
-
-    async fn connect_guest_ssh_inner(
-        &self,
-        reference: &str,
-        user: Option<&str>,
-        forward_agent: bool,
-    ) -> Result<GuestSshClient, LibVmError> {
-        let config = self.running_config().await?;
-        let status = self
-            .runtime()
-            .reconcile_machine_runtime_best_effort(&config)
-            .await?;
-        let run_id = current_run_id(reference, &status)?;
-        let expected_key =
-            utils::ssh::read_host_key_pin(self.runtime().machine_paths(self.machine_id()).dir())
-                .map_err(|error| {
-                    guest_session_error(
-                        reference,
-                        format!("guest SSH host key is not pinned: {error}"),
-                    )
-                })?;
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let guard = ssh::TransportGuard(cancel.clone());
-        let agent_socket = resolve_agent_socket(reference, forward_agent)?;
-        let user = match user {
-            Some(user) => user.to_string(),
-            None => self
-                .runtime()
-                .resolve_machine_config(&MachineRef::id(self.machine_id()))
-                .await?
-                .guest
-                .user
-                .map(|user| user.name)
-                .unwrap_or_else(|| "root".to_string()),
-        };
-        let (private_key, certificate) =
-            crate::ssh_ca::issue(self.runtime().secret_store(), self.machine_id(), &user).map_err(
-                |error| guest_session_error(reference, format!("issue SSH certificate: {error}")),
-            )?;
-        let started = std::time::Instant::now();
-        let mut handle = loop {
-            let stream = self.open_shell_stream().await?;
-            match russh::client::connect_stream(
-                Arc::new(russh::client::Config::default()),
-                ssh::CancellableStream::new(stream, cancel.clone()),
-                SshClientHandler {
-                    agent_socket: agent_socket.clone(),
-                    expected_key: expected_key.clone(),
-                },
-            )
-            .await
-            {
-                Ok(handle) => break handle,
-                Err(error)
-                    if is_transient_ssh_handshake_error(&error.to_string())
-                        && started.elapsed() < SSH_HANDSHAKE_READY_TIMEOUT =>
-                {
-                    tokio::time::sleep(SSH_HANDSHAKE_RETRY_DELAY).await
-                }
-                Err(error) => return Err(ssh_error(reference, "client handshake", error)),
-            }
-        };
-        let auth = handle
-            .authenticate_openssh_cert(user, private_key, certificate)
-            .await
-            .map_err(|error| ssh_error(reference, "public-key authentication", error))?;
-        if !auth.success() {
-            return Err(guest_session_error(
-                reference,
-                "SSH public-key authentication failed",
-            ));
-        }
-        let current = self
-            .runtime()
-            .reconcile_machine_runtime_best_effort(&config)
-            .await?;
-        if current_run_id(reference, &current)? != run_id {
-            return Err(guest_session_error(
-                reference,
-                "machine run changed during SSH setup",
-            ));
-        }
-        Ok(GuestSshClient {
-            reference: reference.to_string(),
-            handle,
-            transport: guard,
+            control: ExecutionControl {
+                state: Arc::new(ExecutionControlState {
+                    reference,
+                    requests: Mutex::new(Some(requests)),
+                    input_open: AtomicBool::new(input_open),
+                    started: AtomicBool::new(false),
+                    input_order: AsyncMutex::new(()),
+                    request_closed: watch::channel(false).0,
+                    pipe_stdin,
+                }),
+            },
+            events: Some(events),
         })
     }
 }
 
-fn current_run_id(reference: &str, status: &RuntimeStatus) -> Result<Uuid, LibVmError> {
+fn stdin_chunks(data: Vec<u8>) -> impl Iterator<Item = bytes::Bytes> {
+    let data = bytes::Bytes::from(data);
+    (0..data.len())
+        .step_by(EXECUTION_CHUNK_SIZE)
+        .map(move |offset| data.slice(offset..(offset + EXECUTION_CHUNK_SIZE).min(data.len())))
+}
+
+async fn send_initial_stdin(
+    requests: &mpsc::Sender<ExecuteInput>,
+    reference: &str,
+    data: Vec<u8>,
+    pipe_stdin: bool,
+) -> Result<(), LibVmError> {
+    for data in stdin_chunks(data) {
+        requests
+            .send(ExecuteInput {
+                message: Some(ExecuteMessage::StdinData(StdinData { data })),
+            })
+            .await
+            .map_err(|_| guest_session_error(reference, "execution request stream is closed"))?;
+    }
+    if pipe_stdin {
+        requests
+            .send(ExecuteInput {
+                message: Some(ExecuteMessage::CloseStdin(CloseStdin {})),
+            })
+            .await
+            .map_err(|_| guest_session_error(reference, "execution request stream is closed"))?;
+    }
+    Ok(())
+}
+
+pub(super) fn current_run_id(reference: &str, status: &RuntimeStatus) -> Result<Uuid, LibVmError> {
     if status.state != MachineRuntimeState::Running {
         return Err(guest_session_error(reference, "machine is not running"));
     }
@@ -1220,7 +839,7 @@ fn current_run_id(reference: &str, status: &RuntimeStatus) -> Result<Uuid, LibVm
     })
 }
 
-fn process_spec(program: String, options: ExecutionOptions) -> ProcessSpec {
+fn process_spec(program: String, options: ExecutionOptions, pipe_stdin: bool) -> ProcessSpec {
     let mut argv = Vec::with_capacity(options.args.len() + 1);
     argv.push(program);
     argv.extend(options.args);
@@ -1239,7 +858,7 @@ fn process_spec(program: String, options: ExecutionOptions) -> ProcessSpec {
         }))
     } else {
         Some(protocol::v1::process_spec::Stdio::Pipes(PipeStdio {
-            stdin: matches!(options.stdin, StdinMode::Pipe | StdinMode::Bytes(_)),
+            stdin: pipe_stdin,
         }))
     };
     ProcessSpec {
@@ -1265,7 +884,7 @@ fn apply_default_execution_user(
 }
 
 fn terminal_size() -> TerminalSize {
-    let (columns, rows) = current_terminal_size();
+    let (columns, rows) = host::current_terminal_size();
     TerminalSize { columns, rows }
 }
 
@@ -1373,549 +992,10 @@ pub(crate) fn lost_reason(value: Option<i32>) -> ExecutionLostReason {
     }
 }
 
-async fn attach_execution_stdio(
-    session: &mut ExecutionSession,
-    external_signals: Option<mpsc::Receiver<AttachmentSignal>>,
-) -> Result<ExecutionResult, LibVmError> {
-    let mut _terminal = None;
-    let mut host_stdin = crate::host_input::HostInput::stdin().map_err(|error| {
-        guest_session_error(&session.reference, format!("open host input: {error}"))
-    })?;
-    let mut stdout = tokio::io::stdout();
-    let mut stdin: Option<ExecutionStdin> = None;
-    let mut stdin_closed = false;
-    let mut started = false;
-    let mut launch_cancelled = false;
-    let mut signals = AttachmentSignals::new(&session.reference, external_signals, false)?;
-    loop {
-        tokio::select! {
-            read = host_stdin.read(), if started && !launch_cancelled && !stdin_closed => {
-                let input = read.map_err(|error| guest_session_error(&session.reference, format!("read terminal input: {error}")))?;
-                if input.is_empty() {
-                    stdin_closed = true;
-                } else {
-                    let Some(stdin) = stdin.as_ref() else {
-                        continue;
-                    };
-                    stdin.write(input).await?;
-                }
-            }
-            signal = signals.recv() => {
-                let Some(signal) = signal else {
-                    return Err(guest_session_error(&session.reference, "host signal listeners stopped"));
-                };
-                if signal == AttachmentSignal::WindowChange {
-                    if started && !launch_cancelled {
-                        let (columns, rows) = current_terminal_size();
-                        let rows = u16::try_from(rows).map_err(|_| guest_session_error(&session.reference, "terminal rows exceed 65535"))?;
-                        let columns = u16::try_from(columns).map_err(|_| guest_session_error(&session.reference, "terminal columns exceed 65535"))?;
-                        session.resize_pty(rows, columns).await?;
-                    }
-                } else if started && !launch_cancelled {
-                    let guest = guest_signal(signal.host()).ok_or_else(|| guest_session_error(&session.reference, "unsupported attachment signal"))?;
-                    session.signal(guest).await?;
-                } else if !launch_cancelled {
-                    session.close_requests();
-                    launch_cancelled = true;
-                }
-            }
-            event = session.recv() => match event? {
-                Some(ExecutionEvent::Stdout(data)) | Some(ExecutionEvent::Stderr(data)) | Some(ExecutionEvent::TerminalOutput(data)) => {
-                    stdout.write_all(&data).await.map_err(|error| guest_session_error(&session.reference, format!("write terminal output: {error}")))?;
-                    stdout.flush().await.map_err(|error| guest_session_error(&session.reference, format!("flush terminal output: {error}")))?;
-                }
-                Some(ExecutionEvent::Terminal(result)) => return Ok(result),
-                Some(ExecutionEvent::Accepted) => {}
-                Some(ExecutionEvent::Started) if !launch_cancelled => {
-                    let raw_terminal = RawTerminalGuard::new().map_err(|error| {
-                        guest_session_error(&session.reference, format!("enable raw terminal: {error}"))
-                    })?;
-                    let execution_stdin = session
-                        .stdin()
-                        .ok_or_else(|| guest_session_error(&session.reference, "execution stdin is closed"))?;
-                    _terminal = Some(raw_terminal);
-                    stdin = Some(execution_stdin);
-                    started = true;
-                }
-                Some(ExecutionEvent::Started) => started = true,
-                None => return Err(guest_session_error(&session.reference, "execution ended without a terminal result")),
-            }
-        }
-    }
-}
-
-struct HostSignalForwarders {
-    receiver: mpsc::Receiver<Signal>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl HostSignalForwarders {
-    fn listen(reference: &str, signals: impl Iterator<Item = Signal>) -> Result<Self, LibVmError> {
-        let (sender, receiver) = mpsc::channel(64);
-        let mut forwarders = Self {
-            receiver,
-            tasks: Vec::new(),
-        };
-        for signal in signals {
-            let mut listener = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::from_raw(signal as i32),
-            )
-            .map_err(|error| {
-                guest_session_error(reference, format!("listen for host {signal}: {error}"))
-            })?;
-            let sender = sender.clone();
-            forwarders.tasks.push(tokio::spawn(async move {
-                while listener.recv().await.is_some() {
-                    if sender.send(signal).await.is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
-        drop(sender);
-        Ok(forwarders)
-    }
-
-    async fn recv(&mut self) -> Option<Signal> {
-        self.receiver.recv().await
-    }
-}
-
-impl Drop for HostSignalForwarders {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-
-fn forwardable_signals() -> impl Iterator<Item = Signal> {
-    [
-        Signal::SIGHUP,
-        Signal::SIGINT,
-        Signal::SIGQUIT,
-        Signal::SIGTERM,
-        Signal::SIGUSR1,
-        Signal::SIGUSR2,
-    ]
-    .into_iter()
-}
-
-// The guest is Linux even on macOS, whose USR1/USR2 numbers are different.
-fn guest_signal(signal: Signal) -> Option<u32> {
-    match signal {
-        Signal::SIGHUP => Some(1),
-        Signal::SIGINT => Some(2),
-        Signal::SIGQUIT => Some(3),
-        Signal::SIGTERM => Some(15),
-        Signal::SIGUSR1 => Some(10),
-        Signal::SIGUSR2 => Some(12),
-        _ => None,
-    }
-}
-
-fn ssh_signal(signal: Signal) -> Option<russh::Sig> {
-    match signal {
-        Signal::SIGHUP => Some(russh::Sig::HUP),
-        Signal::SIGINT => Some(russh::Sig::INT),
-        Signal::SIGQUIT => Some(russh::Sig::QUIT),
-        Signal::SIGTERM => Some(russh::Sig::TERM),
-        _ => None,
-    }
-}
-
-struct GuestSshClient {
-    reference: String,
-    handle: russh::client::Handle<SshClientHandler>,
-    transport: ssh::TransportGuard,
-}
-#[derive(Clone)]
-struct SshClientHandler {
-    agent_socket: Option<PathBuf>,
-    expected_key: ssh_key::PublicKey,
-}
-impl russh::client::Handler for SshClientHandler {
-    type Error = russh::Error;
-    async fn check_server_key(
-        &mut self,
-        key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(key.key_data() == self.expected_key.key_data())
-    }
-    async fn server_channel_open_agent_forward(
-        &mut self,
-        channel: Channel<ClientMsg>,
-        _: russh::ChannelOpenHandleInner<ClientMsg>,
-        _: &mut russh::client::Session,
-    ) -> Result<(), Self::Error> {
-        #[cfg(unix)]
-        if let Some(agent_socket) = self.agent_socket.clone() {
-            tokio::spawn(async move {
-                let mut guest_agent = channel.into_stream();
-                if let Ok(mut host_agent) = tokio::net::UnixStream::connect(agent_socket).await {
-                    let _ = tokio::io::copy_bidirectional(&mut guest_agent, &mut host_agent).await;
-                }
-            });
-        }
-        #[cfg(not(unix))]
-        let _ = channel;
-        Ok(())
-    }
-}
-async fn open_session_channel(client: &GuestSshClient) -> Result<Channel<ClientMsg>, LibVmError> {
-    client
-        .handle
-        .channel_open_session()
-        .await
-        .map_err(|error| ssh_error(&client.reference, "open session channel", error))
-}
-async fn wait_channel_success(
-    channel: &mut Channel<ClientMsg>,
-    reference: &str,
-    context: &str,
-) -> Result<(), LibVmError> {
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Success) => return Ok(()),
-            Some(ChannelMsg::Failure) => {
-                return Err(guest_session_error(
-                    reference,
-                    format!("SSH {context} failed"),
-                ));
-            }
-            Some(ChannelMsg::Close) | None => {
-                return Err(guest_session_error(
-                    reference,
-                    format!("SSH channel closed during {context}"),
-                ));
-            }
-            _ => {}
-        }
-    }
-}
-async fn request_agent_forward(
-    channel: &mut Channel<ClientMsg>,
-    reference: &str,
-) -> Result<(), LibVmError> {
-    channel
-        .agent_forward(true)
-        .await
-        .map_err(|error| ssh_error(reference, "request SSH agent forwarding", error))?;
-    wait_channel_success(channel, reference, "request SSH agent forwarding").await
-}
-
-fn ssh_shell_command(options: &SshShellOptions) -> Result<String, LibVmError> {
-    let mut command = String::new();
-    if let Some(cwd) = &options.cwd {
-        command.push_str("cd ");
-        command.push_str(&quote_ssh_shell_argument(cwd));
-        if options.best_effort_cwd {
-            command.push_str(" 2>/dev/null || true; ");
-        } else {
-            command.push_str(" && ");
-        }
-    }
-    command.push_str("exec ");
-    if !options.env.is_empty() {
-        command.push_str("env");
-        for (key, value) in &options.env {
-            if !valid_environment_name(key) {
-                return Err(guest_session_error(
-                    "shell",
-                    format!("invalid environment variable name {key:?}"),
-                ));
-            }
-            command.push(' ');
-            command.push_str(key);
-            command.push('=');
-            command.push_str(&quote_ssh_shell_argument(value));
-        }
-        command.push(' ');
-    }
-    command.push_str("/bin/sh -l -c ");
-    command.push_str(&quote_ssh_shell_argument(DEFAULT_LOGIN_SHELL_SCRIPT));
-    Ok(command)
-}
-
-fn valid_environment_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_' || byte.is_ascii_alphabetic() || index > 0 && byte.is_ascii_digit()
-        })
-}
-
-fn quote_ssh_shell_argument(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\"'\"'"))
-}
-
-async fn attach_ssh_stdio(
-    reference: String,
-    channel: Channel<ClientMsg>,
-    detach_keys: Vec<u8>,
-    _client: GuestSshClient,
-    external_signals: Option<mpsc::Receiver<AttachmentSignal>>,
-) -> Result<SshExitStatus, LibVmError> {
-    let _terminal = RawTerminalGuard::new().map_err(|error| {
-        guest_session_error(&reference, format!("enable raw terminal: {error}"))
-    })?;
-    let (mut rx, tx) = channel.split();
-    let tx = Arc::new(tx);
-    let mut stdin = crate::host_input::HostInput::stdin()
-        .map_err(|error| guest_session_error(&reference, format!("open host input: {error}")))?;
-    let mut stdout = tokio::io::stdout();
-    let mut match_pos = 0;
-    let mut exit_code = None;
-    let mut detached = false;
-    let mut stdin_closed = false;
-    let mut signals = AttachmentSignals::new(&reference, external_signals, true)?;
-    loop {
-        tokio::select! {
-            read = stdin.read(), if !stdin_closed => {
-                let input = read.map_err(|error| guest_session_error(&reference, format!("read terminal input: {error}")))?;
-                if input.is_empty() {
-                    stdin_closed = true;
-                    tx.eof().await.map_err(|error| ssh_error(&reference, "close terminal input", error))?;
-                } else if input_contains_detach_sequence(&input, &detach_keys, &mut match_pos) {
-                    detached = true;
-                    break;
-                } else {
-                    tx.data_bytes(input).await.map_err(|error| ssh_error(&reference, "write terminal input", error))?;
-                }
-            }
-            signal = signals.recv() => {
-                let signal = signal.ok_or_else(|| guest_session_error(&reference, "host signal listeners stopped"))?;
-                if signal == AttachmentSignal::WindowChange {
-                    resize_attached_pty(&reference, tx.as_ref()).await?;
-                } else {
-                    let signal = ssh_signal(signal.host()).ok_or_else(|| guest_session_error(&reference, "unsupported SSH host signal"))?;
-                    tx.signal(signal).await.map_err(|error| ssh_error(&reference, "forward host signal", error))?;
-                }
-            }
-            message = rx.wait() => match message {
-                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    stdout.write_all(&data).await.map_err(|error| guest_session_error(&reference, format!("write terminal output: {error}")))?;
-                    stdout.flush().await.map_err(|error| guest_session_error(&reference, format!("flush terminal output: {error}")))?;
-                }
-                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status as i32),
-                Some(ChannelMsg::ExitSignal { .. }) => exit_code = Some(128),
-                Some(ChannelMsg::Close) | None => break,
-                _ => {}
-            }
-        }
-    }
-    ssh_exit_status(&reference, exit_code, detached)
-}
-
-fn ssh_exit_status(
-    reference: &str,
-    exit_code: Option<i32>,
-    detached: bool,
-) -> Result<SshExitStatus, LibVmError> {
-    if detached {
-        return Ok(SshExitStatus {
-            code: 0,
-            success: true,
-        });
-    }
-    let code = exit_code.ok_or_else(|| {
-        guest_session_error(
-            reference,
-            "attached SSH session ended without an exit status",
-        )
-    })?;
-    Ok(SshExitStatus {
-        code,
-        success: code == 0,
-    })
-}
-
-async fn resize_attached_pty(
-    reference: &str,
-    channel: &ChannelWriteHalf<ClientMsg>,
-) -> Result<(), LibVmError> {
-    let (columns, rows) = current_terminal_size();
-    channel
-        .window_change(columns, rows, 0, 0)
-        .await
-        .map_err(|error| ssh_error(reference, "resize PTY", error))
-}
-
-fn detach_sequence(spec: Option<&str>) -> Result<Vec<u8>, LibVmError> {
-    let Some(spec) = spec else {
-        return Ok(vec![DEFAULT_ATTACH_DETACH_KEY]);
-    };
-    let mut sequence = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if let Some(control) = part.strip_prefix("ctrl-") {
-            let byte = match control {
-                "]" => 0x1d,
-                "[" => 0x1b,
-                "\\" => 0x1c,
-                "^" => 0x1e,
-                "_" => 0x1f,
-                "@" => 0x00,
-                value if value.len() == 1 => {
-                    let byte = value.as_bytes()[0];
-                    if byte.is_ascii_lowercase() {
-                        byte - b'a' + 1
-                    } else if byte.is_ascii_uppercase() {
-                        byte - b'A' + 1
-                    } else {
-                        return Err(invalid_detach_key(part));
-                    }
-                }
-                _ => return Err(invalid_detach_key(part)),
-            };
-            sequence.push(byte);
-        } else if part.len() == 1 {
-            sequence.push(part.as_bytes()[0]);
-        } else {
-            return Err(invalid_detach_key(part));
-        }
-    }
-    if sequence.is_empty() {
-        sequence.push(DEFAULT_ATTACH_DETACH_KEY);
-    }
-    Ok(sequence)
-}
-
-fn invalid_detach_key(key: &str) -> LibVmError {
-    guest_session_error("shell", format!("invalid detach key {key:?}"))
-}
-fn input_contains_detach_sequence(data: &[u8], sequence: &[u8], position: &mut usize) -> bool {
-    for byte in data {
-        if *byte == sequence[*position] {
-            *position += 1;
-            if *position == sequence.len() {
-                *position = 0;
-                return true;
-            }
-        } else {
-            *position = usize::from(*byte == sequence[0]);
-        }
-    }
-    false
-}
-fn current_terminal_size() -> (u32, u32) {
-    let stdout = std::io::stdout();
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    if unsafe { libc::ioctl(stdout.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
-        && size.ws_col > 0
-        && size.ws_row > 0
-    {
-        (u32::from(size.ws_col), u32::from(size.ws_row))
-    } else {
-        (80, 24)
-    }
-}
-fn resolve_agent_socket(
-    reference: &str,
-    forward_agent: bool,
-) -> Result<Option<PathBuf>, LibVmError> {
-    if !forward_agent {
-        return Ok(None);
-    }
-    #[cfg(unix)]
-    {
-        std::env::var_os("SSH_AUTH_SOCK")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(Some)
-            .ok_or_else(|| {
-                guest_session_error(
-                    reference,
-                    "SSH agent forwarding requested, but SSH_AUTH_SOCK is not set",
-                )
-            })
-    }
-    #[cfg(not(unix))]
-    {
-        Err(guest_session_error(
-            reference,
-            "SSH agent forwarding is only supported on Unix hosts",
-        ))
-    }
-}
-fn ssh_error(reference: &str, context: &str, error: russh::Error) -> LibVmError {
-    guest_session_error(reference, format!("SSH {context}: {error}"))
-}
-fn is_transient_ssh_handshake_error(message: &str) -> bool {
-    let value = message.to_ascii_lowercase();
-    [
-        "disconnected",
-        "connection reset",
-        "unexpected eof",
-        "connection aborted",
-        "connection refused",
-    ]
-    .iter()
-    .any(|needle| value.contains(needle))
-        || value == "eof"
-        || value.ends_with(" eof")
-}
-fn guest_session_error(reference: &str, message: impl Into<String>) -> LibVmError {
+pub(super) fn guest_session_error(reference: &str, message: impl Into<String>) -> LibVmError {
     LibVmError::GuestSession {
         reference: reference.to_string(),
         message: message.into(),
-    }
-}
-
-struct RawTerminalGuard {
-    fd: OwnedFd,
-    original: libc::termios,
-    enabled: bool,
-}
-impl RawTerminalGuard {
-    fn new() -> std::io::Result<Self> {
-        let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
-        if unsafe { libc::isatty(fd.as_raw_fd()) } == 0 {
-            return Ok(Self {
-                fd,
-                original: unsafe { std::mem::zeroed() },
-                enabled: false,
-            });
-        }
-        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut original) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut raw = original;
-        raw.c_iflag &= !(libc::IGNBRK
-            | libc::BRKINT
-            | libc::PARMRK
-            | libc::ISTRIP
-            | libc::INLCR
-            | libc::IGNCR
-            | libc::ICRNL
-            | libc::IXON);
-        raw.c_oflag &= !libc::OPOST;
-        raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
-        raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
-        raw.c_cflag |= libc::CS8;
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSAFLUSH, &raw) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self {
-            fd,
-            original,
-            enabled: true,
-        })
-    }
-}
-impl Drop for RawTerminalGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ =
-                unsafe { libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.original) };
-        }
     }
 }
 
@@ -1923,18 +1003,14 @@ impl Drop for RawTerminalGuard {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
-    use nix::sys::signal::{raise, Signal};
     use protocol::v1::execute_input::Message as ExecuteMessage;
     use tokio::sync::{watch, Mutex as AsyncMutex};
-    use tokio::time::timeout;
 
-    use crate::machine::session::{
-        apply_default_execution_user, execution_event_from_wire, forwardable_signals,
-        mark_execution_started, process_spec, ssh_shell_command, ExecutionControl, ExecutionEvent,
-        ExecutionLostReason, ExecutionOptions, ExecutionResult, HostSignalForwarders,
-        SshShellOptions, StdinMode,
+    use super::{
+        apply_default_execution_user, execution_event_from_wire, mark_execution_started,
+        process_spec, ExecutionControl, ExecutionControlState, ExecutionEvent, ExecutionLostReason,
+        ExecutionOptions, ExecutionResult, StdinMode,
     };
     use crate::machine::MachineUserConfig;
 
@@ -1953,6 +1029,7 @@ mod tests {
                 term: "xterm".to_string(),
                 initial_pty_size: None,
             },
+            true,
         );
         assert_eq!(spec.argv, ["program with spaces", "one two"]);
         assert_eq!(spec.environment[0].name, "KEY");
@@ -1973,6 +1050,7 @@ mod tests {
                 tty: true,
                 ..ExecutionOptions::default()
             },
+            false,
         );
         let Some(protocol::v1::process_spec::Stdio::Pty(pty)) = spec.stdio else {
             panic!("expected pty");
@@ -2020,25 +1098,27 @@ mod tests {
     #[tokio::test]
     async fn foreground_controls_follow_the_started_event_before_sending_input_or_resize() {
         let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
-        let started = Arc::new(AtomicBool::new(false));
         let control = ExecutionControl {
-            reference: "dev".to_string(),
-            requests: Arc::new(Mutex::new(Some(requests))),
-            input_open: Arc::new(AtomicBool::new(true)),
-            started: Arc::clone(&started),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin: true,
+            state: Arc::new(ExecutionControlState {
+                reference: "dev".to_string(),
+                requests: Mutex::new(Some(requests)),
+                input_open: AtomicBool::new(true),
+                started: AtomicBool::new(false),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: true,
+            }),
         };
+        let started = &control.state.started;
 
         assert!(control.stdin().is_none());
         assert!(control.write_stdin(b"before").await.is_err());
         assert!(control.resize_pty(24, 80).await.is_err());
         assert!(receiver.try_recv().is_err());
 
-        mark_execution_started(&ExecutionEvent::Accepted, &started);
+        mark_execution_started(&ExecutionEvent::Accepted, started);
         assert!(!started.load(Ordering::Acquire));
-        mark_execution_started(&ExecutionEvent::Started, &started);
+        mark_execution_started(&ExecutionEvent::Started, started);
         assert!(started.load(Ordering::Acquire));
 
         control
@@ -2065,13 +1145,15 @@ mod tests {
     async fn foreground_signal_closes_pending_request_and_forwards_only_after_started() {
         let (pending_requests, mut pending_receiver) = tokio::sync::mpsc::channel(1);
         let pending = ExecutionControl {
-            reference: "dev".to_string(),
-            requests: Arc::new(Mutex::new(Some(pending_requests))),
-            input_open: Arc::new(AtomicBool::new(true)),
-            started: Arc::new(AtomicBool::new(false)),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin: true,
+            state: Arc::new(ExecutionControlState {
+                reference: "dev".to_string(),
+                requests: Mutex::new(Some(pending_requests)),
+                input_open: AtomicBool::new(true),
+                started: AtomicBool::new(false),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: true,
+            }),
         };
 
         pending
@@ -2082,13 +1164,15 @@ mod tests {
 
         let (running_requests, mut running_receiver) = tokio::sync::mpsc::channel(1);
         let running = ExecutionControl {
-            reference: "dev".to_string(),
-            requests: Arc::new(Mutex::new(Some(running_requests))),
-            input_open: Arc::new(AtomicBool::new(true)),
-            started: Arc::new(AtomicBool::new(true)),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin: true,
+            state: Arc::new(ExecutionControlState {
+                reference: "dev".to_string(),
+                requests: Mutex::new(Some(running_requests)),
+                input_open: AtomicBool::new(true),
+                started: AtomicBool::new(true),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: true,
+            }),
         };
 
         running
@@ -2101,174 +1185,19 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn pty_signal_forwarding_is_explicit_and_maps_to_linux() {
-        let signals = forwardable_signals().collect::<Vec<_>>();
-        assert_eq!(
-            signals,
-            [
-                Signal::SIGHUP,
-                Signal::SIGINT,
-                Signal::SIGQUIT,
-                Signal::SIGTERM,
-                Signal::SIGUSR1,
-                Signal::SIGUSR2
-            ]
-        );
-        assert_eq!(
-            signals
-                .into_iter()
-                .map(crate::machine::session::guest_signal)
-                .collect::<Vec<_>>(),
-            [Some(1), Some(2), Some(3), Some(15), Some(10), Some(12)]
-        );
-    }
-
-    #[tokio::test]
-    async fn pty_signal_forwarder_receives_registered_host_signals() {
-        let mut forwarders = HostSignalForwarders::listen("dev", forwardable_signals())
-            .expect("register host signals");
-
-        raise(Signal::SIGUSR1).expect("raise SIGUSR1");
-        let signal = timeout(Duration::from_secs(1), forwarders.recv())
-            .await
-            .expect("receive SIGUSR1")
-            .expect("signal relay is open");
-
-        assert_eq!(signal, Signal::SIGUSR1);
-    }
-
-    #[test]
-    fn attachment_signal_actions_are_onstack_in_isolated_child() {
-        const CHILD: &str = "SILO_SIGNAL_ACTION_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "machine::session::tests::attachment_signal_actions_are_onstack_in_isolated_child", "--nocapture"])
-                .env(CHILD, "1")
-                .status().unwrap();
-            assert!(status.success());
-            return;
-        }
-        fn action(signal: Signal) -> libc::sigaction {
-            let mut action = unsafe { std::mem::zeroed() };
-            // nix::sigaction requires installing an action, and has no read-only query API.
-            assert_eq!(
-                unsafe { libc::sigaction(signal as i32, std::ptr::null(), &mut action) },
-                0
-            );
-            action
-        }
-        let untouched = [
-            Signal::SIGURG,
-            Signal::SIGPROF,
-            Signal::SIGPIPE,
-            Signal::SIGCHLD,
-            Signal::SIGSEGV,
-            Signal::SIGBUS,
-            Signal::SIGFPE,
-        ];
-        let before = untouched.map(action);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let snapshots = forwardable_signals()
-                .chain([Signal::SIGWINCH])
-                .map(|signal| (signal, action(signal)))
-                .collect::<Vec<_>>();
-            let (sender, receiver) = tokio::sync::mpsc::channel(4);
-            let mut external =
-                crate::machine::session::AttachmentSignals::new("isolated", Some(receiver), false)
-                    .unwrap();
-            sender
-                .send(crate::machine::session::AttachmentSignal::Interrupt)
-                .await
-                .unwrap();
-            assert_eq!(
-                external.recv().await,
-                Some(crate::machine::session::AttachmentSignal::Interrupt)
-            );
-            sender
-                .send(crate::machine::session::AttachmentSignal::WindowChange)
-                .await
-                .unwrap();
-            assert_eq!(
-                external.recv().await,
-                Some(crate::machine::session::AttachmentSignal::WindowChange)
-            );
-            drop(sender);
-            assert_eq!(external.recv().await, None);
-            drop(external);
-            for (signal, previous) in snapshots {
-                let current = action(signal);
-                assert_eq!(
-                    current.sa_sigaction, previous.sa_sigaction,
-                    "external source changed {signal}"
-                );
-                assert_eq!(
-                    current.sa_flags, previous.sa_flags,
-                    "external source changed {signal}"
-                );
-            }
-            for round in 0..3 {
-                for signal in forwardable_signals() {
-                    println!(
-                        "round={round} before {signal}: flags={:#x}",
-                        action(signal).sa_flags
-                    );
-                }
-                let mut forwarders =
-                    HostSignalForwarders::listen("isolated", forwardable_signals()).unwrap();
-                let resize =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-                        .unwrap();
-                for signal in forwardable_signals().chain([Signal::SIGWINCH]) {
-                    let current = action(signal);
-                    println!(
-                        "round={round} registered {signal}: flags={:#x}",
-                        current.sa_flags
-                    );
-                    assert_ne!(current.sa_flags & libc::SA_ONSTACK, 0);
-                }
-                raise(Signal::SIGUSR1).unwrap();
-                assert_eq!(
-                    timeout(Duration::from_secs(1), forwarders.recv())
-                        .await
-                        .unwrap(),
-                    Some(Signal::SIGUSR1)
-                );
-                drop(forwarders);
-                drop(resize);
-                tokio::task::yield_now().await;
-                for signal in forwardable_signals().chain([Signal::SIGWINCH]) {
-                    let current = action(signal);
-                    println!(
-                        "round={round} dropped {signal}: flags={:#x}",
-                        current.sa_flags
-                    );
-                    assert_ne!(current.sa_flags & libc::SA_ONSTACK, 0);
-                }
-                for (signal, previous) in untouched.into_iter().zip(before) {
-                    let current = action(signal);
-                    assert_eq!(current.sa_sigaction, previous.sa_sigaction, "{signal}");
-                    assert_eq!(current.sa_flags, previous.sa_flags, "{signal}");
-                }
-            }
-        });
-    }
-
     #[tokio::test]
     async fn vmm_execution_control_splits_large_stdin_without_losing_bytes() {
         let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
         let control = ExecutionControl {
-            reference: "dev".to_string(),
-            requests: Arc::new(Mutex::new(Some(requests))),
-            input_open: Arc::new(AtomicBool::new(true)),
-            started: Arc::new(AtomicBool::new(true)),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin: true,
+            state: Arc::new(ExecutionControlState {
+                reference: "dev".to_string(),
+                requests: Mutex::new(Some(requests)),
+                input_open: AtomicBool::new(true),
+                started: AtomicBool::new(true),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: true,
+            }),
         };
         let input = vec![7; protocol::CHUNK_64_KIB + 3];
 
@@ -2294,13 +1223,15 @@ mod tests {
     fn vmm_execution_control_hides_unavailable_stdin() {
         let (requests, _receiver) = tokio::sync::mpsc::channel(1);
         let control = ExecutionControl {
-            reference: "dev".to_string(),
-            requests: Arc::new(Mutex::new(Some(requests))),
-            input_open: Arc::new(AtomicBool::new(false)),
-            started: Arc::new(AtomicBool::new(true)),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin: false,
+            state: Arc::new(ExecutionControlState {
+                reference: "dev".to_string(),
+                requests: Mutex::new(Some(requests)),
+                input_open: AtomicBool::new(false),
+                started: AtomicBool::new(true),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: false,
+            }),
         };
 
         assert!(control.stdin().is_none());
@@ -2310,13 +1241,15 @@ mod tests {
     async fn concurrent_stdin_closes_publish_exactly_one_eof() {
         let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
         let control = ExecutionControl {
-            reference: "dev".to_string(),
-            requests: Arc::new(Mutex::new(Some(requests))),
-            input_open: Arc::new(AtomicBool::new(true)),
-            started: Arc::new(AtomicBool::new(true)),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin: true,
+            state: Arc::new(ExecutionControlState {
+                reference: "dev".to_string(),
+                requests: Mutex::new(Some(requests)),
+                input_open: AtomicBool::new(true),
+                started: AtomicBool::new(true),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: true,
+            }),
         };
         let stdin = control.stdin().expect("stdin writer");
 
@@ -2340,13 +1273,15 @@ mod tests {
             })
             .expect("fill request queue");
         let control = ExecutionControl {
-            reference: "dev".to_string(),
-            requests: Arc::new(Mutex::new(Some(requests))),
-            input_open: Arc::new(AtomicBool::new(true)),
-            started: Arc::new(AtomicBool::new(true)),
-            input_order: Arc::new(AsyncMutex::new(())),
-            request_closed: Arc::new(watch::channel(false).0),
-            pipe_stdin: true,
+            state: Arc::new(ExecutionControlState {
+                reference: "dev".to_string(),
+                requests: Mutex::new(Some(requests)),
+                input_open: AtomicBool::new(true),
+                started: AtomicBool::new(true),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: true,
+            }),
         };
         let pending = tokio::spawn({
             let control = control.clone();
@@ -2363,167 +1298,129 @@ mod tests {
         assert!(receiver.recv().await.is_none());
     }
 
-    #[test]
-    fn ssh_shell_rejects_environment_names_that_change_the_command() {
-        let mut options = SshShellOptions::default();
-        options
-            .env
-            .push(("GOOD; touch /tmp/nope".to_string(), "value".to_string()));
-
-        assert!(ssh_shell_command(&options).is_err());
+    fn live_control(
+        requests: tokio::sync::mpsc::Sender<protocol::v1::ExecuteInput>,
+    ) -> ExecutionControl {
+        ExecutionControl {
+            state: Arc::new(ExecutionControlState {
+                reference: "regression".into(),
+                requests: Mutex::new(Some(requests)),
+                input_open: AtomicBool::new(true),
+                started: AtomicBool::new(true),
+                input_order: AsyncMutex::new(()),
+                request_closed: watch::channel(false).0,
+                pipe_stdin: true,
+            }),
+        }
     }
 
-    async fn qualify_certificate_image(image_variable: &str, native: bool, external: bool) {
-        if std::env::var("SILO_E2E_KVM").as_deref() != Ok("1") {
-            eprintln!("SKIPPED phase5 {image_variable}: SILO_E2E_KVM=1 required");
-            return;
-        }
-        let (Some(root), Ok(image)) = (
-            std::env::var_os("SILO_TEST_RUNTIME_ROOT"),
-            std::env::var(image_variable),
-        ) else {
-            eprintln!("SKIPPED phase5: SILO_TEST_RUNTIME_ROOT and {image_variable} required");
-            return;
-        };
-        assert!(std::path::Path::new("/dev/kvm").exists());
-        let home = tempfile::tempdir().unwrap();
-        let runtime =
-            crate::Runtime::new(crate::RuntimeConfig::local(home.path()).with_runtime_root(root))
-                .await
-                .unwrap();
-        let stale = std::sync::Arc::new(ssh_key::PrivateKey::from(
-            ssh_key::private::Ed25519Keypair::from_seed(&[77; 32]),
-        ));
-        let userdata = format!("#!/bin/sh\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\nprintf '%s\\n' '{}' > /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\n", stale.public_key().to_openssh().unwrap());
-        let machine = runtime
-            .machine()
-            .name("phase5-cert")
-            .image(image)
-            .userdata(userdata)
-            .vsock(true)
-            .create()
-            .await
-            .unwrap();
-        let task_machine = machine.clone();
-        let mut task = tokio::spawn(async move {
-            let machine = task_machine;
-            let mut pin = None;
-            for _ in 0..2 {
-                machine.start().await.unwrap();
-                let ready = machine
-                    .wait_ready(std::time::Duration::from_secs(75))
-                    .await
-                    .unwrap();
-                assert_eq!(ready.outcome, crate::MachineReadinessOutcome::Ready);
-                if external {
-                    let monitor = machine.monitor_status().await.unwrap();
-                    let crate::MachineAgentStatus::Enabled(agent) = monitor.agent else {
-                        panic!("missing guest agent status");
-                    };
-                    assert_eq!(
-                        agent.status.unwrap().report.ssh.unwrap().backend,
-                        crate::MachineSshBackend::SystemdOpenSsh
-                    );
-                }
-                let data = machine.inspect().await.unwrap();
-                let key = utils::ssh::read_host_key_pin(&data.machine_dir).unwrap();
-                if let Some(previous) = &pin {
-                    assert_eq!(previous, key.key_data());
-                } else {
-                    pin = Some(key.key_data().clone());
-                }
-                let mut raw = russh::client::connect_stream(
-                    std::sync::Arc::new(Default::default()),
-                    machine.open_shell_stream().await.unwrap(),
-                    crate::machine::session::SshClientHandler {
-                        agent_socket: None,
-                        expected_key: key,
-                    },
-                )
-                .await
-                .unwrap();
-                assert!(!raw
-                    .authenticate_publickey(
-                        "root",
-                        russh::keys::PrivateKeyWithHashAlg::new(stale.clone(), None)
-                    )
-                    .await
-                    .unwrap()
-                    .success());
-                raw.disconnect(russh::Disconnect::ByApplication, "negative control", "en")
-                    .await
-                    .unwrap();
-                let client = machine
-                    .connect_guest_ssh("phase5-cert", Some("root"), false)
-                    .await
-                    .unwrap();
-                let mut channel = client.handle.channel_open_session().await.unwrap();
-                channel
-                    .exec(true, "printf certificate-session")
-                    .await
-                    .unwrap();
-                let mut output = Vec::new();
-                while let Some(message) = channel.wait().await {
-                    if let russh::ChannelMsg::Data { data } = message {
-                        output.extend_from_slice(&data);
-                    }
-                }
-                assert_eq!(output, b"certificate-session");
-                client
-                    .handle
-                    .disconnect(russh::Disconnect::ByApplication, "done", "en")
-                    .await
-                    .unwrap();
-                if !native {
-                    let log = machine
-                        .exec(
-                            "sh",
-                            [
-                                "-c",
-                                "journalctl --no-pager -b | grep 'silo:cli:' | grep 'CA ED25519'",
-                            ],
-                        )
-                        .await
-                        .unwrap();
-                    assert!(log.stdout().unwrap().contains("silo:cli:"));
-                }
-                machine.stop().await.unwrap();
-            }
+    #[tokio::test]
+    async fn binary_live_write_and_concurrent_eof_preserve_whole_input_order() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+        let control = live_control(requests);
+        let input: Vec<u8> = (0..3 * protocol::CHUNK_64_KIB + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let writer = tokio::spawn({
+            let control = control.clone();
+            let input = input.clone();
+            async move { control.write_stdin(input).await }
         });
-        let result = tokio::time::timeout(std::time::Duration::from_secs(210), &mut task).await;
-        if result.is_err() {
-            task.abort();
-            let _ = task.await;
+        let first = receiver.recv().await.unwrap();
+        let closer = tokio::spawn({
+            let stdin = control.stdin().unwrap();
+            async move { stdin.close().await }
+        });
+        let Some(ExecuteMessage::StdinData(first)) = first.message else {
+            panic!("write must precede EOF");
+        };
+        let mut received = first.data.to_vec();
+        loop {
+            match receiver.recv().await.unwrap().message.unwrap() {
+                ExecuteMessage::StdinData(data) => {
+                    assert!(data.data.len() <= protocol::CHUNK_64_KIB);
+                    received.extend_from_slice(&data.data);
+                }
+                ExecuteMessage::CloseStdin(_) => break,
+                _ => panic!("unexpected request"),
+            }
         }
-        let _ = machine
-            .stop_with(
-                crate::MachineStopOptions::new()
-                    .force_after_timeout(std::time::Duration::from_secs(20)),
-            )
-            .await;
-        machine.remove().await.unwrap();
-        result.unwrap().unwrap();
+        writer.await.unwrap().unwrap();
+        closer.await.unwrap().unwrap();
+        assert_eq!(received, input);
+        assert!(control.close_stdin().await.is_err());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn phase5_fedora_certificate_guest() {
-        qualify_certificate_image("SILO_TEST_SSH_FEDORA_IMAGE", false, false).await;
-    }
-    #[tokio::test]
-    async fn phase5_arch_certificate_guest() {
-        qualify_certificate_image("SILO_TEST_SSH_ARCH_IMAGE", false, false).await;
-    }
-    #[tokio::test]
-    async fn phase5_ubuntu_certificate_guest() {
-        qualify_certificate_image("SILO_TEST_SSH_UBUNTU_IMAGE", false, false).await;
-    }
-    #[tokio::test]
-    async fn phase5_system_certificate_guest() {
-        qualify_certificate_image("SILO_TEST_SSH_SYSTEM_IMAGE", true, false).await;
+    async fn preloaded_binary_input_is_chunked_before_one_eof() {
+        for input in [
+            Vec::new(),
+            (0..3 * protocol::CHUNK_64_KIB + 19)
+                .map(|index| (index % 256) as u8)
+                .collect(),
+        ] {
+            let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+            let sender = tokio::spawn({
+                let input = input.clone();
+                async move { super::send_initial_stdin(&requests, "preload", input, true).await }
+            });
+            let mut received = Vec::new();
+            let mut eof = 0;
+            while let Some(request) = receiver.recv().await {
+                match request.message.unwrap() {
+                    ExecuteMessage::StdinData(data) => {
+                        assert!(!data.data.is_empty());
+                        assert!(data.data.len() <= protocol::CHUNK_64_KIB);
+                        received.extend_from_slice(&data.data);
+                    }
+                    ExecuteMessage::CloseStdin(_) => eof += 1,
+                    _ => panic!("unexpected initial input"),
+                }
+            }
+            sender.await.unwrap().unwrap();
+            assert_eq!(received, input);
+            assert_eq!(eof, 1);
+        }
     }
 
     #[tokio::test]
-    async fn phase5_systemd_owned_certificate_guest() {
-        qualify_certificate_image("SILO_TEST_SSH_SYSTEMD_IMAGE", false, true).await;
+    async fn session_drop_invalidates_surviving_controls_and_wakes_queued_write() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+        let control = live_control(requests);
+        let stdin = control.stdin().unwrap();
+        control.write_stdin(Vec::new()).await.unwrap();
+        let pending = tokio::spawn({
+            let stdin = stdin.clone();
+            async move { stdin.write(vec![9]).await }
+        });
+        tokio::task::yield_now().await;
+        drop(super::ExecutionSession {
+            control: control.clone(),
+            events: None,
+        });
+        assert!(pending.await.unwrap().is_err());
+        assert!(stdin.write(Vec::new()).await.is_err());
+        assert!(stdin.close().await.is_err());
+        assert!(control.resize_pty(24, 80).await.is_err());
+        assert!(control.signal(15).await.is_err());
+        assert!(control.stdin().is_none());
+        let Some(ExecuteMessage::StdinData(data)) = receiver.recv().await.unwrap().message else {
+            panic!("expected live empty write");
+        };
+        assert!(data.data.is_empty());
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_prestart_signal_does_not_close_requests() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+        let control = live_control(requests);
+        control.state.started.store(false, Ordering::Release);
+        assert!(control.signal(0).await.is_err());
+        assert!(control.signal(65).await.is_err());
+        assert!(receiver.try_recv().is_err());
+        control.signal(15).await.unwrap();
+        assert!(receiver.recv().await.is_none());
     }
 }

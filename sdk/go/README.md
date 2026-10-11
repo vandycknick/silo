@@ -115,12 +115,84 @@ to private networks. SDK session-scoped forward handles are not yet exposed.
 
 ## Execution
 
+| Family | Transport | Result |
+|---|---|---|
+| `Exec(ctx, program, args, ...)` | Agent RPC, literal argv | `ExecutionOutput` |
+| `Spawn(ctx, program, args, ...)` | Agent RPC, caller-driven stream/optional PTY | `ExecutionSession` |
+| `ExecScript(ctx, script, ...)` | Agent RPC, `/bin/sh -l -c` | `ExecutionOutput` |
+| `Shell(ctx, ...SSHShellOption)` | Pinned certificate SSH login over vsock 22 | `SSHExitStatus` |
+
+```go
+literal, err := machine.Exec(ctx, "/usr/bin/printf", []string{"%s\\n", "$HOME"})
+if err != nil { return err }
+fmt.Print(literal.Stdout()) // prints literal $HOME, not its expansion
+script, err := machine.ExecScript(ctx, `printf '%s\n' "$HOME" | cat`)
+if err != nil { return err }
+fmt.Print(script.Stdout())
+```
+
+`ExecScript` invokes a login shell, including its startup files. Do not
+concatenate untrusted input into a script; callers own shell-injection safety.
+The execution timeout option applies to collected execution after startup;
+Spawn does not gain a deadline from it. See [streaming example](examples/streaming)
+for the required Started-before-stdin gate, pipe EOF and terminal outcome.
+`Wait` discards output, `Collect` buffers it, and neither reconnects a session.
+Cancel/Close invalidate surviving controls and input handles.
+
+`Shell(ctx, WithSSHUser("silo"), WithSSHTerm("xterm-256color"))` is a local
+interactive login. It requires a Running/non-stopping VM, an existing immutable
+host-key pin, vsock-22 transport, and accepted user certificate. Already-pinned
+SSH does not require fresh agent readiness; outage access requires an
+independently owned guest SSH listener. Working-directory/environment options
+use the existing quoted exec wrapper (cwd is best effort), not AcceptEnv.
+
+### Supplied shell I/O
+
+[examples/shell](examples/shell) is a runnable finite-input example against an
+already-running machine. It does not provision or stop that VM.
+
+```go
+status, err := machine.Shell(ctx, silo.WithSSHTerm("xterm-256color"),
+    silo.WithShellAttachment(silo.SSHShellAttachment{
+        Rows: 37, Columns: 119,
+        Input: func(inputCtx context.Context) io.Reader {
+            // A finite strings.Reader cannot block, so cancellation adaptation
+            // is unnecessary. Blocking readers MUST unblock on inputCtx cancel.
+            return strings.NewReader("printf '%s\\n' \"$USER\"; exit 7\n")
+        },
+        Stdout: sink, Stderr: sink, // SSHShellWriter, cancellation-cooperative
+    }))
+if err != nil { return err }
+fmt.Printf("SSH exit: %d\n", status.Code)
+```
+
+Rows/columns must be nonzero. Nil input is EOF, nil output is discard, and nil
+controls disables controls. `SSHShellResize` sends dimensions;
+`SSHShellSendSignal` sends one of the supported Linux `SSHShell*` signals.
+Supplied bytes are transparent (including Ctrl+]); no host stdio, termios,
+terminal-size queries or signal subscriptions are used. Explicit detach keys
+cannot be combined with a supplied attachment. TERM is configured only through
+`WithSSHTerm`. Channel EOF is not Ctrl-D and is not cancellation: send a command
+that exits to finish a login shell. Signal exits currently map to code 128;
+local detach maps to success.
+
+Input is constructed once under a child context. Its reader and output
+`WriteContext` callbacks MUST return when their respective contexts are canceled.
+The SDK does not promise to interrupt arbitrary Go syscalls and provides no
+automatic goroutine-based Reader/Writer adapter. Both native output pipes are
+read concurrently; sink calls are serialized (one non-thread-safe sink is safe)
+with per-stream order and no cross-stream order guarantee. Success stops and
+joins input/control, then drains output under a separate live context. Parent
+cancellation remains effective during drain; failure cancels/joins all workers.
+Borrowed outer SSH sessions and process stdio are never closed by success.
+
+
 Machine creation provisions no guest account unless `WithGuestUser` is supplied.
 Default sessions use root when `MachineData.GuestUser` is nil, or the machine's
 persisted account when present. Session-level user options override that default.
 Existing machines retain their stored account. See [explicit guest provisioning](examples/guest-user.md).
 
-Non-zero guest exit status is an `ExecutionResult`, not a Go error. Errors report validation, transport, runtime, or lifecycle failures. Output byte methods preserve arbitrary bytes; string methods perform ordinary Go byte-to-string conversion.
+Non-zero RPC exit status is an `ExecutionResult`, and non-zero SSH exit status is an `SSHExitStatus`, not a Go error. Errors report validation, transport, runtime, or lifecycle failures. Output byte methods preserve arbitrary bytes; string methods perform ordinary Go byte-to-string conversion.
 
 Streaming `Recv` methods return `io.EOF` at the finite end. Only one `Recv`, `Wait`, or `Collect` may be active for an execution session. Closing a session or stream unblocks its active receiver. Lifecycle and image mutations observe context cancellation before entering native work, then run to completion because those `libvm` futures are not yet documented as cancellation-safe.
 
@@ -160,14 +232,12 @@ available without loading the bridge.
 `VerifiedNativeABIVersion()` loads and checks the exact product/ABI and returns
 the actual bridge ABI without opening a runtime or starting a VM.
 
-The attachment contract also requires
-`silo_attachment_cancellation_signal`. Go owns the scoped signal subscription and
-forwards supported notifications through the token's native channel. Each Attach
-or AttachShell temporarily enables forwarding of inherited ignored signals and
-restores those dispositions on return, while preserving application subscribers.
-The Go path installs no cached Tokio process handlers; standalone Rust attachments
-retain their narrow native-listener mode. Cancellation joins the native call before
-freeing its token or restoring the Go subscription.
+Local `Shell` requires `silo_attachment_cancellation_signal`. Go owns scoped
+HUP/INT/QUIT/TERM/WINCH subscriptions and restores inherited ignored dispositions
+without removing application subscribers. No cached Tokio process handlers are
+installed. Cancellation awaits native transport cleanup before freeing the token
+or restoring subscriptions. Supplied Shell uses the bounded attachment exports
+instead and never subscribes to host signals.
 
 ## Stateless CLI creation planning
 

@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,8 +18,6 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/credentials"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"tailscale.com/client/local"
-	"tailscale.com/ipn"
-	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -69,6 +66,7 @@ type Node struct {
 	dial                func(context.Context, netip.AddrPort) (net.Conn, error)
 	running             bool
 	suffix, fingerprint string
+	published           *Snapshot
 	short               map[string]string
 	fullNames           map[string]struct{}
 	knownShort          map[string]struct{}
@@ -178,12 +176,13 @@ func (n *Node) run(ctx context.Context) {
 	defer close(n.done)
 	defer func() {
 		n.mu.Lock()
-		defer n.mu.Unlock()
+		// Snapshot construction reads state; publication owns its own lock.
 		v := n.snapshot(nil)
 		v.State = "stopped"
 		if ctx.Err() == nil {
 			v.State, v.ErrorCode = "failed", "node_start_failed"
 		}
+		n.mu.Unlock()
 		n.publish(v)
 	}()
 	if ctx.Err() != nil {
@@ -222,165 +221,19 @@ func (n *Node) run(ctx context.Context) {
 			defer closeDoor()
 		}
 	}
-	watchDone := make(chan struct{})
-	n.authenticate(ctx, client)
-	go func() { defer close(watchDone); n.watch(ctx, client) }()
-	defer func() { <-watchDone }()
+	changes := newObservationChanges()
+	actions := make(chan statusObservation, 1)
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	watchDone, actionsDone := make(chan struct{}), make(chan struct{})
+	go func() { defer close(watchDone); n.watch(workerCtx, client, changes) }()
+	go func() { defer close(actionsDone); n.runActions(workerCtx, client, actions) }()
+	defer func() {
+		cancelWorkers()
+		<-watchDone
+		<-actionsDone
+	}()
 	slog.Info("tailscale guest IPv6 transport unavailable", "guest_stack", "IPv4 only")
-	for {
-		upCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, upErr := n.server.Up(upCtx)
-		cancel()
-		if upErr == nil {
-			dial, err := strictDialer(n.server)
-			if err == nil {
-				n.mu.Lock()
-				n.dial = dial
-				n.mu.Unlock()
-			} else {
-				slog.Warn("tailscale strict adapter unavailable", "error", err)
-			}
-		}
-		n.refresh(ctx, client)
-		n.maintain(ctx, client)
-		if upErr != nil && ctx.Err() == nil {
-			slog.Debug("tailscale disconnected", "error", upErr)
-		}
-		timer := time.NewTimer(15 * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			n.observe(nil)
-			return
-		case <-timer.C:
-			n.authenticate(ctx, client)
-		}
-	}
-}
-
-func (n *Node) observe(s *ipnstate.Status) {
-	short := make(map[string]string)
-	full := make(map[string]struct{})
-	suffix := ""
-	running := s != nil && s.BackendState == "Running" && n.options.Identity.verify(s, n.options.Declaration.Hostname) == nil
-	parts := []string{fmt.Sprint(running)}
-	if s != nil {
-		if s.CurrentTailnet != nil {
-			suffix = strings.ToLower(strings.TrimSuffix(s.CurrentTailnet.MagicDNSSuffix, "."))
-		}
-		parts = append(parts, suffix)
-		if s.Self != nil {
-			parts = append(parts, fmt.Sprint(s.Self.ID, s.Self.TailscaleIPs))
-		}
-		for _, p := range s.Peer {
-			if p == nil {
-				continue
-			}
-			name := strings.ToLower(strings.TrimSuffix(p.DNSName, "."))
-			if name == "" {
-				continue
-			}
-			label, _, _ := strings.Cut(name, ".")
-			if len(full) < 4096 {
-				full[name] = struct{}{}
-			}
-			if _, ok := short[label]; ok {
-				short[label] = ""
-			} else if len(short) < 4096 {
-				short[label] = name
-			}
-			parts = append(parts, fmt.Sprint(name, p.TailscaleIPs, p.Online))
-		}
-	}
-	sort.Strings(parts)
-	fingerprint := strings.Join(parts, "|")
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.fingerprint != fingerprint {
-		// Invalidate positive provenance, but keep still-cacheable addresses
-		// classified until their original TTL expires. A guest's cached answer
-		// must not become a direct-host route on disconnect or peer removal.
-		n.pruneAddresses(time.Now())
-		for ip, until := range n.provenance {
-			if until.After(n.quarantined[ip]) {
-				n.quarantined[ip] = until
-			}
-		}
-		clear(n.provenance)
-		n.fingerprint = fingerprint
-	}
-	n.short = short
-	n.fullNames = full
-	// A disappeared peer or disconnected status must not turn a known short
-	// name into a host DNS query. Retain bounded negative classification, while
-	// address provenance is invalidated above. Exhaustion fails DNS closed.
-	for name := range short {
-		if _, known := n.knownShort[name]; !known {
-			if len(n.knownShort) < 4096 {
-				n.knownShort[name] = struct{}{}
-			} else {
-				n.classificationFull = true
-			}
-		}
-	}
-	if len(short) == 4096 || len(full) == 4096 {
-		n.classificationFull = true
-	}
-	if suffix != "" {
-		if _, known := n.knownSuffixes[suffix]; !known {
-			if len(n.knownSuffixes) < 32 {
-				n.knownSuffixes[suffix] = struct{}{}
-			} else {
-				n.classificationFull = true
-			}
-		}
-	}
-	n.suffix = suffix
-	n.running = running
-	n.observeCertificateIdentityLocked(s)
-	n.publish(n.snapshot(s))
-}
-
-func (n *Node) watch(ctx context.Context, client *local.Client) {
-	for ctx.Err() == nil {
-		watcher, err := client.WatchIPNBus(ctx, ipn.NotifyInitialState|ipn.NotifyInitialNetMap)
-		if err == nil {
-			for {
-				_, err = watcher.Next()
-				if err != nil {
-					break
-				}
-				n.refresh(ctx, client)
-			}
-			_ = watcher.Close()
-		}
-		n.observe(nil)
-		timer := time.NewTimer(time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
-}
-
-// Serialize sampling as well as publication: a slow periodic query must not
-// overwrite a newer notification's identity observation or approval URL.
-func (n *Node) refresh(ctx context.Context, client *local.Client) {
-	n.observationMu.Lock()
-	defer n.observationMu.Unlock()
-	bounded, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	status, err := client.Status(bounded)
-	if err != nil {
-		n.observe(nil)
-		return
-	}
-	n.observe(status)
-	if status != nil {
-		slog.Debug("tailscale state", "state", status.BackendState)
-	}
+	n.runObservations(workerCtx, client, changes, actions)
 }
 
 func InRange(ip netip.Addr) bool {

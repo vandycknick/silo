@@ -1,23 +1,4 @@
-//! Rust library boundary for managing Silo virtual machines.
-//!
-//! `Runtime` is the service entry point. It creates or resolves machines and
-//! returns `Machine` handles for lifecycle and stream operations. Read output is
-//! returned as owned `MachineData` snapshots so callers do not depend on
-//! internal persistence models.
-//!
-//! ```rust,no_run
-//! use libvm::{MachineRef, Runtime};
-//!
-//! #[tokio::main(flavor = "current_thread")]
-//! async fn main() -> Result<(), libvm::LibVmError> {
-//!     let runtime = Runtime::from_env().await?;
-//!     let machine = runtime.get_machine(&MachineRef::parse("devbox")?).await?;
-//!     let data = machine.inspect().await?;
-//!
-//!     println!("{} is {:?}", data.name, data.status);
-//!     Ok(())
-//! }
-//! ```
+#![doc = include_str!("../README.md")]
 
 mod constants;
 mod error;
@@ -77,8 +58,9 @@ pub use crate::machine::{
     MachineSshBackend, MachineSshListenerReport, MachineStaleReason, MachineStart,
     MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineTailscale,
     MachineUpdate, MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState,
-    MachineWaitOptions, Memory, NetworkPolicyUpdate, ProcessConfig, SshExitStatus, SshShellOptions,
-    SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineWaitOptions, Memory, NetworkPolicyUpdate, ProcessConfig, SshExitStatus,
+    SshShellAttachment, SshShellControl, SshShellOptions, SshShellOptionsBuilder, SshShellSignal,
+    StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,

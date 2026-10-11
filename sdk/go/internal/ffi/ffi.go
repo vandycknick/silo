@@ -283,9 +283,9 @@ func (machine *Machine) Exec(request []byte) (*ExecutionOutput, error) {
 	}
 	return copyExecutionOutput(output), nil
 }
-func (machine *Machine) Shell(request []byte) (*ExecutionOutput, error) {
+func (machine *Machine) ExecScript(request []byte) (*ExecutionOutput, error) {
 	var output C.silo_execution_output
-	if err := takeError(C.bridge_machine_shell(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+	if err := takeError(C.bridge_machine_exec_script(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
 		return nil, err
 	}
 	return copyExecutionOutput(output), nil
@@ -300,20 +300,52 @@ func (machine *Machine) Spawn(request []byte) (*Execution, error) {
 	}
 	return &Execution{pointer: output}, nil
 }
-func (machine *Machine) Attach(request []byte, token *AttachmentCancellation) ([]byte, error) {
+func (machine *Machine) Shell(request []byte, token *AttachmentCancellation, attachment *SshAttachment) ([]byte, error) {
 	var output C.silo_buffer
-	if err := takeError(C.bridge_machine_attach_cancellable(machine.pointer, bytePointer(request), C.size_t(len(request)), token.pointer, &output)); err != nil {
+	var handle *C.SshAttachmentHandle
+	if attachment != nil {
+		handle = attachment.pointer
+	}
+	if err := takeError(C.bridge_machine_shell_cancellable(machine.pointer, bytePointer(request), C.size_t(len(request)), token.pointer, handle, &output)); err != nil {
 		return nil, err
 	}
 	return copyBuffer(output), nil
 }
-func (machine *Machine) AttachShell(request []byte, token *AttachmentCancellation) ([]byte, error) {
-	var output C.silo_buffer
-	if err := takeError(C.bridge_machine_attach_shell_cancellable(machine.pointer, bytePointer(request), C.size_t(len(request)), token.pointer, &output)); err != nil {
+
+type SshAttachment struct{ pointer *C.SshAttachmentHandle }
+
+func (machine *Machine) NewSshAttachment(token *AttachmentCancellation, rows, columns uint16) (*SshAttachment, error) {
+	var handle *C.SshAttachmentHandle
+	if err := takeError(C.bridge_ssh_attachment_new(machine.pointer, token.pointer, C.uint16_t(rows), C.uint16_t(columns), &handle)); err != nil {
 		return nil, err
 	}
-	return copyBuffer(output), nil
+	if handle == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil SSH attachment")
+	}
+	return &SshAttachment{pointer: handle}, nil
 }
+func (h *SshAttachment) Write(data []byte) error {
+	return takeError(C.bridge_ssh_attachment_write(h.pointer, bytePointer(data), C.size_t(len(data))))
+}
+func (h *SshAttachment) CloseStdin() error {
+	return takeError(C.bridge_ssh_attachment_close_stdin(h.pointer))
+}
+func (h *SshAttachment) Read(stderr bool) ([]byte, bool, error) {
+	var buffer C.silo_buffer
+	var eof C.bool
+	if err := takeError(C.bridge_ssh_attachment_read(h.pointer, C.bool(stderr), &buffer, &eof)); err != nil {
+		return nil, false, err
+	}
+	return copyBuffer(buffer), bool(eof), nil
+}
+func (h *SshAttachment) Resize(rows, columns uint16) error {
+	return takeError(C.bridge_ssh_attachment_resize(h.pointer, C.uint16_t(rows), C.uint16_t(columns)))
+}
+func (h *SshAttachment) Signal(signal uint32) error {
+	return takeError(C.bridge_ssh_attachment_signal(h.pointer, C.uint32_t(signal)))
+}
+func (h *SshAttachment) Cancel() error { return takeError(C.bridge_ssh_attachment_cancel(h.pointer)) }
+func (h *SshAttachment) Close()        { C.bridge_ssh_attachment_free(h.pointer); h.pointer = nil }
 
 func (machine *Machine) Logs(request []byte) (*Log, error) {
 	var output *C.silo_log

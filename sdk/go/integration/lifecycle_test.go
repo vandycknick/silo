@@ -61,13 +61,6 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	if result.Kind != silo.ExecutionResultExited || result.Code == nil || *result.Code != 7 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	attachStatus, err := machine.Attach(ctx, "/bin/true", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if attachStatus.Kind != silo.ExecutionResultExited || attachStatus.Code == nil || *attachStatus.Code != 0 {
-		t.Fatalf("unexpected attach result: %#v", attachStatus)
-	}
 	session, err := machine.Spawn(ctx, "/bin/cat", nil, silo.WithExecStdinPipe())
 	if err != nil {
 		t.Fatal(err)

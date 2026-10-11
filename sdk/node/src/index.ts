@@ -77,4 +77,7 @@ export {
   type RuntimeOpenOptions,
   type SshExitStatus,
   type SshShellOptions,
+  type SshShellAttachment,
+  type SshShellControl,
+  type SshShellSignal,
 } from "./types.js";

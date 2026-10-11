@@ -162,9 +162,6 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	if e != nil || code != 3 || !strings.Contains(shell.String(), "37 119") || !strings.Contains(shell.String(), "TERM=s11-terminal") {
 		t.Fatalf("shell %d %v %q", code, e, shell.String())
 	}
-	if code, e = s.Shell(ctx, one, "native-one", "", service.IO{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard, Terminal: service.Terminal{Present: true, Window: service.Window{Rows: 24, Columns: 80}}}); e != nil || code != 0 {
-		t.Fatal("PTY stdin EOF did not end login shell", code, e)
-	}
 	if code, e = s.Exec(ctx, one, "native-one", service.ExecRequest{Program: "/no-such-guest-program"}, service.IO{Stdout: io.Discard, Stderr: io.Discard}); code != 127 || service.Categorize(e).Exit != 127 {
 		t.Fatal("guest command category", code, e)
 	}

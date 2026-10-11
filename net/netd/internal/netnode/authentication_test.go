@@ -66,7 +66,7 @@ func TestPersistedIdentityDoesNotRedeemBootstrapAgain(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	n.authenticate(ctx, client)
+	n.authenticate(ctx, client, nil)
 	if !n.bootstrapDone || !n.lastLogin.IsZero() {
 		t.Fatal("persisted identity caused a bootstrap attempt")
 	}

@@ -256,8 +256,15 @@ func writeSnapshot(dir string, snapshot Snapshot) error {
 	return root.Rename(temp, name)
 }
 
-// Caller serializes publication with node observations using n.mu.
 func (n *Node) publish(snapshot Snapshot) {
+	n.observationMu.Lock()
+	defer n.observationMu.Unlock()
+	n.publishObservation(snapshot)
+}
+
+// observationMu serializes publication; disk I/O never holds the traffic lock.
+func (n *Node) publishObservation(snapshot Snapshot) {
+	n.mu.Lock()
 	if (snapshot.State == "ready" || snapshot.ErrorCode == "key_expired") && snapshot.NodeID != "" && snapshot.DNSName != "" && snapshot.KeyExpiryKnown {
 		o := &Observation{ObservedAt: snapshot.ObservedAt, NodeID: snapshot.NodeID, DNSName: snapshot.DNSName, Tags: slices.Clone(snapshot.Tags), KeyExpiry: snapshot.KeyExpiry}
 		if n.options.Identity != nil {
@@ -268,12 +275,41 @@ func (n *Node) publish(snapshot Snapshot) {
 		n.lastKnown = nil
 	}
 	snapshot.LastKnown = n.lastKnown
+	n.mu.Unlock()
+	if n.published != nil && sameSnapshotState(snapshot, *n.published) &&
+		snapshot.ObservedAt.Sub(n.published.ObservedAt) < observationInterval {
+		return
+	}
 	if n.options.VMID == "" || n.options.RunID == "" {
 		return
 	}
 	if err := writeSnapshot(n.options.Dir, snapshot); err != nil {
 		slog.Warn("tailscale status unavailable", "error", err)
+		return
 	}
+	n.published = &snapshot
+}
+
+func sameSnapshotState(a, b Snapshot) bool {
+	if a.Version != b.Version || a.VMID != b.VMID || a.RunID != b.RunID ||
+		a.State != b.State || a.ApprovalURL != b.ApprovalURL || a.NodeID != b.NodeID ||
+		a.DNSName != b.DNSName || a.ErrorCode != b.ErrorCode || a.KeyExpiryKnown != b.KeyExpiryKnown ||
+		!slices.Equal(a.Tags, b.Tags) || !slices.Equal(a.Addresses, b.Addresses) || !sameExpiry(a.KeyExpiry, b.KeyExpiry) {
+		return false
+	}
+	x, y := a.LastKnown, b.LastKnown
+	if x == nil || y == nil {
+		return x == y
+	}
+	return x.Owner == y.Owner && x.Tailnet == y.Tailnet && x.NodeID == y.NodeID &&
+		x.DNSName == y.DNSName && slices.Equal(x.Tags, y.Tags) && sameExpiry(x.KeyExpiry, y.KeyExpiry)
+}
+
+func sameExpiry(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
 }
 
 // Restore only historical display metadata, not connection state or auth URLs.

@@ -131,7 +131,7 @@ func TestPhase7RealNativeKVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err = machine.Shell(ctx, `/bin/id -u`, silo.WithExecTTY(true), silo.WithExecInitialPTYSize(24, 80), silo.WithExecTerm("dumb"))
+	output, err = machine.ExecScript(ctx, `/bin/id -u`, silo.WithExecTTY(true), silo.WithExecInitialPTYSize(24, 80), silo.WithExecTerm("dumb"))
 	if err != nil || !strings.Contains(output.TerminalOutput(), "1000") {
 		t.Fatalf("second boot user execution: %v %v", output, err)
 	}

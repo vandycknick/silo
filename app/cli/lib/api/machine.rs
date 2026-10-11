@@ -231,12 +231,12 @@ impl AppMachine {
             })
     }
 
-    pub(crate) async fn attach_shell(
+    pub(crate) async fn shell(
         &self,
         user: Option<&str>,
         forward_agent: bool,
     ) -> eyre::Result<SshExitStatus> {
-        crate::api::streams::attach_shell(self, user, forward_agent).await
+        crate::api::streams::shell(self, user, forward_agent).await
     }
 }
 

@@ -10,7 +10,7 @@ use eyre::{ensure, eyre, Result};
 use libvm::{
     ExecutionResult, ImageSource, Machine, MachineAgentStatus, MachineFreshness,
     MachineMonitorStatus, MachineSshBackend, MachineStopOptions, MachineUserConfig, Memory,
-    Runtime, RuntimeConfig,
+    Runtime, RuntimeConfig, SshShellAttachment,
 };
 use tokio::time::Instant;
 
@@ -221,19 +221,34 @@ journalctl -b -u sshd-vsock.socket --no-pager
     inspect_listener(machine, case, evidence).await?;
     // Exercise libvm's real pin check and certificate authentication, outside the idle window.
     // A test-only shell exits without needing interactive terminal input.
-    let (_signals, receiver) = tokio::sync::mpsc::channel(1);
-    let login = tokio::time::timeout(
-        Duration::from_secs(15),
-        machine.attach_shell_with_signals(
-            |options| {
-                options
-                    .user("root")
-                    .env("SHELL", "/run/silo-test-certificate-login")
-            },
-            receiver,
-        ),
-    )
-    .await??;
+    let attachment = SshShellAttachment::new(
+        tokio::io::empty(),
+        tokio::io::sink(),
+        tokio::io::sink(),
+        37,
+        119,
+    );
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let mut shell = std::pin::pin!(machine.shell_with(|options| {
+        options
+            .user("root")
+            .term("xterm-256color")
+            .env("SHELL", "/run/silo-test-certificate-login")
+            .attachment(attachment)
+            .cancellation(cancellation.clone())
+    }));
+    let login = match tokio::time::timeout(Duration::from_secs(15), &mut shell).await {
+        Ok(result) => result?,
+        Err(_) => {
+            cancellation.cancel();
+            let _ = shell.await;
+            return Err(eyre!("certificate SSH login exceeded 15 seconds"));
+        }
+    };
+    ensure!(
+        !cancellation.is_cancelled(),
+        "successful shell cancelled caller token"
+    );
     ensure!(
         login.success && login.code == 0,
         "certificate SSH failed: {login:?}"

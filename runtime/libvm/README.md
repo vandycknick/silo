@@ -8,6 +8,19 @@ Use it when you need to create, resolve, inspect, start, stop, restart, or
 remove Silo VMs from Rust code. The crate keeps database rows, runtime state
 files, image materialization, and monitor processes behind the API boundary.
 
+Choose an operation by intent, not by whether its output looks like a terminal:
+
+| Rust API | Transport | Purpose | Result |
+| --- | --- | --- | --- |
+| `exec` / `exec_with` | Agent RPC | One program with literal argv | Collected `ExecutionOutput` |
+| `spawn` / `spawn_with` | Agent RPC | Streaming program, optionally a PTY | Owned `ExecutionSession` |
+| `exec_script` / `exec_script_with` | Agent RPC | `/bin/sh -l -c SCRIPT` convenience | Collected `ExecutionOutput` |
+| `shell` / `shell_with` | SSH over vsock 22 | Login shell, local or caller-supplied I/O | `SshExitStatus` |
+
+Go uses `Exec`, `Spawn`, `ExecScript`, `Shell`; Node uses `exec`, `spawn`,
+`execScript`, `shell`. `shell` never accepts a script string. Use `spawn` with
+`tty(true)` for an interactive **program** over the agent, not an SSH login.
+
 ```rust,no_run
 use libvm::{Memory, Runtime};
 
@@ -86,6 +99,240 @@ read it from `MachineData::process`.
 The process configuration does not turn an ordinary `start` into a workload
 launch. It lets higher-level callers retain and resolve their intended process
 without reconstructing image metadata.
+
+## Execution
+
+The following examples operate on an already-running machine. None creates,
+stops or removes it. Resolve by name or immutable ID:
+
+```rust,no_run
+use libvm::{MachineRef, Runtime};
+
+# async fn example() -> Result<(), libvm::LibVmError> {
+let runtime = Runtime::from_env().await?;
+let machine = runtime.get_machine(&MachineRef::parse("devbox")?).await?;
+let output = machine.exec("/usr/bin/printf", ["%s\n", "$HOME"]).await?;
+assert_eq!(output.stdout_bytes(), b"$HOME\n");
+# Ok(())
+# }
+```
+
+`exec` sends explicit argv. It does not expand variables, pipelines, wildcards
+or redirections. A nonzero guest exit is an `ExecutionResult`, not a transport
+error; inspect `output.result()` as well as the returned Rust `Result`.
+
+### Scripts are explicitly interpreted
+
+```rust,no_run
+# async fn example(machine: &libvm::Machine) -> Result<(), libvm::LibVmError> {
+let output = machine
+    .exec_script("printf '%s\\n' \"$HOME\" | /usr/bin/tr a-z A-Z")
+    .await?;
+println!("{}", String::from_utf8_lossy(output.stdout_bytes()));
+# Ok(())
+# }
+```
+
+`exec_script` is the existing `/bin/sh -l -c SCRIPT` convenience. Login startup
+files may affect its environment and output. The script is executable code:
+do not construct it by concatenating untrusted input. Prefer literal argv when
+interpretation is unnecessary. The script wrapper preserves the existing argv
+ordering, including builder arguments; it is not a new positional-argument API.
+
+Collected `exec` and `exec_script` apply their `timeout` **after startup**.
+`spawn` does not acquire a deadline from that option. Own your deadline around
+streaming work and explicitly cancel or drop its session on timeout.
+
+### Streaming execution owns its request lifetime
+
+```rust,no_run
+use libvm::{ExecutionEvent, ExecutionResult};
+
+# async fn example(machine: &libvm::Machine) -> Result<(), Box<dyn std::error::Error>> {
+let mut session = machine
+    .spawn_with("/bin/cat", |options| options.stdin_pipe())
+    .await?;
+let mut received = Vec::new();
+let result = loop {
+    match session.recv().await?.ok_or("missing terminal result")? {
+        ExecutionEvent::Started => {
+            let input = session.stdin().ok_or("stdin unavailable after Started")?;
+            input.write(b"streamed input\n".to_vec()).await?;
+            input.close().await?;
+        }
+        ExecutionEvent::Stdout(bytes) => received.extend(bytes),
+        ExecutionEvent::Stderr(bytes) | ExecutionEvent::TerminalOutput(bytes) => {
+            eprintln!("{}", String::from_utf8_lossy(&bytes));
+        }
+        ExecutionEvent::Terminal(result) => break result,
+        ExecutionEvent::Accepted => {}
+    }
+};
+assert_eq!(received, b"streamed input\n");
+assert_eq!(result, ExecutionResult::Exited { code: Some(0) });
+# Ok(())
+# }
+```
+
+Receive `Started` before obtaining stdin, writing, resizing or sending
+process controls. `Accepted` only acknowledges host admission. Pipe stdin
+supports explicit EOF; PTY input does not. Consume output through the terminal
+result, which distinguishes exit, signal, launch failure and execution loss.
+
+For large bidirectional transfers, receive events concurrently with input using
+`session.control()` or `session.stdin()` after `Started`; otherwise both sides
+can fill their bounded queues. A control handle does not keep a dropped session
+alive. Terminal outcome, error, cancellation and drop invalidate surviving
+handles. `session.close_requests()` closes the request side; continue receiving
+if you need the terminal outcome. `session.cancel()` or dropping the session
+also releases its response stream, so no further result can be received.
+Neither operation is a reconnect API.
+
+```rust,no_run
+# async fn example(machine: &libvm::Machine) -> Result<(), libvm::LibVmError> {
+let mut session = machine.spawn("/bin/sleep", ["60"]).await?;
+session.close_requests();
+let outcome = session.wait().await?;
+println!("{outcome:?}");
+# Ok(())
+# }
+```
+
+`wait()` consumes and discards subsequent output. `collect()` buffers it in
+memory. Use `recv()` for bounded streaming or external sinks.
+
+### Local SSH login
+
+```rust,no_run
+# async fn example(machine: &libvm::Machine) -> Result<(), libvm::LibVmError> {
+let status = machine.shell().await?;
+println!("login exited with {}", status.code);
+
+let status = machine.shell_with(|options| {
+    options.user("root")
+        .term("xterm-256color")
+        .cwd("/tmp")
+        .env("EDITOR", "vi")
+        .forward_agent(false)
+}).await?;
+println!("configured login exited with {}", status.code);
+# Ok(())
+# }
+```
+
+SSH needs the current Running/non-stopping VM generation, a reachable vsock-22
+listener, an existing immutable host-key pin, a matching server key and accepted
+user certificate. It does not call the guest identity/process RPC or require
+fresh aggregate agent readiness. First provisioning and pin establishment
+still need their normal flow; interactive login never trusts a first-use key.
+Agent outage access requires an independent listener, such as systemd OpenSSH.
+An agent-owned listener cannot survive its owner stopping. Listener ownership
+remains first binder wins.
+
+Without `attachment`, `shell` owns the local terminal for the call: safe
+demand-driven stdin, raw-mode restoration, local resize and signal forwarding,
+and the configured detach keys (default Ctrl+]). Local output is presented on
+the terminal. Do not run concurrent local-terminal shells in one process.
+`local_signals` lets an embedding runtime own process signal subscriptions.
+SSH always allocates a guest PTY.
+
+Without cwd/env, SSH requests a login shell. With cwd/env it preserves the
+quoted exec-wrapper behavior; it does not depend on sshd `AcceptEnv`. Agent
+forwarding is explicit and confined to this connection. A normal exit preserves
+its code; the current signal-exit representation is code 128, and local detach
+returns success. Transport loss, missing exit status and cancellation are errors.
+
+### Supplied SSH attachment
+
+```rust,no_run
+use libvm::{SshShellAttachment, SshShellControl};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+# async fn example(machine: &libvm::Machine) -> Result<(), Box<dyn std::error::Error>> {
+let cancellation = CancellationToken::new();
+let (controls, receiver) = mpsc::channel(8);
+let attachment = SshShellAttachment::new(
+    std::io::Cursor::new(b"printf 'embedded:%s\\n' \"$USER\"; exit 7\n".to_vec()),
+    tokio::io::stdout(),
+    tokio::io::stderr(),
+    37, 119,
+).controls(receiver);
+// Queue a resize. An embedding application's signal handler can instead send:
+// SshShellControl::Signal(libvm::SshShellSignal::Term).
+controls.send(SshShellControl::Resize { rows: 37, columns: 119 }).await?;
+drop(controls);
+let status = machine.shell_with(|options| {
+    options.term("xterm-256color")
+        .attachment(attachment)
+        .cancellation(cancellation.clone())
+}).await?;
+assert_eq!(status.code, 7);
+assert!(!cancellation.is_cancelled());
+# Ok(())
+# }
+```
+
+Supplied attachment owns its streams and consumes them exactly once. It never
+queries host terminal dimensions, changes termios, subscribes to process signals
+or intercepts detach bytes, including Ctrl+]. Both dimensions must be positive.
+The example explicitly chooses host output writers; library code does not
+implicitly select them. Service callers supply their own per-session writers.
+Combining supplied attachment with `local_signals` or explicit `detach_keys`
+is rejected before connecting. TERM belongs to the shell options, not the
+attachment. A closed controls receiver disables controls, not the session.
+The typed signal set is HUP, INT, QUIT, ILL, ABRT, FPE, KILL, USR1, SEGV,
+USR2, PIPE, ALRM and TERM; resize is a separate control.
+
+Input EOF sends SSH channel EOF once, then drains output and terminal status.
+It is not a terminal Ctrl-D byte and need not exit an interactive shell: send a
+finite command with `exit`, terminal EOF bytes when appropriate for your
+protocol, or cancel. Cancellation is not clean input EOF. Stdout and SSH
+extended stderr remain separate, although a guest PTY normally merges them.
+
+Setup has one 30-second deadline. After remote EOF/status, a two-second
+peer-message budget detects a missing close; delivering already-received
+output does not consume that budget. Success drains output before returning.
+Awaited completion performs bounded graceful teardown, then if necessary
+cancels transport and waits for acknowledgement that the actual wire was
+released. That acknowledgement has no wall-clock guarantee under a stalled
+executor. Dropping the Rust future only requests cancellation; it cannot await
+task joins. The caller's cancellation token is observed, never canceled by
+libvm. A blocked caller sink must cooperate with cancellation in SDK adapters.
+
+Run `cargo run -p libvm --example execution -- <vm> <mode>` with `exec`,
+`script`, `spawn`, `shell` or `embedded-shell` for runnable versions. The
+example preserves nonzero exit codes and never changes VM lifecycle.
+
+### Execution architecture and extension points
+
+```text
+Machine conveniences
+  exec / exec_script / spawn
+    session.rs: RPC session owns events + one shared request control state
+      VmExecutionService.Execute: machine/run fence, Accepted/Lost
+        GuestProcessService.Execute: agent/boot fence, process lifecycle
+  shell
+    session/ssh.rs: pin + certificate, setup, one relay, one teardown owner
+      VmAccessService.OpenSsh: opaque bytes and half-close
+        guest vsock 22: independently selected SSH listener
+    session/host.rs: optional local input/resize/signals/detach policy
+      host_input.rs + utils::terminal: byte reader and raw-termios ownership
+SDK adapters: bounded native byte/control pipes, cooperative caller I/O
+CLI RPC terminal adapter: spawn events + CLI-owned input/terminal policy
+```
+
+New RPC controls belong in session/control ownership and the appropriate
+host/guest protocol envelope. Common payloads do not erase distinct identity
+fences. SSH features belong in the shared SSH client, not a second SDK client.
+Local terminal policy belongs in the host adapter, not in the SSH transport or
+caller-supplied streams. SSH must not emit agent execution events; wire DTOs
+must not become a universal domain model. SDK adapters own cross-language
+buffers and task lifetimes, not a second authentication/relay implementation.
+
+This API cutover requires all consumers and native libraries to restart
+together. It introduces no compatibility aliases, version bump, state reset or
+database migration.
 
 ## Runtime Roots
 
@@ -181,7 +428,7 @@ set for the runtime lifetime. `SILO_VMM_PATH`, or
 `RuntimeConfig::with_supervisor_path` / `RuntimeBuilder::supervisor_path`,
 replaces only the `silo-vmm` path. Machine starts launch the resolved absolute
 `silo-vmm` path directly. For the krun backend,
-silo-vmm re-executes itself with argv[0] `krun` to run libkrun in a
+silo-vmm re-executes itself with `argv[0]` set to `krun` to run libkrun in a
 private worker, so there is no separate krun component to resolve (see
 [silo-vmm architecture](../../docs/architecture/silo-vmm.md)).
 Private networking launches the resolved absolute `netd` path directly.

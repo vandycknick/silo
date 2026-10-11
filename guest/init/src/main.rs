@@ -27,7 +27,13 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
     let Some(program) = (unsafe { get_arg(argv, 0) }) else {
         return 1;
     };
-    let applet = basename(program);
+    // sshd marks a login shell by prefixing its argv[0] with '-'.
+    let applet: &[u8] = match basename(program) {
+        b"-sh" => b"sh",
+        b"-ash" => b"ash",
+        b"-dash" => b"dash",
+        name => name,
+    };
 
     if applet == b"init" {
         if is_init_control_invocation(argc, argv) {

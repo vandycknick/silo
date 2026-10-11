@@ -64,6 +64,10 @@ type ExecutionEvent struct {
 	Data   []byte
 	Result *ExecutionResult
 }
+
+// SSHExitStatus is the SSH login's terminal result, not an RPC process event.
+// Signal exit currently maps to 128 and local detach to success. Missing status,
+// transport loss and cancellation are errors. See examples/shell.
 type SSHExitStatus struct {
 	Code    int32 `json:"code"`
 	Success bool  `json:"success"`

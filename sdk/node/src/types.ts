@@ -60,7 +60,7 @@ export type Network =
   /** Inspection-only fallback for network kinds this SDK does not know yet. */
   | { kind: "unknown" };
 
-/** Options for a structured guest process started by `exec`, `spawn`, or `shell`. */
+/** Options for an RPC process started by `exec`, `spawn`, or `execScript`. */
 export interface ExecutionOptions {
   /** Additional argv values appended to the command. */
   args?: string[];
@@ -70,7 +70,7 @@ export interface ExecutionOptions {
   user?: string;
   /** Extra guest environment variables. */
   env?: KeyValueMap;
-  /** Command timeout in seconds. */
+  /** Seconds, applied after startup for collected calls; spawn does not acquire a deadline. */
   timeout?: number;
   /** Bytes or UTF-8 text sent to input. Pipe mode then receives EOF; PTYs do not. */
   stdin?: Uint8Array | string;
@@ -80,9 +80,9 @@ export interface ExecutionOptions {
   tty?: boolean;
 }
 
-/** Options for the SSH-only interactive guest shell. */
+/** Certificate-authenticated SSH login options. See the README execution examples. */
 export interface SshShellOptions {
-  /** Guest working directory. */
+  /** Best-effort guest cwd; cwd/env select a quoted exec wrapper instead of a shell request. */
   cwd?: string;
   /** Guest user. */
   user?: string;
@@ -90,10 +90,38 @@ export interface SshShellOptions {
   env?: KeyValueMap;
   /** Terminal type requested for the guest PTY. */
   term?: string;
-  /** Docker-style detach key sequence, for example `ctrl-]` or `ctrl-p,ctrl-q`. */
+  /** Local-only Docker-style detach keys; invalid with a supplied attachment. */
   detachKeys?: string;
   /** Forward the host SSH agent into the guest shell. */
   forwardAgent?: boolean;
+  /** Owned caller I/O. Callbacks must settle when their supplied signal aborts. */
+  attachment?: SshShellAttachment;
+  /** Cancels setup, I/O and teardown; successful completion does not abort it. */
+  signal?: AbortSignal;
+}
+
+/** Supported SSH signal names, not host-platform numeric signal values. */
+export type SshShellSignal = "HUP" | "INT" | "QUIT" | "ILL" | "ABRT" | "FPE" | "KILL" | "USR1" | "SEGV" | "USR2" | "PIPE" | "ALRM" | "TERM";
+/** Supplied attachment PTY controls; resize dimensions must both be positive. */
+export type SshShellControl =
+  | { kind: "resize"; rows: number; columns: number }
+  | { kind: "signal"; signal: SshShellSignal };
+
+/**
+ * One-call SSH attachment, without host terminal or signal side effects.
+ * Dimensions are integers in 1..65535. Missing input sends channel EOF;
+ * missing sinks discard output. EOF is not Ctrl-D or cancellation.
+ * Iterators and sinks must honor abort even while next/write is pending.
+ * Output callbacks are serialized; only per-stream ordering is guaranteed.
+ * See README and examples/shell.mjs for finite and cancellation-cooperative I/O.
+ */
+export interface SshShellAttachment {
+  stdin?: (signal: AbortSignal) => AsyncIterable<Uint8Array>;
+  stdout?: (chunk: Uint8Array, signal: AbortSignal) => Promise<void>;
+  stderr?: (chunk: Uint8Array, signal: AbortSignal) => Promise<void>;
+  rows: number;
+  columns: number;
+  controls?: (signal: AbortSignal) => AsyncIterable<SshShellControl>;
 }
 
 /** Selects one persisted machine log source. */

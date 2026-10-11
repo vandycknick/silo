@@ -114,7 +114,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				_ = s.Runtime.Close()
 			}()
 			caller := principal(c, "user:7")
-			op, err := s.Create(ctx, caller, service.CreateRequest{Name: variant, GuestUser: user, NoStart: variant == "uid-conflict" || variant == "no-shell" || variant == "no-sh-stored"})
+			op, err := s.Create(ctx, caller, service.CreateRequest{Image: registry.Reference, Name: variant, GuestUser: user, NoStart: variant == "uid-conflict" || variant == "no-shell" || variant == "no-sh-stored"})
 			if variant == "no-shell" || variant == "no-sh-stored" {
 				daemon.Succeeded(t, s.Jobs, caller.Peer, op, err)
 				d, err := r.Control.Inspect(ctx, variant)

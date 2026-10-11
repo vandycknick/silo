@@ -4638,6 +4638,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "vm-spec",
 ]
 
@@ -4649,9 +4650,11 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "parking_lot",
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "vm-spec",
 ]
 
@@ -5809,6 +5812,7 @@ name = "utils"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "nix 0.31.3",
  "ssh-key",
  "tempfile",
 ]

@@ -41,3 +41,4 @@ tonic = { version = "0.14.6", features = ["transport"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+nix = { version = "0.31.3", features = ["process", "signal", "term"] }

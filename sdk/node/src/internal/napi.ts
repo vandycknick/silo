@@ -56,9 +56,8 @@ export interface NativeMachine {
   remove(): Promise<void>;
   exec(program: string, args?: string[], options?: NativeExecutionOptionsInput): Promise<NativeExecutionOutput>;
   spawn(program: string, args?: string[], options?: NativeExecutionOptionsInput): Promise<NativeExecutionSession>;
-  shell(script: string, options?: NativeExecutionOptionsInput): Promise<NativeExecutionOutput>;
-  attach(program: string, args?: string[], options?: NativeExecutionOptionsInput): Promise<NativeExecutionResult>;
-  attachShell(options?: NativeSshShellOptionsInput): Promise<NativeSshExitStatus>;
+  execScript(script: string, options?: NativeExecutionOptionsInput): Promise<NativeExecutionOutput>;
+  startShell(options?: NativeSshShellOptionsInput, attachmentSize?: { rows: number; columns: number }): NativeShellOperation;
   logs(source: NativeMachineLogSource, options?: NativeMachineLogOptionsInput): Promise<NativeMachineLogHandle>;
   statFile(path: string): Promise<NativeFileEntry>;
   createDirectory(path: string, options?: NativeCreateDirectoryOptions): Promise<string>;
@@ -87,6 +86,18 @@ export interface NativeFileUpload {
 export interface NativeFileDownload {
   read(): Promise<Uint8Array | null>;
   cancel(): void;
+}
+
+export interface NativeShellOperation {
+  writeStdin(data: Uint8Array): Promise<void>;
+  closeStdin(): Promise<void>;
+  readStdout(): Promise<Uint8Array | null>;
+  readStderr(): Promise<Uint8Array | null>;
+  resize(rows: number, columns: number): Promise<void>;
+  signal(signal: string): Promise<void>;
+  cancel(): void;
+  result(): Promise<NativeSshExitStatus>;
+  close(): Promise<void>;
 }
 
 export interface NativeImages {

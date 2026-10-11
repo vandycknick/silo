@@ -82,6 +82,96 @@ await diskMachine.remove();
 await policyMachine.remove();
 ```
 
+## Execution
+
+| Operation | Transport and result |
+| --- | --- |
+| `exec(program, args, options)` | Agent RPC, literal argv, collected `ExecutionOutput` |
+| `spawn(program, args, options)` | Agent RPC, caller-driven `ExecutionSession`, optional PTY |
+| `execScript(script, options)` | Agent RPC `/bin/sh -l -c`, collected `ExecutionOutput` |
+| `shell(options)` | Certificate-authenticated SSH login PTY, `SshExitStatus` |
+
+This is a hard cutover: rebuild the addon and facade together. There are no
+attachment aliases or script/interactive overload dispatch, and no version bump.
+The canonical transport and lifecycle guide is [libvm's README](../../runtime/libvm/README.md).
+
+```ts
+import { Runtime } from "silo";
+const runtime = await Runtime.open();
+const machine = await runtime.getMachine("existing-machine-id");
+console.log((await machine.exec("/usr/bin/printf", ["%s", "$HOME"])).stdout()); // literal
+console.log((await machine.execScript('printf "%s\\n" "$HOME" | cat')).stdout());
+const session = await machine.spawn("/bin/cat", [], { pipeStdin: true });
+try {
+  for (;;) {
+    const event = await session.recv();
+    if (event === null) throw new Error("process ended before Started");
+    if (event.kind === "started") break;
+  }
+  const input = session.stdin();
+  if (!input) throw new Error("stdin unavailable");
+  await input.write("hello\\n");
+  await input.close();
+  console.log((await session.collect()).stdout());
+} finally { session.cancel(); }
+```
+
+Scripts read login startup files; shell syntax and injection safety are the
+caller's responsibility. Never concatenate untrusted input into scripts.
+Collected execution applies `timeout` after startup; `spawn` does not acquire
+a deadline from that option. `wait` discards output, `collect` buffers it;
+neither is a reconnect API. Receive Started before acquiring or writing stdin.
+
+`await machine.shell({ user: "silo", term: "xterm-256color" })` owns the local
+terminal. SSH needs a Running, non-stopping VM, vsock 22, an existing immutable
+host-key pin, a matching presented key and accepted user certificate. A fresh
+agent readiness report is not a prerequisite for independently owned SSH.
+`cwd` is best effort; cwd/env use the existing quoted exec wrapper rather than
+AcceptEnv. Without cwd/env, sshd selects the login shell/environment.
+
+```ts
+const cancellation = new AbortController();
+const chunks: Uint8Array[] = [];
+const status = await machine.shell({
+  term: "xterm-256color", signal: cancellation.signal,
+  attachment: {
+    rows: 37, columns: 119,
+    // This finite memory iterator cannot block.
+    async *stdin() { yield new TextEncoder().encode('printf "embedded:%s\\n" "$USER"; exit 7\\n'); },
+    // Memory sinks cannot block either. Blocking sinks must observe signal.
+    async stdout(chunk) { chunks.push(chunk.slice()); },
+    async stderr(chunk) { chunks.push(chunk.slice()); },
+    async *controls() { yield { kind: "resize" as const, rows: 37, columns: 119 }; },
+  },
+});
+console.log(status.code); // 7, not an exception
+```
+
+Attachments are one-call ownership of supplied I/O only; no host stdio,
+termios, ioctls or process signals are touched. Dimensions must be integers
+in 1..65535. `detachKeys` is invalid with an attachment; supplied Ctrl+] bytes
+are transparent. Missing stdin sends SSH channel EOF, missing sinks discard,
+and absent controls create no JS pump. Channel EOF is not Ctrl-D: a login PTY
+may need `exit` or explicit EOT bytes. Cancellation is neither EOF nor login exit.
+SSH signal exits map to code 128; local detach maps to success.
+
+Callbacks/iterables receive separate input/control and output abort signals.
+They must settle on abort, including pending next/write calls. Arbitrary
+uncooperative callbacks cannot be forcibly interrupted. Native success stops
+and joins input/control while both output readers drain; only then are output
+callbacks aborted and the native operation closed. Parent abort remains active
+during drain. Actual sink calls are serialized so one non-thread-safe sink can
+serve both streams; per-stream, not cross-stream, order is guaranteed.
+Failure cancels and joins all pumps and native cleanup, preserving the first
+error. Borrowed outer SSH sessions and process stdio are never closed.
+
+The addon owns bounded 64-KiB simplex pipes and a 64-entry control channel,
+not JS callbacks or a second SSH client. Its private operation retains the
+machine/runtime until awaited cleanup. Dropping a Rust future can request
+cancellation but cannot await wire release; public awaited calls join cleanup.
+Run `node sdk/node/examples/shell.mjs <machine-id>` against a selected running
+machine (`SILO_HOME` selects its home); it prints and returns exit 7.
+
 ## Guest files
 
 Running machines expose `statFile`, `createDirectory`, `uploadFile`, and

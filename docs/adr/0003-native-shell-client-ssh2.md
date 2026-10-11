@@ -6,7 +6,13 @@ Updated: 2026-09-24
 
 ## Status
 
-Proposed
+Historical proposal, superseded by the [libvm execution guide](../../runtime/libvm/README.md#execution).
+
+The design below records an earlier proposal, not the current implementation.
+Current `shell` uses libvm's shared russh client, certificate authentication and
+an immutable host-key pin over `VmAccessService.OpenSsh` to guest vsock port 22.
+It does not use libssh2, `open_vsock(2222)`, a socat bridge or first-use trust.
+Program execution and scripts use the separate agent RPC execution service.
 
 ## Context
 

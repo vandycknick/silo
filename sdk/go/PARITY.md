@@ -33,7 +33,7 @@ This inventory is completed alongside implementation. A checked item has a publi
 | redacted secret diagnostics | `Runtime.CheckPolicySecrets` | `silo_runtime_query` operation `check_policy_secrets`, public Rust `Runtime::check_policy_secrets` | actual native missing alternatives vs corrupt/type/empty projections, Machine/Home precedence, whole-set overrides, AWS profile, optional auth key | implemented |
 | `remove` | `Machine.Remove` | `silo_machine_remove` | lifecycle tests | implemented |
 | `exec` | `Machine.Exec` | `silo_machine_exec` | execution tests | implemented |
-| `shell` | `Machine.Shell` | `silo_machine_shell` | execution tests | implemented |
+| `execScript` | `Machine.ExecScript` | `silo_machine_exec_script` | execution tests | implemented |
 | `spawn` | `Machine.Spawn` | `silo_machine_spawn` | stream tests | implemented |
 | `statFile` | `Machine.StatFile` | `silo_machine_file_stat` | path validation and VM lifecycle metadata | implemented |
 | `createDirectory` | `Machine.CreateDirectory` | `silo_machine_create_directory` | option validation and VM lifecycle | implemented |
@@ -45,8 +45,8 @@ This inventory is completed alongside implementation. A checked item has a publi
 | session `collect` | `ExecutionSession.Collect` | `silo_execution_collect` | stream tests | implemented |
 | session signal/resize | session control methods | execution control ABI | control tests | implemented |
 | session close requests/cancel | session control methods | execution control ABI | cancellation tests | implemented |
-| `attach` | `Machine.Attach` | `silo_machine_attach` | terminal tests | implemented |
-| `attachShell` | `Machine.AttachShell` | `silo_machine_attach_shell` | terminal tests | implemented |
+| `shell` | `Machine.Shell` | `silo_machine_shell[_cancellable]` | local terminal/signal and supplied SSH tests | implemented |
+| supplied shell attachment | `WithShellAttachment` | `silo_ssh_attachment_*` bounded byte/control bridge | real guest output/cancel/drain regressions | implemented |
 | `logs` | `Machine.Logs` | `silo_machine_logs` | log tests | implemented |
 | log `recv` | `MachineLogStream.Recv` | `silo_log_recv` | log tests | implemented |
 | image `pull` | `Images.Pull` | `silo_images_call` | image tests | implemented |

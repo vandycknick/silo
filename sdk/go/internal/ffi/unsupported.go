@@ -30,37 +30,51 @@ func NativeABIVersion() uint32  { return 0 }
 func PlanningQuery([]byte) ([]byte, error) {
 	return nil, &NativeError{Variant: "Unsupported", Message: "native SDK unavailable"}
 }
-func OpenRuntime([]byte) (*Runtime, error)              { return nil, nil }
-func BuildNetworkPolicy([]byte) ([]byte, error)         { return nil, nil }
-func (*Runtime) Close()                                 {}
-func (*Runtime) CreateMachine([]byte) (*Machine, error) { return nil, nil }
-func (*Runtime) Machine(string) (*Machine, error)       { return nil, nil }
-func (*Runtime) Machines() ([]*Machine, error)          { return nil, nil }
-func (*Runtime) ImageCall([]byte) ([]byte, error)       { return nil, nil }
-func (*Runtime) Query([]byte) ([]byte, error)           { return nil, nil }
-func (*Machine) ID() (string, error)                    { return "", nil }
-func (*Machine) Inspect() ([]byte, error)               { return nil, nil }
-func (*Machine) Start() ([]byte, error)                 { return nil, nil }
-func (*Machine) Secret([]byte) error                    { return nil }
-func (*Machine) Stop() ([]byte, error)                  { return nil, nil }
-func (*Machine) Update([]byte) ([]byte, error)          { return nil, nil }
-func (*Machine) StopWith([]byte) ([]byte, error)        { return nil, nil }
-func (*Machine) Exec([]byte) (*ExecutionOutput, error)  { return nil, nil }
-func (*Machine) Shell([]byte) (*ExecutionOutput, error) { return nil, nil }
-func (*Machine) Spawn([]byte) (*Execution, error)       { return nil, nil }
+func OpenRuntime([]byte) (*Runtime, error)                   { return nil, nil }
+func BuildNetworkPolicy([]byte) ([]byte, error)              { return nil, nil }
+func (*Runtime) Close()                                      {}
+func (*Runtime) CreateMachine([]byte) (*Machine, error)      { return nil, nil }
+func (*Runtime) Machine(string) (*Machine, error)            { return nil, nil }
+func (*Runtime) Machines() ([]*Machine, error)               { return nil, nil }
+func (*Runtime) ImageCall([]byte) ([]byte, error)            { return nil, nil }
+func (*Runtime) Query([]byte) ([]byte, error)                { return nil, nil }
+func (*Machine) ID() (string, error)                         { return "", nil }
+func (*Machine) Inspect() ([]byte, error)                    { return nil, nil }
+func (*Machine) Start() ([]byte, error)                      { return nil, nil }
+func (*Machine) Secret([]byte) error                         { return nil }
+func (*Machine) Stop() ([]byte, error)                       { return nil, nil }
+func (*Machine) Update([]byte) ([]byte, error)               { return nil, nil }
+func (*Machine) StopWith([]byte) ([]byte, error)             { return nil, nil }
+func (*Machine) Exec([]byte) (*ExecutionOutput, error)       { return nil, nil }
+func (*Machine) ExecScript([]byte) (*ExecutionOutput, error) { return nil, nil }
+func (*Machine) Spawn([]byte) (*Execution, error)            { return nil, nil }
 
 type AttachmentCancellation struct{}
 
 func (*AttachmentCancellation) Signal(uint32) error { return nil }
 
-func NewAttachmentCancellation() (*AttachmentCancellation, error)            { return nil, nil }
-func (*AttachmentCancellation) Cancel() error                                { return nil }
-func (*AttachmentCancellation) Close()                                       {}
-func (*Machine) Attach([]byte, *AttachmentCancellation) ([]byte, error)      { return nil, nil }
-func (*Machine) AttachShell([]byte, *AttachmentCancellation) ([]byte, error) { return nil, nil }
-func (*Machine) Logs([]byte) (*Log, error)                                   { return nil, nil }
-func (*Machine) Remove() error                                               { return nil }
-func (*Machine) Close()                                                      {}
+func NewAttachmentCancellation() (*AttachmentCancellation, error) { return nil, nil }
+func (*AttachmentCancellation) Cancel() error                     { return nil }
+func (*AttachmentCancellation) Close()                            {}
+func (*Machine) Shell([]byte, *AttachmentCancellation, *SshAttachment) ([]byte, error) {
+	return nil, nil
+}
+
+type SshAttachment struct{}
+
+func (*Machine) NewSshAttachment(*AttachmentCancellation, uint16, uint16) (*SshAttachment, error) {
+	return nil, nil
+}
+func (*SshAttachment) Write([]byte) error              { return nil }
+func (*SshAttachment) CloseStdin() error               { return nil }
+func (*SshAttachment) Read(bool) ([]byte, bool, error) { return nil, true, nil }
+func (*SshAttachment) Resize(uint16, uint16) error     { return nil }
+func (*SshAttachment) Signal(uint32) error             { return nil }
+func (*SshAttachment) Cancel() error                   { return nil }
+func (*SshAttachment) Close()                          {}
+func (*Machine) Logs([]byte) (*Log, error)             { return nil, nil }
+func (*Machine) Remove() error                         { return nil }
+func (*Machine) Close()                                {}
 
 type NodeStateLease struct{}
 

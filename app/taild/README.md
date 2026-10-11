@@ -74,15 +74,33 @@ tailnet request -> taild authorization -> silod gRPC -> libvm management
                          |
                          +-> exact authorized VM ID
                               -> private Go SDK runtime -> native libvm
-                                   -> silo-vmm Execute -> guest
+                                   +-> Execute RPC -> guest agent (exec)
+                                   +-> OpenSsh bytes -> vsock22 sshd (shell)
 ```
 
-Exec and interactive shell retain the existing native SDK session machinery.
-After fresh RPC authorization, `Runtime.Machine` opens only the authorized UUID
-in the manager-selected Home with its exact component set. `Machine.Spawn`
-streams stdout/stderr and structured exit results directly from the VMM;
-interactive shell retains account lookup, login shell, PTY resize and signals.
-No terminal bytes pass through silod. Closing native handles does not stop VMs.
+After fresh authorization, `Runtime.Machine` opens only the authorized UUID
+in the manager-selected Home with its exact component set. Exec uses RPC
+`Machine.Spawn`, preserving guest account lookup, environment enrichment,
+Started-gated input and structured process outcomes.
+
+Shell uses `Machine.Shell` with a supplied `SSHShellAttachment`: certificate
+SSH over vsock 22, not process RPC. The guest sshd selects the login shell and
+environment. A running VM, a previously established immutable host-key pin and
+an independently owned SSH listener permit login even when agent health is stale;
+shell does not query guest identity or require fresh agent readiness. It cannot
+establish the first pin during an agent outage.
+
+Taild supplies client TERM, initial size, resize/signals and context-aware I/O;
+it never attaches the daemon's terminal. On clean PTY input EOF it sends two
+EOT bytes before SSH channel EOF. These are best-effort terminal input, not a
+logout request: a login shell's startup or terminal-mode transitions can consume
+them without exiting. Send `exit` for graceful completion or cancel the session
+for bounded termination. Cancellation/read failure does not synthesize EOT.
+Input/control contexts stop on shell completion while output keeps its own
+live context until both streams drain, allowing the outer SSH session to send
+exit status. Authorization refresh/revocation and resource accounting apply to
+both paths. No terminal bytes pass through silod, and closing native handles
+does not stop VMs. See the [execution guide](../../runtime/libvm/README.md).
 
 VM enrollment observations come from libvm through `InspectMachine`, not Go
 reads of VM state files. Bounded log tails keep the snapshot/follow descriptors
@@ -152,6 +170,19 @@ three seconds after guest readiness for a login URL, and exposes it through `sho
 Active lobby prompts display deduplicated notices; guest and command output are never interrupted. `reauth` and
 the obsolete `enrollment.timeout` setting are removed. OAuth consent still has its
 own bounded lifetime. See the [status file contract](../../docs/taild/operator.md#live-status-file-version-1).
+
+Netd owns one coalesced IPN observation loop. It performs initial `tsnet.Up`
+once and uses explicit peer notifications for full peer refreshes. Self notifications
+and 15-second freshness checks use peer-free status, promoting to a full refresh
+when node/tailnet identity changes. These checks preserve the one-minute observation
+freshness limit and notice key expiry. A lost/overflowed watcher invalidates
+traffic state and requires full resynchronization; unchanged peers are not
+polled periodically. Authentication and expiry maintenance reuse these fresh
+observations, while SSH authentication/reauthorization still perform their own
+live identity checks. Unchanged notifications do not rebuild DNS maps or rewrite
+the status file within the publication interval. Status writes are serialized
+outside the traffic-state lock; slow enrollment/maintenance calls cannot block
+the observation loop.
 
 Start/update retain native enrollment-state fencing. Taild does not repair
 unknown pending/backup transaction material.
@@ -270,11 +301,13 @@ the default. Remove the obsolete global `vm.guest_user` config setting when upgr
 For direct SSH, request the guest account explicitly, such as `ssh root@dev` or
 `ssh nickvd@dev`. Lost executions return 255; disconnect/revocation cancels only
 the guest execution, never the VM.
-PTY stdin EOF sends a finite two-EOT sequence: the first flushes an unterminated
-canonical line, the second produces EOF on the empty line. No pipe-close request
-is sent for a PTY. Raw-mode guests receive the two literal bytes and retain their
-own interpretation and session-cancellation lifetime. Empty input and login-shell
-exit statuses are preserved. Failed stdout/stderr transport writes return 255.
+PTY stdin EOF sends a finite two-EOT sequence. With a stable canonical terminal,
+the first flushes an unterminated line and the second produces EOF on an empty
+line. No RPC pipe-close request is sent for a PTY. Raw-mode guests interpret the
+literal bytes themselves; login startup and terminal-mode changes can also
+change their meaning. Input EOF does not guarantee SSH logout, including for
+empty input. The actual guest exit status is preserved when the shell exits.
+Failed stdout/stderr transport writes return 255.
 The prompt consumes CRLF as one command terminator, including the transition into
 confirmation or guest stdin, while CR-only input returns without waiting for LF.
 
@@ -465,6 +498,31 @@ CGO_ENABLED=1 SILO_GO_FFI_PATH=/absolute/path/libsilo_go_ffi.so \
   SILO_TAILD_TEST_ROOTFS=/absolute/path/s7-kvm-v3/rootfs SILO_E2E_KVM=1 \
   go -C app/taild test -race -tags=e2e -count=1 -timeout=4m -v ./...
 ```
+
+The independent-listener regression additionally requires a disposable ext4
+image containing OpenSSH, systemd's SSH generator, `systemctl`, `systemd-run`
+and a usable shell; accessible `/dev/kvm`; matching release native/runtime/CLI
+artifacts; the built Rust execution example and Node SDK. It copies that image
+into an isolated SDK home and never modifies an existing VM.
+
+```sh
+SILO_E2E_KVM=1 SILO_TEST_DISK_IMAGE=/absolute/path/disposable.ext4 \
+  SILO_TEST_CLI=/absolute/path/target/release/silo \
+  go -C app/taild test -count=1 -timeout=4m ./internal/service \
+    -run '^TestNativeKVMShellAgentUnavailable$' -v
+```
+
+This three-minute fixture proves RPC exec/script/Spawn and supplied SSH login,
+drains exact payloads larger than 64 KiB from both guest output descriptors
+(merged by the guest PTY), exercises sink failure under output pressure,
+cancellation during final output delivery and blocked input after guest exit,
+and checks cancellation after input EOF plus fifty repeated logins. It runs the Rust, Go and Node
+examples, and pauses the actual agent only after arming a bounded
+systemd recovery timer. While agent health is stale it checks new taild, Node,
+Rust and controlling-PTY CLI shells, cancellation, reconnect and concurrent
+isolation. Cleanup resumes the agent and forcibly stops/removes the fixture.
+These are qualification requirements, not claims that a skipped run passed.
+
 
 These service tests receive explicit principal/capability **input** below
 authentication. They use the actual public SDK, OCI, guest PTY and KVM, including

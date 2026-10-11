@@ -13,7 +13,10 @@ pub enum AttachMode {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Open a shell in a running VM")]
+#[command(
+    about = "Open an SSH login shell in a running VM",
+    long_about = "Open a certificate-authenticated SSH login shell over vsock. Requires an existing pinned host key and a guest SSH listener, but not fresh guest-agent readiness. The local terminal is restored when the session ends. Use --attach serial for the serial console."
+)]
 pub struct Cmd {
     /// Name or ID of the running VM. Defaults to the configured default VM.
     #[arg(value_name = "VM")]
@@ -48,9 +51,8 @@ impl Cmd {
             return terminal::attach_serial_stream(stream).await;
         }
 
-        guest::ensure_guest_ready(&inspect_data)?;
         let status = machine
-            .attach_shell(self.user.as_deref(), self.forward_agent)
+            .shell(self.user.as_deref(), self.forward_agent)
             .await?;
         std::process::exit(status.code);
     }

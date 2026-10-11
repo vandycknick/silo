@@ -27,6 +27,12 @@ typedef struct silo_node_state_lease silo_node_state_lease;
 
 typedef struct silo_runtime silo_runtime;
 
+/**
+ * Opaque, single-consumption bounded SSH attachment. The caller must join the
+ * shell and all byte/control operations before free; no Go pointers are kept.
+ */
+typedef struct SshAttachmentHandle SshAttachmentHandle;
+
 typedef struct silo_stdin silo_stdin;
 
 typedef struct silo_upload silo_upload;
@@ -100,37 +106,27 @@ silo_error *silo_machine_exec(const silo_machine *machine,
                               size_t request_len,
                               silo_execution_output *out_output);
 
-silo_error *silo_machine_shell(const silo_machine *machine,
-                               const uint8_t *request_ptr,
-                               size_t request_len,
-                               silo_execution_output *out_output);
+silo_error *silo_machine_exec_script(const silo_machine *machine,
+                                     const uint8_t *request_ptr,
+                                     size_t request_len,
+                                     silo_execution_output *out_output);
 
 silo_error *silo_machine_spawn(const silo_machine *machine,
                                const uint8_t *request_ptr,
                                size_t request_len,
                                silo_execution **out_session);
 
-silo_error *silo_machine_attach(const silo_machine *machine,
-                                const uint8_t *request_ptr,
-                                size_t request_len,
-                                silo_buffer *out_result);
+silo_error *silo_machine_shell(const silo_machine *machine,
+                               const uint8_t *request_ptr,
+                               size_t request_len,
+                               silo_buffer *out_status);
 
-silo_error *silo_machine_attach_cancellable(const silo_machine *machine,
-                                            const uint8_t *request_ptr,
-                                            size_t request_len,
-                                            const AttachmentCancellation *token,
-                                            silo_buffer *out_result);
-
-silo_error *silo_machine_attach_shell(const silo_machine *machine,
-                                      const uint8_t *request_ptr,
-                                      size_t request_len,
-                                      silo_buffer *out_status);
-
-silo_error *silo_machine_attach_shell_cancellable(const silo_machine *machine,
-                                                  const uint8_t *request_ptr,
-                                                  size_t request_len,
-                                                  const AttachmentCancellation *token,
-                                                  silo_buffer *out_status);
+silo_error *silo_machine_shell_cancellable(const silo_machine *machine,
+                                           const uint8_t *request_ptr,
+                                           size_t request_len,
+                                           const AttachmentCancellation *token,
+                                           const SshAttachmentHandle *attachment,
+                                           silo_buffer *out_status);
 
 silo_error *silo_execution_recv(const silo_execution *session,
                                 silo_execution_event *out_event,
@@ -286,5 +282,32 @@ void silo_machine_free(silo_machine *machine);
 silo_error *silo_machine_secret(const silo_machine *machine,
                                 const uint8_t *request_ptr,
                                 size_t request_len);
+
+silo_error *silo_ssh_attachment_new(const silo_machine *machine,
+                                    const AttachmentCancellation *token,
+                                    uint16_t rows,
+                                    uint16_t columns,
+                                    SshAttachmentHandle **out_handle);
+
+silo_error *silo_ssh_attachment_write(const SshAttachmentHandle *handle,
+                                      const uint8_t *data_ptr,
+                                      size_t data_len);
+
+silo_error *silo_ssh_attachment_close_stdin(const SshAttachmentHandle *handle);
+
+silo_error *silo_ssh_attachment_read(const SshAttachmentHandle *handle,
+                                     bool stderr,
+                                     silo_buffer *out_buffer,
+                                     bool *out_eof);
+
+silo_error *silo_ssh_attachment_resize(const SshAttachmentHandle *handle,
+                                       uint16_t rows,
+                                       uint16_t columns);
+
+silo_error *silo_ssh_attachment_signal(const SshAttachmentHandle *handle, uint32_t linux_signal);
+
+silo_error *silo_ssh_attachment_cancel(const SshAttachmentHandle *handle);
+
+void silo_ssh_attachment_free(SshAttachmentHandle *handle);
 
 #endif  /* SILO_GO_FFI_H */

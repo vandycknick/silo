@@ -79,15 +79,6 @@ message ExecutionLost {
   optional string message = 2;
 }
 
-message ExecutionTerminalResult {
-  oneof result {
-    ExecutionExited exited = 1;
-    ExecutionSignaled signaled = 2;
-    ExecutionLaunchFailed launch_failed = 3;
-    ExecutionLost lost = 4;
-  }
-}
-
 message ExecutionEvent {
   oneof event {
     ExecutionAccepted accepted = 2;

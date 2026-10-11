@@ -13,6 +13,7 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 )
 
 // OAuth-app provisioning returns an opaque single-use registration token. It
@@ -40,7 +41,7 @@ func (n *Node) secret(field string) string {
 
 // Only this owner loop initiates authentication. The notification watcher just
 // observes it. Bootstrap keys are not reapplied to an existing persisted node.
-func (n *Node) authenticate(ctx context.Context, client *local.Client) {
+func (n *Node) authenticate(ctx context.Context, client *local.Client, status *ipnstate.Status) {
 	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if !n.bootstrapDone {
@@ -91,8 +92,7 @@ func (n *Node) authenticate(ctx context.Context, client *local.Client) {
 			}
 		}
 	}
-	status, err := client.StatusWithoutPeers(bounded)
-	if err != nil || status == nil || time.Since(n.lastLogin) < 30*time.Second {
+	if status == nil || time.Since(n.lastLogin) < 30*time.Second {
 		return
 	}
 	mismatch := status.BackendState == "Running" && status.Self != nil && status.CurrentTailnet != nil && n.options.Identity.verify(status, n.options.Declaration.Hostname) != nil
@@ -200,21 +200,20 @@ func (api authAPI) mint(ctx context.Context, secret string, tags []string) (stri
 
 // Expiry policy is node maintenance, not a taild job. Failures are retried and
 // exposed in status without preventing guest readiness or holding a VM lock.
-func (n *Node) maintain(ctx context.Context, client *local.Client) {
+func (n *Node) maintain(ctx context.Context, s *ipnstate.Status) {
 	if n.options.Identity == nil || !n.options.Identity.DisableKeyExpiry {
 		return
 	}
 	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	s, err := client.StatusWithoutPeers(bounded)
-	if err != nil || n.options.Identity.verify(s, n.options.Declaration.Hostname) != nil {
+	if n.options.Identity.verify(s, n.options.Declaration.Hostname) != nil {
 		return
 	}
 	id := string(s.Self.ID)
 	if n.maintenanceNode == id {
 		return
 	}
-	err = newAuthAPI().disableExpiry(bounded, n.secret("api_token"), id, s.Self.DNSName)
+	err := newAuthAPI().disableExpiry(bounded, n.secret("api_token"), id, s.Self.DNSName)
 	n.mu.Lock()
 	n.maintenanceFailed = err != nil
 	n.mu.Unlock()

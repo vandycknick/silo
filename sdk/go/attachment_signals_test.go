@@ -22,7 +22,7 @@ func TestAttachmentSignalsPreserveApplicationSubscribers(t *testing.T) {
 	signal.Notify(app, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(app)
 	for i := 0; i < 10; i++ {
-		notifications, stop := attachmentSignals(false)
+		notifications, stop := attachmentSignals()
 		for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
 			if err := syscall.Kill(os.Getpid(), sig); err != nil {
 				t.Fatal(err)

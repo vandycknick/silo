@@ -1,3 +1,5 @@
+mod shell;
+use shell::{NativeShellOperation, NativeShellSize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -13,8 +15,7 @@ use libvm::{
     MachineNetworkConfig, MachineProvisionReport, MachineProvisionStepReport, MachineRef,
     MachineRootfs, MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder,
     NetworkEndpointBuilder, NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder,
-    OciImageConfigMetadata, Runtime, RuntimeConfig, SshExitStatus, SshShellOptionsBuilder,
-    TailscaleTunnelBuilder,
+    OciImageConfigMetadata, Runtime, RuntimeConfig, SshShellOptionsBuilder, TailscaleTunnelBuilder,
 };
 use napi::bindgen_prelude::{BigInt, Uint8Array};
 use napi::{Error, Result, Status};
@@ -863,38 +864,24 @@ impl NativeMachine {
         })
     }
 
-    #[napi]
-    pub async fn shell(
+    #[napi(js_name = "execScript")]
+    pub async fn exec_script(
         &self,
         script: String,
         options: Option<NativeExecutionOptionsInput>,
     ) -> Result<NativeExecutionOutput> {
         let machine = self.inner.clone();
-        let output = run_shell(machine, script, options).await?;
+        let output = run_exec_script(machine, script, options).await?;
         Ok(execution_output_to_native(output))
     }
 
-    #[napi]
-    pub async fn attach(
-        &self,
-        program: String,
-        args: Option<Vec<String>>,
-        options: Option<NativeExecutionOptionsInput>,
-    ) -> Result<NativeExecutionResult> {
-        let machine = self.inner.clone();
-        let status = attach(machine, program, args.unwrap_or_default(), options).await?;
-        Ok(execution_result_to_native(status))
-    }
-
-    #[napi(js_name = "attachShell")]
-    pub async fn attach_shell(
+    #[napi(js_name = "startShell")]
+    pub fn start_shell(
         &self,
         options: Option<NativeSshShellOptionsInput>,
-    ) -> Result<NativeSshExitStatus> {
-        let machine = self.inner.clone();
-        attach_shell(machine, options)
-            .await
-            .map(ssh_exit_status_to_native)
+        attachment_size: Option<NativeShellSize>,
+    ) -> Result<NativeShellOperation> {
+        NativeShellOperation::start(self.inner.clone(), options, attachment_size)
     }
 
     #[napi(js_name = "statFile")]
@@ -1608,37 +1595,13 @@ async fn spawn_exec(
         .map_err(to_napi_error)
 }
 
-async fn run_shell(
+async fn run_exec_script(
     machine: Machine,
     script: String,
     options: Option<NativeExecutionOptionsInput>,
 ) -> Result<ExecutionOutput> {
     machine
-        .shell_with(script, |builder| apply_execution_options(builder, options))
-        .await
-        .map_err(to_napi_error)
-}
-
-async fn attach(
-    machine: Machine,
-    program: String,
-    args: Vec<String>,
-    options: Option<NativeExecutionOptionsInput>,
-) -> Result<ExecutionResult> {
-    machine
-        .attach_with(program, |builder| {
-            apply_execution_options(builder.args(args), options).tty(true)
-        })
-        .await
-        .map_err(to_napi_error)
-}
-
-async fn attach_shell(
-    machine: Machine,
-    options: Option<NativeSshShellOptionsInput>,
-) -> Result<SshExitStatus> {
-    machine
-        .attach_shell_with(|builder| apply_ssh_shell_options(builder, options))
+        .exec_script_with(script, |builder| apply_execution_options(builder, options))
         .await
         .map_err(to_napi_error)
 }
@@ -2441,13 +2404,6 @@ fn execution_lost_reason(reason: libvm::ExecutionLostReason) -> &'static str {
         libvm::ExecutionLostReason::GuestStreamLost => "guest_stream_lost",
         libvm::ExecutionLostReason::VmStopped => "vm_stopped",
         libvm::ExecutionLostReason::VmmonExited => "vmmon_exited",
-    }
-}
-
-fn ssh_exit_status_to_native(status: SshExitStatus) -> NativeSshExitStatus {
-    NativeSshExitStatus {
-        code: status.code,
-        success: status.success,
     }
 }
 

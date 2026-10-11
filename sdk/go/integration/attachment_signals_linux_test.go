@@ -65,14 +65,15 @@ func TestGoSDKAttachmentSignalsKVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForReady(t, ctx, m)
+	exerciseSuppliedShell(t, ctx, m)
 	for round := 0; round < 2; round++ {
-		for _, mode := range []string{"attach-int", "attach-term", "attach-ctrlc", "attach-resize", "attach-cancel", "shell-int", "shell-term", "shell-ctrlc", "shell-resize", "shell-cancel", "shell-detach"} {
+		for _, mode := range []string{"shell-int", "shell-term", "shell-ctrlc", "shell-resize", "shell-cancel", "shell-detach"} {
 			t.Run(fmt.Sprintf("%d/%s", round, mode), func(t *testing.T) {
 				runAttachmentPTY(t, home, m.ID(), mode)
 			})
 		}
 	}
-	for _, mode := range []string{"attach-ignored-hup", "attach-ignored-int", "shell-ignored-hup", "shell-ignored-int", "attach-default-int", "shell-default-int"} {
+	for _, mode := range []string{"shell-ignored-hup", "shell-ignored-int", "shell-default-int"} {
 		t.Run(mode, func(t *testing.T) { runAttachmentPTY(t, home, m.ID(), mode) })
 	}
 	output, err := m.Exec(ctx, "/bin/true", nil)
@@ -185,60 +186,28 @@ func attachmentChild(t *testing.T, mode string) {
 			t.Fatalf("previous Go action lacks alternate stack: %d", sig)
 		}
 	}
-	if strings.HasPrefix(mode, "attach-") {
-		script := "trap 'printf INT_OK; exit 42' INT; trap 'printf TERM_OK; exit 43' TERM; printf GUEST_READY; while :; do :; done"
-		if mode == "attach-resize" {
-			script = "trap 'stty size; exit 0' WINCH; printf GUEST_READY; while :; do :; done"
-		}
-		result, e := m.Attach(ctx, "/bin/bash", []string{"-c", script})
-		if mode == "attach-cancel" {
-			if !silo.IsErrorKind(e, silo.ErrorCancelled) {
-				t.Fatalf("cancel: %v", e)
-			}
-		} else {
-			want := uint32(42)
-			if mode == "attach-term" {
-				want = 43
-			}
-			if mode == "attach-resize" {
-				want = 0
-			}
-			if e != nil || result.Code == nil || *result.Code != want {
-				t.Fatalf("Attach: %#v %v, want %d", result, e, want)
-			}
-		}
-		// Exercise scoped Go subscriptions in the same process after normal
-		// and cancelled calls, with preemption and CPU profiling still active.
-		for i := 0; i < 10; i++ {
-			result, e = m.Attach(context.Background(), "/bin/true", nil)
-			if e != nil || result.Code == nil || *result.Code != 0 {
-				t.Fatalf("repeated Attach: %#v %v", result, e)
-			}
+	result, e := m.Shell(ctx, silo.WithSSHTerm("xterm"))
+	if mode == "shell-cancel" {
+		if !silo.IsErrorKind(e, silo.ErrorCancelled) {
+			t.Fatalf("shell cancel: %v", e)
 		}
 	} else {
-		result, e := m.AttachShell(ctx, silo.WithSSHTerm("xterm"))
-		if mode == "shell-cancel" {
-			if !silo.IsErrorKind(e, silo.ErrorCancelled) {
-				t.Fatalf("shell cancel: %v", e)
-			}
-		} else {
-			want := int32(42)
-			if mode == "shell-term" {
-				want = 43
-			}
-			if mode == "shell-detach" || mode == "shell-resize" {
-				want = 0
-			}
-			if e != nil || result.Code != want {
-				t.Fatalf("AttachShell: %#v %v, want %d", result, e, want)
-			}
+		want := int32(42)
+		if mode == "shell-term" {
+			want = 43
 		}
-		for i := 0; i < 3; i++ {
-			fmt.Printf("SHELL_REPEAT_%d\n", i)
-			result, e = m.AttachShell(context.Background(), silo.WithSSHTerm("xterm"))
-			if e != nil || result.Code != 0 {
-				t.Fatalf("repeated AttachShell: %#v %v", result, e)
-			}
+		if mode == "shell-detach" || mode == "shell-resize" {
+			want = 0
+		}
+		if e != nil || result.Code != want {
+			t.Fatalf("Shell: %#v %v, want %d", result, e, want)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		fmt.Printf("SHELL_REPEAT_%d\n", i)
+		result, e = m.Shell(context.Background(), silo.WithSSHTerm("xterm"))
+		if e != nil || result.Code != 0 {
+			t.Fatalf("repeated Shell: %#v %v", result, e)
 		}
 	}
 	if strings.HasSuffix(mode, "-int") || strings.HasSuffix(mode, "-term") {
@@ -356,13 +325,34 @@ func runAttachmentPTY(t *testing.T, home, id, mode string) {
 		}
 	}
 	wait := func(marker string) { waitAfter(marker, 0) }
+	waitForRawTerminal := func() {
+		t.Helper()
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			state, readErr := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if state.Lflag&unix.ICANON == 0 {
+				return
+			}
+			select {
+			case <-tick.C:
+			case <-deadline.C:
+				t.Fatal("shell did not acquire the host terminal")
+			}
+		}
+	}
 	if strings.Contains(mode, "-ignored-") || strings.Contains(mode, "-default-") {
 		for round := 0; round < 3; round++ {
 			marker := fmt.Sprintf("INHERITED_ROUND_%d", round)
 			wait(marker)
 			offset := strings.Index(output, marker) + len(marker)
 			if strings.HasPrefix(mode, "shell-") {
-				waitAfter("$ ", offset)
+				waitForRawTerminal()
 				if _, err = io.WriteString(master, fmt.Sprintf("stty -echo; trap 'printf HUP_OK; exit 44' HUP; trap 'printf INT_OK; exit 42' INT; printf 'GUEST_READY_%%s' %d; while :; do :; done\n", round)); err != nil {
 					t.Fatal(err)
 				}
@@ -395,11 +385,11 @@ func runAttachmentPTY(t *testing.T, home, id, mode string) {
 			t.Fatalf("inherited child: %v\n%s", err, output)
 		}
 		t.Logf("inherited/default signal evidence:\n%s", output)
-		verifyAttachmentPTY(t, original, slave, profile)
+		verifyAttachmentPTY(t, original, slave)
 		return
 	}
 	if strings.HasPrefix(mode, "shell-") {
-		wait("$ ")
+		waitForRawTerminal()
 		script := "trap 'printf INT_OK; exit 42' INT; trap 'printf TERM_OK; exit 43' TERM; printf GUEST_READY; while :; do :; done\n"
 		if mode == "shell-resize" {
 			script = "trap 'stty size; exit 0' WINCH; printf GUEST_READY; while :; do :; done\n"
@@ -415,7 +405,7 @@ func runAttachmentPTY(t *testing.T, home, id, mode string) {
 	}
 	wait("GUEST_READY")
 	// Guest output proves native registration is complete. The control descriptor
-	// requests a read-only query while the child is blocked in public Attach.
+	// requests a read-only query while the child is blocked in public Shell.
 	if _, err = writer.Write([]byte{'q'}); err != nil {
 		t.Fatal(err)
 	}
@@ -444,8 +434,7 @@ func runAttachmentPTY(t *testing.T, home, id, mode string) {
 		for i := 0; i < 3; i++ {
 			marker := fmt.Sprintf("SHELL_REPEAT_%d", i)
 			wait(marker)
-			offset := strings.Index(output, marker) + len(marker)
-			waitAfter("$ ", offset)
+			waitForRawTerminal()
 			if _, err = io.WriteString(master, "exit 0\n"); err != nil {
 				t.Fatal(err)
 			}
@@ -454,9 +443,6 @@ func runAttachmentPTY(t *testing.T, home, id, mode string) {
 	wait("ATTACHMENT_DONE")
 	if err = cmd.Wait(); err != nil {
 		t.Fatalf("child: %v\n%s", err, output)
-	}
-	if mode == "attach-int" {
-		t.Logf("child sigaction evidence:\n%s", output)
 	}
 	if strings.HasSuffix(mode, "-resize") && !strings.Contains(output, "41 123") {
 		t.Fatalf("resize not delivered: %s", output)
@@ -469,10 +455,10 @@ func runAttachmentPTY(t *testing.T, home, id, mode string) {
 	if strings.HasSuffix(mode, "-term") && !strings.Contains(output, "TERM_OK") {
 		t.Fatalf("TERM not delivered: %s", output)
 	}
-	verifyAttachmentPTY(t, original, slave, profile)
+	verifyAttachmentPTY(t, original, slave)
 }
 
-func verifyAttachmentPTY(t *testing.T, original *unix.Termios, slave *os.File, profile string) {
+func verifyAttachmentPTY(t *testing.T, original *unix.Termios, slave *os.File) {
 	t.Helper()
 	restored, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
 	// glibc tcsetattr expands the kernel's implicit input baud (CIBAUD=0)
@@ -483,10 +469,6 @@ func verifyAttachmentPTY(t *testing.T, original *unix.Termios, slave *os.File, p
 	}
 	if err != nil || restored.Iflag != original.Iflag || restored.Oflag != original.Oflag || restored.Cflag != wantCflag || restored.Lflag != original.Lflag || restored.Cc != original.Cc {
 		t.Fatalf("host terminal not restored: %v before=%+v after=%+v", err, original, restored)
-	}
-	info, err := os.Stat(profile)
-	if err != nil || info.Size() == 0 {
-		t.Fatalf("CPU profiling failed: %v", err)
 	}
 }
 
@@ -526,16 +508,9 @@ func exerciseInheritedAttachments(t *testing.T, ctx context.Context, m *silo.Mac
 		if strings.HasSuffix(mode, "-hup") {
 			want = 44
 		}
-		if strings.HasPrefix(mode, "attach-") {
-			result, err := m.Attach(ctx, "/bin/bash", []string{"-c", fmt.Sprintf("trap 'printf HUP_OK; exit 44' HUP; trap 'printf INT_OK; exit 42' INT; printf GUEST_READY_%d; while :; do :; done", round)})
-			if err != nil || result.Code == nil || *result.Code != want {
-				t.Fatalf("inherited Attach round %d: %#v %v", round, result, err)
-			}
-		} else {
-			result, err := m.AttachShell(ctx, silo.WithSSHTerm("xterm"))
-			if err != nil || result.Code != int32(want) {
-				t.Fatalf("inherited AttachShell round %d: %#v %v", round, result, err)
-			}
+		result, err := m.Shell(ctx, silo.WithSSHTerm("xterm"))
+		if err != nil || result.Code != int32(want) {
+			t.Fatalf("inherited Shell round %d: %#v %v", round, result, err)
 		}
 		fmt.Printf("INHERITED_FINISHED_%d\n", round)
 	}

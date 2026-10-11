@@ -49,12 +49,16 @@ pub use node_status::{
 };
 pub use process::{MachineRetention, ProcessConfig};
 pub use reference::MachineRef;
+pub use session::host::AttachmentSignal;
 pub(crate) use session::launch_failure_reason;
+pub use session::ssh::{
+    SshExitStatus, SshShellAttachment, SshShellControl, SshShellOptions, SshShellOptionsBuilder,
+    SshShellSignal,
+};
 pub use session::{
-    AttachmentSignal, ExecutionControl, ExecutionEvent, ExecutionLaunchFailure,
-    ExecutionLaunchFailureReason, ExecutionLost, ExecutionLostReason, ExecutionOptions,
-    ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult, ExecutionSession, ExecutionStdin,
-    SshExitStatus, SshShellOptions, SshShellOptionsBuilder, StdinMode,
+    ExecutionControl, ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason,
+    ExecutionLost, ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
+    ExecutionResult, ExecutionSession, ExecutionStdin, StdinMode,
 };
 pub(crate) use start::SecretProvider;
 pub use start::{

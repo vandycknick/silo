@@ -160,42 +160,40 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 			q.User = "root"
 		}
 	}
-	opts := []silo.ExecOption{silo.WithExecUser(q.User), silo.WithExecTTY(q.TTY), silo.WithExecStdinPipe()}
-	if action == identity.Exec {
-		account, err := guestIdentity(ctx, m, q.User, d.GuestUser)
-		if err != nil {
-			return Categorize(err).Exit, Categorize(err)
-		}
-		env := map[string]string{}
-		if account.name != "" {
-			env = map[string]string{"HOME": account.home, "USER": account.name, "LOGNAME": account.name, "SHELL": account.shell}
-		}
-		maps.Copy(env, q.Env)
-		if q.Directory == "" {
-			q.Directory = account.home
-		}
-		opts = append(opts, silo.WithExecWorkingDirectory(q.Directory), silo.WithExecEnv(env))
-	}
 	if q.TTY {
-		w := streams.Terminal.Window
-		if w.Rows == 0 || w.Columns == 0 {
+		size := streams.Terminal.Window
+		if size.Rows == 0 || size.Columns == 0 {
 			return 2, failure("usage", "invalid initial PTY size", 2)
 		}
-		term := streams.Terminal.Term
-		if term == "" {
-			term = "xterm-256color"
+		if streams.Terminal.Term == "" {
+			streams.Terminal.Term = "xterm-256color"
 		}
-		if len(term) > 128 || !text(term) {
+		if len(streams.Terminal.Term) > 128 || !text(streams.Terminal.Term) {
 			return 2, failure("usage", "invalid TERM", 2)
 		}
-		opts = append(opts, silo.WithExecInitialPTYSize(w.Rows, w.Columns), silo.WithExecTerm(term))
 	}
-	var exec *silo.ExecutionSession
 	if action == identity.Shell {
-		exec, e = m.SpawnSSHShell(ctx, opts...)
-	} else {
-		exec, e = m.Spawn(ctx, q.Program, q.Args, opts...)
+		return s.sshShell(ctx, m, q.User, streams)
 	}
+	opts := []silo.ExecOption{silo.WithExecUser(q.User), silo.WithExecTTY(q.TTY), silo.WithExecStdinPipe()}
+	account, err := guestIdentity(ctx, m, q.User, d.GuestUser)
+	if err != nil {
+		return Categorize(err).Exit, Categorize(err)
+	}
+	env := map[string]string{}
+	if account.name != "" {
+		env = map[string]string{"HOME": account.home, "USER": account.name, "LOGNAME": account.name, "SHELL": account.shell}
+	}
+	maps.Copy(env, q.Env)
+	if q.Directory == "" {
+		q.Directory = account.home
+	}
+	opts = append(opts, silo.WithExecWorkingDirectory(q.Directory), silo.WithExecEnv(env))
+	if q.TTY {
+		size := streams.Terminal.Window
+		opts = append(opts, silo.WithExecInitialPTYSize(size.Rows, size.Columns), silo.WithExecTerm(streams.Terminal.Term))
+	}
+	exec, e := m.Spawn(ctx, q.Program, q.Args, opts...)
 	if e != nil {
 		return Categorize(e).Exit, Categorize(e)
 	}

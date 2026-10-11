@@ -1,13 +1,12 @@
+import { shell } from "./shell.js";
 import type { NativeMachine, NativeMachineBuilder } from "./internal/napi.js";
 import {
     executionOptionsToNative,
     forwardsToNative,
-    executionResultFromNative,
     imageSourceToNative,
     machineDataFromNative,
     mapToKeyValues,
     mountsToNative,
-    sshShellOptionsToNative,
 } from "./convert.js";
 import { mapNativePromise } from "./errors.js";
 import { ExecutionOutput, ExecutionSession } from "./exec.js";
@@ -26,7 +25,6 @@ import { MachineNetworkBuilder, type MachineNetworkBuilderCallback } from "./net
 import type {
     ExecutionOptions,
     Forward,
-    ExecutionResult,
     ImageSource,
     KeyValueMap,
     MachineData,
@@ -347,10 +345,10 @@ export class Machine {
     }
 
     /** Run a script through the guest shell and capture output. */
-    async shell(script: string, options?: ExecutionOptions): Promise<ExecutionOutput> {
+    async execScript(script: string, options?: ExecutionOptions): Promise<ExecutionOutput> {
         return new ExecutionOutput(
             await mapNativePromise(
-                this.native.shell(
+                this.native.execScript(
                     assertString(script, "script"),
                     executionOptionsToNative(options),
                 ),
@@ -358,26 +356,12 @@ export class Machine {
         );
     }
 
-    /** Attach the current terminal to an interactive structured guest process. */
-    async attach(
-        program: string,
-        args: string[] = [],
-        options?: ExecutionOptions,
-    ): Promise<ExecutionResult> {
-        return executionResultFromNative(
-            await mapNativePromise(this.native.attach(
-                assertNonEmptyString(program, "program"),
-                assertStringArray(args, "args"),
-                executionOptionsToNative(options),
-            )),
-        );
-    }
-
-    /** Attach the current terminal to the guest's SSH shell. */
-    async attachShell(options?: SshShellOptions): Promise<SshExitStatus> {
-        return await mapNativePromise(
-            this.native.attachShell(sshShellOptionsToNative(options)),
-        );
+    /**
+     * Certificate-authenticated SSH login. Local mode owns the host terminal;
+     * supplied attachment callbacks must cooperate with abort. See README.
+     */
+    async shell(options?: SshShellOptions): Promise<SshExitStatus> {
+        return shell(this.native, options);
     }
 
 }

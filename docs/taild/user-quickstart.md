@@ -13,6 +13,25 @@ ssh silo show dev
 ssh -t silo shell dev
 ```
 
+`shell` is a certificate-authenticated SSH login over the VM's vsock-22
+listener. The guest sshd chooses your configured account's login shell and
+environment; the client supplies TERM and terminal dimensions. It requires a
+running VM and an already-established immutable host-key pin. With an
+independently owned SSH listener it continues to work while the guest agent is
+unavailable, but it cannot create the first pin during that outage.
+
+Use `exit` to leave the guest shell normally. Input EOF is not a logout request:
+taild sends two Ctrl-D bytes and SSH channel EOF, but shell startup or terminal
+mode changes can consume those bytes without exiting. Disconnecting cancels the
+session; it does not stop the VM. For finite automation, prefer `exec` when the
+guest agent is available.
+
+`exec` is different: it runs an explicit program/argv through guest-agent RPC
+and requires that agent to be available. Neither operation interprets the SSH
+username as authorization; the lobby checks your current tailnet capability and
+VM ownership throughout the session.
+
+
 Tailscale enrollment is opt-in. Add `--tailscale` to give the VM its own node:
 
 ```sh

@@ -28,7 +28,6 @@ type execConfig struct {
 	TTY            *bool             `json:"tty,omitempty"`
 	Term           *string           `json:"term,omitempty"`
 	InitialPTYSize *ptySizeWire      `json:"initial_pty_size,omitempty"`
-	SSHShell       bool              `json:"ssh_shell,omitempty"`
 	error          error
 }
 type ExecOption func(*execConfig)
@@ -102,7 +101,10 @@ func executionRequest(program string, args []string, opts []ExecOption) ([]byte,
 	if program == "" {
 		return nil, newError(ErrorInvalidArgument, "", "program must not be empty")
 	}
-	config := execConfig{Program: program, Args: append([]string(nil), args...), Env: map[string]string{}}
+	return configuredExecutionRequest(execConfig{Program: program, Args: append([]string(nil), args...), Env: map[string]string{}}, opts)
+}
+
+func configuredExecutionRequest(config execConfig, opts []ExecOption) ([]byte, error) {
 	for _, option := range opts {
 		if option == nil {
 			return nil, newError(ErrorInvalidArgument, "", "execution option must not be nil")
@@ -114,21 +116,11 @@ func executionRequest(program string, args []string, opts []ExecOption) ([]byte,
 	}
 	return json.Marshal(config)
 }
-func shellRequest(script string, opts []ExecOption) ([]byte, error) {
+func execScriptRequest(script string, opts []ExecOption) ([]byte, error) {
 	if script == "" {
 		return nil, newError(ErrorInvalidArgument, "", "script must not be empty")
 	}
-	data, err := executionRequest("shell", nil, opts)
-	if err != nil {
-		return nil, err
-	}
-	var config execConfig
-	if err = json.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-	config.Program = ""
-	config.Script = script
-	return json.Marshal(config)
+	return configuredExecutionRequest(execConfig{Script: script, Env: map[string]string{}}, opts)
 }
 
 // ExecutionOutput contains exact output bytes and the terminal execution result.
@@ -204,6 +196,8 @@ func decodeOutput(data *ffi.ExecutionOutput) (*ExecutionOutput, error) {
 	}, nil
 }
 
+// Exec collects an agent-RPC program with literal argv (no shell expansion).
+// Nonzero guest status is a result, not an error. See the README execution guide.
 func (m *Machine) Exec(ctx context.Context, program string, args []string, opts ...ExecOption) (*ExecutionOutput, error) {
 	request, err := executionRequest(program, args, opts)
 	if err != nil {
@@ -211,14 +205,18 @@ func (m *Machine) Exec(ctx context.Context, program string, args []string, opts 
 	}
 	return m.collected(ctx, request, false)
 }
-func (m *Machine) Shell(ctx context.Context, script string, opts ...ExecOption) (*ExecutionOutput, error) {
-	request, err := shellRequest(script, opts)
+
+// ExecScript collects /bin/sh -l -c SCRIPT over agent RPC, including login
+// startup files. Callers own shell-injection safety. Execution timeout applies
+// after startup, not to startup itself. See the README execution examples.
+func (m *Machine) ExecScript(ctx context.Context, script string, opts ...ExecOption) (*ExecutionOutput, error) {
+	request, err := execScriptRequest(script, opts)
 	if err != nil {
 		return nil, err
 	}
 	return m.collected(ctx, request, true)
 }
-func (m *Machine) collected(ctx context.Context, request []byte, shell bool) (*ExecutionOutput, error) {
+func (m *Machine) collected(ctx context.Context, request []byte, execScript bool) (*ExecutionOutput, error) {
 	if err := validateContext(ctx); err != nil {
 		return nil, err
 	}
@@ -229,8 +227,8 @@ func (m *Machine) collected(ctx context.Context, request []byte, shell bool) (*E
 	}
 	var data *ffi.ExecutionOutput
 	var err error
-	if shell {
-		data, err = m.native.Shell(request)
+	if execScript {
+		data, err = m.native.ExecScript(request)
 	} else {
 		data, err = m.native.Exec(request)
 	}
@@ -239,36 +237,12 @@ func (m *Machine) collected(ctx context.Context, request []byte, shell bool) (*E
 	}
 	return decodeOutput(data)
 }
+
+// Spawn opens a caller-driven agent-RPC execution stream. Observe Started before
+// querying Stdin or sending controls; Close/Cancel invalidate surviving handles.
+// WithExecTimeout does not establish a Spawn deadline. See examples/streaming.
 func (m *Machine) Spawn(ctx context.Context, program string, args []string, opts ...ExecOption) (*ExecutionSession, error) {
 	request, err := executionRequest(program, args, opts)
-	if err != nil {
-		return nil, err
-	}
-	return m.spawn(ctx, request)
-}
-
-// SpawnSSHShell opens a certificate-authenticated login shell over guest vsock
-// port 22. It uses the existing immutable host-key pin, not agent readiness or
-// the guest process RPC. The SSH listener must remain available independently
-// for this to work during an agent outage.
-//
-// The shell has a PTY and streaming stdin. User, terminal type, initial PTY size
-// and SSH environment requests are supported; execution-only options such as
-// working directory, arguments and timeout are rejected. SSH environment
-// requests remain subject to the guest server's policy.
-func (m *Machine) SpawnSSHShell(ctx context.Context, opts ...ExecOption) (*ExecutionSession, error) {
-	tty := true
-	config := execConfig{SSHShell: true, TTY: &tty, PipeStdin: true, Env: map[string]string{}}
-	for _, option := range opts {
-		if option == nil {
-			return nil, newError(ErrorInvalidArgument, "", "SSH shell option must not be nil")
-		}
-		option(&config)
-	}
-	if config.error != nil {
-		return nil, config.error
-	}
-	request, err := json.Marshal(config)
 	if err != nil {
 		return nil, err
 	}
@@ -511,13 +485,20 @@ type sshShellConfig struct {
 	Term         string            `json:"term,omitempty"`
 	DetachKeys   string            `json:"detach_keys,omitempty"`
 	ForwardAgent *bool             `json:"forward_agent,omitempty"`
+	attachment   *SSHShellAttachment
+	detachSet    bool
 }
 type SSHShellOption func(*sshShellConfig)
 
+// WithSSHWorkingDirectory uses the quoted SSH exec wrapper with best-effort cwd.
 func WithSSHWorkingDirectory(path string) SSHShellOption {
 	return func(c *sshShellConfig) { c.CWD = path }
 }
+
+// WithSSHUser selects the SSH certificate login user instead of the durable default.
 func WithSSHUser(user string) SSHShellOption { return func(c *sshShellConfig) { c.User = user } }
+
+// WithSSHEnv uses the quoted SSH exec wrapper, not server AcceptEnv requests.
 func WithSSHEnv(env map[string]string) SSHShellOption {
 	return func(c *sshShellConfig) {
 		c.Env = maps.Clone(env)
@@ -526,47 +507,24 @@ func WithSSHEnv(env map[string]string) SSHShellOption {
 		}
 	}
 }
+
+// WithSSHTerm sets the guest PTY terminal type, including supplied attachments.
 func WithSSHTerm(term string) SSHShellOption { return func(c *sshShellConfig) { c.Term = term } }
+
+// WithSSHDetachKeys replaces local terminal escape keys; invalid with supplied I/O.
 func WithSSHDetachKeys(keys string) SSHShellOption {
-	return func(c *sshShellConfig) { c.DetachKeys = keys }
+	return func(c *sshShellConfig) { c.DetachKeys = keys; c.detachSet = true }
 }
+
+// WithSSHAgentForwarding explicitly enables forwarding of the local agent socket.
 func WithSSHAgentForwarding(enabled bool) SSHShellOption {
 	return func(c *sshShellConfig) { c.ForwardAgent = &enabled }
 }
 
-// Attach forwards host HUP, INT, QUIT, TERM, USR1 and USR2 to the guest process
-// group and uses WINCH for resize. During every call, this overrides inherited
-// ignored dispositions for those signals. Return restores Go's prior behavior,
-// including inherited SIG_IGN, without removing application subscriptions.
-func (m *Machine) Attach(ctx context.Context, program string, args []string, opts ...ExecOption) (ExecutionResult, error) {
-	request, err := executionRequest(program, args, opts)
-	if err != nil {
-		return ExecutionResult{}, err
-	}
-	if err = validateContext(ctx); err != nil {
-		return ExecutionResult{}, err
-	}
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	if m.closed {
-		return ExecutionResult{}, newError(ErrorClosed, "", "machine is closed")
-	}
-	data, err := attachmentCall(ctx, false, func(token *ffi.AttachmentCancellation) ([]byte, error) {
-		return m.native.Attach(request, token)
-	})
-	if err != nil {
-		return ExecutionResult{}, err
-	}
-	var wire resultWire
-	if err = json.Unmarshal(data, &wire); err != nil {
-		return ExecutionResult{}, err
-	}
-	return decodeResult(wire), nil
-}
-
-// AttachShell forwards host HUP, INT, QUIT and TERM as SSH signals and uses WINCH
-// for resize. Its scoped subscription has the same restoration semantics as Attach.
-func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHExitStatus, error) {
+// Shell opens a certificate-authenticated SSH login shell. By default it owns
+// local terminal I/O and scoped HUP/INT/QUIT/TERM/WINCH subscriptions. A supplied
+// attachment never touches process stdio or signal dispositions.
+func (m *Machine) Shell(ctx context.Context, opts ...SSHShellOption) (SSHExitStatus, error) {
 	if err := validateContext(ctx); err != nil {
 		return SSHExitStatus{}, err
 	}
@@ -577,6 +535,14 @@ func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHE
 		}
 		option(&config)
 	}
+	if config.attachment != nil {
+		if config.detachSet {
+			return SSHExitStatus{}, newError(ErrorInvalidArgument, "", "supplied SSH attachment cannot configure detach keys")
+		}
+		if err := validateShellAttachment(*config.attachment); err != nil {
+			return SSHExitStatus{}, err
+		}
+	}
 	request, err := json.Marshal(config)
 	if err != nil {
 		return SSHExitStatus{}, err
@@ -586,9 +552,14 @@ func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHE
 	if m.closed {
 		return SSHExitStatus{}, newError(ErrorClosed, "", "machine is closed")
 	}
-	data, err := attachmentCall(ctx, true, func(token *ffi.AttachmentCancellation) ([]byte, error) {
-		return m.native.AttachShell(request, token)
-	})
+	var data []byte
+	if config.attachment != nil {
+		data, err = suppliedShell(ctx, m.native, request, *config.attachment)
+	} else {
+		data, err = attachmentCall(ctx, func(token *ffi.AttachmentCancellation) ([]byte, error) {
+			return m.native.Shell(request, token, nil)
+		})
+	}
 	if err != nil {
 		return SSHExitStatus{}, err
 	}
@@ -600,12 +571,9 @@ func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHE
 // Go owns the scoped process-signal subscription and forwards notifications into
 // native controls. Stop restores inherited dispositions, including SIG_IGN,
 // without affecting application subscribers or relying on cached native handlers.
-func attachmentSignals(shell bool) (<-chan os.Signal, func()) {
+func attachmentSignals() (<-chan os.Signal, func()) {
 	notifications := make(chan os.Signal, 16)
 	signals := []os.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGWINCH}
-	if !shell {
-		signals = append(signals, syscall.SIGUSR1, syscall.SIGUSR2)
-	}
 	signal.Notify(notifications, signals...)
 	return notifications, func() { signal.Stop(notifications) }
 }
@@ -620,10 +588,6 @@ func attachmentSignalNumber(sig os.Signal) (uint32, bool) {
 		return 3, true
 	case syscall.SIGTERM:
 		return 15, true
-	case syscall.SIGUSR1:
-		return 10, true
-	case syscall.SIGUSR2:
-		return 12, true
 	case syscall.SIGWINCH:
 		return 28, true
 	default:
@@ -631,13 +595,13 @@ func attachmentSignalNumber(sig os.Signal) (uint32, bool) {
 	}
 }
 
-func attachmentCall(ctx context.Context, shell bool, call func(*ffi.AttachmentCancellation) ([]byte, error)) ([]byte, error) {
+func attachmentCall(ctx context.Context, call func(*ffi.AttachmentCancellation) ([]byte, error)) ([]byte, error) {
 	token, err := ffi.NewAttachmentCancellation()
 	if err != nil {
 		return nil, fromNativeError(err)
 	}
 	defer token.Close()
-	notifications, stopSignals := attachmentSignals(shell)
+	notifications, stopSignals := attachmentSignals()
 	defer stopSignals()
 	type result struct {
 		data []byte
@@ -667,7 +631,7 @@ func attachmentCall(ctx context.Context, shell bool, call func(*ffi.AttachmentCa
 				<-done
 				return nil, fromNativeError(err)
 			}
-			<-done // Native future is dropped before freeing the token or restoring signals.
+			<-done // Await native transport cleanup before freeing the token.
 			return nil, contextError(ctx.Err())
 		}
 	}

@@ -121,3 +121,8 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	op, err = s.Remove(ctx, c, "pending", RemoveRequest{Force: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
 }
+
+// The fixture owns its VM and home; it never opens an existing user's VM.
+func TestNativeKVMShellAgentUnavailable(t *testing.T) {
+	qualifyIndependentShell(t)
+}
