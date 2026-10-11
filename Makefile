@@ -15,6 +15,8 @@ CARGO_TARGET_DIR ?= $(CURDIR)/target
 EXAMPLE ?= basic
 ##? SMOKE_ARGS=...: Extra pytest arguments for make smoke.
 SMOKE_ARGS ?=
+##? BASELINE=path: Select the coverage regression baseline (default: target/coverage-baseline).
+BASELINE ?= $(CARGO_TARGET_DIR)/coverage-baseline
 override CARGO_TARGET_DIR := $(abspath $(CARGO_TARGET_DIR))
 export CARGO_TARGET_DIR
 
@@ -185,6 +187,16 @@ test-unit: ## Run unit tests for all host-supported workspace components.
 
 test-integration: ## Run integration tests for all host-supported workspace components.
 	$(XTASK) test-integration
+
+.PHONY: coverage coverage-baseline coverage-diff
+coverage: ## Collect Rust/Go/Node coverage into target/coverage.
+	$(XTASK) coverage
+
+coverage-baseline: ## Snapshot coverage as the reduction baseline.
+	rm -rf "$(BASELINE)" && cp -R "$(CARGO_TARGET_DIR)/coverage" "$(BASELINE)"
+
+coverage-diff: ## Fail if coverage regressed versus BASELINE.
+	$(XTASK) coverage-diff --baseline "$(BASELINE)" --current "$(CARGO_TARGET_DIR)/coverage"
 
 smoke: ## Run the real-VM smoke test suite against the staged PROFILE runtime (needs KVM/HVF; not CI).
 	cd smoke && SILO_SMOKE_BIN_DIR="$(CARGO_TARGET_DIR)/$(PROFILE)" SILO_SMOKE_RUNTIME_DIR="$(CARGO_TARGET_DIR)/silo-runtime/$(RUNTIME_TARGET)/$(PROFILE)" uv run pytest $(SMOKE_ARGS)

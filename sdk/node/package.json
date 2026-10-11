@@ -28,6 +28,7 @@
     "build": "npm run build:native && npm run build:ts",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
+    "test:coverage": "vitest run --coverage --coverage.provider=v8 --coverage.include=src/**/*.ts --coverage.reporter=text --coverage.reporter=lcov",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "engines": {
@@ -44,6 +45,7 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0",
     "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "4.1.9",
     "typescript": "^5.5.0",
     "vitest": "^4.1.0"
   }

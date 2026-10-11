@@ -455,7 +455,7 @@ fn cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> 
     Ok(cargo)
 }
 
-fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
+pub(crate) fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
     let mut cargo = Command::new("cargo");
     cargo
         .current_dir(workspace_root)

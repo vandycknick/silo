@@ -18,6 +18,7 @@ mod app;
 mod archive;
 mod command;
 mod components;
+mod coverage;
 mod go_sdk;
 mod initramfs;
 mod kernel;
@@ -114,6 +115,15 @@ enum Commands {
     Fmt,
     Clippy,
     Test,
+    Coverage,
+    CoverageDiff {
+        #[arg(long, value_name = "PATH")]
+        baseline: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        current: PathBuf,
+        #[arg(long, value_name = "NAME")]
+        allow_missing_lane: Vec<String>,
+    },
     TestUnit,
     TestIntegration,
     VersionCheck,
@@ -354,6 +364,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             test_units(&workspace_root, &target_dir, host)?;
             test_integration(&workspace_root, &target_dir, host)?;
         }
+        Commands::Coverage => {
+            let host = HostTarget::current()?;
+            coverage::collect::coverage(&workspace_root, &target_dir, host)?;
+        }
+        Commands::CoverageDiff {
+            baseline,
+            current,
+            allow_missing_lane,
+        } => coverage::diff::coverage_diff(&baseline, &current, &allow_missing_lane)?,
         Commands::TestUnit => {
             let host = HostTarget::current()?;
             test_units(&workspace_root, &target_dir, host)?;

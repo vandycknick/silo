@@ -27,6 +27,7 @@ let
       rustToolchain
       pkgs.go
       pkgs.nodejs_26
+      pkgs.cargo-nextest
       pkgs.git
       pkgs.gnumake
       pkgs.gnutar
@@ -47,6 +48,7 @@ let
   developmentPackages = ciPackages
     ++ [
       zig
+      pkgs.cargo-llvm-cov
       pkgs.cargo-zigbuild
       pkgs.oras
       pkgs.syft
