@@ -30,7 +30,7 @@ pub struct DaemonStatus {
     pub schema: u32,
     pub generation: Uuid,
     pub pid: u32,
-    /// [`crate::process::start_time`] of `pid` on Linux; opaque elsewhere.
+    /// [`crate::process::start_time`] of `pid`: its birth time in Unix seconds.
     #[serde(default)]
     pub process_start: String,
     pub core: CorePhase,
