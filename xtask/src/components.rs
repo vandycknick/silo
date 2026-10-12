@@ -192,6 +192,17 @@ fn run_tests(
         ]);
         command::run(build)?;
     }
+    // Real-process tests build private netd copies. Warm Go's build cache once
+    // before parallel nextest workers compete to compile the same cold graph.
+    let mut netd = Command::new("go");
+    netd.current_dir(workspace_root.join("net/netd")).args([
+        "build",
+        "-o",
+        "/dev/null",
+        "./cmd/netd",
+    ]);
+    command::run(netd)?;
+
     command::run(workspace_test_command(
         workspace_root,
         target_dir,

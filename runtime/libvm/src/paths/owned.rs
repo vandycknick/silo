@@ -3,12 +3,11 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::{fcntl, open, openat, FcntlArg, OFlag};
 use nix::sys::stat::{fchmod, fstat, mkdirat, Mode, SFlag};
-use nix::unistd::{ftruncate, geteuid};
+use nix::unistd::{ftruncate, geteuid, mkdir};
 
 use crate::LibVmError;
 
@@ -34,12 +33,9 @@ impl OwnedDirectory {
             .ok_or_else(|| invalid(path, "has no parent directory"))?;
         fs::create_dir_all(parent).map_err(|error| invalid(path, error))?;
 
-        let created = match fs::DirBuilder::new()
-            .mode(PRIVATE_DIRECTORY_MODE.bits())
-            .create(path)
-        {
+        let created = match mkdir(path, PRIVATE_DIRECTORY_MODE) {
             Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(nix::errno::Errno::EEXIST) => false,
             Err(error) => return Err(invalid(path, error)),
         };
         let fd = open_directory(path)?;

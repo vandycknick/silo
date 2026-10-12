@@ -38,6 +38,8 @@ tests. Rust tests use cargo-nextest with process isolation and a single workspac
 pass; integration tests share a prebuilt mock `silo-vmm`. `make test-unit` runs
 Rust unit tests only, while `make test-integration` runs Rust integration tests
 and netd tests. Both Rust unit commands also test rprobe without default features.
+The test runner warms netd's Go build cache before starting parallel Rust tests,
+so real-process fixtures do not spend their test timeout compiling cold dependencies.
 
 With `CI=true`, nextest uses the `ci` profile and writes JUnit results under
 `target/nextest/ci/junit.xml` (under `CARGO_TARGET_DIR` when overridden).
