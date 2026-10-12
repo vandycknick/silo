@@ -71,7 +71,6 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 	// Registered control-plane clients are initialized before temporary native
 	// registry trust. No credentials or host-image escape enters the create API.
 	registry := testfixture.OCIRegistry(t, rootfs)
-	c.VM.AllowedRegistries = []string{registry.Allowed()}
 	n := daemon.Open(t, c, "live-s11", 16)
 	r := n.Runtime
 	svc := &service.Service{Runtime: r, Audit: n.Audit, Jobs: n.Jobs, Config: c, Capability: c.Tailnet.Capability, VisibleNames: node.VisibleNames}

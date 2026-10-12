@@ -512,7 +512,7 @@ func sshPTYLobbyInput(t *testing.T, address string, input []byte) {
 func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	rootfs := testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true)
 	registry := testfixture.OCIRegistry(t, rootfs)
-	cfg := daemon.Config(t, registry)
+	cfg := daemon.Config(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	n := daemon.Open(t, cfg, "terminal-native", 8)

@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use eyre::Context as _;
-use libvm::{NetdRuntimeConfig, RuntimeNetworkingConfig};
+use libvm::{
+    NetdRuntimeConfig, RegistryAction, RegistryPolicy, RegistryRule, RuntimeNetworkingConfig,
+};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 
@@ -24,6 +26,7 @@ pub fn prepare_host_paths(host: &libvm::HostPaths) -> eyre::Result<libvm::HostPa
 pub struct GlobalConfig {
     default_machine: Option<String>,
     networking: RuntimeNetworkingConfig,
+    images: RegistryPolicy,
     daemon: DaemonConfig,
 }
 
@@ -62,6 +65,10 @@ impl GlobalConfig {
         &self.networking
     }
 
+    pub fn images(&self) -> &RegistryPolicy {
+        &self.images
+    }
+
     pub fn tailscale(&self) -> &TailscaleConfig {
         &self.daemon.tailscale
     }
@@ -78,9 +85,10 @@ impl GlobalConfig {
             .tailscale
             .then(|| self.tailscale().effective_settings());
         Ok(format!(
-            "{}:{features:?}:{:?}:{system:?}:{tailscale:?}",
+            "{}:{features:?}:{:?}:{:?}:{system:?}:{tailscale:?}",
             env!("CARGO_PKG_VERSION"),
-            self.networking()
+            self.networking(),
+            self.images()
         ))
     }
 
@@ -148,6 +156,7 @@ impl GlobalConfig {
         Self {
             default_machine: None,
             networking: RuntimeNetworkingConfig::default().with_policy_config_dir(config_dir),
+            images: RegistryPolicy::default(),
             daemon: DaemonConfig::default(),
         }
     }
@@ -172,9 +181,16 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
         daemon.validate()?;
     }
 
+    let images = parsed
+        .images
+        .map(registry_policy)
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(GlobalConfig {
         default_machine,
         networking: RuntimeNetworkingConfig::default().with_netd(netd),
+        images,
         daemon: parsed.daemon.unwrap_or_default(),
     })
 }
@@ -184,7 +200,54 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
 struct RawGlobalConfig {
     default_machine: Option<String>,
     networking: Option<RawNetworkingConfig>,
+    images: Option<RawImagesConfig>,
     daemon: Option<DaemonConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawImagesConfig {
+    default: Option<RawRegistryAction>,
+    search_registries: Option<Vec<String>>,
+    rules: Option<Vec<RawRegistryRule>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawRegistryAction {
+    Allow,
+    Deny,
+}
+
+impl From<RawRegistryAction> for RegistryAction {
+    fn from(raw: RawRegistryAction) -> Self {
+        match raw {
+            RawRegistryAction::Allow => Self::Allow,
+            RawRegistryAction::Deny => Self::Deny,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRegistryRule {
+    prefix: String,
+    action: RawRegistryAction,
+}
+
+fn registry_policy(raw: RawImagesConfig) -> eyre::Result<RegistryPolicy> {
+    let defaults = RegistryPolicy::default();
+    RegistryPolicy::new(
+        raw.default.map_or(defaults.default_action(), Into::into),
+        raw.search_registries
+            .unwrap_or_else(|| defaults.search_registries().to_vec()),
+        raw.rules
+            .unwrap_or_default()
+            .into_iter()
+            .map(|rule| RegistryRule::new(rule.prefix, rule.action.into()))
+            .collect(),
+    )
+    .map_err(|err| eyre::eyre!("[images] {err}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +330,7 @@ pub struct FeatureSelection {
 #[cfg(test)]
 mod tests {
     use crate::{parse_global_config, GlobalConfig};
+    use libvm::{RegistryAction, RegistryPolicy, RegistryRule};
 
     #[test]
     fn daemon_overrides_are_empty_without_a_config_file_or_section() {
@@ -348,6 +412,74 @@ mod tests {
         assert_eq!(
             baseline.daemon_identity(selected).unwrap(),
             persisted.daemon_identity(selected).unwrap()
+        );
+    }
+
+    #[test]
+    fn image_policy_changes_restart_the_daemon_even_with_features_disabled() {
+        let disabled = crate::FeatureSelection {
+            system: false,
+            tailscale: false,
+        };
+        let baseline = parse_global_config("{}").unwrap();
+        let denied = parse_global_config("images:\n  default: deny\n").unwrap();
+        assert_ne!(
+            baseline.daemon_identity(disabled).unwrap(),
+            denied.daemon_identity(disabled).unwrap()
+        );
+    }
+
+    #[test]
+    fn images_section_maps_to_the_registry_policy() {
+        let config = parse_global_config(concat!(
+            "images:\n",
+            "  default: deny\n",
+            "  search_registries: [ghcr.io, docker.io]\n",
+            "  rules:\n",
+            "    - {prefix: docker.io, action: allow}\n",
+            "    - {prefix: ghcr.io/vandycknick, action: allow}\n",
+            "    - {prefix: localhost, action: deny}\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            config.images(),
+            &RegistryPolicy::new(
+                RegistryAction::Deny,
+                vec!["ghcr.io".into(), "docker.io".into()],
+                vec![
+                    RegistryRule::new("docker.io", RegistryAction::Allow),
+                    RegistryRule::new("ghcr.io/vandycknick", RegistryAction::Allow),
+                    RegistryRule::new("localhost", RegistryAction::Deny),
+                ],
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            parse_global_config("images: {}\n").unwrap().images(),
+            &RegistryPolicy::default()
+        );
+        assert_eq!(
+            parse_global_config("{}").unwrap().images(),
+            &RegistryPolicy::default()
+        );
+    }
+
+    #[test]
+    fn images_section_rejects_unknown_keys_and_invalid_rules() {
+        for raw in [
+            "images: {unknown: 1}\n",
+            "images: {default: maybe}\n",
+            "images: {rules: [{prefix: docker.io}]}\n",
+            "images: {rules: [{prefix: docker.io, action: allow, extra: 1}]}\n",
+            "daemon: {version: '1', tailscale: {vm: {allowed-registries: [x]}}}\n",
+        ] {
+            assert!(parse_global_config(raw).is_err(), "{raw}");
+        }
+        let err = parse_global_config("images: {rules: [{prefix: nixos/nix, action: allow}]}\n")
+            .expect_err("prefix without registry host");
+        assert_eq!(
+            err.to_string(),
+            "[images] invalid registry policy: rule prefix \"nixos/nix\" must start with a registry host, e.g. docker.io or ghcr.io/org"
         );
     }
 }

@@ -36,6 +36,7 @@ const (
 	ErrorLocalDiskNotRegularFile     ErrorKind = "LocalDiskNotRegularFile"
 	ErrorLocalDiskUnreadable         ErrorKind = "LocalDiskUnreadable"
 	ErrorImage                       ErrorKind = "Image"
+	ErrorImageReferenceRejected      ErrorKind = "ImageReferenceRejected"
 	ErrorMachineIDAlreadyExists      ErrorKind = "MachineIdAlreadyExists"
 	ErrorMachineAlreadyRunning       ErrorKind = "MachineAlreadyRunning"
 	ErrorMachineNotRunning           ErrorKind = "MachineNotRunning"

@@ -55,7 +55,6 @@ func TestActualSDKCreateInterruptedByMemoryGateWhenMarkerWriteFails(t *testing.T
 	s.Shutdown = &state.ShutdownGate{}
 	s.Jobs.Shutdown = s.Shutdown
 	c := domainCaller(s, "user:1")
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var enteredOnce, releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })

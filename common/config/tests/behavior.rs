@@ -37,7 +37,7 @@ fn missing_config_has_resolved_defaults_without_side_effects() {
     assert_eq!(c.control_url(), "");
     assert_eq!(c.enrollment_mode(), EnrollmentMode::OauthApp);
     assert!(!c.disable_key_expiry());
-    assert_eq!(c.vm().allowed_registries(), &["ghcr.io/vandycknick"]);
+    assert_eq!(config.images(), &libvm::RegistryPolicy::default());
     assert_eq!(c.vm().defaults().cpus(), 2);
     assert_eq!(c.vm().defaults().memory(), 4 << 30);
     assert_eq!(c.vm().defaults().disk(), 20 << 30);

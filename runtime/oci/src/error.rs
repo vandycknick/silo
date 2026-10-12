@@ -15,6 +15,15 @@ pub enum OciError {
     #[error("invalid OCI image reference {reference:?}: {message}")]
     InvalidReference { reference: String, message: String },
 
+    #[error("invalid registry policy: {message}")]
+    InvalidRegistryPolicy { message: String },
+
+    #[error("{}", registry_policy_denied(.reference, .rule))]
+    RegistryPolicyDenied {
+        reference: String,
+        rule: Option<String>,
+    },
+
     #[error("registry request for image {reference:?} failed")]
     Registry {
         reference: String,
@@ -117,6 +126,18 @@ pub enum OciError {
 }
 
 impl OciError {
+    /// Errors that mean "this registry does not have the image", so the next
+    /// search registry is worth trying.
+    pub(crate) fn is_search_miss(&self) -> bool {
+        matches!(
+            self,
+            Self::RegistryImageNotFound { .. }
+                | Self::RegistryImageTagNotFound { .. }
+                | Self::RegistryImageDigestNotFound { .. }
+                | Self::RegistryAccessDenied { .. }
+        )
+    }
+
     pub(crate) fn registry(reference: impl Into<String>, source: OciDistributionError) -> Self {
         let reference = reference.into();
         if let Some(error) = registry_envelope_image_not_found(&reference, &source) {
@@ -153,6 +174,13 @@ impl OciError {
 
     pub(crate) fn flat_ext4(source: disk_image::ext4::FormatError) -> Self {
         Self::FlatExt4 { source }
+    }
+}
+
+fn registry_policy_denied(reference: &str, rule: &Option<String>) -> String {
+    match rule {
+        Some(rule) => format!("image {reference:?} is denied by registry policy rule {rule:?}"),
+        None => format!("image {reference:?} is denied by the registry policy default"),
     }
 }
 

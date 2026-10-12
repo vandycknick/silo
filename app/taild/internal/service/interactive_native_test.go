@@ -23,7 +23,6 @@ func TestNativeInteractiveCreateBootsWithOfflineControl(t *testing.T) {
 	}
 	registry := testfixture.OCIRegistry(t, testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true))
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.Enrollment.Mode = "interactive"
 	s.VMNodesEnabled = true
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "http://127.0.0.1:1"}, Registry: enroll.NewRegistry(), Metrics: s.Runtime.Metrics}

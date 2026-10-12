@@ -252,7 +252,6 @@ func TestForwardCreateRequiresTailscaleBeforeWorkThroughRPC(t *testing.T) {
 	s := actualService(t)
 	ctx := t.Context()
 	c := domainCaller(s, "user:1")
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.PoliciesDir = testfixture.TempDir(t)
 	for name, raw := range map[string]string{"web": forwardWebPolicy, "plain": `settings { default_action = "allow" }`} {
 		if _, err := s.Documents(ctx, c, "policy", "create", name, "", raw); err != nil {
@@ -314,7 +313,6 @@ func TestForwardCreateRetainsBoundPolicyThroughRPC(t *testing.T) {
 	s := actualService(t)
 	ctx := t.Context()
 	c := domainCaller(s, "user:1")
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "https://pinned-control.example.test"}}
 	if _, err := s.Documents(ctx, c, "policy", "create", "web", "", forwardWebPolicy); err != nil {
@@ -396,7 +394,6 @@ func TestSetPolicyRetainsManagedNodeThroughRPC(t *testing.T) {
 	s := actualService(t)
 	ctx := t.Context()
 	c := domainCaller(s, "user:1")
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "https://pinned-control.example.test"}}
 	if _, err := s.Documents(ctx, c, "policy", "create", "web", "", forwardWebPolicy); err != nil {

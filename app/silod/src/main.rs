@@ -160,6 +160,7 @@ async fn run(args: Args) -> eyre::Result<()> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let helper_config = global.tailscale().clone();
+    let registry_policy = global.images().clone();
     let state = std::sync::Arc::new(control::ControlState::new(
         host,
         global,
@@ -189,6 +190,7 @@ async fn run(args: Args) -> eyre::Result<()> {
             system_status.ok_or_else(|| eyre::eyre!("enabled system has no initial status"))?,
             system_shutdown.clone(),
             publisher.clone(),
+            registry_policy,
         )))
     } else {
         None

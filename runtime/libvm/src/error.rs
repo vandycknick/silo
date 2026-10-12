@@ -97,6 +97,9 @@ pub enum LibVmError {
         source: oci::OciError,
     },
 
+    #[error("{message}")]
+    ImageReferenceRejected { reference: String, message: String },
+
     #[error("machine {id} already exists")]
     MachineIdAlreadyExists { id: String },
 
@@ -285,6 +288,7 @@ impl LibVmError {
             Self::LocalDiskNotRegularFile { .. } => "LocalDiskNotRegularFile",
             Self::LocalDiskUnreadable { .. } => "LocalDiskUnreadable",
             Self::Image { .. } => "Image",
+            Self::ImageReferenceRejected { .. } => "ImageReferenceRejected",
             Self::MachineIdAlreadyExists { .. } => "MachineIdAlreadyExists",
             Self::MachineAlreadyRunning { .. } => "MachineAlreadyRunning",
             Self::MachineNotRunning { .. } => "MachineNotRunning",

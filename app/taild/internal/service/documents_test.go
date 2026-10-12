@@ -373,7 +373,6 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Config.Tailnet.ControlURL = "https://wrong-config.example.test"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: "https://pinned-control.example.test"}}
@@ -489,7 +488,6 @@ func TestTemplateCreationOverridesAndStampedAuthority(t *testing.T) {
 	c := domainCaller(s, "user:1")
 	// A real tiny OCI image, materialized into a stopped VM through silod.
 	registry := fixture.Reference
-	s.Config.VM.AllowedRegistries = []string{strings.Split(registry, "/")[0] + "/fixture"}
 	raw := "version: '1'\nimage: " + registry + "\nresources: {cpus: 2, memory: 512MiB}\ndisk_size: 1GiB\nnetwork: {kind: private, publish: [8080]}\nlabels: {team: template, x: original}"
 	if _, e := s.Documents(ctx, c, "template", "create", "dev", "", raw); e != nil {
 		t.Fatal(e)
@@ -608,7 +606,6 @@ func TestDocumentsPolicyBoundVMsThroughRPC(t *testing.T) {
 			s := actualService(t)
 			ctx := t.Context()
 			c := domainCaller(s, "user:1")
-			s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 			for _, ref := range []string{"web", "unrelated"} {
 				if _, err := s.Documents(ctx, c, "policy", "create", ref, "", `settings { default_action = "allow" }`); err != nil {
 					t.Fatal(err)

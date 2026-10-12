@@ -147,7 +147,7 @@ impl Cmd {
         };
         if self.dry_run {
             let resolution = crate::api::AppApi::resolve_read_only_creation(
-                RuntimeConfig::from_env()?,
+                RuntimeConfig::from_env()?.with_registry_policy(context.config()?.images().clone()),
                 self.name,
                 self.image.as_deref(),
                 &template.template,

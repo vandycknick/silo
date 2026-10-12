@@ -240,6 +240,26 @@ fn typed_errors_preserve_generation_and_guest_exit_classification() {
     }
 }
 #[test]
+fn rejected_image_reference_keeps_its_policy_message_across_the_wire() {
+    let message = "image \"docker.io/nixos/nix:latest\" is denied by the registry policy default";
+    let status = native_error_to_status(&libvm::LibVmError::ImageReferenceRejected {
+        reference: "nixos/nix".into(),
+        message: message.into(),
+    });
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.message(), message);
+    match status_to_native_error(&status).unwrap() {
+        libvm::LibVmError::ImageReferenceRejected {
+            reference,
+            message: received,
+        } => {
+            assert_eq!(reference, "nixos/nix");
+            assert_eq!(received, message);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+}
+#[test]
 fn image_progress_preserves_layer_accounting_and_absence() {
     let events = [
         libvm::ImageProgress::ResolvedManifest {

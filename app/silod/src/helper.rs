@@ -83,7 +83,6 @@ fn settings(c: &silo_config::tailscale::TailscaleConfig) -> eyre::Result<w::Tail
             silo_config::tailscale::EnrollmentMode::None => w::EnrollmentMode::None as i32,
         },
         disable_key_expiry: c.disable_key_expiry(),
-        allowed_registries: c.vm().allowed_registries().to_vec(),
         defaults: Some(w::ResourceDefaults {
             cpus: d.cpus().try_into()?,
             memory_bytes: d.memory(),

@@ -44,7 +44,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	}
 	_ = kvm.Close()
 	registry := testfixture.OCIRegistry(t, rootfs)
-	c := daemon.Config(t, registry)
+	c := daemon.Config(t)
 	c.VM.Defaults.Memory = 1 << 30
 	c.FileTransferLimit = 256 << 20
 	n := daemon.Open(t, c, "native-e2e", 16)

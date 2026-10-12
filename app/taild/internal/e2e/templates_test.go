@@ -29,7 +29,7 @@ func TestNativeKVMTemplatesPolicyAndMissingSecrets(t *testing.T) {
 	}
 	rootfs := testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true)
 	registry := testfixture.OCIRegistry(t, rootfs)
-	c := daemon.Config(t, registry)
+	c := daemon.Config(t)
 	c.VM.Defaults.Memory = 1 << 30
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()

@@ -223,26 +223,13 @@ impl Ceilings {
         self.vms_per_principal
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VmSettings {
-    allowed_registries: Vec<String>,
     defaults: ResourceLimits,
     ceilings: Ceilings,
 }
-impl Default for VmSettings {
-    fn default() -> Self {
-        Self {
-            allowed_registries: vec!["ghcr.io/vandycknick".into()],
-            defaults: ResourceLimits::default(),
-            ceilings: Ceilings::default(),
-        }
-    }
-}
 impl VmSettings {
-    pub fn allowed_registries(&self) -> &[String] {
-        &self.allowed_registries
-    }
     pub fn defaults(&self) -> &ResourceLimits {
         &self.defaults
     }

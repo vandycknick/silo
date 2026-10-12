@@ -120,6 +120,12 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = "machine ID already exists".into();
             tonic::Code::AlreadyExists
         }
+        E::ImageReferenceRejected { reference, message } => {
+            d.kind = 1;
+            d.reference = Some(reference.clone());
+            d.safe_message = message.clone();
+            tonic::Code::InvalidArgument
+        }
         E::InvalidMachineName { .. }
         | E::InvalidMachineIdPrefix { .. }
         | E::InvalidCreateRequest { .. }
@@ -232,6 +238,10 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             },
             "ImageNotFound" => E::ImageNotFound {
                 reference: required(d.reference, "error.reference")?,
+            },
+            "ImageReferenceRejected" => E::ImageReferenceRejected {
+                reference: required(d.reference, "error.reference")?,
+                message: d.safe_message,
             },
             "MachineAlreadyExists" => E::MachineAlreadyExists {
                 name: required(d.reference, "error.reference")?,

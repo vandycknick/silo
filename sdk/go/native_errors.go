@@ -18,6 +18,7 @@ var nativeErrorKinds = map[string]ErrorKind{
 	"ImagePullPolicyUnsupported": ErrorImagePullPolicyUnsupported, "LocalDiskCanonicalize": ErrorLocalDiskCanonicalize,
 	"LocalDiskMetadata": ErrorLocalDiskMetadata, "LocalDiskNotRegularFile": ErrorLocalDiskNotRegularFile,
 	"LocalDiskUnreadable": ErrorLocalDiskUnreadable, "Image": ErrorImage,
+	"ImageReferenceRejected": ErrorImageReferenceRejected,
 	"MachineIdAlreadyExists": ErrorMachineIDAlreadyExists, "MachineAlreadyRunning": ErrorMachineAlreadyRunning,
 	"MachineNotRunning": ErrorMachineNotRunning, "MachineStaleGeneration": ErrorMachineStaleGeneration,
 	"MachineLogSourceUnavailable": ErrorMachineLogSourceUnavailable, "MonitorConnection": ErrorMonitorConnection,

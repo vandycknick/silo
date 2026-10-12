@@ -53,12 +53,11 @@ var (
 	errVMNotFound   = failure("not_found", "VM not found", 3)
 	errVMRunning    = failure("conflict", "VM is running; use --force", 5)
 	errInvalidName  = failure("usage", "invalid exact name", 2)
-	errImage        = failure("usage", "image must be an allowlisted OCI reference", 2)
 	errImageMissing = failure("usage", "an image is required; supply IMAGE or --image, or select a --template that provides an image", 2)
 	errUserdata     = failure("usage", "userdata must be an inline shebang script, at most 16KiB", 2)
 )
 
-// Categorize never exposes native diagnostics, which may contain paths or credentials.
+// Categorize exposes only safe image rejection messages, never other native diagnostics.
 func Categorize(err error) *authz.Error {
 	if err == nil {
 		return nil
@@ -78,6 +77,8 @@ func Categorize(err error) *authz.Error {
 			return failure("conflict", "VM state does not permit this operation", 5)
 		case silo.ErrorInvalidArgument, silo.ErrorInvalidCreateRequest, silo.ErrorInvalidMachineName:
 			return failure("usage", "invalid request", 2)
+		case silo.ErrorImageReferenceRejected:
+			return failure("usage", e.Message, 2)
 		case silo.ErrorImage, silo.ErrorImageNotFound:
 			return failure("image", "image pull or materialization failed", 7)
 		case silo.ErrorMachinePreparationFailed, silo.ErrorMachineStartCleanupFailed, silo.ErrorEntrypointLaunchFailed, silo.ErrorRootDisk, silo.ErrorGuestSession, silo.ErrorNetworkRuntime:
@@ -148,10 +149,7 @@ func project(d *silo.MachineData) VM {
 		}
 	}
 	if d.RootFS != nil && d.RootFS.SourceKind == "oci" {
-		host, _, _ := strings.Cut(d.ImageRef, "/")
-		if imageAllowed(d.ImageRef, []string{host}) {
-			v.Image = d.ImageRef
-		}
+		v.Image = d.ImageRef
 	}
 	if d.CPUs != nil {
 		v.CPUs = *d.CPUs
@@ -251,33 +249,6 @@ type CreateRequest struct {
 }
 
 func text(s string) bool { return !strings.ContainsFunc(s, unicode.IsControl) }
-func imageAllowed(ref string, allow []string) bool {
-	if len(ref) == 0 || len(ref) > 512 || !text(ref) || strings.ContainsAny(ref, " \\?#") || strings.Contains(ref, "://") || strings.HasPrefix(ref, "/") {
-		return false
-	}
-	parts := strings.Split(ref, "/")
-	for _, c := range ref {
-		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._/:@-", c) {
-			continue
-		}
-		return false
-	}
-	if len(parts) < 2 || !strings.ContainsAny(parts[0], ".:") && parts[0] != "localhost" {
-		return false
-	}
-	for _, p := range parts {
-		if p == "" || p == "." || p == ".." {
-			return false
-		}
-	}
-	for _, prefix := range allow {
-		prefix = strings.TrimSuffix(prefix, "/")
-		if ref != prefix && strings.HasPrefix(ref, prefix+"/") {
-			return true
-		}
-	}
-	return false
-}
 
 func (s *Service) ValidateCreate(ctx context.Context, p identity.Peer, q CreateRequest) (CreateRequest, error) {
 	if e := s.Authorize(p, identity.Create, nil); e != nil {
@@ -322,9 +293,6 @@ func (s *Service) ValidateCreate(ctx context.Context, p identity.Peer, q CreateR
 	}
 	if q.Image == "" {
 		return q, errImageMissing
-	}
-	if !imageAllowed(q.Image, s.Config.VM.AllowedRegistries) {
-		return q, errImage
 	}
 	if !validUserdata(q.Userdata) {
 		return q, errUserdata

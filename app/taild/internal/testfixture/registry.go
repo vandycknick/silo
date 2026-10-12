@@ -42,12 +42,6 @@ type Registry struct {
 	BeforeManifest func()
 }
 
-// Allowed is the registry prefix the fixture image lives under.
-func (r *Registry) Allowed() string {
-	host, _, _ := strings.Cut(r.Reference, "/")
-	return host + "/fixture"
-}
-
 // GuestFile adds a regular file to the fixture image without changing rootfs.
 type GuestFile struct {
 	Path string

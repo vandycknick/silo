@@ -15,6 +15,7 @@ use crate::paths::{vm_spec_path_in, LocalPaths, MachinePaths};
 use crate::runtime::boot_assets::{self, BootAssetOverrides, ResolvedBootAssets};
 use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::runtime::{RuntimeConfig, RuntimeNetworkingConfig};
+use crate::RegistryPolicy;
 use nix::{
     errno::Errno,
     sys::signal::{kill, Signal},
@@ -101,6 +102,7 @@ pub struct Runtime {
     store: Arc<dyn DataStore>,
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
+    registry_policy: RegistryPolicy,
     components: ResolvedRuntimeComponents,
     supervisor: VmSupervisor,
     image_pull_policy: ImagePullPolicy,
@@ -140,6 +142,7 @@ impl Runtime {
             paths,
             Arc::new(store),
             config.networking,
+            config.registry_policy,
             components,
             config.virt_backend,
         )
@@ -162,13 +165,22 @@ impl Runtime {
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
         let components = crate::runtime::components::test_components(paths.home());
-        Self::from_store(paths, Arc::new(store), networking, components, None).await
+        Self::from_store(
+            paths,
+            Arc::new(store),
+            networking,
+            RegistryPolicy::default(),
+            components,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn from_store(
         paths: LocalPaths,
         store: Arc<dyn DataStore>,
         networking: RuntimeNetworkingConfig,
+        registry_policy: RegistryPolicy,
         components: ResolvedRuntimeComponents,
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Result<Self, LibVmError> {
@@ -185,6 +197,7 @@ impl Runtime {
             store,
             lock_manager,
             networking,
+            registry_policy,
             components,
             supervisor,
             image_pull_policy: ImagePullPolicy::default(),
@@ -199,6 +212,10 @@ impl Runtime {
     /// Returns the Silo home holding this runtime's persistent state.
     pub fn local_home(&self) -> &Path {
         self.paths.home()
+    }
+
+    pub(crate) fn image_store(&self) -> oci::OciResult<RootfsImageStore> {
+        RootfsImageStore::open(self.local_images_dir(), self.registry_policy.clone())
     }
 
     /// Read-only readiness using the start resolver. No values or signing material are returned.
@@ -571,7 +588,8 @@ impl Runtime {
         &self,
         reference: &str,
     ) -> Result<MaterializedImage, LibVmError> {
-        let store = RootfsImageStore::open(self.local_images_dir())
+        let store = self
+            .image_store()
             .map_err(|err| image_error(reference, err))?;
         let options = MaterializeOptions::for_host().map_err(|err| image_error(reference, err))?;
         let progress = self.image_progress.clone();
@@ -662,7 +680,8 @@ impl Runtime {
         reference: String,
         policy: ImagePullPolicy,
     ) -> Result<ResolvedOciImage, LibVmError> {
-        let store = RootfsImageStore::open(self.local_images_dir())
+        let store = self
+            .image_store()
             .map_err(|err| image_error(&reference, err))?;
         let options = MaterializeOptions::for_host().map_err(|err| image_error(&reference, err))?;
 
@@ -699,7 +718,8 @@ impl Runtime {
         resolved: &ResolvedOciImage,
     ) -> Result<MaterializedImage, LibVmError> {
         let source = ImageSource::oci(resolved.requested_reference.clone());
-        let store = RootfsImageStore::open(self.local_images_dir())
+        let store = self
+            .image_store()
             .map_err(|err| image_error(&resolved.requested_reference, err))?;
         let options = MaterializeOptions::for_host()
             .map_err(|err| image_error(&resolved.requested_reference, err))?;
@@ -1456,7 +1476,8 @@ impl Runtime {
             .store
             .ensure_image_removable(reference, options.clone())
             .await?;
-        let rootfs_store = RootfsImageStore::open(self.local_images_dir())
+        let rootfs_store = self
+            .image_store()
             .map_err(|err| image_error(&image.requested_reference, err))?;
         let rootfs_options = MaterializeOptions::for_host()
             .map_err(|err| image_error(&image.requested_reference, err))?;
@@ -2494,6 +2515,7 @@ mod tests {
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
             components,
             None,
         )
@@ -3129,6 +3151,7 @@ mod tests {
             paths,
             store.clone(),
             RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
             components,
             None,
         )

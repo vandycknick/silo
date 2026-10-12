@@ -150,9 +150,6 @@ func (s *Service) ParseTemplate(ctx context.Context, raw string) (Template, erro
 	if t.Description != nil && (len(*t.Description) > 4096 || !text(*t.Description)) {
 		return t, usageDocument()
 	}
-	if t.Image != nil && !imageAllowed(*t.Image, s.Config.VM.AllowedRegistries) {
-		return t, errImage
-	}
 	if t.Resources != nil {
 		if t.Resources.CPUs != nil && (*t.Resources.CPUs == 0 || *t.Resources.CPUs > 255) {
 			return t, usageDocument()

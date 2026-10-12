@@ -7,6 +7,7 @@ use crate::paths::{
 use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::store::models::DbConfig;
 use crate::LibVmError;
+use crate::RegistryPolicy;
 
 /// Local runtime configuration.
 #[derive(Debug, Clone, Default)]
@@ -18,6 +19,8 @@ pub struct RuntimeConfig {
     pub home: Option<PathBuf>,
     /// Networking configuration for locally started machines.
     pub networking: RuntimeNetworkingConfig,
+    /// Registry policy for OCI image resolution.
+    pub registry_policy: RegistryPolicy,
     /// Explicit silo-vmm executable path.
     pub supervisor_path: Option<PathBuf>,
     /// Explicit netd executable path.
@@ -76,6 +79,12 @@ impl RuntimeConfig {
     /// Sets local runtime networking configuration.
     pub fn with_networking(mut self, networking: RuntimeNetworkingConfig) -> Self {
         self.networking = networking;
+        self
+    }
+
+    /// Sets the registry policy applied before contacting OCI registries.
+    pub fn with_registry_policy(mut self, policy: RegistryPolicy) -> Self {
+        self.registry_policy = policy;
         self
     }
 

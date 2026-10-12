@@ -11,6 +11,7 @@ use crate::image::{
 use crate::runtime::RuntimeConfig;
 use crate::store::ReadOnlyStore;
 use crate::LibVmError;
+use crate::RegistryPolicy;
 
 /// Read-only runtime facilities used to build a creation plan.
 ///
@@ -20,6 +21,7 @@ use crate::LibVmError;
 pub struct ReadOnlyRuntime {
     home: PathBuf,
     store: Option<ReadOnlyStore>,
+    registry_policy: RegistryPolicy,
 }
 
 impl ReadOnlyRuntime {
@@ -32,7 +34,11 @@ impl ReadOnlyRuntime {
                 crate::runtime::config::validate_db_config(&stored)?;
             }
         }
-        Ok(Self { home, store })
+        Ok(Self {
+            home,
+            store,
+            registry_policy: config.registry_policy,
+        })
     }
 
     /// Checks whether a machine name is free without reserving it.
@@ -54,7 +60,7 @@ impl ReadOnlyRuntime {
         reference: String,
         policy: ImagePullPolicy,
     ) -> Result<ResolvedOciImage, LibVmError> {
-        let store = RootfsImageStore::open(self.home.join("images"))
+        let store = RootfsImageStore::open(self.home.join("images"), self.registry_policy.clone())
             .map_err(|error| image_error(&reference, error))?;
         let options =
             MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?;

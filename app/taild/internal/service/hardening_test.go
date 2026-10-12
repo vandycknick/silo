@@ -22,7 +22,6 @@ import (
 func TestConsentPrecedesNativeMaterialization(t *testing.T) {
 	s := actualService(t)
 	registry := testfixture.OCIRegistry(t, "")
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.Enrollment.Mode = "oauth-app"
 	s.VMNodesEnabled = true
 	r := enroll.NewRegistry()

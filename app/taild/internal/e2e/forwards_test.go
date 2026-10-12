@@ -80,7 +80,7 @@ func TestLiveTailnetPolicyForwards(t *testing.T) {
 		t.Fatal("live forwards require SILO_TAILD_TEST_ROOTFS with systemctl and systemd as PID 1; once-only userdata installs a persistent systemd service")
 	}
 	registry := testfixture.OCIRegistry(t, rootfs, testfixture.GuestFile{Path: "usr/local/bin/silo-forward-probe", Mode: 0755, Data: probe})
-	cfg := daemon.Config(t, registry)
+	cfg := daemon.Config(t)
 	cfg.VM.Defaults.Memory = 1 << 30
 	cfg.Tailnet.Tag = "tag:silo-test"
 	cfg.Tailnet.Hostname = fmt.Sprintf("forward-lobby-%x", time.Now().UnixNano())

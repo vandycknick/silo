@@ -19,7 +19,7 @@ use crate::layer::apply_layer;
 use crate::lock::FileLock;
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::registry::{ImageConfig, RegistryClient, ResolvedImage, ResolvedLayer};
-use crate::{OciError, OciResult, Platform};
+use crate::{OciError, OciResult, Platform, RegistryPolicy};
 
 const BLOBS_DIR_NAME: &str = "blobs";
 const METADATA_VERSION: u32 = 2;
@@ -99,6 +99,7 @@ enum StoredRootfsImageSource {
 #[derive(Debug, Clone)]
 pub struct ImageStore {
     root: PathBuf,
+    policy: RegistryPolicy,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -248,9 +249,10 @@ struct LayerStreamWrite<'a> {
 }
 
 impl ImageStore {
-    pub fn open(root: impl AsRef<Path>) -> OciResult<Self> {
+    pub fn open(root: impl AsRef<Path>, policy: RegistryPolicy) -> OciResult<Self> {
         Ok(Self {
             root: root.as_ref().to_path_buf(),
+            policy,
         })
     }
 
@@ -279,6 +281,7 @@ impl ImageStore {
                 actual: resolved.platform.to_string(),
             });
         }
+        self.policy.check(&resolved.reference)?;
         let registry = RegistryClient::new()?;
         registry
             .authenticate_pull(&resolved.reference, &resolved.requested_reference)
@@ -310,18 +313,20 @@ impl ImageStore {
     /// Removes the mutable tag mapping for an OCI reference without deleting its artifact.
     /// Digest-pinned references have no mutable mapping and return `false`.
     pub fn remove_reference(&self, image_ref: &str, platform: &Platform) -> OciResult<bool> {
-        let reference = RegistryClient::parse_reference(image_ref)?;
-        if reference.digest().is_some() {
+        let keys: Vec<String> = self
+            .policy
+            .candidates(image_ref)?
+            .iter()
+            .filter(|reference| reference.digest().is_none())
+            .map(|reference| tag_key(&reference.to_string(), platform))
+            .collect();
+        if keys.is_empty() {
             return Ok(false);
         }
 
-        let canonical_ref = reference.to_string();
         let _index_lock = FileLock::exclusive(&self.index_lock_path())?;
         let mut index = self.read_index()?;
-        let removed = index
-            .tags
-            .remove(&tag_key(&canonical_ref, platform))
-            .is_some();
+        let removed = keys.iter().any(|key| index.tags.remove(key).is_some());
         if removed {
             self.write_index(&index)?;
         }
@@ -359,27 +364,48 @@ impl ImageStore {
         platform: &Platform,
         progress: Option<&ProgressReporter>,
     ) -> OciResult<ResolvedImage> {
-        let reference = RegistryClient::parse_reference(image_ref)?;
-        let canonical_ref = reference.to_string();
-        emit_progress(
-            progress,
-            ProgressEvent::ResolvingManifest {
-                image_ref: canonical_ref.clone(),
-            },
-        );
-        let resolved = RegistryClient::new()?
-            .resolve_manifest(&reference, platform)
-            .await?;
-        emit_progress(
-            progress,
-            ProgressEvent::ResolvedManifest {
-                image_ref: canonical_ref,
-                manifest_digest: resolved.manifest_digest.clone(),
-                layer_count: resolved.layers.len(),
-                total_download_bytes: total_download_bytes(&resolved.layers),
-            },
-        );
-        Ok(resolved)
+        let mut denied = None;
+        let mut missed = None;
+        for reference in self.policy.candidates(image_ref)? {
+            if let Err(err) = self.policy.check(&reference) {
+                denied.get_or_insert(err);
+                continue;
+            }
+            let canonical_ref = reference.to_string();
+            emit_progress(
+                progress,
+                ProgressEvent::ResolvingManifest {
+                    image_ref: canonical_ref.clone(),
+                },
+            );
+            let resolved = match RegistryClient::new()?
+                .resolve_manifest(&reference, platform)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) if err.is_search_miss() => {
+                    missed = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            emit_progress(
+                progress,
+                ProgressEvent::ResolvedManifest {
+                    image_ref: canonical_ref,
+                    manifest_digest: resolved.manifest_digest.clone(),
+                    layer_count: resolved.layers.len(),
+                    total_download_bytes: total_download_bytes(&resolved.layers),
+                },
+            );
+            return Ok(resolved);
+        }
+        Err(missed
+            .or(denied)
+            .unwrap_or_else(|| OciError::InvalidReference {
+                reference: image_ref.to_string(),
+                message: "no candidate references".to_string(),
+            }))
     }
 
     async fn materialize_resolved_oci(
@@ -441,17 +467,27 @@ impl ImageStore {
         image_ref: &str,
         options: &MaterializeOptions,
     ) -> OciResult<Option<PublishedRootfs>> {
-        let reference = RegistryClient::parse_reference(image_ref)?;
-        let canonical_ref = reference.to_string();
-        let Some(digest) = reference.digest() else {
-            let index = self.read_index()?;
-            let Some(tag) = index.tags.get(&tag_key(&canonical_ref, &options.platform)) else {
-                return Ok(None);
+        for reference in self.policy.candidates(image_ref)? {
+            let canonical_ref = reference.to_string();
+            let cached = match reference.digest() {
+                Some(digest) => self.cached_image(&canonical_ref, digest, &options.platform)?,
+                None => {
+                    let index = self.read_index()?;
+                    match index.tags.get(&tag_key(&canonical_ref, &options.platform)) {
+                        Some(tag) => self.cached_image(
+                            &canonical_ref,
+                            &tag.manifest_digest,
+                            &options.platform,
+                        )?,
+                        None => None,
+                    }
+                }
             };
-            return self.cached_image(&canonical_ref, &tag.manifest_digest, &options.platform);
-        };
-
-        self.cached_image(&canonical_ref, digest, &options.platform)
+            if cached.is_some() {
+                return Ok(cached);
+            }
+        }
+        Ok(None)
     }
 
     async fn create_rootfs(
@@ -1294,6 +1330,7 @@ fn now_unix_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+    use std::str::FromStr;
     use std::sync::{Arc, Barrier};
 
     use crate::registry::ResolvedLayer;
@@ -1303,7 +1340,10 @@ mod tests {
         ImageStore, MaterializeOptions, StoredRootfsImageSource, INDEX_FILE_NAME,
         METADATA_FILE_NAME, METADATA_VERSION, ROOTFS_FILESYSTEM, ROOTFS_FILE_NAME,
     };
-    use crate::{FlatExt4Artifact, ImageConfig, OciError, Platform, PublishedRootfs};
+    use crate::{
+        FlatExt4Artifact, ImageConfig, OciError, Platform, PublishedRootfs, RegistryAction,
+        RegistryPolicy, RegistryRule, ResolvedImage,
+    };
 
     const HISTORICAL_CACHE_METADATA_V2: &[u8] =
         include_bytes!("../testdata/cache-metadata-v2.json");
@@ -1314,7 +1354,7 @@ mod tests {
     #[test]
     fn image_id_and_platform_define_cache_path() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let path = store
             .image_dir(TEST_IMAGE_ID, &Platform::linux_amd64())
             .expect("cache path");
@@ -1329,7 +1369,7 @@ mod tests {
     #[test]
     fn uppercase_image_id_preserves_existing_cache_path_spelling() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let image_id = format!("sha256:{}", "AB".repeat(32));
         let path = store
             .image_dir(&image_id, &Platform::linux_amd64())
@@ -1345,7 +1385,7 @@ mod tests {
     #[test]
     fn validates_existing_cache_metadata() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let platform = Platform::linux_arm64();
         let dir = store
             .image_dir(TEST_IMAGE_ID, &platform)
@@ -1421,7 +1461,7 @@ mod tests {
     #[test]
     fn reads_historical_cache_metadata_v2_without_schema_drift() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let platform = Platform::linux_amd64();
         let image_id = "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea";
         let dir = store.image_dir(image_id, &platform).expect("cache path");
@@ -1465,7 +1505,7 @@ mod tests {
     #[test]
     fn reads_historical_store_index_v1_without_schema_drift() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         std::fs::write(temp.path().join("index.json"), HISTORICAL_STORE_INDEX_V1)
             .expect("write historical index");
 
@@ -1486,7 +1526,7 @@ mod tests {
     #[test]
     fn historical_index_and_metadata_resolve_as_one_cache_entry() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let options = MaterializeOptions::new(Platform::linux_amd64());
         let image_id = "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea";
         let dir = store
@@ -1576,7 +1616,7 @@ mod tests {
     #[test]
     fn corrupt_cache_metadata_is_reported() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let platform = Platform::linux_amd64();
         let dir = store
             .image_dir(TEST_IMAGE_ID, &platform)
@@ -1595,7 +1635,7 @@ mod tests {
     #[test]
     fn cache_metadata_manifest_must_match_its_image_id() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let platform = Platform::linux_amd64();
         let mut metadata = serde_json::from_slice::<ImageMetadata>(HISTORICAL_CACHE_METADATA_V2)
             .expect("read historical metadata");
@@ -1624,7 +1664,7 @@ mod tests {
     #[test]
     fn rejects_cache_metadata_from_the_previous_schema() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let platform = Platform::linux_amd64();
         let dir = store
             .image_dir(TEST_IMAGE_ID, &platform)
@@ -1666,7 +1706,7 @@ mod tests {
     #[test]
     fn cache_metadata_filesystem_mismatch_is_reported() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let platform = Platform::linux_amd64();
         let dir = store
             .image_dir(TEST_IMAGE_ID, &platform)
@@ -1723,7 +1763,7 @@ mod tests {
     #[test]
     fn blob_cache_paths_are_content_addressed() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let digest = format!("sha256:{}", sha256_bytes(b"layer"));
         let encoded = digest.strip_prefix("sha256:").expect("digest prefix");
 
@@ -1745,7 +1785,7 @@ mod tests {
     #[test]
     fn uppercase_blob_digest_uses_the_existing_lowercase_cache_path() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let digest = format!("sha256:{}", "AB".repeat(32));
         let encoded = "ab".repeat(32);
 
@@ -1819,7 +1859,8 @@ mod tests {
                 let root = temp.path().to_path_buf();
                 let barrier = Arc::clone(&barrier);
                 threads.push(scope.spawn(move || {
-                    let store = ImageStore::open(root).expect("open store");
+                    let store =
+                        ImageStore::open(root, RegistryPolicy::default()).expect("open store");
                     let reference = format!("example.test/demo-{index}:latest");
                     let digest = format!("sha256:{index:064x}");
                     barrier.wait();
@@ -1833,7 +1874,7 @@ mod tests {
             }
         });
 
-        let store = ImageStore::open(temp.path()).expect("open store");
+        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
         let index = store.read_index().expect("read shared index");
         assert_eq!(index.tags.len(), thread_count);
         for entry in 0..thread_count {
@@ -1849,5 +1890,145 @@ mod tests {
                 Some(format!("sha256:{entry:064x}").as_str())
             );
         }
+    }
+
+    fn deny_by_default(search: &[&str]) -> RegistryPolicy {
+        RegistryPolicy::new(
+            RegistryAction::Deny,
+            search.iter().map(|s| s.to_string()).collect(),
+            vec![RegistryRule::new("ghcr.io/allowed", RegistryAction::Allow)],
+        )
+        .expect("valid policy")
+    }
+
+    #[test]
+    fn resolve_rejects_denied_references_before_contacting_a_registry() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let store =
+            ImageStore::open(temp.path(), deny_by_default(&["docker.io"])).expect("open store");
+
+        // `now_or_never` only completes if nothing awaited network I/O.
+        let err = futures_util::FutureExt::now_or_never(store.resolve(
+            "example.test/x:latest",
+            &Platform::linux_amd64(),
+            None,
+        ))
+        .expect("policy check must not await the registry")
+        .expect_err("denied");
+        assert_eq!(
+            err.to_string(),
+            "image \"example.test/x:latest\" is denied by the registry policy default"
+        );
+
+        let err = futures_util::FutureExt::now_or_never(store.get_or_create(
+            "nixos/nix",
+            &MaterializeOptions::new(Platform::linux_amd64()),
+            None,
+        ))
+        .expect("policy check must not await the registry")
+        .expect_err("denied");
+        assert!(matches!(
+            &err,
+            OciError::RegistryPolicyDenied { reference, rule: None }
+                if reference == "docker.io/nixos/nix:latest"
+        ));
+    }
+
+    #[test]
+    fn resolve_reports_the_first_denial_when_every_candidate_is_denied() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let store = ImageStore::open(temp.path(), deny_by_default(&["quay.io", "docker.io"]))
+            .expect("open store");
+
+        let err = futures_util::FutureExt::now_or_never(store.resolve(
+            "nixos/nix",
+            &Platform::linux_amd64(),
+            None,
+        ))
+        .expect("policy check must not await the registry")
+        .expect_err("denied");
+        assert!(matches!(
+            &err,
+            OciError::RegistryPolicyDenied { reference, .. }
+                if reference == "quay.io/nixos/nix:latest"
+        ));
+    }
+
+    #[test]
+    fn materialize_rechecks_policy_on_the_transport_reference() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let store =
+            ImageStore::open(temp.path(), deny_by_default(&["docker.io"])).expect("open store");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let resolved = ResolvedImage {
+            requested_reference: "ghcr.io/allowed/x:latest".to_string(),
+            selected_reference: format!("example.test/x@{digest}"),
+            manifest_digest: digest.clone(),
+            config_digest: digest.clone(),
+            config: ImageConfig::default(),
+            platform: Platform::linux_amd64(),
+            reference: oci_client::Reference::from_str(&format!("example.test/x@{digest}"))
+                .expect("reference"),
+            layers: Vec::new(),
+        };
+
+        let err = futures_util::FutureExt::now_or_never(store.materialize(
+            &resolved,
+            &MaterializeOptions::new(Platform::linux_amd64()),
+            None,
+        ))
+        .expect("policy check must not await the registry")
+        .expect_err("denied");
+        assert!(matches!(
+            &err,
+            OciError::RegistryPolicyDenied { reference, .. }
+                if reference == &format!("example.test/x@{digest}")
+        ));
+    }
+
+    #[test]
+    fn short_name_cache_lookup_and_removal_search_every_registry_without_policy() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let store = ImageStore::open(temp.path(), deny_by_default(&["ghcr.io", "docker.io"]))
+            .expect("open store");
+        let options = MaterializeOptions::new(Platform::linux_amd64());
+        let metadata = serde_json::from_slice::<ImageMetadata>(HISTORICAL_CACHE_METADATA_V2)
+            .expect("read historical metadata");
+        let image_id = metadata.image_id.clone();
+        let dir = store
+            .image_dir(&image_id, &options.platform)
+            .expect("cache path");
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+        std::fs::write(dir.join(METADATA_FILE_NAME), HISTORICAL_CACHE_METADATA_V2)
+            .expect("write metadata");
+        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"rootfs").expect("write rootfs");
+        store
+            .update_tag_mapping(
+                "docker.io/acme/tool:latest",
+                &options.platform,
+                &metadata.manifest_digest,
+            )
+            .expect("map tag");
+
+        let rootfs = store
+            .get_cached("acme/tool", &options)
+            .expect("read cache")
+            .expect("cache hit through the second search registry");
+        assert_eq!(
+            rootfs.flat_ext4().requested_reference,
+            "docker.io/acme/tool:latest"
+        );
+        assert_eq!(rootfs.flat_ext4().image_id, image_id);
+
+        assert!(store
+            .remove_reference("acme/tool", &options.platform)
+            .expect("remove tag"));
+        assert!(store
+            .get_cached("acme/tool", &options)
+            .expect("read cache")
+            .is_none());
+        assert!(!store
+            .remove_reference("acme/tool", &options.platform)
+            .expect("remove missing tag"));
     }
 }

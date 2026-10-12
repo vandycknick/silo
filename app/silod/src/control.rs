@@ -91,7 +91,9 @@ impl ControlState {
         generation: uuid::Uuid,
         publisher: Arc<crate::status::StatusPublisher>,
     ) -> Self {
-        let config = RuntimeConfig::local(host.home()).with_networking(global.networking().clone());
+        let config = RuntimeConfig::local(host.home())
+            .with_networking(global.networking().clone())
+            .with_registry_policy(global.images().clone());
         Self {
             host,
             config,

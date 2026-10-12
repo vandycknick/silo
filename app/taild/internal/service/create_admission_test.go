@@ -17,7 +17,6 @@ import (
 func TestCreateAdmissionFinalizerWithActualHome(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	c := domainCaller(s, "user:1")
 	checkReleased := func(name string) {
 		t.Helper()
@@ -72,7 +71,6 @@ func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s, sdk := actualNativeService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	c := domainCaller(s, "user:1")
 	entered, hold := make(chan struct{}), make(chan struct{})
 	var once, releaseOnce sync.Once
@@ -119,7 +117,6 @@ func TestGeneratedNameNativeRaceKeepsPublishedName(t *testing.T) {
 func TestCreateMissingImageRejectsBeforeNativeAdmission(t *testing.T) {
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.Enrollment.Mode = "interactive"
 	s.VMNodesEnabled = true
 	s.Enrollment = &enroll.Manager{Config: s.Config, Registry: enroll.NewRegistry()}

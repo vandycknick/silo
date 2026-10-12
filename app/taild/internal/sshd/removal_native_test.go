@@ -377,7 +377,7 @@ func TestRemovalOpenSSHNativeRunningForce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
 	registry := testfixture.OCIRegistry(t, testfixture.Path(t, "SILO_TAILD_TEST_ROOTFS", true))
-	cfg := daemon.Config(t, registry)
+	cfg := daemon.Config(t)
 	n := daemon.Open(t, cfg, "removal-running", 8)
 	s := &service.Service{Runtime: n.Runtime, Audit: n.Audit, Jobs: n.Jobs, Config: cfg}
 	caller := service.Caller{Peer: daemon.Peer(cfg, "explicit-removal-running", "user:7")}

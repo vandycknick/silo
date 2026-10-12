@@ -28,6 +28,22 @@ func TestRichNativeErrorParity(t *testing.T) {
 		})
 	}
 }
+
+func TestRichImageReferenceRejected(t *testing.T) {
+	const message = `image "docker.io/nixos/nix:latest" is denied by registry policy rule "docker.io"`
+	variant, reference := "ImageReferenceRejected", "nixos/nix"
+	s, err := status.New(codes.InvalidArgument, "unsafe diagnostic").WithDetails(&w.ErrorDetail{
+		Kind: w.ErrorKind_ERROR_KIND_INVALID, Code: w.ErrorCode_ERROR_CODE_NATIVE,
+		NativeVariant: &variant, SafeMessage: message, Reference: &reference,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *silo.Error
+	if err := rpcError(context.Background(), s.Err()); !errors.As(err, &got) || got.Kind != silo.ErrorImageReferenceRejected || got.Message != message {
+		t.Fatalf("image rejection was not preserved: %v", err)
+	}
+}
 func TestRichCodeAndTransportSemantics(t *testing.T) {
 	for code, kind := range map[w.ErrorCode]silo.ErrorKind{w.ErrorCode_ERROR_CODE_ALREADY_RUNNING: silo.ErrorMachineAlreadyRunning, w.ErrorCode_ERROR_CODE_NOT_RUNNING: silo.ErrorMachineNotRunning, w.ErrorCode_ERROR_CODE_STALE_GENERATION: silo.ErrorMachineStaleGeneration, w.ErrorCode_ERROR_CODE_MONITOR_CONNECTION: silo.ErrorMonitorConnection, w.ErrorCode_ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED: silo.ErrorEntrypointLaunchFailed, w.ErrorCode_ERROR_CODE_COMMAND_NOT_FOUND: silo.ErrorEntrypointLaunchFailed} {
 		s, e := status.New(codes.Unavailable, "unsafe").WithDetails(&w.ErrorDetail{Kind: w.ErrorKind_ERROR_KIND_UNAVAILABLE, Code: code, SafeMessage: "safe"})

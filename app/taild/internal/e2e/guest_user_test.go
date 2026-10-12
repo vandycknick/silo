@@ -98,7 +98,7 @@ func TestNativeKVMGuestUserRootAndOptIn(t *testing.T) {
 				}
 			}
 			registry := testfixture.OCIRegistry(t, rootfs)
-			c := daemon.Config(t, registry)
+			c := daemon.Config(t)
 			c.VM.Defaults.Memory = 1 << 30
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()

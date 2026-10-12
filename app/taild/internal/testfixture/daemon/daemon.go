@@ -18,10 +18,9 @@ import (
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
-// Config is the operator defaults pointed at a private home, the installed
-// test runtime and, when a registry is given, its allowlist. The small
-// resources keep stopped-VM tests cheap; tests that boot raise memory.
-func Config(t *testing.T, registry *testfixture.Registry) config.Config {
+// Config is the operator defaults pointed at a private home and the installed
+// test runtime. The small resources keep stopped-VM tests cheap; tests that boot raise memory.
+func Config(t *testing.T) config.Config {
 	t.Helper()
 	c := testfixture.Config()
 	c.Home = testfixture.TempDir(t)
@@ -29,9 +28,6 @@ func Config(t *testing.T, registry *testfixture.Registry) config.Config {
 	c.PoliciesDir = testfixture.TempDir(t)
 	c.Components = testfixture.Components(testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true))
 	c.VM.Defaults = config.Resources{CPUs: 1, Memory: 256 << 20, Disk: 1 << 30}
-	if registry != nil {
-		c.VM.AllowedRegistries = []string{registry.Allowed()}
-	}
 	return c
 }
 

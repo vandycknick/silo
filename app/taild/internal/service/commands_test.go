@@ -29,17 +29,26 @@ func domainCaller(s *Service, owner identity.Principal) Caller {
 }
 func actualService(t *testing.T) *Service {
 	t.Helper()
-	c := daemon.Config(t, nil)
+	c := daemon.Config(t)
 	n := daemon.Open(t, c, "native-service", 32)
 	return &Service{Runtime: n.Runtime, Audit: n.Audit, Config: c, Jobs: n.Jobs}
 }
 
 func actualNativeService(t *testing.T) (*Service, *silo.Runtime) {
 	t.Helper()
-	c := daemon.Config(t, nil)
+	c := daemon.Config(t)
 	n := daemon.Open(t, c, "native-service", 32)
 	return &Service{Runtime: n.Runtime, Audit: n.Audit, Config: c, Jobs: n.Jobs}, n.SDK
 }
+
+func TestCategorizeImageReferenceRejected(t *testing.T) {
+	const message = `image "docker.io/nixos/nix:latest" is denied by registry policy rule "docker.io"`
+	got := Categorize(&silo.Error{Kind: silo.ErrorImageReferenceRejected, Message: message})
+	if got.Code != "usage" || got.Exit != 2 || got.Message != message {
+		t.Fatalf("image rejection was not preserved: %+v", got)
+	}
+}
+
 func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 	s := actualService(t)
 	c := domainCaller(s, "user:1")
@@ -48,10 +57,6 @@ func TestCreateValidationAndOperatorCapabilityIntersection(t *testing.T) {
 		change func(*CreateRequest)
 		exit   int
 	}{
-		{"host-disk", func(q *CreateRequest) { q.Image = "/etc/passwd" }, 2},
-		{"registry-boundary", func(q *CreateRequest) { q.Image = "ghcr.io/vandycknick-evil/x:latest" }, 2},
-		{"registry-parent", func(q *CreateRequest) { q.Image = "ghcr.io/vandycknick/../x" }, 2},
-		{"registry-control", func(q *CreateRequest) { q.Image = "ghcr.io/vandycknick/x\x00" }, 2},
 		{"forged-owner", func(q *CreateRequest) { q.Owner = "tag:foreign" }, 4},
 		{"human-owner-flag", func(q *CreateRequest) { q.Owner = "user:1" }, 4},
 		{"reserved-label", func(q *CreateRequest) { q.Labels = map[string]string{"io.silo.taild.owner": "user:2"} }, 2},
@@ -87,7 +92,6 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.Config.VM.Ceilings.VMs = 1
 	one, two := domainCaller(s, "user:1"), domainCaller(s, "user:2")
 	entered := make(chan struct{})
@@ -213,7 +217,6 @@ func TestInterruptedCreateKeepsDurableStoppedTruth(t *testing.T) {
 	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s.Jobs = jobs.New(ctx, 4)
@@ -278,7 +281,6 @@ func TestCreateCountRevokedDuringActualPull(t *testing.T) {
 	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	caller := domainCaller(s, "user:1")
 	var current atomic.Pointer[identity.Peer]
 	peer := caller.Peer
@@ -317,7 +319,6 @@ func TestActualSDKBoundedLogsFiltersAndRedaction(t *testing.T) {
 	testfixture.RequireRegistryTrust(t)
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	c := domainCaller(s, "user:1")
 	op, e := s.Create(context.Background(), c, CreateRequest{Image: registry.Reference, Name: "logs", NoStart: true})
 	daemon.Succeeded(t, s.Jobs, c.Peer, op, e)

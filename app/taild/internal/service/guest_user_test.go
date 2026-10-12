@@ -12,7 +12,6 @@ func TestGuestUserValidationBeforeImagePull(t *testing.T) {
 	s := actualService(t)
 	c := domainCaller(s, "user:1")
 	registry := testfixture.OCIRegistry(t, "")
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	for _, u := range []silo.GuestUser{{Name: "root", UID: 1000, GID: 1000, Home: "/home/root"}, {Name: "nickvd", UID: 1000, GID: 1000, Home: "../host"}} {
 		if _, err := s.Create(context.Background(), c, CreateRequest{Image: registry.Reference, Name: "invalid-user", GuestUser: &u}); err == nil || Categorize(err).Exit != 2 {
 			t.Fatal(err)

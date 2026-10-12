@@ -825,6 +825,7 @@ mod tests {
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
             components,
             None,
         )
@@ -839,6 +840,7 @@ mod tests {
             paths,
             store.clone(),
             RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
             components,
             None,
         )

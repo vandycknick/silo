@@ -9,9 +9,17 @@ use crate::image::{
 use crate::LibVmError;
 
 pub(crate) fn image_error(reference: &str, source: OciError) -> LibVmError {
-    LibVmError::Image {
-        reference: reference.to_string(),
-        source,
+    match source {
+        OciError::InvalidReference { .. } | OciError::RegistryPolicyDenied { .. } => {
+            LibVmError::ImageReferenceRejected {
+                reference: reference.to_string(),
+                message: source.to_string(),
+            }
+        }
+        source => LibVmError::Image {
+            reference: reference.to_string(),
+            source,
+        },
     }
 }
 

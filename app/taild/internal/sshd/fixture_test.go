@@ -17,7 +17,7 @@ import (
 func nativeService(t *testing.T, instance string, principals ...identity.Principal) (*service.Service, service.Caller, *testfixture.Registry) {
 	t.Helper()
 	registry := testfixture.OCIRegistry(t, "")
-	c := daemon.Config(t, registry)
+	c := daemon.Config(t)
 	n := daemon.Open(t, c, instance, 8)
 	s := &service.Service{Runtime: n.Runtime, Audit: n.Audit, Jobs: n.Jobs, Config: c}
 	p := daemon.Peer(c, "explicit-"+instance, principals...)

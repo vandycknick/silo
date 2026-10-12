@@ -16,7 +16,6 @@ func TestHumanRequestedTagsKeepManagementOwnership(t *testing.T) {
 	// Install fixture TLS trust before the real daemon inherits its environment.
 	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
-	s.Config.VM.AllowedRegistries = []string{registry.Allowed()}
 	s.VMNodesEnabled = true
 	s.Config.Enrollment.Mode = "interactive"
 	s.Enrollment = &enroll.Manager{Config: s.Config, Registry: enroll.NewRegistry(), Pin: state.NodePin{Tailnet: "fixture", Suffix: "tail.test"}}

@@ -101,7 +101,7 @@ func TestActualUnsweptCancellationRecovers(t *testing.T) {
 	if os.Getenv("SILO_TEST_LOGIND") != "1" {
 		t.Skip("SILO_TEST_LOGIND=1 requires an available real login1 delay inhibitor")
 	}
-	c := daemon.Config(t, nil)
+	c := daemon.Config(t)
 	n := daemon.Open(t, c, "cancelled-instance", 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

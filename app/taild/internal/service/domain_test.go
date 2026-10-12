@@ -9,27 +9,6 @@ import (
 )
 
 func TestRemoteSurfacePureDomain(t *testing.T) {
-	for _, tt := range []struct {
-		ref   string
-		valid bool
-	}{
-		{"ghcr.io/vandycknick/silo/devbox:latest", true},
-		{"ghcr.io/vandycknick/silo/devbox:Release_1", true},
-		{"ghcr.io/vandycknick/silo/devbox@sha256:" + strings.Repeat("a", 64), true},
-		{"ghcr.io/vandycknick.evil/devbox:latest", false},
-		{"ghcr.io.evil/vandycknick/devbox:latest", false},
-		{"ghcr.io/vandycknick/../../etc/passwd", false},
-		{"ghcr.io/vandycknick/devbox\x00", false},
-		{"ghcr.io/vandycknick/devbox\n", false},
-		{"ghcr.io/vandycknick/devbox?path=/etc", false},
-		{"https://ghcr.io/vandycknick/devbox", false},
-		{"disk:/etc/passwd", false},
-		{"/etc/passwd", false},
-	} {
-		if got := imageAllowed(tt.ref, []string{"ghcr.io/vandycknick"}); got != tt.valid {
-			t.Errorf("%q: %v", tt.ref, got)
-		}
-	}
 	for _, key := range []string{"GOOD", "_X", "a1"} {
 		if !envKey(key) {
 			t.Fatal(key)
