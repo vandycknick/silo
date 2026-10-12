@@ -301,8 +301,11 @@ func TestForwardCreateRequiresTailscaleBeforeWorkThroughRPC(t *testing.T) {
 	if _, err = s.resolveCreate(ctx, c.Peer, CreateRequest{Name: "enabled", Template: "web", Tailscale: true}); err != nil {
 		t.Fatal(err)
 	}
-	op, err := s.Create(ctx, c, CreateRequest{Name: "override", Template: "web", PolicyRef: "plain", NoStart: true})
-	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	t.Run("ordinary policy override creates machine", func(t *testing.T) {
+		testfixture.RequireRegistryTrust(t)
+		op, err := s.Create(t.Context(), c, CreateRequest{Name: "override", Template: "web", PolicyRef: "plain", NoStart: true})
+		daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	})
 }
 
 func TestForwardCreateRetainsBoundPolicyThroughRPC(t *testing.T) {

@@ -45,6 +45,10 @@ With `CI=true`, nextest uses the `ci` profile and writes JUnit results under
 `target/nextest/ci/junit.xml` (under `CARGO_TARGET_DIR` when overridden).
 Real-VM qualification is separate; see the [smoke suite](smoke/README.md).
 
+Taild admission tests run on Linux and macOS. Their successful fixture-registry
+pull subtests run only on Linux: macOS registry verification uses the keychain,
+not the fixture's `SSL_CERT_FILE`. Pre-pull rejection checks still run on both.
+
 ## CLI
 
 Build the CLI locally:

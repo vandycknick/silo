@@ -159,6 +159,9 @@ func TestCreateMissingImageRejectsBeforeNativeAdmission(t *testing.T) {
 		t.Fatal("missing image reserved a name", err)
 	}
 	release()
-	op, err := s.Create(t.Context(), c, CreateRequest{Name: "missing", Template: "image-free", Image: registry.Reference, NoStart: true})
-	daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	t.Run("explicit image releases admission", func(t *testing.T) {
+		testfixture.RequireRegistryTrust(t)
+		op, err := s.Create(t.Context(), c, CreateRequest{Name: "missing", Template: "image-free", Image: registry.Reference, NoStart: true})
+		daemon.Succeeded(t, s.Jobs, c.Peer, op, err)
+	})
 }
