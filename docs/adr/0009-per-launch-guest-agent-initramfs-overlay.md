@@ -449,7 +449,8 @@ nonsensitive configuration path belongs in a process argument.
 - Each regular file is limited to the unsigned 32-bit archive size field.
 - Serialized `AgentConfig` is limited to 16 MiB.
 - This mechanism does not synchronize host and guest clocks. The virtual RTC
-  and kernel timekeeping configuration own early wall-clock initialization.
+  sets wall time at boot; `GuestAgentService.SyncClock` keeps it aligned
+  afterwards (ADR 0008).
 
 ## References
 

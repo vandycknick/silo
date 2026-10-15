@@ -223,7 +223,13 @@ mod tests {
         );
         assert_eq!(
             service_methods("GuestAgentService"),
-            ["GetStatus", "WatchStatus", "GetMetrics", "WatchMetrics"]
+            [
+                "GetStatus",
+                "WatchStatus",
+                "GetMetrics",
+                "WatchMetrics",
+                "SyncClock"
+            ]
         );
         assert_eq!(service_methods("GuestProcessService"), ["Execute"]);
         assert_eq!(service_methods("VmExecutionService"), ["Execute"]);

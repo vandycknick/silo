@@ -47,9 +47,11 @@ pub(crate) async fn spawn_guest_services(
             shutdown.clone(),
         );
         let metrics = supervise_metrics(machine.clone(), store.clone(), shutdown.clone());
+        let clock =
+            crate::clock_sync::supervise_clock(machine.clone(), store.clone(), shutdown.clone());
         let capability =
             crate::forward::spawn_capability_supervisor(machine, store, forwards, shutdown);
-        tokio::join!(status, metrics, ssh);
+        tokio::join!(status, metrics, ssh, clock);
         if let Err(error) = capability.await {
             tracing::warn!(%error, "guest forward capability supervisor failed");
         }
@@ -435,7 +437,7 @@ fn duration(value: Duration) -> prost_types::Duration {
     }
 }
 
-fn agent_client(channel: Channel) -> GuestAgentServiceClient<Channel> {
+pub(crate) fn agent_client(channel: Channel) -> GuestAgentServiceClient<Channel> {
     GuestAgentServiceClient::new(channel)
         .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
         .max_encoding_message_size(protocol::STRUCTURED_16_MIB)

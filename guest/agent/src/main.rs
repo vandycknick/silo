@@ -1,6 +1,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("silo-agent only supports Linux guests");
 
+mod clock;
 mod filesystem;
 mod forward;
 mod guest_process;

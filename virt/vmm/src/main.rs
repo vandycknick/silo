@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+mod clock_sync;
 mod context;
 mod exec_log;
 mod execution;

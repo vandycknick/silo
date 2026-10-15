@@ -274,6 +274,18 @@ impl InstanceStore {
             .map_err(|_| StoreError::Poisoned)
     }
 
+    pub(crate) fn agent_instance_id(&self) -> Result<Option<String>, StoreError> {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.instance_id.clone())
+            })
+            .map_err(|_| StoreError::Poisoned)
+    }
+
     pub(crate) fn set_vm_state(
         &self,
         vm_state: VmState,

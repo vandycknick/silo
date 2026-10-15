@@ -7,8 +7,8 @@ use prost_types::{Duration as ProtoDuration, Timestamp};
 use protocol::v1::guest_agent_service_server::{GuestAgentService, GuestAgentServiceServer};
 use protocol::v1::{
     AgentIdentity, AgentStatus, AgentStatusReport, AgentStatusState, GetAgentMetricsRequest,
-    GetAgentStatusRequest, GuestBootReport, ProvisionReport, WatchAgentMetricsRequest,
-    WatchAgentStatusRequest,
+    GetAgentStatusRequest, GuestBootReport, ProvisionReport, SyncClockRequest, SyncClockResponse,
+    WatchAgentMetricsRequest, WatchAgentStatusRequest,
 };
 use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
@@ -140,6 +140,7 @@ impl AgentServer {
             state: self.state.clone(),
             status_watches: std::sync::Arc::new(Semaphore::new(8)),
             metric_watches: std::sync::Arc::new(Semaphore::new(4)),
+            clock_syncs: std::sync::Arc::new(Semaphore::new(1)),
         };
         let filesystem = FilesystemService::new("/", self.state.instance_id.clone());
         let guest_process = GuestProcessServiceImpl::new(
@@ -474,6 +475,7 @@ struct AgentService {
     state: AgentState,
     status_watches: std::sync::Arc<Semaphore>,
     metric_watches: std::sync::Arc<Semaphore>,
+    clock_syncs: std::sync::Arc<Semaphore>,
 }
 
 #[tonic::async_trait]
@@ -576,6 +578,31 @@ impl GuestAgentService for AgentService {
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn sync_clock(
+        &self,
+        request: Request<SyncClockRequest>,
+    ) -> Result<Response<SyncClockResponse>, Status> {
+        let _permit = admission(&self.clock_syncs, "clock sync")?;
+        let request = request.into_inner();
+        let outcome =
+            crate::clock::sync_realtime(request.host_time.as_ref()).map_err(
+                |error| match error {
+                    crate::clock::ClockSyncError::Missing
+                    | crate::clock::ClockSyncError::Invalid(_) => {
+                        protocol::detailed_status(Status::invalid_argument(error.to_string()))
+                    }
+                    crate::clock::ClockSyncError::Read(_)
+                    | crate::clock::ClockSyncError::Set(_) => {
+                        protocol::detailed_status(Status::internal(error.to_string()))
+                    }
+                },
+            )?;
+        Ok(Response::new(SyncClockResponse {
+            offset: Some(crate::clock::offset_duration(outcome.offset_nanos)),
+            stepped: outcome.stepped,
+        }))
     }
 }
 
