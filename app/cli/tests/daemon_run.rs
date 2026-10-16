@@ -1,4 +1,4 @@
-//! Black-box tests of the silod executable through its published interface.
+//! Black-box tests of `silo daemon run` through its published interface.
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -12,14 +12,15 @@ const RUN_ROOT_PARENT: &str = "/tmp";
 
 fn temporary_home() -> tempfile::TempDir {
     tempfile::Builder::new()
-        .prefix("silod-e2e-")
+        .prefix("silo-daemon-e2e-")
         .tempdir_in(RUN_ROOT_PARENT)
         .expect("temporary home")
 }
 
 fn command(home: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_silod"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_silo"));
     command
+        .args(["daemon", "run"])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
@@ -58,7 +59,7 @@ fn malformed_shared_configuration_is_rejected_without_creating_state() {
     let root = temporary_home();
     unreadable_cli_config(root.path());
     let original = std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config");
-    let check = command(root.path()).arg("--check").output().expect("check");
+    let check = command(root.path()).output().expect("check");
     assert_eq!(check.status.code(), Some(2));
     assert_eq!(
         std::fs::read(root.path().join(".config/silo/config.yaml")).expect("config"),
@@ -145,8 +146,7 @@ fn daemon_keeps_core_ready_through_system_retry_and_log_failure() {
     assert_eq!(status.pid, child.0.id());
     assert_eq!(
         status.control_endpoint,
-        root.path()
-            .join("run/silod/control.sock")
+        silod_spec::paths::control_socket(&root.path().join("run"))
             .display()
             .to_string()
     );

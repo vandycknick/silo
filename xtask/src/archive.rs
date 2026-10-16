@@ -59,8 +59,8 @@ impl ArchiveKind {
     }
 }
 
-fn product_files(host: HostTarget) -> [&'static str; 4] {
-    ["silo", "silod", "taild", host.go_ffi_library()]
+fn product_files(host: HostTarget) -> [&'static str; 3] {
+    ["silo", "taild", host.go_ffi_library()]
 }
 
 pub fn produce_runtime(
@@ -217,8 +217,6 @@ fn create_tar(
             "--mode=u+rwX,go+rX,go-w",
             "--transform",
             &format!("s,^silo$,{root}/bin/silo,"),
-            "--transform",
-            &format!("s,^silod$,{root}/bin/silod,"),
             "--transform",
             &format!("s,^taild$,{root}/bin/taild,"),
             "--transform",

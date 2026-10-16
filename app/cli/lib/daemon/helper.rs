@@ -1,5 +1,5 @@
 //! Optional frontend lifetime. The only owner-pipe writer stays in this task.
-use crate::{control::ControlState, status::StatusPublisher};
+use crate::daemon::{control::ControlState, status::StatusPublisher};
 use eyre::Context;
 use prost::Message;
 use silo_secrets::{FileStore, Secret, SecretName, SecretScope, SecretStore};
@@ -21,10 +21,21 @@ use zeroize::{Zeroize, Zeroizing};
 const FRAME_LIMIT: usize = 64 * 1024;
 const SECRET_LIMIT: usize = 16 * 1024;
 
-fn sibling(executable: &Path, name: &str, executable_file: bool) -> eyre::Result<PathBuf> {
+/// Helpers sit beside a portable `silo`; a bundle keeps them in `Contents/Helpers`
+/// while `silo` itself runs from `Contents/MacOS`.
+fn helper_directory(executable: &Path) -> eyre::Result<PathBuf> {
     let parent = executable
         .parent()
         .ok_or_else(|| eyre::eyre!("missing executable parent"))?;
+    if parent.file_name().is_some_and(|name| name == "MacOS") {
+        Ok(parent.join("../Helpers").canonicalize()?)
+    } else {
+        Ok(parent.to_path_buf())
+    }
+}
+
+fn sibling(executable: &Path, name: &str, executable_file: bool) -> eyre::Result<PathBuf> {
+    let parent = helper_directory(executable)?;
     let path = parent.join(name);
     let m = std::fs::symlink_metadata(&path)?;
     eyre::ensure!(
@@ -37,7 +48,7 @@ fn sibling(executable: &Path, name: &str, executable_file: bool) -> eyre::Result
     );
     let canonical = path.canonicalize()?;
     eyre::ensure!(
-        canonical.parent() == Some(parent),
+        canonical.parent() == Some(parent.as_path()),
         "helper sibling escaped package"
     );
     Ok(canonical)
@@ -68,7 +79,7 @@ fn credential(store: &FileStore, name: &str) -> eyre::Result<Option<Vec<u8>>> {
         Some(_) => eyre::bail!("helper credential {name} must be plain"),
     }
 }
-fn settings(c: &silo_config::tailscale::TailscaleConfig) -> eyre::Result<w::TailscaleSettings> {
+fn settings(c: &crate::config::tailscale::TailscaleConfig) -> eyre::Result<w::TailscaleSettings> {
     let d = c.vm().defaults();
     let ceilings = c.vm().ceilings();
     Ok(w::TailscaleSettings {
@@ -76,11 +87,13 @@ fn settings(c: &silo_config::tailscale::TailscaleConfig) -> eyre::Result<w::Tail
         tag: c.tag().into(),
         control_url: c.control_url().into(),
         enrollment_mode: match c.enrollment_mode() {
-            silo_config::tailscale::EnrollmentMode::OauthApp => w::EnrollmentMode::OauthApp as i32,
-            silo_config::tailscale::EnrollmentMode::Interactive => {
+            crate::config::tailscale::EnrollmentMode::OauthApp => {
+                w::EnrollmentMode::OauthApp as i32
+            }
+            crate::config::tailscale::EnrollmentMode::Interactive => {
                 w::EnrollmentMode::Interactive as i32
             }
-            silo_config::tailscale::EnrollmentMode::None => w::EnrollmentMode::None as i32,
+            crate::config::tailscale::EnrollmentMode::None => w::EnrollmentMode::None as i32,
         },
         disable_key_expiry: c.disable_key_expiry(),
         defaults: Some(w::ResourceDefaults {
@@ -140,7 +153,7 @@ async fn write_frame(
 }
 fn bootstrap(
     identity: &w::DaemonStatus,
-    c: &silo_config::tailscale::TailscaleConfig,
+    c: &crate::config::tailscale::TailscaleConfig,
     generation: uuid::Uuid,
 ) -> eyre::Result<w::HelperBootstrap> {
     Ok(w::HelperBootstrap {
@@ -181,7 +194,7 @@ fn spawn(path: &Path, shutdown_only: bool) -> eyre::Result<tokio::process::Child
 /// One-shot owner pipe, deliberately independent of normal helper generations.
 pub(crate) async fn host_shutdown(
     identity: &w::DaemonStatus,
-    config: &silo_config::tailscale::TailscaleConfig,
+    config: &crate::config::tailscale::TailscaleConfig,
     deadline: tokio::time::Instant,
 ) -> eyre::Result<()> {
     let exe = std::env::current_exe()?.canonicalize()?;
@@ -213,7 +226,7 @@ pub(crate) async fn host_shutdown(
 }
 async fn prepare(
     state: &ControlState,
-    c: &silo_config::tailscale::TailscaleConfig,
+    c: &crate::config::tailscale::TailscaleConfig,
     generation: uuid::Uuid,
 ) -> eyre::Result<(PathBuf, Zeroizing<Vec<u8>>)> {
     let exe = std::env::current_exe()?.canonicalize()?;
@@ -311,7 +324,7 @@ async fn reap(child: &mut tokio::process::Child) -> eyre::Result<()> {
 }
 pub(crate) async fn serve(
     state: Arc<ControlState>,
-    config: silo_config::tailscale::TailscaleConfig,
+    config: crate::config::tailscale::TailscaleConfig,
     publisher: Arc<StatusPublisher>,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
@@ -411,7 +424,7 @@ pub(crate) async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use crate::helper::*;
+    use crate::daemon::helper::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
     #[test]
     fn shutdown_frame_never_resolves_assets_documents_or_credentials() {
@@ -435,7 +448,7 @@ mod tests {
             control_endpoint: b"/private/control.sock".to_vec(),
             ..Default::default()
         };
-        let config = silo_config::GlobalConfig::default();
+        let config = crate::config::GlobalConfig::default();
         let frame = encode(bootstrap(&identity, config.tailscale(), helper).unwrap()).unwrap();
         let decoded = w::HelperBootstrap::decode(&frame[4..]).unwrap();
         assert_eq!(decoded.daemon_generation, daemon.to_string());
@@ -462,7 +475,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // Callers pass a canonical executable; macOS temp dirs sit behind /var.
         let package = root.path().canonicalize().unwrap();
-        let exe = package.join("silod");
+        let exe = package.join("silo");
         let target = package.join("taild");
         std::fs::write(&target, b"binary").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -473,6 +486,25 @@ mod tests {
         assert!(sibling(&exe, "taild", true).is_err());
         symlink(&target, package.join("linked")).unwrap();
         assert!(sibling(&exe, "linked", false).is_err());
+    }
+    #[test]
+    fn bundle_executable_finds_helpers_in_contents_helpers() {
+        let root = tempfile::tempdir().unwrap();
+        let contents = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("Silo.app/Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::create_dir_all(contents.join("Helpers")).unwrap();
+        let exe = contents.join("MacOS/silo");
+        let target = contents.join("Helpers/taild");
+        std::fs::write(&target, b"binary").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(sibling(&exe, "taild", true).unwrap(), target);
+        // A helper beside the main executable is not where the bundle keeps them.
+        std::fs::write(contents.join("MacOS/libsilo_go_ffi.dylib"), b"library").unwrap();
+        assert!(sibling(&exe, "libsilo_go_ffi.dylib", false).is_err());
     }
     #[test]
     fn frame_limit_and_big_endian_prefix() {

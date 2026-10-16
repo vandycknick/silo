@@ -38,7 +38,7 @@ func TestNativeControlLifecycle(t *testing.T) {
 	home := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	command := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false", "--system-image=registry.invalid/disabled:test")
+	command := exec.Command(filepath.Join(bin, "silo"), "daemon", "run", "--system-enabled=false", "--tailscale-enabled=false", "--system-image=registry.invalid/disabled:test")
 	command.Env = []string{"HOME=" + home, "SILO_HOME=" + filepath.Join(home, "state"), "XDG_CONFIG_HOME=" + filepath.Join(home, "config"), "PATH=" + os.Getenv("PATH"), "SILO_RUN_ROOT=" + runRoot}
 	for _, key := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "SILO_RUNTIME_DIR"} {
 		if value := os.Getenv(key); value != "" {

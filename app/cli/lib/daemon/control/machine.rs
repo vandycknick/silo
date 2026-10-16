@@ -1,5 +1,5 @@
-use crate::control::{
-    conversion, duration, id, native, reference, required, run, sibling_cli, Service, Stream,
+use crate::daemon::control::{
+    conversion, duration, id, native, reference, required, run, Service, Stream,
 };
 use futures::StreamExt;
 use silo_vm_control::{lifecycle, readiness, requests, snapshots, updates};
@@ -184,8 +184,9 @@ impl w::machine_service_server::MachineService for Service {
                     options = options.entrypoint(e.program().to_owned(), |_| e);
                 }
                 if opts.cleanup_on_exit {
-                    let command = sibling_cli()
-                        .map_err(|_| Status::unavailable("matching sibling silo unavailable"))?;
+                    let command = std::env::current_exe()
+                        .and_then(|path| path.canonicalize())
+                        .map_err(|_| Status::unavailable("silo executable path unavailable"))?;
                     options = options.on_exit(
                         libvm::HostCommand::new(command)
                             .arg("cleanup")

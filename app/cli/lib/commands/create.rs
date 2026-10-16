@@ -317,7 +317,7 @@ impl Cmd {
         let name = image_result?.name;
         success(format!("Created {name}"));
         if self.set_default {
-            silo_config::GlobalConfig::write_default_machine(Some(&name))?;
+            crate::config::GlobalConfig::write_default_machine(Some(&name))?;
         }
         println!("{name}");
         Ok(())

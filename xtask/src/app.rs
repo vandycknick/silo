@@ -16,11 +16,10 @@ const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
 const BRIDGE: &str = "libsilo_go_ffi.dylib";
-const HELPERS: [(&str, u32, Option<&str>); 5] = [
+const HELPERS: [(&str, u32, Option<&str>); 4] = [
     (BRIDGE, 0o644, None),
     ("silo-vmm", 0o755, Some("virt/vmm/silo-vmm.entitlements")),
     ("netd", 0o755, None),
-    ("silod", 0o755, None),
     ("taild", 0o755, None),
 ];
 const ASSETS: [(&str, u32); 3] = [
@@ -838,7 +837,7 @@ fn validate_payload_layout(contents: &Path) -> Result<(), AppError> {
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
     validate_directory_entries(
         &contents.join("Helpers"),
-        [BRIDGE, "netd", "silo-vmm", "silod", "taild"],
+        [BRIDGE, "netd", "silo-vmm", "taild"],
     )?;
     validate_directory_entries(
         &contents.join("Resources"),
@@ -1501,7 +1500,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bundle = fixture(root.path());
         let paths = signed_code_paths(&bundle);
-        for name in ["taild", BRIDGE, "silod", "netd", "silo-vmm"] {
+        for name in ["taild", BRIDGE, "netd", "silo-vmm"] {
             assert!(paths.contains(&bundle.join("Contents/Helpers").join(name)));
         }
         assert!(paths.contains(&bundle.join("Contents/MacOS/silo")));

@@ -1,4 +1,4 @@
-use crate::control::{required, ControlState, Service};
+use crate::daemon::control::{required, ControlState, Service};
 use silod_spec::daemon::v1 as w;
 use tonic::{Request, Response, Status};
 

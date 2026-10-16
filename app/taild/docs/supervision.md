@@ -42,7 +42,7 @@ The error explicitly reports loss of cross-process durable protection rather
 than pretending the marker exists. Recovery uses episode revisions, so an old
 cancellation cannot clear a newer shutdown latch.
 Every valid instance/owner/name-labelled VM is inspected and stopped through
-silod's generated management API, with at most 16 concurrent workers. Graceful
+the daemon's generated management API, with at most 16 concurrent workers. Graceful
 and forced requests retain the same inspected run ID. The first stop pass is
 followed by `DrainMutations` for actual accepted native work, a fresh inventory
 and final stop pass, then another actual drain. Cancelled RPC waiters are not
@@ -50,7 +50,7 @@ native completion. Jobs and shutdown helpers must also settle before early
 inhibitor release; the deadline still releases its FD on time and reports
 incomplete work rather than inventing success.
 
-Linux service `ExecStop` invokes the adjacent `silod --host-shutdown`.
+Linux service `ExecStop` invokes `silo daemon run --host-shutdown`.
 It uses an authenticated existing manager, or, only after proven absence,
 holds both Home and per-UID ownership before publishing a temporary restricted
 control service. That service admits only status, mutation drain, machine
@@ -105,7 +105,7 @@ HTTP errors and host paths. Intentional operator login URLs remain visible.
 
 An ordinary returned SDK/native error can be categorized as exit 9. A fatal
 native SIGSEGV inside the direct session bridge cannot return a structured SSH
-exit 9. The client sees transport loss (normally SSH 255); silod supervises
+exit 9. The client sees transport loss (normally SSH 255); the daemon supervises
 replacement of its helper. Durable libvm records remain recovery truth.
 Closing or replacing a broken lobby transport does not stop VM supervisors.
 

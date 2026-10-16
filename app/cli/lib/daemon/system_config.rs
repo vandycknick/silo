@@ -1,6 +1,6 @@
 //! Resolves the controller's explicit overrides against the installation.
 //!
-//! An omitted setting takes silod's default, except those fixed when the system VM
+//! An omitted setting takes the daemon's default, except those fixed when the system VM
 //! and its data disk were created (backend, root and data disk sizes), which keep the
 //! recorded value.
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use silod_spec::arguments::{Backend, SystemOverrides};
 use utils::HumanSize;
 
-use crate::record::DaemonRecord;
+use crate::daemon::record::DaemonRecord;
 
 #[cfg(debug_assertions)]
 const DEVELOPMENT_IMAGE: &str = "ghcr.io/vandycknick/silo/system:dev";
@@ -88,13 +88,13 @@ pub(crate) struct ResolvedShare {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DesiredSystem {
     pub(crate) config: ResolvedSystemConfig,
-    /// The image reference silod follows, upgrading whenever it resolves to a
+    /// The image reference the daemon follows, upgrading whenever it resolves to a
     /// different manifest than the active system VM runs.
     pub(crate) image: String,
 }
 
 /// `user_home` is shared into the system VM when configured; `docker_socket` is the
-/// host endpoint silod serves.
+/// host endpoint the daemon serves.
 pub(crate) fn resolve(
     overrides: &SystemOverrides,
     user_home: &Path,
@@ -254,9 +254,9 @@ fn rosetta_available() -> bool {
 mod tests {
     use silod_spec::arguments::{Backend, PublishBind, Share, SystemOverrides};
 
-    use crate::config::{resolve, ResolvedSystemConfig, SystemBackend};
-    use crate::paths::SystemPaths;
-    use crate::record::DaemonRecord;
+    use crate::daemon::record::DaemonRecord;
+    use crate::daemon::system_config::{resolve, ResolvedSystemConfig, SystemBackend};
+    use silod_spec::paths::DaemonPaths;
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn omission_defaults_changeable_settings_but_keeps_creation_fixed_ones() {
         let home = tempfile::tempdir().expect("home");
-        let paths = SystemPaths::new(home.path().join(".silo"), home.path().join("run"));
+        let paths = DaemonPaths::new(home.path().join(".silo"));
         let socket = paths.docker_socket();
         let initial = SystemOverrides {
             backend: Some(Backend::Vz),

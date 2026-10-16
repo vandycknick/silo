@@ -1,5 +1,6 @@
-//! Registration of silod with the native per-user service manager (launchd or
-//! systemd), and the controller's view of the daemon it starts.
+//! Registration of the daemon (`silo daemon run`) with the native per-user
+//! service manager (launchd or systemd), and the controller's view of what it
+//! starts.
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ fn service_marker(existing: Option<&[u8]>) -> eyre::Result<String> {
     Ok(format!("{MARKER_PREFIX}{id}"))
 }
 
-/// How the native service manager runs silod.
+/// How the native service manager runs `silo daemon run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServiceConfig {
     pub(crate) executable: PathBuf,
@@ -191,15 +192,15 @@ pub(crate) async fn up(
         let marker = service_marker(Some(&existing))?;
         let definition_changed = existing != render_native(service, &marker, &[])?;
         if live.configuration_identity != configuration_identity || definition_changed {
-            spinner.step("Restarting", "silod (preserving VM runs)");
+            spinner.step("Restarting", "daemon (preserving VM runs)");
             native_halt()?;
             wait_for_exit(&service.paths, Duration::from_secs(120))?;
         }
     }
-    spinner.step("Registering", "silod service");
+    spinner.step("Registering", "daemon service");
     install_native(service, &[])?;
     let started = chrono::Utc::now();
-    spinner.step("Starting", "silod");
+    spinner.step("Starting", "daemon");
     native_start(service)?;
     wait_ready(
         service,
@@ -213,9 +214,9 @@ pub(crate) async fn up(
     .await
 }
 
-/// Disables the service, waits for silod to stop its VM and exit, then makes sure
-/// no VM of the installation is left running, even if silod died first.
-pub(crate) fn down(paths: &DaemonPaths, executable: &Path) -> eyre::Result<()> {
+/// Disables the service, waits for the daemon to stop its VM and exit, then makes
+/// sure no VM of the installation is left running, even if the daemon died first.
+pub(crate) async fn down(paths: &DaemonPaths) -> eyre::Result<()> {
     reject_root()?;
     let mut spinner = Spinner::start("Stopping", "system daemon");
     let _lock = OperationLock::acquire(&controller_lock_path()?)?;
@@ -225,7 +226,7 @@ pub(crate) fn down(paths: &DaemonPaths, executable: &Path) -> eyre::Result<()> {
     if native_path.try_exists()? {
         native_stop()?;
     }
-    // Foreground silod has no native MainPID; its verified publication still
+    // A foreground daemon has no native MainPID; its verified publication still
     // identifies the process this explicit shutdown must terminate.
     if let Some(value) = read_status_value(paths) {
         if let (Some(pid), Some(birth)) = (
@@ -248,19 +249,19 @@ pub(crate) fn down(paths: &DaemonPaths, executable: &Path) -> eyre::Result<()> {
     }
     wait_for_exit(paths, Duration::from_secs(120))?;
     spinner.step("Stopping", "system VM");
-    crate::daemon::stop_installation(executable)?;
+    crate::daemon::serve::stop_installation().await?;
     spinner.step("Stopped", "system daemon");
     spinner.finish_success("Stopped");
     Ok(())
 }
 
-/// silod holds its lifetime lock until it has detached and exited. Explicit
+/// The daemon holds its lifetime lock until it has detached and exited. Explicit
 /// installation shutdown runs separately after this wait.
 fn wait_for_exit(paths: &DaemonPaths, timeout: Duration) -> eyre::Result<()> {
     let deadline = Instant::now() + timeout;
     while !lifetime_lock_is_free(&paths.lifetime_lock())? {
         if Instant::now() >= deadline {
-            bail!("timed out waiting for silod to stop the system VM; see `silo daemon logs`");
+            bail!("timed out waiting for the daemon to stop the system VM; see `silo daemon logs`");
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -276,7 +277,7 @@ fn lifetime_lock_is_free(path: &Path) -> eyre::Result<bool> {
     match Flock::lock(file, FlockArg::LockSharedNonblock) {
         Ok(_released_on_drop) => Ok(true),
         Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(false),
-        Err((_, error)) => Err(error).context("probe the silod lifetime lock"),
+        Err((_, error)) => Err(error).context("probe the daemon lifetime lock"),
     }
 }
 
@@ -389,12 +390,12 @@ fn verified_status(value: serde_json::Value, home: &Path) -> eyre::Result<Option
     if let (Some(pid), Some(birth)) = (pid, birth) {
         if silod_spec::process::start_time(pid)?.as_deref() == Some(birth) {
             if value.get("schema").and_then(serde_json::Value::as_u64) != Some(2) {
-                bail!("a live silod publishes an old status schema; restart required: run `silo daemon down` then `silo daemon up`");
+                bail!("a live daemon publishes an old status schema; restart required: run `silo daemon down` then `silo daemon up`");
             }
             let status: DaemonStatus =
-                serde_json::from_value(value).context("invalid live silod status")?;
+                serde_json::from_value(value).context("invalid live daemon status")?;
             if std::fs::canonicalize(&status.home)? != std::fs::canonicalize(home)? {
-                bail!("the running silod is bound to another Silo Home; run `silo daemon down` with its original Home");
+                bail!("the running daemon is bound to another Silo Home; run `silo daemon down` with its original Home");
             }
             return Ok(Some(status));
         }
@@ -464,7 +465,7 @@ async fn wait_ready(
             .map_err(|error| eyre::eyre!("{error}{}", native_log_tail(paths)))?;
         if let Some(status) = status(paths)? {
             if status.configuration_identity != identity {
-                bail!("silod started with different effective configuration; check `silo daemon status`");
+                bail!("the daemon started with different effective configuration; check `silo daemon status`");
             }
             match status.core {
                 CorePhase::Failed => bail!(
@@ -505,8 +506,9 @@ async fn wait_ready(
 
 async fn verify_core_api(status: &DaemonStatus, host: &libvm::HostPaths) -> eyre::Result<bool> {
     eyre::ensure!(
-        status.control_endpoint == libvm::HostPaths::run_root()?.join("silod/control.sock"),
-        "silod control endpoint does not match the per-user endpoint"
+        status.control_endpoint
+            == silod_spec::paths::control_socket(&libvm::HostPaths::run_root()?),
+        "daemon control endpoint does not match the per-user endpoint"
     );
     let check = tokio::time::timeout(Duration::from_secs(2), async {
         let Some(selected) =
@@ -518,27 +520,27 @@ async fn verify_core_api(status: &DaemonStatus, host: &libvm::HostPaths) -> eyre
         let response = selected.status;
         eyre::ensure!(
             response.generation == status.generation.to_string(),
-            "silod generation changed during startup"
+            "daemon generation changed during startup"
         );
         eyre::ensure!(
             response.pid == status.pid && response.process_start == status.process_start,
-            "silod process identity changed during startup"
+            "daemon process identity changed during startup"
         );
         eyre::ensure!(
             response.schema == 2,
-            "silod status schema mismatch; restart required"
+            "daemon status schema mismatch; restart required"
         );
         Ok::<_, eyre::Report>(response.core == silod_spec::daemon::v1::CorePhase::Ready as i32)
     })
     .await;
     match check {
         Ok(Ok(ready)) => Ok(ready),
-        Ok(Err(error)) => Err(error).context("verify the ready silod management API"),
+        Ok(Err(error)) => Err(error).context("verify the ready daemon management API"),
         Err(_) => Ok(false),
     }
 }
 
-/// What the spinner says while silod is in `status.phase`.
+/// What the spinner says while the daemon is in `status.phase`.
 fn phase_step(status: &SystemStatus) -> (&'static str, String) {
     match status.phase {
         SystemPhase::PreparingStorage => ("Preparing", "installation storage".into()),
@@ -812,7 +814,7 @@ fn verify_running_home(path: &Path, home: &Path, running: bool) -> eyre::Result<
         return Ok(());
     }
     let bytes = std::fs::read(path).context(
-        "running silod has no readable service definition; run `silo daemon down` and reconfigure",
+        "the running daemon has no readable service definition; run `silo daemon down` and reconfigure",
     )?;
     validate_running_home(&bytes, home)
 }
@@ -850,7 +852,7 @@ fn validate_running_home(bytes: &[u8], home: &Path) -> eyre::Result<()> {
         .lines()
         .any(|line| line == identity)
     {
-        bail!("the running silod is bound to another Silo Home or an old service definition; run `silo daemon down` with its original Home, then reconfigure with `silo daemon up`");
+        bail!("the running daemon is bound to another Silo Home or an old service definition; run `silo daemon down` with its original Home, then reconfigure with `silo daemon up`");
     }
     Ok(())
 }
@@ -877,7 +879,7 @@ fn render_native(
     marker: &str,
     arguments: &[OsString],
 ) -> eyre::Result<Vec<u8>> {
-    let mut command = systemd_executable(&service.executable)?;
+    let mut command = format!("{} daemon run", systemd_executable(&service.executable)?);
     let stop_command = format!("{command} --host-shutdown");
     for argument in arguments {
         command.push(' ');
@@ -992,7 +994,7 @@ fn render_native(
             "<dict>\n",
             "\t<key>Label</key>\n\t<string>{label}</string>\n",
             "\t<key>ProgramArguments</key>\n\t<array>\n",
-            "\t\t<string>{executable}</string>\n",
+            "\t\t<string>{executable}</string>\n\t\t<string>daemon</string>\n\t\t<string>run</string>\n",
             "{arguments}",
             "\t</array>\n",
             "\t<key>EnvironmentVariables</key>\n\t<dict>\n{environment}\t</dict>\n",
@@ -1432,7 +1434,7 @@ mod tests {
     fn service_environment_contains_only_resolved_path_identities() {
         let service = service(
             std::path::Path::new("/users/a & $b/100%"),
-            "/opt/silo/bin/silod",
+            "/opt/silo/bin/silo",
         );
         let bytes = render_native(&service, "test", &[]).expect("render");
         let text = std::str::from_utf8(&bytes).expect("UTF-8");
@@ -1504,7 +1506,7 @@ mod tests {
     #[test]
     fn service_definition_carries_only_explicit_arguments_and_a_stable_identity() {
         let temp = tempfile::tempdir().expect("temp");
-        let service = service(temp.path(), "/opt/silo/bin/silod");
+        let service = service(temp.path(), "/opt/silo/bin/silo");
         let overrides = silod_spec::arguments::SystemOverrides {
             cpus: Some(10),
             additional_shares: Some(vec![silod_spec::arguments::Share {
@@ -1517,7 +1519,12 @@ mod tests {
         let bytes = render_native(&service, &marker, &overrides.to_args()).expect("definition");
         assert_eq!(service_marker(Some(&bytes)).expect("preserve ID"), marker);
         let text = String::from_utf8(bytes).expect("utf8");
-        assert!(text.contains("/opt/silo/bin/silod"));
+        #[cfg(target_os = "linux")]
+        assert!(text.contains("ExecStart=\"/opt/silo/bin/silo\" daemon run \"--system-cpus\""));
+        #[cfg(target_os = "linux")]
+        assert!(text.contains("ExecStop=\"/opt/silo/bin/silo\" daemon run --host-shutdown\n"));
+        #[cfg(target_os = "macos")]
+        assert!(text.contains("<string>/opt/silo/bin/silo</string>\n\t\t<string>daemon</string>\n\t\t<string>run</string>\n\t\t<string>--system-cpus</string>"));
         assert!(text.contains("--system-cpus"));
         assert!(text.contains("--system-share"));
         assert!(!text.contains("--system-memory"));
@@ -1656,11 +1663,11 @@ mod tests {
         }
         let temp = tempfile::tempdir().expect("temp");
         let root = std::fs::canonicalize(temp.path()).expect("canonical root");
-        let executable = root.join("silod space$literal%");
+        let executable = root.join("silo space$literal%");
         let record = root.join("stop-record");
         let start_record = root.join("start-record");
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = --host-shutdown ]; then\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nelse\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nexec /bin/sleep 60\nfi\n",
+            "#!/bin/sh\nif [ \"$3\" = --host-shutdown ]; then\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nelse\nprintf '%s\\n' \"$@\" \"$HOME\" \"$SILO_HOME\" \"$XDG_CONFIG_HOME\" > {}\nexec /bin/sleep 60\nfi\n",
             crate::daemon::service::shell_word(record.to_str().unwrap()),
             crate::daemon::service::shell_word(start_record.to_str().unwrap()),
         );
@@ -1708,11 +1715,13 @@ mod tests {
         .join("\n");
         assert_eq!(
             std::fs::read_to_string(start_record).expect("start arguments/environment"),
-            format!("--system-cpus\n9\nliteral $percent%\"quote\\slash\n{environment}\n")
+            format!(
+                "daemon\nrun\n--system-cpus\n9\nliteral $percent%\"quote\\slash\n{environment}\n"
+            )
         );
         assert_eq!(
             std::fs::read_to_string(record).expect("stop arguments/environment"),
-            format!("--host-shutdown\n{environment}\n")
+            format!("daemon\nrun\n--host-shutdown\n{environment}\n")
         );
     }
 
@@ -1772,7 +1781,7 @@ mod tests {
     #[test]
     fn launchd_plist_follows_platform_conventions() {
         let service = ServiceConfig {
-            executable: PathBuf::from("/Applications/Silo & Co/silod"),
+            executable: PathBuf::from("/Applications/Silo & Co/silo"),
             native_service_path: PathBuf::from(
                 "/Users/me/Library/LaunchAgents/io.silo.system.plist",
             ),
@@ -1787,7 +1796,7 @@ mod tests {
             render_native(&service, "Silo-Installation-ID: test", &[]).expect("render"),
         )
         .expect("utf8");
-        assert!(plist.contains("<string>/Applications/Silo &amp; Co/silod</string>"));
+        assert!(plist.contains("<string>/Applications/Silo &amp; Co/silo</string>\n\t\t<string>daemon</string>\n\t\t<string>run</string>\n\t</array>"));
         assert!(!plist.contains("<string>serve</string>"));
         assert!(!plist.contains("--state"));
         assert!(!plist.contains("daemon.json"));

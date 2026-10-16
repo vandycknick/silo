@@ -6,7 +6,7 @@ import pytest
 
 from silo_smoke import procs
 from silo_smoke.config import SmokeConfig
-from silo_smoke.daemon import Silod
+from silo_smoke.daemon import Daemon
 from silo_smoke.workspace import Workspace
 
 pytestmark = [pytest.mark.daemon, pytest.mark.system]
@@ -25,7 +25,7 @@ def _identity(workspace: Workspace) -> tuple[str, str, str, str]:
 
 
 @pytest.mark.usefixtures("pulled_images")
-def test_graceful_restart_adopts_running_appliance(daemon: Silod, workspace: Workspace, config: SmokeConfig) -> None:
+def test_graceful_restart_adopts_running_appliance(daemon: Daemon, workspace: Workspace, config: SmokeConfig) -> None:
     if config.system_image is None:
         pytest.skip("SILO_SMOKE_SYSTEM_IMAGE is empty")
     args = (

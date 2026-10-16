@@ -3,8 +3,8 @@ use eyre::Context as _;
 use libvm::{MachineRunId, RuntimeConfig};
 use std::path::PathBuf;
 
+use crate::config::GlobalConfig;
 use crate::context::Context;
-use silo_config::GlobalConfig;
 
 const MACHINE_RUN_ID_ENV: &str = "SILO_MACHINE_RUN_ID";
 

@@ -613,7 +613,7 @@ fn canonical_component(
 
 fn portable_root_for_executable(executable: &Path) -> Option<PathBuf> {
     let bin = executable.parent()?;
-    (matches!(executable.file_name()?.to_str()?, "silo" | "silod") && bin.file_name()? == "bin")
+    (executable.file_name()? == "silo" && bin.file_name()? == "bin")
         .then(|| bin.parent().map(Path::to_path_buf))?
 }
 
@@ -621,13 +621,9 @@ fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
     let macos = executable.parent()?;
     let contents = macos.parent()?;
     let bundle = contents.parent()?;
-    (matches!(
-        (
-            executable.file_name()?.to_str()?,
-            macos.file_name()?.to_str()?
-        ),
-        ("silo", "MacOS") | ("silod", "Helpers")
-    ) && contents.file_name()? == "Contents"
+    (executable.file_name()? == "silo"
+        && macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
         && bundle.file_name()? == "Silo.app")
         .then(|| bundle.to_path_buf())
 }
@@ -1227,23 +1223,21 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().join("portable");
         portable(&root);
-        for name in ["silo", "silod"] {
-            let executable = root.join("bin").join(name);
-            write_file(&executable, true);
-            let resolved = resolve(
-                &RuntimeConfig::default(),
-                &mut TestEnvironment::default(),
-                executable,
-                vec![],
-            )
-            .expect("resolve portable runtime");
-            assert_eq!(
-                resolved.kernel,
-                root.join("assets/kernel-default")
-                    .canonicalize()
-                    .expect("kernel")
-            );
-        }
+        let executable = root.join("bin/silo");
+        write_file(&executable, true);
+        let resolved = resolve(
+            &RuntimeConfig::default(),
+            &mut TestEnvironment::default(),
+            executable,
+            vec![],
+        )
+        .expect("resolve portable runtime");
+        assert_eq!(
+            resolved.kernel,
+            root.join("assets/kernel-default")
+                .canonicalize()
+                .expect("kernel")
+        );
     }
 
     #[test]
@@ -1626,26 +1620,21 @@ mod tests {
     fn app_executable_uses_bundle_layout() {
         let temp = tempfile::tempdir().expect("temp dir");
         let bundle = app_bundle(temp.path(), false);
-        for relative in ["Contents/MacOS/silo", "Contents/Helpers/silod"] {
-            let executable = bundle.join(relative);
-            if relative.ends_with("silod") {
-                write_file(&executable, true);
-            }
-            let resolved = resolve(
-                &RuntimeConfig::default(),
-                &mut TestEnvironment::default(),
-                executable,
-                vec![],
-            )
-            .expect("resolve app runtime");
-            assert_eq!(
-                resolved.supervisor,
-                bundle
-                    .join("Contents/Helpers/silo-vmm")
-                    .canonicalize()
-                    .expect("canonical silo-vmm")
-            );
-        }
+        let executable = bundle.join("Contents/MacOS/silo");
+        let resolved = resolve(
+            &RuntimeConfig::default(),
+            &mut TestEnvironment::default(),
+            executable,
+            vec![],
+        )
+        .expect("resolve app runtime");
+        assert_eq!(
+            resolved.supervisor,
+            bundle
+                .join("Contents/Helpers/silo-vmm")
+                .canonicalize()
+                .expect("canonical silo-vmm")
+        );
     }
 
     #[test]

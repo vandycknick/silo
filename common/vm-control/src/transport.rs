@@ -33,7 +33,7 @@ pub async fn probe(host: &HostPaths, admission: Admission) -> eyre::Result<Optio
     probe_at(
         host,
         admission,
-        HostPaths::run_root()?.join("silod/control.sock"),
+        silod_spec::paths::control_socket(&HostPaths::run_root()?),
     )
     .await
 }
@@ -68,7 +68,7 @@ async fn probe_at(
         };
         eyre::ensure!(
             stream.peer_cred()?.uid() == nix::unistd::geteuid().as_raw(),
-            "silod peer UID mismatch"
+            "daemon peer UID mismatch"
         );
         let first = Arc::new(std::sync::Mutex::new(Some(stream)));
         let path = socket.clone();
@@ -80,21 +80,21 @@ async fn probe_at(
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 let initial = first
                     .lock()
-                    .map_err(|_| std::io::Error::other("silod connector lock poisoned"))?
+                    .map_err(|_| std::io::Error::other("daemon connector lock poisoned"))?
                     .take();
                 let stream = match initial {
                     Some(stream) => stream,
                     None => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::ConnectionAborted,
-                            "selected silod connection was lost; refusing daemon replacement",
+                            "selected daemon connection was lost; refusing daemon replacement",
                         ))
                     }
                 };
                 if stream.peer_cred()?.uid() != nix::unistd::geteuid().as_raw() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
-                        "silod peer UID mismatch",
+                        "daemon peer UID mismatch",
                     ));
                 }
                 Ok::<_, std::io::Error>(TokioIo::new(stream))
@@ -103,7 +103,7 @@ async fn probe_at(
         let channel = Endpoint::from_static("http://silod.local")
             .connect_with_connector(connector)
             .await
-            .context("connect to silod management socket")?;
+            .context("connect to the daemon management socket")?;
         let mut daemon = DaemonServiceClient::new(channel.clone())
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -113,7 +113,7 @@ async fn probe_at(
             .map_err(|status| {
                 crate::errors::status_to_native_error(&status).unwrap_or_else(|_| {
                     std::io::Error::other(format!(
-                        "silod management {}: {}",
+                        "daemon management {}: {}",
                         status.code(),
                         status.message()
                     ))
@@ -125,7 +125,9 @@ async fn probe_at(
         Ok(Some(SelectedDaemon { channel, status }))
     })
     .await
-    .context("silod is unavailable: connect/status exceeded two seconds; no local fallback")??;
+    .context(
+        "the daemon is unavailable: connect/status exceeded two seconds; no local fallback",
+    )??;
     Ok(selected)
 }
 
@@ -145,7 +147,7 @@ fn validate_existing_parents(socket: &Path) -> eyre::Result<()> {
                 m.is_dir()
                     && m.uid() == nix::unistd::geteuid().as_raw()
                     && m.mode() & 0o7777 == 0o700,
-                "unsafe silod control directory {}",
+                "unsafe daemon control directory {}",
                 path.display()
             ),
             Err(error) if error.raw_os_error() == Some(nix::libc::ENOENT) => {}
@@ -162,7 +164,7 @@ fn validate_endpoint(path: &Path) -> eyre::Result<()> {
             && m.uid() == nix::unistd::geteuid().as_raw()
             && m.mode() & 0o7777 == 0o600
             && m.nlink() == 1,
-        "unsafe silod control endpoint {}",
+        "unsafe daemon control endpoint {}",
         path.display()
     );
     Ok(())
@@ -190,14 +192,14 @@ fn ensure_unowned(socket: &Path) -> eyre::Result<()> {
             && m.uid() == nix::unistd::geteuid().as_raw()
             && m.mode() & 0o7777 == 0o600
             && m.nlink() == 1,
-        "unsafe silod owner lock"
+        "unsafe daemon owner lock"
     );
     let _guard: nix::fcntl::Flock<File> = nix::fcntl::Flock::lock(
         file,
         nix::fcntl::FlockArg::LockExclusiveNonblock,
     )
     .map_err(|(_, error)| {
-        eyre::eyre!("silod owns this UID but its API is unavailable; no local fallback: {error}")
+        eyre::eyre!("a daemon owns this UID but its API is unavailable; no local fallback: {error}")
     })?;
     Ok(())
 }
@@ -208,7 +210,7 @@ fn admit_status(
 ) -> eyre::Result<()> {
     eyre::ensure!(
         status.product_version == env!("CARGO_PKG_VERSION") && status.protocol_major == 1,
-        "silod product/protocol mismatch; restart with the matching silo installation"
+        "daemon product/protocol mismatch; restart with the matching silo installation"
     );
     crate::validate_uuid(&status.generation, "daemon.generation")?;
     let home = crate::path_from_wire(status.home.clone())?;
@@ -218,16 +220,16 @@ fn admit_status(
             && config.is_absolute()
             && std::fs::canonicalize(&home)? == home
             && std::fs::canonicalize(&config)? == config,
-        "silod returned noncanonical roots"
+        "the daemon returned noncanonical roots"
     );
     eyre::ensure!(
         canonical_selected(host.home())? == home
             && canonical_selected(host.config_dir())? == config,
-        "silod is bound to another Home/config root; run silo daemon down and reconfigure it"
+        "the daemon is bound to another Home/config root; run silo daemon down and reconfigure it"
     );
     eyre::ensure!(
         admission == Admission::Owned || status.core == w::CorePhase::Ready as i32,
-        "silod core is unavailable (starting, stopping or failed); no local fallback"
+        "the daemon core is unavailable (starting, stopping or failed); no local fallback"
     );
     Ok(())
 }
@@ -389,7 +391,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, HostPaths, std::path::PathBuf) {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = root.path().join("silod/control.sock");
+        let socket = silod_spec::paths::control_socket(root.path());
         let host = HostPaths::new(root.path().join("home"), root.path().join("config"));
         (root, host, socket)
     }

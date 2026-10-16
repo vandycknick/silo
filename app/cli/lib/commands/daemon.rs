@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use eyre::Context as _;
 
 use silod_spec::paths::DaemonPaths;
 use silod_spec::status::{CorePhase, DaemonStatus, MemoryReclaimOutcome, SystemStatus};
@@ -10,11 +11,20 @@ use crate::ui::Spinner;
 #[derive(Debug, Args)]
 pub struct Cmd {
     #[command(subcommand)]
-    command: DaemonCommand,
+    pub(crate) command: DaemonCommand,
 }
 
 #[derive(Debug, Subcommand)]
-enum DaemonCommand {
+pub(crate) enum DaemonCommand {
+    /// Run the daemon in the foreground (what the registered service executes).
+    Run(crate::daemon::serve::Run),
+    // The controller commands need the host paths; the daemon resolves its own.
+    #[command(flatten)]
+    Control(ControlCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ControlCommand {
     /// Enable and start the per-user daemon and selected integrations.
     Up(Up),
     /// Disable the per-user service and stop the system VM.
@@ -26,7 +36,7 @@ enum DaemonCommand {
 }
 
 #[derive(Debug, Args)]
-struct Up {
+pub(crate) struct Up {
     #[arg(long)]
     foreground: bool,
     #[arg(long)]
@@ -40,13 +50,13 @@ struct Up {
 }
 
 #[derive(Debug, Args)]
-struct Status {
+pub(crate) struct Status {
     #[arg(long, value_enum, default_value_t = crate::ui::OutputFormat::Plain)]
     format: crate::ui::OutputFormat,
 }
 
 #[derive(Debug, Args)]
-struct Logs {
+pub(crate) struct Logs {
     #[arg(long)]
     follow: bool,
     #[arg(long, default_value_t = 200)]
@@ -55,10 +65,14 @@ struct Logs {
 
 impl Cmd {
     pub(crate) async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        let command = match self.command {
+            DaemonCommand::Run(args) => return run_daemon(args).await,
+            DaemonCommand::Control(command) => command,
+        };
         let host = libvm::HostPaths::from_env()?;
         let paths = DaemonPaths::new(host.home());
-        match self.command {
-            DaemonCommand::Up(command) => {
+        match command {
+            ControlCommand::Up(command) => {
                 eyre::ensure!(
                     !command.foreground || command.linger.is_none(),
                     "--linger cannot be used with --foreground"
@@ -69,7 +83,7 @@ impl Cmd {
                     "--linger is supported only on Linux"
                 );
                 let spinner = Spinner::start("Checking", "daemon configuration");
-                let selection = silo_config::FeatureOverrides {
+                let selection = crate::config::FeatureOverrides {
                     system: command.system,
                     tailscale: command.tailscale,
                 };
@@ -80,28 +94,41 @@ impl Cmd {
                 let mut arguments = context.config()?.daemon_overrides()?.to_args();
                 arguments.push(format!("--system-enabled={}", features.system).into());
                 arguments.push(format!("--tailscale-enabled={}", features.tailscale).into());
-                let executable = crate::daemon::executable()?;
                 let socket = paths.docker_socket();
                 let live = service::status(&paths)?.is_some();
                 if features.system {
                     crate::daemon::docker::preflight(&socket, live)?;
                 }
-                crate::daemon::check(&executable, &arguments)?;
+                let selected = crate::config::FeatureOverrides {
+                    system: Some(features.system),
+                    tailscale: Some(features.tailscale),
+                };
+                crate::daemon::serve::validate(&host, selected)?;
                 if command.foreground {
                     spinner.finish_clear();
-                    return crate::daemon::foreground(&executable, &arguments);
+                    return run_daemon(crate::daemon::serve::Run {
+                        system: silod_spec::arguments::SystemArgs::default(),
+                        system_enabled: selected.system,
+                        tailscale_enabled: selected.tailscale,
+                        stop: false,
+                        host_shutdown: false,
+                    })
+                    .await;
                 }
+                let executable = std::env::current_exe()
+                    .and_then(|path| path.canonicalize())
+                    .context("locate the silo executable")?;
                 let service = service::ServiceConfig::new(&paths, executable)?;
                 service::validate_registration(&service)?;
                 spinner.finish_success("Checked");
                 service::bootstrap_linger(command.linger)?;
-                let mut spinner = Spinner::start("Starting", "silod");
-                silo_config::GlobalConfig::persist_features(
+                let mut spinner = Spinner::start("Starting", "daemon");
+                crate::config::GlobalConfig::persist_features(
                     &host,
                     selection,
                     existing_installation,
                 )?;
-                let persisted = silo_config::GlobalConfig::load_from(&host)?;
+                let persisted = crate::config::GlobalConfig::load_from(&host)?;
                 let features =
                     persisted.resolve_features(Default::default(), existing_installation);
                 let identity = persisted.daemon_identity(features)?;
@@ -121,15 +148,15 @@ impl Cmd {
                 }
                 Ok(())
             }
-            DaemonCommand::Down => service::down(&paths, &crate::daemon::executable()?),
-            DaemonCommand::Status(command) => {
+            ControlCommand::Down => service::down(&paths).await,
+            ControlCommand::Status(command) => {
                 let view = DaemonStatusView::collect(&paths)?;
                 match command.format {
                     crate::ui::OutputFormat::Json => crate::ui::print_json(&view),
                     crate::ui::OutputFormat::Plain => view.print_human(),
                 }
             }
-            DaemonCommand::Logs(command) => {
+            ControlCommand::Logs(command) => {
                 let logs = service::logs(&paths, command.lines)?;
                 if !logs.is_empty() {
                     println!("{logs}");
@@ -141,6 +168,15 @@ impl Cmd {
             }
         }
     }
+}
+
+/// Runs the daemon to completion, mapping a rejected configuration to exit code 2
+/// so the service manager does not retry it.
+async fn run_daemon(args: crate::daemon::serve::Run) -> eyre::Result<()> {
+    crate::daemon::serve::run(args).await.map_err(|error| {
+        let code = crate::daemon::serve::exit_code(&error);
+        eyre::eyre!("{error:#}").wrap_err(crate::errors::ExecutionExit::new(code))
+    })
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -312,7 +348,7 @@ impl DaemonStatusView {
     }
 }
 
-/// When silod last asked the registry about the system image, and what went wrong.
+/// When the daemon last asked the registry about the system image, and what went wrong.
 fn format_update_check(status: &SystemStatus) -> String {
     let checked = status
         .update_checked_at
@@ -494,8 +530,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_controller_commands_only() {
+    fn parses_controller_commands_and_the_daemon_entrypoint() {
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "up", "--foreground"]).is_ok());
+        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "run", "--stop"]).is_ok());
+        // The daemon takes the normal Silo Home; there is no state/home argument.
+        assert!(
+            crate::app::Cli::try_parse_from(["silo", "daemon", "run", "--home", "/x"]).is_err()
+        );
+        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "run", "--check"]).is_err());
         assert!(crate::app::Cli::try_parse_from([
             "silo",
             "daemon",
@@ -506,7 +548,7 @@ mod tests {
         .is_err());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "down"]).is_ok());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "logs", "--follow"]).is_ok());
-        // silod upgrades the system VM itself; there is nothing to drive by hand.
+        // The daemon upgrades the system VM itself; there is nothing to drive by hand.
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_err());
         assert!(
             crate::app::Cli::try_parse_from(["silo", "daemon", "balloon", "--target", "1GiB"])

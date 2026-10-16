@@ -9,7 +9,7 @@ import pytest
 from silo_smoke import config as smoke_config, image_cache, images, preflight
 from silo_smoke.cli import Silo, Vm
 from silo_smoke.config import SmokeConfig
-from silo_smoke.daemon import Silod
+from silo_smoke.daemon import Daemon
 from silo_smoke.errors import SmokeEnvironmentError
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -105,8 +105,8 @@ def vm(silo: Silo, basic_image: str) -> Generator[Vm, None, None]:
 
 
 @pytest.fixture
-def daemon(workspace: Workspace) -> Silod:
-    return Silod(workspace)
+def daemon(workspace: Workspace) -> Daemon:
+    return Daemon(workspace)
 
 
 @pytest.fixture

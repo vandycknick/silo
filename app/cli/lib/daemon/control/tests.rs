@@ -1,6 +1,6 @@
-use crate::control::{socket, ControlState, Service};
+use crate::config::GlobalConfig;
+use crate::daemon::control::{socket, ControlState, Service};
 use libvm::HostPaths;
-use silo_config::GlobalConfig;
 use silod_spec::daemon::v1 as w;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::{sync::Arc, time::Duration};
@@ -10,12 +10,12 @@ fn state(root: &std::path::Path) -> Arc<ControlState> {
     let host = HostPaths::new(root.join("home"), root.join("config"));
     let global = GlobalConfig::default();
     let generation = uuid::Uuid::new_v4();
-    let features = silo_config::FeatureSelection {
+    let features = crate::config::FeatureSelection {
         system: false,
         tailscale: false,
     };
     let publisher = Arc::new(
-        crate::status::StatusPublisher::new(
+        crate::daemon::status::StatusPublisher::new(
             &host,
             generation,
             features,
@@ -554,11 +554,11 @@ async fn ownership_acquisition_does_not_replace_socket_and_retains_both_locks() 
     let owner = state(root.path());
     let dir = root.path().join("control");
     let lifetime_path = owner.host.home().join("daemon/daemon.lock");
-    let lifetime = crate::supervisor::LifetimeLock::acquire(&lifetime_path).unwrap();
+    let lifetime = crate::daemon::supervisor::LifetimeLock::acquire(&lifetime_path).unwrap();
     let ownership = socket::SocketOwnership::acquire_at(dir.clone()).unwrap();
     let stale = tokio::net::UnixListener::bind(dir.join("control.sock")).unwrap();
     let before = std::fs::metadata(dir.join("control.sock")).unwrap().ino();
-    assert!(crate::supervisor::LifetimeLock::acquire(&lifetime_path).is_err());
+    assert!(crate::daemon::supervisor::LifetimeLock::acquire(&lifetime_path).is_err());
     assert!(socket::SocketOwnership::acquire_at(dir.clone()).is_err());
     assert_eq!(
         std::fs::metadata(dir.join("control.sock")).unwrap().ino(),
@@ -566,12 +566,12 @@ async fn ownership_acquisition_does_not_replace_socket_and_retains_both_locks() 
     );
     drop(stale);
     let server = ownership.bind(owner).unwrap();
-    assert!(crate::supervisor::LifetimeLock::acquire(&lifetime_path).is_err());
+    assert!(crate::daemon::supervisor::LifetimeLock::acquire(&lifetime_path).is_err());
     assert!(socket::SocketOwnership::acquire_at(dir.clone()).is_err());
     drop(server);
     assert!(!dir.join("control.sock").exists());
     drop(lifetime);
-    assert!(crate::supervisor::LifetimeLock::acquire(&lifetime_path).is_ok());
+    assert!(crate::daemon::supervisor::LifetimeLock::acquire(&lifetime_path).is_ok());
     assert!(socket::SocketOwnership::acquire_at(dir).is_ok());
 }
 
@@ -674,7 +674,7 @@ async fn shutdown_only_real_transport_enforces_every_protocol_method() {
     // Parse the authoritative protocol, so additions must explicitly be admitted.
     let mut service = "";
     let mut denied = 0;
-    for line in include_str!("../../../../specs/silod-spec/proto/daemon.proto").lines() {
+    for line in include_str!("../../../../../specs/silod-spec/proto/daemon.proto").lines() {
         if let Some(declaration) = line.strip_prefix("service ") {
             service = declaration.split_whitespace().next().unwrap();
         } else if let Some(declaration) = line.trim().strip_prefix("rpc ") {

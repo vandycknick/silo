@@ -486,7 +486,7 @@ func TestTemplateCreationOverridesAndStampedAuthority(t *testing.T) {
 	s := actualService(t)
 	ctx := context.Background()
 	c := domainCaller(s, "user:1")
-	// A real tiny OCI image, materialized into a stopped VM through silod.
+	// A real tiny OCI image, materialized into a stopped VM through the daemon.
 	registry := fixture.Reference
 	raw := "version: '1'\nimage: " + registry + "\nresources: {cpus: 2, memory: 512MiB}\ndisk_size: 1GiB\nnetwork: {kind: private, publish: [8080]}\nlabels: {team: template, x: original}"
 	if _, e := s.Documents(ctx, c, "template", "create", "dev", "", raw); e != nil {

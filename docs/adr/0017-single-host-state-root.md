@@ -37,7 +37,7 @@ Generated runtime state (per-machine and per-network sockets, pidfiles, locks)
 lives under a fixed **run root**, `/tmp/silo-<euid>`, created with mode 0700 and
 checked for ownership and against symlinks, exactly as before. macOS spells it
 `/private/tmp/silo-<euid>`, the canonical form of its symlinked `/tmp`, so
-published endpoints such as the silod control socket are canonical paths.
+published endpoints such as the daemon control socket are canonical paths.
 `SILO_RUN_ROOT` now allows an absolute, canonical override of that default;
 it must be short enough for generated socket paths to fit inside `sun_path`.
 

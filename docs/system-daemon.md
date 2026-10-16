@@ -1,11 +1,12 @@
 # Silo daemon
 
-Silod is an optional per-user VM-management daemon. Its independently enabled
+The Silo daemon is an optional per-user VM-management daemon, run as
+`silo daemon run` by the native user service. Its independently enabled
 system integration runs a persistent Docker Engine in one microVM. Docker and
 containerd data live on an installation-owned ext4 disk, separate from the
 replaceable appliance root disk. Its endpoint is `<Home>/run/docker.sock`.
 The daemon resolves the same `SILO_HOME` and `XDG_CONFIG_HOME` as the CLI;
-`silod` has no `--home` or `--state` argument.
+`silo daemon run` has no `--home` or `--state` argument.
 
 The Docker socket grants its callers administrative control of the guest and
 read/write access to every configured host share. Treat access to it like
@@ -14,8 +15,9 @@ or replace `/var/run/docker.sock`.
 
 ## Process boundary
 
-`silod` (`app/silod`) is the daemon; `silo daemon up/down/status/logs` is its
-controller. Both read normal configuration through `silo-config`. Their published
+`silo daemon run` (`app/cli/lib/daemon`) is the daemon; `silo daemon
+up/down/status/logs` is its controller. Both live in the `silo` executable and
+read normal configuration through the CLI's `config` module. Their published
 daemon contract is the `silod-spec` crate, which holds data and encodings only:
 
 The typed management schema is
@@ -43,7 +45,7 @@ work, not merely RPC waiters. A disconnected mutation must not be replayed
 automatically. Log tails and following share native snapshot descriptors to avoid
 duplicating or losing bytes between history and live output.
 
-Each CLI command selects management once. A matching ready silod receives its
+Each CLI command selects management once. A matching ready daemon receives its
 management calls; proven absence uses local libvm. Selection has a two-second
 deadline. A live owner without a usable API, incompatible identity, unsafe socket,
 or different Home/config root is an error, never permission to fall back.
@@ -52,44 +54,46 @@ to a replacement daemon or replay a mutation locally.
 
 CLI SSH shell, structured exec, forwarding, serial, and logs remain native.
 Their lazy session runtime adopts the selected daemon's exact runtime components
-and immutable machine ID. An established independent CLI session survives silod
+and immutable machine ID. An established independent CLI session survives daemon
 shutdown. Foreground cleanup still requires its selected management backend and
 original run ID; detached cleanup runs locally in the monitor's trusted hook.
-`create/run --dry-run` remain local, metadata-only planning without probing silod
+`create/run --dry-run` remain local, metadata-only planning without probing the daemon
 or opening a mutable runtime. CLI creation and updates normalize host paths before
 dispatch, so the daemon's working directory cannot change their meaning.
 
 
 ```text
  CLI management, daemon absent  -> libvm
- CLI management, daemon ready   -> gRPC -> silod -> libvm
+ CLI management, daemon ready   -> gRPC -> silo daemon run -> libvm
  CLI shell/exec                 -> libvm -> silo-vmm -> guest
- CLI service control            -> native user service -> silod
+ CLI service control            -> native user service -> silo daemon run
 ```
 
 - The CLI owns service registration (launchd/systemd), Docker context integration
-  and the status display. It never reads silod's installation record or performs
+  and the status display. It never reads the daemon's installation record or performs
   appliance provisioning.
-- `silod` reads the shared configuration and owns installation records,
+- The daemon reads the shared configuration and owns installation records,
   provisioning, supervision and image upgrades. Appliance networking remains
   separate from ordinary VM networking.
 
-`silod` has no subcommands: running it starts the foreground daemon. The CLI
-registers the native service without copying default-filled configuration into
-arguments. The service reads configuration on every launch and persists only
-the resolved `HOME`, `SILO_HOME` and `XDG_CONFIG_HOME` environment identities.
-Before registering, `up` runs `silod --check`, so invalid configuration does not
-replace the service. `up --foreground` applies process-only overrides without
-persisting feature choices.
+`silo daemon run` has no further subcommands: running it starts the foreground
+daemon. The CLI registers the native service without copying default-filled
+configuration into arguments. The service reads configuration on every launch
+and persists only the resolved `HOME`, `SILO_HOME` and `XDG_CONFIG_HOME`
+environment identities. Before registering, `up` validates the configuration
+in-process, so invalid configuration does not replace the service.
+`up --foreground` runs the daemon in the calling process, applying process-only
+overrides without persisting feature choices.
 Every `--system-*` argument configures the system appliance, not defaults for
-ordinary VMs. Silod implements the local management API through libvm; guest
-execution remains a direct libvm/SDK session, not a daemon stream relay.
+ordinary VMs. The daemon implements the local management API through libvm;
+guest execution remains a direct libvm/SDK session, not a daemon stream relay.
 
-`make build` produces the CLI, silod, taild and native bridge together. Portable
-installations keep them in `bin/`; macOS bundles place silod, taild and the bridge
-under `Contents/Helpers/`. Existing services must be stopped before upgrading
-from the embedded daemon, then started with the new CLI so its service
-definition points at `silod`. Rebuilding alone does not replace a running process.
+`make build` produces the CLI, taild and native bridge together. Portable
+installations keep them in `bin/`; macOS bundles keep `silo` in
+`Contents/MacOS/` and place taild and the bridge under `Contents/Helpers/`.
+The service definition points at the `silo` executable that registered it.
+Rebuilding alone does not replace a running process; `silo daemon up` restarts
+the service when its definition changed.
 
 ## Prerequisites
 
@@ -110,7 +114,7 @@ No configuration file is required. A fresh Linux `silo daemon up` starts core
 management only; macOS and existing appliance installations default to system
 integration enabled. Use `silo daemon up --system` to enable the built-in system
 image (4 CPUs, 8 GiB memory, a sparse 20 GiB root disk, 500 GiB data disk, and a
-read/write home share). For that integration, silod generates
+read/write home share). For that integration, the daemon generates
 `~/.silo/daemon/daemon.json` as internal installation state; do not create or
 edit it yourself. An omitted option always means its default, so removing a key
 from `config.yaml` reverts it on the next `up`. The exceptions are settings
@@ -123,8 +127,8 @@ built without an embedded image requires an explicit image override.
 
 To override defaults, optionally add a strict version-1 `daemon` section to
 `~/.config/silo/config.yaml` (or the equivalent `XDG_CONFIG_HOME` path).
-Only specify settings you want to change. Both executables use the shared strict
-parser; explicit foreground arguments take precedence over stored values.
+Only specify settings you want to change. The daemon and the controller use the
+same strict parser; explicit foreground arguments take precedence over stored values.
 
 ```yaml
 daemon:
@@ -164,22 +168,21 @@ symlinks or FIFOs; group/world-writable configuration is rejected.
 The equivalent direct daemon interface is:
 
 ```text
-silod [--system-backend krun|vz] [--system-image REFERENCE]
-      [--system-cpus COUNT] [--system-memory SIZE]
-      [--system-root-size SIZE] [--system-data-size SIZE]
-      [--system-rosetta true|false] [--system-home-share true|false]
-      [--system-share PATH] [--system-share-read-only PATH]
-      [--system-clear-shares] [--system-publish-bind loopback|any]
+silo daemon run [--system-backend krun|vz] [--system-image REFERENCE]
+                [--system-cpus COUNT] [--system-memory SIZE]
+                [--system-root-size SIZE] [--system-data-size SIZE]
+                [--system-rosetta true|false] [--system-home-share true|false]
+                [--system-share PATH] [--system-share-read-only PATH]
+                [--system-clear-shares] [--system-publish-bind loopback|any]
 ```
 
 Shares are repeatable. Explicit empty `additional: []` maps to
 `--system-clear-shares`. Existing installation restrictions still apply. For
-example, `silod --system-cpus 10` overrides only appliance CPUs. Bare `silod`
-requires no configuration or arguments. `silod --check [options]` validates the
-options against the installation and exits without changing anything.
-`silod --stop` stops the installation's VMs when no daemon is running.
+example, `silo daemon run --system-cpus 10` overrides only appliance CPUs. Bare
+`silo daemon run` requires no configuration or arguments.
+`silo daemon run --stop` stops the installation's VMs when no daemon is running.
 
-VMs silod creates carry the `io.silo.system.role=system` and
+VMs the daemon creates carry the `io.silo.system.role=system` and
 `io.silo.system.installation` labels so they can be tracked. Ordinary `silo`
 commands (`stop`, `rm`, `set`, ...) work on them like on any other VM.
 
@@ -288,10 +291,10 @@ docker --host unix://$HOME/.silo/run/docker.sock version
 docker --context silo info
 ```
 
-`down` disables automatic startup and waits for `silod` to detach and exit.
-It then runs `silod --stop`, which explicitly stops the installation's VMs,
-so the system VM is stopped when `down` returns. A service-manager restart or
-SIGINT/SIGTERM to silod alone leaves the VM running for the next manager to adopt. It preserves the machine, images, containers, networks, volumes, build cache, and
+`down` disables automatic startup and waits for the daemon to detach and exit.
+It then stops the installation's VMs explicitly (what `silo daemon run --stop`
+does), so the system VM is stopped when `down` returns. A service-manager
+restart or SIGINT/SIGTERM to the daemon alone leaves the VM running for the next manager to adopt. It preserves the machine, images, containers, networks, volumes, build cache, and
 both disks. It does not select another Docker context. Repeated `down` remains
 disabled across the next login or service-manager activation cycle.
 
@@ -303,13 +306,13 @@ silo daemon up --foreground
 
 Foreground mode uses the same supervisor and persistent installation. It does
 not background itself or install a service. SIGINT or SIGTERM stops only the
-manager, leaving an established VM and its network helper running. Run `silod
---stop` after the manager exits to explicitly stop the system appliance, or use
-`silo daemon down` for the complete stop operation.
+manager, leaving an established VM and its network helper running. Run
+`silo daemon run --stop` after the manager exits to explicitly stop the system
+appliance, or use `silo daemon down` for the complete stop operation.
 
 ## Daemon State
 
-The CLI's `config.yaml` holds optional user overrides. `silod` keeps its internal installation record at
+The CLI's `config.yaml` holds optional user overrides. The daemon keeps its internal installation record at
 `~/.silo/daemon/daemon.json`. It contains:
 
 - Installation and persistent data-disk identities.
@@ -325,13 +328,13 @@ recorded VM for those facts. A missing recorded VM is an error, not permission t
 create a replacement. Ownership-label discovery is only used to recover creation
 that finished before its VM ID could be saved.
 
-The record is replaced atomically, and only `silod` reads or writes it. The
+The record is replaced atomically, and only the daemon reads or writes it. The
 lifetime lock prevents two daemons from owning the installation, and the CLI
 waits on it in `down`. `status.json` is only a live-status cache, checked
 against the daemon process, not installation state.
 
 Records written while the CLI embedded the daemon also held its service
-registration; `silod` drops that field when it loads such a record. There is no
+registration; the daemon drops that field when it loads such a record. There is no
 migration for the older multi-file daemon state.
 
 An interrupted first setup with no VM resumes with whatever image is configured
@@ -339,21 +342,21 @@ now; a VM created before its ID was recorded is adopted and upgraded normally.
 
 ## Image upgrades
 
-`silod` follows the configured image reference (`daemon.system.image`, else the
+The daemon follows the configured image reference (`daemon.system.image`, else the
 built-in default) and replaces the system VM in place, without restarting
 itself. Shortly after the engine first becomes Ready, and then every hour, it
 asks the registry which manifest the reference names. A digest reference never
 changes, so a release build only upgrades when a new release embeds a new
 digest, or when the configured image changes.
 
-When the manifest differs from the one the VM runs, silod:
+When the manifest differs from the one the VM runs, the daemon:
 
 1. Qualifies the image by booting it against a throwaway data disk. Docker keeps
    serving meanwhile, and a failure only reports `update_error` in the status.
 2. Stops Docker and the VM (phase `upgrading`), backs up the data disk sparsely,
    and boots a candidate VM against the original data disk.
 3. Commits the candidate once its guest manifest, activation, and Docker socket
-   validate, then brings it up like any start. After it reaches Ready, silod
+   validate, then brings it up like any start. After it reaches Ready, the daemon
    removes the previous VM and the backup.
 
 Any failure after the old VM stopped restores the previous VM, its
@@ -362,7 +365,7 @@ next start, and a committed candidate that cannot reach Ready. Recovery discards
 engine writes made after the backup; the engine is down from the backup until the
 candidate's validation, so only writes made during that validation are at risk.
 A manifest that fails qualification, validation, or its first boot is not
-retried until silod restarts.
+retried until the daemon restarts.
 
 ## Diagnostics
 
@@ -416,7 +419,7 @@ The launchd agent restarts only after an unsuccessful exit, allows 90 seconds
 for the manager to detach before SIGKILL, uses `AbandonProcessGroup`, and runs
 with the `Standard` process type. The systemd unit uses `KillMode=process`:
 restarting the management service must not kill the surviving VMM/netd processes.
-Explicit `down` still stops the system appliance through the separate `silod --stop` operation. The VM inherits this scheduling policy: `Background` throttles its CPU and
+Explicit `down` still stops the system appliance through the separate installation-stop operation (`silo daemon run --stop`). The VM inherits this scheduling policy: `Background` throttles its CPU and
 I/O work even when a user is actively building or running containers. Standard
 uses normal service scheduling, without requesting the `Interactive` class or
 pinning host cores. See [build performance](architecture/build-performance.md)
@@ -466,7 +469,7 @@ Common failures are actionable:
 ## Optional tailnet helper
 
 `silo daemon up --tailscale` enables the same-user `taild` child. It is not a
-remote host-login interface. The existing user service owns silod, and silod owns
+remote host-login interface. The existing user service owns the daemon, and the daemon owns
 the helper through a private bootstrap/lifetime pipe. Core readiness remains
 independent of tailnet enrollment and reports pending authentication separately.
 
@@ -475,12 +478,12 @@ assets. Its stable identity, pins and audit remain under `<Home>/taild`; optiona
 frontend credentials come from plain Home-scope secrets. See the
 [operator guide](taild/operator.md) for setup and authorization.
 
-Helper crashes get bounded restart backoff. Normal silod termination drains and
+Helper crashes get bounded restart backoff. Normal daemon termination drains and
 reaps the helper; owner-pipe EOF after an unexpected parent death cancels it
 within five seconds. Neither event stops VMs. `KillMode=process` preserves VM
-descendants while silod explicitly owns helper cleanup.
+descendants while the daemon explicitly owns helper cleanup.
 
-Linux `ExecStop` uses `silod --host-shutdown`, not a VM-stop request on ordinary
+Linux `ExecStop` uses `silo daemon run --host-shutdown`, not a VM-stop request on ordinary
 service termination. The adjacent shutdown-only helper authorizes stops only
 after real `systemctl` state is `stopping`, existing ownership is read and the
 helper lease is held. A live manager remains authoritative; proven absence

@@ -1,4 +1,4 @@
-use crate::control::{conversion, id, native, Service, Stream};
+use crate::daemon::control::{conversion, id, native, Service, Stream};
 use silo_vm_control::{images, policy, values};
 use silod_spec::daemon::v1 as w;
 use tonic::{Request, Response, Status};

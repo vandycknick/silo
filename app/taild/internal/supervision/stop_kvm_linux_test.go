@@ -96,7 +96,7 @@ func TestActualKVMMultiVMShutdownCoordinator(t *testing.T) {
 }
 
 // Seeds local episode transitions, not host signals. Recovery uses real logind
-// observations and silod mutation admission; this is not reboot qualification.
+// observations and daemon mutation admission; this is not reboot qualification.
 func TestActualUnsweptCancellationRecovers(t *testing.T) {
 	if os.Getenv("SILO_TEST_LOGIND") != "1" {
 		t.Skip("SILO_TEST_LOGIND=1 requires an available real login1 delay inhibitor")

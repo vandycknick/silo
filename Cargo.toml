@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "app/cli",
-    "app/silod",
-    "common/config",
     "common/vm-control",
     "common/policy",
     "common/secrets",
@@ -26,7 +24,7 @@ members = [
     "specs/silod-spec",
     "specs/vm-spec",
 ]
-default-members = ["app/cli", "app/silod", "virt/vmm"]
+default-members = ["app/cli", "virt/vmm"]
 resolver = "2"
 
 [workspace.dependencies]

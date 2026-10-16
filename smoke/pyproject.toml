@@ -12,7 +12,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = [
-  "daemon: starts a private silod",
+  "daemon: starts a private Silo daemon",
   "system: needs SILO_SMOKE_SYSTEM_IMAGE",
   "sdk: runs SDK example programs",
   "linux_only: requires Linux",

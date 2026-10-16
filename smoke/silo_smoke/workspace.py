@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from .config import RUN_ROOT_PARENT, SmokeConfig
 
 if TYPE_CHECKING:
-    from .daemon import Silod
+    from .daemon import Daemon
 
 
 def _system_trust_bundle() -> bytes:
@@ -40,7 +40,7 @@ class Workspace:
         self.evidence = self.root / "evidence"
         self._trust_bundle = self.root / "ca-bundle.pem"
         self._machines: list[str] = []
-        self._daemons: list[Silod] = []
+        self._daemons: list[Daemon] = []
         self._record_lock = threading.Lock()
         assert len(os.fsencode(self.run_root / "machines" / ("x" * 36) / "vsock.sock")) < 100
         for directory in (self.user_home, self.silo_home, self.config_home, self.run_root, self.evidence):
@@ -71,7 +71,7 @@ class Workspace:
         if name not in self._machines:
             self._machines.append(name)
 
-    def register_daemon(self, daemon: Silod) -> None:
+    def register_daemon(self, daemon: Daemon) -> None:
         if daemon not in self._daemons:
             self._daemons.append(daemon)
 

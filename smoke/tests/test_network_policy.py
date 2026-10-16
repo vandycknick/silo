@@ -20,7 +20,7 @@ def ca_trust_image(config: SmokeConfig, registry: LoopbackRegistry) -> str:
 def test_bearer_policy_machine_starts_ready(silo: Silo, workspace: Workspace, ca_trust_image: str) -> None:
     workspace.silo_home.mkdir(parents=True, exist_ok=True)
     secrets = workspace.silo_home / "secrets.json"
-    secrets.write_text('{"bearer_token.api.token":{"type":"plain","value":"synthetic-silod-secret"}}')
+    secrets.write_text('{"bearer_token.api.token":{"type":"plain","value":"synthetic-daemon-secret"}}')
     secrets.chmod(0o600)
     assert stat.S_IMODE(secrets.stat().st_mode) == 0o600
     policy = workspace.root / "policy.json"

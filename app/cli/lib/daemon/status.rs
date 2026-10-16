@@ -1,5 +1,5 @@
 //! One process-owned snapshot for both the status file and management API.
-use crate::{
+use crate::daemon::{
     record::write_record,
     supervisor::{now, process_start_identity},
 };
@@ -15,7 +15,7 @@ impl StatusPublisher {
     pub(crate) fn new(
         host: &libvm::HostPaths,
         generation: uuid::Uuid,
-        features: silo_config::FeatureSelection,
+        features: crate::config::FeatureSelection,
         configuration_identity: String,
         system: Option<SystemStatus>,
     ) -> eyre::Result<Self> {
@@ -29,7 +29,7 @@ impl StatusPublisher {
                 process_start: process_start_identity()?,
                 core: CorePhase::Starting,
                 home: host.home().into(),
-                control_endpoint: libvm::HostPaths::run_root()?.join("silod/control.sock"),
+                control_endpoint: silod_spec::paths::control_socket(&libvm::HostPaths::run_root()?),
                 updated_at: now(),
                 last_error: None,
                 system,
@@ -209,7 +209,7 @@ fn system_wire(s: &SystemStatus) -> w::SystemStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::status::*;
+    use crate::daemon::status::*;
     use std::sync::Arc;
 
     #[test]
@@ -217,12 +217,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let host = libvm::HostPaths::new(root.path().join("home"), root.path().join("config"));
         let generation = uuid::Uuid::new_v4();
-        let system = crate::supervisor::initial_status(&root.path().join("docker.sock")).unwrap();
+        let system =
+            crate::daemon::supervisor::initial_status(&root.path().join("docker.sock")).unwrap();
         let publisher = Arc::new(
             StatusPublisher::new(
                 &host,
                 generation,
-                silo_config::FeatureSelection {
+                crate::config::FeatureSelection {
                     system: true,
                     tailscale: true,
                 },
@@ -298,7 +299,7 @@ mod tests {
         let publisher = StatusPublisher::new(
             &host,
             uuid::Uuid::new_v4(),
-            silo_config::FeatureSelection {
+            crate::config::FeatureSelection {
                 system: false,
                 tailscale: false,
             },

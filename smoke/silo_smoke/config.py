@@ -12,7 +12,7 @@ from .errors import SmokeEnvironmentError
 RUN_ROOT_PARENT = "/private/tmp" if platform.system() == "Darwin" else "/tmp"
 REPO = Path(__file__).resolve().parents[2]
 # Published multi-arch images every lane can rely on: the appliance comes from
-# .github/workflows/system-image.yml (the same dev default silod uses), the Arch
+# .github/workflows/system-image.yml (the same dev default the daemon uses), the Arch
 # image is the README quickstart image (systemd init, no OpenSSH, so the agent's
 # native SSH backend serves logins).
 DEFAULT_SYSTEM_IMAGE = "ghcr.io/vandycknick/silo/system:dev"
@@ -49,10 +49,6 @@ class SmokeConfig:
     @property
     def silo(self) -> Path:
         return self.bin_dir / "silo"
-
-    @property
-    def silod(self) -> Path:
-        return self.bin_dir / "silod"
 
 
 def add_options(parser: pytest.Parser) -> None:

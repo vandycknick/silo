@@ -7,14 +7,14 @@ pub(crate) async fn run() -> eyre::Result<()> {
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn run() -> eyre::Result<()> {
-    use crate::{
+    use crate::daemon::{
         control::{socket::SocketOwnership, ControlState},
         helper,
-        paths::SystemPaths,
         status::StatusPublisher,
         supervisor::LifetimeLock,
     };
     use silo_vm_control::transport::{probe, Admission};
+    use silod_spec::paths::DaemonPaths;
     use silod_spec::status::CorePhase;
     use std::{sync::Arc, time::Duration};
     use tokio_util::sync::CancellationToken;
@@ -22,19 +22,19 @@ pub(crate) async fn run() -> eyre::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(85);
     let helper_deadline = deadline - Duration::from_secs(5);
     let host = libvm::HostPaths::from_env()?;
-    let global = silo_config::GlobalConfig::load_from(&host)?;
+    let global = crate::config::GlobalConfig::load_from(&host)?;
     if let Some(selected) = probe(&host, Admission::Owned).await? {
         // Keep the admitted connection alive throughout the child invocation.
         // Never refresh identity or register/revoke a normal helper generation.
         return helper::host_shutdown(&selected.status, global.tailscale(), helper_deadline).await;
     }
 
-    let host = silo_config::prepare_host_paths(&host)?;
-    let paths = SystemPaths::from_host(&host)?;
+    let host = crate::config::prepare_host_paths(&host)?;
+    let paths = DaemonPaths::new(host.home());
     let _lifetime = LifetimeLock::acquire(&paths.lifetime_lock())?;
     let ownership = SocketOwnership::acquire()?;
     // Both ownership domains are held before touching status or the endpoint.
-    let features = silo_config::FeatureSelection {
+    let features = crate::config::FeatureSelection {
         system: false,
         tailscale: false,
     };

@@ -15,7 +15,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// Requires real silod with explicit installed runtime/bin directories.
+// Requires a real daemon with explicit installed runtime/bin directories.
 func TestActualAdmittedTransportRefusesReplacement(t *testing.T) {
 	if os.Getenv("SILO_TEST_CONTROL_REPLACEMENT") != "1" {
 		t.Skip("requires explicit real-daemon replacement admission")
@@ -33,7 +33,7 @@ func TestActualAdmittedTransportRefusesReplacement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	start := func() (*Client, *daemonv1.DaemonStatus, func()) {
-		cmd := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false")
+		cmd := exec.Command(filepath.Join(bin, "silo"), "daemon", "run", "--system-enabled=false", "--tailscale-enabled=false")
 		cmd.Env = []string{"HOME=" + root, "SILO_HOME=" + filepath.Join(root, "state"), "XDG_CONFIG_HOME=" + filepath.Join(root, "config"), "PATH=" + os.Getenv("PATH"), "SILO_RUNTIME_DIR=" + runtimeDir, "SILO_RUN_ROOT=" + runRoot}
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {

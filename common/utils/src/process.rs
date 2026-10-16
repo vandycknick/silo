@@ -1,6 +1,6 @@
 //! Kernel process birth-time queries shared by native supervisors and controllers.
 //!
-//! Every caller (machine runtime state, netd helper generations, silod status
+//! Every caller (machine runtime state, netd helper generations, daemon status
 //! identity) persists and compares this value, and user-facing surfaces render it
 //! as a date. It is therefore always whole Unix seconds, on every platform.
 use std::io;

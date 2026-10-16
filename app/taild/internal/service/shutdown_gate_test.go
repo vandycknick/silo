@@ -103,7 +103,7 @@ func TestActualSDKCreateInterruptedByMemoryGateWhenMarkerWriteFails(t *testing.T
 	}
 	// Cancellation interrupts the consumer, not an already accepted daemon
 	// image mutation. Observe its durable cache result without starting another
-	// pull; job completion alone does not drain silod.
+	// pull; job completion alone does not drain the daemon.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	poll := time.NewTicker(20 * time.Millisecond)

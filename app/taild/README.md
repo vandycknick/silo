@@ -7,7 +7,7 @@ Authenticated host shutdown is a separate, bounded lifecycle.
 
 ## Managed startup
 
-Taild is an optional same-user child of silod, not a separately installed service.
+Taild is an optional same-user child of the Silo daemon, not a separately installed service.
 Enable it through normal Silo configuration:
 
 ```sh
@@ -20,7 +20,7 @@ flags preserve the selected features. Core readiness does not imply lobby
 readiness: network delay or pending authentication leaves the core API usable,
 and local daemon status reports the component state and any approval URL.
 
-`make build` builds the ordinary runtime assets, CLI, silod, native Go bridge
+`make build` builds the ordinary runtime assets, CLI (including the daemon), native Go bridge
 and adjacent taild together on Linux and macOS. For a helper-only incremental
 build, use `make taild PROFILE=debug`; it ensures the bridge dependency once.
 Neither path assembles or installs a standalone SDK runtime.
@@ -37,7 +37,7 @@ bridge extraction.
 `taild help` and `taild version` are side-effect-free offline diagnostics.
 Offline version reports the expected ABI and explicitly leaves the verified ABI
 unavailable; it neither loads a runtime nor invents a connected daemon. The
-remote version command reports the actual connected silod/protocol and verified
+remote version command reports the actual connected daemon/protocol and verified
 native ABI.
 
 Optional plain Home-scope secrets are `tailscale.lobby.client_secret`,
@@ -53,9 +53,9 @@ not logs. TCP 22 and TLS 443 bind through tsnet, never host listeners or Funnel.
 HTTP health/metrics require fresh WhoIs and own-scope `vm.read`; the OAuth callback
 requires an unexpired one-use nonce.
 
-An unexpected helper exit gets capped restart backoff without restarting silod
+An unexpected helper exit gets capped restart backoff without restarting the daemon
 or stopping VMs. Deterministic bootstrap/configuration failures remain failed
-until reconfiguration/restart. Normal silod shutdown permits bounded helper
+until reconfiguration/restart. Normal daemon shutdown permits bounded helper
 job/session draining within 80 seconds, then reaps it before the 90-second
 service deadline. Unexpected owner-pipe EOF cancels the helper immediately and
 exits within five seconds; it is not a VM-stop request. Old standalone service
@@ -63,14 +63,14 @@ accounts and `/var/lib/silo-taild` state are not imported or modified.
 
 ## Management and guest sessions
 
-Taild uses generated silod gRPC clients for inventory, image resolution,
-creation, lifecycle, policy normalization, secret writes and logs. Silod
+Taild uses generated daemon gRPC clients for inventory, image resolution,
+creation, lifecycle, policy normalization, secret writes and logs. The daemon
 implements those operations through libvm. Management returns owned snapshots
 and immutable IDs, not native handles; an ambiguous transport failure is
 reported for inspection, never replayed through a local fallback.
 
 ```text
-tailnet request -> taild authorization -> silod gRPC -> libvm management
+tailnet request -> taild authorization -> daemon gRPC -> libvm management
                          |
                          +-> exact authorized VM ID
                               -> private Go SDK runtime -> native libvm
@@ -99,7 +99,7 @@ for bounded termination. Cancellation/read failure does not synthesize EOT.
 Input/control contexts stop on shell completion while output keeps its own
 live context until both streams drain, allowing the outer SSH session to send
 exit status. Authorization refresh/revocation and resource accounting apply to
-both paths. No terminal bytes pass through silod, and closing native handles
+both paths. No terminal bytes pass through the daemon, and closing native handles
 does not stop VMs. See the [execution guide](../../runtime/libvm/README.md).
 
 VM enrollment observations come from libvm through `InspectMachine`, not Go
@@ -361,10 +361,10 @@ Ordinary termination seals local admission, closes sessions and drains jobs
 within the parent's bounded cleanup window. SDK Close starts only after sessions
 and jobs drain, and is bounded by the same deadline. Incomplete cleanup is
 reported rather than treated as native completion. Ordinary termination never
-requests VM Stop or Remove; restart reads authoritative libvm state through silod.
+requests VM Stop or Remove; restart reads authoritative libvm state through the daemon.
 
 Linux host shutdown is separate: authenticated logind episodes and the guarded
-`silod --host-shutdown` ExecStop path share run-fenced management stops, actual
+`silo daemon run --host-shutdown` ExecStop path share run-fenced management stops, actual
 server mutation drain and a fresh final inventory. The shutdown-only child
 requires neither SDK assets nor a bridge and never starts a frontend. Cancellation
 retains admission sealing until native work, jobs and helpers settle and fresh
@@ -416,7 +416,7 @@ overrides its policy reference. Labels merge with explicit flags winning;
 labels and projected by `show`; `set policy=NAME` updates the policy reference.
 Description remains template metadata.
 
-Policies are HCL parsed and emitted by libvm through silod's `NormalizePolicy` RPC.
+Policies are HCL parsed and emitted by libvm through the daemon's `NormalizePolicy` RPC.
 User-authored Tailscale declarations and rule tunnel references are prohibited;
 same-VM `tailscale` forwards are the only forwards accepted and require `--tailscale`.
 Production enables the one `Service.VMNodesEnabled` switch.
@@ -465,7 +465,7 @@ go -C app/taild vet ./...
 ```
 
 Daemon fixtures create a private mode-0700 run root under `/tmp` (`/private/tmp`
-on macOS) and pass its absolute path through `SILO_RUN_ROOT` to silod, the CLI
+on macOS) and pass its absolute path through `SILO_RUN_ROOT` to the daemon, the CLI
 and the in-process SDK. They can run alongside the developer's daemon and across
 packages without serialization.
 

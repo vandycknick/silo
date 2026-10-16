@@ -1,4 +1,4 @@
-use crate::control::{ControlState, Service};
+use crate::daemon::control::{ControlState, Service};
 use futures::StreamExt;
 use libvm::HostPaths;
 use silod_spec::daemon::v1 as w;
@@ -27,7 +27,7 @@ impl SocketOwnership {
     pub(crate) fn acquire() -> eyre::Result<Self> {
         let root = HostPaths::run_root()?;
         private_directory(&root)?;
-        Self::acquire_at(root.join("silod"))
+        Self::acquire_at(silod_spec::paths::control_dir(&root))
     }
     pub(super) fn acquire_at(dir: PathBuf) -> eyre::Result<Self> {
         private_directory(&dir)?;
@@ -53,7 +53,7 @@ impl SocketOwnership {
         );
         let lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
             .map_err(|(_, error)| {
-                eyre::eyre!("another silod owns this UID; down and reconfigure its Home: {error}")
+                eyre::eyre!("another daemon owns this UID; down and reconfigure its Home: {error}")
             })?;
         Ok(Self { dir, lock })
     }

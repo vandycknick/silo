@@ -1,69 +1,41 @@
-mod config;
-mod control;
-mod engine;
-mod helper;
-mod paths;
-mod provision;
-mod record;
-mod runtime;
-mod shutdown;
-mod status;
-mod storage;
-mod supervisor;
-mod upgrade;
-
-use clap::Parser;
-use silo_config::{FeatureOverrides, GlobalConfig};
+//! The daemon entrypoint behind `silo daemon run`: argument validation, startup
+//! ordering, and the serve loop that supervises the system VM and the tailscale
+//! helper until it is told to stop.
+use crate::config::{FeatureOverrides, GlobalConfig};
 use silod_spec::arguments::{SystemArgs, SystemOverrides};
+use silod_spec::paths::DaemonPaths;
 
-use crate::config::DesiredSystem;
-use crate::paths::SystemPaths;
-use crate::record::DaemonRecord;
-use crate::supervisor::LifetimeLock;
+use crate::daemon::control;
+use crate::daemon::helper;
+use crate::daemon::record::DaemonRecord;
+use crate::daemon::shutdown;
+use crate::daemon::status;
+use crate::daemon::supervisor::{self, LifetimeLock};
+use crate::daemon::system_config::{self, DesiredSystem};
 
-#[derive(Debug, Parser)]
+#[derive(Debug, clap::Args)]
 #[command(
-    name = "silod",
-    about = "Silo VM-management daemon",
-    version,
-    after_help = "Runs in the foreground. All --system-* resource options apply only to the system appliance; omitted ones use normal configuration or their defaults, except the backend and disk sizes, which keep the installation's values. silod follows the system image reference and upgrades the system VM in place when it changes. State uses the normal Silo Home (SILO_HOME, else ~/.silo). Use `silo daemon` for service management."
+    after_help = "Runs in the foreground. All --system-* resource options apply only to the system appliance; omitted ones use normal configuration or their defaults, except the backend and disk sizes, which keep the installation's values. The daemon follows the system image reference and upgrades the system VM in place when it changes. State uses the normal Silo Home (SILO_HOME, else ~/.silo). Use `silo daemon up` to register it as a service."
 )]
-struct Args {
+pub(crate) struct Run {
     #[command(flatten)]
-    system: SystemArgs,
+    pub(crate) system: SystemArgs,
     /// Override the configured system integration selection for validation.
     #[arg(long, hide = true)]
-    system_enabled: Option<bool>,
+    pub(crate) system_enabled: Option<bool>,
     /// Override the configured Tailscale integration selection for validation.
     #[arg(long, hide = true)]
-    tailscale_enabled: Option<bool>,
-    /// Validate the options against the installation, then exit without changing
-    /// anything.
-    #[arg(long, conflicts_with = "stop")]
-    check: bool,
+    pub(crate) tailscale_enabled: Option<bool>,
     /// Stop the installation's VMs if no daemon is running, then exit.
     #[arg(long)]
-    stop: bool,
+    pub(crate) stop: bool,
     /// Internal Linux user-service ExecStop entrypoint.
-    #[arg(long, hide = true, conflicts_with_all = ["stop", "check"])]
-    host_shutdown: bool,
+    #[arg(long, hide = true, conflicts_with = "stop")]
+    pub(crate) host_shutdown: bool,
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
-    match run(Args::parse()).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            std::process::ExitCode::from(if error.downcast_ref::<ConfigurationError>().is_some() {
-                2
-            } else {
-                1
-            })
-        }
-    }
-}
-
+/// A rejected configuration: restarting the daemon cannot fix it, so the service
+/// manager must not retry (exit code 2).
 #[derive(Debug)]
 struct ConfigurationError(eyre::Report);
 impl std::fmt::Display for ConfigurationError {
@@ -82,19 +54,82 @@ fn configuration<T>(result: eyre::Result<T>) -> eyre::Result<T> {
     })
 }
 
-async fn run(args: Args) -> eyre::Result<()> {
+/// The process exit code for a failed `run`: 2 for a rejected configuration,
+/// 1 for anything a restart might cure.
+pub(crate) fn exit_code(error: &eyre::Report) -> i32 {
+    if error.downcast_ref::<ConfigurationError>().is_some() {
+        2
+    } else {
+        1
+    }
+}
+
+/// Validates what `silo daemon up` would register (the stored overrides plus the
+/// selected features), without creating daemon state or touching the service
+/// locks, so a bad configuration fails before it lands in a unit definition.
+pub(crate) fn validate(host: &libvm::HostPaths, features: FeatureOverrides) -> eyre::Result<()> {
+    let global = configuration(GlobalConfig::load_from(host))?;
+    let paths = DaemonPaths::new(host.home());
+    let overrides = configuration(global.daemon_overrides())?;
+    let features = global.resolve_features(
+        features,
+        configuration(DaemonRecord::load(&paths))?.is_some(),
+    );
+    if features.system {
+        configuration(desired_system(&paths, &overrides))?;
+    }
+    Ok(())
+}
+
+/// Stops any VM of this installation still running with no daemon supervising
+/// it, publishing the outcome like a daemon shutdown would.
+pub(crate) async fn stop_installation() -> eyre::Result<()> {
+    let host = configuration(libvm::HostPaths::from_env().map_err(Into::into))?;
+    let global = configuration(GlobalConfig::load_from(&host))?;
+    let paths = DaemonPaths::new(host.home());
+    let features = global.resolve_features(
+        FeatureOverrides::default(),
+        configuration(DaemonRecord::load(&paths))?.is_some(),
+    );
+    let configuration_identity = configuration(global.daemon_identity(features))?;
+    let host = configuration(crate::config::prepare_host_paths(&host))?;
+    let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
+    let system_status = supervisor::initial_status(&paths.docker_socket())?;
+    let publisher = status::StatusPublisher::new(
+        &host,
+        uuid::Uuid::new_v4(),
+        features,
+        configuration_identity,
+        Some(system_status.clone()),
+    )?;
+    let result = supervisor::stop_installation(&paths, system_status, &publisher).await;
+    publisher.set_core(
+        if result.is_ok() {
+            silod_spec::status::CorePhase::Stopped
+        } else {
+            silod_spec::status::CorePhase::Failed
+        },
+        result.as_ref().err().map(|e| format!("{e:#}")),
+    )?;
+    result
+}
+
+pub(crate) async fn run(args: Run) -> eyre::Result<()> {
     if nix::unistd::geteuid().is_root() {
         return configuration(Err(eyre::eyre!(
-            "silod is a per-user daemon; run without sudo/root"
+            "silo daemon run is a per-user daemon; run without sudo/root"
         )));
     }
     if args.host_shutdown {
         return shutdown::run().await;
     }
+    if args.stop {
+        return stop_installation().await;
+    }
     let host = configuration(libvm::HostPaths::from_env().map_err(Into::into))?;
     // Validate before creating daemon state or service locks.
     let global = configuration(GlobalConfig::load_from(&host))?;
-    let paths = SystemPaths::from_host(&host)?;
+    let paths = DaemonPaths::new(host.home());
     let overrides = merge_system_overrides(
         configuration(global.daemon_overrides())?,
         args.system.into_overrides(),
@@ -106,33 +141,20 @@ async fn run(args: Args) -> eyre::Result<()> {
         },
         configuration(DaemonRecord::load(&paths))?.is_some(),
     );
-    if args.check {
-        return if features.system {
-            configuration(desired_system(&paths, &overrides)).map(drop)
-        } else {
-            Ok(())
-        };
-    }
-    let desired = if features.system && !args.stop {
+    let desired = if features.system {
         Some(configuration(desired_system(&paths, &overrides))?)
     } else {
         None
     };
     let configuration_identity = configuration(global.daemon_identity(features))?;
-    let host = configuration(silo_config::prepare_host_paths(&host))?;
-    let paths = SystemPaths::from_host(&host)?;
+    let host = configuration(crate::config::prepare_host_paths(&host))?;
     let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
-    let socket_ownership = if args.stop {
-        None
-    } else {
-        Some(control::socket::SocketOwnership::acquire()?)
-    };
+    let socket_ownership = control::socket::SocketOwnership::acquire()?;
     let generation = uuid::Uuid::new_v4();
-    let system_status = if features.system || args.stop {
-        Some(supervisor::initial_status(&paths.docker_socket())?)
-    } else {
-        None
-    };
+    let system_status = features
+        .system
+        .then(|| supervisor::initial_status(&paths.docker_socket()))
+        .transpose()?;
     let publisher = std::sync::Arc::new(status::StatusPublisher::new(
         &host,
         generation,
@@ -140,23 +162,6 @@ async fn run(args: Args) -> eyre::Result<()> {
         configuration_identity,
         system_status.clone(),
     )?);
-    if args.stop {
-        let result = supervisor::stop_installation(
-            &paths,
-            system_status.ok_or_else(|| eyre::eyre!("stop has no initial system status"))?,
-            &publisher,
-        )
-        .await;
-        publisher.set_core(
-            if result.is_ok() {
-                silod_spec::status::CorePhase::Stopped
-            } else {
-                silod_spec::status::CorePhase::Failed
-            },
-            result.as_ref().err().map(|e| format!("{e:#}")),
-        )?;
-        return result;
-    }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let helper_config = global.tailscale().clone();
@@ -167,10 +172,7 @@ async fn run(args: Args) -> eyre::Result<()> {
         generation,
         publisher.clone(),
     ));
-    let server = match socket_ownership
-        .ok_or_else(|| eyre::eyre!("daemon control ownership unavailable"))?
-        .bind(state.clone())
-    {
+    let server = match socket_ownership.bind(state.clone()) {
         Ok(server) => server,
         Err(error) => {
             publisher.set_core(
@@ -305,16 +307,16 @@ async fn run(args: Args) -> eyre::Result<()> {
     result
 }
 
-fn desired_system(paths: &SystemPaths, overrides: &SystemOverrides) -> eyre::Result<DesiredSystem> {
+fn desired_system(paths: &DaemonPaths, overrides: &SystemOverrides) -> eyre::Result<DesiredSystem> {
     let installation = DaemonRecord::load(paths)?;
-    let desired = config::resolve(
+    let desired = system_config::resolve(
         overrides,
         &user_home()?,
         &paths.docker_socket(),
         installation.as_ref(),
     )?;
     if let Some(installation) = &installation {
-        provision::validate_installation(installation, &desired.config)?;
+        crate::daemon::provision::validate_installation(installation, &desired.config)?;
     }
     Ok(desired)
 }
@@ -342,47 +344,50 @@ fn user_home() -> eyre::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use crate::Args;
     use clap::Parser as _;
+
+    use crate::app::Cli;
+    use crate::commands::daemon::DaemonCommand;
+    use crate::commands::Command;
+    use crate::daemon::serve::{configuration, merge_system_overrides, ConfigurationError, Run};
+
+    fn parse<const N: usize>(args: [&str; N]) -> Result<Run, clap::Error> {
+        let argv = ["silo", "daemon", "run"].into_iter().chain(args);
+        let cli = Cli::try_parse_from(argv)?;
+        match cli.command {
+            Command::Daemon(daemon) => match daemon.command {
+                DaemonCommand::Run(run) => Ok(run),
+                other => panic!("parsed {other:?} instead of daemon run"),
+            },
+            other => panic!("parsed {other:?} instead of daemon run"),
+        }
+    }
 
     #[test]
     fn defaults_require_no_state_or_home_argument() {
-        let defaults = Args::try_parse_from(["silod"]).expect("defaults");
-        assert!(!defaults.check);
+        let defaults = parse([]).expect("defaults");
         assert!(!defaults.stop);
-        assert!(Args::try_parse_from(["silod", "--check", "--stop"]).is_err());
+        assert!(!defaults.host_shutdown);
         assert_eq!(
             defaults.system.into_overrides(),
             silod_spec::arguments::SystemOverrides::default()
         );
-        for flag in ["--state", "--home"] {
-            assert!(Args::try_parse_from(["silod", flag, "/tmp/unused"]).is_err());
-        }
-    }
-    #[test]
-    fn host_shutdown_is_explicit_and_not_ordinary_stop() {
-        let args = Args::try_parse_from(["silod", "--host-shutdown"]).unwrap();
-        assert!(args.host_shutdown);
-        assert!(!args.stop);
-        for flag in ["--stop", "--check"] {
-            assert!(Args::try_parse_from(["silod", "--host-shutdown", flag]).is_err());
+        for flag in ["--state", "--home", "--check"] {
+            assert!(parse([flag, "/tmp/unused"]).is_err());
         }
     }
 
     #[test]
-    fn daemon_has_no_management_subcommands() {
-        for command in [
-            "service", "system", "start", "stop", "upgrade", "daemon", "serve",
-        ] {
-            assert!(Args::try_parse_from(["silod", command]).is_err());
-        }
+    fn host_shutdown_is_explicit_and_not_ordinary_stop() {
+        let args = parse(["--host-shutdown"]).expect("host shutdown");
+        assert!(args.host_shutdown);
+        assert!(!args.stop);
+        assert!(parse(["--host-shutdown", "--stop"]).is_err());
     }
 
     #[test]
     fn only_explicit_system_overrides_are_set() {
-        let args =
-            Args::try_parse_from(["silod", "--system-cpus", "10", "--system-rosetta", "false"])
-                .expect("options");
+        let args = parse(["--system-cpus", "10", "--system-rosetta", "false"]).expect("options");
         let overrides = args.system.into_overrides();
         assert_eq!(overrides.cpus, Some(10));
         assert_eq!(overrides.rosetta, Some(false));
@@ -408,7 +413,7 @@ mod tests {
             additional_shares: Some(vec![]),
             ..Default::default()
         };
-        let merged = crate::merge_system_overrides(stored, explicit);
+        let merged = merge_system_overrides(stored, explicit);
         assert_eq!(merged.cpus, Some(2));
         assert_eq!(merged.memory.as_deref(), Some("12GiB"));
         assert_eq!(merged.rosetta, Some(false));
@@ -417,25 +422,23 @@ mod tests {
 
     #[test]
     fn feature_overrides_are_separate_from_system_resource_arguments() {
-        let args = Args::try_parse_from([
-            "silod",
-            "--check",
-            "--system-enabled=false",
-            "--tailscale-enabled=true",
-        ])
-        .expect("feature options");
+        let args =
+            parse(["--system-enabled=false", "--tailscale-enabled=true"]).expect("feature options");
         assert_eq!(args.system_enabled, Some(false));
         assert_eq!(args.tailscale_enabled, Some(true));
         assert_eq!(args.system.into_overrides(), Default::default());
     }
+
     #[test]
     fn operational_io_failures_remain_restartable() {
         let io = eyre::Report::from(std::io::Error::from_raw_os_error(nix::libc::ENOSPC))
             .wrap_err("preparing the selected Home");
-        let error = crate::configuration::<()>(Err(io)).expect_err("operational failure");
-        assert!(error.downcast_ref::<crate::ConfigurationError>().is_none());
-        let error = crate::configuration::<()>(Err(eyre::eyre!("unsafe root")))
+        let error = configuration::<()>(Err(io)).expect_err("operational failure");
+        assert!(error.downcast_ref::<ConfigurationError>().is_none());
+        assert_eq!(crate::daemon::serve::exit_code(&error), 1);
+        let error = configuration::<()>(Err(eyre::eyre!("unsafe root")))
             .expect_err("invalid configuration");
-        assert!(error.downcast_ref::<crate::ConfigurationError>().is_some());
+        assert!(error.downcast_ref::<ConfigurationError>().is_some());
+        assert_eq!(crate::daemon::serve::exit_code(&error), 2);
     }
 }

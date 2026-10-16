@@ -28,19 +28,19 @@ profile; use the corresponding pytest options to override them.
 
 | Environment | pytest option | Default / meaning |
 | --- | --- | --- |
-| `SILO_SMOKE_BIN_DIR` | `--silo-bin-dir` | `<repo>/target/debug`; must contain silo and silod |
+| `SILO_SMOKE_BIN_DIR` | `--silo-bin-dir` | `<repo>/target/debug`; must contain silo |
 | `SILO_SMOKE_RUNTIME_DIR` | `--silo-runtime-dir` | `<repo>/target/silo-runtime/<host-target>/debug` |
 | `SILO_SMOKE_BACKEND` | `--backend krun\|vz` | `krun`; `vz` requires macOS |
 | `SILO_SMOKE_CACHE` | `--cache-dir` | `${XDG_CACHE_HOME:-~/.cache}/silo-smoke` |
 | `SILO_SMOKE_KEEP` | `--keep` | `1` retains workspaces even on success |
-| `SILO_SMOKE_SYSTEM_IMAGE` | none | Appliance OCI reference; defaults to `ghcr.io/vandycknick/silo/system:dev` (the silod dev default); set it empty to skip system tests |
+| `SILO_SMOKE_SYSTEM_IMAGE` | none | Appliance OCI reference; defaults to `ghcr.io/vandycknick/silo/system:dev` (the daemon dev default); set it empty to skip system tests |
 | `SILO_SMOKE_DISTRO_IMAGES` | none | `label=oci-ref` list for the SSH distro lane; defaults to `arch=ghcr.io/vandycknick/archlinux:latest,system=<system image>`; set it empty to skip |
 | `SILO_SMOKE_SYSTEMD_IMAGE` | none | Optional Phase F systemd image with vsock SSH socket activation |
 | `SILO_SMOKE_CURL_IMAGE` | none | Optional Phase F image containing curl for live secret-provider tests |
 
 Host targets are `linux-amd64-gnu`, `linux-arm64-gnu` and `darwin-arm64`.
 
-Markers: `daemon` starts a private silod; `system` needs the appliance image;
+Markers: `daemon` starts a private daemon; `system` needs the appliance image;
 `sdk` runs Go/Node examples; `linux_only` and `macos_only` select host-specific
 checks. Phase F also uses `slow` for long-running checks and `live` for
 internet-dependent tests. Live tests require explicit selection with `-m live`.

@@ -41,7 +41,7 @@ func canonical(path string) (string, error) {
 func run() error {
 	endpoint := flag.String("endpoint", "", "running manager's same-user Unix socket")
 	home := flag.String("home", "", "manager's canonical fresh Home")
-	bridge := flag.String("bridge", "", "explicit product bridge adjacent to silod")
+	bridge := flag.String("bridge", "", "explicit product bridge adjacent to silo")
 	configDir := flag.String("config-dir", "", "manager's canonical configuration directory")
 	root := flag.String("components-root", "", "portable root or Silo.app for exact component admission")
 	inspect := flag.Bool("inspect", false, "admit manager/components/native SDK and print JSON; no VM")

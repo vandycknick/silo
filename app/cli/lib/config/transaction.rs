@@ -1,4 +1,4 @@
-use crate::{parse_global_config, GlobalConfig};
+use crate::config::{parse_global_config, GlobalConfig};
 use eyre::Context as _;
 use nix::fcntl::{Flock, FlockArg, OFlag};
 use serde_yaml_ng::{Mapping, Value};

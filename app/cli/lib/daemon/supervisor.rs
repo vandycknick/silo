@@ -15,7 +15,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::status::StatusPublisher;
+use crate::daemon::status::StatusPublisher;
 use eyre::{bail, Context as _};
 use libvm::{
     MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification, MachineMemoryReclaimReport,
@@ -27,22 +27,22 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{DesiredSystem, SystemBackend};
-use crate::engine::{
+use crate::daemon::engine::{
     activate, ensure_docker_socket_parent, probe_docker_socket, stop_engine, wait_docker_socket,
     ENGINE_REACHABLE_TIMEOUT, READY_TIMEOUT,
 };
-use crate::paths::SystemPaths;
-use crate::provision::ensure_system_machine;
-use crate::record::DaemonRecord;
-use crate::runtime::{SystemMachine, SystemRuntime};
+use crate::daemon::provision::ensure_system_machine;
+use crate::daemon::record::DaemonRecord;
+use crate::daemon::runtime::{SystemMachine, SystemRuntime};
+use crate::daemon::system_config::{DesiredSystem, SystemBackend};
+use silod_spec::paths::DaemonPaths;
 
 /// Engine health probe cadence.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 /// Supervisor tick: refreshes status from silo-vmm metrics (the guest agent reports
 /// every 5 seconds) and, every `HEALTH_INTERVAL`, probes the Docker socket.
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
-/// How often silod asks the registry whether the configured image moved. The first
+/// How often the daemon asks the registry whether the configured image moved. The first
 /// check follows the first Ready so a changed image applies promptly.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -128,9 +128,9 @@ pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<SystemStatus>
     })
 }
 
-/// Reports a failure that ends this silod process.
+/// Reports a failure that ends this daemon process.
 pub(crate) fn publish_failure(
-    paths: &SystemPaths,
+    paths: &DaemonPaths,
     publisher: &StatusPublisher,
     status: &mut SystemStatus,
     error: &eyre::Report,
@@ -142,7 +142,7 @@ pub(crate) fn publish_failure(
 }
 
 struct Supervisor {
-    paths: SystemPaths,
+    paths: DaemonPaths,
     publisher: Arc<StatusPublisher>,
     desired: DesiredSystem,
     runtime_config: libvm::RuntimeConfig,
@@ -150,14 +150,14 @@ struct Supervisor {
     runtime: Option<SystemRuntime>,
     status: SystemStatus,
     /// Manifests that failed qualification, validation, or their first boot in this
-    /// process. Not retried until silod restarts.
+    /// process. Not retried until the daemon restarts.
     rejected: BTreeSet<String>,
     next_update_check: Instant,
 }
 
 /// Runs until the daemon owner requests detachment. The caller holds the lifetime lock.
 pub(crate) async fn serve(
-    paths: SystemPaths,
+    paths: DaemonPaths,
     desired: DesiredSystem,
     mut status: SystemStatus,
     cancellation: CancellationToken,
@@ -267,7 +267,7 @@ impl Supervisor {
     /// A committed upgrade becomes permanent once its VM reached Ready.
     async fn after_ready(&mut self) -> eyre::Result<()> {
         let runtime = connected(&mut self.runtime)?;
-        if let Err(error) = crate::upgrade::finalize(runtime, &self.paths).await {
+        if let Err(error) = crate::daemon::upgrade::finalize(runtime, &self.paths).await {
             append_log(
                 &self.paths,
                 &format!("could not finalize the system image upgrade: {error:#}"),
@@ -303,7 +303,7 @@ impl Supervisor {
             &self.paths,
             "the upgraded system VM did not become ready; rolling back",
         )?;
-        crate::upgrade::recover(runtime, &self.paths).await
+        crate::daemon::upgrade::recover(runtime, &self.paths).await
     }
 
     async fn supervise(&mut self, active: &Active, shutdown: &mut Shutdown) -> eyre::Result<Next> {
@@ -381,7 +381,7 @@ impl Supervisor {
         let runtime = connected(&mut self.runtime)?;
         let checked = async {
             let current = runtime.inspect_machine(&active.machine_id).await?;
-            crate::upgrade::check(runtime, &self.desired.image, &current).await
+            crate::daemon::upgrade::check(runtime, &self.desired.image, &current).await
         }
         .await;
         self.status.update_checked_at = Some(now());
@@ -403,7 +403,7 @@ impl Supervisor {
         // An upgrade record still present here belongs to an earlier upgrade whose
         // cleanup failed. Finish it first, so a failure below can only ever roll
         // back the upgrade this call starts.
-        if let Err(error) = crate::upgrade::finalize(runtime, &self.paths).await {
+        if let Err(error) = crate::daemon::upgrade::finalize(runtime, &self.paths).await {
             return self
                 .update_failed(None, "could not finalize the previous upgrade", &error)
                 .map(|()| UpdateOutcome::Unchanged);
@@ -413,8 +413,7 @@ impl Supervisor {
             &format!("qualifying system image {}", image.selected_reference),
         )?;
         let qualified = {
-            let qualify =
-                crate::upgrade::qualify(runtime, &self.paths, &self.desired, image.clone());
+            let qualify = crate::daemon::upgrade::qualify(runtime, &self.desired, image.clone());
             tokio::pin!(qualify);
             tokio::select! {
                 result = &mut qualify => Some(result),
@@ -426,7 +425,7 @@ impl Supervisor {
                 // Best effort: the next
                 // start removes whatever is left.
                 if let Err(error) =
-                    crate::upgrade::remove_abandoned_qualifications(runtime, &self.paths).await
+                    crate::daemon::upgrade::remove_abandoned_qualifications(runtime).await
                 {
                     append_log(
                         &self.paths,
@@ -460,7 +459,7 @@ impl Supervisor {
             return Ok(UpdateOutcome::Restart);
         }
         let runtime = connected(&mut self.runtime)?;
-        match crate::upgrade::replace(runtime, &self.paths, &self.desired, image).await {
+        match crate::daemon::upgrade::replace(runtime, &self.paths, &self.desired, image).await {
             Ok(()) => {
                 append_log(&self.paths, "system VM upgraded; starting it")?;
                 Ok(UpdateOutcome::Restart)
@@ -470,7 +469,7 @@ impl Supervisor {
                 // Nothing to restore when it failed before recording the transaction.
                 if DaemonRecord::load(&self.paths)?.is_some_and(|record| record.upgrade.is_some()) {
                     let runtime = connected(&mut self.runtime)?;
-                    crate::upgrade::recover(runtime, &self.paths)
+                    crate::daemon::upgrade::recover(runtime, &self.paths)
                         .await
                         .context("restore the system VM after a failed upgrade")?;
                     append_log(&self.paths, "restored the previous system VM")?;
@@ -496,7 +495,7 @@ impl Supervisor {
 
     fn detach(&mut self) -> eyre::Result<()> {
         // Restarting the management process is not a request to stop the VM.
-        // `silo daemon stop` separately invokes silod --stop after service exit.
+        // `silo daemon down` separately stops the installation after service exit.
         self.status.phase = SystemPhase::Stopped;
         publish(&self.publisher, &mut self.status)?;
         append_log(&self.paths, "system daemon detached; VM remains running")
@@ -507,7 +506,7 @@ impl Supervisor {
 /// process has detached. Ordinary daemon restarts do not call this operation.
 /// The caller holds the lifetime lock.
 pub(crate) async fn stop_installation(
-    paths: &SystemPaths,
+    paths: &DaemonPaths,
     mut status: SystemStatus,
     publisher: &StatusPublisher,
 ) -> eyre::Result<()> {
@@ -515,10 +514,10 @@ pub(crate) async fn stop_installation(
         let config = libvm::RuntimeConfig::local(paths.home())
             .with_virt_backend(record.config.backend.runtime_override());
         let mut runtime = SystemRuntime::connect(config).await?;
-        crate::upgrade::remove_abandoned_qualifications(&mut runtime, paths).await?;
+        crate::daemon::upgrade::remove_abandoned_qualifications(&mut runtime).await?;
         for machine in runtime.list_machines().await? {
-            if !crate::provision::is_installation_machine(&machine, record.installation_id)
-                || !crate::provision::is_live(&machine)
+            if !crate::daemon::provision::is_installation_machine(&machine, record.installation_id)
+                || !crate::daemon::provision::is_live(&machine)
             {
                 continue;
             }
@@ -542,7 +541,7 @@ fn connected(runtime: &mut Option<SystemRuntime>) -> eyre::Result<&mut SystemRun
 async fn attempt(
     runtime: &mut Option<SystemRuntime>,
     runtime_config: &libvm::RuntimeConfig,
-    paths: &SystemPaths,
+    paths: &DaemonPaths,
     desired: &DesiredSystem,
     status: &mut SystemStatus,
     publisher: &StatusPublisher,
@@ -551,13 +550,13 @@ async fn attempt(
         *runtime = Some(SystemRuntime::connect(runtime_config.clone()).await?);
     }
     let runtime = connected(runtime)?;
-    crate::upgrade::remove_abandoned_qualifications(runtime, paths).await?;
+    crate::daemon::upgrade::remove_abandoned_qualifications(runtime).await?;
     if DaemonRecord::load(paths)?
         .and_then(|record| record.upgrade)
         .is_some_and(|upgrade| !upgrade.complete)
     {
         append_log(paths, "recovering an interrupted system image upgrade")?;
-        crate::upgrade::recover(runtime, paths).await?;
+        crate::daemon::upgrade::recover(runtime, paths).await?;
     }
     status.phase = SystemPhase::Creating;
     publish(publisher, status)?;
@@ -738,7 +737,7 @@ fn startup_retry_delay(failed_attempts: u32) -> Duration {
     BASE.saturating_mul(1 << exponent).min(MAX)
 }
 
-pub(crate) fn append_log(paths: &SystemPaths, message: &str) -> eyre::Result<()> {
+pub(crate) fn append_log(paths: &DaemonPaths, message: &str) -> eyre::Result<()> {
     let path = paths.log();
     libvm::HostPaths::ensure_log_dir(paths.home(), "daemon")?;
     if std::fs::metadata(&path)
@@ -767,7 +766,7 @@ mod tests {
 
     use silod_spec::status::{MemoryReclaimOutcome, SystemStatus};
 
-    use crate::supervisor::{
+    use crate::daemon::supervisor::{
         apply_guest_memory_reclaim, describe_guest_memory_reclaim, error_causes, error_summary,
         initial_host_memory_reclaim_effective, startup_retry_delay, LifetimeLock,
     };
@@ -775,25 +774,25 @@ mod tests {
     #[test]
     fn manager_detach_preserves_the_vm_generation_without_a_runtime() {
         let temp = tempfile::tempdir().expect("temp");
-        let paths =
-            crate::paths::SystemPaths::new(temp.path().join("home"), temp.path().join("run"));
-        let desired = crate::config::resolve(
+        let paths = silod_spec::paths::DaemonPaths::new(temp.path().join("home"));
+        let desired = crate::daemon::system_config::resolve(
             &silod_spec::arguments::SystemOverrides::default(),
             temp.path(),
             &paths.docker_socket(),
             None,
         )
         .expect("config");
-        let mut status = crate::supervisor::initial_status(&paths.docker_socket()).expect("status");
+        let mut status =
+            crate::daemon::supervisor::initial_status(&paths.docker_socket()).expect("status");
         status.machine_id = Some("existing-vm".into());
         status.run_id = Some("existing-run".into());
         let host = libvm::HostPaths::new(paths.home().to_path_buf(), temp.path().join("config"));
-        let features = silo_config::FeatureSelection {
+        let features = crate::config::FeatureSelection {
             system: true,
             tailscale: false,
         };
         let publisher = std::sync::Arc::new(
-            crate::status::StatusPublisher::new(
+            crate::daemon::status::StatusPublisher::new(
                 &host,
                 uuid::Uuid::new_v4(),
                 features,
@@ -802,7 +801,7 @@ mod tests {
             )
             .expect("publisher"),
         );
-        let mut supervisor = crate::supervisor::Supervisor {
+        let mut supervisor = crate::daemon::supervisor::Supervisor {
             runtime_config: libvm::RuntimeConfig::local(paths.home()),
             paths,
             publisher,

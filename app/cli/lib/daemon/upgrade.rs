@@ -1,4 +1,4 @@
-//! In-place system image upgrades, owned entirely by the running silod.
+//! In-place system image upgrades, owned entirely by the running daemon.
 //!
 //! ```text
 //!  check ──► qualify (throwaway VM, engine keeps serving)
@@ -24,14 +24,16 @@ use libvm::{ExecutionResult, ImagePullPolicy, MachineData, MachineReadinessOutco
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::{DesiredSystem, ResolvedSystemConfig};
-use crate::engine::READY_TIMEOUT;
-use crate::paths::SystemPaths;
-use crate::provision::{is_installation_machine, is_live, validate_installation, validate_machine};
-use crate::record::DaemonRecord;
-use crate::runtime::SystemRuntime;
-use crate::storage::validate_data_image;
-use crate::supervisor::append_log;
+use crate::daemon::engine::READY_TIMEOUT;
+use crate::daemon::provision::{
+    is_installation_machine, is_live, validate_installation, validate_machine,
+};
+use crate::daemon::record::DaemonRecord;
+use crate::daemon::runtime::SystemRuntime;
+use crate::daemon::storage::validate_data_image;
+use crate::daemon::supervisor::append_log;
+use crate::daemon::system_config::{DesiredSystem, ResolvedSystemConfig};
+use silod_spec::paths::DaemonPaths;
 
 const QUALIFICATION_PREFIX: &str = "silo-system-qualification-";
 
@@ -84,7 +86,7 @@ impl UpgradeRecord {
         format!("silo-system-upgrade-{}", self.operation_id.simple())
     }
 
-    fn backup_path(&self, paths: &SystemPaths) -> PathBuf {
+    fn backup_path(&self, paths: &DaemonPaths) -> PathBuf {
         paths
             .backups()
             .join(format!("data-{}.img", self.operation_id))
@@ -123,7 +125,6 @@ pub(crate) async fn check(
 /// [`remove_abandoned_qualifications`] reclaims it.
 pub(crate) async fn qualify(
     runtime: &mut SystemRuntime,
-    paths: &SystemPaths,
     desired: &DesiredSystem,
     image: libvm::ResolvedOciImage,
 ) -> eyre::Result<()> {
@@ -131,7 +132,7 @@ pub(crate) async fn qualify(
         image: image.selected_reference.clone(),
         ..desired.config.clone()
     };
-    qualify_candidate_image(runtime, paths, &config, image).await
+    qualify_candidate_image(runtime, &config, image).await
 }
 
 /// Replaces the stopped active VM with one built from `image`, committing only once
@@ -139,7 +140,7 @@ pub(crate) async fn qualify(
 /// [`recover`].
 pub(crate) async fn replace(
     runtime: &mut SystemRuntime,
-    paths: &SystemPaths,
+    paths: &DaemonPaths,
     desired: &DesiredSystem,
     image: libvm::ResolvedOciImage,
 ) -> eyre::Result<()> {
@@ -215,7 +216,7 @@ pub(crate) async fn replace(
 
 /// Makes a committed upgrade permanent: removes the previous VM and the data backup.
 /// Without a committed upgrade this does nothing.
-pub(crate) async fn finalize(runtime: &mut SystemRuntime, paths: &SystemPaths) -> eyre::Result<()> {
+pub(crate) async fn finalize(runtime: &mut SystemRuntime, paths: &DaemonPaths) -> eyre::Result<()> {
     let Some(mut state) = DaemonRecord::load(paths)? else {
         return Ok(());
     };
@@ -245,7 +246,7 @@ pub(crate) async fn finalize(runtime: &mut SystemRuntime, paths: &SystemPaths) -
 
 /// Restores the VM, configuration, and engine data from before the recorded
 /// upgrade, whether it was interrupted or committed but never became Ready.
-pub(crate) async fn recover(runtime: &mut SystemRuntime, paths: &SystemPaths) -> eyre::Result<()> {
+pub(crate) async fn recover(runtime: &mut SystemRuntime, paths: &DaemonPaths) -> eyre::Result<()> {
     let state = DaemonRecord::load(paths)?
         .ok_or_else(|| eyre::eyre!("the system installation record is missing"))?;
     let record = state
@@ -329,7 +330,6 @@ fn remove_backup(path: &Path) -> eyre::Result<()> {
 /// crashed qualification.
 pub(crate) async fn remove_abandoned_qualifications(
     runtime: &mut SystemRuntime,
-    paths: &SystemPaths,
 ) -> eyre::Result<()> {
     for machine in runtime.list_machines().await? {
         if machine.name.starts_with(QUALIFICATION_PREFIX)
@@ -339,7 +339,7 @@ pub(crate) async fn remove_abandoned_qualifications(
             runtime.remove_machine(&machine.id).await?;
         }
     }
-    let entries = match std::fs::read_dir(paths.run_root()) {
+    let entries = match std::fs::read_dir(libvm::HostPaths::run_root()?) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -359,13 +359,13 @@ pub(crate) async fn remove_abandoned_qualifications(
 
 async fn qualify_candidate_image(
     runtime: &mut SystemRuntime,
-    paths: &SystemPaths,
     config: &ResolvedSystemConfig,
     image: libvm::ResolvedOciImage,
 ) -> eyre::Result<()> {
-    std::fs::create_dir_all(paths.run_root())?;
+    let run_root = libvm::HostPaths::run_root()?;
+    std::fs::create_dir_all(&run_root)?;
     let installation_id = Uuid::new_v4();
-    let temporary = paths.run_root().join(format!(
+    let temporary = run_root.join(format!(
         "upgrade-qualification-{}",
         installation_id.simple()
     ));
@@ -377,7 +377,12 @@ async fn qualify_candidate_image(
     }
     let data_uuid = Uuid::new_v4();
     let data_image = temporary.join("data.img");
-    crate::storage::ensure_data_image(&data_image, 512 * 1024 * 1024, installation_id, data_uuid)?;
+    crate::daemon::storage::ensure_data_image(
+        &data_image,
+        512 * 1024 * 1024,
+        installation_id,
+        data_uuid,
+    )?;
     let mut qualification_config = config.clone();
     qualification_config.docker_socket = temporary.join("docker.sock");
     let name = format!("{QUALIFICATION_PREFIX}{}", installation_id.simple());
@@ -454,18 +459,20 @@ async fn validate_candidate(
             );
         }
         validate_guest_manifest(&machine).await?;
-        crate::engine::activate(&machine, config, &machine_data.spec, data_uuid).await?;
-        crate::engine::wait_docker_socket(&config.docker_socket, READY_TIMEOUT).await
+        crate::daemon::engine::activate(&machine, config, &machine_data.spec, data_uuid).await?;
+        crate::daemon::engine::wait_docker_socket(&config.docker_socket, READY_TIMEOUT).await
     }
     .await;
-    crate::engine::stop_engine(&machine).await;
+    crate::daemon::engine::stop_engine(&machine).await;
     let stopped = machine.stop_run(run_id).await;
     validation?;
     stopped?;
     Ok(())
 }
 
-async fn validate_guest_manifest(machine: &crate::runtime::SystemMachine) -> eyre::Result<()> {
+async fn validate_guest_manifest(
+    machine: &crate::daemon::runtime::SystemMachine,
+) -> eyre::Result<()> {
     let output = machine
         .exec_with_input(
             "/usr/bin/cat",
@@ -599,9 +606,9 @@ fn restore_backup(backup: &Path, data: &Path) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::record::tests::fixture;
-    use crate::record::DaemonRecord;
-    use crate::upgrade::{restore_backup, sparse_copy, UpgradeRecord};
+    use crate::daemon::record::tests::fixture;
+    use crate::daemon::record::DaemonRecord;
+    use crate::daemon::upgrade::{restore_backup, sparse_copy, UpgradeRecord};
 
     #[test]
     fn upgrade_recovery_is_committed_with_the_active_vm_reference() {

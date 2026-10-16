@@ -1,4 +1,4 @@
-use crate::control::{conversion, native, reference, required, Service, Stream};
+use crate::daemon::control::{conversion, native, reference, required, Service, Stream};
 use silo_vm_control::{network, updates};
 use silod_spec::daemon::v1 as w;
 use tonic::Response;

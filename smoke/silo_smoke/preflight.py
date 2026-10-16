@@ -55,10 +55,9 @@ def _macos_checks(config: SmokeConfig) -> None:
 
 def check(config: SmokeConfig) -> LiveDaemonMark | None:
     if os.geteuid() == 0:
-        raise SmokeEnvironmentError("Run smoke as a non-root user: silod refuses root")
-    for binary in (config.silo, config.silod):
-        if not binary.is_file() or not os.access(binary, os.X_OK):
-            raise SmokeEnvironmentError(f"Missing executable {binary}; run make stage first")
+        raise SmokeEnvironmentError("Run smoke as a non-root user: the daemon refuses root")
+    if not config.silo.is_file() or not os.access(config.silo, os.X_OK):
+        raise SmokeEnvironmentError(f"Missing executable {config.silo}; run make stage first")
     for relative in ("bin/silo-vmm", "bin/netd", "assets/kernel-default", "assets/initramfs", "assets/agent"):
         path = config.runtime_dir / relative
         if not path.is_file():

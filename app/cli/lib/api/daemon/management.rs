@@ -379,11 +379,11 @@ impl DaemonVmService {
         while let Some(event) = stream.message().await.map_err(native_status)? {
             eyre::ensure!(
                 terminal.is_none(),
-                "silod image stream continued after terminal image"
+                "daemon image stream continued after terminal image"
             );
             match event
                 .event
-                .ok_or_else(|| eyre::eyre!("silod image stream omitted event"))?
+                .ok_or_else(|| eyre::eyre!("daemon image stream omitted event"))?
             {
                 w::resolve_image_event::Event::Progress(value) => {
                     progress.send(images::progress_from_wire(value)?)
@@ -394,7 +394,7 @@ impl DaemonVmService {
             }
         }
         let image = terminal
-            .ok_or_else(|| eyre::eyre!("silod image stream ended without resolved image"))?;
+            .ok_or_else(|| eyre::eyre!("daemon image stream ended without resolved image"))?;
         let identity = &image.identity;
         let plan_image = ResolvedImage::Oci {
             identity: planning::OciImageIdentity {
@@ -458,11 +458,11 @@ impl DaemonVmService {
         while let Some(event) = stream.message().await.map_err(native_status)? {
             eyre::ensure!(
                 terminal.is_none(),
-                "silod create stream continued after terminal machine"
+                "daemon create stream continued after terminal machine"
             );
             match event
                 .event
-                .ok_or_else(|| eyre::eyre!("silod create stream omitted event"))?
+                .ok_or_else(|| eyre::eyre!("daemon create stream omitted event"))?
             {
                 w::create_machine_event::Event::Progress(value) => {
                     progress.send(images::progress_from_wire(value)?)
@@ -474,7 +474,7 @@ impl DaemonVmService {
         }
         terminal.ok_or_else(|| {
             eyre::eyre!(
-                "silod create stream ended without terminal machine; inspect state before retrying"
+                "daemon create stream ended without terminal machine; inspect state before retrying"
             )
         })
     }

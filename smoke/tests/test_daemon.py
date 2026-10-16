@@ -9,7 +9,7 @@ from uuid import UUID
 import pytest
 
 from silo_smoke.cli import Silo
-from silo_smoke.daemon import Silod
+from silo_smoke.daemon import Daemon
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
@@ -17,7 +17,7 @@ pytestmark = pytest.mark.daemon
 
 
 def test_daemon_ready_status_and_cli_routing(
-    daemon: Silod, silo: Silo, workspace: Workspace, registry: LoopbackRegistry,
+    daemon: Daemon, silo: Silo, workspace: Workspace, registry: LoopbackRegistry,
 ) -> None:
     daemon.start()
     status = daemon.wait_core("ready")
@@ -33,12 +33,12 @@ def test_daemon_ready_status_and_cli_routing(
     routed = silo.json("daemon", "status")
     assert routed["state"] == "ready"
     assert routed["daemon"]["generation"] == status["generation"]
-    second = Silod(workspace)
+    second = Daemon(workspace)
     started = time.monotonic()
-    proc = second.start_raw("--system-enabled=false", "--tailscale-enabled=false", label="second-silod")
+    proc = second.start_raw("--system-enabled=false", "--tailscale-enabled=false", label="second-daemon")
     assert proc.wait(timeout=10) == 1
     assert time.monotonic() - started < 10
-    assert "another Silo system daemon owns this installation" in workspace.evidence_path("second-silod-1").read_text()
+    assert "another Silo system daemon owns this installation" in workspace.evidence_path("second-daemon-1").read_text()
     requests = registry.requests
     assert silo.ls() == []
     assert registry.requests == requests
@@ -50,7 +50,7 @@ def test_daemon_ready_status_and_cli_routing(
 
 
 def test_daemon_managed_vm_lifecycle(
-    daemon: Silod, silo: Silo, workspace: Workspace,
+    daemon: Daemon, silo: Silo, workspace: Workspace,
     basic_image: str, registry: LoopbackRegistry,
 ) -> None:
     daemon.start()
@@ -98,7 +98,7 @@ def test_daemon_managed_vm_lifecycle(
 
 
 def test_cli_with_other_home_fails_closed(
-    daemon: Silod, silo: Silo, workspace: Workspace, basic_image: str,
+    daemon: Daemon, silo: Silo, workspace: Workspace, basic_image: str,
 ) -> None:
     daemon.start()
     daemon.wait_core("ready")
@@ -107,13 +107,13 @@ def test_cli_with_other_home_fails_closed(
     env = workspace.env(SILO_HOME=str(other))
     result = silo.run("ls", env=env, expect=1)
     assert result.returncode == 1
-    assert "silod is bound to another Home/config root" in result.stderr
+    assert "the daemon is bound to another Home/config root" in result.stderr
     dry_run = silo.run("create", basic_image, "--dry-run", "--format", "json", env=env)
     assert dry_run.returncode == 0
 
 
 def test_daemon_managed_disk_create_update_remove(
-    daemon: Silod, silo: Silo, workspace: Workspace, basic_image: str,
+    daemon: Daemon, silo: Silo, workspace: Workspace, basic_image: str,
 ) -> None:
     daemon.start()
     daemon.wait_core("ready")

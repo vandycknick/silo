@@ -6,13 +6,13 @@ use eyre::{bail, Context as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::ResolvedSystemConfig;
-use crate::paths::SystemPaths;
+use crate::daemon::system_config::ResolvedSystemConfig;
+use silod_spec::paths::DaemonPaths;
 
 const MAX_RECORD_BYTES: u64 = 256 * 1024;
 
 /// The installation record. Strict, unlike the published status: an unknown field
-/// means a different silod wrote it, and guessing could orphan engine data.
+/// means a different daemon wrote it, and guessing could orphan engine data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonRecord {
@@ -25,7 +25,7 @@ pub(crate) struct DaemonRecord {
     pub(crate) configured_image: String,
     pub(crate) config: ResolvedSystemConfig,
     pub(crate) machine_id: Option<String>,
-    pub(crate) upgrade: Option<crate::upgrade::UpgradeRecord>,
+    pub(crate) upgrade: Option<crate::daemon::upgrade::UpgradeRecord>,
 }
 
 impl DaemonRecord {
@@ -43,7 +43,7 @@ impl DaemonRecord {
         }
     }
 
-    pub(crate) fn load(paths: &SystemPaths) -> eyre::Result<Option<Self>> {
+    pub(crate) fn load(paths: &DaemonPaths) -> eyre::Result<Option<Self>> {
         let Some(value) = load_record::<serde_json::Value>(&paths.record())? else {
             return Ok(None);
         };
@@ -63,7 +63,7 @@ impl DaemonRecord {
         Ok(())
     }
 
-    pub(crate) fn save(&self, paths: &SystemPaths) -> eyre::Result<()> {
+    pub(crate) fn save(&self, paths: &DaemonPaths) -> eyre::Result<()> {
         self.validate()?;
         write_record(&paths.record(), self)
     }
@@ -171,18 +171,19 @@ fn set_private_file(_path: &Path) -> eyre::Result<()> {
 pub(crate) mod tests {
     use serde::{Deserialize, Serialize};
 
-    use crate::paths::SystemPaths;
-    use crate::record::{load_record, write_record, DaemonRecord};
+    use crate::daemon::record::{load_record, write_record, DaemonRecord};
+    use silod_spec::paths::DaemonPaths;
 
-    pub(crate) fn fixture(root: &std::path::Path) -> (SystemPaths, DaemonRecord) {
-        let paths = SystemPaths::new(root.join("home"), root.join("run"));
+    pub(crate) fn fixture(root: &std::path::Path) -> (DaemonPaths, DaemonRecord) {
+        let paths = DaemonPaths::new(root.join("home"));
         let overrides = silod_spec::arguments::SystemOverrides {
             image: Some("registry.example/system@sha256:old".into()),
             data_size: Some("512MiB".into()),
             ..Default::default()
         };
-        let desired = crate::config::resolve(&overrides, root, &paths.docker_socket(), None)
-            .expect("resolve");
+        let desired =
+            crate::daemon::system_config::resolve(&overrides, root, &paths.docker_socket(), None)
+                .expect("resolve");
         (paths, DaemonRecord::new(desired.config))
     }
 

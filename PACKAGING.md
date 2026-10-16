@@ -2,7 +2,7 @@
 
 ## Integrated native product packages
 
-`make build` produces the CLI, silod, taild and its adjacent native Go bridge
+`make build` produces the CLI (which contains the daemon), taild and its adjacent native Go bridge
 alongside the ordinary runtime assets. Taild builds directly from `app/taild`
 with the source SDK and generated management-module replacements. Its build
 ensures the bridge once, uses `CGO_ENABLED=1`, and never assembles or installs a
@@ -27,7 +27,7 @@ The integrated product instead loads the canonical adjacent sidecar, verifies
 its ABI/product version and uses the exact manager-selected six components.
 `make version-check` also checks the standalone SDK bundle cache-version constant.
 
-Portable archives on both operating systems include `bin/silo`, `bin/silod`,
+Portable archives on both operating systems include `bin/silo`,
 `bin/taild` and `bin/libsilo_go_ffi.so` (or `.dylib`). Runtime-only SDK archives
 contain VMM/netd/guest assets, never those frontends or bridge. Product archives
 include only useful `share/silo-taild/examples`, not standalone units, sysusers,
@@ -61,7 +61,7 @@ same native release toolchain as the product; a Nix-linked observation tool
 cannot execute with `/nix` hidden.
 
 The verifier extracts real archives into fresh canonical Home/config roots,
-starts the packaged silod and taild, observes the mapped sidecar and checks
+starts the packaged daemon (`silo daemon run`) and taild, observes the mapped sidecar and checks
 exact six-component selection over the real management API. It creates no SDK
 installation/cache. Missing bridge, malformed library, dependency, ABI and
 version failures leave core inventory usable. Missing shared guest assets leave
@@ -303,7 +303,7 @@ target/silo-runtime/<target>/release/
     agent
 ```
 
-The stage deliberately excludes the public `silo` frontend and the `silod` appliance daemon. Product and SDK
+The stage deliberately excludes the public `silo` frontend (and with it the appliance daemon). Product and SDK
 packagers add their frontend or native binding without rebuilding or replacing
 the staged runtime files.
 
@@ -332,16 +332,15 @@ silo-runtime-<version>-<target>/
     APACHE-2.0.txt
 ```
 
-The portable CLI archive contains the same files plus `bin/silo` and `bin/silod`.
-The CLI starts its sibling `silod`; distribute and upgrade them together.
-`Silo.app` places the daemon at `Contents/Helpers/silod` and signs it without
-virtualization entitlements (the VMM owns virtualization):
+The portable CLI archive contains the same files plus `bin/silo`, which is both
+the CLI and the daemon (`silo daemon run`). `Silo.app` places it at
+`Contents/MacOS/silo` and signs it without virtualization entitlements (the VMM
+owns virtualization):
 
 ```text
 silo-<version>-<target>/
   bin/
     silo
-    silod
     silo-vmm
     netd
   assets/

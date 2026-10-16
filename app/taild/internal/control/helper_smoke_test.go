@@ -111,7 +111,7 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 	})
 	startDaemon := func() *Client {
 		t.Helper()
-		daemon = exec.Command(filepath.Join(bin, "silod"))
+		daemon = exec.Command(filepath.Join(bin, "silo"), "daemon", "run")
 		daemon.Env, daemon.Stderr = environment, os.Stderr
 		if err := daemon.Start(); err != nil {
 			t.Fatal(err)
@@ -206,8 +206,8 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sessions.Close()
-	// Spawn through silod after its owner writer exists. A leaked descriptor in
-	// this surviving VMM would keep the orphan helper alive after silod dies.
+	// Spawn through the daemon after its owner writer exists. A leaked descriptor in
+	// this surviving VMM would keep the orphan helper alive after the daemon dies.
 	runCLI("create", "--name", "helper-lifetime", "--cpus", "1", "--memory", "512MiB", "--network", "none", registry.Reference)
 	machineCreated = true
 	if _, err := client.Machines.UpdateMachine(ctx, &w.UpdateMachineRequest{
@@ -250,7 +250,7 @@ func TestIntegratedHelperLifetime(t *testing.T) {
 		}
 		guard, finish := context.WithTimeout(ctx, 20*time.Second)
 		defer finish()
-		command := exec.CommandContext(guard, filepath.Join(bin, "silod"), "--host-shutdown")
+		command := exec.CommandContext(guard, filepath.Join(bin, "silo"), "daemon", "run", "--host-shutdown")
 		command.Env = append(append([]string(nil), environment...),
 			"SILO_RUNTIME_DIR="+filepath.Join(home, "absent-runtime"),
 			"SILO_GO_FFI_PATH="+filepath.Join(home, "absent-bridge"))

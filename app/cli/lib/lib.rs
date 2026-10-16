@@ -2,6 +2,7 @@ mod api;
 pub mod app;
 mod boundary;
 pub mod commands;
+mod config;
 pub mod context;
 mod daemon;
 pub mod environment;

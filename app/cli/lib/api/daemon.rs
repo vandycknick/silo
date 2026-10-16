@@ -76,9 +76,9 @@ impl DaemonVmService {
     pub(crate) async fn session_runtime(&self) -> eyre::Result<&Runtime> {
         self.session.runtime.get_or_try_init(|| async {
             let info = self.daemon.clone().get_runtime_info(()).await.map_err(native_status)?.into_inner();
-            eyre::ensure!(info.generation == self.session.generation, "silod generation changed before native session initialization; retry the command");
-            eyre::ensure!(silo_vm_control::path_from_wire(info.home)? == self.session.home, "silod runtime Home changed");
-            let c = info.components.ok_or_else(|| eyre::eyre!("silod omitted runtime components"))?;
+            eyre::ensure!(info.generation == self.session.generation, "daemon generation changed before native session initialization; retry the command");
+            eyre::ensure!(silo_vm_control::path_from_wire(info.home)? == self.session.home, "daemon runtime Home changed");
+            let c = info.components.ok_or_else(|| eyre::eyre!("the daemon omitted runtime components"))?;
             let components = libvm::ResolvedRuntimeComponents::from_paths(
                 silo_vm_control::path_from_wire(c.supervisor_path)?, silo_vm_control::path_from_wire(c.netd_path)?,
                 silo_vm_control::path_from_wire(c.kernel_path)?, silo_vm_control::path_from_wire(c.initramfs_path)?,
@@ -96,7 +96,7 @@ impl DaemonVmService {
 fn native_status(status: tonic::Status) -> libvm::LibVmError {
     silo_vm_control::errors::status_to_native_error(&status).unwrap_or_else(|_| {
         std::io::Error::other(format!(
-            "silod management {}: {}",
+            "daemon management {}: {}",
             status.code(),
             status.message()
         ))
@@ -106,7 +106,7 @@ fn native_status(status: tonic::Status) -> libvm::LibVmError {
 fn invalid_response(error: impl std::fmt::Display) -> libvm::LibVmError {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("invalid silod response: {error}"),
+        format!("invalid daemon response: {error}"),
     )
     .into()
 }

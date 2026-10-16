@@ -37,7 +37,7 @@ func Peer(c config.Config, nodeID string, principals ...identity.Principal) iden
 	return identity.Peer{Principals: principals, NodeID: nodeID, ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: c.Limits()}}
 }
 
-// Native owns a real silod manager, helper session runtime, and independent writer.
+// Native owns a real daemon manager, helper session runtime, and independent writer.
 type Native struct {
 	Runtime *runtime.Runtime
 	Audit   *state.Audit
@@ -47,9 +47,9 @@ type Native struct {
 	config  config.Config
 }
 
-// Open launches silod on c.Home with optional integrations disabled. Cleanup
+// Open launches the daemon on c.Home with optional integrations disabled. Cleanup
 // drains jobs and sessions and cleans VMs while management is alive, then closes
-// local runtimes/client and finally terminates and reaps silod.
+// local runtimes/client and finally terminates and reaps the daemon.
 func Open(t *testing.T, c config.Config, instance string, jobLimit int) Native {
 	t.Helper()
 	manager, c := launchManager(t, c)

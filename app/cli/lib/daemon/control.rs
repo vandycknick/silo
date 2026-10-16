@@ -1,9 +1,9 @@
 //! Same-user management boundary. Sessions deliberately remain native and direct.
 // Accepted native mutations own their semaphore permit independently of RPC waiters.
 // Sealing admission precedes draining; native sessions are outside this tracker.
+use crate::config::GlobalConfig;
 use libvm::{HostPaths, ResolvedRuntimeComponents, Runtime, RuntimeConfig};
 use parking_lot::Mutex;
-use silo_config::GlobalConfig;
 use silod_spec::daemon::v1 as w;
 use std::os::unix::fs::MetadataExt;
 use std::{future::Future, sync::Arc, time::Duration};
@@ -78,7 +78,7 @@ pub(crate) struct ControlState {
     pub(super) shutdown_only: bool,
     components: OnceCell<ResolvedRuntimeComponents>,
     runtime: OnceCell<Runtime>,
-    publisher: Arc<crate::status::StatusPublisher>,
+    publisher: Arc<crate::daemon::status::StatusPublisher>,
     admission: Mutex<Admission>,
     capacity: Arc<Semaphore>,
     settled: Arc<tokio::sync::Notify>,
@@ -89,7 +89,7 @@ impl ControlState {
         host: HostPaths,
         global: GlobalConfig,
         generation: uuid::Uuid,
-        publisher: Arc<crate::status::StatusPublisher>,
+        publisher: Arc<crate::daemon::status::StatusPublisher>,
     ) -> Self {
         let config = RuntimeConfig::local(host.home())
             .with_networking(global.networking().clone())
@@ -118,7 +118,7 @@ impl ControlState {
         host: HostPaths,
         global: GlobalConfig,
         generation: uuid::Uuid,
-        publisher: Arc<crate::status::StatusPublisher>,
+        publisher: Arc<crate::daemon::status::StatusPublisher>,
     ) -> Self {
         let mut state = Self::new(host, global, generation, publisher);
         state.shutdown_only = true;
@@ -199,8 +199,9 @@ impl ControlState {
         let runtime = self
             .runtime
             .get_or_try_init(|| async {
-                let command = sibling_cli()
-                    .map_err(|_| Status::unavailable("matching sibling silo unavailable"))?;
+                let command = std::env::current_exe()
+                    .and_then(|path| path.canonicalize())
+                    .map_err(|_| Status::unavailable("silo executable path unavailable"))?;
                 let runtime = Runtime::new(self.config.clone().with_runtime_components(components))
                     .await
                     .map_err(native)?;
@@ -276,22 +277,4 @@ impl ControlState {
         rx.await
             .map_err(|_| Status::internal("mutation task failed"))?
     }
-}
-fn sibling_cli() -> eyre::Result<std::path::PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let path = exe
-        .parent()
-        .ok_or_else(|| eyre::eyre!("missing executable parent"))?
-        .join("silo");
-    let m = std::fs::symlink_metadata(&path)?;
-    eyre::ensure!(
-        m.is_file()
-            && !m.file_type().is_symlink()
-            && m.mode() & 0o111 != 0
-            && (m.uid() == nix::unistd::geteuid().as_raw() || m.uid() == 0)
-            && m.mode() & 0o022 == 0,
-        "unsafe sibling silo"
-    );
-    Ok(path.canonicalize()?)
 }

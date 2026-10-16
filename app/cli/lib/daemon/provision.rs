@@ -4,17 +4,17 @@ use eyre::{bail, Context as _};
 use libvm::{ImagePullPolicy, MachineData, MachineStatus, Memory};
 use uuid::Uuid;
 
-use crate::config::{DesiredSystem, ResolvedSystemConfig};
-use crate::paths::SystemPaths;
-use crate::record::DaemonRecord;
-use crate::runtime::SystemRuntime;
-use crate::storage::{ensure_data_image, validate_data_image};
+use crate::daemon::record::DaemonRecord;
+use crate::daemon::runtime::SystemRuntime;
+use crate::daemon::storage::{ensure_data_image, validate_data_image};
+use crate::daemon::system_config::{DesiredSystem, ResolvedSystemConfig};
+use silod_spec::paths::DaemonPaths;
 
 pub(crate) const SYSTEM_MACHINE_NAME: &str = "silo-system";
 
 pub(crate) async fn ensure_system_machine(
     runtime: &mut SystemRuntime,
-    paths: &SystemPaths,
+    paths: &DaemonPaths,
     desired: &DesiredSystem,
 ) -> eyre::Result<(DaemonRecord, MachineData)> {
     let config = &desired.config;
@@ -58,7 +58,7 @@ pub(crate) async fn ensure_system_machine(
 }
 
 pub(crate) fn prepare_installation(
-    paths: &SystemPaths,
+    paths: &DaemonPaths,
     config: &ResolvedSystemConfig,
 ) -> eyre::Result<DaemonRecord> {
     let installation = match DaemonRecord::load(paths)? {
@@ -297,11 +297,11 @@ fn attachment_matches_data_image(
 mod tests {
     use std::os::unix::fs::symlink;
 
-    use crate::provision::{
+    use crate::daemon::provision::{
         attachment_matches_data_image, installation_labels_match, prepare_installation,
         validate_installation, SystemHardware,
     };
-    use crate::record::tests::fixture;
+    use crate::daemon::record::tests::fixture;
 
     #[test]
     fn persisted_data_share_and_endpoint_changes_fail_closed() {

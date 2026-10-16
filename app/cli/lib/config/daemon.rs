@@ -13,7 +13,7 @@ pub(super) struct DaemonConfig {
     #[serde(default)]
     system: SystemSection,
     #[serde(default)]
-    pub(super) tailscale: crate::tailscale::TailscaleConfig,
+    pub(super) tailscale: crate::config::tailscale::TailscaleConfig,
 }
 
 impl Default for DaemonConfig {
@@ -22,7 +22,7 @@ impl Default for DaemonConfig {
             version: "1".into(),
             backend: None,
             system: SystemSection::default(),
-            tailscale: crate::tailscale::TailscaleConfig::default(),
+            tailscale: crate::config::tailscale::TailscaleConfig::default(),
         }
     }
 }
@@ -123,7 +123,7 @@ impl DaemonConfig {
             );
         }
         let system = &self.system;
-        // silod has no engine argument yet; this stops compiling once a second
+        // The daemon has no engine argument yet; this stops compiling once a second
         // engine exists and needs one.
         match system.engine {
             Some(Engine::Docker) | None => {}
@@ -155,7 +155,7 @@ impl DaemonConfig {
 mod tests {
     use silod_spec::arguments::{Backend, PublishBind, Share, SystemOverrides};
 
-    use crate::daemon::DaemonConfig;
+    use crate::config::daemon::DaemonConfig;
 
     fn parse(yaml: &str) -> Result<DaemonConfig, serde_yaml_ng::Error> {
         serde_yaml_ng::from_str(yaml)

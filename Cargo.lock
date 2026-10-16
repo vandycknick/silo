@@ -670,28 +670,38 @@ dependencies = [
  "chrono",
  "clap",
  "console",
+ "disk-image",
  "eyre",
+ "futures",
+ "hyper-util",
  "indicatif",
  "libc",
  "libvm",
  "nix 0.31.3",
+ "parking_lot",
+ "prost",
+ "prost-types",
  "reqwest",
  "secrets",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.11.0",
- "silo-config",
  "silo-vm-control",
  "silod-spec",
  "ssh-key",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
+ "tonic-prost",
+ "tower",
+ "tracing",
  "utils",
  "uuid",
  "vm-spec",
+ "zeroize",
 ]
 
 [[package]]
@@ -4620,19 +4630,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "silo-config"
-version = "0.1.0"
-dependencies = [
- "eyre",
- "libvm",
- "nix 0.31.3",
- "serde",
- "serde_yaml_ng",
- "silod-spec",
- "tempfile",
-]
-
-[[package]]
 name = "silo-go-ffi"
 version = "0.1.0"
 dependencies = [
@@ -4741,42 +4738,6 @@ dependencies = [
  "uuid",
  "vm-spec",
  "vz",
-]
-
-[[package]]
-name = "silod"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "disk-image",
- "eyre",
- "futures",
- "hyper-util",
- "libc",
- "libvm",
- "nix 0.31.3",
- "parking_lot",
- "prost",
- "prost-types",
- "secrets",
- "serde",
- "serde_json",
- "silo-config",
- "silo-vm-control",
- "silod-spec",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tower",
- "tracing",
- "utils",
- "uuid",
- "vm-spec",
- "zeroize",
 ]
 
 [[package]]

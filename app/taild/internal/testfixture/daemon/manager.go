@@ -36,7 +36,7 @@ func launchManager(t *testing.T, c config.Config) (*control.Client, config.Confi
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(filepath.Join(bin, "silod"), "--system-enabled=false", "--tailscale-enabled=false")
+	command := exec.Command(filepath.Join(bin, "silo"), "daemon", "run", "--system-enabled=false", "--tailscale-enabled=false")
 	command.Env = []string{"HOME=" + home, "SILO_HOME=" + home, "XDG_CONFIG_HOME=" + configRoot, "PATH=" + os.Getenv("PATH"), "SILO_RUNTIME_DIR=" + filepath.Dir(c.Components.AssetDir), "SILO_RUN_ROOT=" + runRoot}
 	for _, key := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
 		if value := os.Getenv(key); value != "" {
@@ -54,12 +54,12 @@ func launchManager(t *testing.T, c config.Config) (*control.Client, config.Confi
 		select {
 		case err := <-exited:
 			if err != nil {
-				t.Error("silod exit:", err)
+				t.Error("daemon exit:", err)
 			}
 		case <-time.After(90 * time.Second):
 			_ = command.Process.Kill()
 			<-exited
-			t.Error("silod failed to drain")
+			t.Error("daemon failed to drain")
 		}
 	}
 	// Register now so any failure during admission still reaps the daemon.
@@ -82,7 +82,7 @@ func launchManager(t *testing.T, c config.Config) (*control.Client, config.Confi
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatal("silod readiness:", ctx.Err())
+			t.Fatal("daemon readiness:", ctx.Err())
 		case <-time.After(50 * time.Millisecond):
 		}
 	}

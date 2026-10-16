@@ -7,8 +7,8 @@ use eyre::{bail, Context as _};
 use libvm::ExecutionResult;
 use uuid::Uuid;
 
-use crate::config::ResolvedSystemConfig;
-use crate::runtime::SystemMachine;
+use crate::daemon::runtime::SystemMachine;
+use crate::daemon::system_config::ResolvedSystemConfig;
 
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const ENGINE_REACHABLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -142,7 +142,7 @@ fn guest_error(stderr: &str) -> String {
 /// Creates the directory the host half of the docker forward binds into. silo-vmm
 /// refuses to bind under a missing, symlinked or foreign-owned parent, so a fresh
 /// home has to grow `run/` before the system VM starts; `silo daemon up` does the
-/// same in its preflight, but bare `silod` must not depend on it.
+/// same in its preflight, but a bare daemon must not depend on it.
 pub(crate) fn ensure_docker_socket_parent(socket: &Path) -> eyre::Result<()> {
     let parent = socket
         .parent()
@@ -216,8 +216,8 @@ pub(crate) fn probe_docker_socket(path: &Path) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{ResolvedShare, ResolvedSystemConfig};
-    use crate::engine::{activation_request, ensure_docker_socket_parent, guest_error};
+    use crate::daemon::engine::{activation_request, ensure_docker_socket_parent, guest_error};
+    use crate::daemon::system_config::{ResolvedShare, ResolvedSystemConfig};
 
     #[test]
     fn guest_errors_collapse_to_distinct_lines() {
@@ -234,7 +234,7 @@ mod tests {
 
     fn activation_config(shares: Vec<ResolvedShare>) -> ResolvedSystemConfig {
         let temp = tempfile::tempdir().expect("temp");
-        let (_paths, record) = crate::record::tests::fixture(temp.path());
+        let (_paths, record) = crate::daemon::record::tests::fixture(temp.path());
         ResolvedSystemConfig {
             shares,
             ..record.config

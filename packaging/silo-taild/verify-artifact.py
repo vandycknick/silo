@@ -91,7 +91,7 @@ def signed_app(app, reference, version):
         path = app / name
         if not path.resolve().is_relative_to(app) or path.is_symlink() or digest(path) != sha:
             raise RuntimeError(f"signed app digest mismatch: {name}")
-    required = ["Contents/MacOS/silo"] + ["Contents/Helpers/" + name for name in ("silod", "taild", "libsilo_go_ffi.dylib", "silo-vmm", "netd")]
+    required = ["Contents/MacOS/silo"] + ["Contents/Helpers/" + name for name in ("taild", "libsilo_go_ffi.dylib", "silo-vmm", "netd")]
     for name in required:
         if name not in data["files"]:
             raise RuntimeError(f"missing signed app provenance component: {name}")
@@ -135,7 +135,7 @@ def scenario(layout, work, driver, isolation, failure=None):
     bridge = bin_dir / ("libsilo_go_ffi.dylib" if sys.platform == "darwin" else "libsilo_go_ffi.so")
     environment = {key: value for key, value in os.environ.items() if not key.startswith(("SILO_", "TS_", "LD_", "DYLD_")) and key != "GODEBUG"}
     environment.update(HOME=str(userhome), SILO_HOME=str(home), XDG_CONFIG_HOME=str(userhome / "config"), XDG_CACHE_HOME=str(userhome / "cache"), XDG_DATA_HOME=str(userhome / "data"))
-    # Poison inherited discovery selectors; silod must select its own components
+    # Poison inherited discovery selectors; the daemon must select its own components
     # and scrub these from taild, not search or extract an SDK fallback.
     environment.update(SILO_GO_FFI_PATH=str(work / "wrong-bridge"), SILO_RUNTIME_ROOT=str(work / "wrong-runtime"))
     with socket.socket() as blocked:
@@ -144,7 +144,7 @@ def scenario(layout, work, driver, isolation, failure=None):
         config.joinpath("config.yaml").write_text("daemon:\n  version: '1'\n  system:\n    enabled: false\n  tailscale:\n    enabled: true\n    control-url: 'http://127.0.0.1:%d'\n    enrollment:\n      mode: none\n" % blocked.getsockname()[1])
         log = work / "daemon.log"
         with log.open("w+") as output:
-            daemon = subprocess.Popen([*isolation, str(bin_dir / "silod")], env=environment, stdout=output, stderr=output, start_new_session=True)
+            daemon = subprocess.Popen([*isolation, str(bin_dir / "silo"), "daemon", "run"], env=environment, stdout=output, stderr=output, start_new_session=True)
             try:
                 status_path = home / "daemon/status.json"
                 deadline = time.monotonic() + 45
@@ -223,8 +223,8 @@ def main():
         parser.error("--app requires native macOS")
     if args.require_no_nix and sys.platform != "linux":
         parser.error("--require-no-nix is Linux-only")
-    if subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "silod"], capture_output=True).returncode == 0:
-        raise RuntimeError("live silod found; use an idle dedicated test UID")
+    if subprocess.run(["pgrep", "-u", str(os.getuid()), "-f", "silo daemon run"], capture_output=True).returncode == 0:
+        raise RuntimeError("live silo daemon found; use an idle dedicated test UID")
     driver = args.driver.resolve(strict=True)
     portable, runtime = (p.resolve(strict=True) for p in (args.portable, args.runtime))
     with tempfile.TemporaryDirectory(prefix="silo-integrated-acceptance-") as temporary:
@@ -236,12 +236,12 @@ def main():
         files = {str(p.relative_to(reference)): digest(p) for p in reference.rglob("*") if p.is_file() and not p.is_symlink() and p != manifest_path}
         if manifest["files"] != files:
             raise RuntimeError("runtime component inventory/digest mismatch")
-        if any((reference / "bin" / name).exists() for name in ("silo", "silod", "taild", "libsilo_go_ffi.so", "libsilo_go_ffi.dylib")):
+        if any((reference / "bin" / name).exists() for name in ("silo", "taild", "libsilo_go_ffi.so", "libsilo_go_ffi.dylib")):
             raise RuntimeError("SDK runtime archive contains product frontends/bridge")
         prov = provenance(portable, package)
         provenance(runtime, reference)
         bridge_name = "libsilo_go_ffi.dylib" if sys.platform == "darwin" else "libsilo_go_ffi.so"
-        for name in ("silo", "silod", "taild", bridge_name):
+        for name in ("silo", "taild", bridge_name):
             if "bin/" + name not in prov["file_hashes"]:
                 raise RuntimeError("missing product component provenance: " + name)
         for name, sha in files.items():

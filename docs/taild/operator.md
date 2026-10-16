@@ -1,6 +1,6 @@
 # Operating taild
 
-Taild is an optional same-user helper supervised by silod. It exposes a tailnet
+Taild is an optional same-user helper supervised by the Silo daemon. It exposes a tailnet
 SSH lobby and authenticated HTTPS health/metrics endpoints. It uses Silo's normal
 Home/configuration and the manager-selected native SDK assets, not a separate
 service account or runtime installation. Native Linux and macOS execution must
@@ -291,7 +291,7 @@ observed result here.
 
 ## Restart and shutdown
 
-`KillMode=process` is essential: the user service terminates silod, which drains
+`KillMode=process` is essential: the user service terminates the daemon, which drains
 and reaps taild explicitly. Independent VM workers and guest SSH sessions survive.
 Helper-owned lobby sessions drain within the bounded shutdown window; unexpected
 parent-pipe EOF cancels them immediately. Neither event is a host-shutdown request.
@@ -299,7 +299,7 @@ Never use a whole-cgroup kill to repair the service. On Linux, the existing logi
 delay inhibitor permits a bounded stop of managed VMs only for authenticated host
 shutdown. Configure its budget/margin within the host's inhibitor delay and test it.
 
-The Linux unit also runs `silod --host-shutdown` as ExecStop. On an ordinary
+The Linux unit also runs `silo daemon run --host-shutdown` as ExecStop. On an ordinary
 stop/restart this observes the real non-stopping host state and stops nothing.
 During shutdown it uses the live manager, or a restricted temporary manager only
 after proving absence and acquiring both ownership locks. Its shutdown-only
@@ -360,5 +360,5 @@ the current Linux amd64 release archive passed real guest execution at 256 MiB o
 2026-10-01. This does not qualify other guest workloads or architectures.
 Offline `taild version` reports the required ABI (currently 1), not an invented
 verified value. The remote version reports the actually verified ABI and connected
-silod/protocol. Integrated startup loads the manager-selected adjacent bridge;
+daemon/protocol. Integrated startup loads the manager-selected adjacent bridge;
 it does not extract an embedded SDK bridge.

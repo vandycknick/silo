@@ -116,7 +116,7 @@ impl SystemRuntime {
     pub(crate) async fn create_system_machine(
         &mut self,
         name: &str,
-        config: &crate::config::ResolvedSystemConfig,
+        config: &crate::daemon::system_config::ResolvedSystemConfig,
         installation_id: uuid::Uuid,
         data_image: &std::path::Path,
         image: ResolvedOciImage,

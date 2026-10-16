@@ -1,11 +1,9 @@
 use serde::{Deserialize, Deserializer};
 use std::time::Duration;
 
-pub const CAPABILITY: &str = "github.com/vandycknick/silo/cap/taild";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum EnrollmentMode {
+pub(crate) enum EnrollmentMode {
     OauthApp,
     Interactive,
     None,
@@ -13,7 +11,7 @@ pub enum EnrollmentMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct TailscaleConfig {
+pub(crate) struct TailscaleConfig {
     enabled: Option<bool>,
     hostname: String,
     tag: String,
@@ -57,40 +55,37 @@ impl TailscaleConfig {
             &self.shutdown,
         )
     }
-    pub fn enabled(&self) -> Option<bool> {
+    pub(crate) fn enabled(&self) -> Option<bool> {
         self.enabled
     }
-    pub fn hostname(&self) -> &str {
+    pub(crate) fn hostname(&self) -> &str {
         &self.hostname
     }
-    pub fn tag(&self) -> &str {
+    pub(crate) fn tag(&self) -> &str {
         &self.tag
     }
-    pub fn capability(&self) -> &'static str {
-        CAPABILITY
-    }
-    pub fn control_url(&self) -> &str {
+    pub(crate) fn control_url(&self) -> &str {
         &self.control_url
     }
-    pub fn enrollment_mode(&self) -> EnrollmentMode {
+    pub(crate) fn enrollment_mode(&self) -> EnrollmentMode {
         self.enrollment.mode
     }
-    pub fn disable_key_expiry(&self) -> bool {
+    pub(crate) fn disable_key_expiry(&self) -> bool {
         self.enrollment.disable_key_expiry
     }
-    pub fn vm(&self) -> &VmSettings {
+    pub(crate) fn vm(&self) -> &VmSettings {
         &self.vm
     }
-    pub fn sessions(&self) -> &SessionLimits {
+    pub(crate) fn sessions(&self) -> &SessionLimits {
         &self.sessions
     }
-    pub fn disk_reserve(&self) -> u64 {
+    pub(crate) fn disk_reserve(&self) -> u64 {
         self.disk_reserve
     }
-    pub fn file_transfer_limit(&self) -> u64 {
+    pub(crate) fn file_transfer_limit(&self) -> u64 {
         self.file_transfer_limit
     }
-    pub fn shutdown(&self) -> &ShutdownSettings {
+    pub(crate) fn shutdown(&self) -> &ShutdownSettings {
         &self.shutdown
     }
     pub(super) fn validate(&self) -> eyre::Result<()> {
@@ -162,7 +157,7 @@ impl Default for Enrollment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct ResourceLimits {
+pub(crate) struct ResourceLimits {
     cpus: u64,
     #[serde(deserialize_with = "size")]
     memory: u64,
@@ -179,19 +174,19 @@ impl Default for ResourceLimits {
     }
 }
 impl ResourceLimits {
-    pub fn cpus(&self) -> u64 {
+    pub(crate) fn cpus(&self) -> u64 {
         self.cpus
     }
-    pub fn memory(&self) -> u64 {
+    pub(crate) fn memory(&self) -> u64 {
         self.memory
     }
-    pub fn disk(&self) -> u64 {
+    pub(crate) fn disk(&self) -> u64 {
         self.disk
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Ceilings {
+pub(crate) struct Ceilings {
     cpus: u64,
     #[serde(deserialize_with = "size")]
     memory: u64,
@@ -210,36 +205,36 @@ impl Default for Ceilings {
     }
 }
 impl Ceilings {
-    pub fn cpus(&self) -> u64 {
+    pub(crate) fn cpus(&self) -> u64 {
         self.cpus
     }
-    pub fn memory(&self) -> u64 {
+    pub(crate) fn memory(&self) -> u64 {
         self.memory
     }
-    pub fn disk(&self) -> u64 {
+    pub(crate) fn disk(&self) -> u64 {
         self.disk
     }
-    pub fn vms_per_principal(&self) -> u64 {
+    pub(crate) fn vms_per_principal(&self) -> u64 {
         self.vms_per_principal
     }
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct VmSettings {
+pub(crate) struct VmSettings {
     defaults: ResourceLimits,
     ceilings: Ceilings,
 }
 impl VmSettings {
-    pub fn defaults(&self) -> &ResourceLimits {
+    pub(crate) fn defaults(&self) -> &ResourceLimits {
         &self.defaults
     }
-    pub fn ceilings(&self) -> &Ceilings {
+    pub(crate) fn ceilings(&self) -> &Ceilings {
         &self.ceilings
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct SessionLimits {
+pub(crate) struct SessionLimits {
     global: u64,
     per_peer: u64,
 }
@@ -252,16 +247,16 @@ impl Default for SessionLimits {
     }
 }
 impl SessionLimits {
-    pub fn global(&self) -> u64 {
+    pub(crate) fn global(&self) -> u64 {
         self.global
     }
-    pub fn per_peer(&self) -> u64 {
+    pub(crate) fn per_peer(&self) -> u64 {
         self.per_peer
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct ShutdownSettings {
+pub(crate) struct ShutdownSettings {
     #[serde(deserialize_with = "duration")]
     stop_budget: Duration,
     #[serde(deserialize_with = "duration")]
@@ -276,10 +271,10 @@ impl Default for ShutdownSettings {
     }
 }
 impl ShutdownSettings {
-    pub fn stop_budget(&self) -> Duration {
+    pub(crate) fn stop_budget(&self) -> Duration {
         self.stop_budget
     }
-    pub fn margin(&self) -> Duration {
+    pub(crate) fn margin(&self) -> Duration {
         self.margin
     }
 }
@@ -396,7 +391,7 @@ fn parse_duration(mut input: &str) -> Result<Duration, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tailscale::TailscaleConfig;
+    use crate::config::tailscale::TailscaleConfig;
 
     #[test]
     fn file_transfer_limit_defaults_and_accepts_sizes() {

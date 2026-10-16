@@ -3,7 +3,7 @@ use libvm::RuntimeConfig;
 
 use crate::api::machine::AppMachine;
 use crate::api::AppApi;
-use silo_config::GlobalConfig;
+use crate::config::GlobalConfig;
 
 #[derive(Debug)]
 pub struct Context {
