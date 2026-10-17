@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd;
 
 use eyre::Context as _;
 use libvm::{
@@ -7,18 +8,20 @@ use libvm::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use utils::terminal::RawTerminalGuard;
 
 use crate::api::machine::AppMachine;
 
-pub(crate) async fn attach_shell(
+pub(crate) async fn shell(
     machine: &AppMachine,
     user: Option<&str>,
     forward_agent: bool,
 ) -> eyre::Result<SshExitStatus> {
     let cwd = std::env::current_dir().context("resolve current working directory")?;
     machine
-        .inner()
-        .attach_shell_with(|options| {
+        .session_machine()
+        .await?
+        .shell_with(|options| {
             let options = options.cwd(cwd.to_string_lossy()).best_effort_cwd();
             let options = match user {
                 Some(user) => options.user(user),
@@ -62,12 +65,13 @@ pub(crate) async fn run_command_streaming(
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
     let mut session = machine
-        .inner()
+        .session_machine()
+        .await?
         .spawn_with(program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment).stdin_pipe()
         })
         .await?;
-    stream_events(&mut session).await
+    stream_events(&mut session, StreamMode::Piped).await
 }
 
 pub(crate) async fn attach_command(
@@ -78,13 +82,16 @@ pub(crate) async fn attach_command(
     environment: &BTreeMap<String, String>,
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
-    machine
-        .inner()
-        .attach_with(program, |options| {
+    let mut session = machine
+        .session_machine()
+        .await?
+        .spawn_with(program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment)
+                .stdin_pipe()
+                .tty(true)
         })
-        .await
-        .map_err(Into::into)
+        .await?;
+    stream_events(&mut session, StreamMode::Interactive).await
 }
 
 /// Runs one exact process configuration through the structured guest protocol.
@@ -115,34 +122,70 @@ pub(crate) async fn run_process(
     .await
 }
 
-async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<ExecutionResult> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    Piped,
+    Interactive,
+}
+
+async fn stream_events(
+    session: &mut ExecutionSession,
+    mode: StreamMode,
+) -> eyre::Result<ExecutionResult> {
+    // Input's Drop joins its worker before the terminal guard restores termios.
+    let mut _raw_terminal = None;
+    let mut host_stdin = match mode {
+        StreamMode::Piped => {
+            Some(libvm::host_input::HostInput::stdin().context("open host stdin")?)
+        }
+        StreamMode::Interactive => None,
+    };
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let mut host_stdin = libvm::host_input::HostInput::stdin().context("open host stdin")?;
     let control = session.control();
     let mut stdin: Option<libvm::ExecutionStdin> = None;
     let mut stdin_closed = false;
     let mut started = false;
     let mut launch_cancelled = false;
-    let mut signals = HostSignals::forwardable()?;
+    let mut signals = match mode {
+        StreamMode::Piped => HostSignals::forwardable()?,
+        StreamMode::Interactive => HostSignals::new(interactive_signals())?,
+    };
+    let mut signals_open = true;
     loop {
         let event = tokio::select! {
             event = session.recv() => event?,
-            read = host_stdin.read(), if started && !launch_cancelled && !stdin_closed => {
+            read = read_host_input(&mut host_stdin), if started && !launch_cancelled && !stdin_closed => {
                 let input = read.context("read host stdin")?;
                 if input.is_empty() {
                     stdin_closed = true;
-                    if let Some(stdin) = stdin.as_ref() {
-                        stdin.close().await.context("close guest stdin")?;
+                    if mode == StreamMode::Piped {
+                        if let Some(stdin) = stdin.as_ref() {
+                            stdin.close().await.context("close guest stdin")?;
+                        }
                     }
                 } else if let Some(stdin) = stdin.as_ref() {
                     stdin.write(input).await.context("write guest stdin")?;
                 }
                 continue;
             }
-            signal = signals.recv() => {
+            signal = signals.recv(), if signals_open => {
                 if let Some(signal) = signal {
-                    forward_signal(&control, started, &mut launch_cancelled, signal).await?;
+                    if mode == StreamMode::Interactive && signal == libc::SIGWINCH as u32 {
+                        if started && !launch_cancelled {
+                            let (rows, columns) = current_terminal_size();
+                            control.resize_pty(rows, columns).await.context("resize guest terminal")?;
+                        }
+                    } else {
+                        let signal = if mode == StreamMode::Interactive {
+                            guest_signal(signal).ok_or_else(|| eyre::eyre!("unsupported host signal {signal}"))?
+                        } else {
+                            signal
+                        };
+                        forward_signal(&control, started, &mut launch_cancelled, signal).await?;
+                    }
+                } else {
+                    signals_open = false;
                 }
                 continue;
             }
@@ -153,6 +196,13 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
         match event {
             ExecutionEvent::Accepted => {}
             ExecutionEvent::Started if !launch_cancelled => {
+                if mode == StreamMode::Interactive {
+                    _raw_terminal = Some(
+                        RawTerminalGuard::new(std::io::stdin()).context("enable raw terminal")?,
+                    );
+                    host_stdin =
+                        Some(libvm::host_input::HostInput::stdin().context("open host stdin")?);
+                }
                 stdin = control.stdin();
                 started = true;
             }
@@ -163,6 +213,16 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
                     .await
                     .context("write guest stdout")?;
                 stdout.flush().await.context("flush guest stdout")?;
+            }
+            ExecutionEvent::Stderr(data) if mode == StreamMode::Interactive => {
+                stdout
+                    .write_all(&data)
+                    .await
+                    .context("write guest terminal output")?;
+                stdout
+                    .flush()
+                    .await
+                    .context("flush guest terminal output")?;
             }
             ExecutionEvent::Stderr(data) => {
                 stderr
@@ -185,6 +245,60 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
         }
     }
     eyre::bail!("guest command ended without a terminal result")
+}
+
+async fn read_host_input(
+    input: &mut Option<libvm::host_input::HostInput>,
+) -> std::io::Result<Vec<u8>> {
+    match input {
+        Some(input) => input.read().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn interactive_signals() -> impl Iterator<Item = u32> {
+    [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGWINCH,
+    ]
+    .into_iter()
+    .map(|signal| signal as u32)
+}
+
+// Host signal numbers are not Linux guest signal numbers on macOS.
+fn guest_signal(signal: u32) -> Option<u32> {
+    match signal as i32 {
+        libc::SIGHUP => Some(1),
+        libc::SIGINT => Some(2),
+        libc::SIGQUIT => Some(3),
+        libc::SIGTERM => Some(15),
+        libc::SIGUSR1 => Some(10),
+        libc::SIGUSR2 => Some(12),
+        _ => None,
+    }
+}
+
+fn current_terminal_size() -> (u16, u16) {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // nix has no safe terminal-size query.
+    if unsafe { libc::ioctl(std::io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
+        && size.ws_row > 0
+        && size.ws_col > 0
+    {
+        (size.ws_row, size.ws_col)
+    } else {
+        (24, 80)
+    }
 }
 
 pub(crate) struct HostSignals {
@@ -296,7 +410,9 @@ fn with_exec_options(
 
 #[cfg(test)]
 mod tests {
-    use crate::api::streams::{command_argv, forwardable_signals};
+    use crate::api::streams::{
+        command_argv, forwardable_signals, guest_signal, interactive_signals,
+    };
 
     #[test]
     fn command_argv_preserves_the_exact_argv_vector() {
@@ -320,5 +436,23 @@ mod tests {
         }
         assert!(signals.contains(&(libc::SIGINT as u32)));
         assert!(signals.contains(&(libc::SIGTERM as u32)));
+    }
+
+    #[test]
+    fn interactive_signals_use_linux_guest_numbers_and_keep_resize_separate() {
+        for (host, guest) in [
+            (libc::SIGHUP, 1),
+            (libc::SIGINT, 2),
+            (libc::SIGQUIT, 3),
+            (libc::SIGTERM, 15),
+            (libc::SIGUSR1, 10),
+            (libc::SIGUSR2, 12),
+        ] {
+            assert_eq!(guest_signal(host as u32), Some(guest));
+            assert!(interactive_signals().any(|signal| signal == host as u32));
+        }
+        assert_eq!(guest_signal(libc::SIGWINCH as u32), None);
+        assert!(interactive_signals().any(|signal| signal == libc::SIGWINCH as u32));
+        assert_eq!(guest_signal(libc::SIGCHLD as u32), None);
     }
 }

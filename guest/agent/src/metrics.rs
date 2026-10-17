@@ -151,15 +151,10 @@ fn parse_filesystems(text: &str) -> Vec<FilesystemMetrics> {
         let Ok(stat) = rustix::fs::statvfs(&mount) else {
             continue;
         };
-        let block_size = u64::try_from(stat.f_frsize).ok();
-        let blocks = u64::try_from(stat.f_blocks).ok();
-        let free_blocks = u64::try_from(stat.f_bfree).ok();
-        let available_blocks = u64::try_from(stat.f_bavail).ok();
-        let (Some(block_size), Some(blocks), Some(free_blocks), Some(available_blocks)) =
-            (block_size, blocks, free_blocks, available_blocks)
-        else {
-            continue;
-        };
+        let block_size = stat.f_frsize;
+        let blocks = stat.f_blocks;
+        let free_blocks = stat.f_bfree;
+        let available_blocks = stat.f_bavail;
         let (Some(total_bytes), Some(free_bytes), Some(available_bytes)) = (
             blocks.checked_mul(block_size),
             free_blocks.checked_mul(block_size),

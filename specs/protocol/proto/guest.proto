@@ -4,12 +4,14 @@ package silo.v1;
 
 import "common.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 service GuestAgentService {
   rpc GetStatus(GetAgentStatusRequest) returns (AgentStatus);
   rpc WatchStatus(WatchAgentStatusRequest) returns (stream AgentStatus);
   rpc GetMetrics(GetAgentMetricsRequest) returns (AgentMetrics);
   rpc WatchMetrics(WatchAgentMetricsRequest) returns (stream AgentMetrics);
+  rpc SyncClock(SyncClockRequest) returns (SyncClockResponse);
 }
 
 message GetAgentStatusRequest {}
@@ -22,4 +24,17 @@ message GetAgentMetricsRequest {}
 
 message WatchAgentMetricsRequest {
   google.protobuf.Duration interval = 1;
+}
+
+message SyncClockRequest {
+  // Host CLOCK_REALTIME captured immediately before the call.
+  google.protobuf.Timestamp host_time = 1;
+}
+
+message SyncClockResponse {
+  // host_time minus the guest CLOCK_REALTIME read before any step.
+  // Positive means the guest was behind the host.
+  google.protobuf.Duration offset = 1;
+  // True when the guest stepped CLOCK_REALTIME to host_time.
+  bool stepped = 2;
 }

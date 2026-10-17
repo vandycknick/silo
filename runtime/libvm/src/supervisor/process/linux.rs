@@ -1,6 +1,5 @@
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
 
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::process::{pidfd_open, PidfdFlags};
@@ -25,7 +24,7 @@ impl ProcessIdentity {
                 if pidfd_has_exited(&pidfd)? {
                     return Ok(None);
                 }
-                let Some(started_at) = process_started_at(pid)? else {
+                let Some(started_at) = utils::process::start_time(pid)? else {
                     return Ok(None);
                 };
                 Ok(Some(Self {
@@ -36,7 +35,7 @@ impl ProcessIdentity {
             }
             Err(rustix::io::Errno::SRCH) => Ok(None),
             Err(_) if pid_exists(pid)? => {
-                let Some(started_at) = process_started_at(pid)? else {
+                let Some(started_at) = utils::process::start_time(pid)? else {
                     return Ok(None);
                 };
                 Ok(Some(Self {
@@ -64,45 +63,10 @@ impl ProcessIdentity {
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
         match self.pidfd.as_ref() {
             Some(pidfd) => Ok(!pidfd_has_exited(pidfd)?),
-            None => Ok(process_started_at(self.pid)?
+            None => Ok(utils::process::start_time(self.pid)?
                 .is_some_and(|started| Some(started) == self.started_at)),
         }
     }
-}
-
-fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
-    let path = PathBuf::from("/proc").join(pid.to_string()).join("stat");
-    let stat = match std::fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let Some((_, fields)) = stat.rsplit_once(") ") else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("parse process stat {}", path.display()),
-        ));
-    };
-    if matches!(fields.split_whitespace().next(), Some("Z" | "X")) {
-        return Ok(None);
-    }
-    let started_at = fields
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("process stat {} has no start time", path.display()),
-            )
-        })?
-        .parse::<i64>()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("parse process start time {}: {error}", path.display()),
-            )
-        })?;
-    Ok(Some(started_at))
 }
 
 fn pidfd_has_exited(pidfd: &OwnedFd) -> io::Result<bool> {

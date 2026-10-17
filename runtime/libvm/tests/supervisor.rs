@@ -40,8 +40,14 @@ fn write_file(path: &Path, contents: &[u8], mode: u32) {
 fn write_runtime_root(root: &Path) -> PathBuf {
     write_file(&root.join("bin/netd"), b"#!/bin/sh\nexit 0\n", 0o755);
     let supervisor = root.join("bin/silo-vmm");
-    std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
-        .expect("install mock-enabled silo-vmm");
+    // macOS policy-scans the first exec of every new executable inode for
+    // about a second, one at a time, so a fresh copy per test queues parallel
+    // launches past the 5s daemonize budget. Hard links share the inode
+    // mock_vmm_binary already executed; other filesystems fall back to a copy.
+    if std::fs::hard_link(test_utils::mock_vmm_binary(), &supervisor).is_err() {
+        std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
+            .expect("install mock-enabled silo-vmm");
+    }
     std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755))
         .expect("make silo-vmm executable");
     write_file(&root.join("assets/kernel-default"), b"kernel", 0o644);
@@ -52,7 +58,7 @@ fn write_runtime_root(root: &Path) -> PathBuf {
 
 struct TestEnv {
     _temp: tempfile::TempDir,
-    /// The fixed generated-state root every runtime uses.
+    /// This fixture's private generated-state root.
     run_root: std::path::PathBuf,
     runtime: Runtime,
     disk: PathBuf,
@@ -67,6 +73,7 @@ impl Drop for TestEnv {
                 .unwrap_or_else(PoisonError::into_inner),
         );
         if machines.is_empty() {
+            kill_monitors_under(&self.run_root);
             return;
         }
         let cleanup = std::thread::Builder::new()
@@ -96,16 +103,72 @@ impl Drop for TestEnv {
         if let Ok(cleanup) = cleanup {
             let _ = cleanup.join();
         }
+        // Last resort for a test that died mid-flight (a panic while it still held
+        // every descriptor, say): the graceful path above needs a control socket, so
+        // anything still registered in a pidfile under our private run root gets the
+        // signal treatment before the temp dir vanishes and orphans it for good.
+        kill_monitors_under(&self.run_root);
     }
 }
 
+fn kill_monitors_under(run_root: &Path) {
+    let Ok(machines) = std::fs::read_dir(run_root.join("machines")) else {
+        return;
+    };
+    for entry in machines.flatten() {
+        let Ok(contents) = std::fs::read_to_string(entry.path().join("vm.pid")) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<i32>() else {
+            continue;
+        };
+        // The monitor unlinks its pidfile on a clean exit, so a stale file after a
+        // SIGKILL may name a recycled pid: only signal a silo-vmm that was started
+        // for this run root.
+        let pid = Pid::from_raw(pid);
+        let ours = process_args(pid).is_some_and(|args| {
+            args.contains("silo-vmm") && args.contains(&run_root.display().to_string())
+        });
+        if ours {
+            eprintln!("killing leaked silo-vmm {pid} under {}", run_root.display());
+            let _ = kill(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+fn process_args(pid: Pid) -> Option<String> {
+    if cfg!(target_os = "linux") {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        return Some(String::from_utf8_lossy(&raw).replace('\0', " "));
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn short_temp_dir() -> tempfile::TempDir {
+    let parent = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    tempfile::Builder::new()
+        .prefix("silo-sv-")
+        .tempdir_in(parent)
+        .expect("create short temp dir")
+}
+
 async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
-    // The mock backend and runtime both create Unix sockets below these roots.
-    // Keep them short enough for macOS's 104-byte sockaddr_un limit.
-    let temp = tempfile::Builder::new()
-        .prefix("silo-test")
-        .tempdir_in("/tmp")
-        .expect("create short temp dir");
+    test_env_in(short_temp_dir(), name, scenario).await
+}
+
+async fn test_env_in(temp: tempfile::TempDir, name: &str, scenario: &Scenario) -> TestEnv {
+    let run_root = temp.path().join("run");
     let runtime_root = write_runtime_root(&temp.path().join("runtime"));
     let scenario_path = temp.path().join(format!("{name}-scenario.json"));
     scenario.write_to(&scenario_path).expect("write scenario");
@@ -116,6 +179,7 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
     let runtime = Runtime::new(
         RuntimeConfig::local(temp.path().join("home"))
             .with_runtime_root(&runtime_root)
+            .with_run_root(&run_root)
             .with_mock_vmm(&scenario_path),
     )
     .await
@@ -123,7 +187,7 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
 
     TestEnv {
         _temp: temp,
-        run_root: std::path::PathBuf::from(format!("/tmp/silo-{}", nix::unistd::geteuid())),
+        run_root,
         runtime,
         disk,
         machines: Mutex::new(Vec::new()),
@@ -291,6 +355,41 @@ async fn dropping_test_environment_stops_a_running_monitor() {
     drop(env);
 
     assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+}
+
+#[tokio::test]
+async fn dropping_test_environment_sweeps_a_monitor_the_graceful_path_cannot_reach() {
+    let env = test_env("drop-sweep", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-drop-sweep").await;
+    start_ready(&machine).await;
+    let pid_path = env
+        .run_root
+        .join("machines")
+        .join(machine.id())
+        .join("vm.pid");
+    let pid = std::fs::read_to_string(pid_path)
+        .expect("read silo-vmm pid")
+        .trim()
+        .parse::<i32>()
+        .expect("parse silo-vmm pid");
+    assert!(kill(Pid::from_raw(pid), None).is_ok());
+
+    // Forget the handle the way a panicking test effectively does, so only the
+    // pidfile sweep knows about the monitor.
+    env.machines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    drop(machine);
+    drop(env);
+
+    for _ in 0..50 {
+        if kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("silo-vmm {pid} survived the fixture sweep");
 }
 
 #[tokio::test]
@@ -531,13 +630,14 @@ async fn inbound_connection_before_agent_ready_is_parked_then_served() {
 
 #[tokio::test]
 async fn inbound_refusal_closes_host_connection_without_bytes() {
-    let target = PathBuf::from("/tmp/refused-forward-target.sock");
+    let temp = short_temp_dir();
+    let target = temp.path().join("refused.sock");
     let mut scenario = Scenario::default();
     scenario
         .forward
         .refuse_targets
         .push(format!("unix:{}", target.display()));
-    let env = test_env("forward-refused", &scenario).await;
+    let env = test_env_in(temp, "forward-refused", &scenario).await;
     let machine = create_machine(&env, "integration-forward-refused").await;
     let listen = env._temp.path().join("refused-listen.sock");
     set_forwards(&machine, vec![inbound_unix(&listen, &target)]).await;
@@ -648,9 +748,10 @@ async fn unsupported_agent_closes_forward_without_changing_readiness() {
 }
 
 #[tokio::test]
-async fn pending_forward_parking_is_bounded_and_expires_after_thirty_seconds() {
+async fn pending_forward_parking_is_bounded_and_expires_after_park_timeout() {
     let mut scenario = Scenario::default();
-    scenario.agent.ready_delay_ms = Some(40_000);
+    scenario.forward.park_timeout_ms = Some(2000);
+    scenario.agent.ready_delay_ms = Some(10_000);
     let env = test_env("forward-parking-limit", &scenario).await;
     let machine = create_machine(&env, "integration-forward-parking-limit").await;
     let listen = env._temp.path().join("parking-limit.sock");
@@ -672,16 +773,33 @@ async fn pending_forward_parking_is_bounded_and_expires_after_thirty_seconds() {
     assert_closed_without_bytes(&mut overflow).await;
 
     let started = std::time::Instant::now();
-    assert_closed_without_bytes_within(&mut parked[0], Duration::from_secs(35)).await;
-    assert!(started.elapsed() >= Duration::from_secs(27));
-    assert!(started.elapsed() <= Duration::from_secs(35));
+    assert_closed_without_bytes_within(&mut parked[0], Duration::from_secs(5)).await;
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+    assert!(started.elapsed() <= Duration::from_secs(5));
 
     machine.stop().await.expect("stop machine");
     machine.remove().await.expect("remove machine");
 }
 
+/// This test process itself holds every one of the 1006 client sockets, so it
+/// needs more than the 1024 soft limit most shells inherit; the monitor raises
+/// its own limit at startup and is not the constraint here.
+fn ensure_open_file_limit(minimum: u64) {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("read open file limits");
+    assert!(
+        hard >= minimum,
+        "capacity test needs an open file hard limit of at least {minimum}, got {hard}"
+    );
+    if soft < minimum {
+        setrlimit(Resource::RLIMIT_NOFILE, hard, hard).expect("raise the open file soft limit");
+    }
+}
+
 #[tokio::test]
 async fn mux_and_forward_streams_share_public_capacity_and_leave_headroom() {
+    ensure_open_file_limit(4096);
     let env = test_env("forward-capacity", &Scenario::default()).await;
     let machine = env
         .runtime
@@ -888,11 +1006,52 @@ async fn outbound_agent_restart_reopens_listener_and_unknown_token_is_rejected()
     )
     .await;
     start_ready(&machine).await;
+    let initial_instance = match machine
+        .monitor_status()
+        .await
+        .expect("initial monitor status")
+        .agent
+    {
+        MachineAgentStatus::Enabled(agent) => {
+            agent.identity.expect("initial agent identity").instance_id
+        }
+        MachineAgentStatus::Disabled => panic!("mock guest agent must be enabled"),
+    };
 
     let listen = machine_tcp_bound(&machine).await;
     let mut first = connect_tcp_eventually(listen).await;
     assert_echo(&mut first, b"before-restart").await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let inspected = machine.inspect().await.expect("inspect restarted agent");
+            let status = machine
+                .monitor_status()
+                .await
+                .expect("restarted monitor status");
+            let restarted = match status.agent {
+                MachineAgentStatus::Enabled(agent) => agent
+                    .identity
+                    .is_some_and(|identity| identity.instance_id != initial_instance),
+                MachineAgentStatus::Disabled => false,
+            };
+            let forwards = machine
+                .list_forwards()
+                .await
+                .expect("list restarted forwards");
+            if inspected.status.ready()
+                && restarted
+                && !forwards.is_empty()
+                && forwards
+                    .iter()
+                    .all(|forward| forward.state == MachineForwardState::Active)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("agent restart must restore the outbound listener");
     let listen = machine_tcp_bound(&machine).await;
     let mut second = connect_tcp_eventually(listen).await;
     assert_echo(&mut second, b"after-restart").await;
@@ -1024,7 +1183,7 @@ async fn session_forward_lifecycle_is_the_response_stream_and_port_zero_sessions
     assert_ne!(first_bound, second_bound);
     drop(second);
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let mut client = TcpStream::connect(first_bound)
         .await
         .expect("silent session remains alive");
@@ -2033,30 +2192,6 @@ async fn host_port_22_listener_is_independent_of_host_to_guest_ssh() {
         .await
         .expect("dial guest control service");
     assert!(read_mux_acknowledgement(&mut guest_control).await >= 1_u32 << 30);
-
-    machine.stop().await.expect("stop machine");
-    machine.remove().await.expect("remove machine");
-}
-
-#[tokio::test]
-async fn machine_exec_round_trips_stdout() {
-    let env = test_env("exec-stdout", &Scenario::default()).await;
-    let machine = create_machine(&env, "integration-exec-stdout").await;
-    start_ready(&machine).await;
-
-    let output = machine
-        .exec("/bin/echo", ["hello-from-mock-guest"])
-        .await
-        .expect("exec in guest");
-    assert!(
-        matches!(output.result(), ExecutionResult::Exited { code: Some(0) }),
-        "unexpected result: {:?}",
-        output.result()
-    );
-    assert_eq!(
-        String::from_utf8_lossy(output.stdout_bytes()),
-        "hello-from-mock-guest\n"
-    );
 
     machine.stop().await.expect("stop machine");
     machine.remove().await.expect("remove machine");

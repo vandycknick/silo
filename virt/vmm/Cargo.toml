@@ -31,7 +31,7 @@ eyre = "0.6.12"
 futures = "0.3.33"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 libc = "0.2.189"
-nix = { version = "0.31.3", features = ["dir", "signal", "fs", "socket", "uio", "process", "term", "user", "poll"] }
+nix = { version = "0.31.3", features = ["dir", "signal", "fs", "socket", "uio", "process", "term", "user", "poll", "resource"] }
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 bytes = "1.12.1"
 prost-types = "0.14.4"
@@ -47,6 +47,7 @@ tonic-reflection = { version = "0.14.6", features = ["server"] }
 tower = { version = "0.5.3", features = ["util"] }
 thiserror = "2.0.19"
 tracing = "0.1.44"
+russh = "0.62.4"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }

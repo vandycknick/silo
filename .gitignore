@@ -80,6 +80,8 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+sdk/node/coverage/
+*.profraw
 *.cover
 *.py,cover
 .hypothesis/

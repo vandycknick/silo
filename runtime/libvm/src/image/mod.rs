@@ -11,6 +11,7 @@ use crate::LibVmError;
 
 pub use ::oci::ImageConfig as OciImageConfigMetadata;
 pub use ::oci::Platform;
+pub use ::oci::{RegistryAction, RegistryPolicy, RegistryRule};
 pub use progress::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 
 /// Source used to create a machine root disk.

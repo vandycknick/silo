@@ -8,10 +8,10 @@ use crate::image::{
     oci::{cached_resolved_oci_image, image_error, resolve_oci_image_from_registry},
     ImagePullPolicy, ResolvedOciImage,
 };
-use crate::machine::generate_machine_name;
 use crate::runtime::RuntimeConfig;
 use crate::store::ReadOnlyStore;
 use crate::LibVmError;
+use crate::RegistryPolicy;
 
 /// Read-only runtime facilities used to build a creation plan.
 ///
@@ -21,6 +21,7 @@ use crate::LibVmError;
 pub struct ReadOnlyRuntime {
     home: PathBuf,
     store: Option<ReadOnlyStore>,
+    registry_policy: RegistryPolicy,
 }
 
 impl ReadOnlyRuntime {
@@ -33,7 +34,11 @@ impl ReadOnlyRuntime {
                 crate::runtime::config::validate_db_config(&stored)?;
             }
         }
-        Ok(Self { home, store })
+        Ok(Self {
+            home,
+            store,
+            registry_policy: config.registry_policy,
+        })
     }
 
     /// Checks whether a machine name is free without reserving it.
@@ -46,7 +51,7 @@ impl ReadOnlyRuntime {
 
     /// Generates a proposed name without reserving it.
     pub fn propose_machine_name(&self) -> Result<String, LibVmError> {
-        generate_machine_name()
+        crate::planning::propose_machine_name()
     }
 
     /// Resolves OCI metadata without writing cache or durable state.
@@ -55,7 +60,7 @@ impl ReadOnlyRuntime {
         reference: String,
         policy: ImagePullPolicy,
     ) -> Result<ResolvedOciImage, LibVmError> {
-        let store = RootfsImageStore::open(self.home.join("images"))
+        let store = RootfsImageStore::open(self.home.join("images"), self.registry_policy.clone())
             .map_err(|error| image_error(&reference, error))?;
         let options =
             MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?;

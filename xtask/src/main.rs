@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::components::{
-    build_all, build_component, clippy, format, test_integration, test_units, BuildContext,
-    Component,
+    build_all, build_component, clippy, format, test_all, test_integration, test_units,
+    BuildContext, Component,
 };
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel::KernelOptions;
@@ -18,11 +18,13 @@ mod app;
 mod archive;
 mod command;
 mod components;
+mod coverage;
 mod go_sdk;
 mod initramfs;
 mod kernel;
 mod macos;
 mod profiles;
+mod protocol_go;
 mod release;
 mod rprobe;
 mod runtime;
@@ -67,6 +69,8 @@ enum Commands {
         rprobe: RprobeAssetOptions,
     },
     Archive {
+        #[arg(long)]
+        runtime_only: bool,
         #[command(flatten)]
         kernel: KernelOptions,
         #[command(flatten)]
@@ -111,9 +115,31 @@ enum Commands {
     Fmt,
     Clippy,
     Test,
+    Coverage,
+    CoverageDiff {
+        #[arg(long, value_name = "PATH")]
+        baseline: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        current: PathBuf,
+        #[arg(long, value_name = "NAME")]
+        allow_missing_lane: Vec<String>,
+    },
     TestUnit,
     TestIntegration,
     VersionCheck,
+    ProtocolGo {
+        #[arg(long)]
+        check: bool,
+    },
+    RuntimeArchive {
+        #[arg(long, value_enum, default_value_t = Profile::Release)]
+        profile: Profile,
+    },
+    PortableArchive,
+    QualifyGoBridge {
+        #[arg(long, value_enum, default_value_t = Profile::Release)]
+        profile: Profile,
+    },
     AssembleGoSdk {
         #[arg(long, value_name = "PATH")]
         packages_root: Option<PathBuf>,
@@ -227,7 +253,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &rprobe,
             )?;
         }
-        Commands::Archive { kernel, rprobe } => {
+        Commands::Archive {
+            kernel,
+            rprobe,
+            runtime_only,
+        } => {
+            version::check(&workspace_root)?;
             build_release_or_development(
                 &workspace_root,
                 &target_dir,
@@ -236,7 +267,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 true,
                 &rprobe,
             )?;
-            archive::produce(&workspace_root, &target_dir)?;
+            archive::produce_runtime(&workspace_root, &target_dir, Profile::Release)?;
+            let context = build_context(&workspace_root, &target_dir, Profile::Release)?;
+            go_sdk::qualify_bridge(&context)?;
+            if !runtime_only {
+                archive::produce_portable(&workspace_root, &target_dir)?;
+            }
         }
         Commands::App {
             build_number,
@@ -325,9 +361,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Commands::Test => {
             let host = HostTarget::current()?;
-            test_units(&workspace_root, &target_dir, host)?;
-            test_integration(&workspace_root, &target_dir, host)?;
+            test_all(&workspace_root, &target_dir, host)?;
         }
+        Commands::Coverage => {
+            let host = HostTarget::current()?;
+            coverage::collect::coverage(&workspace_root, &target_dir, host)?;
+        }
+        Commands::CoverageDiff {
+            baseline,
+            current,
+            allow_missing_lane,
+        } => coverage::diff::coverage_diff(&baseline, &current, &allow_missing_lane)?,
         Commands::TestUnit => {
             let host = HostTarget::current()?;
             test_units(&workspace_root, &target_dir, host)?;
@@ -337,6 +381,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             test_integration(&workspace_root, &target_dir, host)?;
         }
         Commands::VersionCheck => version::check(&workspace_root)?,
+        Commands::ProtocolGo { check } => protocol_go::generate(&workspace_root, check)?,
+        Commands::RuntimeArchive { profile } => {
+            archive::produce_runtime(&workspace_root, &target_dir, profile)?
+        }
+        Commands::PortableArchive => archive::produce_portable(&workspace_root, &target_dir)?,
+        Commands::QualifyGoBridge { profile } => {
+            go_sdk::qualify_bridge(&build_context(&workspace_root, &target_dir, profile)?)?;
+        }
         Commands::AssembleGoSdk { packages_root } => {
             let packages_root = packages_root
                 .map(|path| {
@@ -364,7 +416,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &rprobe,
             )?;
             let context = build_context(&workspace_root, &target_dir, profile)?;
-            build_component(Component::GoFfi, &context)?;
             go_sdk::run_example(&context, &example)?;
         }
         Commands::PackInitramfs { init, out } => {

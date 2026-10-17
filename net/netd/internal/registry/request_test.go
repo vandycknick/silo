@@ -6,6 +6,7 @@ import (
 )
 
 func TestClassifyNPMRequests(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		path    string
 		kind    RequestKind
@@ -28,9 +29,11 @@ func TestClassifyNPMRequests(t *testing.T) {
 			t.Errorf("ClassifyRequest(%q) = %#v", test.path, classified)
 		}
 	}
+
 }
 
 func TestClassifyPyPIRequests(t *testing.T) {
+	t.Parallel()
 	metadata := ClassifyRequest(http.MethodGet, "pypi.org", "/simple/Foo_Bar/")
 	if metadata.Kind != RequestMetadata || metadata.Name != "foo-bar" || metadata.Ecosystem != EcosystemPyPI {
 		t.Fatalf("metadata request = %#v", metadata)
@@ -51,4 +54,5 @@ func TestClassifyPyPIRequests(t *testing.T) {
 	if latest.Kind != RequestUnknown {
 		t.Fatalf("latest artifact request = %#v", latest)
 	}
+
 }

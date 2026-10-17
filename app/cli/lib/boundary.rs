@@ -30,7 +30,10 @@ mod tests {
                 .strip_prefix(&source_root)
                 .expect("source path is below CLI library root");
             let relative = relative.to_string_lossy();
+            // `api/` is the command-side boundary; `daemon/` is the daemon itself,
+            // which owns the runtime the API talks to.
             if relative.starts_with("api/")
+                || relative.starts_with("daemon/")
                 || relative == "boundary.rs"
                 || allowed.contains(relative.as_ref())
             {

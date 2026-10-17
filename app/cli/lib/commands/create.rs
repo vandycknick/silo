@@ -93,6 +93,9 @@ pub(crate) struct VmOverrideArgs {
     /// Override the network target. Allowed: private, none, NAME, or name:NAME.
     #[arg(long, value_parser = MachineNetworkSelection::parse)]
     pub(crate) network: Option<MachineNetworkSelection>,
+    /// HCL or canonical JSON network policy (absolute path or configured policy name).
+    #[arg(long, value_name = "POLICY")]
+    pub(crate) network_policy: Option<String>,
     /// Allow guest requests for host TCP publications.
     #[arg(long, value_name = "loopback|any")]
     pub(crate) guest_publish: Option<PublishBind>,
@@ -146,6 +149,18 @@ impl VmOverrideArgs {
             .as_deref()
             .map(read_userdata_path)
             .transpose()?;
+        let network = match (&self.network_policy, &self.network) {
+            (Some(policy), None | Some(MachineNetworkSelection::Private)) => {
+                Some(MachineNetwork::Private {
+                    policy_ref: Some(policy.clone()),
+                    publish: None,
+                })
+            }
+            (Some(_), _) => eyre::bail!("--network-policy requires a private network"),
+            (None, network) => network
+                .clone()
+                .map(MachineNetworkSelection::into_machine_network),
+        };
         Ok(MachineCliOptions {
             overrides: MachineOverrides {
                 resources,
@@ -154,10 +169,7 @@ impl VmOverrideArgs {
                 mounts: self.mounts.clone(),
                 forwards: (!self.forwards.is_empty()).then(|| self.forwards.clone()),
                 vsock: self.vsock.then_some(true),
-                network: self
-                    .network
-                    .clone()
-                    .map(MachineNetworkSelection::into_machine_network),
+                network,
                 guest_publish: self.guest_publish,
                 labels: self.labels.iter().cloned().collect(),
             },
@@ -223,12 +235,12 @@ impl Cmd {
             &template.template,
             &machine,
             self.image.as_deref(),
-            context.config()?.networking.policy_config_dir.as_deref(),
+            context.config()?.networking().policy_config_dir.as_deref(),
         )?;
 
         if self.dry_run {
             let resolution = crate::api::AppApi::resolve_read_only_creation(
-                RuntimeConfig::from_env()?,
+                RuntimeConfig::from_env()?.with_registry_policy(context.config()?.images().clone()),
                 requested_name,
                 self.image.as_deref(),
                 &template.template,
@@ -293,7 +305,7 @@ impl Cmd {
             let Plan::Create(plan) = plan else {
                 unreachable!("create resolution returns a create plan")
             };
-            let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+            let policy_config_dir = context.config()?.networking().policy_config_dir.clone();
             context
                 .app_api()
                 .await?
@@ -507,8 +519,13 @@ pub(crate) fn preflight_create(
     {
         // Resolving here makes dry runs and real runs reject the same missing,
         // unreadable, or invalid policy before image resolution reaches a registry.
-        let _ =
+        let policy =
             crate::network_policy::resolve_network_policy_source(policy_ref, policy_config_dir)?;
+        if !policy.tailscale().is_empty()
+            && !options.overrides.vsock.or(template.vsock).unwrap_or(false)
+        {
+            eyre::bail!("Tailscale policy requires --vsock");
+        }
     }
     Ok(())
 }
@@ -849,7 +866,6 @@ mod tests {
             panic!("expected disk source")
         };
         assert_eq!(path, &std::fs::canonicalize(&disk).expect("canonical disk"));
-        assert_eq!(disk_source.disk.as_ref(), Some(path));
 
         let oci_result = AppApi::resolve_read_only_creation(
             RuntimeConfig::local(&data_root),

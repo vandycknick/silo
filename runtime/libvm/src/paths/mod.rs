@@ -5,7 +5,7 @@ mod machine;
 mod network;
 mod owned;
 
-pub(crate) use defaults::{default_run_root, ensure_run_root, resolve_default_home};
+pub(crate) use defaults::{absolute_path, default_run_root, ensure_run_root, resolve_default_home};
 pub use host::HostPaths;
 pub(crate) use local::{LocalPaths, LocalRoots};
 pub(crate) use machine::{

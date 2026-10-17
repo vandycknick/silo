@@ -72,10 +72,10 @@ pub(crate) fn main() -> eyre::Result<()> {
                 },
                 vsock_mux: mux,
             },
-            |control| {
+            |_control| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
-                    let shutdown = control.clone();
+                    let shutdown = _control.clone();
                     std::thread::Builder::new()
                         .name("krun-shutdown".to_string())
                         .spawn(move || match shutdown_signals.wait() {
@@ -89,9 +89,7 @@ pub(crate) fn main() -> eyre::Result<()> {
                         })?;
                 }
                 #[cfg(target_os = "macos")]
-                start_status_reporter(events.clone(), control)?;
-                #[cfg(not(target_os = "macos"))]
-                drop(control);
+                start_status_reporter(events.clone(), _control)?;
                 emit(&events, &Event::BackendStarted {})?;
                 stage = StartupStage::Started;
                 Ok(())

@@ -3,12 +3,11 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::{fcntl, open, openat, FcntlArg, OFlag};
 use nix::sys::stat::{fchmod, fstat, mkdirat, Mode, SFlag};
-use nix::unistd::{ftruncate, geteuid};
+use nix::unistd::{ftruncate, geteuid, mkdir};
 
 use crate::LibVmError;
 
@@ -21,11 +20,10 @@ pub(crate) struct OwnedDirectory {
 }
 
 impl OwnedDirectory {
-    /// Duplicates this validated directory for inheritance by one child process.
+    /// Duplicates this directory, keeping CLOEXEC until cleared in the child.
     pub(crate) fn duplicate_inheritable(&self) -> Result<OwnedFd, LibVmError> {
-        let fd =
-            fcntl(&self.fd, FcntlArg::F_DUPFD(3)).map_err(|error| invalid(&self.path, error))?;
-        // F_DUPFD returns a newly owned descriptor without FD_CLOEXEC.
+        let fd = fcntl(&self.fd, FcntlArg::F_DUPFD_CLOEXEC(3))
+            .map_err(|error| invalid(&self.path, error))?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
@@ -35,12 +33,9 @@ impl OwnedDirectory {
             .ok_or_else(|| invalid(path, "has no parent directory"))?;
         fs::create_dir_all(parent).map_err(|error| invalid(path, error))?;
 
-        let created = match fs::DirBuilder::new()
-            .mode(u32::from(PRIVATE_DIRECTORY_MODE.bits()))
-            .create(path)
-        {
+        let created = match mkdir(path, PRIVATE_DIRECTORY_MODE) {
             Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(nix::errno::Errno::EEXIST) => false,
             Err(error) => return Err(invalid(path, error)),
         };
         let fd = open_directory(path)?;
@@ -413,6 +408,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let root_path = temp.path().join("state");
         let root = OwnedDirectory::open_root(&root_path).expect("create owned root");
+        let duplicate = root.duplicate_inheritable().expect("duplicate directory");
+        let flags = nix::fcntl::fcntl(&duplicate, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(
+            nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
         let logs = root.ensure_dir("logs").expect("create logs directory");
         let machine = logs
             .ensure_dir("machine-id")

@@ -10,7 +10,7 @@ use vm_spec::Mount;
 use crate::buffer::SiloBuffer;
 use crate::dto;
 use crate::error::{catch_ffi, error_from_libvm, invalid_argument, SiloError};
-use crate::handles::{MachineHandle, RuntimeHandle};
+use crate::handles::{MachineHandle, NodeStateLeaseHandle, RuntimeHandle};
 use crate::runtime::request_bytes;
 
 #[derive(Deserialize)]
@@ -41,6 +41,163 @@ struct MachineCreateRequest {
     forwards: Vec<libvm::Forward>,
     vsock: Option<bool>,
     network: Option<NetworkRequest>,
+    guest_user: Option<GuestUserRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestUserRequest {
+    name: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+}
+
+impl GuestUserRequest {
+    fn into_config(self) -> libvm::MachineUserConfig {
+        libvm::MachineUserConfig::new(self.name, self.uid, self.gid, self.home)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineUpdateRequest {
+    name: Option<String>,
+    labels: Option<BTreeMap<String, String>>,
+    cpus: Option<u8>,
+    memory_bytes: Option<u64>,
+    root_disk_size_bytes: Option<u64>,
+    nested_virtualization: Option<bool>,
+    rosetta: Option<bool>,
+    forwards: Option<Vec<libvm::Forward>>,
+    vsock: Option<bool>,
+    network: Option<NetworkRequest>,
+    policy_json: Option<String>,
+    #[serde(default)]
+    clear_policy: bool,
+    guest_user: Option<GuestUserRequest>,
+    #[serde(default)]
+    clear_guest_user: bool,
+    guest_agent: Option<GuestAgentRequest>,
+    publish: Option<libvm::GuestPublish>,
+    #[serde(default)]
+    clear_publish: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum GuestAgentRequest {
+    Default {},
+    Custom { path: String },
+    Disabled {},
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopRequest {
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_machine_update(
+    machine: *const MachineHandle,
+    request_ptr: *const u8,
+    request_len: usize,
+    out_data: *mut SiloBuffer,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        let request: MachineUpdateRequest =
+            serde_json::from_slice(request_bytes(request_ptr, request_len)?)
+                .map_err(|error| invalid_argument(format!("decode machine update: {error}")))?;
+        if request.clear_policy && request.policy_json.is_some()
+            || request.clear_guest_user && request.guest_user.is_some()
+            || request.clear_publish && request.publish.is_some()
+        {
+            return Err(invalid_argument("set and clear cannot be combined"));
+        }
+        let mut update = libvm::MachineUpdate::new();
+        update.name = request.name;
+        update.labels = request.labels;
+        update.cpus = request.cpus;
+        update.memory = request.memory_bytes.map(Memory::bytes);
+        update.root_disk_size = request.root_disk_size_bytes;
+        update.nested_virtualization = request.nested_virtualization;
+        update.rosetta = request.rosetta;
+        update.forwards = request.forwards;
+        update.vsock = request
+            .vsock
+            .map(|enabled| vm_spec::Vsock { enabled, uds: None });
+        if let Some(network) = request.network {
+            let parsed = parse_network(network)?;
+            update = update.network(|builder| parsed.apply(builder));
+        }
+        if let Some(json) = request.policy_json {
+            update = update.set_network_policy(
+                NetworkPolicy::from_json_str(&json)
+                    .map_err(|error| invalid_argument(error.to_string()))?,
+            );
+        }
+        if request.clear_policy {
+            update = update.clear_network_policy();
+        }
+        if let Some(user) = request.guest_user {
+            update = update.user(user.into_config());
+        }
+        if request.clear_guest_user {
+            update = update.clear_user();
+        }
+        if let Some(agent) = request.guest_agent {
+            update = update.guest(|guest| match agent {
+                GuestAgentRequest::Default {} => guest,
+                GuestAgentRequest::Custom { path } => guest.agent(Some(PathBuf::from(path))),
+                GuestAgentRequest::Disabled {} => guest.agent(None),
+            });
+        }
+        if let Some(publish) = request.publish {
+            update = update.publish(Some(publish.bind));
+        }
+        if request.clear_publish {
+            update = update.publish(None);
+        }
+        let result = machine_data_operation(machine, out_data, |machine| async move {
+            machine.update(update).await
+        });
+        if result.is_null() {
+            Ok(())
+        } else {
+            Err(result)
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_machine_stop_with(
+    machine: *const MachineHandle,
+    request_ptr: *const u8,
+    request_len: usize,
+    out_data: *mut SiloBuffer,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        let request: StopRequest = serde_json::from_slice(request_bytes(request_ptr, request_len)?)
+            .map_err(|error| invalid_argument(format!("decode stop options: {error}")))?;
+        let mut options = libvm::MachineStopOptions::new();
+        if let Some(ms) = request.timeout_ms {
+            options = options.timeout(std::time::Duration::from_millis(ms));
+        }
+        if request.force {
+            options = options.force_after_timeout(std::time::Duration::from_secs(10));
+        }
+        let result = machine_data_operation(machine, out_data, |machine| async move {
+            machine.stop_with(options).await
+        });
+        if result.is_null() {
+            Ok(())
+        } else {
+            Err(result)
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -139,6 +296,36 @@ pub unsafe extern "C" fn silo_machine_start(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn silo_machine_lease_node_state(
+    machine: *const MachineHandle,
+    out_lease: *mut *mut NodeStateLeaseHandle,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        let machine = machine
+            .as_ref()
+            .ok_or_else(|| invalid_argument("machine must not be null"))?;
+        if out_lease.is_null() {
+            return Err(invalid_argument("out_lease must not be null"));
+        }
+        *out_lease = ptr::null_mut();
+        let lease = machine
+            .context
+            .tokio
+            .block_on(machine.machine.lease_node_state())
+            .map_err(error_from_libvm)?;
+        *out_lease = Box::into_raw(Box::new(NodeStateLeaseHandle { _lease: lease }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_node_state_lease_free(lease: *mut NodeStateLeaseHandle) {
+    if !lease.is_null() {
+        drop(Box::from_raw(lease));
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn silo_machine_stop(
     machine: *const MachineHandle,
     out_data: *mut SiloBuffer,
@@ -186,7 +373,8 @@ where
             .tokio
             .block_on(operation(machine.machine.clone()))
             .map_err(error_from_libvm)?;
-        let data = serde_json::to_vec(&dto::machine_data(data))
+        let data = dto::machine_data(data).map_err(error_from_libvm)?;
+        let data = serde_json::to_vec(&data)
             .map_err(|error| SiloError::new("Serialization", error.to_string()))?;
         *out_data = SiloBuffer::from_vec(data);
         Ok(())
@@ -218,7 +406,18 @@ fn apply_create_request(
         builder = builder.initramfs(initramfs);
     }
     if request.agent_set {
-        builder = builder.guest(|guest| guest.agent(request.agent_path.map(PathBuf::from)));
+        builder = builder.guest(|guest| guest.agent(request.agent_path.clone().map(PathBuf::from)));
+    }
+    if let Some(user) = request.guest_user {
+        let user = user.into_config();
+        builder = builder.guest(|guest| {
+            let guest = guest.user(user);
+            if request.agent_set {
+                guest.agent(request.agent_path.map(PathBuf::from))
+            } else {
+                guest
+            }
+        });
     }
     if let Some(bytes) = request.root_disk_size_bytes {
         builder = builder.root_disk_size(bytes);
@@ -310,6 +509,32 @@ fn parse_network(network: NetworkRequest) -> Result<ParsedNetwork, *mut SiloErro
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_and_stop_requests_preserve_zero_and_reject_unknown_fields() {
+        let request: crate::machine::MachineUpdateRequest =
+            serde_json::from_str(r#"{"cpus":0,"vsock":false,"labels":{},"forwards":[]}"#).unwrap();
+        assert_eq!(request.cpus, Some(0));
+        assert_eq!(request.vsock, Some(false));
+        assert_eq!(request.labels.unwrap().len(), 0);
+        assert_eq!(request.forwards.unwrap().len(), 0);
+        for json in [
+            r#"{"unknown":true}"#,
+            r#"{"guest_user":{"name":"silo","uid":1000,"gid":1000,"home":"/home/silo","unknown":true}}"#,
+            r#"{"network":{"kind":"private","unknown":true}}"#,
+            r#"{"guest_agent":{"mode":"disabled","unknown":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<crate::machine::MachineUpdateRequest>(json).is_err());
+        }
+        assert!(
+            serde_json::from_str::<crate::machine::StopRequest>(r#"{"timeout_ms":0,"force":true}"#)
+                .unwrap()
+                .force
+        );
+        assert!(serde_json::from_str::<crate::machine::StopRequest>(
+            r#"{"force":true,"unknown":true}"#
+        )
+        .is_err());
+    }
     use std::ptr;
 
     use crate::machine::silo_machine_id;

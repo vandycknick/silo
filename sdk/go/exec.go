@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"maps"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vandycknick/silo/sdk/go/internal/ffi"
@@ -23,9 +26,30 @@ type execConfig struct {
 	Stdin          []byte            `json:"stdin,omitempty"`
 	PipeStdin      bool              `json:"pipe_stdin"`
 	TTY            *bool             `json:"tty,omitempty"`
+	Term           *string           `json:"term,omitempty"`
+	InitialPTYSize *ptySizeWire      `json:"initial_pty_size,omitempty"`
 	error          error
 }
 type ExecOption func(*execConfig)
+
+type ptySizeWire struct {
+	Rows    uint16 `json:"rows"`
+	Columns uint16 `json:"columns"`
+}
+
+func WithExecTerm(term string) ExecOption {
+	return func(c *execConfig) { c.Term = &term }
+}
+
+func WithExecInitialPTYSize(rows, columns uint16) ExecOption {
+	return func(c *execConfig) {
+		if rows == 0 || columns == 0 {
+			c.error = newError(ErrorInvalidArgument, "", "PTY rows and columns must be positive")
+			return
+		}
+		c.InitialPTYSize = &ptySizeWire{Rows: rows, Columns: columns}
+	}
+}
 
 func WithExecAdditionalArgs(args ...string) ExecOption {
 	return func(c *execConfig) { c.AdditionalArgs = append([]string(nil), args...) }
@@ -77,7 +101,10 @@ func executionRequest(program string, args []string, opts []ExecOption) ([]byte,
 	if program == "" {
 		return nil, newError(ErrorInvalidArgument, "", "program must not be empty")
 	}
-	config := execConfig{Program: program, Args: append([]string(nil), args...), Env: map[string]string{}}
+	return configuredExecutionRequest(execConfig{Program: program, Args: append([]string(nil), args...), Env: map[string]string{}}, opts)
+}
+
+func configuredExecutionRequest(config execConfig, opts []ExecOption) ([]byte, error) {
 	for _, option := range opts {
 		if option == nil {
 			return nil, newError(ErrorInvalidArgument, "", "execution option must not be nil")
@@ -89,21 +116,11 @@ func executionRequest(program string, args []string, opts []ExecOption) ([]byte,
 	}
 	return json.Marshal(config)
 }
-func shellRequest(script string, opts []ExecOption) ([]byte, error) {
+func execScriptRequest(script string, opts []ExecOption) ([]byte, error) {
 	if script == "" {
 		return nil, newError(ErrorInvalidArgument, "", "script must not be empty")
 	}
-	data, err := executionRequest("shell", nil, opts)
-	if err != nil {
-		return nil, err
-	}
-	var config execConfig
-	if err = json.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-	config.Program = ""
-	config.Script = script
-	return json.Marshal(config)
+	return configuredExecutionRequest(execConfig{Script: script, Env: map[string]string{}}, opts)
 }
 
 // ExecutionOutput contains exact output bytes and the terminal execution result.
@@ -179,6 +196,8 @@ func decodeOutput(data *ffi.ExecutionOutput) (*ExecutionOutput, error) {
 	}, nil
 }
 
+// Exec collects an agent-RPC program with literal argv (no shell expansion).
+// Nonzero guest status is a result, not an error. See the README execution guide.
 func (m *Machine) Exec(ctx context.Context, program string, args []string, opts ...ExecOption) (*ExecutionOutput, error) {
 	request, err := executionRequest(program, args, opts)
 	if err != nil {
@@ -186,14 +205,18 @@ func (m *Machine) Exec(ctx context.Context, program string, args []string, opts 
 	}
 	return m.collected(ctx, request, false)
 }
-func (m *Machine) Shell(ctx context.Context, script string, opts ...ExecOption) (*ExecutionOutput, error) {
-	request, err := shellRequest(script, opts)
+
+// ExecScript collects /bin/sh -l -c SCRIPT over agent RPC, including login
+// startup files. Callers own shell-injection safety. Execution timeout applies
+// after startup, not to startup itself. See the README execution examples.
+func (m *Machine) ExecScript(ctx context.Context, script string, opts ...ExecOption) (*ExecutionOutput, error) {
+	request, err := execScriptRequest(script, opts)
 	if err != nil {
 		return nil, err
 	}
 	return m.collected(ctx, request, true)
 }
-func (m *Machine) collected(ctx context.Context, request []byte, shell bool) (*ExecutionOutput, error) {
+func (m *Machine) collected(ctx context.Context, request []byte, execScript bool) (*ExecutionOutput, error) {
 	if err := validateContext(ctx); err != nil {
 		return nil, err
 	}
@@ -204,8 +227,8 @@ func (m *Machine) collected(ctx context.Context, request []byte, shell bool) (*E
 	}
 	var data *ffi.ExecutionOutput
 	var err error
-	if shell {
-		data, err = m.native.Shell(request)
+	if execScript {
+		data, err = m.native.ExecScript(request)
 	} else {
 		data, err = m.native.Exec(request)
 	}
@@ -214,12 +237,20 @@ func (m *Machine) collected(ctx context.Context, request []byte, shell bool) (*E
 	}
 	return decodeOutput(data)
 }
+
+// Spawn opens a caller-driven agent-RPC execution stream. Observe Started before
+// querying Stdin or sending controls; Close/Cancel invalidate surviving handles.
+// WithExecTimeout does not establish a Spawn deadline. See examples/streaming.
 func (m *Machine) Spawn(ctx context.Context, program string, args []string, opts ...ExecOption) (*ExecutionSession, error) {
 	request, err := executionRequest(program, args, opts)
 	if err != nil {
 		return nil, err
 	}
-	if err = validateContext(ctx); err != nil {
+	return m.spawn(ctx, request)
+}
+
+func (m *Machine) spawn(ctx context.Context, request []byte) (*ExecutionSession, error) {
+	if err := validateContext(ctx); err != nil {
 		return nil, err
 	}
 	m.mutex.RLock()
@@ -231,16 +262,7 @@ func (m *Machine) Spawn(ctx context.Context, program string, args []string, opts
 	if err != nil {
 		return nil, fromNativeError(err)
 	}
-	stdin, err := native.Stdin()
-	if err != nil {
-		native.Close()
-		return nil, fromNativeError(err)
-	}
-	session := &ExecutionSession{native: native}
-	if stdin != nil {
-		session.stdin = &ExecutionStdin{native: stdin}
-	}
-	return session, nil
+	return &ExecutionSession{native: native}, nil
 }
 
 // ExecutionSession is a bidirectional structured execution. Recv, Wait, and Collect must not overlap.
@@ -252,9 +274,24 @@ type ExecutionSession struct {
 	receiver sync.Mutex
 }
 
+// Stdin returns pipe or PTY input after the Started event has been received.
+// Before Started (or after Close) it returns nil. It retains the same writer
+// once available; an early query does not permanently cache the absent writer.
 func (s *ExecutionSession) Stdin() *ExecutionStdin {
 	if s == nil {
 		return nil
+	}
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.closed || s.native == nil {
+		return nil
+	}
+	if s.stdin == nil {
+		stdin, err := s.native.Stdin()
+		if err != nil || stdin == nil {
+			return nil
+		}
+		s.stdin = &ExecutionStdin{native: stdin}
 	}
 	return s.stdin
 }
@@ -367,9 +404,11 @@ func (s *ExecutionSession) control(ctx context.Context, call func() error) error
 	return fromNativeError(call())
 }
 func (s *ExecutionSession) CloseRequests() error {
-	return s.control(context.Background(), s.native.CloseRequests)
+	return s.control(context.Background(), func() error { return s.native.CloseRequests() })
 }
-func (s *ExecutionSession) Cancel() error { return s.control(context.Background(), s.native.Cancel) }
+func (s *ExecutionSession) Cancel() error {
+	return s.control(context.Background(), func() error { return s.native.Cancel() })
+}
 func (s *ExecutionSession) Close() error {
 	if s == nil {
 		return nil
@@ -446,13 +485,20 @@ type sshShellConfig struct {
 	Term         string            `json:"term,omitempty"`
 	DetachKeys   string            `json:"detach_keys,omitempty"`
 	ForwardAgent *bool             `json:"forward_agent,omitempty"`
+	attachment   *SSHShellAttachment
+	detachSet    bool
 }
 type SSHShellOption func(*sshShellConfig)
 
+// WithSSHWorkingDirectory uses the quoted SSH exec wrapper with best-effort cwd.
 func WithSSHWorkingDirectory(path string) SSHShellOption {
 	return func(c *sshShellConfig) { c.CWD = path }
 }
+
+// WithSSHUser selects the SSH certificate login user instead of the durable default.
 func WithSSHUser(user string) SSHShellOption { return func(c *sshShellConfig) { c.User = user } }
+
+// WithSSHEnv uses the quoted SSH exec wrapper, not server AcceptEnv requests.
 func WithSSHEnv(env map[string]string) SSHShellOption {
 	return func(c *sshShellConfig) {
 		c.Env = maps.Clone(env)
@@ -461,37 +507,24 @@ func WithSSHEnv(env map[string]string) SSHShellOption {
 		}
 	}
 }
+
+// WithSSHTerm sets the guest PTY terminal type, including supplied attachments.
 func WithSSHTerm(term string) SSHShellOption { return func(c *sshShellConfig) { c.Term = term } }
+
+// WithSSHDetachKeys replaces local terminal escape keys; invalid with supplied I/O.
 func WithSSHDetachKeys(keys string) SSHShellOption {
-	return func(c *sshShellConfig) { c.DetachKeys = keys }
+	return func(c *sshShellConfig) { c.DetachKeys = keys; c.detachSet = true }
 }
+
+// WithSSHAgentForwarding explicitly enables forwarding of the local agent socket.
 func WithSSHAgentForwarding(enabled bool) SSHShellOption {
 	return func(c *sshShellConfig) { c.ForwardAgent = &enabled }
 }
-func (m *Machine) Attach(ctx context.Context, program string, args []string, opts ...ExecOption) (ExecutionResult, error) {
-	request, err := executionRequest(program, args, opts)
-	if err != nil {
-		return ExecutionResult{}, err
-	}
-	if err = validateContext(ctx); err != nil {
-		return ExecutionResult{}, err
-	}
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	if m.closed {
-		return ExecutionResult{}, newError(ErrorClosed, "", "machine is closed")
-	}
-	data, err := m.native.Attach(request)
-	if err != nil {
-		return ExecutionResult{}, fromNativeError(err)
-	}
-	var wire resultWire
-	if err = json.Unmarshal(data, &wire); err != nil {
-		return ExecutionResult{}, err
-	}
-	return decodeResult(wire), nil
-}
-func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHExitStatus, error) {
+
+// Shell opens a certificate-authenticated SSH login shell. By default it owns
+// local terminal I/O and scoped HUP/INT/QUIT/TERM/WINCH subscriptions. A supplied
+// attachment never touches process stdio or signal dispositions.
+func (m *Machine) Shell(ctx context.Context, opts ...SSHShellOption) (SSHExitStatus, error) {
 	if err := validateContext(ctx); err != nil {
 		return SSHExitStatus{}, err
 	}
@@ -502,6 +535,14 @@ func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHE
 		}
 		option(&config)
 	}
+	if config.attachment != nil {
+		if config.detachSet {
+			return SSHExitStatus{}, newError(ErrorInvalidArgument, "", "supplied SSH attachment cannot configure detach keys")
+		}
+		if err := validateShellAttachment(*config.attachment); err != nil {
+			return SSHExitStatus{}, err
+		}
+	}
 	request, err := json.Marshal(config)
 	if err != nil {
 		return SSHExitStatus{}, err
@@ -511,11 +552,87 @@ func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHE
 	if m.closed {
 		return SSHExitStatus{}, newError(ErrorClosed, "", "machine is closed")
 	}
-	data, err := m.native.AttachShell(request)
+	var data []byte
+	if config.attachment != nil {
+		data, err = suppliedShell(ctx, m.native, request, *config.attachment)
+	} else {
+		data, err = attachmentCall(ctx, func(token *ffi.AttachmentCancellation) ([]byte, error) {
+			return m.native.Shell(request, token, nil)
+		})
+	}
 	if err != nil {
-		return SSHExitStatus{}, fromNativeError(err)
+		return SSHExitStatus{}, err
 	}
 	var result SSHExitStatus
 	err = json.Unmarshal(data, &result)
 	return result, err
+}
+
+// Go owns the scoped process-signal subscription and forwards notifications into
+// native controls. Stop restores inherited dispositions, including SIG_IGN,
+// without affecting application subscribers or relying on cached native handlers.
+func attachmentSignals() (<-chan os.Signal, func()) {
+	notifications := make(chan os.Signal, 16)
+	signals := []os.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGWINCH}
+	signal.Notify(notifications, signals...)
+	return notifications, func() { signal.Stop(notifications) }
+}
+
+func attachmentSignalNumber(sig os.Signal) (uint32, bool) {
+	switch sig {
+	case syscall.SIGHUP:
+		return 1, true
+	case syscall.SIGINT:
+		return 2, true
+	case syscall.SIGQUIT:
+		return 3, true
+	case syscall.SIGTERM:
+		return 15, true
+	case syscall.SIGWINCH:
+		return 28, true
+	default:
+		return 0, false
+	}
+}
+
+func attachmentCall(ctx context.Context, call func(*ffi.AttachmentCancellation) ([]byte, error)) ([]byte, error) {
+	token, err := ffi.NewAttachmentCancellation()
+	if err != nil {
+		return nil, fromNativeError(err)
+	}
+	defer token.Close()
+	notifications, stopSignals := attachmentSignals()
+	defer stopSignals()
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		data, err := call(token)
+		done <- result{data, err}
+	}()
+	for {
+		select {
+		case value := <-done:
+			return value.data, fromNativeError(value.err)
+		case sig := <-notifications:
+			number, supported := attachmentSignalNumber(sig)
+			if !supported {
+				continue
+			}
+			if err := token.Signal(number); err != nil {
+				_ = token.Cancel()
+				<-done
+				return nil, fromNativeError(err)
+			}
+		case <-ctx.Done():
+			if err := token.Cancel(); err != nil {
+				<-done
+				return nil, fromNativeError(err)
+			}
+			<-done // Await native transport cleanup before freeing the token.
+			return nil, contextError(ctx.Err())
+		}
+	}
 }

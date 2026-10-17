@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 )
 
 func TestLoadedPolicyOmitsPolicyHash(t *testing.T) {
+	t.Parallel()
 	compiled, err := LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
   "metadata": {"policy_hash": "frontend-owned"},
@@ -30,9 +32,11 @@ func TestLoadedPolicyOmitsPolicyHash(t *testing.T) {
 	if got := compiled.Metadata()["policy_hash"]; got != "frontend-owned" {
 		t.Fatalf("expected frontend metadata to remain available, got %#v", got)
 	}
+
 }
 
 func TestLoadCanonicalPolicy(t *testing.T) {
+	t.Parallel()
 	compiled, err := LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
   "metadata": {},
@@ -57,24 +61,28 @@ func TestLoadCanonicalPolicy(t *testing.T) {
 	if !compiled.HasHTTPS() {
 		t.Fatal("HTTPS endpoint was not compiled")
 	}
+
 }
 
 func TestLoadCanonicalPolicyRejectsUnsupportedVersion(t *testing.T) {
+	t.Parallel()
 	_, err := LoadReader("policy.json", strings.NewReader(`{"version":2}`))
 	if err == nil || !strings.Contains(err.Error(), "policy version must be 1") {
 		t.Fatalf("unsupported version error = %v", err)
 	}
+
 }
 
 func TestLoadCanonicalPolicyRejectsUnimplementedSessionCapabilities(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		body string
 		want string
 	}{
-		{name: "tailscale", body: `{"version":1,"tailscale":[{"name":"prod"}]}`, want: "tailscale is not implemented"},
-		{name: "forwards", body: `{"version":1,"forwards":[{"name":"ssh","kind":"host","target":"127.0.0.1","target_port":22}]}`, want: "forwards are not implemented"},
-		{name: "tunnel rule", body: `{"version":1,"endpoints":[{"kind":"ip","name":"private","family":"ip","transport":"packet-filter","tls":"none","destination_cidrs":["10.0.0.0/8"],"protocol":"any"}],"rules":[{"name":"tunneled","endpoints":["private"],"tunnel":"prod","verdict":"allow"}]}`, want: "tunnels are not implemented"},
+		{name: "tailscale", body: `{"version":1,"tailscale":[{"name":"prod"},{"name":"other"}]}`, want: "at most one tailscale"},
+		{name: "forwards", body: `{"version":1,"forwards":[{"name":"ssh","kind":"host","target":"127.0.0.1","target_port":22}]}`, want: `unsupported listener kind "host"`},
+		{name: "tunnel rule", body: `{"version":1,"endpoints":[{"kind":"ip","name":"private","family":"ip","transport":"packet-filter","tls":"none","destination_cidrs":["10.0.0.0/8"],"protocol":"any"}],"rules":[{"name":"tunneled","endpoints":["private"],"tunnel":"prod","verdict":"allow"}]}`, want: "requires an existing tailscale tunnel"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -84,9 +92,11 @@ func TestLoadCanonicalPolicyRejectsUnimplementedSessionCapabilities(t *testing.T
 			}
 		})
 	}
+
 }
 
 func TestLoadCanonicalPolicyRejectsDescriptorlessEndpoint(t *testing.T) {
+	t.Parallel()
 	_, err := LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
   "endpoints": [{"kind":"https","name":"api","hosts":["api.example.com"]}]
@@ -94,9 +104,11 @@ func TestLoadCanonicalPolicyRejectsDescriptorlessEndpoint(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `requires family "http"`) {
 		t.Fatalf("descriptorless endpoint error = %v", err)
 	}
+
 }
 
 func TestLoadCanonicalPolicyRejectsMetadataMismatch(t *testing.T) {
+	t.Parallel()
 	_, err := LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
   "settings": {"default_action": "deny", "audit": {}},
@@ -113,9 +125,11 @@ func TestLoadCanonicalPolicyRejectsMetadataMismatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `requires family "http"`) {
 		t.Fatalf("metadata mismatch error = %v", err)
 	}
+
 }
 
 func TestLoadCanonicalRegistryEndpoint(t *testing.T) {
+	t.Parallel()
 	compiled, err := LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
   "settings": {"default_action": "deny", "audit": {}},
@@ -154,9 +168,11 @@ func TestLoadCanonicalRegistryEndpoint(t *testing.T) {
 	if decision.Action != ActionAllow || decision.RuleName != "allow-old" {
 		t.Fatalf("registry action decision = %#v", decision)
 	}
+
 }
 
 func TestLoadCanonicalPolicyRejectsPluginFields(t *testing.T) {
+	t.Parallel()
 	for _, field := range []string{
 		`"plugins": []`,
 		`"endpoints": [{"kind":"https","name":"api","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"plugin":"echo","hosts":["api.example.com"]}]`,
@@ -166,9 +182,11 @@ func TestLoadCanonicalPolicyRejectsPluginFields(t *testing.T) {
 			t.Fatalf("plugin field %s error = %v", field, err)
 		}
 	}
+
 }
 
 func TestLoadCanonicalRegistryEndpointRejectsDerivedEnvelopeMismatch(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		config string
@@ -193,9 +211,11 @@ func TestLoadCanonicalRegistryEndpointRejectsDerivedEnvelopeMismatch(t *testing.
 			}
 		})
 	}
+
 }
 
 func TestDefaultPolicyHasNoPolicyHash(t *testing.T) {
+	t.Parallel()
 	compiled := Default()
 	if compiled.PolicyHash() != "" {
 		t.Fatalf("expected implicit default policy to have no hash, got %q", compiled.PolicyHash())
@@ -205,9 +225,11 @@ func TestDefaultPolicyHasNoPolicyHash(t *testing.T) {
 	if decision.Action != ActionAllow || decision.Source != DecisionSourceDefault {
 		t.Fatalf("expected default policy to allow, got %#v", decision)
 	}
+
 }
 
 func TestAuditSettingsRejectSinkControls(t *testing.T) {
+	t.Parallel()
 	_, err := loadPolicyError(t, `
 settings {
   audit {
@@ -223,9 +245,11 @@ settings {
 	if !strings.Contains(text, `An argument named "path" is not expected here.`) || !strings.Contains(text, `An argument named "enabled" is not expected here.`) {
 		t.Fatalf("expected audit sink controls to be rejected, got %v", err)
 	}
+
 }
 
 func TestDefaultActionDefaultsToAllow(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "ip" "private" {
   destination = ["10.0.0.0/8"]
@@ -243,9 +267,11 @@ endpoint "ip" "private" {
 	if decision.Action != ActionAllow || decision.Source != DecisionSourceDefault {
 		t.Fatalf("expected default allow, got %#v", decision)
 	}
+
 }
 
 func TestFlowRulesUsePriorityThenDeclarationOrder(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -285,9 +311,11 @@ rule "second-deny" {
 	if decision.Action != ActionAllow || decision.RuleName != "first-allow" {
 		t.Fatalf("expected first high-priority allow, got %#v", decision)
 	}
+
 }
 
 func TestDisabledRulesAreValidatedButNotEvaluated(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "ip" "private" {
   destination = ["10.0.0.0/8"]
@@ -334,9 +362,11 @@ rule "disabled-invalid" {
 	if err == nil || !strings.Contains(err.Error(), "condition") {
 		t.Fatalf("expected disabled invalid rule to fail validation, got %v", err)
 	}
+
 }
 
 func TestHTTPFamilyRulesMayMixHTTPAndHTTPS(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -365,9 +395,11 @@ rule "http-family-read" {
 	if https.Action != ActionAllow || https.EndpointKind != "https" {
 		t.Fatalf("expected https allow, got %#v", https)
 	}
+
 }
 
 func TestHTTPHostBindingsMatchADRNormalization(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "http" "exact" {
   hosts = ["Example.COM", "api.example.com:8080", "192.0.2.10", "[2001:db8::1]"]
@@ -415,9 +447,11 @@ endpoint "http" "nested" {
 			}
 		})
 	}
+
 }
 
 func TestHTTPSHostBindingsMatchWildcards(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "https" "generic" {
   hosts = ["*.example.com"]
@@ -453,9 +487,11 @@ endpoint "https" "service" {
 	if ref, _, _, ok := compiled.ResolveHTTPSHost("api.example.com", 8443); ok {
 		t.Fatalf("wildcard must not match wrong port, got %#v", ref)
 	}
+
 }
 
 func TestHTTPClassificationUsesConfiguredEndpointPorts(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -482,9 +518,11 @@ endpoint "http" "metadata" {
 	if decision.Action != ActionDeny || decision.ClassificationOpportunity {
 		t.Fatalf("expected unconfigured http port to remain flow default deny, got %#v", decision)
 	}
+
 }
 
 func TestDuplicateHTTPExactHostBindingsAreRejected(t *testing.T) {
+	t.Parallel()
 	_, err := loadPolicyError(t, `
 endpoint "http" "one" {
   hosts = ["Example.COM"]
@@ -507,9 +545,11 @@ endpoint "https" "tls" {
   hosts = ["api.example.com"]
 }
 `)
+
 }
 
 func TestHTTPEndpointHostsAreRequiredAndValidated(t *testing.T) {
+	t.Parallel()
 	_, err := loadPolicyError(t, `
 endpoint "http" "missing" {
 }
@@ -547,9 +587,11 @@ endpoint "http" "bad" {
 			}
 		})
 	}
+
 }
 
 func TestCredentialsCannotBindToHTTPEndpoints(t *testing.T) {
+	t.Parallel()
 	_, err := loadPolicyError(t, `
 endpoint "http" "metadata" {
   hosts = ["metadata.internal"]
@@ -562,9 +604,11 @@ credential "bearer_token" "metadata" {
 	if err == nil || !strings.Contains(err.Error(), "must reference an https endpoint") {
 		t.Fatalf("expected http credential binding to be rejected, got %v", err)
 	}
+
 }
 
 func TestUnknownHTTPHostsUseDefaultActionWithoutCredentials(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "http" "metadata" {
   hosts = ["metadata.internal"]
@@ -600,9 +644,11 @@ endpoint "http" "metadata" {
 	if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault || decision.Reason != "default_deny" {
 		t.Fatalf("expected unknown http host to use default deny, got %#v", decision)
 	}
+
 }
 
 func TestHTTPCELRequestFacets(t *testing.T) {
+	t.Parallel()
 	request := HTTPRequest{
 		EndpointKind: "https",
 		Host:         "api.example.com:443",
@@ -645,9 +691,11 @@ func TestHTTPCELRequestFacets(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestHTTPCELRequestFacetLoadErrors(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		condition string
@@ -672,9 +720,11 @@ func TestHTTPCELRequestFacetLoadErrors(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestReferencesAllowHCLIdentifiersWithDashes(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -705,9 +755,11 @@ rule "allow-codex" {
 	if decision.SelectedCredential == nil || decision.SelectedCredential.Name != "api-token" {
 		t.Fatalf("expected dashed credential name, got %#v", decision.SelectedCredential)
 	}
+
 }
 
 func TestCredentialProviderMetadataReachesRuntime(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -771,9 +823,11 @@ rule "allow-api" {
 	if bearer.SelectedCredential == nil || bearer.SelectedCredential.Kind != "bearer_token" || !bearer.SelectedCredential.IdempotencyKey {
 		t.Fatalf("expected bearer_token metadata, got %#v", bearer.SelectedCredential)
 	}
+
 }
 
 func TestMixedEndpointFamiliesAreRejected(t *testing.T) {
+	t.Parallel()
 	_, err := loadPolicyError(t, `
 endpoint "ip" "private" {
   destination = ["10.0.0.0/8"]
@@ -791,9 +845,11 @@ rule "mixed" {
 	if err == nil || !strings.Contains(err.Error(), "same family") {
 		t.Fatalf("expected mixed family error, got %v", err)
 	}
+
 }
 
 func TestUnknownFieldsAndUnsupportedSyntaxAreRejected(t *testing.T) {
+	t.Parallel()
 	_, err := loadPolicyError(t, `
 endpoint "invalid_endpoint" "private" {
   destination = ["10.0.0.0/8"]
@@ -820,9 +876,11 @@ endpoint "ip" "private" {
 	if err == nil || !strings.Contains(err.Error(), "surprise") {
 		t.Fatalf("expected unknown endpoint field error, got %v", err)
 	}
+
 }
 
 func TestPortNumbersMustBeIntegers(t *testing.T) {
+	t.Parallel()
 	_, err := loadPolicyError(t, `
 endpoint "ip" "private" {
   destination = ["10.0.0.0/8"]
@@ -833,72 +891,57 @@ endpoint "ip" "private" {
 	if err == nil || !strings.Contains(err.Error(), "port 443.5 must be an integer") {
 		t.Fatalf("expected fractional port error, got %v", err)
 	}
+
 }
 
-func TestIPEndpointExactTCPPortMatches(t *testing.T) {
-	compiled := loadPolicy(t, `
+func TestIPEndpointExactL4PortMatches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name              string
+		protocol          string
+		endpoint          string
+		port              uint16
+		missProtocol      string
+		missPort          uint16
+		checkMissMetadata bool
+	}{
+		{name: "tcp", protocol: "tcp", endpoint: "private", port: 443, missProtocol: "tcp", missPort: 444, checkMissMetadata: true},
+		{name: "udp", protocol: "udp", endpoint: "dns", port: 53, missProtocol: "tcp", missPort: 53},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			compiled := loadPolicy(t, fmt.Sprintf(`
 settings {
   default_action = "deny"
 }
-
-endpoint "ip" "private" {
+endpoint "ip" "%s" {
   destination = ["10.0.0.0/8"]
-  protocol = "tcp"
-  ports = [443]
+  protocol = "%s"
+  ports = [%d]
 }
-
-rule "allow-private" {
-  endpoint = ip.private
+rule "allow-%s" {
+  endpoint = ip.%s
   verdict = "allow"
 }
-`)
-
-	decision := compiled.EvaluateFlow(l4Flow("tcp", 443))
-	if decision.Action != ActionAllow || decision.RuleName != "allow-private" {
-		t.Fatalf("expected tcp 443 allow, got %#v", decision)
-	}
-	assertL4Match(t, decision, L4Match{EndpointProtocol: "tcp", DestPort: 443, PortRange: PortRange{Start: 443, End: 443}, Kind: L4MatchExactPort})
-
-	decision = compiled.EvaluateFlow(l4Flow("tcp", 444))
-	if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault {
-		t.Fatalf("expected tcp 444 default deny, got %#v", decision)
-	}
-	if decision.MatchedL4 != nil {
-		t.Fatalf("default decision must not carry l4 metadata, got %#v", decision.MatchedL4)
-	}
-}
-
-func TestIPEndpointExactUDPPortMatches(t *testing.T) {
-	compiled := loadPolicy(t, `
-settings {
-  default_action = "deny"
-}
-
-endpoint "ip" "dns" {
-  destination = ["10.0.0.0/8"]
-  protocol = "udp"
-  ports = [53]
-}
-
-rule "allow-dns" {
-  endpoint = ip.dns
-  verdict = "allow"
-}
-`)
-
-	decision := compiled.EvaluateFlow(l4Flow("udp", 53))
-	if decision.Action != ActionAllow || decision.RuleName != "allow-dns" {
-		t.Fatalf("expected udp 53 allow, got %#v", decision)
-	}
-	assertL4Match(t, decision, L4Match{EndpointProtocol: "udp", DestPort: 53, PortRange: PortRange{Start: 53, End: 53}, Kind: L4MatchExactPort})
-
-	decision = compiled.EvaluateFlow(l4Flow("tcp", 53))
-	if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault {
-		t.Fatalf("expected tcp 53 to miss udp endpoint, got %#v", decision)
+`, test.endpoint, test.protocol, test.port, test.endpoint, test.endpoint))
+			decision := compiled.EvaluateFlow(l4Flow(test.protocol, test.port))
+			if decision.Action != ActionAllow || decision.RuleName != "allow-"+test.endpoint {
+				t.Fatalf("expected %s %d allow, got %#v", test.protocol, test.port, decision)
+			}
+			assertL4Match(t, decision, L4Match{EndpointProtocol: test.protocol, DestPort: test.port, PortRange: PortRange{Start: test.port, End: test.port}, Kind: L4MatchExactPort})
+			decision = compiled.EvaluateFlow(l4Flow(test.missProtocol, test.missPort))
+			if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault {
+				t.Fatalf("expected %s %d default deny, got %#v", test.missProtocol, test.missPort, decision)
+			}
+			if test.checkMissMetadata && decision.MatchedL4 != nil {
+				t.Fatalf("default decision must not carry l4 metadata, got %#v", decision.MatchedL4)
+			}
+		})
 	}
 }
 
 func TestIPEndpointPortRangesAreInclusive(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -930,9 +973,11 @@ rule "allow-app" {
 			t.Fatalf("expected tcp %d default deny, got %#v", port, decision)
 		}
 	}
+
 }
 
 func TestIPEndpointBoundaryPortsMatch(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -957,9 +1002,11 @@ rule "allow-boundaries" {
 		}
 		assertL4Match(t, decision, L4Match{EndpointProtocol: "tcp", DestPort: port, PortRange: PortRange{Start: port, End: port}, Kind: L4MatchExactPort})
 	}
+
 }
 
 func TestIPEndpointDefaultProtocolMatchesAnyWithoutPorts(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -982,9 +1029,11 @@ rule "allow-private" {
 		}
 		assertL4Match(t, decision, L4Match{EndpointProtocol: "any", DestPort: 8443, Kind: L4MatchProtocolOnly})
 	}
+
 }
 
 func TestIPEndpointPortRangesAreCanonicalized(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "ip" "canonical" {
   destination = ["10.0.0.0/8"]
@@ -1006,9 +1055,11 @@ endpoint "ip" "canonical" {
 			t.Fatalf("expected canonical ports %#v, got %#v", want, endpoint.Ports)
 		}
 	}
+
 }
 
 func TestInvalidIPEndpointL4PolicyIsRejected(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		body string
@@ -1121,9 +1172,11 @@ endpoint "ip" "bad" {
 			}
 		})
 	}
+
 }
 
 func TestExplicitIPDenyIsTerminalBeforeL7Classification(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1160,9 +1213,11 @@ rule "allow-api" {
 	if decision.Action != ActionDeny || decision.Source != DecisionSourceRule || decision.ClassificationOpportunity {
 		t.Fatalf("expected terminal ip deny, got %#v", decision)
 	}
+
 }
 
 func TestDefaultDenyAllowsL7ClassificationOnly(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1192,9 +1247,11 @@ rule "allow-metadata" {
 	if requestDecision.Action != ActionAllow || requestDecision.Source != DecisionSourceRule {
 		t.Fatalf("expected L7 rule allow after classification, got %#v", requestDecision)
 	}
+
 }
 
 func TestHTTPSClassificationUsesConfiguredEndpointPorts(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1221,9 +1278,11 @@ endpoint "https" "api" {
 	if decision.Action != ActionDeny || decision.ClassificationOpportunity {
 		t.Fatalf("expected unconfigured port to remain flow default deny, got %#v", decision)
 	}
+
 }
 
 func TestResolveHTTPSRawIPMatchesOnlyExactIPBindings(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "https" "proxmox" {
   hosts = ["203.0.113.10:8006"]
@@ -1244,9 +1303,11 @@ endpoint "https" "api" {
 	if _, _, _, ok := compiled.ResolveHTTPSRawIP(net.ParseIP("203.0.113.11"), 8006); ok {
 		t.Fatal("did not expect raw IP binding to match the wrong IP")
 	}
+
 }
 
 func TestConditionRuntimeErrorsFailClosed(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1274,9 +1335,11 @@ rule "lower-allow" {
 	if decision.Action != ActionDeny || decision.Reason != "condition_error" || decision.RuleName != "bad-condition" {
 		t.Fatalf("expected condition error deny, got %#v", decision)
 	}
+
 }
 
 func TestCredentialConditionsSelectOneCredential(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1316,9 +1379,11 @@ rule "allow-api" {
 	if publicDecision.Action != ActionAllow || publicDecision.SelectedCredential != nil {
 		t.Fatalf("expected explicit allow without credential injection, got %#v", publicDecision)
 	}
+
 }
 
 func TestCredentialConditionRuntimeErrorsFailClosed(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1343,9 +1408,11 @@ rule "allow-api" {
 	if decision.Action != ActionDeny || decision.Reason != "credential_condition_error" || decision.Source != DecisionSourceDefault {
 		t.Fatalf("expected credential condition error deny, got %#v", decision)
 	}
+
 }
 
 func TestAmbiguousCredentialsFailClosedBeforeRules(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "https" "api" {
   hosts = ["api.example.com"]
@@ -1369,9 +1436,11 @@ rule "allow-api" {
 	if decision.Action != ActionDeny || decision.Reason != "ambiguous_credentials" || decision.Source != DecisionSourceDefault {
 		t.Fatalf("expected ambiguous credential deny, got %#v", decision)
 	}
+
 }
 
 func TestRuleCredentialIsPredicateNotInjectionTrigger(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1409,9 +1478,11 @@ rule "public" {
 	if publicDecision.Action != ActionAllow || publicDecision.RuleName != "public" || publicDecision.SelectedCredential != nil {
 		t.Fatalf("expected credential predicate to skip without selecting credentials, got %#v", publicDecision)
 	}
+
 }
 
 func TestUDP443IsNotHTTP3Inspected(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   default_action = "deny"
@@ -1452,9 +1523,11 @@ rule "allow-quic" {
 	if decision.Action != ActionAllow || decision.RuleName != "allow-quic" || decision.ClassificationOpportunity {
 		t.Fatalf("expected UDP/443 to follow normal ip endpoint handling without classification, got %#v", decision)
 	}
+
 }
 
 func TestCredentialMetadataDoesNotApplyOnDefaultAllow(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 endpoint "https" "api" {
   hosts = ["api.example.com"]
@@ -1472,9 +1545,11 @@ credential "bearer_token" "api" {
 	if decision.SelectedCredential != nil {
 		t.Fatalf("default allow must not select credentials, got %#v", decision.SelectedCredential)
 	}
+
 }
 
 func TestAuditSettingsWarningsArePolicyDiagnostics(t *testing.T) {
+	t.Parallel()
 	compiled := loadPolicy(t, `
 settings {
   audit {
@@ -1487,9 +1562,11 @@ settings {
 	if len(diagnostics) != 1 || diagnostics[0].Severity != "warning" || !strings.Contains(diagnostics[0].Detail, "body_buffer") {
 		t.Fatalf("expected audit warning diagnostic, got %#v", diagnostics)
 	}
+
 }
 
 func TestLoadFileRejectsUnknownCanonicalFields(t *testing.T) {
+	t.Parallel()
 	_, err := LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
   "policy_hash": "sha256:old-contract",
@@ -1511,9 +1588,11 @@ func TestLoadFileRejectsUnknownCanonicalFields(t *testing.T) {
 	if len(loadErr.Diagnostics) != 1 || !strings.Contains(loadErr.Diagnostics[0].Detail, "policy_hash") {
 		t.Fatalf("expected unknown policy_hash diagnostic, got %#v", loadErr.Diagnostics)
 	}
+
 }
 
 func TestLoadFileRejectsNonObjectMetadata(t *testing.T) {
+	t.Parallel()
 	for _, metadata := range []string{"null", "[]", `"hash"`} {
 		_, err := LoadReader("policy.json", strings.NewReader(fmt.Sprintf(`{
   "version": 1,
@@ -1536,6 +1615,7 @@ func TestLoadFileRejectsNonObjectMetadata(t *testing.T) {
 			t.Fatalf("expected invalid metadata diagnostic, got %#v", loadErr.Diagnostics)
 		}
 	}
+
 }
 
 func loadPolicy(t *testing.T, text string) *Policy {
@@ -1587,4 +1667,196 @@ func assertL4Match(t *testing.T, decision Decision, want L4Match) {
 	if *decision.MatchedL4 != want {
 		t.Fatalf("expected l4 match %#v, got %#v", want, *decision.MatchedL4)
 	}
+}
+
+func TestForwardCanonicalCompilation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		fields   string
+		protocol ForwardProtocol
+	}{
+		{name: "implicit tcp", protocol: ForwardProtocolTCP},
+		{name: "explicit tcp", fields: `,"protocol":"tcp"`, protocol: ForwardProtocolTCP},
+		{name: "https", fields: `,"protocol":"https","tls":{"provider":"tailscale"}`, protocol: ForwardProtocolHTTPS},
+		{name: "explicit tunnel", fields: `,"tunnel":"vm"`, protocol: ForwardProtocolTCP},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := fmt.Sprintf(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[{"name":"web","kind":"tailscale","target":"self","listen":":00443","target_port":8080%s}]}`, test.fields)
+			compiled, err := LoadReader("forward.json", strings.NewReader(source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []Forward{{Name: "web", ListenPort: 443, GuestPort: 8080, Protocol: test.protocol}}
+			if got := compiled.Forwards(); !slices.Equal(got, want) {
+				t.Fatalf("Forwards() = %#v, want %#v", got, want)
+			}
+			if compiled.DefaultAction != ActionAllow {
+				t.Fatal("forwards must not require deny-by-default egress")
+			}
+			copy := compiled.Forwards()
+			copy[0].GuestPort = 1
+			if !slices.Equal(compiled.Forwards(), want) {
+				t.Fatal("caller mutated compiled forwards")
+			}
+		})
+	}
+	var absent *Policy
+	if absent.Forwards() != nil {
+		t.Fatal("nil policy must have no forwards")
+	}
+
+}
+
+func TestForwardCanonicalRejectsInvalidDeclarations(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		forward string
+		nodes   string
+		want    string
+	}{
+		{name: "host", forward: `{"kind":"host","target":"self"}`, want: "unsupported listener kind"},
+		{name: "unknown kind", forward: `{"kind":"udp","target":"self"}`, want: "unsupported listener kind"},
+		{name: "cross vm", forward: `{"kind":"tailscale","target":"name:web"}`, want: "unsupported target"},
+		{name: "missing target", forward: `{"kind":"tailscale"}`, want: "unsupported target"},
+		{name: "no node", forward: `{"kind":"tailscale","target":"self"}`, nodes: `[]`, want: "requires exactly one tailscale"},
+		{name: "multiple nodes", forward: `{"kind":"tailscale","target":"self"}`, nodes: `[{"name":"vm"},{"name":"other"}]`, want: "at most one tailscale"},
+		{name: "wrong tunnel", forward: `{"kind":"tailscale","target":"self","tunnel":"other"}`, want: "does not match"},
+		{name: "unknown protocol", forward: `{"kind":"tailscale","target":"self","protocol":"http"}`, want: "unsupported protocol"},
+		{name: "case sensitive protocol", forward: `{"kind":"tailscale","target":"self","protocol":"TCP"}`, want: "unsupported protocol"},
+		{name: "empty explicit protocol", forward: `{"kind":"tailscale","target":"self","protocol":""}`, want: "unsupported protocol"},
+		{name: "null explicit protocol", forward: `{"kind":"tailscale","target":"self","protocol":null}`, want: "unsupported protocol"},
+		{name: "tcp tls", forward: `{"kind":"tailscale","target":"self","tls":{"provider":"tailscale"}}`, want: "tcp forbids tls"},
+		{name: "https no tls", forward: `{"kind":"tailscale","target":"self","protocol":"https"}`, want: "https requires"},
+		{name: "missing provider", forward: `{"kind":"tailscale","target":"self","protocol":"https","tls":{}}`, want: "https requires"},
+		{name: "wrong provider", forward: `{"kind":"tailscale","target":"self","protocol":"https","tls":{"provider":"acme"}}`, want: "https requires"},
+		{name: "unknown tls field", forward: `{"kind":"tailscale","target":"self","protocol":"https","tls":{"provider":"tailscale","domain":"evil.example"}}`, want: "unknown field"},
+		{name: "unknown forward field", forward: `{"kind":"tailscale","target":"self","address":"evil.example"}`, want: "unknown field"},
+		{name: "zero guest port", forward: `{"kind":"tailscale","target":"self","listen":":443","target_port":0}`, want: "target_port"},
+		{name: "overflow guest port", forward: `{"kind":"tailscale","target":"self","listen":":443","target_port":65536}`, want: "uint16"},
+		{name: "negative guest port", forward: `{"kind":"tailscale","target":"self","listen":":443","target_port":-1}`, want: "uint16"},
+	}
+	for _, listen := range []string{"", ":0", ":65536", ":22", ":00022", "443", "0.0.0.0:443", "localhost:443", "[::]:443", ":+443", ":-1", ": 443", ":443 ", ":0x1bb", ":４４３"} {
+		tests = append(tests, struct {
+			name    string
+			forward string
+			nodes   string
+			want    string
+		}{name: "listen " + listen, forward: fmt.Sprintf(`{"kind":"tailscale","target":"self","listen":%q,"target_port":8080}`, listen), want: "forward"})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nodes := test.nodes
+			if nodes == "" {
+				nodes = `[{"name":"vm"}]`
+			}
+			source := fmt.Sprintf(`{"version":1,"tailscale":%s,"forwards":[{"name":"web",%s]}`, nodes, strings.TrimPrefix(test.forward, "{"))
+			_, err := LoadReader("forward.json", strings.NewReader(source))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+
+}
+
+func TestForwardDuplicateNormalizedListener(t *testing.T) {
+	t.Parallel()
+	_, err := LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[
+		{"name":"raw","kind":"tailscale","target":"self","listen":":00443","target_port":8443},
+		{"name":"web","kind":"tailscale","target":"self","listen":":443","target_port":8080,"protocol":"https","tls":{"provider":"tailscale"}}
+	]}`))
+	if err == nil || !strings.Contains(err.Error(), "duplicate listener port 443") {
+		t.Fatalf("error = %v, want duplicate normalized listener", err)
+	}
+
+}
+
+func TestForwardNamesAreUniqueAuditIdentifiers(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"", "web frontend", "web/other", "web\nother"} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[{"name":`+string(encoded)+`,"kind":"tailscale","target":"self","listen":":443","target_port":8080}]}`))
+			if err == nil {
+				t.Fatal("accepted ambiguous forward audit identifier")
+			}
+		})
+	}
+	_, err := LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[
+		{"name":"web","kind":"tailscale","target":"self","listen":":443","target_port":8080},
+		{"name":"web","kind":"tailscale","target":"self","listen":":9443","target_port":9000}
+	]}`))
+	if err == nil {
+		t.Fatal("accepted duplicate forward audit identifiers")
+	}
+
+}
+
+func TestForwardAttachmentScope(t *testing.T) {
+	t.Parallel()
+	for _, protocol := range []ForwardProtocol{ForwardProtocolTCP, ForwardProtocolHTTPS} {
+		t.Run(string(protocol), func(t *testing.T) {
+			fields := ""
+			if protocol == ForwardProtocolHTTPS {
+				fields = `,"protocol":"https","tls":{"provider":"tailscale"}`
+			}
+			source := fmt.Sprintf(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[{"name":"web","kind":"tailscale","target":"self","listen":":443","target_port":8080%s}]}`, fields)
+			compiled, err := LoadReader("forward.json", strings.NewReader(source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, scope := range []AttachmentScope{AttachmentScopeUnknown, AttachmentScopeDedicatedVM, AttachmentScopeSharedNetwork, AttachmentScope(255)} {
+				err := ValidateForwardAttachment(scope, compiled.Forwards())
+				if scope == AttachmentScopeDedicatedVM {
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else if err == nil || err.Error() != `forward "web": target "self" requires a dedicated 1:1 netd attachment` {
+					t.Fatalf("scope %d: error = %v", scope, err)
+				}
+				if err := ValidateForwardAttachment(scope, nil); err != nil {
+					t.Fatalf("empty forwards, scope %d: %v", scope, err)
+				}
+			}
+		})
+	}
+	if err := ValidateForwardAttachment(AttachmentScopeSharedNetwork, []Forward{{Name: "first"}, {Name: "second"}}); err == nil || !strings.Contains(err.Error(), `"first"`) {
+		t.Fatalf("must identify first declaration: %v", err)
+	}
+
+}
+
+func TestForwardMultipleListenersPreserveOrderAndPortBounds(t *testing.T) {
+	t.Parallel()
+	compiled, err := LoadReader("forward.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm"}],"forwards":[
+		{"name":"last-port","kind":"tailscale","target":"self","listen":":65535","target_port":1},
+		{"name":"first-port","kind":"tailscale","target":"self","listen":":1","target_port":65535,"protocol":"https","tls":{"provider":"tailscale"}}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Forward{
+		{Name: "last-port", ListenPort: 65535, GuestPort: 1, Protocol: ForwardProtocolTCP},
+		{Name: "first-port", ListenPort: 1, GuestPort: 65535, Protocol: ForwardProtocolHTTPS},
+	}
+	if !slices.Equal(compiled.Forwards(), want) {
+		t.Fatalf("forwards = %#v, want %#v", compiled.Forwards(), want)
+	}
+	empty, err := LoadReader("empty.json", strings.NewReader(`{"version":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Forwards()) != 0 {
+		t.Fatal("no-forward policy acquired forwards")
+	}
+	if err := ValidateForwardAttachment(AttachmentScopeUnknown, empty.Forwards()); err != nil {
+		t.Fatal(err)
+	}
+
 }

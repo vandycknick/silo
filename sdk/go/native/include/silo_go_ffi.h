@@ -9,15 +9,33 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * A scoped cancellation token for a blocking host attachment call.
+ * It may be cancelled concurrently, but must not be freed until that call returns.
+ */
+typedef struct AttachmentCancellation AttachmentCancellation;
+
+typedef struct silo_download silo_download;
+
 typedef struct silo_execution silo_execution;
 
 typedef struct silo_log silo_log;
 
 typedef struct silo_machine silo_machine;
 
+typedef struct silo_node_state_lease silo_node_state_lease;
+
 typedef struct silo_runtime silo_runtime;
 
+/**
+ * Opaque, single-consumption bounded SSH attachment. The caller must join the
+ * shell and all byte/control operations before free; no Go pointers are kept.
+ */
+typedef struct SshAttachmentHandle SshAttachmentHandle;
+
 typedef struct silo_stdin silo_stdin;
+
+typedef struct silo_upload silo_upload;
 
 typedef struct {
   uint8_t *ptr;
@@ -71,30 +89,44 @@ void silo_buffer_free(silo_buffer buffer);
  */
 void silo_error_free(silo_error *error);
 
+silo_error *silo_attachment_cancellation_new(AttachmentCancellation **out_token);
+
+silo_error *silo_attachment_cancellation_cancel(const AttachmentCancellation *token);
+
+/**
+ * Queues one embedding-owned Linux signal or WINCH resize notification.
+ */
+silo_error *silo_attachment_cancellation_signal(const AttachmentCancellation *token,
+                                                uint32_t signal);
+
+void silo_attachment_cancellation_free(AttachmentCancellation *token);
+
 silo_error *silo_machine_exec(const silo_machine *machine,
                               const uint8_t *request_ptr,
                               size_t request_len,
                               silo_execution_output *out_output);
 
-silo_error *silo_machine_shell(const silo_machine *machine,
-                               const uint8_t *request_ptr,
-                               size_t request_len,
-                               silo_execution_output *out_output);
+silo_error *silo_machine_exec_script(const silo_machine *machine,
+                                     const uint8_t *request_ptr,
+                                     size_t request_len,
+                                     silo_execution_output *out_output);
 
 silo_error *silo_machine_spawn(const silo_machine *machine,
                                const uint8_t *request_ptr,
                                size_t request_len,
                                silo_execution **out_session);
 
-silo_error *silo_machine_attach(const silo_machine *machine,
-                                const uint8_t *request_ptr,
-                                size_t request_len,
-                                silo_buffer *out_result);
+silo_error *silo_machine_shell(const silo_machine *machine,
+                               const uint8_t *request_ptr,
+                               size_t request_len,
+                               silo_buffer *out_status);
 
-silo_error *silo_machine_attach_shell(const silo_machine *machine,
-                                      const uint8_t *request_ptr,
-                                      size_t request_len,
-                                      silo_buffer *out_status);
+silo_error *silo_machine_shell_cancellable(const silo_machine *machine,
+                                           const uint8_t *request_ptr,
+                                           size_t request_len,
+                                           const AttachmentCancellation *token,
+                                           const SshAttachmentHandle *attachment,
+                                           silo_buffer *out_status);
 
 silo_error *silo_execution_recv(const silo_execution *session,
                                 silo_execution_event *out_event,
@@ -125,6 +157,42 @@ silo_error *silo_stdin_close(const silo_stdin *stdin);
 
 void silo_stdin_free(silo_stdin *stdin);
 
+silo_error *silo_machine_file_stat(const silo_machine *machine,
+                                   const uint8_t *request_ptr,
+                                   size_t request_len,
+                                   silo_buffer *out_entry);
+
+silo_error *silo_machine_create_directory(const silo_machine *machine,
+                                          const uint8_t *request_ptr,
+                                          size_t request_len,
+                                          silo_buffer *out_result);
+
+silo_error *silo_machine_upload_open(const silo_machine *machine,
+                                     const uint8_t *request_ptr,
+                                     size_t request_len,
+                                     silo_upload **out_upload);
+
+silo_error *silo_upload_write(const silo_upload *upload, const uint8_t *data_ptr, size_t data_len);
+
+silo_error *silo_upload_finish(const silo_upload *upload, silo_buffer *out_result);
+
+silo_error *silo_upload_cancel(const silo_upload *upload);
+
+void silo_upload_free(silo_upload *upload);
+
+silo_error *silo_machine_download_open(const silo_machine *machine,
+                                       const uint8_t *request_ptr,
+                                       size_t request_len,
+                                       silo_download **out_download);
+
+silo_error *silo_download_read(const silo_download *download,
+                               silo_buffer *out_chunk,
+                               bool *out_eof);
+
+silo_error *silo_download_cancel(const silo_download *download);
+
+void silo_download_free(silo_download *download);
+
 silo_error *silo_images_call(const silo_runtime *runtime,
                              const uint8_t *request_ptr,
                              size_t request_len,
@@ -141,6 +209,16 @@ silo_error *silo_log_close(const silo_log *log);
 
 void silo_log_free(silo_log *log);
 
+silo_error *silo_machine_update(const silo_machine *machine,
+                                const uint8_t *request_ptr,
+                                size_t request_len,
+                                silo_buffer *out_data);
+
+silo_error *silo_machine_stop_with(const silo_machine *machine,
+                                   const uint8_t *request_ptr,
+                                   size_t request_len,
+                                   silo_buffer *out_data);
+
 silo_error *silo_runtime_machine_create(const silo_runtime *runtime,
                                         const uint8_t *request_ptr,
                                         size_t request_len,
@@ -152,6 +230,11 @@ silo_error *silo_machine_inspect(const silo_machine *machine, silo_buffer *out_d
 
 silo_error *silo_machine_start(const silo_machine *machine, silo_buffer *out_data);
 
+silo_error *silo_machine_lease_node_state(const silo_machine *machine,
+                                          silo_node_state_lease **out_lease);
+
+void silo_node_state_lease_free(silo_node_state_lease *lease);
+
 silo_error *silo_machine_stop(const silo_machine *machine, silo_buffer *out_data);
 
 silo_error *silo_machine_remove(const silo_machine *machine);
@@ -159,6 +242,22 @@ silo_error *silo_machine_remove(const silo_machine *machine);
 silo_error *silo_network_policy_build(const uint8_t *request_ptr,
                                       size_t request_len,
                                       silo_buffer *out_policy);
+
+/**
+ * Runs stateless planning. No runtime handle or home directory is required.
+ * Requests are strict objects: memory/disk require input; name accepts no input.
+ *
+ * # Safety
+ * Request bytes must be readable for request_len; out_data must be writable.
+ */
+silo_error *silo_planning_query(const uint8_t *request_ptr,
+                                size_t request_len,
+                                silo_buffer *out_data);
+
+silo_error *silo_runtime_query(const silo_runtime *runtime,
+                               const uint8_t *request_ptr,
+                               size_t request_len,
+                               silo_buffer *out_data);
 
 silo_error *silo_runtime_open(const uint8_t *request_ptr,
                               size_t request_len,
@@ -179,5 +278,36 @@ silo_machine *silo_machine_handle_list_at(const silo_machine_handle_list *machin
 void silo_machine_handle_list_free(silo_machine_handle_list machines);
 
 void silo_machine_free(silo_machine *machine);
+
+silo_error *silo_machine_secret(const silo_machine *machine,
+                                const uint8_t *request_ptr,
+                                size_t request_len);
+
+silo_error *silo_ssh_attachment_new(const silo_machine *machine,
+                                    const AttachmentCancellation *token,
+                                    uint16_t rows,
+                                    uint16_t columns,
+                                    SshAttachmentHandle **out_handle);
+
+silo_error *silo_ssh_attachment_write(const SshAttachmentHandle *handle,
+                                      const uint8_t *data_ptr,
+                                      size_t data_len);
+
+silo_error *silo_ssh_attachment_close_stdin(const SshAttachmentHandle *handle);
+
+silo_error *silo_ssh_attachment_read(const SshAttachmentHandle *handle,
+                                     bool stderr,
+                                     silo_buffer *out_buffer,
+                                     bool *out_eof);
+
+silo_error *silo_ssh_attachment_resize(const SshAttachmentHandle *handle,
+                                       uint16_t rows,
+                                       uint16_t columns);
+
+silo_error *silo_ssh_attachment_signal(const SshAttachmentHandle *handle, uint32_t linux_signal);
+
+silo_error *silo_ssh_attachment_cancel(const SshAttachmentHandle *handle);
+
+void silo_ssh_attachment_free(SshAttachmentHandle *handle);
 
 #endif  /* SILO_GO_FFI_H */

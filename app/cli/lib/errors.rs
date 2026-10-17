@@ -24,9 +24,11 @@ pub(crate) fn execution_exit_code(error: &Report) -> Option<i32> {
 }
 
 pub fn print(error: &Report, verbose: u8) {
+    // The exit-code wrapper is always outermost; eyre reports its context
+    // wrapper in the chain, so `is::<ExecutionExit>` on the cause never matches.
     let causes = error
         .chain()
-        .filter(|cause| !cause.is::<ExecutionExit>())
+        .skip(usize::from(execution_exit_code(error).is_some()))
         .collect::<Vec<_>>();
     let Some(head) = causes.first() else {
         eprintln!("error: {error}");

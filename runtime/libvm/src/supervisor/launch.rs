@@ -97,6 +97,20 @@ impl VmSupervisor {
             machine_log_dir.as_raw_fd().to_string(),
         );
         command.env(ENV_VM_MACHINE_LOCK, machine_lock.as_raw_fd().to_string());
+        let log_fd = machine_log_dir.as_raw_fd();
+        let lock_fd = machine_lock.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                for raw in [log_fd, lock_fd] {
+                    nix::fcntl::fcntl(
+                        std::os::fd::BorrowedFd::borrow_raw(raw),
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                    )
+                    .map_err(io::Error::other)?;
+                }
+                Ok(())
+            });
+        }
 
         // The writer stays CLOEXEC in the caller, including while other VMs
         // launch concurrently. Only this VMM child receives it.

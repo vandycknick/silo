@@ -402,6 +402,8 @@ pub struct RuleDecl {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailscaleDecl {
     pub name: String,
+    #[serde(default)]
+    pub ephemeral: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -421,6 +423,10 @@ pub struct ForwardDecl {
     pub target_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<Ref>,
+    #[serde(default)]
+    pub protocol: crate::ForwardProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::ForwardTls>,
     pub order: usize,
 }
 

@@ -6,6 +6,8 @@ import "errors"
 type ErrorKind string
 
 const (
+	ErrorSecretResolution            ErrorKind = "SecretResolution"
+	ErrorMissingNetworkSecrets       ErrorKind = "MissingNetworkSecrets"
 	ErrorUnknown                     ErrorKind = "Unknown"
 	ErrorInvalidArgument             ErrorKind = "InvalidArgument"
 	ErrorClosed                      ErrorKind = "Closed"
@@ -34,6 +36,7 @@ const (
 	ErrorLocalDiskNotRegularFile     ErrorKind = "LocalDiskNotRegularFile"
 	ErrorLocalDiskUnreadable         ErrorKind = "LocalDiskUnreadable"
 	ErrorImage                       ErrorKind = "Image"
+	ErrorImageReferenceRejected      ErrorKind = "ImageReferenceRejected"
 	ErrorMachineIDAlreadyExists      ErrorKind = "MachineIdAlreadyExists"
 	ErrorMachineAlreadyRunning       ErrorKind = "MachineAlreadyRunning"
 	ErrorMachineNotRunning           ErrorKind = "MachineNotRunning"
@@ -41,6 +44,7 @@ const (
 	ErrorMachineLogSourceUnavailable ErrorKind = "MachineLogSourceUnavailable"
 	ErrorMonitorConnection           ErrorKind = "MonitorConnection"
 	ErrorMonitorProtocol             ErrorKind = "MonitorProtocol"
+	ErrorGuestPathNotFound           ErrorKind = "GuestPathNotFound"
 	ErrorGuestSession                ErrorKind = "GuestSession"
 	ErrorMachinePreparationFailed    ErrorKind = "MachinePreparationFailed"
 	ErrorMachineStartCleanupFailed   ErrorKind = "MachineStartCleanupFailed"

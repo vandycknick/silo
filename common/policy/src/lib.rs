@@ -1,6 +1,7 @@
 mod builder;
 mod canonical;
 mod condition;
+mod format;
 mod model;
 mod parse;
 mod plugin;
@@ -11,9 +12,10 @@ pub use builder::{
     NetworkPolicyBuildError, NetworkPolicyBuilder, NetworkRuleBuilder, TailscaleTunnelBuilder,
 };
 pub use canonical::{
-    IpProtocol, NetworkAuditSettings, NetworkCredential, NetworkEgress, NetworkEndpoint,
-    NetworkForward, NetworkPolicy, NetworkPolicySettings, NetworkRule, NetworkSecretAlternative,
-    NetworkSecretKind, NetworkSecretRequirement, NetworkSecretSlot, PolicyLoadError,
+    ForwardCertificateProvider, ForwardProtocol, ForwardTls, IpProtocol, NetworkAuditSettings,
+    NetworkCredential, NetworkEgress, NetworkEndpoint, NetworkForward, NetworkPolicy,
+    NetworkPolicySettings, NetworkRule, NetworkSecretAlternative, NetworkSecretKind,
+    NetworkSecretRequirement, NetworkSecretSlot, NetworkSecretSource, PolicyLoadError,
     TailscaleTunnel,
 };
 pub use condition::{ConditionCompileError, ConditionEvalError, HttpConditionContext};

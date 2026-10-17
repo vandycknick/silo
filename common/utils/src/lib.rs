@@ -1,5 +1,10 @@
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod process;
+pub mod ssh;
+#[cfg(unix)]
+pub mod terminal;
 
 const BYTES_PER_MB: u64 = 1_000_000;
 const BYTES_PER_GB: u64 = 1_000_000_000;

@@ -7,27 +7,36 @@ import (
 )
 
 func TestManagedDescriptorContract(t *testing.T) {
+	t.Parallel()
 	for _, args := range [][]string{
 		{"--daemonize"}, {"--startup-fd=5"}, {"--exit-fd=6"},
 		{"--startup-fd=0", "--exit-fd=6"}, {"--startup-fd=5", "--exit-fd=5"},
 		{"--startup-fd=3", "--exit-fd=6"}, {"--startup-fd=-2"},
 		{"--daemonize", "unexpected-positional-argument"},
+		{"--secrets-fd=-2"}, {"--secrets-fd=0"}, {"--secrets-fd=1"}, {"--secrets-fd=2"},
+		{"--secrets-fd=3"}, {"--secrets-fd=4"},
+		{"--startup-fd=5", "--exit-fd=6", "--secrets-fd=5"},
+		{"--startup-fd=5", "--exit-fd=6", "--secrets-fd=6"},
+		{"--log-dir-fd=0"}, {"--runtime-dir-fd=2"}, {"--log-dir-fd=-2"},
+		{"--policy-file=policy.json"},
 	} {
 		if _, err := Parse(append(configArgs(t), args...)); err == nil {
 			t.Fatalf("accepted invalid arguments %v", args)
 		}
 	}
-	cfg := parseConfig(t, "--daemonize", "--startup-fd=5", "--exit-fd=6")
-	if !cfg.Daemonize || cfg.StartupFD != 5 || cfg.ExitFD != 6 {
+	cfg := parseConfig(t, "--daemonize", "--startup-fd=5", "--exit-fd=6", "--secrets-fd=7")
+	if !cfg.Daemonize || cfg.StartupFD != 5 || cfg.ExitFD != 6 || cfg.SecretsFD != 7 {
 		t.Fatalf("unexpected managed config: %+v", cfg)
 	}
 	cfg = parseConfig(t)
 	if cfg.Daemonize || cfg.StartupFD != -1 || cfg.ExitFD != -1 {
 		t.Fatal("foreground worker unexpectedly managed")
 	}
+
 }
 
 func TestParseWithoutStaticLeaseHasNoGuestLeaseOrForwards(t *testing.T) {
+	t.Parallel()
 	cfg := parseConfig(t)
 	if len(cfg.Stack.DHCPStaticLeases) != 0 {
 		t.Fatalf("expected no DHCP static leases, got %#v", cfg.Stack.DHCPStaticLeases)
@@ -35,9 +44,11 @@ func TestParseWithoutStaticLeaseHasNoGuestLeaseOrForwards(t *testing.T) {
 	if len(cfg.Stack.Forwards) != 0 {
 		t.Fatalf("expected no host forwards, got %#v", cfg.Stack.Forwards)
 	}
+
 }
 
 func TestParseStaticLeaseSetsDeviceIPAndDHCPLease(t *testing.T) {
+	t.Parallel()
 	cfg := parseConfig(t, "--static-lease", "192.168.127.42=02:00:00:00:00:2a")
 	if cfg.Stack.DeviceIP != "192.168.127.42" {
 		t.Fatalf("expected static lease device IP, got %q", cfg.Stack.DeviceIP)
@@ -46,9 +57,11 @@ func TestParseStaticLeaseSetsDeviceIPAndDHCPLease(t *testing.T) {
 	if len(cfg.Stack.DHCPStaticLeases) != len(want) || cfg.Stack.DHCPStaticLeases["192.168.127.42"] != want["192.168.127.42"] {
 		t.Fatalf("unexpected DHCP static leases: %#v", cfg.Stack.DHCPStaticLeases)
 	}
+
 }
 
 func TestParseRejectsInvalidStaticLeases(t *testing.T) {
+	t.Parallel()
 	for _, lease := range []string{
 		"192.168.127.42",
 		"192.168.127.42.1=02:00:00:00:00:2a",
@@ -71,23 +84,29 @@ func TestParseRejectsInvalidStaticLeases(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestParseRejectsNonIPv4Subnet(t *testing.T) {
+	t.Parallel()
 	_, err := Parse(append(configArgs(t), "--subnet", "2001:db8::/64"))
 	if err == nil {
 		t.Fatal("expected IPv6 subnet to be rejected")
 	}
+
 }
 
 func TestParseRejectsRemovedSSHPortFlag(t *testing.T) {
+	t.Parallel()
 	_, err := Parse(append(configArgs(t), "--ssh-port", "2222"))
 	if err == nil {
 		t.Fatal("expected removed --ssh-port flag to be rejected")
 	}
+
 }
 
 func TestParseGuestPublish(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name  string
 		value string
@@ -111,16 +130,20 @@ func TestParseGuestPublish(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestParseRejectsInvalidGuestPublish(t *testing.T) {
+	t.Parallel()
 	_, err := Parse(append(configArgs(t), "--guest-publish", "everything"))
 	if err == nil {
 		t.Fatal("expected invalid guest publication bind to be rejected")
 	}
+
 }
 
 func TestParseAcceptsExplicitLogFilesAndRunMetadata(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	logFile := "service.jsonl"
 	auditLogFile := "audit.jsonl"
@@ -151,9 +174,11 @@ func TestParseAcceptsExplicitLogFilesAndRunMetadata(t *testing.T) {
 	if cfg.Metadata != (Metadata{VMID: "vm-123", RunID: "run-456", NetworkID: "network-789"}) {
 		t.Fatalf("unexpected metadata: %#v", cfg.Metadata)
 	}
+
 }
 
 func TestParseRequiresLogFilesAndGenerationMetadata(t *testing.T) {
+	t.Parallel()
 	for _, missing := range []string{"--log-dir-fd", "--runtime-dir-fd", "--log-file", "--audit-log-file", "--vm-id", "--run-id", "--network-id"} {
 		t.Run(missing, func(t *testing.T) {
 			args := configArgs(t)
@@ -168,9 +193,11 @@ func TestParseRequiresLogFilesAndGenerationMetadata(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestParseRejectsRemovedProfileAndAuditAliases(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	_, err := Parse([]string{
 		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
@@ -189,9 +216,11 @@ func TestParseRejectsRemovedProfileAndAuditAliases(t *testing.T) {
 			t.Fatalf("expected %s flag to be rejected", flag)
 		}
 	}
+
 }
 
 func TestParseRejectsPathNamesForDescriptorRelativeFiles(t *testing.T) {
+	t.Parallel()
 	for _, flag := range []string{"--log-file", "--audit-log-file", "--pid-file", "--pcap"} {
 		t.Run(flag, func(t *testing.T) {
 			if _, err := Parse(append(configArgs(t), flag, "nested/file")); err == nil {
@@ -199,9 +228,11 @@ func TestParseRejectsPathNamesForDescriptorRelativeFiles(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestLoadPolicyUsesDefaultPolicyWithoutHash(t *testing.T) {
+	t.Parallel()
 	cfg, err := Parse(configArgs(t))
 	if err != nil {
 		t.Fatal(err)
@@ -216,9 +247,11 @@ func TestLoadPolicyUsesDefaultPolicyWithoutHash(t *testing.T) {
 	if compiled.PolicyHash() != "" {
 		t.Fatalf("expected implicit default policy to omit policy hash, got %q", compiled.PolicyHash())
 	}
+
 }
 
-func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
+func TestLoadPolicyDefersHTTPSCAValidationToSession(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	writeConfigPolicy(t, policyPath, `
@@ -236,17 +269,20 @@ func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
 
 	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
+		"--secrets-fd", "7",
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = LoadPolicy(cfg)
-	if err == nil {
-		t.Fatal("expected missing CA material to be rejected")
+	if err != nil {
+		t.Fatal(err)
 	}
+
 }
 
-func TestLoadPolicyRequiresTLSCAForRegistryEndpoints(t *testing.T) {
+func TestLoadPolicyDefersRegistryCAValidationToSession(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	writeConfigPolicy(t, policyPath, `
@@ -267,16 +303,19 @@ func TestLoadPolicyRequiresTLSCAForRegistryEndpoints(t *testing.T) {
 `)
 	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
+		"--secrets-fd", "7",
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadPolicy(cfg); err == nil {
-		t.Fatal("expected missing CA material to be rejected")
+	if _, err := LoadPolicy(cfg); err != nil {
+		t.Fatal(err)
 	}
+
 }
 
 func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	writeConfigPolicy(t, policyPath, `
@@ -294,8 +333,7 @@ func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 
 	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
-		"--tls-ca-cert", filepath.Join(dir, "ca.pem"),
-		"--tls-ca-key", filepath.Join(dir, "ca-key.pem"),
+		"--secrets-fd", "7",
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -304,9 +342,11 @@ func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPolicy returned error: %v", err)
 	}
+
 }
 
 func TestParseKeepsLogFileOnValidationError(t *testing.T) {
+	t.Parallel()
 	logFile := "netd.log"
 	auditLogFile := "audit.jsonl"
 	cfg, err := Parse([]string{"--log-file", logFile, "--audit-log-file", auditLogFile})
@@ -316,6 +356,7 @@ func TestParseKeepsLogFileOnValidationError(t *testing.T) {
 	if cfg == nil || cfg.LogFile != logFile || cfg.AuditLogFile != auditLogFile {
 		t.Fatalf("expected parser-owned log file on validation error, got %#v", cfg)
 	}
+
 }
 
 func parseConfig(t *testing.T, args ...string) *Config {

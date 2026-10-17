@@ -3,6 +3,7 @@ package registry
 import "testing"
 
 func TestIntelligencePoolSharesEquivalentFeedSnapshots(t *testing.T) {
+	t.Parallel()
 	pool := NewIntelligencePool(nil)
 	firstCatalog, err := NewCatalog([]string{"npm", "pypi"})
 	if err != nil {
@@ -23,9 +24,11 @@ func TestIntelligencePoolSharesEquivalentFeedSnapshots(t *testing.T) {
 	if first != second {
 		t.Fatal("equivalent feed configuration did not share an intelligence snapshot")
 	}
+
 }
 
 func TestIntelligencePoolSeparatesDifferentEcosystemSets(t *testing.T) {
+	t.Parallel()
 	pool := NewIntelligencePool(nil)
 	npmCatalog, err := NewCatalog([]string{"npm"})
 	if err != nil {
@@ -46,4 +49,5 @@ func TestIntelligencePoolSeparatesDifferentEcosystemSets(t *testing.T) {
 	if npm == pypi {
 		t.Fatal("different ecosystem sets shared an intelligence snapshot")
 	}
+
 }

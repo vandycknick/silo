@@ -21,7 +21,8 @@ use protocol::v1::{
     GuestProcessInput, GuestProcessLaunchFailed, GuestProcessSignaled, GuestProcessStarted,
     GuestProcessStderr, GuestProcessStdout, GuestProcessTerminalOutput, LaunchFailureReason,
     ListenEvent, ListenRequest, ListenerBound, ListenerFailed, LoadAverageMetrics, MemoryMetrics,
-    MetricSnapshot, SystemInfo, WatchAgentMetricsRequest, WatchAgentStatusRequest,
+    MetricSnapshot, SyncClockRequest, SyncClockResponse, SystemInfo, WatchAgentMetricsRequest,
+    WatchAgentStatusRequest,
 };
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -421,6 +422,7 @@ fn agent_status(identity: &Identity, state: AgentStatusState) -> AgentStatus {
                 ..GuestBootReport::default()
             }),
             provisioning: None,
+            ssh: None,
         }),
     }
 }
@@ -550,6 +552,19 @@ impl GuestAgentService for AgentService {
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn sync_clock(
+        &self,
+        _: Request<SyncClockRequest>,
+    ) -> Result<Response<SyncClockResponse>, Status> {
+        Ok(Response::new(SyncClockResponse {
+            offset: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 0,
+            }),
+            stepped: false,
+        }))
     }
 }
 

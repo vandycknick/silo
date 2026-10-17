@@ -89,6 +89,16 @@ message AgentStatusReport {
   SystemInfo system = 5;
   GuestBootReport boot = 6;
   ProvisionReport provisioning = 7;
+  SshListenerReport ssh = 8;
+}
+
+// Prepared by the guest, then KEX-verified by the host against the actual port.
+message SshListenerReport {
+  string backend = 1;
+  uint32 port = 2;
+  string host_public_key = 3;
+  bool config_verified = 4;
+  bool kex_verified = 5;
 }
 
 message SystemInfo {

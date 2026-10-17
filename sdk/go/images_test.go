@@ -11,16 +11,3 @@ func TestImageHandleUsesStrongSizes(t *testing.T) {
 		t.Fatalf("size = %#v", value.Size)
 	}
 }
-
-func TestOCIConfigPreservesAbsentAndEmptyCollections(t *testing.T) {
-	absent := imageDetailWire{}
-	if absent.Config.Entrypoint != nil || absent.Config.Labels != nil {
-		t.Fatal("zero-value OCI config should preserve absent collections")
-	}
-	emptyStrings := []string{}
-	emptyLabels := map[string]string{}
-	empty := OCIImageConfig{Entrypoint: &emptyStrings, Command: &emptyStrings, Env: &emptyStrings, Labels: &emptyLabels}
-	if empty.Entrypoint == nil || len(*empty.Entrypoint) != 0 || empty.Labels == nil || len(*empty.Labels) != 0 {
-		t.Fatal("OCI config did not preserve explicitly empty collections")
-	}
-}

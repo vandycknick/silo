@@ -10,9 +10,13 @@ The native backend is implemented inside `silo-agent` with `russh`. It serves SS
 
 1. Use OpenSSH when `/usr/sbin/sshd` exists.
 2. Use the native `agent` backend when OpenSSH is unavailable.
-3. If another process already owns guest `vsock::22`, leave that listener alone.
+3. If another process already owns guest `vsock::22`, validate its systemd OpenSSH socket and CA-only policy, then delegate to it.
 
-The third point is important. Selecting the native backend is not enough by itself. The agent also has to successfully bind guest `vsock::22`.
+Production ownership is **first binder wins**. The agent attempts to bind port 22 once. If it wins, it serves its selected `openssh` or `agent` backend. If systemd wins, the agent validates the active socket, exact port, Accept setting, service command, and effective sshd policy before publishing a `systemd-openssh` descriptor. An unrecognized or noncompliant owner fails startup; it is not advertised as trusted SSH.
+
+Trust configuration and service overrides are installed before init handoff. Neither owner steals the listener or polls/rebinds. A generated `sshd-vsock.socket` that loses the bind may remain failed with `EADDRINUSE` while the agent-owned listener is healthy. Do not reset that losing unit, mask it in production, or use `systemd.ssh_auto=no` as the production ownership policy.
+
+For `Accept=yes`, systemd uses the matching `sshd-vsock@.service` template. Validation queries an unstarted inspection instance of that template: `Triggers` lists live instances and can be empty before the first connection, while `systemctl show` cannot directly inspect a bare template. See the [systemd socket activation contract](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html#Service=). The inspection instance is never started and does not own a socket.
 
 Expected native-agent logs:
 
@@ -24,13 +28,46 @@ native SSH backend is ready
 
 This means the native backend was selected and is serving traffic.
 
-This log means the native backend is not serving traffic:
+When systemd owns the listener, an INFO event records delegation to the validated external OpenSSH listener. The selected agent backend is not serving traffic in that case; the status descriptor identifies the actual owner as `systemd-openssh`.
 
-```text
-SSH vsock port is already in use, leaving the existing listener active
-```
+## Cached Host SSH Verification
 
-In that case, the selected backend may be `agent`, but shell traffic still goes to the existing listener.
+Guest status receipts still arrive every five seconds. They describe the listener and its verified configuration, but the guest's `kex_verified` assertion is not trusted. The host independently verifies the advertised listener key and the immutable host-key pin. Initial eligibility and relevant identity/backend/port/key changes trigger an immediate check, after any old attempt's resources drain.
+
+For an unchanged target, the next check starts **60 seconds after the previous check completes**, after either success or failure. Healthy idle operation therefore still makes periodic pre-authentication SSH connections, but no longer one connection per status heartbeat. Status and metrics receipt processing continues while a check connects, shuts down, verifies the pin, or waits for resources to drain.
+
+One attempt has a five-second readiness budget. Successful evidence expires after at most 65 seconds and identical heartbeats do not renew it. A fresh raw Ready report with pending, failed, or expired SSH evidence is exposed as Starting with `SSH_NOT_READY` and `kex_verified=false`. Freshness is independent: a handshake cannot refresh a stale guest observation.
+
+The normal health-detection window is up to **60 + 5 seconds**. Failed checks retry at the same cadence, not on every heartbeat. Configuration changes, identity replacement, loss of the control connection, and stopping invalidate the cached evidence. Normal periodic checks retain prior successful evidence until its deadline.
+
+The probe sends a local SSH disconnect and joins the connection task after KEX. Cancellation closes its owned transport before another attempt can start. Pin locking is nonblocking; a contended lock is a failed check at the normal cadence. Filesystem syscalls already in progress cannot be canceled, so a timed-out pin job is drained before a replacement attempt. The readiness budget does not promise five-second termination of every OS syscall.
+
+Actual authenticated SSH sessions check the existing immutable host pin and use
+certificate authentication. Cached readiness is not a replacement for those
+session security checks, nor a gate on already-pinned SSH access. `silo shell`,
+libvm `shell`, and taild Shell use SSH over `VmAccessService.OpenSsh` to vsock 22,
+without guest identity/process RPC. They require a Running, non-stopping VM
+generation, the prior pin, a matching server key and an accepted user certificate.
+There is no interactive first-use pinning.
+
+An independently owned listener, such as systemd OpenSSH, can remain usable when
+the guest agent is unavailable. An agent-owned listener cannot survive its owner
+stopping. Initial provisioning and pin establishment still require their normal
+readiness flow; this does not relax the health-probe policy above.
+Use `exec`, `spawn` or `exec_script` for agent RPC execution instead. See the
+[execution guide](../../runtime/libvm/README.md#execution) for API selection and
+local versus caller-supplied terminal ownership.
+
+## OpenSSH Connection Diagnostics
+
+Production OpenSSH children retain their VERBOSE syslog diagnostics; the invocation does not add `-e`. At child exit the agent checks whether a Unix datagram connect to `/dev/log` succeeds, without sending a message. Socket-path existence alone does not establish availability, and this best-effort check is not a delivery guarantee.
+
+- Exit zero is a DEBUG connection-lifecycle event.
+- Normal nonzero exit with reachable syslog is DEBUG, retaining the numeric status. A pre-authentication readiness disconnect can legitimately produce such an exit.
+- Normal nonzero exit without reachable syslog is WARN, retaining status and noting unavailable syslog. Logger-less guests deliberately retain this conservative fallback.
+- Signal termination is WARN regardless of syslog availability. Spawn/wait/stderr-read errors and captured stderr retain their diagnostics.
+
+The systemd-owned listener uses systemd/journal diagnostics instead of the agent child-wait policy. Individual pre-authentication service instances can exit nonzero; do not globally declare exit 255 successful with `SuccessExitStatus=255`. Less frequent probes reduce lifecycle noise but do not establish the cause of slow interactive SSH setup or stalls.
 
 ## Process Tree Check
 
@@ -53,9 +90,29 @@ If the process tree contains `sshd`, `sshd-session`, or `/usr/bin/sshd -D`, that
 
 `russh` cannot produce `sshd-session` processes. If they are present, OpenSSH handled the session.
 
-## Forcing The Native Backend
+SSHD marks login shells with a leading dash in `argv[0]`, such as `-sh`.
+The Silo rescue multicall binary recognizes `-sh`, `-ash` and `-dash`, preserves
+that login name for `$0`, and loads login profiles. An `applet not found: -sh`
+error indicates an older rescue executable in the guest rootfs; updating the
+initramfs alone does not replace that rootfs executable. Rescue qualification
+fixtures must contain the multicall binary from the current build.
 
-For local testing on an image that still has OpenSSH installed, temporarily force `SshService::new` to skip OpenSSH detection.
+## Native Session I/O Lifetime
+
+The native server drains both process output streams through window-aware SSH
+writes before sending exit status, EOF and channel close. Child exit alone is
+not evidence that the final output has reached the SSH queue. Stdout/stderr
+reader completion belongs to the exit waiter, not independent detached threads.
+
+Channel close or connection loss cancels descriptor-readiness and SSH
+flow-control waits. Input EOF only closes input; it does not cancel output.
+PTY master duplicates share nonblocking flags, so both readers and the input
+writer use readiness-aware I/O. This keeps output drain and cancellation correct
+without timer polling or blocking a runtime thread on a PTY write.
+
+## Forcing The Native Backend (Diagnostic Only)
+
+The following temporary source change is for isolated local diagnostics only, not production listener ownership policy. On an image that still has OpenSSH installed, temporarily force `SshService::new` to skip OpenSSH detection.
 
 In `guest/agent/src/ssh/mod.rs`, temporarily change:
 
@@ -79,11 +136,9 @@ cargo run -p cli -- run agent --initramfs target/resources/assets/initramfs --di
 
 Always pass the rebuilt initramfs while testing local agent changes. Without this, `silo run` may use installed assets and accidentally test an older guest agent.
 
-## Disabling systemd's SSH Vsock Listener
+## Disabling systemd's SSH Vsock Listener (Diagnostic Only)
 
-On systemd 256+ guests, `systemd-ssh-generator` can automatically bind OpenSSH to guest `vsock::22` when `sshd` is installed. This races the Silo agent for the same port.
-
-The intended kernel command line switch is:
+On systemd 256+ guests, `systemd-ssh-generator` can automatically bind OpenSSH to guest `vsock::22`. Production permits this first-binder-wins race with mandatory trust validation. For an isolated native-backend diagnostic fixture only, the kernel command line switch is:
 
 ```text
 systemd.ssh_auto=no
@@ -112,9 +167,9 @@ systemd.mask=sshd.service
 
 Do not rely on masking `ssh.socket` or `sshd.socket` for the systemd-generated vsock listener. On Arch Linux with modern systemd, the generated unit is named around `sshd-vsock.socket`, not the classic distro socket names.
 
-## No Cmdline Override Workaround
+## No Cmdline Override Workaround (Diagnostic Only)
 
-If passing kernel command line arguments is inconvenient, use Silo userdata to stop and mask only the generated vsock SSH socket before the agent binds SSH.
+If passing kernel command line arguments is inconvenient, an isolated diagnostic fixture can use Silo userdata to stop and mask only the generated vsock SSH socket before the agent binds SSH. This masking is not the production ownership policy and must not be applied to existing running VMs for qualification.
 
 Create `disable-systemd-vsock-ssh.sh`:
 
@@ -143,7 +198,7 @@ cargo run -p cli -- run agent \
 
 This works because Silo userdata runs during agent provisioning, before `silo-agent` tries to listen on guest `vsock::22`.
 
-For a persistent VM, this can be done once from inside the guest, then rebooted:
+Only on a disposable diagnostic VM, the equivalent persistent mask requires a reboot:
 
 ```bash
 sudo systemctl stop sshd-vsock.socket
@@ -211,4 +266,31 @@ listening for SSH vsock connections port=22
 native SSH backend is ready
 ```
 
-The native backend owns the Silo shell path. If a shell still shows `sshd-session`, verify that you connected through `silo shell` and not direct network SSH.
+These logs identify the native backend as the owner of vsock 22 for that run.
+The CLI command does not select the SSH server implementation: `silo shell` and
+taild Shell can also reach an agent-managed OpenSSH backend or the validated
+systemd-owned listener. An `sshd-session` process is valid in those cases. Check
+the current listener descriptor and process tree, not the client command name.
+
+## Isolated Real KVM Qualification
+
+Real-VM SSH qualification lives in the Python smoke suite, not in `cargo test`.
+See [the smoke suite README](../../smoke/README.md) for prerequisites, isolated
+workspaces, image configuration, and retained failure evidence.
+
+The `test_ssh_distros.py` cases qualify certificate login and persistent host keys
+across two boots using the images selected by `SILO_SMOKE_DISTRO_IMAGES`.
+The `test_ssh_systemd_owned.py` cases qualify agent-owned and systemd-owned
+vsock listeners, continued readiness, idle host CPU and descriptor usage, and
+socket failure/recovery using `SILO_SMOKE_SYSTEMD_IMAGE`.
+
+Build and stage the runtime first, then select the SSH cases:
+
+```bash
+make stage
+make smoke SMOKE_ARGS="-k 'ssh_distros or ssh_systemd_owned'"
+```
+
+Image-dependent cases skip explicitly when their configured images are absent.
+A skipped case is not qualification evidence. Do not roll out or profile these
+changes on existing VMs without a separately coordinated restart.

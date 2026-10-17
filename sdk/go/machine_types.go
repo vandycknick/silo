@@ -144,6 +144,12 @@ type VsockConfig struct {
 }
 
 type MachineData struct {
+	Observation     string
+	Issues          []MachineIssue
+	RunID           *string
+	CPUs            *uint8
+	Memory          *ByteSize
+	GuestUser       *GuestUser
 	ID              string
 	Name            string
 	MachineDir      string

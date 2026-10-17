@@ -336,57 +336,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize_path_absolute() {
-        assert_eq!(normalize_path("/etc/passwd"), vec!["etc", "passwd"]);
-    }
-
-    #[test]
-    fn test_normalize_path_relative() {
-        assert_eq!(normalize_path("etc/passwd"), vec!["etc", "passwd"]);
-    }
-
-    #[test]
-    fn test_normalize_path_root() {
-        assert!(normalize_path("/").is_empty());
-    }
-
-    #[test]
-    fn test_normalize_path_empty() {
-        assert!(normalize_path("").is_empty());
-    }
-
-    #[test]
-    fn test_normalize_path_consecutive_slashes() {
-        assert_eq!(normalize_path("//a///b//"), vec!["a", "b"]);
-    }
-
-    #[test]
-    fn test_normalize_path_dots() {
-        // Dots are kept as components; resolution handles them during traversal.
-        assert_eq!(
-            normalize_path("/a/./b/../c"),
-            vec!["a", ".", "b", "..", "c"]
-        );
-    }
-
-    #[test]
-    fn test_normalize_path_single_component() {
-        assert_eq!(normalize_path("/file.txt"), vec!["file.txt"]);
-        assert_eq!(normalize_path("file.txt"), vec!["file.txt"]);
-    }
-
-    #[test]
-    fn test_normalize_path_trailing_slash() {
-        // A trailing slash should not produce an empty trailing component.
-        assert_eq!(normalize_path("/etc/"), vec!["etc"]);
-        assert_eq!(normalize_path("/a/b/c/"), vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_normalize_path_deeply_nested() {
-        assert_eq!(
-            normalize_path("/a/b/c/d/e/f"),
-            vec!["a", "b", "c", "d", "e", "f"]
-        );
+    fn test_normalize_path_cases() {
+        for (label, input, expected) in [
+            ("absolute", "/etc/passwd", vec!["etc", "passwd"]),
+            ("relative", "etc/passwd", vec!["etc", "passwd"]),
+            ("root", "/", vec![]),
+            ("empty", "", vec![]),
+            ("consecutive_slashes", "//a///b//", vec!["a", "b"]),
+            ("dots", "/a/./b/../c", vec!["a", ".", "b", "..", "c"]),
+            ("absolute_single_component", "/file.txt", vec!["file.txt"]),
+            ("relative_single_component", "file.txt", vec!["file.txt"]),
+            ("trailing_slash", "/etc/", vec!["etc"]),
+            ("nested_trailing_slash", "/a/b/c/", vec!["a", "b", "c"]),
+            (
+                "deeply_nested",
+                "/a/b/c/d/e/f",
+                vec!["a", "b", "c", "d", "e", "f"],
+            ),
+        ] {
+            assert_eq!(normalize_path(input), expected, "{label}");
+        }
     }
 }

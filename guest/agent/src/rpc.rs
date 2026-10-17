@@ -7,8 +7,8 @@ use prost_types::{Duration as ProtoDuration, Timestamp};
 use protocol::v1::guest_agent_service_server::{GuestAgentService, GuestAgentServiceServer};
 use protocol::v1::{
     AgentIdentity, AgentStatus, AgentStatusReport, AgentStatusState, GetAgentMetricsRequest,
-    GetAgentStatusRequest, GuestBootReport, ProvisionReport, WatchAgentMetricsRequest,
-    WatchAgentStatusRequest,
+    GetAgentStatusRequest, GuestBootReport, ProvisionReport, SyncClockRequest, SyncClockResponse,
+    WatchAgentMetricsRequest, WatchAgentStatusRequest,
 };
 use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
@@ -140,6 +140,7 @@ impl AgentServer {
             state: self.state.clone(),
             status_watches: std::sync::Arc::new(Semaphore::new(8)),
             metric_watches: std::sync::Arc::new(Semaphore::new(4)),
+            clock_syncs: std::sync::Arc::new(Semaphore::new(1)),
         };
         let filesystem = FilesystemService::new("/", self.state.instance_id.clone());
         let guest_process = GuestProcessServiceImpl::new(
@@ -259,8 +260,19 @@ impl AgentServer {
             Some(("PROVISIONING_COMPLETE", "provisioning complete")),
         );
     }
-    pub(crate) fn ready(&self, boot: GuestBootReport, provision: ProvisionReport) {
-        self.publish(AgentStatusState::Ready, boot, Some(provision), None);
+    pub(crate) fn ready(
+        &self,
+        boot: GuestBootReport,
+        provision: ProvisionReport,
+        ssh: protocol::v1::SshListenerReport,
+    ) {
+        self.publish_with_ssh(
+            AgentStatusState::Ready,
+            boot,
+            Some(provision),
+            None,
+            Some(ssh),
+        );
     }
     pub(crate) fn fail(&self, message: impl Into<String>) {
         let current = self.state.status.borrow().clone();
@@ -268,7 +280,7 @@ impl AgentServer {
             .report
             .as_ref()
             .and_then(|report| report.boot.clone())
-            .map_or_else(GuestBootReport::default, |boot| boot);
+            .unwrap_or_default();
         let provision = current.report.and_then(|report| report.provisioning);
         let message = message.into();
         self.publish(
@@ -285,6 +297,16 @@ impl AgentServer {
         provision: Option<ProvisionReport>,
         detail: Option<(&str, &str)>,
     ) {
+        self.publish_with_ssh(state, boot, provision, detail, None);
+    }
+    fn publish_with_ssh(
+        &self,
+        state: AgentStatusState,
+        boot: GuestBootReport,
+        provision: Option<ProvisionReport>,
+        detail: Option<(&str, &str)>,
+        ssh: Option<protocol::v1::SshListenerReport>,
+    ) {
         let boot_id = self
             .state
             .status
@@ -292,7 +314,7 @@ impl AgentServer {
             .identity
             .as_ref()
             .and_then(|identity| identity.boot_id.clone())
-            .map_or_else(String::new, |boot_id| boot_id);
+            .unwrap_or_default();
         let mut next = status(
             &self.state.instance_id,
             boot_id,
@@ -302,12 +324,15 @@ impl AgentServer {
             detail,
         );
         let current = self.state.status.borrow().clone();
+        if let Some(report) = next.report.as_mut() {
+            report.ssh = ssh;
+        }
         if same_status_content(&current, &next) {
             return;
         }
-        next.report
-            .as_mut()
-            .map(|report| report.observed_at = Some(now()));
+        if let Some(report) = next.report.as_mut() {
+            report.observed_at = Some(now());
+        }
         self.state.status.send_replace(next);
     }
 }
@@ -407,6 +432,7 @@ fn status(
             system: get_system_info().ok(),
             boot: Some(boot),
             provisioning,
+            ssh: None,
         }),
     }
 }
@@ -449,6 +475,7 @@ struct AgentService {
     state: AgentState,
     status_watches: std::sync::Arc<Semaphore>,
     metric_watches: std::sync::Arc<Semaphore>,
+    clock_syncs: std::sync::Arc<Semaphore>,
 }
 
 #[tonic::async_trait]
@@ -551,6 +578,31 @@ impl GuestAgentService for AgentService {
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn sync_clock(
+        &self,
+        request: Request<SyncClockRequest>,
+    ) -> Result<Response<SyncClockResponse>, Status> {
+        let _permit = admission(&self.clock_syncs, "clock sync")?;
+        let request = request.into_inner();
+        let outcome =
+            crate::clock::sync_realtime(request.host_time.as_ref()).map_err(
+                |error| match error {
+                    crate::clock::ClockSyncError::Missing
+                    | crate::clock::ClockSyncError::Invalid(_) => {
+                        protocol::detailed_status(Status::invalid_argument(error.to_string()))
+                    }
+                    crate::clock::ClockSyncError::Read(_)
+                    | crate::clock::ClockSyncError::Set(_) => {
+                        protocol::detailed_status(Status::internal(error.to_string()))
+                    }
+                },
+            )?;
+        Ok(Response::new(SyncClockResponse {
+            offset: Some(crate::clock::offset_duration(outcome.offset_nanos)),
+            stepped: outcome.stepped,
+        }))
     }
 }
 

@@ -1,6 +1,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("silo-agent only supports Linux guests");
 
+mod clock;
 mod filesystem;
 mod forward;
 mod guest_process;
@@ -149,6 +150,8 @@ fn prepare_agent_process(
 
     let early_provisioning = prepare_early_provisioning(&agent_config.provision)
         .context("prepare required early guest provisioning")?;
+    crate::provision::ssh::prepare(&agent_config.ssh)
+        .context("prepare mandatory SSH trust before init handoff")?;
     let boot_mode = match agent_mode {
         AgentMode::Standard => BootMode::Standard,
         AgentMode::Init { requested_init } => handoff::maybe_handoff_init(requested_init)?,
@@ -175,7 +178,6 @@ async fn run_agent(
     .await?;
     let provision_report = match run_provisioning(
         &agent_config.provision,
-        &agent_config.ssh,
         &process_supervisor,
         &early_provisioning,
     ) {
@@ -187,6 +189,10 @@ async fn run_agent(
         }
     };
     agent_server.update(boot_report.clone(), provision_report.clone());
+    crate::provision::ssh::verify_trust(&agent_config.ssh).map_err(|error| {
+        agent_server.fail(format!("SSH trust verification failed: {error}"));
+        error
+    })?;
 
     if provision_report.status == Some(ProvisionOverallStatus::FailedBoot as i32) {
         agent_server.fail("guest provisioning requested boot failure");
@@ -225,9 +231,13 @@ async fn run_agent(
             true
         }
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            crate::ssh::constrain_external_listener().map_err(|error| {
+                agent_server.fail(format!("external SSH listener is not CA-only: {error}"));
+                error
+            })?;
             tracing::info!(
                 port = SSH_VSOCK_PORT,
-                "SSH vsock port is already in use, leaving the existing listener active"
+                "delegating SSH vsock connections to validated systemd OpenSSH listener"
             );
             false
         }
@@ -272,7 +282,11 @@ async fn run_agent(
     }
     running_servers.push(forward_server);
 
-    agent_server.ready(boot_report, provision_report);
+    agent_server.ready(
+        boot_report,
+        provision_report,
+        ssh_service.descriptor(!owns_ssh_listener)?,
+    );
 
     let mut join_set = tokio::task::JoinSet::new();
     for server in running_servers {

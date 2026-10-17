@@ -21,8 +21,9 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, _context: &mut Context) -> eyre::Result<()> {
         let global_config = GlobalConfig::load().context("load global config")?;
-        let runtime_config =
-            RuntimeConfig::local(self.home).with_networking(global_config.networking.clone());
+        let runtime_config = RuntimeConfig::local(self.home)
+            .with_networking(global_config.networking().clone())
+            .with_registry_policy(global_config.images().clone());
         let run_id = std::env::var(MACHINE_RUN_ID_ENV)
             .context("detached cleanup is missing its machine run ID")?
             .parse::<MachineRunId>()

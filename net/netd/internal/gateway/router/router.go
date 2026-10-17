@@ -2,15 +2,19 @@ package router
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 
 	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/netnode"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 )
 
 type Router struct {
+	tunnel     *netnode.Node
 	policy     *policy.Policy
 	policyHash string
 	audit      *audit.Logger
@@ -25,11 +29,35 @@ func New(compiledPolicy *policy.Policy, audit *audit.Logger) *Router {
 
 func (r *Router) Decide(ctx context.Context, flow hooks.Flow) (hooks.RouteDecision, error) {
 	_ = ctx
+	tailnet := r.IsTailnetDestination(flow.DestIP)
 	decision := r.policy.EvaluateFlow(policy.Flow{
-		Protocol: flow.Protocol, SourceIP: flow.SourceIP, SourcePort: flow.SourcePort,
+		TailnetDestination: tailnet,
+		Protocol:           flow.Protocol, SourceIP: flow.SourceIP, SourcePort: flow.SourcePort,
 		DestIP: flow.DestIP, DestPort: flow.DestPort,
 	})
-	return routeDecisionFromPolicy(decision), nil
+	converted := routeDecisionFromPolicy(decision)
+	if tailnet && converted.Tunnel == nil && converted.Action != hooks.RouteDeny {
+		converted.Action = hooks.RouteDeny
+		converted.ClassificationOpportunity = false
+		converted.Reason = "tunnel_required"
+	}
+	return converted, nil
+}
+
+// Classify before host NAT: translation must never erase DNS provenance or
+// turn a selected tailnet address into a loopback host escape.
+func (r *Router) IsTailnetDestination(address net.IP) bool {
+	ip, ok := netip.AddrFromSlice(address)
+	return ok && (netnode.InRange(ip) || (r.tunnel != nil && r.tunnel.IsDestination(ip)))
+}
+
+func (r *Router) SetTunnel(node *netnode.Node) { r.tunnel = node }
+func (r *Router) Node() *netnode.Node          { return r.tunnel }
+func (r *Router) DialTunnel(ctx context.Context, dst netip.AddrPort) (net.Conn, string, error) {
+	if r.tunnel == nil {
+		return nil, "tunnel_not_connected", errors.New("no tunnel node")
+	}
+	return r.tunnel.DialTCP(ctx, dst)
 }
 
 func (r *Router) WithFlowID(flow hooks.Flow) hooks.Flow {
@@ -151,6 +179,9 @@ func routeDecisionFromPolicy(decision policy.Decision) hooks.RouteDecision {
 		Action: routeActionFromPolicy(decision), Layer: string(decision.Layer), Source: string(decision.Source),
 		DefaultAction: string(decision.DefaultAction), ClassificationOpportunity: decision.ClassificationOpportunity,
 		Reason: decision.Reason, RuleName: decision.RuleName, EndpointKind: decision.EndpointKind, EndpointName: decision.EndpointName,
+	}
+	if decision.Tunnel != nil {
+		converted.Tunnel = &hooks.Tunnel{Kind: decision.Tunnel.Kind, Name: decision.Tunnel.Name}
 	}
 	if decision.SelectedCredential != nil {
 		converted.Credential = &hooks.Credential{

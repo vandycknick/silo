@@ -7,12 +7,13 @@ socket. Run these commands from `nix develop`, which provides `grpcurl` and
 ## Select a running machine
 
 Set the machine name, obtain its immutable ID from the CLI, then derive the
-ephemeral runtime socket from the run root (`/tmp/silo-<euid>`):
+ephemeral runtime socket from the run root (`/tmp/silo-<euid>` unless
+`SILO_RUN_ROOT` (absolute) overrides it; use `/private/tmp` on macOS):
 
 ```bash
 VM=dev
 MACHINE_ID="$(silo status "$VM" --format json | jq -r '.id')"
-RUN_ROOT="/tmp/silo-$(id -u)"
+RUN_ROOT="${SILO_RUN_ROOT:-/tmp/silo-$(id -u)}"
 SOCKET="$RUN_ROOT/machines/$MACHINE_ID/vm.sock"
 GRPC_TARGET="unix://$SOCKET"
 

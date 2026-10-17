@@ -14,7 +14,6 @@ use crate::targets::HostTarget;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Component {
     Cli,
-    Silod,
     SiloVmm,
     Netd,
     Agent,
@@ -23,6 +22,7 @@ pub enum Component {
     Initramfs,
     Rprobe,
     GoFfi,
+    Taild,
 }
 
 pub struct BuildContext<'a> {
@@ -52,16 +52,18 @@ pub enum ComponentError {
     MissingVmmBinary { path: std::path::PathBuf },
     #[error("rprobe must be built natively on Linux ARM64")]
     UnsupportedRprobeHost,
+    #[error(transparent)]
+    Version(#[from] crate::version::VersionError),
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     for component in [
         Component::Cli,
-        Component::Silod,
         Component::SiloVmm,
         Component::Netd,
         Component::Agent,
         Component::Init,
+        Component::Taild,
     ] {
         build_component(component, context)?;
     }
@@ -74,7 +76,6 @@ pub fn build_component(
 ) -> Result<(), ComponentError> {
     match component {
         Component::Cli => build_cargo_package(context, "cli"),
-        Component::Silod => build_cargo_package(context, "silod"),
         Component::SiloVmm => build_vmm(context),
         Component::Netd => build_netd(context),
         Component::Agent => build_guest_agent(context),
@@ -83,6 +84,7 @@ pub fn build_component(
         Component::Initramfs => build_initramfs(context),
         Component::Rprobe => build_rprobe(context),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
+        Component::Taild => build_taild(context),
     }
 }
 
@@ -137,35 +139,19 @@ pub fn clippy(
     command::run(rprobe)
 }
 
+#[derive(Clone, Copy)]
+enum TestSuite {
+    Unit,
+    Integration,
+    All,
+}
+
 pub fn test_units(
     workspace_root: &Path,
     target_dir: &Path,
     host: HostTarget,
 ) -> Result<(), command::CommandError> {
-    let mut cargo = standard_cargo_command(workspace_root, target_dir);
-    cargo.args([
-        "test",
-        "--locked",
-        "--workspace",
-        "--lib",
-        "--bins",
-        "--all-features",
-    ]);
-    for member in host.workspace_excludes() {
-        cargo.args(["--exclude", member]);
-    }
-    command::run(cargo)?;
-
-    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
-    rprobe.args([
-        "test",
-        "--locked",
-        "-p",
-        "rprobe",
-        "--lib",
-        "--no-default-features",
-    ]);
-    command::run(rprobe)
+    run_tests(workspace_root, target_dir, host, TestSuite::Unit)
 }
 
 pub fn test_integration(
@@ -173,24 +159,110 @@ pub fn test_integration(
     target_dir: &Path,
     host: HostTarget,
 ) -> Result<(), command::CommandError> {
-    let mut cargo = standard_cargo_command(workspace_root, target_dir);
-    cargo.args([
-        "test",
-        "--locked",
-        "--workspace",
-        "--test",
-        "*",
-        "--all-features",
+    run_tests(workspace_root, target_dir, host, TestSuite::Integration)
+}
+
+pub fn test_all(
+    workspace_root: &Path,
+    target_dir: &Path,
+    host: HostTarget,
+) -> Result<(), command::CommandError> {
+    run_tests(workspace_root, target_dir, host, TestSuite::All)
+}
+
+fn run_tests(
+    workspace_root: &Path,
+    target_dir: &Path,
+    host: HostTarget,
+    suite: TestSuite,
+) -> Result<(), command::CommandError> {
+    let ci = std::env::var("CI").is_ok_and(|value| value == "true");
+    if !matches!(suite, TestSuite::Unit) {
+        let mut build = standard_cargo_command(workspace_root, target_dir);
+        build.args([
+            "build",
+            "--locked",
+            "-p",
+            "silo-vmm",
+            "--features",
+            "mock-backend",
+        ]);
+        command::run(build)?;
+    }
+    // Real-process tests build private netd copies. Warm Go's build cache once
+    // before parallel nextest workers compete to compile the same cold graph.
+    let mut netd = Command::new("go");
+    netd.current_dir(workspace_root.join("net/netd")).args([
+        "build",
+        "-o",
+        "/dev/null",
+        "./cmd/netd",
     ]);
+    command::run(netd)?;
+
+    command::run(workspace_test_command(
+        workspace_root,
+        target_dir,
+        host,
+        suite,
+        ci,
+    ))?;
+
+    if !matches!(suite, TestSuite::Integration) {
+        command::run(rprobe_test_command(workspace_root, target_dir, ci))?;
+    }
+    if !matches!(suite, TestSuite::Unit) {
+        let mut go = Command::new("go");
+        go.current_dir(workspace_root.join("net/netd")).arg("test");
+        // The darwin/arm64 race runtime slows netd's gVisor stack by orders of
+        // magnitude, past every real-time budget; Linux hosts carry the race lane.
+        if host != HostTarget::MacosArm64 {
+            go.arg("-race");
+        }
+        go.arg("./...");
+        command::run(go)?;
+    }
+    Ok(())
+}
+
+fn nextest_command(workspace_root: &Path, target_dir: &Path, ci: bool) -> Command {
+    let mut cargo = standard_cargo_command(workspace_root, target_dir);
+    cargo.args(["nextest", "run", "--locked"]);
+    if ci {
+        cargo.args(["--profile", "ci"]);
+    }
+    cargo
+}
+
+fn workspace_test_command(
+    workspace_root: &Path,
+    target_dir: &Path,
+    host: HostTarget,
+    suite: TestSuite,
+    ci: bool,
+) -> Command {
+    let mut cargo = nextest_command(workspace_root, target_dir, ci);
+    cargo.arg("--workspace");
+    if !matches!(suite, TestSuite::Integration) {
+        cargo.args(["--lib", "--bins"]);
+    }
+    if !matches!(suite, TestSuite::Unit) {
+        cargo.arg("--tests").env(
+            "SILO_TEST_MOCK_VMM_BINARY",
+            target_dir.join("debug/silo-vmm"),
+        );
+    }
+    cargo.arg("--all-features");
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
-    command::run(cargo)?;
+    cargo
+}
 
-    let mut go = Command::new("go");
-    go.current_dir(workspace_root.join("net/netd"))
-        .args(["test", "./..."]);
-    command::run(go)
+fn rprobe_test_command(workspace_root: &Path, target_dir: &Path, ci: bool) -> Command {
+    let mut cargo = nextest_command(workspace_root, target_dir, ci);
+    cargo.args(["-p", "rprobe", "--lib", "--no-default-features"]);
+    cargo
 }
 
 fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), ComponentError> {
@@ -275,6 +347,66 @@ fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     ]);
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
+    Ok(())
+}
+
+fn build_taild(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    crate::version::check(context.workspace_root)?;
+    build_component(Component::GoFfi, context)?;
+
+    let source = context.workspace_root.join("app/taild");
+    let output_dir = context.target_dir.join(context.profile.directory());
+    fs::create_dir_all(&output_dir).map_err(|source| ComponentError::CreateOutputDirectory {
+        path: output_dir.clone(),
+        source,
+    })?;
+    let output = output_dir.join("taild");
+    let go_program = release::tool("go")?;
+    let (goos, goarch) = context.host.go_target();
+    let mut go = Command::new(&go_program);
+    go.current_dir(&source)
+        .args(["build", "-mod=readonly", "-trimpath", "-buildvcs=false"]);
+    release::configure_command(
+        &mut go,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
+    go.env("CGO_ENABLED", "1")
+        .env("GOOS", goos)
+        .env("GOARCH", goarch)
+        .env_remove("SILO_GO_FFI_PATH");
+    if context.profile == Profile::Release {
+        go.args(["-ldflags", "-s -w"]);
+    }
+    go.arg("-o").arg(&output).arg("./cmd/taild");
+    command::run(go)?;
+    if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
+        release::set_macos_build_version(&output)?;
+    }
+
+    let mut notices = Command::new("python3");
+    notices
+        .arg(
+            context
+                .workspace_root
+                .join("packaging/silo-taild/licenses.py"),
+        )
+        .arg(&source)
+        .arg(context.target_dir.join("taild-licenses"))
+        .arg(go_program);
+    release::configure_command(
+        &mut notices,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
+    notices
+        .env("CGO_ENABLED", "1")
+        .env("GOOS", goos)
+        .env("GOARCH", goarch)
+        .env_remove("SILO_GO_FFI_PATH");
+    command::run(notices)?;
     Ok(())
 }
 
@@ -385,7 +517,7 @@ fn cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> 
     Ok(cargo)
 }
 
-fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
+pub(crate) fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
     let mut cargo = Command::new("cargo");
     cargo
         .current_dir(workspace_root)
@@ -395,7 +527,10 @@ fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use crate::components::{build_rprobe, BuildContext, ComponentError};
+    use crate::components::{
+        build_rprobe, rprobe_test_command, workspace_test_command, BuildContext, ComponentError,
+        TestSuite,
+    };
     use crate::profiles::Profile;
     use crate::targets::HostTarget;
     use std::path::Path;
@@ -413,6 +548,81 @@ mod tests {
                 build_rprobe(&context),
                 Err(ComponentError::UnsupportedRprobeHost)
             ));
+        }
+    }
+
+    #[test]
+    fn workspace_nextest_preserves_suite_targets_and_host_exclusions() {
+        for host in [
+            HostTarget::MacosArm64,
+            HostTarget::LinuxX86_64,
+            HostTarget::LinuxArm64,
+        ] {
+            for (suite, targets, mock_vmm) in [
+                (TestSuite::Unit, vec!["--lib", "--bins"], false),
+                (TestSuite::Integration, vec!["--tests"], true),
+                (TestSuite::All, vec!["--lib", "--bins", "--tests"], true),
+            ] {
+                let command = workspace_test_command(
+                    Path::new("/workspace"),
+                    Path::new("/build"),
+                    host,
+                    suite,
+                    false,
+                );
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                let mut expected = vec!["nextest", "run", "--locked", "--workspace"];
+                expected.extend(targets);
+                expected.push("--all-features");
+                for member in host.workspace_excludes() {
+                    expected.extend(["--exclude", member]);
+                }
+                assert_eq!(args, expected);
+                assert_eq!(command.get_current_dir(), Some(Path::new("/workspace")));
+                let env: Vec<_> = command.get_envs().collect();
+                assert!(env.contains(&(
+                    std::ffi::OsStr::new("CARGO_TARGET_DIR"),
+                    Some(std::ffi::OsStr::new("/build")),
+                )));
+                assert_eq!(
+                    env.iter()
+                        .find(|(key, _)| *key == "SILO_TEST_MOCK_VMM_BINARY")
+                        .and_then(|(_, value)| *value),
+                    mock_vmm.then_some(std::ffi::OsStr::new("/build/debug/silo-vmm")),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nextest_ci_profile_applies_to_workspace_and_rprobe() {
+        for ci in [false, true] {
+            let rprobe = rprobe_test_command(Path::new("."), Path::new("target"), ci);
+            let args: Vec<_> = rprobe.get_args().map(|arg| arg.to_str().unwrap()).collect();
+            let mut expected = vec!["nextest", "run", "--locked"];
+            if ci {
+                expected.extend(["--profile", "ci"]);
+            }
+            expected.extend(["-p", "rprobe", "--lib", "--no-default-features"]);
+            assert_eq!(args, expected);
+
+            for suite in [TestSuite::Unit, TestSuite::Integration, TestSuite::All] {
+                let command = workspace_test_command(
+                    Path::new("."),
+                    Path::new("target"),
+                    HostTarget::LinuxX86_64,
+                    suite,
+                    ci,
+                );
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                assert_eq!(args.windows(2).any(|pair| pair == ["--profile", "ci"]), ci);
+            }
         }
     }
 }

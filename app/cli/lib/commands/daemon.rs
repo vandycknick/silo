@@ -1,7 +1,8 @@
 use clap::{Args, Subcommand};
+use eyre::Context as _;
 
 use silod_spec::paths::DaemonPaths;
-use silod_spec::status::{DaemonPhase, DaemonStatus, MemoryReclaimOutcome};
+use silod_spec::status::{CorePhase, DaemonStatus, MemoryReclaimOutcome, SystemStatus};
 
 use crate::context::Context;
 use crate::daemon::service;
@@ -10,12 +11,21 @@ use crate::ui::Spinner;
 #[derive(Debug, Args)]
 pub struct Cmd {
     #[command(subcommand)]
-    command: DaemonCommand,
+    pub(crate) command: DaemonCommand,
 }
 
 #[derive(Debug, Subcommand)]
-enum DaemonCommand {
-    /// Enable and start the per-user system VM.
+pub(crate) enum DaemonCommand {
+    /// Run the daemon in the foreground (what the registered service executes).
+    Run(crate::daemon::serve::Run),
+    // The controller commands need the host paths; the daemon resolves its own.
+    #[command(flatten)]
+    Control(ControlCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ControlCommand {
+    /// Enable and start the per-user daemon and selected integrations.
     Up(Up),
     /// Disable the per-user service and stop the system VM.
     Down,
@@ -26,21 +36,27 @@ enum DaemonCommand {
 }
 
 #[derive(Debug, Args)]
-struct Up {
+pub(crate) struct Up {
     #[arg(long)]
     foreground: bool,
     #[arg(long)]
     no_switch_context: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    system: Option<bool>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    tailscale: Option<bool>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, conflicts_with = "foreground")]
+    linger: Option<bool>,
 }
 
 #[derive(Debug, Args)]
-struct Status {
+pub(crate) struct Status {
     #[arg(long, value_enum, default_value_t = crate::ui::OutputFormat::Plain)]
     format: crate::ui::OutputFormat,
 }
 
 #[derive(Debug, Args)]
-struct Logs {
+pub(crate) struct Logs {
     #[arg(long)]
     follow: bool,
     #[arg(long, default_value_t = 200)]
@@ -49,36 +65,98 @@ struct Logs {
 
 impl Cmd {
     pub(crate) async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let paths = DaemonPaths::from_env()?;
-        match self.command {
-            DaemonCommand::Up(command) => {
-                let mut spinner = Spinner::start("Checking", "daemon configuration");
-                let arguments = context.config()?.daemon_overrides()?.to_args();
-                let executable = crate::daemon::executable()?;
+        let command = match self.command {
+            DaemonCommand::Run(args) => return run_daemon(args).await,
+            DaemonCommand::Control(command) => command,
+        };
+        let host = libvm::HostPaths::from_env()?;
+        let paths = DaemonPaths::new(host.home());
+        match command {
+            ControlCommand::Up(command) => {
+                eyre::ensure!(
+                    !command.foreground || command.linger.is_none(),
+                    "--linger cannot be used with --foreground"
+                );
+                #[cfg(not(target_os = "linux"))]
+                eyre::ensure!(
+                    command.linger.is_none(),
+                    "--linger is supported only on Linux"
+                );
+                let spinner = Spinner::start("Checking", "daemon configuration");
+                let selection = crate::config::FeatureOverrides {
+                    system: command.system,
+                    tailscale: command.tailscale,
+                };
+                let existing_installation = paths.daemon_data().join("daemon.json").try_exists()?;
+                let features = context
+                    .config()?
+                    .resolve_features(selection, existing_installation);
+                let mut arguments = context.config()?.daemon_overrides()?.to_args();
+                arguments.push(format!("--system-enabled={}", features.system).into());
+                arguments.push(format!("--tailscale-enabled={}", features.tailscale).into());
                 let socket = paths.docker_socket();
                 let live = service::status(&paths)?.is_some();
-                crate::daemon::docker::preflight(&socket, live)?;
-                crate::daemon::check(&executable, &arguments)?;
+                if features.system {
+                    crate::daemon::docker::preflight(&socket, live)?;
+                }
+                let selected = crate::config::FeatureOverrides {
+                    system: Some(features.system),
+                    tailscale: Some(features.tailscale),
+                };
+                crate::daemon::serve::validate(&host, selected)?;
                 if command.foreground {
                     spinner.finish_clear();
-                    return crate::daemon::foreground(&executable, &arguments);
+                    return run_daemon(crate::daemon::serve::Run {
+                        system: silod_spec::arguments::SystemArgs::default(),
+                        system_enabled: selected.system,
+                        tailscale_enabled: selected.tailscale,
+                        stop: false,
+                        host_shutdown: false,
+                    })
+                    .await;
                 }
+                let executable = std::env::current_exe()
+                    .and_then(|path| path.canonicalize())
+                    .context("locate the silo executable")?;
                 let service = service::ServiceConfig::new(&paths, executable)?;
-                service::up(&service, &arguments, &mut spinner)?;
+                service::validate_registration(&service)?;
+                spinner.finish_success("Checked");
+                service::bootstrap_linger(command.linger)?;
+                let mut spinner = Spinner::start("Starting", "daemon");
+                crate::config::GlobalConfig::persist_features(
+                    &host,
+                    selection,
+                    existing_installation,
+                )?;
+                let persisted = crate::config::GlobalConfig::load_from(&host)?;
+                let features =
+                    persisted.resolve_features(Default::default(), existing_installation);
+                let identity = persisted.daemon_identity(features)?;
+                let status = service::up(
+                    &service,
+                    &identity,
+                    features.system,
+                    command.tailscale == Some(true),
+                    &mut spinner,
+                )
+                .await?;
                 spinner.finish_success("Started");
-                crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
-                crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
+                report_tailscale(&status);
+                if features.system {
+                    crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
+                    crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
+                }
                 Ok(())
             }
-            DaemonCommand::Down => service::down(&paths, &crate::daemon::executable()?),
-            DaemonCommand::Status(command) => {
+            ControlCommand::Down => service::down(&paths).await,
+            ControlCommand::Status(command) => {
                 let view = DaemonStatusView::collect(&paths)?;
                 match command.format {
                     crate::ui::OutputFormat::Json => crate::ui::print_json(&view),
                     crate::ui::OutputFormat::Plain => view.print_human(),
                 }
             }
-            DaemonCommand::Logs(command) => {
+            ControlCommand::Logs(command) => {
                 let logs = service::logs(&paths, command.lines)?;
                 if !logs.is_empty() {
                     println!("{logs}");
@@ -92,13 +170,22 @@ impl Cmd {
     }
 }
 
+/// Runs the daemon to completion, mapping a rejected configuration to exit code 2
+/// so the service manager does not retry it.
+async fn run_daemon(args: crate::daemon::serve::Run) -> eyre::Result<()> {
+    crate::daemon::serve::run(args).await.map_err(|error| {
+        let code = crate::daemon::serve::exit_code(&error);
+        eyre::eyre!("{error:#}").wrap_err(crate::errors::ExecutionExit::new(code))
+    })
+}
+
 #[derive(Debug, serde::Serialize)]
 struct DaemonStatusView {
     /// Summary state: `stopped`, `starting`, `ready`, `degraded`, `failed`, `stopping`.
     state: &'static str,
     /// Whether the native user service starts the daemon at login.
     autostart: Option<bool>,
-    /// Docker endpoint the daemon serves (or is registered to serve).
+    linger: Option<bool>,
     endpoint: Option<String>,
     /// Configured guest memory ceiling, in bytes, as the running daemon reports it.
     memory_bytes: Option<u64>,
@@ -110,30 +197,21 @@ impl DaemonStatusView {
     fn collect(paths: &DaemonPaths) -> eyre::Result<Self> {
         let daemon = service::status(paths)?;
         let autostart = service::is_enabled().ok();
-        let endpoint = Some(match &daemon {
-            Some(status) => status.docker_socket.clone(),
-            None => paths.docker_socket().display().to_string(),
-        });
-        let memory_bytes = daemon.as_ref().and_then(|status| status.memory_bytes);
-        let state = match daemon.as_ref().map(|status| status.phase) {
-            None | Some(DaemonPhase::Stopped) => "stopped",
-            Some(DaemonPhase::Ready) => "ready",
-            Some(DaemonPhase::Degraded) => "degraded",
-            Some(DaemonPhase::Failed) => "failed",
-            Some(DaemonPhase::Stopping) => "stopping",
-            Some(DaemonPhase::Upgrading) => "upgrading",
-            Some(
-                DaemonPhase::PreparingStorage
-                | DaemonPhase::Creating
-                | DaemonPhase::StartingVm
-                | DaemonPhase::WaitingGuest
-                | DaemonPhase::ActivatingEngine
-                | DaemonPhase::Retrying,
-            ) => "starting",
+        let linger = service::linger_status();
+        let system = daemon.as_ref().and_then(|status| status.system.as_ref());
+        let endpoint = system.map(|system| system.docker_socket.clone());
+        let memory_bytes = system.and_then(|system| system.memory_bytes);
+        let state = match daemon.as_ref().map(|status| status.core) {
+            None | Some(CorePhase::Stopped) => "stopped",
+            Some(CorePhase::Ready) => "ready",
+            Some(CorePhase::Failed) => "failed",
+            Some(CorePhase::Stopping) => "stopping",
+            Some(CorePhase::Starting) => "starting",
         };
         Ok(Self {
             state,
             autostart,
+            linger,
             endpoint,
             memory_bytes,
             daemon,
@@ -142,27 +220,7 @@ impl DaemonStatusView {
 
     fn print_human(&self) -> eyre::Result<()> {
         let mut rows: Vec<(String, String)> = Vec::new();
-        let state = match &self.daemon {
-            Some(status) => match status.phase {
-                DaemonPhase::PreparingStorage => "starting (preparing storage)".to_string(),
-                DaemonPhase::Creating => "starting (creating system machine)".to_string(),
-                DaemonPhase::StartingVm => "starting (booting VM)".to_string(),
-                DaemonPhase::WaitingGuest => "starting (waiting for guest)".to_string(),
-                DaemonPhase::ActivatingEngine => "starting (activating Docker)".to_string(),
-                DaemonPhase::Ready => "ready".to_string(),
-                DaemonPhase::Degraded => "degraded (Docker health probe failing)".to_string(),
-                DaemonPhase::Upgrading => "upgrading (replacing the system VM)".to_string(),
-                DaemonPhase::Retrying => format!(
-                    "starting (retrying; {} attempts so far)",
-                    status.restart_count
-                ),
-                DaemonPhase::Failed => "failed".to_string(),
-                DaemonPhase::Stopping => "stopping".to_string(),
-                DaemonPhase::Stopped => "stopped".to_string(),
-            },
-            None => "stopped".to_string(),
-        };
-        rows.push(("State".to_string(), state));
+        rows.push(("Core".to_string(), self.state.to_string()));
         rows.push((
             "Autostart".to_string(),
             match self.autostart {
@@ -171,11 +229,62 @@ impl DaemonStatusView {
                 None => "unknown".to_string(),
             },
         ));
+        rows.push((
+            "User linger".to_string(),
+            match self.linger {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
+            .to_string(),
+        ));
         if let Some(endpoint) = &self.endpoint {
             rows.push(("Endpoint".to_string(), format!("unix://{endpoint}")));
         }
-        if let Some(status) = &self.daemon {
-            rows.push(("PID".to_string(), status.pid.to_string()));
+        if let Some(daemon) = &self.daemon {
+            rows.push(("PID".to_string(), daemon.pid.to_string()));
+            rows.push((
+                "Control endpoint".to_string(),
+                daemon.control_endpoint.display().to_string(),
+            ));
+            rows.push((
+                "Tailscale".to_string(),
+                component_state(daemon.tailscale.state).to_string(),
+            ));
+            rows.push((
+                "Tailscale shutdown protection".to_string(),
+                format!("{:?}", daemon.tailscale.shutdown_protection).to_lowercase(),
+            ));
+            rows.push((
+                "Tailscale restarts".to_string(),
+                daemon.tailscale.restart_count.to_string(),
+            ));
+            if let Some(url) = &daemon.tailscale.approval_url {
+                rows.push(("Tailscale login".to_string(), url.clone()));
+            }
+            if let Some(diagnostic) = &daemon.tailscale.diagnostic {
+                rows.push(("Tailscale diagnostic".to_string(), diagnostic.clone()));
+            }
+            if let Some(dns) = &daemon.tailscale.dns_name {
+                rows.push(("Tailscale DNS".to_string(), dns.clone()));
+            }
+            rows.push((
+                "System".to_string(),
+                daemon
+                    .system
+                    .as_ref()
+                    .map(|system| format!("{:?}", system.phase))
+                    .unwrap_or_else(|| "disabled".into()),
+            ));
+            if let Some(error) = &daemon.last_error {
+                rows.push(("Core error".to_string(), error.clone()));
+            }
+        }
+        if let Some(status) = self
+            .daemon
+            .as_ref()
+            .and_then(|daemon| daemon.system.as_ref())
+        {
             if let Some(machine_id) = &status.machine_id {
                 rows.push(("Machine".to_string(), machine_id.clone()));
             }
@@ -239,8 +348,8 @@ impl DaemonStatusView {
     }
 }
 
-/// When silod last asked the registry about the system image, and what went wrong.
-fn format_update_check(status: &DaemonStatus) -> String {
+/// When the daemon last asked the registry about the system image, and what went wrong.
+fn format_update_check(status: &SystemStatus) -> String {
     let checked = status
         .update_checked_at
         .as_deref()
@@ -255,6 +364,33 @@ fn format_update_check(status: &DaemonStatus) -> String {
     match &status.update_error {
         Some(error) => format!("{checked}; {error}"),
         None => checked,
+    }
+}
+
+fn component_state(state: silod_spec::status::ComponentState) -> &'static str {
+    use silod_spec::status::ComponentState;
+    match state {
+        ComponentState::Disabled => "disabled",
+        ComponentState::Starting => "starting (lobby readiness not established)",
+        ComponentState::NeedsAuth => "needs authentication (lobby not ready)",
+        ComponentState::Ready => "ready",
+        ComponentState::Degraded => "degraded",
+        ComponentState::Failed => "failed",
+    }
+}
+
+fn report_tailscale(status: &DaemonStatus) {
+    if status.tailscale.enabled {
+        crate::ui::hint(format!(
+            "Tailscale: {}",
+            component_state(status.tailscale.state)
+        ));
+        if let Some(url) = &status.tailscale.approval_url {
+            crate::ui::hint(format!("Tailscale login: {url}"));
+        }
+        if let Some(diagnostic) = &status.tailscale.diagnostic {
+            crate::ui::hint(format!("Tailscale: {diagnostic}"));
+        }
     }
 }
 
@@ -350,8 +486,58 @@ mod tests {
     };
 
     #[test]
-    fn parses_controller_commands_only() {
+    fn feature_flags_distinguish_omitted_enabled_and_disabled() {
+        #[derive(clap::Parser)]
+        struct Options {
+            #[command(flatten)]
+            up: crate::commands::daemon::Up,
+        }
+        let omitted = Options::try_parse_from(["up"]).expect("omitted");
+        assert_eq!(omitted.up.system, None);
+        assert_eq!(omitted.up.tailscale, None);
+        assert_eq!(omitted.up.linger, None);
+        let linger = Options::try_parse_from(["up", "--linger"]).expect("linger");
+        assert_eq!(linger.up.linger, Some(true));
+        let no_linger = Options::try_parse_from(["up", "--linger=false"]).expect("no linger");
+        assert_eq!(no_linger.up.linger, Some(false));
+        let selected =
+            Options::try_parse_from(["up", "--system=false", "--tailscale"]).expect("selection");
+        assert_eq!(selected.up.system, Some(false));
+        assert_eq!(selected.up.tailscale, Some(true));
+        let reversed =
+            Options::try_parse_from(["up", "--system", "--tailscale=false"]).expect("selection");
+        assert_eq!(reversed.up.system, Some(true));
+        assert_eq!(reversed.up.tailscale, Some(false));
+        assert!(Options::try_parse_from(["up", "--foreground", "--linger"]).is_err());
+        assert!(Options::try_parse_from(["up", "--system=invalid"]).is_err());
+    }
+
+    #[test]
+    fn pending_authentication_never_claims_lobby_readiness() {
+        use silod_spec::status::ComponentState;
+        assert!(
+            crate::commands::daemon::component_state(ComponentState::Starting)
+                .contains("not established")
+        );
+        assert!(
+            crate::commands::daemon::component_state(ComponentState::NeedsAuth)
+                .contains("lobby not ready")
+        );
+        assert_eq!(
+            crate::commands::daemon::component_state(ComponentState::Ready),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn parses_controller_commands_and_the_daemon_entrypoint() {
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "up", "--foreground"]).is_ok());
+        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "run", "--stop"]).is_ok());
+        // The daemon takes the normal Silo Home; there is no state/home argument.
+        assert!(
+            crate::app::Cli::try_parse_from(["silo", "daemon", "run", "--home", "/x"]).is_err()
+        );
+        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "run", "--check"]).is_err());
         assert!(crate::app::Cli::try_parse_from([
             "silo",
             "daemon",
@@ -362,7 +548,7 @@ mod tests {
         .is_err());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "down"]).is_ok());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "logs", "--follow"]).is_ok());
-        // silod upgrades the system VM itself; there is nothing to drive by hand.
+        // The daemon upgrades the system VM itself; there is nothing to drive by hand.
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_err());
         assert!(
             crate::app::Cli::try_parse_from(["silo", "daemon", "balloon", "--target", "1GiB"])
@@ -371,92 +557,34 @@ mod tests {
     }
 
     #[test]
-    fn host_memory_reclaim_status_keeps_requested_and_effective_axes_separate() {
-        for (requested, effective, expected) in [
-            (false, Some(false), "requested off; effective off"),
-            (false, Some(true), "requested off; effective on"),
-            (
-                false,
-                None,
-                "requested off; effective unknown (not yet reported by the VM backend)",
-            ),
-            (true, Some(false), "requested auto; effective off"),
-            (true, Some(true), "requested auto; effective on"),
-            (
-                true,
-                None,
-                "requested auto; effective unknown (not yet reported by the VM backend)",
-            ),
+    fn status_wording_cases() {
+        use silod_spec::status::MemoryReclaimOutcome;
+
+        for (label, actual, expected) in [
+            ("off_off", format_host_memory_reclaim(false, Some(false), None, None), "requested off; effective off"),
+            ("off_on", format_host_memory_reclaim(false, Some(true), None, None), "requested off; effective on"),
+            ("off_unknown", format_host_memory_reclaim(false, None, None, None), "requested off; effective unknown (not yet reported by the VM backend)"),
+            ("auto_off", format_host_memory_reclaim(true, Some(false), None, None), "requested auto; effective off"),
+            ("auto_on", format_host_memory_reclaim(true, Some(true), None, None), "requested auto; effective on"),
+            ("auto_unknown", format_host_memory_reclaim(true, None, None, None), "requested auto; effective unknown (not yet reported by the VM backend)"),
+            ("passed_probe", format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)), "requested auto; effective on (probe passed); 6MiB advised free since VM start"),
+            ("failed_probe", format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)), "requested auto; effective off (probe failed); 0B advised free since VM start"),
+            ("unreported_counter", format_host_memory_reclaim(true, None, None, Some(10)), "requested auto; effective unknown (not yet reported by the VM backend)"),
+            ("partial_gradual", crate::commands::daemon::format_guest_reclaim(Some("gradual"), MemoryReclaimOutcome::Partial, Some(512 * 1024 * 1024), "2 minutes ago".to_string()), "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"),
+            ("failed_dropcache", crate::commands::daemon::format_guest_reclaim(Some("dropcache"), MemoryReclaimOutcome::Failed, Some(7), "just now".to_string()), "; last idle cache drop reclaim in the guest failed just now"),
+            ("nothing_default", crate::commands::daemon::format_guest_reclaim(None, MemoryReclaimOutcome::Nothing, Some(0), "just now".to_string()), "; last idle gradual reclaim in the guest found nothing reclaimable just now, guest cache fell by 0B"),
+            ("unknown_backend", format_actual_backend(None).to_string(), "unknown"),
+            ("krun_backend", format_actual_backend(Some("krun")).to_string(), "krun"),
         ] {
-            assert_eq!(
-                format_host_memory_reclaim(requested, effective, None, None),
-                expected
-            );
+            assert_eq!(actual, expected, "{label}");
         }
     }
 
     #[test]
-    fn host_memory_reclaim_status_appends_probe_and_advised_bytes_once_reported() {
-        assert_eq!(
-            format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)),
-            "requested auto; effective on (probe passed); 6MiB advised free since VM start"
-        );
-        assert_eq!(
-            format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)),
-            "requested auto; effective off (probe failed); 0B advised free since VM start"
-        );
-        // Counters are only meaningful alongside a reported effective state.
-        assert_eq!(
-            format_host_memory_reclaim(true, None, None, Some(10)),
-            "requested auto; effective unknown (not yet reported by the VM backend)"
-        );
-    }
-
-    #[test]
-    fn guest_reclaim_clause_names_mode_outcome_and_measured_delta() {
-        use silod_spec::status::MemoryReclaimOutcome;
-
-        assert_eq!(
-            crate::commands::daemon::format_guest_reclaim(
-                Some("gradual"),
-                MemoryReclaimOutcome::Partial,
-                Some(512 * 1024 * 1024),
-                "2 minutes ago".to_string(),
-            ),
-            "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"
-        );
-        assert_eq!(
-            crate::commands::daemon::format_guest_reclaim(
-                Some("dropcache"),
-                MemoryReclaimOutcome::Failed,
-                Some(7),
-                "just now".to_string(),
-            ),
-            "; last idle cache drop reclaim in the guest failed just now"
-        );
-        assert_eq!(
-            crate::commands::daemon::format_guest_reclaim(
-                None,
-                MemoryReclaimOutcome::Nothing,
-                Some(0),
-                "just now".to_string(),
-            ),
-            "; last idle gradual reclaim in the guest found nothing reclaimable just now, guest cache fell by 0B"
-        );
-    }
-
-    #[test]
-    fn missing_actual_backend_is_reported_as_unknown() {
-        assert_eq!(format_actual_backend(None), "unknown");
-        assert_eq!(format_actual_backend(Some("krun")), "krun");
-    }
-
-    #[test]
     fn update_check_row_reports_errors_alongside_the_last_check() {
-        let mut status: silod_spec::status::DaemonStatus =
+        let mut status: silod_spec::status::SystemStatus =
             serde_json::from_value(serde_json::json!({
-                "schema": 1, "generation": "d823458f-090b-48c3-87d4-33daf76c0000",
-                "pid": 1, "phase": "ready", "machine_id": null, "run_id": null,
+                "phase": "ready", "machine_id": null, "run_id": null,
                 "image_digest": null, "docker_socket": "/tmp/test.sock",
                 "updated_at": "2026-01-01T00:00:00Z", "last_error": null, "restart_count": 0,
             }))

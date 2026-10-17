@@ -1,16 +1,21 @@
+import { shell } from "./shell.js";
 import type { NativeMachine, NativeMachineBuilder } from "./internal/napi.js";
 import {
     executionOptionsToNative,
     forwardsToNative,
-    executionResultFromNative,
     imageSourceToNative,
     machineDataFromNative,
     mapToKeyValues,
     mountsToNative,
-    sshShellOptionsToNative,
 } from "./convert.js";
 import { mapNativePromise } from "./errors.js";
 import { ExecutionOutput, ExecutionSession } from "./exec.js";
+import {
+    FileDownload, guestPath, uploadOptionsToNative, directoryOptionsToNative,
+    fileEntryFromNative, directoryDisposition, fileWriteDisposition,
+    type FileEntry, type CreateDirectoryOptions, type DirectoryDisposition,
+    type UploadOptions, type UploadResult,
+} from "./files.js";
 import {
     MachineLogStream,
     machineLogOptionsToNative,
@@ -20,7 +25,6 @@ import { MachineNetworkBuilder, type MachineNetworkBuilderCallback } from "./net
 import type {
     ExecutionOptions,
     Forward,
-    ExecutionResult,
     ImageSource,
     KeyValueMap,
     MachineData,
@@ -39,6 +43,7 @@ import {
     assertPositiveU32,
     assertString,
     assertStringArray,
+    assertUint8Array,
 } from "./validation.js";
 
 /**
@@ -300,11 +305,50 @@ export class Machine {
         );
     }
 
+    /** Inspect a guest filesystem entry at an absolute path. */
+    async statFile(path: string): Promise<FileEntry> {
+        return fileEntryFromNative(await mapNativePromise(this.native.statFile(guestPath(path))));
+    }
+
+    /** Create a guest directory, optionally including missing parents. */
+    async createDirectory(path: string, options?: CreateDirectoryOptions): Promise<DirectoryDisposition> {
+        return directoryDisposition(await mapNativePromise(
+            this.native.createDirectory(guestPath(path), directoryOptionsToNative(options)),
+        ));
+    }
+
+    /** Stream bytes into an atomically replaced regular guest file. */
+    async uploadFile(path: string, source: Uint8Array | AsyncIterable<Uint8Array>, options?: UploadOptions): Promise<UploadResult> {
+        const upload = await mapNativePromise(this.native.uploadFile(guestPath(path), uploadOptionsToNative(options)));
+        let bytes = 0;
+        try {
+            if (source instanceof Uint8Array) {
+                await mapNativePromise(upload.write(source));
+                bytes = source.byteLength;
+            } else {
+                for await (const chunk of source) {
+                    const data = assertUint8Array(chunk, "chunk");
+                    await mapNativePromise(upload.write(data));
+                    bytes += data.byteLength;
+                }
+            }
+            return { disposition: fileWriteDisposition(await mapNativePromise(upload.finish())), bytes };
+        } catch (error) {
+            upload.cancel();
+            throw error;
+        }
+    }
+
+    /** Open a streaming regular guest file download. */
+    async downloadFile(path: string): Promise<FileDownload> {
+        return new FileDownload(await mapNativePromise(this.native.downloadFile(guestPath(path))));
+    }
+
     /** Run a script through the guest shell and capture output. */
-    async shell(script: string, options?: ExecutionOptions): Promise<ExecutionOutput> {
+    async execScript(script: string, options?: ExecutionOptions): Promise<ExecutionOutput> {
         return new ExecutionOutput(
             await mapNativePromise(
-                this.native.shell(
+                this.native.execScript(
                     assertString(script, "script"),
                     executionOptionsToNative(options),
                 ),
@@ -312,26 +356,12 @@ export class Machine {
         );
     }
 
-    /** Attach the current terminal to an interactive structured guest process. */
-    async attach(
-        program: string,
-        args: string[] = [],
-        options?: ExecutionOptions,
-    ): Promise<ExecutionResult> {
-        return executionResultFromNative(
-            await mapNativePromise(this.native.attach(
-                assertNonEmptyString(program, "program"),
-                assertStringArray(args, "args"),
-                executionOptionsToNative(options),
-            )),
-        );
-    }
-
-    /** Attach the current terminal to the guest's SSH shell. */
-    async attachShell(options?: SshShellOptions): Promise<SshExitStatus> {
-        return await mapNativePromise(
-            this.native.attachShell(sshShellOptionsToNative(options)),
-        );
+    /**
+     * Certificate-authenticated SSH login. Local mode owns the host terminal;
+     * supplied attachment callbacks must cooperate with abort. See README.
+     */
+    async shell(options?: SshShellOptions): Promise<SshExitStatus> {
+        return shell(this.native, options);
     }
 
 }

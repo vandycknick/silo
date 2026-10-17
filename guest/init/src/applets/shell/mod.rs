@@ -21,8 +21,6 @@ mod standalone;
 mod state;
 mod util;
 
-use crate::applets::get_arg;
-
 pub use entry::{ash, dash, sh};
 pub use standalone::{echo, false_cmd, true_cmd};
 

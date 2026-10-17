@@ -43,6 +43,42 @@ Go context cancellation is cooperative. Cancellation-safe stream waits have expl
 
 Methods in the first four rows check a context before entering cgo. Once entered, they finish and return the native result even if the caller's context expires. This is deliberate rather than pretending that dropping a Go waiter rolls back Rust work.
 
+### SSH shell ownership
+
+`Exec`, `Spawn` and `ExecScript` retain the agent execution boundary. `Shell`
+uses libvm's one pinned, certificate-authenticated SSH client over vsock 22;
+the bridge never emits SSH output as execution events or implements another SSH
+client. `silo_machine_exec_script` collects scripts and `silo_machine_shell`
+opens SSH; public/native RPC attachment and the abandoned hybrid are removed.
+
+Local Shell owns scoped Go signal subscriptions and passes the cancellation
+token into `SshShellOptionsBuilder::cancellation` with `.local_signals`. Native
+completion awaits transport cleanup before Go restores subscriptions, including
+inherited ignored dispositions.
+
+Supplied `SSHShellAttachment` is separate from JSON scalar SSH options.
+`silo_ssh_attachment_new` retains the runtime and binds an already-created token;
+the cancellable shell export receives its nullable handle before `out_status`.
+Three 64-KiB simplex pipes bound bytes and a 64-entry queue bounds controls.
+Rust retains no Go pointers or callbacks. Byte operations take one direction's
+state out of its lock before awaiting; overlap is rejected. Explicit writer
+shutdown publishes EOF. Input EOF does not inject Ctrl-D or cancel SSH.
+
+Input is created once under an input/control child context and must unblock on
+its cancellation. Context-aware output writers must likewise return on cancel;
+the SDK cannot interrupt arbitrary blocking Reader/Writer syscalls and supplies
+no goroutine wrapper claiming otherwise. Both output pipes are read concurrently
+and callback invocation is serialized by a cancellation-aware gate. Per-stream
+ordering is preserved; there is no cross-stream ordering guarantee.
+
+Native success stops input/control only and shuts down outputs without canceling
+the shared token. Go joins input/control and drains outputs under a separate
+still-live context; parent cancellation stays active throughout. Only after
+writers and native calls settle may handles be freed. Native/pump failure
+cancels all work, joins all workers and preserves the first error. Borrowed outer
+SSH sessions and process stdio are never closed on successful supplied calls.
+
+
 ## Compatibility
 
-The ABI version changes for incompatible symbol or layout changes. The SDK version must exactly match the Go package. Runtime components also match the exact product version; compatibility ranges and independently upgraded components are not supported.
+The SDK version must exactly match the Go package. Runtime components also match the exact product version; compatibility ranges and independently upgraded components are not supported. The execution API cutover is an atomic change to the unreleased ABI 1 baseline, without a product/ABI version bump or old-symbol fallback. All SDK/native consumers must restart together.

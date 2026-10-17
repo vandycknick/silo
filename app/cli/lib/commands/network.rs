@@ -175,7 +175,7 @@ async fn remove_network(context: &mut Context, command: RmCmd) -> eyre::Result<(
 }
 
 async fn set_machine_network(context: &mut Context, command: SetCmd) -> eyre::Result<()> {
-    let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+    let policy_config_dir = context.config()?.networking().policy_config_dir.clone();
     let network = machine_network_with_policy(
         command.network,
         command.policy.as_deref(),
@@ -319,18 +319,6 @@ mod tests {
             err.to_string(),
             "--policy is only supported with private networks"
         );
-    }
-
-    #[test]
-    fn machine_network_policy_rejects_relative_path() {
-        let err = machine_network_with_policy(
-            MachineNetworkSelection::Private,
-            Some("policies/github.hcl"),
-            None,
-        )
-        .expect_err("relative path should fail");
-
-        assert!(err.to_string().contains("relative network policy paths"));
     }
 
     fn network_set_cmd(args: impl IntoIterator<Item = &'static str>) -> super::SetCmd {

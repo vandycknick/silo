@@ -1,11 +1,5 @@
 //! Shared constants for libvm behavior that crosses module boundaries.
 
-/// Local certificate authority certificate filename under the Silo keys directory.
-pub(crate) const CERTIFICATE_AUTHORITY_CERTIFICATE_FILE_NAME: &str = "ca.pem";
-
-/// Local certificate authority private key filename under the Silo keys directory.
-pub(crate) const CERTIFICATE_AUTHORITY_PRIVATE_KEY_FILE_NAME: &str = "ca-key.pem";
-
 /// Common name used for the generated local Silo certificate authority.
 pub(crate) const CERTIFICATE_AUTHORITY_COMMON_NAME: &str = "Silo Local Certificate Authority";
 
@@ -24,12 +18,6 @@ pub(crate) const DEFAULT_HOST_LOCALE: &str = "en_US.UTF-8";
 /// Certificate authority path installed inside the guest for provisioning trust.
 pub(crate) const GUEST_CERTIFICATE_AUTHORITY_PATH: &str =
     "/usr/local/share/ca-certificates/silo-ca.crt";
-
-/// Private SSH key filename used for Silo guest login credentials.
-pub(crate) const GUEST_SSH_PRIVATE_KEY_FILE_NAME: &str = "id_ed25519";
-
-/// Public SSH key filename used for Silo guest login credentials.
-pub(crate) const GUEST_SSH_PUBLIC_KEY_FILE_NAME: &str = "id_ed25519.pub";
 
 /// Default shell assigned to the provisioned guest user.
 pub(crate) const GUEST_USER_SHELL: &str = "/bin/bash";

@@ -3,9 +3,11 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"os"
 	"testing"
 	"time"
@@ -33,7 +35,7 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	machine, err := runtime.CreateMachine(ctx, silo.OCIImage(image), silo.WithName("go-sdk-e2e"), silo.WithCPUs(1), silo.WithMemory(silo.Gibibytes(1)), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
+	machine, err := runtime.CreateMachine(ctx, silo.OCIImage(image), silo.WithName("go-sdk-e2e"), silo.WithCPUs(1), silo.WithMemory(silo.Gibibytes(1)), silo.WithRootDiskSize(silo.Gibibytes(1)), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,16 +61,24 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	if result.Kind != silo.ExecutionResultExited || result.Code == nil || *result.Code != 7 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	attachStatus, err := machine.Attach(ctx, "/bin/true", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if attachStatus.Kind != silo.ExecutionResultExited || attachStatus.Code == nil || *attachStatus.Code != 0 {
-		t.Fatalf("unexpected attach result: %#v", attachStatus)
-	}
 	session, err := machine.Spawn(ctx, "/bin/cat", nil, silo.WithExecStdinPipe())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if session.Stdin() != nil {
+		t.Fatal("stdin exposed before Started observation")
+	}
+	for {
+		event, e := session.Recv(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if event.Kind == silo.ExecutionEventStarted {
+			break
+		}
+		if event.Kind == silo.ExecutionEventTerminal {
+			t.Fatal("cat ended before Started")
+		}
 	}
 	stdin := session.Stdin()
 	if stdin == nil {
@@ -89,6 +99,40 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	}
 	if err = session.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if disposition, err := machine.CreateDirectory(ctx, "/tmp/silo-cp", silo.CreateDirectoryOptions{Parents: true}); err != nil || disposition != silo.DirectoryCreated {
+		t.Fatalf("create directory: %q, %v", disposition, err)
+	}
+	fileBytes := make([]byte, 300*1024)
+	random := rand.New(rand.NewPCG(42, 123))
+	for i := range fileBytes {
+		fileBytes[i] = byte(random.Uint32())
+	}
+	for _, want := range []silo.FileWriteDisposition{silo.FileCreated, silo.FileReplaced} {
+		uploaded, err := machine.UploadFile(ctx, "/tmp/silo-cp/a.bin", bytes.NewReader(fileBytes))
+		if err != nil || uploaded.Disposition != want || uploaded.Bytes != int64(len(fileBytes)) {
+			t.Fatalf("upload: %#v, %v; want %s", uploaded, err, want)
+		}
+	}
+	entry, err := machine.StatFile(ctx, "/tmp/silo-cp/a.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Kind != silo.FileEntryFile || entry.SizeBytes != uint64(len(fileBytes)) {
+		t.Fatalf("file entry: %#v", entry)
+	}
+	download, err := machine.DownloadFile(ctx, "/tmp/silo-cp/a.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloaded, readErr := io.ReadAll(download)
+	closeErr := download.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(downloaded, fileBytes) {
+		t.Fatalf("download mismatch: read=%v close=%v bytes=%d", readErr, closeErr, len(downloaded))
+	}
+	if directory, err := machine.DownloadFile(ctx, "/tmp/silo-cp"); err == nil {
+		_ = directory.Close()
+		t.Fatal("directory download unexpectedly succeeded")
 	}
 	pty, err := machine.Spawn(ctx, "/bin/sleep", []string{"30"}, silo.WithExecTTY(true))
 	if err != nil {

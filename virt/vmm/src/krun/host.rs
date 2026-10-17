@@ -13,7 +13,6 @@ const DEFAULT_KVM_DEVICE: &CStr = c"/dev/kvm";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvmHostInfo {
     pub api_version: i32,
-    pub vm_creation_checked: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -38,26 +37,15 @@ pub enum KvmHostError {
         device: String,
         capability: &'static str,
     },
-    #[error("create an empty VM through {device}: {source}.{guidance}")]
-    CreateVm {
-        device: String,
-        source: kvm_ioctls::Error,
-        guidance: &'static str,
-    },
 }
 
 #[cfg(target_os = "linux")]
 pub fn check_host() -> Result<KvmHostInfo, KvmHostError> {
-    check_host_at(DEFAULT_KVM_DEVICE, false)
+    check_host_at(DEFAULT_KVM_DEVICE)
 }
 
 #[cfg(target_os = "linux")]
-pub fn check_host_with_vm_creation() -> Result<KvmHostInfo, KvmHostError> {
-    check_host_at(DEFAULT_KVM_DEVICE, true)
-}
-
-#[cfg(target_os = "linux")]
-fn check_host_at(device: &CStr, create_vm: bool) -> Result<KvmHostInfo, KvmHostError> {
+fn check_host_at(device: &CStr) -> Result<KvmHostInfo, KvmHostError> {
     let device_name = device.to_string_lossy().into_owned();
     let kvm = Kvm::new_with_path(device).map_err(|source| KvmHostError::Open {
         device: device_name.clone(),
@@ -80,19 +68,8 @@ fn check_host_at(device: &CStr, create_vm: bool) -> Result<KvmHostInfo, KvmHostE
             });
         }
     }
-    if create_vm {
-        let vm = kvm.create_vm().map_err(|source| KvmHostError::CreateVm {
-            device: device_name,
-            guidance: errno_guidance(source.errno()),
-            source,
-        })?;
-        drop(vm);
-    }
 
-    Ok(KvmHostInfo {
-        api_version,
-        vm_creation_checked: create_vm,
-    })
+    Ok(KvmHostInfo { api_version })
 }
 
 #[cfg(target_os = "linux")]
@@ -232,7 +209,7 @@ mod tests {
         ))
         .expect("valid device path");
 
-        let error = check_host_at(&device, false).expect_err("missing KVM device must fail");
+        let error = check_host_at(&device).expect_err("missing KVM device must fail");
         match error {
             KvmHostError::Open {
                 source, guidance, ..

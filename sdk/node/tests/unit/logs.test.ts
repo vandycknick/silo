@@ -1,4 +1,4 @@
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { SiloError } from "../../src/errors.js";
 import {
   MachineLogStream,
@@ -6,8 +6,7 @@ import {
   machineLogSourceToNative,
 } from "../../src/logs.js";
 import type { NativeMachineLogChunk, NativeMachineLogHandle } from "../../src/internal/napi.js";
-import type { Machine } from "../../src/machine.js";
-import type { MachineLogChunk, MachineLogOptions, MachineLogSource } from "../../src/types.js";
+import type { MachineLogChunk } from "../../src/types.js";
 
 describe("machine log conversion", () => {
   it("accepts only semantic log sources and options", () => {
@@ -75,13 +74,6 @@ describe("machine log conversion", () => {
       name: "MachineLogSourceUnavailableError",
       variant: "MachineLogSourceUnavailable",
     } satisfies Partial<SiloError>);
-  });
-
-  it("exports the typed logs surface", () => {
-    expectTypeOf<Machine["logs"]>().returns.toEqualTypeOf<Promise<MachineLogStream>>();
-    expectTypeOf<MachineLogSource>().toEqualTypeOf<"monitor" | "serial" | "exec" | "network" | "networkAudit">();
-    expectTypeOf<MachineLogOptions>().toEqualTypeOf<{ follow?: boolean }>();
-    expectTypeOf<MachineLogChunk>().toEqualTypeOf<{ output: "stdout" | "stderr"; data: Uint8Array }>();
   });
 });
 

@@ -67,7 +67,12 @@ fn ensure_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()
     match read_user_entry(context, &user.name)? {
         Some(entry) => reconcile_existing_user(context, user, &entry),
         None => match read_user_entry_by_uid(context, user.uid)? {
-            Some(entry) => adopt_existing_user(context, user, &entry),
+            Some(entry) => Err(eyre!(
+                "uid {} is already owned by account {}; refusing to rename it to {}",
+                entry.uid,
+                entry.name,
+                user.name
+            )),
             None => create_user(context, user),
         },
     }
@@ -236,114 +241,6 @@ fn set_owner(path: &Path, uid: u32, gid: u32) -> eyre::Result<()> {
         Some(rustix::process::Gid::from_raw(gid)),
     )
     .map_err(|error| eyre!("set owner on {}: {error}", path.display()))
-}
-
-fn adopt_existing_user(
-    context: &ProvisionContext,
-    user: &UserConfig,
-    entry: &UserEntry,
-) -> eyre::Result<()> {
-    validate_adoptable_user(entry)?;
-    validate_primary_gid(user, entry)?;
-    rename_private_group(context, user, entry)?;
-
-    let old_name = entry.name.clone();
-    run_command(
-        context.process_supervisor(),
-        "usermod",
-        adoption_usermod_args(user, entry),
-    )?;
-
-    reconcile_home(context, user, user.gid)?;
-    reconcile_password_lock(context, user)?;
-
-    tracing::info!(
-        user = %user.name,
-        previous_user = %old_name,
-        uid = user.uid,
-        "adopted existing user"
-    );
-    Ok(())
-}
-
-fn validate_adoptable_user(entry: &UserEntry) -> eyre::Result<()> {
-    const MIN_REGULAR_UID: u32 = 1000;
-    const NOBODY_UID: u32 = 65_534;
-
-    let shell = entry.shell.trim_end_matches('/');
-    if entry.uid < MIN_REGULAR_UID
-        || entry.uid == NOBODY_UID
-        || entry.name == "nobody"
-        || shell.ends_with("/nologin")
-        || shell.ends_with("/false")
-    {
-        return Err(eyre!(
-            "uid {} is already owned by protected account {}; refusing to rename it",
-            entry.uid,
-            entry.name
-        ));
-    }
-
-    Ok(())
-}
-
-fn adoption_usermod_args(user: &UserConfig, entry: &UserEntry) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("--login"),
-        OsString::from(&user.name),
-        OsString::from("--comment"),
-        OsString::from(&user.gecos),
-    ];
-    if entry.home != user.home {
-        args.push(OsString::from("--home"));
-        args.push(OsString::from(&user.home));
-        args.push(OsString::from("--move-home"));
-    }
-    args.push(OsString::from("--shell"));
-    args.push(OsString::from(&user.shell));
-    args.push(OsString::from(&entry.name));
-    args
-}
-
-fn rename_private_group(
-    context: &ProvisionContext,
-    user: &UserConfig,
-    entry: &UserEntry,
-) -> eyre::Result<()> {
-    let Some(group) = read_group_entry_by_gid(context, entry.gid)? else {
-        return Ok(());
-    };
-    if group.name != entry.name {
-        return Ok(());
-    }
-
-    if let Some(target) = read_group_entry(context, &user.name)? {
-        if target.gid == entry.gid {
-            return Ok(());
-        }
-        tracing::warn!(
-            user = %user.name,
-            group = %group.name,
-            target_gid = target.gid,
-            "keeping existing primary group because the target group name is already used"
-        );
-        return Ok(());
-    }
-
-    if !command_exists("groupmod") {
-        tracing::warn!(
-            user = %user.name,
-            group = %group.name,
-            "keeping existing primary group because groupmod is unavailable"
-        );
-        return Ok(());
-    }
-
-    run_command(
-        context.process_supervisor(),
-        "groupmod",
-        ["--new-name", user.name.as_str(), group.name.as_str()],
-    )
 }
 
 fn reconcile_existing_user(
@@ -565,56 +462,8 @@ fn read_user_entry_by_uid(
     Ok(None)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct GroupEntry {
-    name: String,
-    gid: u32,
-}
-
-fn read_group_entry(context: &ProvisionContext, name: &str) -> eyre::Result<Option<GroupEntry>> {
-    read_group_entry_matching(context, |entry_name, _| entry_name == name)
-}
-
-fn read_group_entry_by_gid(
-    context: &ProvisionContext,
-    expected_gid: u32,
-) -> eyre::Result<Option<GroupEntry>> {
-    read_group_entry_matching(context, |_, gid| gid == expected_gid)
-}
-
-fn read_group_entry_matching(
-    context: &ProvisionContext,
-    matches: impl Fn(&str, u32) -> bool,
-) -> eyre::Result<Option<GroupEntry>> {
-    let group_path = context.guest_path("/etc/group");
-    let contents = match fs::read_to_string(&group_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", group_path.display())),
-    };
-
-    for line in contents.lines() {
-        let fields = line.split(':').collect::<Vec<_>>();
-        if fields.len() < 3 {
-            continue;
-        }
-        let Ok(gid) = fields[2].parse::<u32>() else {
-            continue;
-        };
-        if matches(fields[0], gid) {
-            return Ok(Some(GroupEntry {
-                name: fields[0].to_string(),
-                gid,
-            }));
-        }
-    }
-
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -635,7 +484,7 @@ mod tests {
         .expect("write passwd");
 
         let context = ProvisionContext::for_test(&root);
-        let entry = super::read_user_entry(&context, "silo")
+        let entry = crate::provision::user::read_user_entry(&context, "silo")
             .expect("read user")
             .expect("entry exists");
 
@@ -660,9 +509,12 @@ mod tests {
         )
         .expect("write passwd");
 
-        let entry = super::read_user_entry_by_uid(&ProvisionContext::for_test(&root), 1000)
-            .expect("read user")
-            .expect("entry exists");
+        let entry = crate::provision::user::read_user_entry_by_uid(
+            &ProvisionContext::for_test(&root),
+            1000,
+        )
+        .expect("read user")
+        .expect("entry exists");
 
         assert_eq!(entry.name, "ubuntu");
         assert_eq!(entry.uid, 1000);
@@ -673,34 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn finds_private_group_by_name_and_gid() {
-        let root = temp_root("group-entry");
-        let etc = root.join("etc");
-        fs::create_dir_all(&etc).expect("create etc");
-        fs::write(
-            etc.join("group"),
-            "root:x:0:\nubuntu:x:1000:\nusers:x:1001:\n",
-        )
-        .expect("write group");
-        let context = ProvisionContext::for_test(&root);
-
-        let by_name = super::read_group_entry(&context, "ubuntu")
-            .expect("read group")
-            .expect("group exists");
-        let by_gid = super::read_group_entry_by_gid(&context, 1000)
-            .expect("read group")
-            .expect("group exists");
-
-        assert_eq!(by_name, by_gid);
-        assert_eq!(by_name.name, "ubuntu");
-        assert_eq!(by_name.gid, 1000);
-
-        fs::remove_dir_all(root).expect("clean temp root");
-    }
-
-    #[test]
     fn home_owner_uses_numeric_uid_and_primary_gid() {
-        assert_eq!(super::home_owner(1000, 1001), "1000:1001");
+        assert_eq!(crate::provision::user::home_owner(1000, 1001), "1000:1001");
     }
 
     #[test]
@@ -723,7 +549,7 @@ mod tests {
         let gid = nix::unistd::Gid::current().as_raw();
         let context = ProvisionContext::for_test(&root);
 
-        super::initialize_home(&context, &user, gid).expect("initialize home");
+        crate::provision::user::initialize_home(&context, &user, gid).expect("initialize home");
 
         let home = root.join("home/nickvd");
         assert_eq!(
@@ -761,8 +587,11 @@ mod tests {
         fs::create_dir_all(&outside).expect("create outside");
         symlink(&outside, root.join("home")).expect("create home symlink");
 
-        let error = super::ensure_home_directory(&ProvisionContext::for_test(&root), "/home/silo")
-            .expect_err("symlinked home component must fail");
+        let error = crate::provision::user::ensure_home_directory(
+            &ProvisionContext::for_test(&root),
+            "/home/silo",
+        )
+        .expect_err("symlinked home component must fail");
 
         assert!(error.to_string().contains("non-symlink directory"));
         assert!(!outside.join("silo").exists());
@@ -772,8 +601,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_regular_login_account_for_adoption() {
-        super::validate_adoptable_user(&ubuntu_entry()).expect("ubuntu should be adoptable");
+    fn rejects_uid_owned_by_another_account_without_mutation() {
+        let root = temp_root("uid-conflict");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let passwd = "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n";
+        fs::write(root.join("etc/passwd"), passwd).unwrap();
+        let error = crate::provision::user::ensure_user(
+            &ProvisionContext::for_test(&root),
+            &nickvd_config(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to rename"));
+        assert_eq!(fs::read_to_string(root.join("etc/passwd")).unwrap(), passwd);
+        assert!(!root.join("home/nickvd").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -781,83 +622,14 @@ mod tests {
         let mut user = nickvd_config();
         user.gid = 2000;
 
-        let error = super::validate_primary_gid(&user, &ubuntu_entry())
+        let error = crate::provision::user::validate_primary_gid(&user, &ubuntu_entry())
             .expect_err("primary gid mismatch must fail");
 
         assert!(error.to_string().contains("expected 2000"));
     }
 
-    #[test]
-    fn refuses_protected_accounts_for_adoption() {
-        let cases = [
-            super::UserEntry {
-                name: "daemon".to_string(),
-                uid: 1,
-                gid: 1,
-                gecos: "daemon".to_string(),
-                home: "/usr/sbin".to_string(),
-                shell: "/usr/sbin/nologin".to_string(),
-            },
-            super::UserEntry {
-                name: "service".to_string(),
-                uid: 1001,
-                gid: 1001,
-                gecos: String::new(),
-                home: "/var/lib/service".to_string(),
-                shell: "/bin/false".to_string(),
-            },
-            super::UserEntry {
-                name: "nobody".to_string(),
-                uid: 65_534,
-                gid: 65_534,
-                gecos: String::new(),
-                home: "/nonexistent".to_string(),
-                shell: "/bin/bash".to_string(),
-            },
-        ];
-
-        for entry in cases {
-            let error = super::validate_adoptable_user(&entry)
-                .expect_err("protected account should not be adoptable");
-            assert!(error.to_string().contains("protected account"));
-        }
-    }
-
-    #[test]
-    fn adoption_renames_account_and_moves_home() {
-        let args = super::adoption_usermod_args(&nickvd_config(), &ubuntu_entry());
-
-        assert_eq!(
-            args,
-            [
-                "--login",
-                "nickvd",
-                "--comment",
-                "Nick Van Driessche",
-                "--home",
-                "/home/nickvd",
-                "--move-home",
-                "--shell",
-                "/bin/bash",
-                "ubuntu",
-            ]
-            .map(OsString::from)
-        );
-    }
-
-    #[test]
-    fn adoption_does_not_move_matching_home() {
-        let mut entry = ubuntu_entry();
-        entry.home = "/home/nickvd".to_string();
-
-        let args = super::adoption_usermod_args(&nickvd_config(), &entry);
-
-        assert!(!args.contains(&OsString::from("--home")));
-        assert!(!args.contains(&OsString::from("--move-home")));
-    }
-
-    fn ubuntu_entry() -> super::UserEntry {
-        super::UserEntry {
+    fn ubuntu_entry() -> crate::provision::user::UserEntry {
+        crate::provision::user::UserEntry {
             name: "ubuntu".to_string(),
             uid: 1000,
             gid: 1000,

@@ -3,15 +3,17 @@
 
 #include "../../native/include/silo_go_ffi.h"
 
-char *bridge_load(const char *path);
+char *bridge_load(const char *path, uint32_t expected_abi);
 uint32_t bridge_abi_version(void);
 const char *bridge_sdk_version(void);
 void bridge_string_free(char *value);
 void bridge_buffer_free(silo_buffer value);
 void bridge_error_free(silo_error *error);
+silo_error *bridge_planning_query(const uint8_t *request, size_t request_len, silo_buffer *out_data);
 
 silo_error *bridge_runtime_open(const uint8_t *request, size_t request_len, silo_runtime **out_runtime);
 void bridge_runtime_free(silo_runtime *runtime);
+silo_error *bridge_runtime_query(const silo_runtime *runtime, const uint8_t *request, size_t request_len, silo_buffer *out_data);
 silo_error *bridge_runtime_machine_create(const silo_runtime *runtime, const uint8_t *request, size_t request_len, silo_machine **out_machine);
 silo_error *bridge_runtime_machine_get(const silo_runtime *runtime, const uint8_t *reference, size_t reference_len, silo_machine **out_machine);
 silo_error *bridge_runtime_machines(const silo_runtime *runtime, silo_machine_handle_list *out_machines);
@@ -22,13 +24,30 @@ void bridge_machine_free(silo_machine *machine);
 silo_error *bridge_machine_id(const silo_machine *machine, silo_buffer *out_id);
 silo_error *bridge_machine_inspect(const silo_machine *machine, silo_buffer *out_data);
 silo_error *bridge_machine_start(const silo_machine *machine, silo_buffer *out_data);
+silo_error *bridge_machine_lease_node_state(const silo_machine *machine, silo_node_state_lease **out_lease);
+void bridge_node_state_lease_free(silo_node_state_lease *lease);
 silo_error *bridge_machine_stop(const silo_machine *machine, silo_buffer *out_data);
+silo_error *bridge_machine_update(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);
+silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);
 silo_error *bridge_machine_remove(const silo_machine *machine);
+silo_error *bridge_machine_secret(const silo_machine *machine, const uint8_t *request, size_t request_len);
 silo_error *bridge_machine_exec(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output);
-silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output);
+silo_error *bridge_machine_exec_script(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output);
 silo_error *bridge_machine_spawn(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution **out_session);
-silo_error *bridge_machine_attach(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result);
-silo_error *bridge_machine_attach_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_status);
+silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_status);
+silo_error *bridge_attachment_cancellation_new(AttachmentCancellation **out_token);
+silo_error *bridge_attachment_cancellation_cancel(const AttachmentCancellation *token);
+silo_error *bridge_attachment_cancellation_signal(const AttachmentCancellation *token, uint32_t signal);
+void bridge_attachment_cancellation_free(AttachmentCancellation *token);
+silo_error *bridge_machine_shell_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, const SshAttachmentHandle *attachment, silo_buffer *out_status);
+silo_error *bridge_ssh_attachment_new(const silo_machine *machine, const AttachmentCancellation *token, uint16_t rows, uint16_t columns, SshAttachmentHandle **out_handle);
+silo_error *bridge_ssh_attachment_write(const SshAttachmentHandle *handle, const uint8_t *data, size_t len);
+silo_error *bridge_ssh_attachment_close_stdin(const SshAttachmentHandle *handle);
+silo_error *bridge_ssh_attachment_read(const SshAttachmentHandle *handle, _Bool stderr, silo_buffer *out_buffer, _Bool *out_eof);
+silo_error *bridge_ssh_attachment_resize(const SshAttachmentHandle *handle, uint16_t rows, uint16_t columns);
+silo_error *bridge_ssh_attachment_signal(const SshAttachmentHandle *handle, uint32_t signal);
+silo_error *bridge_ssh_attachment_cancel(const SshAttachmentHandle *handle);
+void bridge_ssh_attachment_free(SshAttachmentHandle *handle);
 silo_error *bridge_execution_recv(const silo_execution *session, silo_execution_event *out_event, _Bool *out_eof);
 silo_error *bridge_execution_wait(const silo_execution *session, silo_buffer *out_result);
 silo_error *bridge_execution_collect(const silo_execution *session, silo_execution_output *out_output);
@@ -47,4 +66,15 @@ silo_error *bridge_log_close(const silo_log *log);
 void bridge_log_free(silo_log *log);
 silo_error *bridge_network_policy_build(const uint8_t *request, size_t request_len, silo_buffer *out_policy);
 
+silo_error *bridge_machine_file_stat(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_entry);
+silo_error *bridge_machine_create_directory(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result);
+silo_error *bridge_machine_upload_open(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_upload **out_upload);
+silo_error *bridge_upload_write(const silo_upload *upload, const uint8_t *data, size_t data_len);
+silo_error *bridge_upload_finish(const silo_upload *upload, silo_buffer *out_result);
+silo_error *bridge_upload_cancel(const silo_upload *upload);
+void bridge_upload_free(silo_upload *upload);
+silo_error *bridge_machine_download_open(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_download **out_download);
+silo_error *bridge_download_read(const silo_download *download, silo_buffer *out_chunk, _Bool *out_eof);
+silo_error *bridge_download_cancel(const silo_download *download);
+void bridge_download_free(silo_download *download);
 #endif

@@ -42,6 +42,29 @@ pub struct MachineRootfs {
     pub created_at: i64,
 }
 
+impl MachineRootfs {
+    /// Constructs a disk pin observation; OCI identity can be supplied in public fields.
+    pub fn new(
+        source_kind: ImageSourceKind,
+        requested_reference: String,
+        root_disk_path: PathBuf,
+        root_disk_size_bytes: u64,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            source_kind,
+            requested_reference,
+            selected_reference: None,
+            selected_manifest_digest: None,
+            config_digest: None,
+            image_id: None,
+            root_disk_path,
+            root_disk_size_bytes,
+            created_at,
+        }
+    }
+}
+
 impl From<MachineRootfsRecord> for MachineRootfs {
     fn from(value: MachineRootfsRecord) -> Self {
         Self {
@@ -146,6 +169,8 @@ pub struct MachineData {
     pub metadata: BTreeMap<String, String>,
     /// Desired network attachment recorded for the machine.
     pub network: MachineNetworkConfig,
+    /// Host-owned Tailscale identity settings derived from the effective policy.
+    pub tailscale: Option<MachineTailscale>,
     /// Durable guest behavior owned by libvm.
     pub guest: MachineGuestConfig,
     /// Observed lifecycle status, or a persisted fallback when `observation`
@@ -175,6 +200,40 @@ pub struct MachineData {
 }
 
 impl MachineData {
+    /// Constructs an owned observation for adapters without opening a machine handle.
+    /// Optional observations remain unavailable until the adapter supplies them.
+    pub fn new(id: String, name: String, spec: VmSpec) -> Self {
+        Self {
+            id,
+            name,
+            spec,
+            retention: MachineRetention::Persistent,
+            process: ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
+            machine_dir: PathBuf::new(),
+            created_at: 0,
+            modified_at: 0,
+            image_ref: String::new(),
+            rootfs: None,
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+            tailscale: None,
+            guest: MachineGuestConfig::default(),
+            status: MachineStatus::Stopped,
+            observation: MachineObservation::Unavailable,
+            issues: Vec::new(),
+            run_id: None,
+            boot_report: None,
+            provision_report: None,
+            started_at: None,
+            last_error: None,
+            updated_at: 0,
+        }
+    }
+
     pub(crate) fn from_models_with_status(
         config: MachineConfig,
         rootfs: Option<MachineRootfsRecord>,
@@ -184,6 +243,21 @@ impl MachineData {
         provision_report: Option<MachineProvisionReport>,
         state: MachineState,
     ) -> Self {
+        let tailscale = match &config.network {
+            crate::store::models::MachineNetworkConfig::Private {
+                policy: Some(policy),
+                ..
+            } => policy.tailscale().first().map(|tunnel| MachineTailscale {
+                state_dir: config.machine_dir.join("tailscale"),
+                hostname: tunnel
+                    .hostname
+                    .clone()
+                    .filter(|hostname| !hostname.is_empty())
+                    .unwrap_or_else(|| config.name.clone()),
+                ephemeral: tunnel.ephemeral,
+            }),
+            _ => None,
+        };
         Self {
             id: config.id.to_string(),
             name: config.name,
@@ -201,6 +275,7 @@ impl MachineData {
             labels: config.labels,
             metadata: config.metadata,
             network: config.network.into(),
+            tailscale,
             guest: config.guest,
             status,
             observation: MachineObservation::Observed,
@@ -218,6 +293,13 @@ impl MachineData {
     pub fn is_running(&self) -> bool {
         self.status.is_running()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MachineTailscale {
+    pub state_dir: PathBuf,
+    pub hostname: String,
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +717,37 @@ fn agent_reports_ready(agent: Option<&HostAgent>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_guest_ready_does_not_override_stale_current_readiness() {
+        let status = MachineStatus::from_protocol(protocol::v1::HostStatus {
+            vm: Some(protocol::v1::VmSnapshot {
+                state: Some(protocol::v1::VmState::Running as i32),
+                ..Default::default()
+            }),
+            readiness: Some(protocol::v1::Readiness {
+                ready: Some(false),
+                reason: Some(protocol::v1::ReadinessReason::AgentStatusStale as i32),
+            }),
+            agent: Some(protocol::v1::HostAgent {
+                mode: Some(protocol::v1::host_agent::Mode::Enabled(
+                    protocol::v1::EnabledAgent {
+                        status: Some(protocol::v1::AgentStatusObservation {
+                            freshness: Some(protocol::v1::Freshness::Stale as i32),
+                            report: Some(protocol::v1::AgentStatusReport {
+                                state: Some(protocol::v1::AgentStatusState::Ready as i32),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            ..Default::default()
+        });
+        assert!(status.guest_ready());
+        assert!(!status.ready());
+    }
     use protocol::v1::{HostStatus, Readiness, VmSnapshot, VmState};
 
     use crate::machine::MachineStatus;

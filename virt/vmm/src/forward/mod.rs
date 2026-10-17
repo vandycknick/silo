@@ -1,6 +1,6 @@
 mod agent;
 mod host_socket;
-mod inbound;
+pub(crate) mod inbound;
 mod outbound;
 pub(crate) mod service;
 mod task;
@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use forward_spec::{Address, Forward, ForwardShape, GuestHalf, Token};
 use rand::RngExt;
@@ -78,6 +79,7 @@ pub(crate) struct ForwardTable {
     operation: tokio::sync::Mutex<()>,
     runtime_dir: PathBuf,
     mux_filename: Option<String>,
+    park_timeout: Duration,
     machine: std::sync::OnceLock<VirtualMachine>,
     running: AtomicBool,
     next_id: AtomicU64,
@@ -110,6 +112,7 @@ impl ForwardTable {
         forwards: &[Forward],
         runtime_dir: &Path,
         mux_filename: Option<&str>,
+        park_timeout: Duration,
     ) -> eyre::Result<Arc<Self>> {
         validate_forward_set(forwards, runtime_dir, mux_filename)
             .map_err(|error| eyre::eyre!("validate machine-scoped forwards: {error}"))?;
@@ -125,6 +128,7 @@ impl ForwardTable {
             operation: tokio::sync::Mutex::new(()),
             runtime_dir: runtime_dir.to_path_buf(),
             mux_filename: mux_filename.map(str::to_owned),
+            park_timeout,
             machine: std::sync::OnceLock::new(),
             running: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
@@ -307,7 +311,12 @@ impl ForwardTable {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            entry.spawn(inbound::serve(listener, entry.clone(), machine.clone()));
+            entry.spawn(inbound::serve(
+                listener,
+                entry.clone(),
+                machine.clone(),
+                self.park_timeout,
+            ));
         }
         if let Some(listener) = entry
             .vsock_listener
@@ -863,10 +872,15 @@ mod tests {
                     "guest:tcp:81".parse().unwrap(),
                 ),
             ];
-            let error = ForwardTable::prepare_machine(&forwards, &root, None)
-                .await
-                .err()
-                .expect("duplicate listener must fail");
+            let error = ForwardTable::prepare_machine(
+                &forwards,
+                &root,
+                None,
+                crate::forward::inbound::PARK_TIMEOUT,
+            )
+            .await
+            .err()
+            .expect("duplicate listener must fail");
             assert!(
                 error.to_string().contains("Unix listen endpoint"),
                 "{error}"
@@ -883,9 +897,10 @@ mod tests {
             std::path::Path::new("/tmp").join(format!("fr-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("listen");
-        let table = ForwardTable::prepare_machine(&[], &root, None)
-            .await
-            .unwrap();
+        let table =
+            ForwardTable::prepare_machine(&[], &root, None, crate::forward::inbound::PARK_TIMEOUT)
+                .await
+                .unwrap();
         let capacity = VsockCapacity::new("forward-unit-test");
         for port in 5000..6100 {
             let spec = forward_spec::Forward::new(
@@ -921,10 +936,14 @@ mod tests {
             "vsock:5000".parse().unwrap(),
             "host:tcp:5432".parse().unwrap(),
         );
-        let table =
-            ForwardTable::prepare_machine(&[forward], std::path::Path::new("/unused"), None)
-                .await
-                .unwrap();
+        let table = ForwardTable::prepare_machine(
+            &[forward],
+            std::path::Path::new("/unused"),
+            None,
+            crate::forward::inbound::PARK_TIMEOUT,
+        )
+        .await
+        .unwrap();
         let entry = &table.entries()[0];
         entry.set_state(ForwardState::Active, None);
         assert_eq!(

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -135,6 +136,8 @@ pub struct ForwardScenario {
     pub refuse_targets: Vec<String>,
     /// Omit GuestForwardService from health discovery.
     pub unsupported: bool,
+    /// Override the pending inbound connection parking timeout in milliseconds.
+    pub park_timeout_ms: Option<u64>,
 }
 
 impl Scenario {
@@ -168,16 +171,26 @@ impl Scenario {
 /// Build (once) and return the path to a silo-vmm binary compiled with the
 /// `mock-backend` feature.
 ///
-/// Runs `cargo build -p silo-vmm --features mock-backend` in the workspace root
-/// the first time it is called in a process. Under `make test` / CI this is a
-/// cache hit because the workspace is already built with `--all-features`.
-/// Nested `cargo build` inside `cargo test` is safe: cargo releases its build
-/// lock before executing tests.
+/// `SILO_TEST_MOCK_VMM_BINARY` names a prebuilt binary and skips the nested
+/// build; `xtask test`/`xtask coverage` set it so every test process reuses one
+/// artifact (and, under coverage, an instrumented one). Otherwise this runs
+/// `cargo build -p silo-vmm --features mock-backend` in the workspace root the
+/// first time it is called in a process. Under `make test` / CI this is a cache
+/// hit because the workspace is already built with `--all-features`. Nested
+/// `cargo build` inside `cargo test` is safe: cargo releases its build lock
+/// before executing tests.
 pub fn mock_vmm_binary() -> &'static Path {
-    use std::sync::OnceLock;
-
-    static BINARY: OnceLock<PathBuf> = OnceLock::new();
-    BINARY.get_or_init(|| {
+    static BINARY: LazyLock<PathBuf> = LazyLock::new(|| {
+        if let Some(binary) = std::env::var_os("SILO_TEST_MOCK_VMM_BINARY") {
+            let binary = PathBuf::from(binary);
+            assert!(
+                binary.is_file(),
+                "SILO_TEST_MOCK_VMM_BINARY does not name a file: {}",
+                binary.display()
+            );
+            warm(&binary);
+            return binary;
+        }
         let workspace_root = workspace_root();
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let status = std::process::Command::new(cargo)
@@ -196,8 +209,22 @@ pub fn mock_vmm_binary() -> &'static Path {
             "expected mock-enabled silo-vmm binary at {}",
             binary.display()
         );
+        warm(&binary);
         binary
-    })
+    });
+    &BINARY
+}
+
+/// Cargo uplifts binaries by copying, so every build leaves a fresh inode.
+/// macOS policy-scans the first exec of a new executable inode for about a
+/// second; pay it here, not inside a timed launch.
+fn warm(binary: &Path) {
+    let warm = std::process::Command::new(binary)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("failed to execute the mock-enabled silo-vmm");
+    assert!(warm.success(), "mock-enabled silo-vmm --help failed");
 }
 
 fn workspace_root() -> PathBuf {

@@ -266,6 +266,8 @@ impl GuestFilesystemService for FilesystemProxy {
             .map_err(|_| detailed_status(Status::cancelled("upload relay stopped")))?;
         let request_guard = sender.clone();
         let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+        // The producer reports `Err(None)` when the guest RPC dropped its request
+        // stream; the RPC then carries the real guest error (e.g. missing parent).
         let producer = AbortOnDropHandle::new(tokio::spawn(async move {
             let result = async {
                 let mut total = 0_usize;
@@ -274,31 +276,39 @@ impl GuestFilesystemService for FilesystemProxy {
                     let message =
                         match tokio::time::timeout_at(progress_deadline, input.next()).await {
                             Ok(Some(message)) => message,
-                            Ok(None) => return Ok::<(), Status>(()),
+                            Ok(None) => return Ok::<(), Option<Status>>(()),
                             Err(_) => {
-                                return Err(protocol::detailed_status(Status::deadline_exceeded(
-                                    "upload made no progress before its deadline",
+                                return Err(Some(protocol::detailed_status(
+                                    Status::deadline_exceeded(
+                                        "upload made no progress before its deadline",
+                                    ),
                                 )));
                             }
                         };
-                    let message = message?;
+                    let message = message.map_err(Some)?;
                     let data = match message.payload {
                         Some(protocol::v1::upload_file_request::Payload::Chunk(ByteChunk {
                             data: Some(data),
                         })) if data.len() <= protocol::CHUNK_64_KIB => data,
                         Some(protocol::v1::upload_file_request::Payload::Chunk(ByteChunk {
                             data: None,
-                        })) => return Err(invalid_status("upload chunk data is required")),
+                        })) => return Err(Some(invalid_status("upload chunk data is required"))),
                         Some(protocol::v1::upload_file_request::Payload::Chunk(_)) => {
-                            return Err(invalid_status("upload chunk exceeds 64 KiB"));
+                            return Err(Some(invalid_status("upload chunk exceeds 64 KiB")));
                         }
-                        _ => return Err(invalid_status("only chunks may follow upload header")),
+                        _ => {
+                            return Err(Some(invalid_status(
+                                "only chunks may follow upload header",
+                            )))
+                        }
                     };
                     total = total
                         .checked_add(data.len())
                         .filter(|total| *total <= MAX_TRANSFER_BYTES)
                         .ok_or_else(|| {
-                            detailed_status(Status::resource_exhausted("upload exceeds 8 GiB"))
+                            Some(detailed_status(Status::resource_exhausted(
+                                "upload exceeds 8 GiB",
+                            )))
                         })?;
                     if data.is_empty() {
                         continue;
@@ -314,11 +324,11 @@ impl GuestFilesystemService for FilesystemProxy {
                     )
                     .await
                     .map_err(|_| {
-                        detailed_status(Status::deadline_exceeded(
+                        Some(detailed_status(Status::deadline_exceeded(
                             "upload relay made no progress before its deadline",
-                        ))
+                        )))
                     })?
-                    .map_err(|_| detailed_status(Status::cancelled("upload relay stopped")))?;
+                    .map_err(|_| None)?;
                     idle_deadline = tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT;
                 }
             }
@@ -349,12 +359,21 @@ impl GuestFilesystemService for FilesystemProxy {
                 drop(request_guard);
                 rpc.await.map_err(sanitize_status)?.into_inner()
             }
-            futures::future::Either::Left(Ok(Err(error))) => {
+            futures::future::Either::Left(Ok(Err(Some(error)))) => {
                 drop(rpc);
                 drop(request_guard);
                 producer.abort();
                 let _ = producer.await;
                 return Err(protocol::detailed_status(error));
+            }
+            futures::future::Either::Left(Ok(Err(None))) => {
+                drop(request_guard);
+                producer.abort();
+                let _ = producer.await;
+                return Err(match rpc.await {
+                    Err(status) => sanitize_status(status),
+                    Ok(_) => detailed_status(Status::cancelled("upload relay stopped")),
+                });
             }
             futures::future::Either::Left(Err(_)) => {
                 drop(rpc);

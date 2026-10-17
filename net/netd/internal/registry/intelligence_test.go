@@ -13,6 +13,7 @@ import (
 )
 
 func TestIntelligenceUsesRegistryAndFeedAgeWithoutCrossRequestObservation(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
 	server := newFeedServer(t, now)
 	defer server.Close()
@@ -36,9 +37,11 @@ func TestIntelligenceUsesRegistryAndFeedAgeWithoutCrossRequestObservation(t *tes
 	if facts.AgeHours != 48 || facts.AgeSource != "feed" {
 		t.Fatalf("feed facts = %#v", facts)
 	}
+
 }
 
 func TestIntelligenceRejectsNonBaseFeedURLs(t *testing.T) {
+	t.Parallel()
 	for _, feed := range []string{
 		"http://feeds.example.test",
 		"https://user@feeds.example.test",
@@ -50,9 +53,11 @@ func TestIntelligenceRejectsNonBaseFeedURLs(t *testing.T) {
 			t.Errorf("NewIntelligence(%q) succeeded", feed)
 		}
 	}
+
 }
 
 func TestIntelligenceMatchesMalwareAndNormalizesPyPINames(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
 	server := newFeedServer(t, now)
 	defer server.Close()
@@ -73,9 +78,11 @@ func TestIntelligenceMatchesMalwareAndNormalizesPyPINames(t *testing.T) {
 	if facts.Name != "foo-bar" || !facts.Malware || facts.MalwareReason != "MALWARE" {
 		t.Fatalf("PyPI malware facts = %#v", facts)
 	}
+
 }
 
 func TestIntelligenceReportsUnavailableFeedsWithoutInventingEvidence(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 	}))
@@ -89,9 +96,11 @@ func TestIntelligenceReportsUnavailableFeedsWithoutInventingEvidence(t *testing.
 	if facts.MalwareDataAvailable || facts.Malware || facts.AgeKnown || facts.AgeSource != "" {
 		t.Fatalf("unavailable facts = %#v", facts)
 	}
+
 }
 
 func TestIntelligenceRetainsLastSuccessfulSnapshotAfterRefreshFailure(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
 	failing := false
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -126,9 +135,11 @@ func TestIntelligenceRetainsLastSuccessfulSnapshotAfterRefreshFailure(t *testing
 	if !facts.MalwareDataAvailable || !facts.Malware {
 		t.Fatalf("stale malware snapshot was not retained: %#v", facts)
 	}
+
 }
 
 func TestIntelligenceFactsDoesNotRefreshFeeds(t *testing.T) {
+	t.Parallel()
 	requests := 0
 	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		requests++
@@ -139,9 +150,11 @@ func TestIntelligenceFactsDoesNotRefreshFeeds(t *testing.T) {
 	if requests != 0 {
 		t.Fatalf("Facts performed %d feed requests", requests)
 	}
+
 }
 
 func TestIntelligenceRefreshAndFactsAreConcurrentSafe(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
 	server := newFeedServer(t, now)
 	defer server.Close()
@@ -179,9 +192,11 @@ func TestIntelligenceRefreshAndFactsAreConcurrentSafe(t *testing.T) {
 	}
 	close(stopReaders)
 	readers.Wait()
+
 }
 
 func TestIntelligenceRejectsCrossOriginRedirects(t *testing.T) {
+	t.Parallel()
 	redirected := make(chan struct{}, 1)
 	destination := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		redirected <- struct{}{}
@@ -203,6 +218,7 @@ func TestIntelligenceRejectsCrossOriginRedirects(t *testing.T) {
 		t.Fatal("cross-origin intelligence redirect was followed")
 	default:
 	}
+
 }
 
 func newFeedServer(t *testing.T, now time.Time) *httptest.Server {

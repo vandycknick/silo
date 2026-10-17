@@ -1,3 +1,5 @@
+mod shell;
+use shell::{NativeShellOperation, NativeShellSize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -5,19 +7,20 @@ use std::time::Duration;
 
 use libvm::{
     ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult,
-    ExecutionSession, ExecutionStdin, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
-    ImagePullOptions, ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError,
-    Machine, MachineBootReport, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions,
+    ExecutionSession, ExecutionStdin, ForwardCertificateProvider, ForwardProtocol, ForwardTls,
+    ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport, ImagePullOptions,
+    ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError, Machine,
+    MachineBootReport, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions,
     MachineLogOutput, MachineLogSource, MachineLogStream, MachineNetworkBuilder,
     MachineNetworkConfig, MachineProvisionReport, MachineProvisionStepReport, MachineRef,
     MachineRootfs, MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder,
     NetworkEndpointBuilder, NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder,
-    OciImageConfigMetadata, Runtime, RuntimeConfig, SshExitStatus, SshShellOptionsBuilder,
-    TailscaleTunnelBuilder,
+    OciImageConfigMetadata, Runtime, RuntimeConfig, SshShellOptionsBuilder, TailscaleTunnelBuilder,
 };
-use napi::bindgen_prelude::Uint8Array;
+use napi::bindgen_prelude::{BigInt, Uint8Array};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use vm_spec::Mount;
@@ -189,6 +192,42 @@ pub struct NativeNetworkForwardInput {
     pub target_port: Option<u32>,
     pub listen: Option<String>,
     pub tunnel: Option<String>,
+    pub protocol: Option<String>,
+    pub tls: Option<NativeNetworkForwardTlsInput>,
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeNetworkForwardTlsInput {
+    pub provider: String,
+}
+
+impl napi::bindgen_prelude::ValidateNapiValue for NativeNetworkForwardTlsInput {}
+
+impl napi::bindgen_prelude::FromNapiValue for NativeNetworkForwardTlsInput {
+    unsafe fn from_napi_value(
+        env: napi::bindgen_prelude::sys::napi_env,
+        value: napi::bindgen_prelude::sys::napi_value,
+    ) -> Result<Self> {
+        use napi::bindgen_prelude::{
+            JsObjectValue, KeyCollectionMode, KeyConversion, KeyFilter, Object,
+        };
+        let object = unsafe { Object::from_napi_value(env, value)? };
+        let keys = object.get_all_property_names(
+            KeyCollectionMode::OwnOnly,
+            KeyFilter::AllProperties,
+            KeyConversion::NumbersToStrings,
+        )?;
+        let length: u32 = keys.get_named_property("length")?;
+        for index in 0..length {
+            let key: String = keys.get_element(index)?;
+            if key != "provider" {
+                return Err(invalid_arg(format!("unknown forward TLS field {key:?}")));
+            }
+        }
+        Ok(Self {
+            provider: object.get_named_property("provider")?,
+        })
+    }
 }
 
 #[napi(object)]
@@ -428,6 +467,71 @@ pub struct NativeMachineBuilder {
 #[napi(js_name = "NativeMachine")]
 pub struct NativeMachine {
     inner: Machine,
+}
+
+#[napi(object)]
+pub struct NativeFileEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size_bytes: BigInt,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub modified_at_unix_millis: BigInt,
+}
+
+#[napi(object)]
+#[derive(Default)]
+pub struct NativeUploadOptions {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+#[napi(object)]
+#[derive(Default)]
+pub struct NativeCreateDirectoryOptions {
+    pub parents: Option<bool>,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+type UploadTask =
+    tokio::task::JoinHandle<std::result::Result<libvm::FileWriteDisposition, LibVmError>>;
+type UploadWriter = tokio::io::WriteHalf<tokio::io::SimplexStream>;
+
+#[napi]
+pub struct NativeFileUpload {
+    inner: Mutex<FileUploadState>,
+}
+
+struct FileUploadState {
+    resources: Option<(UploadWriter, UploadTask)>,
+    abort: tokio::task::AbortHandle,
+    cancellation: watch::Sender<bool>,
+    busy: bool,
+    closed: bool,
+}
+
+impl Drop for FileUploadState {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+#[napi]
+pub struct NativeFileDownload {
+    inner: Mutex<FileDownloadState>,
+}
+
+struct FileDownloadState {
+    reader: Option<libvm::MachineFileDownload>,
+    cancellation: watch::Sender<bool>,
+    busy: bool,
+    closed: bool,
+    eof: bool,
 }
 
 #[napi(js_name = "NativeImages")]
@@ -760,38 +864,137 @@ impl NativeMachine {
         })
     }
 
-    #[napi]
-    pub async fn shell(
+    #[napi(js_name = "execScript")]
+    pub async fn exec_script(
         &self,
         script: String,
         options: Option<NativeExecutionOptionsInput>,
     ) -> Result<NativeExecutionOutput> {
         let machine = self.inner.clone();
-        let output = run_shell(machine, script, options).await?;
+        let output = run_exec_script(machine, script, options).await?;
         Ok(execution_output_to_native(output))
     }
 
-    #[napi]
-    pub async fn attach(
-        &self,
-        program: String,
-        args: Option<Vec<String>>,
-        options: Option<NativeExecutionOptionsInput>,
-    ) -> Result<NativeExecutionResult> {
-        let machine = self.inner.clone();
-        let status = attach(machine, program, args.unwrap_or_default(), options).await?;
-        Ok(execution_result_to_native(status))
-    }
-
-    #[napi(js_name = "attachShell")]
-    pub async fn attach_shell(
+    #[napi(js_name = "startShell")]
+    pub fn start_shell(
         &self,
         options: Option<NativeSshShellOptionsInput>,
-    ) -> Result<NativeSshExitStatus> {
-        let machine = self.inner.clone();
-        attach_shell(machine, options)
+        attachment_size: Option<NativeShellSize>,
+    ) -> Result<NativeShellOperation> {
+        NativeShellOperation::start(self.inner.clone(), options, attachment_size)
+    }
+
+    #[napi(js_name = "statFile")]
+    pub async fn stat_file(&self, path: String) -> Result<NativeFileEntry> {
+        let entry = self
+            .inner
+            .get_file_entry(path)
             .await
-            .map(ssh_exit_status_to_native)
+            .map_err(to_napi_error)?;
+        let modified = entry
+            .modified_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invalid_state(format!("invalid file modification time: {error}")))?;
+        let millis = u64::try_from(modified.as_millis())
+            .map_err(|_| invalid_state("file modification time exceeds u64"))?;
+        let kind = match entry.kind {
+            libvm::MachineEntryKind::File => "file",
+            libvm::MachineEntryKind::Directory => "directory",
+            libvm::MachineEntryKind::Symlink => "symlink",
+            libvm::MachineEntryKind::Fifo => "fifo",
+            libvm::MachineEntryKind::Socket => "socket",
+            libvm::MachineEntryKind::BlockDevice => "block_device",
+            libvm::MachineEntryKind::CharacterDevice => "character_device",
+        };
+        Ok(NativeFileEntry {
+            path: entry.path,
+            name: entry.name,
+            kind: kind.to_owned(),
+            size_bytes: BigInt::from(entry.size_bytes),
+            mode: entry.mode,
+            uid: entry.uid,
+            gid: entry.gid,
+            modified_at_unix_millis: BigInt::from(millis),
+        })
+    }
+
+    #[napi(js_name = "createDirectory")]
+    pub async fn create_directory(
+        &self,
+        path: String,
+        options: Option<NativeCreateDirectoryOptions>,
+    ) -> Result<String> {
+        let options = options.unwrap_or_default();
+        self.inner
+            .create_directory(
+                path,
+                options.parents.unwrap_or(false),
+                options.mode,
+                options.uid,
+                options.gid,
+            )
+            .await
+            .map(|value| match value {
+                libvm::MachineDirectoryCreateDisposition::Created => "created".to_owned(),
+                libvm::MachineDirectoryCreateDisposition::AlreadyExists => {
+                    "already_exists".to_owned()
+                }
+            })
+            .map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "uploadFile")]
+    pub async fn upload_file(
+        &self,
+        path: String,
+        options: Option<NativeUploadOptions>,
+    ) -> Result<NativeFileUpload> {
+        let options = options.unwrap_or_default();
+        let machine = self.inner.clone();
+        let (reader, writer) = tokio::io::simplex(65536);
+        let task = tokio::spawn(async move {
+            machine
+                .upload_file(
+                    libvm::MachineFileUploadOptions {
+                        path,
+                        mode: options.mode,
+                        uid: options.uid,
+                        gid: options.gid,
+                    },
+                    reader,
+                )
+                .await
+        });
+        let abort = task.abort_handle();
+        let (cancellation, _) = watch::channel(false);
+        Ok(NativeFileUpload {
+            inner: Mutex::new(FileUploadState {
+                resources: Some((writer, task)),
+                abort,
+                cancellation,
+                busy: false,
+                closed: false,
+            }),
+        })
+    }
+
+    #[napi(js_name = "downloadFile")]
+    pub async fn download_file(&self, path: String) -> Result<NativeFileDownload> {
+        let reader = self
+            .inner
+            .download_file(path)
+            .await
+            .map_err(to_napi_error)?;
+        let (cancellation, _) = watch::channel(false);
+        Ok(NativeFileDownload {
+            inner: Mutex::new(FileDownloadState {
+                reader: Some(reader),
+                cancellation,
+                busy: false,
+                closed: false,
+                eof: false,
+            }),
+        })
     }
 
     #[napi]
@@ -814,6 +1017,180 @@ impl NativeMachine {
         Ok(NativeMachineLogHandle {
             inner: Mutex::new(MachineLogHandleState::new(stream)),
         })
+    }
+}
+
+fn file_write_disposition(value: libvm::FileWriteDisposition) -> String {
+    match value {
+        libvm::FileWriteDisposition::Created => "created",
+        libvm::FileWriteDisposition::Replaced => "replaced",
+    }
+    .to_owned()
+}
+
+impl NativeFileUpload {
+    fn begin(&self) -> Result<(UploadWriter, UploadTask, watch::Receiver<bool>)> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file upload lock is poisoned"))?;
+        if state.closed {
+            return Err(invalid_state("file upload is closed"));
+        }
+        if state.busy {
+            return Err(invalid_state("file upload already has an active operation"));
+        }
+        let (writer, task) = state
+            .resources
+            .take()
+            .ok_or_else(|| invalid_state("file upload is closed"))?;
+        state.busy = true;
+        Ok((writer, task, state.cancellation.subscribe()))
+    }
+
+    fn complete(&self, resources: Option<(UploadWriter, UploadTask)>) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file upload lock is poisoned"))?;
+        state.busy = false;
+        if state.closed {
+            return Err(invalid_state("file upload is closed"));
+        }
+        state.closed = resources.is_none();
+        state.resources = resources;
+        Ok(())
+    }
+}
+
+#[napi]
+impl NativeFileUpload {
+    #[napi]
+    pub async fn write(&self, data: Uint8Array) -> Result<()> {
+        let (mut writer, task, mut cancellation) = self.begin()?;
+        let data = data.to_vec();
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(invalid_state("file upload is closed")),
+            result = writer.write_all(&data) => result.map_err(|error| invalid_state(format!("file upload write: {error}"))),
+        };
+        if let Err(error) = result {
+            drop(writer);
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.changed() => Err(invalid_state("file upload is closed")),
+                result = task => match result {
+                    Ok(Err(error)) => Err(to_napi_error(error)),
+                    Err(error) => Err(invalid_state(format!("file upload task: {error}"))),
+                    Ok(Ok(_)) => Err(error),
+                },
+            };
+            self.complete(None)?;
+            return result;
+        }
+        self.complete(Some((writer, task)))
+    }
+
+    #[napi]
+    pub async fn finish(&self) -> Result<String> {
+        let (mut writer, task, mut cancellation) = self.begin()?;
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(invalid_state("file upload is closed")),
+            result = async {
+                // Simplex halves share one stream: dropping the writer does not
+                // signal EOF, only shutdown does. A shutdown failure means the
+                // upload task already ended, and its result says why.
+                let _ = writer.shutdown().await;
+                drop(writer);
+                task.await
+            } => result
+                .map_err(|error| invalid_state(format!("file upload task: {error}")))
+                .and_then(|result| result.map(file_write_disposition).map_err(to_napi_error)),
+        };
+        self.complete(None)?;
+        result
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file upload lock is poisoned"))?;
+        state.closed = true;
+        state.cancellation.send_replace(true);
+        state.abort.abort();
+        state.resources = None;
+        Ok(())
+    }
+}
+
+#[napi]
+impl NativeFileDownload {
+    #[napi]
+    pub async fn read(&self) -> Result<Option<Uint8Array>> {
+        let (mut reader, mut cancellation) = {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| invalid_state("file download lock is poisoned"))?;
+            if state.closed {
+                return Err(invalid_state("file download is closed"));
+            }
+            if state.busy {
+                return Err(invalid_state("file download already has an active read"));
+            }
+            if state.eof {
+                return Ok(None);
+            }
+            let reader = state
+                .reader
+                .take()
+                .ok_or_else(|| invalid_state("file download is closed"))?;
+            state.busy = true;
+            (reader, state.cancellation.subscribe())
+        };
+        let mut bytes = Vec::with_capacity(65536);
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(invalid_state("file download is closed")),
+            result = reader.read_buf(&mut bytes) => result.map_err(|error| invalid_state(format!("file download read: {error}"))),
+        };
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file download lock is poisoned"))?;
+        state.busy = false;
+        if state.closed {
+            return Err(invalid_state("file download is closed"));
+        }
+        match result {
+            Ok(0) => {
+                state.eof = true;
+                Ok(None)
+            }
+            Ok(_) => {
+                state.reader = Some(reader);
+                Ok(Some(bytes.into()))
+            }
+            Err(error) => {
+                state.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invalid_state("file download lock is poisoned"))?;
+        state.closed = true;
+        state.reader = None;
+        state.cancellation.send_replace(true);
+        Ok(())
     }
 }
 
@@ -1218,37 +1595,13 @@ async fn spawn_exec(
         .map_err(to_napi_error)
 }
 
-async fn run_shell(
+async fn run_exec_script(
     machine: Machine,
     script: String,
     options: Option<NativeExecutionOptionsInput>,
 ) -> Result<ExecutionOutput> {
     machine
-        .shell_with(script, |builder| apply_execution_options(builder, options))
-        .await
-        .map_err(to_napi_error)
-}
-
-async fn attach(
-    machine: Machine,
-    program: String,
-    args: Vec<String>,
-    options: Option<NativeExecutionOptionsInput>,
-) -> Result<ExecutionResult> {
-    machine
-        .attach_with(program, |builder| {
-            apply_execution_options(builder.args(args), options).tty(true)
-        })
-        .await
-        .map_err(to_napi_error)
-}
-
-async fn attach_shell(
-    machine: Machine,
-    options: Option<NativeSshShellOptionsInput>,
-) -> Result<SshExitStatus> {
-    machine
-        .attach_shell_with(|builder| apply_ssh_shell_options(builder, options))
+        .exec_script_with(script, |builder| apply_execution_options(builder, options))
         .await
         .map_err(to_napi_error)
 }
@@ -1521,6 +1874,24 @@ fn validate_forward_input(input: &NativeNetworkForwardInput) -> Result<()> {
             _ => return Err(invalid_arg(format!("unsupported forward kind {kind:?}"))),
         }
     }
+    if let Some(protocol) = input.protocol.as_deref() {
+        match protocol {
+            "tcp" | "https" => {}
+            _ => {
+                return Err(invalid_arg(format!(
+                    "unsupported forward protocol {protocol:?}"
+                )))
+            }
+        }
+    }
+    if let Some(tls) = &input.tls {
+        if tls.provider != "tailscale" {
+            return Err(invalid_arg(format!(
+                "unsupported forward TLS provider {:?}",
+                tls.provider
+            )));
+        }
+    }
     if let Some(port) = input.target_port {
         validate_u16_port(port, "forward targetPort")?;
     }
@@ -1686,17 +2057,32 @@ fn apply_forward_input(
     mut builder: NetworkForwardBuilder,
     input: NativeNetworkForwardInput,
 ) -> NetworkForwardBuilder {
-    if let Some(kind) = input.kind {
-        builder = match kind.as_str() {
-            "host" => builder.host(),
-            "tailscale" => match input.tunnel.as_deref() {
-                Some(tunnel) => builder.tailscale(tunnel.to_string()),
-                None => builder,
-            },
-            _ => builder,
-        };
-    } else if let Some(tunnel) = input.tunnel.as_deref() {
-        builder = builder.tailscale(tunnel.to_string());
+    match input.kind.as_deref() {
+        Some("host") => builder = builder.host(),
+        Some("tailscale") => builder = builder.tailscale(),
+        None if input.tunnel.is_some() => builder = builder.tailscale(),
+        None => {}
+        Some(_) => unreachable!("forward kind was validated"),
+    }
+    if let Some(tunnel) = input.tunnel {
+        builder = builder.tunnel(tunnel);
+    }
+    if let Some(protocol) = input.protocol {
+        builder = builder.protocol(match protocol.as_str() {
+            "tcp" => ForwardProtocol::Tcp,
+            "https" => ForwardProtocol::Https,
+            _ => unreachable!("forward protocol was validated"),
+        });
+    }
+    if let Some(tls) = input.tls {
+        match tls.provider.as_str() {
+            "tailscale" => {
+                builder = builder.tls(ForwardTls {
+                    provider: ForwardCertificateProvider::Tailscale,
+                })
+            }
+            _ => unreachable!("forward TLS provider was validated"),
+        }
     }
     if let Some(target) = input.target {
         builder = builder.target(target);
@@ -2021,13 +2407,6 @@ fn execution_lost_reason(reason: libvm::ExecutionLostReason) -> &'static str {
     }
 }
 
-fn ssh_exit_status_to_native(status: SshExitStatus) -> NativeSshExitStatus {
-    NativeSshExitStatus {
-        code: status.code,
-        success: status.success,
-    }
-}
-
 fn execution_event_to_native(event: ExecutionEvent) -> NativeExecutionEvent {
     match event {
         ExecutionEvent::Accepted => NativeExecutionEvent {
@@ -2207,6 +2586,7 @@ fn to_napi_error(error: LibVmError) -> Error {
         LibVmError::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
         LibVmError::MonitorConnection { .. } => "MonitorConnection",
         LibVmError::MonitorProtocol { .. } => "MonitorProtocol",
+        LibVmError::GuestPathNotFound { .. } => "GuestPathNotFound",
         LibVmError::GuestSession { .. } => "GuestSession",
         LibVmError::MachinePreparationFailed { .. } => "MachinePreparationFailed",
         LibVmError::NetworkRuntime { .. } => "NetworkRuntime",

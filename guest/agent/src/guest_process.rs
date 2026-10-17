@@ -240,7 +240,7 @@ async fn run_execution(
                         return;
                     }
                     Ok(PrestartControl::Deferred(control)) => {
-                        deferred_control = Some(control);
+                        deferred_control = Some(*control);
                     }
                     Err(status) => {
                         let _ = events.send(Err(status)).await;
@@ -291,7 +291,7 @@ async fn run_execution(
 
 enum PrestartControl {
     Signal,
-    Deferred(protocol::v1::GuestProcessInput),
+    Deferred(Box<protocol::v1::GuestProcessInput>),
 }
 
 fn prestart_control(control: protocol::v1::GuestProcessInput) -> Result<PrestartControl, Status> {
@@ -309,7 +309,7 @@ fn prestart_control(control: protocol::v1::GuestProcessInput) -> Result<Prestart
         Some(Message::Start(_)) => Err(invalid_request(
             "StartGuestProcess is only valid as the first Execute request",
         )),
-        Some(_) => Ok(PrestartControl::Deferred(control)),
+        Some(_) => Ok(PrestartControl::Deferred(Box::new(control))),
         None => Err(invalid_request("Execute request message is required")),
     }
 }

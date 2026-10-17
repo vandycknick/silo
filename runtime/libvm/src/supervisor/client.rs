@@ -28,6 +28,9 @@ pub(crate) enum VmmClientError {
     Connection(String),
     #[error("{0}")]
     Protocol(String),
+    /// The guest reported that the requested path does not exist.
+    #[error("{0}")]
+    PathNotFound(String),
     #[error("forward RPC failed: {0}")]
     Forward(ForwardClientError),
 }
@@ -339,12 +342,22 @@ fn rpc_error(context: &str, status: Status) -> VmmClientError {
         .ok()
         .and_then(|detail| detail.code)
         .and_then(|code| protocol::v1::ErrorCode::try_from(code).ok())
-        .filter(|code| *code != protocol::v1::ErrorCode::Unspecified)
-        .map(|code| code.as_str_name().to_ascii_lowercase());
-    VmmClientError::Protocol(match detail {
-        Some(detail) => format!("{context}: {detail}: {}", status.message()),
-        None => format!("{context}: {status}"),
-    })
+        .filter(|code| *code != protocol::v1::ErrorCode::Unspecified);
+    match detail {
+        Some(code) => {
+            let message = format!(
+                "{context}: {}: {}",
+                code.as_str_name().to_ascii_lowercase(),
+                status.message()
+            );
+            if code == protocol::v1::ErrorCode::PathNotFound {
+                VmmClientError::PathNotFound(message)
+            } else {
+                VmmClientError::Protocol(message)
+            }
+        }
+        None => VmmClientError::Protocol(format!("{context}: {status}")),
+    }
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -384,6 +397,41 @@ mod tests {
             VmmClientError::Forward(error) => {
                 panic!("missing socket was misclassified as a forward error: {error}")
             }
+            VmmClientError::PathNotFound(message) => {
+                panic!("missing socket was misclassified as a guest path error: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn guest_status_details_classify_missing_paths() {
+        let missing = crate::supervisor::client::rpc_error(
+            "guest filesystem get_entry RPC failed",
+            protocol::status_with_error(
+                tonic::Code::NotFound,
+                protocol::v1::ErrorCode::PathNotFound,
+                "No such file or directory",
+                None,
+            ),
+        );
+        assert!(
+            matches!(&missing, VmmClientError::PathNotFound(message) if message == "guest filesystem get_entry RPC failed: error_code_path_not_found: No such file or directory"),
+            "{missing:?}"
+        );
+        for status in [
+            protocol::status_with_error(
+                tonic::Code::PermissionDenied,
+                protocol::v1::ErrorCode::PermissionDenied,
+                "denied",
+                None,
+            ),
+            tonic::Status::not_found("transport not found without detail"),
+        ] {
+            let error = crate::supervisor::client::rpc_error(
+                "guest filesystem get_entry RPC failed",
+                status,
+            );
+            assert!(matches!(error, VmmClientError::Protocol(_)), "{error:?}");
         }
     }
 }

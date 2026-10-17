@@ -1,14 +1,6 @@
-//! Files silod publishes for its controller. The layout is fixed under the user's
-//! `~/.silo`; neither side honors `SILO_HOME` for daemon state.
+//! Files silod publishes for its controller, rooted in the manager-selected Silo
+//! Home. Resolve Home with libvm's HostPaths before constructing this layout.
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum PathsError {
-    #[error("HOME is required")]
-    HomeUnset,
-    #[error("HOME must be absolute: {0}")]
-    HomeRelative(PathBuf),
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
@@ -16,21 +8,6 @@ pub struct DaemonPaths {
 }
 
 impl DaemonPaths {
-    /// The layout for the user in `HOME`.
-    pub fn from_env() -> Result<Self, PathsError> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or(PathsError::HomeUnset)?;
-        if !home.is_absolute() {
-            return Err(PathsError::HomeRelative(home));
-        }
-        Ok(Self::for_user_home(&home))
-    }
-
-    pub fn for_user_home(user_home: &Path) -> Self {
-        Self::new(user_home.join(".silo"))
-    }
-
     /// The layout rooted at an explicit Silo home.
     pub fn new(home: impl Into<PathBuf>) -> Self {
         Self { home: home.into() }
@@ -43,6 +20,19 @@ impl DaemonPaths {
     /// silod-private state (installation record, data disk, backups) lives here.
     pub fn daemon_data(&self) -> PathBuf {
         self.home.join("daemon")
+    }
+
+    /// The installation record; the daemon is its only reader and writer.
+    pub fn record(&self) -> PathBuf {
+        self.daemon_data().join("daemon.json")
+    }
+
+    pub fn data_image(&self) -> PathBuf {
+        self.daemon_data().join("system/data.img")
+    }
+
+    pub fn backups(&self) -> PathBuf {
+        self.daemon_data().join("backups")
     }
 
     /// Live status, written atomically by silod. See [`crate::status`].
@@ -82,15 +72,25 @@ impl DaemonPaths {
     }
 }
 
+/// The daemon's private control directory under the per-user run root.
+pub fn control_dir(run_root: &Path) -> PathBuf {
+    run_root.join("silod")
+}
+
+/// The Unix socket serving the daemon's control API.
+pub fn control_socket(run_root: &Path) -> PathBuf {
+    control_dir(run_root).join("control.sock")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use crate::paths::DaemonPaths;
+    use crate::paths::{control_dir, control_socket, DaemonPaths};
 
     #[test]
-    fn layout_is_fixed_under_the_user_home() {
-        let paths = DaemonPaths::for_user_home(Path::new("/Users/me"));
+    fn layout_uses_the_selected_silo_home_without_appending_a_default() {
+        let paths = DaemonPaths::new("/Users/me/.silo");
         assert_eq!(paths.home(), Path::new("/Users/me/.silo"));
         assert_eq!(
             paths.status(),
@@ -111,6 +111,30 @@ mod tests {
         assert_eq!(
             paths.docker_socket(),
             Path::new("/Users/me/.silo/run/docker.sock")
+        );
+        assert_eq!(
+            paths.record(),
+            Path::new("/Users/me/.silo/daemon/daemon.json")
+        );
+        assert_eq!(
+            paths.data_image(),
+            Path::new("/Users/me/.silo/daemon/system/data.img")
+        );
+        assert_eq!(paths.backups(), Path::new("/Users/me/.silo/daemon/backups"));
+        let custom = DaemonPaths::new("/srv/custom-silo");
+        assert_eq!(
+            custom.status(),
+            Path::new("/srv/custom-silo/daemon/status.json")
+        );
+    }
+
+    #[test]
+    fn control_socket_lives_in_the_private_run_directory() {
+        let run_root = Path::new("/run/user/1000/silo");
+        assert_eq!(control_dir(run_root), run_root.join("silod"));
+        assert_eq!(
+            control_socket(run_root),
+            Path::new("/run/user/1000/silo/silod/control.sock")
         );
     }
 }

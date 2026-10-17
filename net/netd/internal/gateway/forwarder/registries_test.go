@@ -95,7 +95,7 @@ func TestRegistryProxyFiltersMetadataAndBlocksDirectArtifact(t *testing.T) {
 	}
 	route := router.New(compiled, nil)
 	certPath, keyPath, rootCAs := writeTestCA(t, t.TempDir())
-	ca, err := LoadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(caSource(t, certPath, keyPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestRegistryProxyDoesNotFilterMalwareMetadata(t *testing.T) {
 	auditLog := testAuditLogger(t, auditPath, compiled.PolicyHash())
 	route := router.New(compiled, auditLog)
 	certPath, keyPath, rootCAs := writeTestCA(t, t.TempDir())
-	ca, err := LoadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(caSource(t, certPath, keyPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +451,7 @@ func proxyNPMRegistryTestRequest(t *testing.T, defaultAction string, requestPath
 	}
 	route := router.New(compiled, nil)
 	certPath, keyPath, rootCAs := writeTestCA(t, t.TempDir())
-	ca, err := LoadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(caSource(t, certPath, keyPath))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,8 +7,10 @@ import (
 )
 
 var nativeErrorKinds = map[string]ErrorKind{
-	"HomeUnavailable":      ErrorHomeUnavailable,
-	"ConfigDirUnavailable": ErrorConfigDirUnavailable, "RelativeEnvironmentPath": ErrorRelativeEnvironmentPath,
+	"SecretResolution":      ErrorSecretResolution,
+	"MissingNetworkSecrets": ErrorMissingNetworkSecrets,
+	"HomeUnavailable":       ErrorHomeUnavailable,
+	"ConfigDirUnavailable":  ErrorConfigDirUnavailable, "RelativeEnvironmentPath": ErrorRelativeEnvironmentPath,
 	"InvalidRunRoot": ErrorInvalidRunRoot, "InvalidOwnedPath": ErrorInvalidOwnedPath,
 	"InvalidMachineName": ErrorInvalidMachineName, "InvalidMachineIdPrefix": ErrorInvalidMachineIDPrefix,
 	"MachineAlreadyExists": ErrorMachineAlreadyExists, "MachineNameGenerationFailed": ErrorMachineNameGenerationFailed,
@@ -16,10 +18,11 @@ var nativeErrorKinds = map[string]ErrorKind{
 	"ImagePullPolicyUnsupported": ErrorImagePullPolicyUnsupported, "LocalDiskCanonicalize": ErrorLocalDiskCanonicalize,
 	"LocalDiskMetadata": ErrorLocalDiskMetadata, "LocalDiskNotRegularFile": ErrorLocalDiskNotRegularFile,
 	"LocalDiskUnreadable": ErrorLocalDiskUnreadable, "Image": ErrorImage,
+	"ImageReferenceRejected": ErrorImageReferenceRejected,
 	"MachineIdAlreadyExists": ErrorMachineIDAlreadyExists, "MachineAlreadyRunning": ErrorMachineAlreadyRunning,
 	"MachineNotRunning": ErrorMachineNotRunning, "MachineStaleGeneration": ErrorMachineStaleGeneration,
 	"MachineLogSourceUnavailable": ErrorMachineLogSourceUnavailable, "MonitorConnection": ErrorMonitorConnection,
-	"MonitorProtocol": ErrorMonitorProtocol, "GuestSession": ErrorGuestSession,
+	"MonitorProtocol": ErrorMonitorProtocol, "GuestPathNotFound": ErrorGuestPathNotFound, "GuestSession": ErrorGuestSession,
 	"MachinePreparationFailed": ErrorMachinePreparationFailed, "MachineStartCleanupFailed": ErrorMachineStartCleanupFailed,
 	"EntrypointLaunchFailed": ErrorEntrypointLaunchFailed, "NetworkRuntime": ErrorNetworkRuntime,
 	"VmMonExecutableNotFound": ErrorVMMonExecutableNotFound, "VmMonExecutableInvalid": ErrorVMMonExecutableInvalid,

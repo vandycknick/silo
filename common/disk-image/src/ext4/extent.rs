@@ -486,11 +486,7 @@ mod tests {
             end: phys_start + data_blocks,
         };
 
-        // Allocate a cursor large enough for the index (leaf) blocks.
-        // The index blocks are written at current_block * block_size.
-        // We need at most a few blocks for the tree, so 1 MiB is plenty.
-        let backing = vec![0u8; 1024 * 1024];
-        let mut cursor = Cursor::new(backing);
+        let mut cursor = tempfile::tempfile().unwrap();
         // Set current_block high enough that the index blocks don't overlap
         // with the range [phys_start .. phys_start + data_blocks].
         let mut current_block = phys_start + data_blocks + 10;
@@ -549,8 +545,7 @@ mod tests {
             end: phys_start + data_blocks,
         };
 
-        let backing = vec![0u8; 1024 * 1024];
-        let mut cursor = Cursor::new(backing);
+        let mut cursor = tempfile::tempfile().unwrap();
         let mut current_block = phys_start + data_blocks + 10;
 
         write_extents(

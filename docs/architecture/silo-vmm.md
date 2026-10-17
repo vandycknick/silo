@@ -42,6 +42,20 @@ in process on its own dispatch queue. On macOS silo-vmm is signed with both
 `com.apple.security.hypervisor` and `com.apple.security.virtualization`
 (`virt/vmm/silo-vmm.entitlements`).
 
+### Idle listener discovery
+
+The public vsock surface watches the runtime directory for listener changes.
+Ordinary filesystem access events are ignored: on Linux, scanning the watched
+directory itself generates open/read/close notifications, which must not trigger
+another scan. Rescan-required events and watcher errors still trigger
+reconciliation. The bounded notification queue coalesces changes; it does not
+prevent a self-triggering event loop.
+
+Periodic reconciliation remains necessary because a session can release a vsock
+port without a filesystem event. It also retries watcher installation after a
+failure. Idle CPU qualification should measure the supervisor separately from
+its `krun` worker and include a real socket publication and guest round trip.
+
 ## Worker Handoff
 
 The monitor spawns its own executable with argv[0] `krun` and no

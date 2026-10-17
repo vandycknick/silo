@@ -1,20 +1,26 @@
 use std::env::consts::OS;
 use std::path::{Component, Path, PathBuf};
 
-use crate::paths::{default_run_root, ensure_run_root, resolve_default_home, LocalRoots};
+use crate::paths::{
+    absolute_path, default_run_root, ensure_run_root, resolve_default_home, LocalRoots,
+};
+use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::store::models::DbConfig;
 use crate::LibVmError;
+use crate::RegistryPolicy;
 
 /// Local runtime configuration.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct RuntimeConfig {
     /// Silo home holding all persistent state. `None` resolves `SILO_HOME`,
-    /// else `~/.silo`. Generated sockets, pidfiles and locks always live under
-    /// `/tmp/silo-<euid>`.
+    /// else `~/.silo`. Generated sockets, pidfiles and locks live under
+    /// `/tmp/silo-<euid>` unless `SILO_RUN_ROOT` (absolute) overrides it.
     pub home: Option<PathBuf>,
     /// Networking configuration for locally started machines.
     pub networking: RuntimeNetworkingConfig,
+    /// Registry policy for OCI image resolution.
+    pub registry_policy: RegistryPolicy,
     /// Explicit silo-vmm executable path.
     pub supervisor_path: Option<PathBuf>,
     /// Explicit netd executable path.
@@ -27,8 +33,13 @@ pub struct RuntimeConfig {
     pub agent_path: Option<PathBuf>,
     /// Explicit portable runtime root.
     pub runtime_root: Option<PathBuf>,
+    /// Explicit generated-state root, overriding `SILO_RUN_ROOT`.
+    /// Must be absolute and short enough for machine Unix socket paths.
+    pub run_root: Option<PathBuf>,
     /// Portable runtime root bundled by an SDK frontend.
     pub bundled_runtime_root: Option<PathBuf>,
+    /// Exact component selection; use `with_runtime_components` to set it.
+    pub(crate) runtime_components: Option<ResolvedRuntimeComponents>,
     /// Explicit override of silo-vmm's virtualization backend.
     pub virt_backend: Option<VirtBackendOverride>,
 }
@@ -71,14 +82,22 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets the registry policy applied before contacting OCI registries.
+    pub fn with_registry_policy(mut self, policy: RegistryPolicy) -> Self {
+        self.registry_policy = policy;
+        self
+    }
+
     /// Sets the silo-vmm executable path used to launch machines.
     pub fn with_supervisor_path(mut self, supervisor_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.supervisor_path = Some(supervisor_path.into());
         self
     }
 
     /// Sets the netd executable path used for userspace networking.
     pub fn with_netd_path(mut self, netd_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.netd_path = Some(netd_path.into());
         self
     }
@@ -91,31 +110,62 @@ impl RuntimeConfig {
 
     /// Sets the default kernel path.
     pub fn with_kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.kernel_path = Some(kernel_path.into());
         self
     }
 
     /// Sets the default initramfs path.
     pub fn with_initramfs_path(mut self, initramfs_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.initramfs_path = Some(initramfs_path.into());
         self
     }
 
     /// Sets the default guest agent path.
     pub fn with_agent_path(mut self, agent_path: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.agent_path = Some(agent_path.into());
         self
     }
 
     /// Sets an explicit portable runtime root.
     pub fn with_runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.runtime_root = Some(runtime_root.into());
+        self
+    }
+
+    /// Sets the generated-state root for sockets, pidfiles and locks.
+    /// Must be absolute and short enough for machine Unix socket paths.
+    pub fn with_run_root(mut self, run_root: impl Into<PathBuf>) -> Self {
+        self.run_root = Some(run_root.into());
         self
     }
 
     /// Sets a portable runtime root bundled by an SDK frontend.
     pub fn with_bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
+        self.runtime_components = None;
         self.bundled_runtime_root = Some(bundled_runtime_root.into());
+        self
+    }
+
+    /// Resolves native components without opening a runtime or its state store.
+    pub fn resolve_components(&self) -> Result<ResolvedRuntimeComponents, LibVmError> {
+        resolve_components(self)
+    }
+
+    /// Pins an exact snapshot, replacing earlier runtime discovery selectors.
+    /// Later component/root setters discard this snapshot and resume discovery.
+    pub fn with_runtime_components(mut self, components: ResolvedRuntimeComponents) -> Self {
+        self.supervisor_path = None;
+        self.netd_path = None;
+        self.kernel_path = None;
+        self.initramfs_path = None;
+        self.agent_path = None;
+        self.runtime_root = None;
+        self.bundled_runtime_root = None;
+        self.runtime_components = Some(components);
         self
     }
 
@@ -143,7 +193,10 @@ impl RuntimeConfig {
 
     /// Both runtime roots; creates and validates the run root.
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
-        let run_root = default_run_root();
+        let run_root = match &self.run_root {
+            Some(path) => absolute_path("run_root", path.clone().into_os_string())?,
+            None => default_run_root()?,
+        };
         ensure_run_root(&run_root)?;
         Ok(LocalRoots::with_roots(self.resolve_home()?, run_root))
     }
@@ -263,9 +316,9 @@ pub struct NetdRuntimeConfig {
     pub subnet: String,
     /// Whether packet capture should be enabled.
     pub pcap: bool,
-    /// Optional TLS CA certificate path.
+    /// Optional operator CA certificate import input, checked against the Home store.
     pub tls_ca_cert: Option<PathBuf>,
-    /// Optional TLS CA key path.
+    /// Optional operator CA key import input, never passed to netd or the guest.
     pub tls_ca_key: Option<PathBuf>,
 }
 
@@ -298,7 +351,9 @@ impl NetdRuntimeConfig {
         self
     }
 
-    /// Sets both TLS CA paths.
+    /// Imports a TLS CA into the selected Home secret store on the first
+    /// intercepting start. Repeated imports must equal the stored pair;
+    /// conflicts fail without replacing existing trust.
     pub fn with_tls_ca(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
         self.tls_ca_cert = Some(cert.into());
         self.tls_ca_key = Some(key.into());
@@ -308,6 +363,8 @@ impl NetdRuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::store::models::MachineId;
     use crate::store::Store;
     use crate::{LibVmError, Runtime, RuntimeConfig, VirtBackendOverride};
@@ -428,7 +485,7 @@ mod tests {
             .expect("open fresh runtime");
         let machine_id = MachineId::new();
         let machine = runtime.local_paths().machine(machine_id);
-        let run_root = crate::paths::default_run_root();
+        let run_root = crate::paths::default_run_root().expect("resolve run root");
         assert_eq!(runtime.local_home(), home);
         assert!(home.join("state.db").is_file());
         assert_eq!(runtime.local_paths().roots().run_root(), run_root);
@@ -455,5 +512,42 @@ mod tests {
         );
         drop(store);
         Runtime::new(config).await.expect("reopen runtime");
+    }
+
+    #[tokio::test]
+    async fn runtime_uses_explicit_run_root_override() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let run_root = temp.path().join("run");
+        let runtime_root = complete_runtime_root(temp.path());
+        let config = RuntimeConfig::local(temp.path().join("home"))
+            .with_runtime_root(runtime_root)
+            .with_run_root(&run_root);
+
+        let runtime = Runtime::new(config).await.expect("open fresh runtime");
+        assert_eq!(runtime.local_paths().roots().run_root(), run_root);
+        assert_eq!(
+            std::fs::metadata(&run_root)
+                .expect("read run root metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn explicit_run_root_must_be_absolute() {
+        let err = RuntimeConfig::local("/tmp/silo-home")
+            .with_run_root("relative/run")
+            .resolve_roots()
+            .expect_err("relative run root should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::RelativeEnvironmentPath {
+                name: "run_root",
+                ..
+            }
+        ));
     }
 }

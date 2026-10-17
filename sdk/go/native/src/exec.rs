@@ -14,6 +14,7 @@ use crate::buffer::SiloBuffer;
 use crate::error::{catch_ffi, catch_ffi_void, error_from_libvm, invalid_argument, SiloError};
 use crate::handles::{ExecutionHandle, ExecutionSessionState, MachineHandle, StdinHandle};
 use crate::runtime::request_bytes;
+use crate::shell_attachment::SshAttachmentHandle;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +35,15 @@ struct ExecRequest {
     #[serde(default)]
     pipe_stdin: bool,
     tty: Option<bool>,
+    term: Option<String>,
+    initial_pty_size: Option<PtySizeRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PtySizeRequest {
+    rows: u16,
+    columns: u16,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +113,92 @@ struct SshStatusDto {
     success: bool,
 }
 
+/// A scoped cancellation token for a blocking host attachment call.
+/// It may be cancelled concurrently, but must not be freed until that call returns.
+pub struct AttachmentCancellation {
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    signals: tokio::sync::mpsc::Sender<libvm::AttachmentSignal>,
+    receiver: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<libvm::AttachmentSignal>>>,
+}
+
+impl AttachmentCancellation {
+    fn new() -> Self {
+        let (signals, receiver) = tokio::sync::mpsc::channel(64);
+        Self {
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            signals,
+            receiver: std::sync::Mutex::new(Some(receiver)),
+        }
+    }
+
+    fn take_signals(
+        &self,
+    ) -> Result<tokio::sync::mpsc::Receiver<libvm::AttachmentSignal>, *mut SiloError> {
+        self.receiver
+            .lock()
+            .map_err(|_| SiloError::new("Closed", "attachment control lock is poisoned"))?
+            .take()
+            .ok_or_else(|| invalid_argument("attachment token has already been used"))
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_attachment_cancellation_new(
+    out_token: *mut *mut AttachmentCancellation,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        if out_token.is_null() {
+            return Err(invalid_argument("out_token must not be null"));
+        }
+        *out_token = Box::into_raw(Box::new(AttachmentCancellation::new()));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_attachment_cancellation_cancel(
+    token: *const AttachmentCancellation,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        let token = token
+            .as_ref()
+            .ok_or_else(|| invalid_argument("token must not be null"))?;
+        token.cancellation.cancel();
+        Ok(())
+    })
+}
+
+/// Queues one embedding-owned Linux signal or WINCH resize notification.
+#[no_mangle]
+pub unsafe extern "C" fn silo_attachment_cancellation_signal(
+    token: *const AttachmentCancellation,
+    signal: u32,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        let token = token
+            .as_ref()
+            .ok_or_else(|| invalid_argument("token must not be null"))?;
+        let signal = libvm::AttachmentSignal::from_linux(signal)
+            .ok_or_else(|| invalid_argument("unsupported attachment signal"))?;
+        match token.signals.try_send(signal) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(SiloError::new(
+                "GuestSession",
+                "attachment signal queue is full",
+            )),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_attachment_cancellation_free(token: *mut AttachmentCancellation) {
+    catch_ffi_void(|| {
+        if !token.is_null() {
+            drop(Box::from_raw(token));
+        }
+    });
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn silo_machine_exec(
     machine: *const MachineHandle,
@@ -114,7 +210,7 @@ pub unsafe extern "C" fn silo_machine_exec(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn silo_machine_shell(
+pub unsafe extern "C" fn silo_machine_exec_script(
     machine: *const MachineHandle,
     request_ptr: *const u8,
     request_len: usize,
@@ -128,7 +224,7 @@ unsafe fn collected(
     request_ptr: *const u8,
     request_len: usize,
     out_output: *mut SiloExecutionOutput,
-    shell: bool,
+    exec_script: bool,
 ) -> *mut SiloError {
     catch_ffi(|| {
         let machine = machine
@@ -139,15 +235,15 @@ unsafe fn collected(
         }
         *out_output = SiloExecutionOutput::empty();
         let request = decode_request(request_ptr, request_len)?;
-        let output = if shell {
+        let output = if exec_script {
             let script = request
                 .script
                 .clone()
-                .ok_or_else(|| invalid_argument("shell requires script"))?;
+                .ok_or_else(|| invalid_argument("exec_script requires script"))?;
             machine.context.tokio.block_on(
                 machine
                     .machine
-                    .shell_with(script, |builder| apply_options(builder, request)),
+                    .exec_script_with(script, |builder| apply_options(builder, request)),
             )
         } else {
             let program = request
@@ -207,43 +303,44 @@ pub unsafe extern "C" fn silo_machine_spawn(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn silo_machine_attach(
-    machine: *const MachineHandle,
-    request_ptr: *const u8,
-    request_len: usize,
-    out_result: *mut SiloBuffer,
-) -> *mut SiloError {
-    catch_ffi(|| {
-        let machine = machine
-            .as_ref()
-            .ok_or_else(|| invalid_argument("machine must not be null"))?;
-        if out_result.is_null() {
-            return Err(invalid_argument("out_result must not be null"));
-        }
-        let request = decode_request(request_ptr, request_len)?;
-        let program = request
-            .program
-            .clone()
-            .ok_or_else(|| invalid_argument("attach requires program"))?;
-        let args = request.args.clone();
-        let result = machine
-            .context
-            .tokio
-            .block_on(machine.machine.attach_with(program, |builder| {
-                apply_options(builder.args(args), request).tty(true)
-            }))
-            .map_err(error_from_libvm)?;
-        *out_result = json_buffer(result_dto(result))?;
-        Ok(())
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn silo_machine_attach_shell(
+pub unsafe extern "C" fn silo_machine_shell(
     machine: *const MachineHandle,
     request_ptr: *const u8,
     request_len: usize,
     out_status: *mut SiloBuffer,
+) -> *mut SiloError {
+    shell(machine, request_ptr, request_len, out_status, None, None)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_machine_shell_cancellable(
+    machine: *const MachineHandle,
+    request_ptr: *const u8,
+    request_len: usize,
+    token: *const AttachmentCancellation,
+    attachment: *const SshAttachmentHandle,
+    out_status: *mut SiloBuffer,
+) -> *mut SiloError {
+    let Some(token) = token.as_ref() else {
+        return invalid_argument("token must not be null");
+    };
+    shell(
+        machine,
+        request_ptr,
+        request_len,
+        out_status,
+        Some(token),
+        attachment.as_ref(),
+    )
+}
+
+unsafe fn shell(
+    machine: *const MachineHandle,
+    request_ptr: *const u8,
+    request_len: usize,
+    out_status: *mut SiloBuffer,
+    cancellation: Option<&AttachmentCancellation>,
+    attachment: Option<&SshAttachmentHandle>,
 ) -> *mut SiloError {
     catch_ffi(|| {
         let machine = machine
@@ -252,17 +349,44 @@ pub unsafe extern "C" fn silo_machine_attach_shell(
         if out_status.is_null() {
             return Err(invalid_argument("out_status must not be null"));
         }
+        *out_status = SiloBuffer::empty();
         let request: SshRequest = serde_json::from_slice(request_bytes(request_ptr, request_len)?)
             .map_err(|error| invalid_argument(format!("decode SSH request: {error}")))?;
-        let status = machine
-            .context
-            .tokio
-            .block_on(
-                machine
-                    .machine
-                    .attach_shell_with(|builder| apply_ssh_options(builder, request)),
-            )
-            .map_err(error_from_libvm)?;
+        let supplied = attachment
+            .map(|handle| handle.take_attachment(cancellation))
+            .transpose()?;
+        let signals = if supplied.is_none() {
+            cancellation
+                .map(AttachmentCancellation::take_signals)
+                .transpose()?
+        } else {
+            None
+        };
+        let (result, was_cancelled) = machine.context.tokio.block_on(async {
+            let configure = |builder: SshShellOptionsBuilder| {
+                let mut builder = apply_ssh_options(builder, request);
+                if let Some(token) = cancellation {
+                    builder = builder.cancellation(token.cancellation.clone());
+                }
+                if let Some(signals) = signals {
+                    builder = builder.local_signals(signals);
+                }
+                if let Some(supplied) = supplied {
+                    builder = builder.attachment(supplied);
+                }
+                builder
+            };
+            let result = machine.machine.shell_with(configure).await;
+            let was_cancelled = cancellation.is_some_and(|token| token.cancellation.is_cancelled());
+            if let Some(handle) = attachment {
+                handle.finish(result.is_ok()).await;
+            }
+            (result, was_cancelled)
+        });
+        if was_cancelled {
+            return Err(SiloError::new("Cancelled", "SSH shell cancelled"));
+        }
+        let status = result.map_err(error_from_libvm)?;
         *out_status = json_buffer(SshStatusDto {
             code: status.code,
             success: status.success,
@@ -534,8 +658,16 @@ where
 
 fn decode_request(pointer: *const u8, length: usize) -> Result<ExecRequest, *mut SiloError> {
     unsafe {
-        serde_json::from_slice(request_bytes(pointer, length)?)
-            .map_err(|error| invalid_argument(format!("decode execution request: {error}")))
+        let request: ExecRequest = serde_json::from_slice(request_bytes(pointer, length)?)
+            .map_err(|error| invalid_argument(format!("decode execution request: {error}")))?;
+        if request
+            .initial_pty_size
+            .as_ref()
+            .is_some_and(|size| size.rows == 0 || size.columns == 0)
+        {
+            return Err(invalid_argument("PTY rows and columns must be positive"));
+        }
+        Ok(request)
     }
 }
 fn apply_options(
@@ -543,6 +675,12 @@ fn apply_options(
     request: ExecRequest,
 ) -> ExecutionOptionsBuilder {
     builder = builder.args(request.additional_args);
+    if let Some(term) = request.term {
+        builder = builder.term(term);
+    }
+    if let Some(size) = request.initial_pty_size {
+        builder = builder.initial_pty_size(size.rows, size.columns);
+    }
     if let Some(cwd) = request.cwd {
         builder = builder.cwd(cwd)
     }
@@ -761,6 +899,66 @@ fn lost_reason(value: libvm::ExecutionLostReason) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_controls_are_scoped_bounded_and_validate_signals() {
+        let mut token = std::ptr::null_mut();
+        assert!(unsafe { crate::exec::silo_attachment_cancellation_new(&mut token) }.is_null());
+        let value = unsafe { &*token };
+        let mut receiver = value.take_signals().unwrap();
+        let used = value.take_signals().unwrap_err();
+        unsafe { crate::error::silo_error_free(used) };
+        let supported = [
+            (1, libvm::AttachmentSignal::Hangup),
+            (2, libvm::AttachmentSignal::Interrupt),
+            (3, libvm::AttachmentSignal::Quit),
+            (15, libvm::AttachmentSignal::Terminate),
+            (10, libvm::AttachmentSignal::User1),
+            (12, libvm::AttachmentSignal::User2),
+            (28, libvm::AttachmentSignal::WindowChange),
+        ];
+        for signal in 1..=64 {
+            let error = unsafe { crate::exec::silo_attachment_cancellation_signal(token, signal) };
+            if let Some((_, expected)) = supported.iter().find(|(number, _)| *number == signal) {
+                assert!(error.is_null());
+                assert_eq!(receiver.try_recv().unwrap(), *expected);
+            } else {
+                assert_eq!(
+                    unsafe { std::ffi::CStr::from_ptr((*error).variant) }.to_bytes(),
+                    b"InvalidArgument"
+                );
+                unsafe { crate::error::silo_error_free(error) };
+            }
+        }
+        for _ in 0..64 {
+            assert!(
+                unsafe { crate::exec::silo_attachment_cancellation_signal(token, 2) }.is_null()
+            );
+        }
+        let full = unsafe { crate::exec::silo_attachment_cancellation_signal(token, 2) };
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr((*full).variant) }.to_bytes(),
+            b"GuestSession"
+        );
+        unsafe { crate::error::silo_error_free(full) };
+        drop(receiver);
+        assert!(unsafe { crate::exec::silo_attachment_cancellation_signal(token, 2) }.is_null());
+        assert!(unsafe { crate::exec::silo_attachment_cancellation_cancel(token) }.is_null());
+        assert!(value.cancellation.is_cancelled());
+        unsafe { crate::exec::silo_attachment_cancellation_free(token) };
+    }
+
+    #[test]
+    fn initial_pty_and_term_are_explicit_and_nested_schema_is_strict() {
+        let request: crate::exec::ExecRequest = serde_json::from_str(r#"{"program":"sh","tty":true,"term":"dumb","initial_pty_size":{"rows":37,"columns":119}}"#).unwrap();
+        let options =
+            crate::exec::apply_options(libvm::ExecutionOptionsBuilder::default(), request).build();
+        assert_eq!(options.initial_pty_size, Some((37, 119)));
+        assert_eq!(options.term, "dumb");
+        assert!(serde_json::from_str::<crate::exec::ExecRequest>(
+            r#"{"initial_pty_size":{"rows":37,"columns":119,"unknown":1}}"#
+        )
+        .is_err());
+    }
     use libvm::ExecutionEvent;
 
     use crate::exec::{decode_request, execution_event};

@@ -18,6 +18,7 @@ let
     pkgs.oras
     pkgs.syft
     pkgs.zstd
+    pkgs.python3
   ];
   # Everything needed to compile, lint, and test the workspace. Deliberately
   # omits the cross-compilation and packaging tools that only release builds
@@ -26,6 +27,7 @@ let
       rustToolchain
       pkgs.go
       pkgs.nodejs_26
+      pkgs.cargo-nextest
       pkgs.git
       pkgs.gnumake
       pkgs.gnutar
@@ -46,12 +48,15 @@ let
   developmentPackages = ciPackages
     ++ [
       zig
+      pkgs.cargo-llvm-cov
       pkgs.cargo-zigbuild
       pkgs.oras
       pkgs.syft
       pkgs.docker
       pkgs.docker-credential-helpers
       pkgs.grpcurl
+      pkgs.uv
+      pkgs.openssl
     ];
   workspaceHook = ''
     workspace_root="$(pwd -P)"

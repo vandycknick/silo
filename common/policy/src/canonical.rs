@@ -131,6 +131,16 @@ impl NetworkPolicy {
         &self.tailscale
     }
 
+    /// Supplies machine identity in a generated run policy without changing explicit hostnames.
+    pub fn with_default_tailscale_hostname(mut self, hostname: &str) -> Self {
+        for tunnel in &mut self.tailscale {
+            if tunnel.hostname.as_deref().is_none_or(str::is_empty) {
+                tunnel.hostname = Some(hostname.to_owned());
+            }
+        }
+        self
+    }
+
     pub fn forwards(&self) -> &[NetworkForward] {
         &self.forwards
     }
@@ -165,10 +175,21 @@ impl NetworkPolicy {
             slots.extend(credential_secret_slots(credential));
         }
         for tunnel in &self.tailscale {
-            slots.push(NetworkSecretSlot::required(
-                format!("{}.tailscale.auth_key", tunnel.name),
-                NetworkSecretKind::Plain,
-            ));
+            for field in ["auth_key", "client_secret", "api_token"] {
+                if let Ok(key) =
+                    silo_secrets::SecretName::new(format!("tailscale.{}.{field}", tunnel.name))
+                {
+                    slots.push(NetworkSecretSlot {
+                        name: format!("{}.tailscale.{field}", tunnel.name),
+                        required: false,
+                        kind: NetworkSecretKind::Plain,
+                        source: NetworkSecretSource {
+                            key,
+                            field: silo_secrets::SecretField::Value,
+                        },
+                    });
+                }
+            }
         }
         slots
     }
@@ -177,12 +198,6 @@ impl NetworkPolicy {
         let mut requirements = Vec::new();
         for credential in &self.credentials {
             requirements.extend(credential_secret_requirements(credential));
-        }
-        for tunnel in &self.tailscale {
-            requirements.push(NetworkSecretRequirement::one(
-                format!("Tailscale tunnel {}", tunnel.name),
-                vec![format!("{}.tailscale.auth_key", tunnel.name)],
-            ));
         }
         requirements
     }
@@ -420,6 +435,8 @@ impl NetworkRule {
 pub struct TailscaleTunnel {
     pub name: String,
     #[serde(default)]
+    pub ephemeral: bool,
+    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -427,6 +444,37 @@ pub struct TailscaleTunnel {
     pub control_url: Option<String>,
 }
 
+/// Transport for a network-policy forward. Port 443 does not imply TLS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProtocol {
+    #[default]
+    Tcp,
+    Https,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardCertificateProvider {
+    Tailscale,
+}
+
+/// HTTPS termination is available only for a same-VM Tailscale forward.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardTls {
+    pub provider: ForwardCertificateProvider,
+}
+
+/// A listener and explicit guest destination declaration.
+///
+/// `target = "self"` selects the VM attached to a dedicated 1:1 netd instance,
+/// not guest or host loopback. Parsing is context-free; runtime attachment
+/// validation must reject self in shared or unknown scope. Tailscale/self
+/// listeners use `:<decimal port>` (1–65535, except reserved SSH port 22).
+/// TCP is byte-preserving; HTTPS requires Tailscale-managed TLS and proxies
+/// plaintext HTTP to `target_port`. Neither kind nor port implies HTTPS.
+/// A self declaration may omit its tunnel until the runtime binds its node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkForward {
@@ -438,10 +486,66 @@ pub struct NetworkForward {
     pub listen: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<String>,
+    #[serde(default)]
+    pub protocol: ForwardProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<ForwardTls>,
 }
 
 impl NetworkForward {
-    fn normalize(&mut self) {}
+    fn normalize(&mut self) {
+        if self.kind == "tailscale" && self.target == "self" {
+            if let Ok(Some(port)) = validate_forward_transport(
+                &self.kind,
+                &self.target,
+                self.protocol,
+                self.tls.as_ref(),
+                &self.listen,
+            ) {
+                self.listen = format!(":{port}");
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_forward_transport(
+    kind: &str,
+    target: &str,
+    protocol: ForwardProtocol,
+    tls: Option<&ForwardTls>,
+    listen: &str,
+) -> Result<Option<u16>, String> {
+    match protocol {
+        ForwardProtocol::Tcp if tls.is_some() => {
+            return Err("TCP forwards cannot configure TLS".into());
+        }
+        ForwardProtocol::Https => {
+            if kind != "tailscale" || target != "self" {
+                return Err("HTTPS forwards require Tailscale target self".into());
+            }
+            if tls.is_none() {
+                return Err("HTTPS forwards require tls.provider = tailscale".into());
+            }
+        }
+        ForwardProtocol::Tcp => {}
+    }
+    if kind != "tailscale" || target != "self" {
+        return Ok(None);
+    }
+    let digits = listen
+        .strip_prefix(':')
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "Tailscale/self listen must be :<decimal port>".to_string())?;
+    let port = digits
+        .parse::<u16>()
+        .map_err(|_| "forward listen port must be between 1 and 65535".to_string())?;
+    if port == 0 || port == 22 {
+        return Err(
+            "forward listen port must be between 1 and 65535, excluding reserved SSH port 22"
+                .into(),
+        );
+    }
+    Ok(Some(port))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,42 +553,13 @@ pub struct NetworkSecretSlot {
     pub name: String,
     pub required: bool,
     pub kind: NetworkSecretKind,
+    pub source: NetworkSecretSource,
 }
 
-impl NetworkSecretSlot {
-    pub fn env_name(&self) -> String {
-        let mut name = String::from("SILO_NET_SECRET_");
-        let mut previous_was_separator = false;
-        for character in self.name.chars() {
-            if character.is_ascii_alphanumeric() {
-                name.push(character.to_ascii_uppercase());
-                previous_was_separator = false;
-            } else if !previous_was_separator {
-                name.push('_');
-                previous_was_separator = true;
-            }
-        }
-        while name.ends_with('_') {
-            name.pop();
-        }
-        name
-    }
-
-    fn required(name: String, kind: NetworkSecretKind) -> Self {
-        Self {
-            name,
-            required: true,
-            kind,
-        }
-    }
-
-    fn optional(name: String, kind: NetworkSecretKind) -> Self {
-        Self {
-            name,
-            required: false,
-            kind,
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSecretSource {
+    pub key: silo_secrets::SecretName,
+    pub field: silo_secrets::SecretField,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,6 +772,7 @@ fn lower_rule(rule: &RuleDecl) -> NetworkRule {
 fn lower_tailscale(tunnel: &TailscaleDecl) -> TailscaleTunnel {
     TailscaleTunnel {
         name: tunnel.name.clone(),
+        ephemeral: tunnel.ephemeral,
         tags: tunnel.tags.clone(),
         hostname: non_empty_string(&tunnel.hostname),
         control_url: non_empty_string(&tunnel.control_url),
@@ -711,6 +787,8 @@ fn lower_forward(forward: &ForwardDecl) -> NetworkForward {
         target_port: forward.target_port,
         listen: forward.listen.clone(),
         tunnel: forward.tunnel.as_ref().map(|tunnel| tunnel.name.clone()),
+        protocol: forward.protocol,
+        tls: forward.tls.clone(),
     }
 }
 
@@ -1104,6 +1182,15 @@ impl PolicyValidator {
     }
 
     fn validate_tunnels(&mut self, tunnels: &[TailscaleTunnel]) -> BTreeSet<String> {
+        if let [first, second, ..] = tunnels {
+            self.error(
+                "multiple tailscale tunnels",
+                format!(
+                    "at most one tailscale declaration is allowed: {:?} and {:?}",
+                    first.name, second.name
+                ),
+            );
+        }
         let mut names = BTreeSet::new();
         for tunnel in tunnels {
             self.validate_name("tailscale tunnel", &tunnel.name);
@@ -1224,6 +1311,7 @@ impl PolicyValidator {
 
     fn validate_forwards(&mut self, forwards: &[NetworkForward], tunnels: &BTreeSet<String>) {
         let mut names = BTreeSet::new();
+        let mut listeners = BTreeSet::new();
         for forward in forwards {
             self.validate_name("forward", &forward.name);
             if !names.insert(forward.name.clone()) {
@@ -1249,6 +1337,14 @@ impl PolicyValidator {
                                 format!("forward {} references tunnel {tunnel_name}", forward.name),
                             );
                         }
+                    } else if forward.target != "self" {
+                        self.error(
+                            "missing forward tunnel",
+                            format!(
+                                "forward {} requires a tunnel unless its target is self",
+                                forward.name
+                            ),
+                        );
                     }
                 }
                 _ => self.error(
@@ -1268,21 +1364,41 @@ impl PolicyValidator {
                     ),
                 );
             }
-            if !valid_target_selector(&forward.target) {
+            if !(valid_target_selector(&forward.target)
+                || (forward.kind == "tailscale" && forward.target == "self"))
+            {
                 self.error(
                     "invalid forward target selector",
                     format!(
-                        "forward {} target must start with name:, id:, or label:",
+                        "forward {} target must start with name:, id:, or label:, or be self for Tailscale",
                         forward.name
                     ),
                 );
+            }
+            match validate_forward_transport(
+                &forward.kind,
+                &forward.target,
+                forward.protocol,
+                forward.tls.as_ref(),
+                &forward.listen,
+            ) {
+                Ok(Some(port)) if !listeners.insert(port) => self.error(
+                    "duplicate forward listener",
+                    format!(
+                        "forward {} duplicates Tailscale listener :{port}",
+                        forward.name
+                    ),
+                ),
+                Err(detail) => self.error(
+                    "invalid forward transport",
+                    format!("forward {}: {detail}", forward.name),
+                ),
+                _ => {}
             }
         }
     }
 
     fn validate_secret_slots(&mut self, policy: &NetworkPolicy) {
-        let mut env_names: BTreeMap<String, String> = BTreeMap::new();
-
         for slot in policy.secret_slots() {
             if !valid_secret_slot(&slot.name) {
                 self.error(
@@ -1293,25 +1409,16 @@ impl PolicyValidator {
                     ),
                 );
             }
-
-            let env_name = slot.env_name();
-            if let Some(existing) = env_names.get(&env_name) {
-                if existing != &slot.name {
-                    self.error(
-                        "network secret env name collision",
-                        format!(
-                            "network secret slots {:?} and {:?} both map to {}",
-                            existing, slot.name, env_name
-                        ),
-                    );
-                }
-            } else {
-                env_names.insert(env_name, slot.name);
-            }
         }
     }
 
     fn validate_name(&mut self, kind: &str, name: &str) {
+        if name == "silo" && matches!(kind, "credential" | "tailscale tunnel") {
+            self.error(
+                "reserved policy object name",
+                format!("{kind} name silo is reserved for generated secrets"),
+            );
+        }
         if !valid_identifier(name) {
             self.error(
                 "invalid policy object name",
@@ -1350,29 +1457,48 @@ struct NetworkCredentialInfo {
 }
 
 fn credential_secret_slots(credential: &NetworkCredential) -> Vec<NetworkSecretSlot> {
-    let slot = |name: &str| format!("{}.{}", credential.name, name);
-    match credential.kind.as_str() {
-        "basic_auth" => vec![NetworkSecretSlot::required(
-            slot("password"),
-            NetworkSecretKind::Plain,
-        )],
-        "bearer_token" | "header_token" => vec![NetworkSecretSlot::required(
-            slot("token"),
-            NetworkSecretKind::Plain,
-        )],
-        "github_oauth" | "openai_codex_oauth" => vec![
-            NetworkSecretSlot::required(slot("oauth.access_token"), NetworkSecretKind::OAuth),
-            NetworkSecretSlot::required(slot("oauth.expires_at"), NetworkSecretKind::OAuth),
-            NetworkSecretSlot::optional(slot("oauth.account_id"), NetworkSecretKind::OAuth),
+    use silo_secrets::SecretField;
+    let fields: &[(&str, bool, SecretField)] = match credential.kind.as_str() {
+        "basic_auth" => &[("password", true, SecretField::Value)],
+        "bearer_token" | "header_token" => &[("token", true, SecretField::Value)],
+        "github_oauth" | "openai_codex_oauth" => &[
+            ("oauth.access_token", true, SecretField::OAuthAccessToken),
+            ("oauth.expires_at", true, SecretField::OAuthExpiresAt),
+            ("oauth.account_id", false, SecretField::OAuthAccountId),
         ],
-        "aws_credential" => vec![
-            NetworkSecretSlot::required(slot("access_key_id"), NetworkSecretKind::Plain),
-            NetworkSecretSlot::required(slot("secret_access_key"), NetworkSecretKind::Plain),
-            NetworkSecretSlot::optional(slot("session_token"), NetworkSecretKind::Plain),
-            NetworkSecretSlot::optional(slot("profile"), NetworkSecretKind::Plain),
+        "aws_credential" => &[
+            ("access_key_id", true, SecretField::Value),
+            ("secret_access_key", true, SecretField::Value),
+            ("session_token", false, SecretField::Value),
+            ("profile", false, SecretField::Value),
         ],
-        _ => Vec::new(),
-    }
+        _ => &[],
+    };
+    fields
+        .iter()
+        .filter_map(|(suffix, required, field)| {
+            let oauth = *field != SecretField::Value;
+            // Invalid policies are rejected by validate(); don't manufacture an
+            // unchecked store address when inspecting an unvalidated builder.
+            let key = silo_secrets::SecretName::new(format!(
+                "{}.{}.{}",
+                credential.kind,
+                credential.name,
+                if oauth { "oauth" } else { suffix }
+            ))
+            .ok()?;
+            Some(NetworkSecretSlot {
+                name: format!("{}.{}", credential.name, suffix),
+                required: *required,
+                kind: if oauth {
+                    NetworkSecretKind::OAuth
+                } else {
+                    NetworkSecretKind::Plain
+                },
+                source: NetworkSecretSource { key, field: *field },
+            })
+        })
+        .collect()
 }
 
 fn credential_secret_requirements(credential: &NetworkCredential) -> Vec<NetworkSecretRequirement> {
@@ -1778,19 +1904,18 @@ plugin "echo" {
             slot.name == "codex.oauth.access_token"
                 && slot.required
                 && slot.kind == NetworkSecretKind::OAuth
-                && slot.env_name() == "SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"
         }));
         assert!(slots
             .iter()
             .any(|slot| slot.name == "codex.oauth.account_id" && !slot.required));
         assert!(slots
             .iter()
-            .any(|slot| slot.name == "worktail.tailscale.auth_key" && slot.required));
+            .any(|slot| slot.name == "worktail.tailscale.auth_key" && !slot.required));
     }
 
     #[test]
-    fn rejects_network_secret_env_name_collisions() {
-        let error = NetworkPolicy::from_json_str(
+    fn preserves_distinct_exact_secret_names() {
+        let policy = NetworkPolicy::from_json_str(
             r#"
             {
               "version": 1,
@@ -1804,14 +1929,14 @@ plugin "echo" {
             }
             "#,
         )
-        .expect_err("colliding secret env names should fail");
-
-        assert!(error.diagnostics.iter().any(|diagnostic| {
-            diagnostic.summary == "network secret env name collision"
-                && diagnostic.detail.contains("api-key.token")
-                && diagnostic.detail.contains("api_key.token")
-                && diagnostic.detail.contains("SILO_NET_SECRET_API_KEY_TOKEN")
-        }));
+        .expect("exact secret names are distinct");
+        let names: Vec<_> = policy
+            .secret_slots()
+            .into_iter()
+            .map(|slot| slot.name)
+            .collect();
+        assert!(names.contains(&"api-key.token".to_string()));
+        assert!(names.contains(&"api_key.token".to_string()));
     }
 
     #[test]

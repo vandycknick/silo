@@ -28,18 +28,20 @@ jobs:
     outputs:
       node: ${{ steps.result.outputs.node }}
       go: ${{ steps.result.outputs.go }}
+      taild: ${{ steps.result.outputs.taild }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - name: Detect SDK-relevant changes
+      - name: Detect SDK and taild changes
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             node:
+              - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -48,9 +50,11 @@ jobs:
               - 'flake.lock'
               - 'flake.nix'
               - 'runtime/libvm/**'
+              - 'common/policy/**'
               - 'specs/**'
               - 'sdk/node/**'
             go:
+              - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -58,32 +62,59 @@ jobs:
               - 'VERSION'
               - 'flake.lock'
               - 'flake.nix'
+              - 'nix/**'
               - 'runtime/libvm/**'
+              - 'common/policy/**'
               - 'specs/**'
               - 'sdk/go/**'
               - 'xtask/**'
+            taild:
+              - 'vendor/signal-hook-registry/**'
+              - '.github/workflows/test.yml'
+              - 'packaging/silo-taild/**'
+              - 'nix/**'
+              - 'app/taild/**'
+              - 'app/cli/**'
+              - 'common/vm-control/**'
+              - 'sdk/go/**'
+              - 'runtime/**'
+              - 'guest/**'
+              - 'virt/**'
+              - 'net/netd/**'
+              - 'common/policy/**'
+              - 'common/secrets/**'
+              - 'Makefile'
+              - 'xtask/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'VERSION'
+              - 'specs/**'
+              - 'flake.lock'
+              - 'flake.nix'
 
-      - name: Select SDK checks
+      - name: Select checks
         id: result
         env:
           NODE_CHANGED: ${{ steps.filter.outputs.node }}
           GO_CHANGED: ${{ steps.filter.outputs.go }}
+          TAILD_CHANGED: ${{ steps.filter.outputs.taild }}
         run: |
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            printf 'node=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            printf 'node=true\ngo=true\ntaild=true\n' >> "$GITHUB_OUTPUT"
           else
-            printf 'node=%s\ngo=%s\n' "$NODE_CHANGED" "$GO_CHANGED" >> "$GITHUB_OUTPUT"
+            printf 'node=%s\ngo=%s\ntaild=%s\n' "$NODE_CHANGED" "$GO_CHANGED" "$TAILD_CHANGED" >> "$GITHUB_OUTPUT"
           fi
 
-  # Clippy and Cargo tests stay per-OS: the workspace has platform-only
-  # crates (virt/vz on macOS, libkrun in silo-vmm on both hosts) that a single lane
-  # would silently stop covering. Platform-independent style and
-  # consistency checks run once, on the Linux cell.
-  checks:
-    name: Checks (${{ matrix.platform }})
+  # Clippy, Cargo, netd and taild tests stay per-OS: the workspace has
+  # platform-only crates (virt/vz on macOS, libkrun in silo-vmm on both hosts)
+  # and Go build tags that a single lane would silently stop covering.
+  # Platform-independent style and consistency checks run once, on the Linux
+  # cell. Portable packaging is qualified by release-tip.yml, not here.
+  core:
+    name: Core (${{ matrix.platform }})
     needs: changes
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -91,9 +122,13 @@ jobs:
           - platform: linux
             runner: ubuntu-24.04
             primary: true
+            target: linux-amd64-gnu
+            ffi_library: libsilo_go_ffi.so
           - platform: macos
             runner: macos-26
             primary: false
+            target: darwin-arm64
+            ffi_library: libsilo_go_ffi.dylib
 
     steps:
       - name: Check out repository
@@ -120,7 +155,12 @@ jobs:
 
       - name: Check Go formatting
         if: ${{ matrix.primary }}
-        run: test -z "$(nix develop .#ci --command gofmt -l sdk/go)"
+        run: |
+          files="$(nix develop .#ci --command gofmt -l sdk/go app/taild)"
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
 
       - name: Check versions
         if: ${{ matrix.primary }}
@@ -131,8 +171,45 @@ jobs:
 
       # Cargo integration discovery includes tests/krun_worker.rs on both hosts.
       # These real-process boundary tests need no successful hypervisor admission.
+      # make test also tests net/netd (race-enabled on Linux); make fmt gofmt-checks it.
       - name: Run host-aware tests, including the private silo-vmm worker boundary
         run: nix develop .#ci --command make test
+
+      - name: Vet netd
+        env:
+          GOTOOLCHAIN: auto
+          GOFLAGS: -mod=readonly
+        run: nix develop .#ci --command go -C net/netd vet ./...
+
+      # Guest components cross-compile with cargo-zigbuild, which only the
+      # default shell carries. The debug stage reuses the artifacts make test
+      # already built; any complete stage satisfies the taild fixtures.
+      - name: Build and stage the integrated development product
+        if: needs.changes.outputs.taild == 'true'
+        run: nix develop --command make stage
+
+      - name: Vet taild
+        if: needs.changes.outputs.taild == 'true'
+        env:
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: auto
+          GOFLAGS: -mod=readonly
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ matrix.ffi_library }}
+        run: nix develop .#ci --command go -C app/taild vet ./...
+
+      - name: Test taild with actual bridge and race detector
+        if: needs.changes.outputs.taild == 'true'
+        # VM-fixture tests retain their explicit host/rootfs opt-in.
+        env:
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: auto
+          GOFLAGS: -mod=readonly
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ matrix.ffi_library }}
+          SILO_TEST_RUNTIME_ROOT: ${{ github.workspace }}/target/silo-runtime/${{ matrix.target }}/debug
+          SILO_RUNTIME_DIR: ${{ github.workspace }}/target/silo-runtime/${{ matrix.target }}/debug
+          SILO_TEST_BIN_DIR: ${{ github.workspace }}/target/debug
+          SILO_TEST_CLI: ${{ github.workspace }}/target/debug/silo
+        run: nix develop .#ci --command go -C app/taild test -race -count=1 -timeout=4m -v ./...
 
   node-sdk:
     name: Node SDK (${{ matrix.platform }})
@@ -190,9 +267,9 @@ jobs:
         include:
           # Every cell builds the native bridge and runs the full suite;
           # platform-independent checks run only on the primary cell.
-          # saves_cache marks the cells with no Checks counterpart on the same
+          # saves_cache marks the cells with no Core counterpart on the same
           # architecture, which therefore have to populate the shared cache
-          # themselves instead of restoring one Checks already wrote.
+          # themselves instead of restoring one Core already wrote.
           - platform: linux-amd64
             runner: ubuntu-24.04
             primary: true
@@ -215,7 +292,7 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      # Checks builds the whole workspace in the same dev profile, so its cache
+      # Core builds the whole workspace in the same dev profile, so its cache
       # is a superset of what the bridge needs. Share it rather than keeping a
       # second copy, and let only one job per architecture write it.
       - name: Cache Rust build outputs
@@ -263,7 +340,23 @@ jobs:
             "context"
             "github.com/vandycknick/silo/sdk/go"
           )
-          func main() { _, _ = silo.InstalledRuntime(); _ = context.Background() }
+          func contracts(runtime *silo.Runtime, machine *silo.Machine, policy *silo.NetworkPolicy) {
+            ctx := context.Background()
+            name := "exact"
+            labels := map[string]string{"io.silo.taild.name": name}
+            _, _ = machine.Update(ctx, silo.MachineUpdate{Name: &name, Labels: &labels})
+            _, _ = machine.StopWith(ctx, silo.StopOptions{Force: true})
+            _, _ = machine.WaitReady(ctx, 1)
+            _, _ = runtime.Inventory(ctx)
+            _, _ = runtime.PolicySecretsReady(ctx, policy, "")
+            _, _ = silo.ParseNetworkPolicyHCL(`tailscale "vm" { ephemeral = false }`)
+            _, _ = policy.HCL()
+            _, _ = policy.SecretMetadata()
+            _ = silo.WithGuestUser("silo", 1000, 1000, "/home/silo")
+            _ = silo.WithExecInitialPTYSize(24, 80)
+            _ = silo.WithExecTerm("xterm")
+          }
+          func main() { _, _ = silo.InstalledRuntime(); _ = contracts }
           EOF
           nix develop "$GITHUB_WORKSPACE#ci" --command go mod tidy
           nix develop "$GITHUB_WORKSPACE#ci" --command go build ./...
@@ -273,7 +366,7 @@ jobs:
     if: always()
     needs:
       - changes
-      - checks
+      - core
       - node-sdk
       - go-sdk
     runs-on: ubuntu-24.04

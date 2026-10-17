@@ -1,7 +1,8 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 use eyre::Context as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use utils::terminal::RawTerminalGuard;
 
 pub(crate) async fn attach_serial_stream<S>(stream: S) -> eyre::Result<()>
 where
@@ -24,7 +25,7 @@ async fn proxy_serial_stdio<S>(stream: S) -> eyre::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _raw_terminal = RawTerminalGuard::new()?;
+    let _raw_terminal = RawTerminalGuard::new(std::io::stdin()).context("enable raw terminal")?;
     proxy_serial_io(stream, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
@@ -96,68 +97,6 @@ where
             SerialInputEnd::Detached => Ok(()),
             SerialInputEnd::Eof => output_task.await,
         },
-    }
-}
-
-struct RawTerminalGuard {
-    fd: std::os::fd::OwnedFd,
-    original: libc::termios,
-    enabled: bool,
-}
-
-impl RawTerminalGuard {
-    fn new() -> eyre::Result<Self> {
-        let stdin = std::io::stdin();
-        let fd = stdin.as_fd().try_clone_to_owned().context("dup stdin fd")?;
-
-        // nix's safe termios API is behind a feature this crate does not otherwise need.
-        if unsafe { libc::isatty(fd.as_raw_fd()) } == 0 {
-            return Ok(Self {
-                fd,
-                original: unsafe { std::mem::zeroed() },
-                enabled: false,
-            });
-        }
-
-        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut original) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("tcgetattr stdin");
-        }
-
-        let mut raw = original;
-        raw.c_iflag &= !(libc::IGNBRK
-            | libc::BRKINT
-            | libc::PARMRK
-            | libc::ISTRIP
-            | libc::INLCR
-            | libc::IGNCR
-            | libc::ICRNL
-            | libc::IXON);
-        raw.c_oflag &= !libc::OPOST;
-        raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
-        raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
-        raw.c_cflag |= libc::CS8;
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-
-        if unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSAFLUSH, &raw) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("tcsetattr stdin raw");
-        }
-
-        Ok(Self {
-            fd,
-            original,
-            enabled: true,
-        })
-    }
-}
-
-impl Drop for RawTerminalGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ =
-                unsafe { libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.original) };
-        }
     }
 }
 

@@ -1,6 +1,7 @@
 package silo
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 )
@@ -70,5 +71,22 @@ func TestMachineMemoryUsesExactBytes(t *testing.T) {
 	WithMemory(Gibibytes(2))(&config)
 	if config.MemoryBytes == nil || *config.MemoryBytes != 2*1024*1024*1024 {
 		t.Fatalf("memory bytes = %v", config.MemoryBytes)
+	}
+}
+
+func TestGuestUserExplicitSyntaxAndValidation(t *testing.T) {
+	for _, value := range []string{"nickvd:1000:1000:/home/nickvd", "Silo_2:42:43:/srv/work", "machine$:1001:1002:/home/machine", "1$:1:1:/home/one"} {
+		if _, err := ParseGuestUser(value); err != nil {
+			t.Errorf("%q: %v", value, err)
+		}
+	}
+	for _, value := range []string{"", "nickvd", "nickvd:1000:1000", "nickvd:1000:1000:/home/nickvd:extra", "root:1:1:/root", "nobody:1:1:/home/nobody", "nickvd:0:1:/home/x", "nickvd:1:65534:/home/x", "nickvd:4294967295:1:/home/x", "nickvd:1:4294967295:/home/x", "123:1:1:/home/x", "-x:1:1:/home/x", "x$:1:1:relative", "x:1:1:/", "x:1:1:/home/../x", "x:1:1:/home/./x", "x:1:1:/home/x\x00", "x:1:1:/home/x\n", "x:1:1:/home/x\r", "x:+1:1:/home/x", "x:4294967296:1:/home/x"} {
+		if _, err := ParseGuestUser(value); err == nil {
+			t.Errorf("accepted %q", value)
+		}
+	}
+	var runtime Runtime
+	if _, err := runtime.CreateMachine(context.Background(), OCIImage("invalid.example/image"), WithGuestUser("root", 0, 0, "/root")); !IsErrorKind(err, ErrorInvalidArgument) {
+		t.Fatal(err)
 	}
 }

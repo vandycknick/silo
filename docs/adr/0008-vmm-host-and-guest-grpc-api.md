@@ -106,6 +106,7 @@ The guest endpoint admits these Silo services:
 | `GuestAgentService` | `WatchStatus` | server stream | Return current status, changes, and heartbeats. |
 | `GuestAgentService` | `GetMetrics` | unary | Collect one complete metrics snapshot. |
 | `GuestAgentService` | `WatchMetrics` | server stream | Collect and stream metrics at a requested interval. |
+| `GuestAgentService` | `SyncClock` | unary | Step guest `CLOCK_REALTIME` to host time when it is more than 1 s off. |
 | `GuestFilesystemService` | `GetEntry` | unary | Read entry attributes. |
 | `GuestFilesystemService` | `RemoveEntry` | unary | Remove an entry. |
 | `GuestFilesystemService` | `DownloadFile` | server stream | Stream a regular file to the host. |
@@ -117,8 +118,26 @@ The guest also serves `grpc.health.v1.Health` and
 `grpc.reflection.v1.ServerReflection`.
 
 `silo-vmm` uses `WatchStatus` and `WatchMetrics` during normal supervision. The
-unary guest methods remain useful for direct diagnostics and independent
-clients, but they do not drive host readiness.
+unary status and metrics methods remain useful for direct diagnostics and
+independent clients, but they do not drive host readiness.
+
+### Guest Wall Clock
+
+The virtual RTC only sets guest wall time at boot, and on macOS both the guest
+counter and libkrun's PL031 RTC follow host uptime, which stops while the host
+sleeps. A guest therefore falls behind by every host sleep and never notices.
+
+`silo-vmm` runs a clock supervisor next to the status and metrics supervisors.
+It calls `SyncClock` with the host `CLOCK_REALTIME` when a new agent identity
+appears, every 60 s, and within about 1 s of a host wall-clock jump. A jump is
+detected when host wall time and monotonic time drift more than 2 s apart
+between 1 s ticks, which covers both wake from sleep and host clock steps. The
+agent steps the guest clock only beyond a 1 s offset, so an NTP daemon inside
+the guest keeps sub-second ownership without being fought. The response reports
+the observed offset and whether a step happened.
+
+An agent that answers `Unimplemented` is not asked again until its identity
+changes, so a newer `silo-vmm` paired with an older agent stays quiet.
 
 ### Reflection Boundaries
 

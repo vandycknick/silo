@@ -7,14 +7,17 @@ import (
 )
 
 func TestEndpointParsesPyPIArtifactWithoutMetadataObservation(t *testing.T) {
+	t.Parallel()
 	endpoint := newTestEndpoint(t, "pypi")
 	classified := endpoint.Classify(http.MethodGet, "files.pythonhosted.org", "/packages/aa/bb/foo_bar-2.0.0-py3-none-any.whl")
 	if classified.Kind != RequestArtifact || classified.Name != "foo-bar" || classified.Version != "2.0.0" {
 		t.Fatalf("classified direct artifact = %#v", classified)
 	}
+
 }
 
 func TestEndpointUsesAdvertisedPyPICoreMetadataIdentity(t *testing.T) {
+	t.Parallel()
 	endpoint := newTestEndpoint(t, "pypi")
 	baseURL, err := url.Parse("https://pypi.org/simple/example/")
 	if err != nil {
@@ -41,6 +44,7 @@ func TestEndpointUsesAdvertisedPyPICoreMetadataIdentity(t *testing.T) {
 	if classified.Kind != RequestArtifact || classified.Name != "example" || classified.Version != "1.0.0" {
 		t.Fatalf("core metadata request = %#v", classified)
 	}
+
 }
 
 func newTestEndpoint(t *testing.T, repositories ...string) *Endpoint {

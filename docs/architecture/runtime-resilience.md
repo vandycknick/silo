@@ -52,7 +52,7 @@ machine configuration is corrupt; reading logs does not require a runtime lock.
 A managed netd launch uses two modes of the same executable:
 
 ```text
-silo / silod / embedded libvm
+silo (CLI or `silo daemon run`) / embedded libvm
   `- netd --daemonize             short-lived launcher, waited on by caller
        `- netd worker             new session; adopted when launcher exits
 
@@ -87,7 +87,7 @@ and type are validated. Startup reports and startup waits are bounded.
 netd worker                           final silo-vmm
   exit-pipe READ  <-------------------- exit-pipe WRITE
 
-CLI, silod, temporary launchers, backend workers and exit hooks:
+CLI, daemon, temporary launchers, backend workers and exit hooks:
   no writer copies retained after handoff
 ```
 
@@ -106,10 +106,10 @@ There is deliberately **no reverse pipe**:
 
 - VMM exits -> netd shuts down and the OS reaps it.
 - netd exits -> VMM continues running, potentially without networking.
-- CLI exit or silod restart after handoff -> neither is stopped.
+- CLI exit or daemon restart after handoff -> neither is stopped.
 
-silod SIGINT/SIGTERM detaches the manager. Explicit `silo daemon down` stops the
-service and then invokes `silod --stop` to stop the installation. Regenerate
+Daemon SIGINT/SIGTERM detaches the manager. Explicit `silo daemon down` stops the
+service and then stops the installation (`silo daemon run --stop`). Regenerate
 existing native service definitions after upgrading to obtain the new process-
 preservation settings. See [system daemon](../system-daemon.md).
 
@@ -139,21 +139,15 @@ Focused process tests use the real netd binary and actual child processes. The
 real-host smoke tests require built/signed runtime components and disposable VMs:
 
 ```sh
-make cli silod silo-vmm netd
-
-# Use an immutable cached root disk; create clones, never boot the source.
-SILO_SMOKE_DISK=/path/to/cached/rootfs.img \
-  python3 scripts/smoke/netd_lifetime.py
-
-# Requires a compatible system image; an existing image cache may be COW-cloned.
-SILO_SMOKE_SYSTEM_IMAGE=registry/system@sha256:... \
-SILO_SMOKE_CACHE=/path/to/images \
-  python3 scripts/smoke/silod_restart.py
+make stage && make smoke SMOKE_ARGS="-k 'netd_lifetime or daemon'"
 ```
 
-These are dependency-free Python scripts. Both isolate HOME/config/state and stop
-their test VMs on completion; failed runs retain evidence under `/tmp`. They cover
-real helper reaping, normal/VMM-crash EOF shutdown, netd-crash survival, suspended
+The suite isolates HOME/config/state and generated sockets, stops its test VMs,
+and retains evidence on failure. See [smoke/README.md](../../smoke/README.md)
+for prerequisites, image configuration, and evidence paths. It covers real
+helper reaping, normal/VMM-crash EOF shutdown, netd-crash survival, suspended
 monitor timeouts, partial plain/JSON inventory, historical logs, strict runtime
-validation, and adoption of the same VMM/netd generation across silod restart.
+validation, and adoption of the same VMM/netd generation across daemon restart
+(pulls `ghcr.io/vandycknick/silo/system:dev` unless `SILO_SMOKE_SYSTEM_IMAGE`
+overrides it).
 Run on each supported host platform; success on macOS is not Linux verification.

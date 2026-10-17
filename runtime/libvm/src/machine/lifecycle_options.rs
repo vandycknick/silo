@@ -51,6 +51,13 @@ pub struct MachineStart {
     pub run_id: MachineRunId,
 }
 
+impl MachineStart {
+    /// Constructs an acknowledged start observation without a live handle.
+    pub fn new(machine: MachineData, run_id: MachineRunId) -> Self {
+        Self { machine, run_id }
+    }
+}
+
 /// Options for waiting on a machine run to exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MachineWaitOptions {
@@ -77,7 +84,8 @@ impl MachineWaitOptions {
         self
     }
 
-    pub(crate) fn timeout_value(self) -> Duration {
+    /// Returns the configured maximum wait.
+    pub fn timeout_value(self) -> Duration {
         self.timeout
     }
 }
@@ -108,11 +116,13 @@ impl MachineStopOptions {
         self
     }
 
-    pub(crate) fn force_timeout(self) -> Option<Duration> {
+    /// Returns the optional forced-stop escalation budget.
+    pub fn force_timeout(self) -> Option<Duration> {
         self.force_timeout
     }
 
-    pub(crate) fn wait_options(self) -> MachineWaitOptions {
+    /// Returns the graceful-stop wait configuration.
+    pub fn wait_options(self) -> MachineWaitOptions {
         self.wait
     }
 }
@@ -135,7 +145,8 @@ impl MachineKillOptions {
         self
     }
 
-    pub(crate) fn wait_options(self) -> MachineWaitOptions {
+    /// Returns the forced-stop wait configuration.
+    pub fn wait_options(self) -> MachineWaitOptions {
         self.wait
     }
 }
@@ -152,6 +163,23 @@ pub struct MachineExit {
     pub exited_at: Option<SystemTime>,
     /// High-level exit outcome.
     pub outcome: MachineExitOutcome,
+}
+
+impl MachineExit {
+    /// Constructs an owned run-exit observation without altering lifecycle state.
+    pub fn new(
+        machine: MachineData,
+        run_id: Option<MachineRunId>,
+        exited_at: Option<SystemTime>,
+        outcome: MachineExitOutcome,
+    ) -> Self {
+        Self {
+            machine,
+            run_id,
+            exited_at,
+            outcome,
+        }
+    }
 }
 
 /// High-level outcome for a machine run observed by `Machine::wait`.

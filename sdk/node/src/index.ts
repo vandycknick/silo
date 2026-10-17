@@ -1,5 +1,9 @@
 export { SiloError } from "./errors.js";
 export { ExecutionSession, ExecutionOutput, ExecutionStdin, type ExecutionEvent } from "./exec.js";
+export {
+  FileDownload, type FileEntry, type FileEntryKind, type DirectoryDisposition,
+  type FileWriteDisposition, type CreateDirectoryOptions, type UploadOptions, type UploadResult,
+} from "./files.js";
 export { Images } from "./images.js";
 export { MachineLogStream } from "./logs.js";
 export { GuestBuilder, Machine, MachineBuilder } from "./machine.js";
@@ -27,6 +31,8 @@ export {
   type NetworkEndpointRef,
   type NetworkEndpointSelector,
   type NetworkPolicyDefinitionCallback,
+  type NetworkForwardProtocol,
+  type NetworkForwardTLS,
   type NetworkCredentialRef,
   type TailscaleTunnelRef,
 } from "./network.js";
@@ -71,4 +77,7 @@ export {
   type RuntimeOpenOptions,
   type SshExitStatus,
   type SshShellOptions,
+  type SshShellAttachment,
+  type SshShellControl,
+  type SshShellSignal,
 } from "./types.js";

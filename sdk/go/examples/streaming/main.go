@@ -15,16 +15,6 @@ func stream(ctx context.Context, machine *silo.Machine) error {
 		return err
 	}
 	defer session.Close()
-	stdin := session.Stdin()
-	if stdin == nil {
-		return errors.New("stdin pipe unavailable")
-	}
-	if _, err = stdin.Write([]byte("hello\n")); err != nil {
-		return err
-	}
-	if err = stdin.Close(); err != nil {
-		return err
-	}
 	for {
 		event, recvErr := session.Recv(ctx)
 		if errors.Is(recvErr, io.EOF) {
@@ -32,6 +22,18 @@ func stream(ctx context.Context, machine *silo.Machine) error {
 		}
 		if recvErr != nil {
 			return recvErr
+		}
+		if event.Kind == silo.ExecutionEventStarted {
+			stdin := session.Stdin()
+			if stdin == nil {
+				return errors.New("stdin pipe unavailable after Started")
+			}
+			if _, err = stdin.WriteContext(ctx, []byte("hello\n")); err != nil {
+				return err
+			}
+			if err = stdin.Close(); err != nil {
+				return err
+			}
 		}
 		log.Printf("%s: %s", event.Kind, event.Data)
 	}

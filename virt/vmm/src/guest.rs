@@ -1,3 +1,5 @@
+mod ssh;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 pub(crate) async fn spawn_guest_services(
     machine: &VirtualMachine,
+    machine_dir: &std::path::Path,
     store: Arc<InstanceStore>,
     forwards: Arc<crate::forward::ForwardTable>,
     shutdown: CancellationToken,
@@ -34,12 +37,21 @@ pub(crate) async fn spawn_guest_services(
         "connecting to guest agent over vsock"
     );
     let machine = machine.clone();
+    let machine_dir = machine_dir.to_path_buf();
     Ok(tokio::spawn(async move {
         let status = supervise_status(machine.clone(), store.clone(), shutdown.clone());
+        let ssh = ssh::supervise_ssh_verification(
+            machine.clone(),
+            machine_dir,
+            store.clone(),
+            shutdown.clone(),
+        );
         let metrics = supervise_metrics(machine.clone(), store.clone(), shutdown.clone());
+        let clock =
+            crate::clock_sync::supervise_clock(machine.clone(), store.clone(), shutdown.clone());
         let capability =
             crate::forward::spawn_capability_supervisor(machine, store, forwards, shutdown);
-        tokio::join!(status, metrics);
+        tokio::join!(status, metrics, ssh, clock);
         if let Err(error) = capability.await {
             tracing::warn!(%error, "guest forward capability supervisor failed");
         }
@@ -276,7 +288,9 @@ fn observation_error(error: StoreError) -> tonic::Status {
         StoreError::Validation(_) | StoreError::Protocol(_) | StoreError::IdentityMismatch => {
             tonic::Status::invalid_argument(error.to_string())
         }
-        StoreError::Poisoned | StoreError::Clock => tonic::Status::internal(error.to_string()),
+        StoreError::Poisoned | StoreError::Clock | StoreError::SshEpochExhausted => {
+            tonic::Status::internal(error.to_string())
+        }
     }
 }
 
@@ -423,7 +437,7 @@ fn duration(value: Duration) -> prost_types::Duration {
     }
 }
 
-fn agent_client(channel: Channel) -> GuestAgentServiceClient<Channel> {
+pub(crate) fn agent_client(channel: Channel) -> GuestAgentServiceClient<Channel> {
     GuestAgentServiceClient::new(channel)
         .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
         .max_encoding_message_size(protocol::STRUCTURED_16_MIB)

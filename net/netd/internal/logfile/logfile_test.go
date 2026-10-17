@@ -132,37 +132,53 @@ func TestOpenTruncateReplacesExistingContent(t *testing.T) {
 	}
 }
 
-func TestOpenTruncateRejectsSymlink(t *testing.T) {
-	directory, root := testDirectory(t)
-	target := filepath.Join(root, "target.pcap")
-	path := filepath.Join(root, "capture.pcap")
-	if err := os.WriteFile(target, []byte("target"), fileMode); err != nil {
-		t.Fatal(err)
+func TestOpenRejectsUnsafeFileKinds(t *testing.T) {
+	tests := []struct {
+		name     string
+		truncate bool
+		symlink  bool
+		filename string
+		target   string
+	}{
+		{name: "truncate symlink", truncate: true, symlink: true, filename: "capture.pcap", target: "target.pcap"},
+		{name: "truncate directory", truncate: true, filename: "directory"},
+		{name: "append symlink", symlink: true, filename: "netd.log", target: "target.log"},
+		{name: "append directory", filename: "directory"},
 	}
-	if err := os.Symlink(target, path); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := directory.OpenTruncate("capture.pcap"); err == nil {
-		t.Fatal("expected symlink to be rejected")
-	}
-	contents, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(contents); got != "target" {
-		t.Fatalf("symlink target was modified: %q", got)
-	}
-}
-
-func TestOpenTruncateRejectsNonRegularFile(t *testing.T) {
-	directory, root := testDirectory(t)
-	path := filepath.Join(root, "directory")
-	if err := os.Mkdir(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := directory.OpenTruncate("directory"); err == nil {
-		t.Fatal("expected directory to be rejected")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory, root := testDirectory(t)
+			path := filepath.Join(root, test.filename)
+			target := filepath.Join(root, test.target)
+			if test.symlink {
+				if err := os.WriteFile(target, []byte("target"), fileMode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			open := directory.OpenAppend
+			if test.truncate {
+				open = directory.OpenTruncate
+			}
+			file, err := open(test.filename)
+			if err == nil {
+				_ = file.Close()
+				t.Fatal("expected unsafe file kind to be rejected")
+			}
+			if test.symlink {
+				contents, err := os.ReadFile(target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := string(contents); got != "target" {
+					t.Fatalf("symlink target was modified: %q", got)
+				}
+			}
+		})
 	}
 }
 
@@ -189,40 +205,6 @@ func TestSyncClosePersistsAndClosesFile(t *testing.T) {
 	}
 	if got, want := string(contents), "pcap data"; got != want {
 		t.Fatalf("capture content = %q, want %q", got, want)
-	}
-}
-
-func TestOpenAppendRejectsSymlink(t *testing.T) {
-	directory, root := testDirectory(t)
-	target := filepath.Join(root, "target.log")
-	path := filepath.Join(root, "netd.log")
-	if err := os.WriteFile(target, []byte("target"), fileMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, path); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := directory.OpenAppend("netd.log"); err == nil {
-		t.Fatal("expected symlink to be rejected")
-	}
-	contents, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(contents); got != "target" {
-		t.Fatalf("symlink target was modified: %q", got)
-	}
-}
-
-func TestOpenAppendRejectsNonRegularFile(t *testing.T) {
-	directory, root := testDirectory(t)
-	path := filepath.Join(root, "directory")
-	if err := os.Mkdir(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := directory.OpenAppend("directory"); err == nil {
-		t.Fatal("expected directory to be rejected")
 	}
 }
 

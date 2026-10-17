@@ -484,9 +484,14 @@ mod tests {
         let prepared = PreparedVsockSurface::prepare(&runtime_dir, Path::new("vsock.sock"))
             .expect("prepare surface");
         machine.start().await.expect("start mock machine");
-        let forwards = crate::forward::ForwardTable::prepare_machine(&[], &runtime_dir, None)
-            .await
-            .expect("prepare empty forward table");
+        let forwards = crate::forward::ForwardTable::prepare_machine(
+            &[],
+            &runtime_dir,
+            None,
+            crate::forward::inbound::PARK_TIMEOUT,
+        )
+        .await
+        .expect("prepare empty forward table");
         let mut surface = prepared
             .activate(machine.clone(), forwards)
             .await

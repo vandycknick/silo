@@ -6,7 +6,6 @@ use thiserror::Error;
 
 const RUST_PRODUCT_MANIFESTS: &[&str] = &[
     "app/cli/Cargo.toml",
-    "app/silod/Cargo.toml",
     "runtime/libvm/Cargo.toml",
     "virt/vmm/Cargo.toml",
     "guest/agent/Cargo.toml",
@@ -77,6 +76,12 @@ pub fn check(workspace_root: &Path) -> Result<(), VersionError> {
     )?;
     check_declaration(
         workspace_root,
+        "sdk/go/internal/bundle/bundle.go",
+        "const sdkVersion =",
+        &authority,
+    )?;
+    check_declaration(
+        workspace_root,
         GO_PRODUCT_VERSION,
         "const Version =",
         &authority,
@@ -84,7 +89,7 @@ pub fn check(workspace_root: &Path) -> Result<(), VersionError> {
     let go_abi = unquoted_declaration(
         workspace_root,
         GO_PRODUCT_VERSION,
-        "const ffiABIVersion uint32 =",
+        "const NativeABIVersion uint32 =",
     )?;
     let native_abi =
         unquoted_declaration(workspace_root, GO_NATIVE_ABI, "const ABI_VERSION: u32 =")?;
@@ -184,7 +189,7 @@ fn declaration(contents: &str, prefix: &str) -> Option<String> {
     })
 }
 
-fn is_semver(version: &str) -> bool {
+pub(crate) fn is_semver(version: &str) -> bool {
     version.split('.').count() == 3
         && version
             .split('.')

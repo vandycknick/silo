@@ -4,12 +4,14 @@ mod ext4_writer;
 mod layer;
 mod lock;
 mod platform;
+mod policy;
 mod progress;
 mod registry;
 mod store;
 
 pub use crate::error::{OciError, OciResult};
 pub use crate::platform::Platform;
+pub use crate::policy::{RegistryAction, RegistryPolicy, RegistryRule};
 pub use crate::progress::{ProgressEvent, ProgressReporter};
 pub use crate::registry::{ImageConfig, ResolvedImage};
 pub use crate::store::{

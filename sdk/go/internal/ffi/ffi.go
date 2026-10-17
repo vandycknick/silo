@@ -11,6 +11,7 @@ import "C"
 
 import (
 	"fmt"
+	"strings"
 	"unsafe"
 )
 
@@ -33,6 +34,51 @@ type Runtime struct{ pointer *C.silo_runtime }
 
 // Machine owns one native libvm machine handle.
 type Machine struct{ pointer *C.silo_machine }
+
+type AttachmentCancellation struct{ pointer *C.AttachmentCancellation }
+
+func NewAttachmentCancellation() (*AttachmentCancellation, error) {
+	var token *C.AttachmentCancellation
+	if err := takeError(C.bridge_attachment_cancellation_new(&token)); err != nil {
+		return nil, err
+	}
+	if token == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil attachment cancellation token")
+	}
+	return &AttachmentCancellation{pointer: token}, nil
+}
+
+func (token *AttachmentCancellation) Cancel() error {
+	return takeError(C.bridge_attachment_cancellation_cancel(token.pointer))
+}
+
+func (token *AttachmentCancellation) Signal(signal uint32) error {
+	return takeError(C.bridge_attachment_cancellation_signal(token.pointer, C.uint32_t(signal)))
+}
+
+func (token *AttachmentCancellation) Close() {
+	C.bridge_attachment_cancellation_free(token.pointer)
+	token.pointer = nil
+}
+
+type NodeStateLease struct{ pointer *C.silo_node_state_lease }
+
+func (machine *Machine) LeaseNodeState() (*NodeStateLease, error) {
+	var output *C.silo_node_state_lease
+	if err := takeError(C.bridge_machine_lease_node_state(machine.pointer, &output)); err != nil {
+		return nil, err
+	}
+	if output == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil lease")
+	}
+	return &NodeStateLease{pointer: output}, nil
+}
+func (lease *NodeStateLease) Close() {
+	if lease != nil && lease.pointer != nil {
+		C.bridge_node_state_lease_free(lease.pointer)
+		lease.pointer = nil
+	}
+}
 
 // Execution owns one native structured execution session.
 type Execution struct{ pointer *C.silo_execution }
@@ -66,9 +112,12 @@ type LogChunk struct {
 func load(path, expectedVersion string, expectedABI uint32) error {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
-	if message := C.bridge_load(cPath); message != nil {
+	if message := C.bridge_load(cPath, C.uint32_t(expectedABI)); message != nil {
 		value := C.GoString(message)
 		C.bridge_string_free(message)
+		if strings.HasPrefix(value, "native Silo bridge ABI mismatch:") {
+			return &ABIMismatchError{Message: value}
+		}
 		return fmt.Errorf("load native Silo bridge: %s", value)
 	}
 	if actual := uint32(C.bridge_abi_version()); actual != expectedABI {
@@ -78,6 +127,17 @@ func load(path, expectedVersion string, expectedABI uint32) error {
 		return &ABIMismatchError{Message: fmt.Sprintf("native Silo bridge version is %q, SDK requires %q", actual, expectedVersion)}
 	}
 	return nil
+}
+
+// NativeABIVersion returns the ABI of the bridge already validated by Load.
+func NativeABIVersion() uint32 { return uint32(C.bridge_abi_version()) }
+
+func PlanningQuery(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_planning_query(bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
 }
 
 func openRuntime(request []byte) (*Runtime, error) {
@@ -172,6 +232,14 @@ func (machine *Machine) Inspect() ([]byte, error) {
 	return copyBuffer(output), nil
 }
 
+func (runtime *Runtime) Query(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_runtime_query(runtime.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+
 func (machine *Machine) Start() ([]byte, error) {
 	var output C.silo_buffer
 	if err := takeError(C.bridge_machine_start(machine.pointer, &output)); err != nil {
@@ -180,9 +248,29 @@ func (machine *Machine) Start() ([]byte, error) {
 	return copyBuffer(output), nil
 }
 
+func (machine *Machine) Secret(request []byte) error {
+	return takeError(C.bridge_machine_secret(machine.pointer, bytePointer(request), C.size_t(len(request))))
+}
+
 func (machine *Machine) Stop() ([]byte, error) {
 	var output C.silo_buffer
 	if err := takeError(C.bridge_machine_stop(machine.pointer, &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+
+func (machine *Machine) Update(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_update(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+
+func (machine *Machine) StopWith(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_stop_with(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
 		return nil, err
 	}
 	return copyBuffer(output), nil
@@ -195,9 +283,9 @@ func (machine *Machine) Exec(request []byte) (*ExecutionOutput, error) {
 	}
 	return copyExecutionOutput(output), nil
 }
-func (machine *Machine) Shell(request []byte) (*ExecutionOutput, error) {
+func (machine *Machine) ExecScript(request []byte) (*ExecutionOutput, error) {
 	var output C.silo_execution_output
-	if err := takeError(C.bridge_machine_shell(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+	if err := takeError(C.bridge_machine_exec_script(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
 		return nil, err
 	}
 	return copyExecutionOutput(output), nil
@@ -212,20 +300,52 @@ func (machine *Machine) Spawn(request []byte) (*Execution, error) {
 	}
 	return &Execution{pointer: output}, nil
 }
-func (machine *Machine) Attach(request []byte) ([]byte, error) {
+func (machine *Machine) Shell(request []byte, token *AttachmentCancellation, attachment *SshAttachment) ([]byte, error) {
 	var output C.silo_buffer
-	if err := takeError(C.bridge_machine_attach(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+	var handle *C.SshAttachmentHandle
+	if attachment != nil {
+		handle = attachment.pointer
+	}
+	if err := takeError(C.bridge_machine_shell_cancellable(machine.pointer, bytePointer(request), C.size_t(len(request)), token.pointer, handle, &output)); err != nil {
 		return nil, err
 	}
 	return copyBuffer(output), nil
 }
-func (machine *Machine) AttachShell(request []byte) ([]byte, error) {
-	var output C.silo_buffer
-	if err := takeError(C.bridge_machine_attach_shell(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+
+type SshAttachment struct{ pointer *C.SshAttachmentHandle }
+
+func (machine *Machine) NewSshAttachment(token *AttachmentCancellation, rows, columns uint16) (*SshAttachment, error) {
+	var handle *C.SshAttachmentHandle
+	if err := takeError(C.bridge_ssh_attachment_new(machine.pointer, token.pointer, C.uint16_t(rows), C.uint16_t(columns), &handle)); err != nil {
 		return nil, err
 	}
-	return copyBuffer(output), nil
+	if handle == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil SSH attachment")
+	}
+	return &SshAttachment{pointer: handle}, nil
 }
+func (h *SshAttachment) Write(data []byte) error {
+	return takeError(C.bridge_ssh_attachment_write(h.pointer, bytePointer(data), C.size_t(len(data))))
+}
+func (h *SshAttachment) CloseStdin() error {
+	return takeError(C.bridge_ssh_attachment_close_stdin(h.pointer))
+}
+func (h *SshAttachment) Read(stderr bool) ([]byte, bool, error) {
+	var buffer C.silo_buffer
+	var eof C.bool
+	if err := takeError(C.bridge_ssh_attachment_read(h.pointer, C.bool(stderr), &buffer, &eof)); err != nil {
+		return nil, false, err
+	}
+	return copyBuffer(buffer), bool(eof), nil
+}
+func (h *SshAttachment) Resize(rows, columns uint16) error {
+	return takeError(C.bridge_ssh_attachment_resize(h.pointer, C.uint16_t(rows), C.uint16_t(columns)))
+}
+func (h *SshAttachment) Signal(signal uint32) error {
+	return takeError(C.bridge_ssh_attachment_signal(h.pointer, C.uint32_t(signal)))
+}
+func (h *SshAttachment) Cancel() error { return takeError(C.bridge_ssh_attachment_cancel(h.pointer)) }
+func (h *SshAttachment) Close()        { C.bridge_ssh_attachment_free(h.pointer); h.pointer = nil }
 
 func (machine *Machine) Logs(request []byte) (*Log, error) {
 	var output *C.silo_log
@@ -366,4 +486,76 @@ func bytePointer(value []byte) *C.uint8_t {
 		return nil
 	}
 	return (*C.uint8_t)(unsafe.Pointer(&value[0]))
+}
+
+type Upload struct{ pointer *C.silo_upload }
+type Download struct{ pointer *C.silo_download }
+
+func (machine *Machine) MachineFileStat(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_file_stat(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+func (machine *Machine) MachineCreateDirectory(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_create_directory(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+func (machine *Machine) MachineUploadOpen(request []byte) (*Upload, error) {
+	var output *C.silo_upload
+	if err := takeError(C.bridge_machine_upload_open(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	if output == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil upload")
+	}
+	return &Upload{pointer: output}, nil
+}
+func (upload *Upload) UploadWrite(data []byte) error {
+	return takeError(C.bridge_upload_write(upload.pointer, bytePointer(data), C.size_t(len(data))))
+}
+func (upload *Upload) UploadFinish() ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_upload_finish(upload.pointer, &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+func (upload *Upload) UploadCancel() error { return takeError(C.bridge_upload_cancel(upload.pointer)) }
+func (upload *Upload) UploadFree() {
+	if upload != nil && upload.pointer != nil {
+		C.bridge_upload_free(upload.pointer)
+		upload.pointer = nil
+	}
+}
+func (machine *Machine) MachineDownloadOpen(request []byte) (*Download, error) {
+	var output *C.silo_download
+	if err := takeError(C.bridge_machine_download_open(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	if output == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil download")
+	}
+	return &Download{pointer: output}, nil
+}
+func (download *Download) DownloadRead() ([]byte, bool, error) {
+	var output C.silo_buffer
+	var eof C._Bool
+	if err := takeError(C.bridge_download_read(download.pointer, &output, &eof)); err != nil {
+		return nil, false, err
+	}
+	return copyBuffer(output), bool(eof), nil
+}
+func (download *Download) DownloadCancel() error {
+	return takeError(C.bridge_download_cancel(download.pointer))
+}
+func (download *Download) DownloadFree() {
+	if download != nil && download.pointer != nil {
+		C.bridge_download_free(download.pointer)
+		download.pointer = nil
+	}
 }

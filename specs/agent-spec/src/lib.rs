@@ -31,19 +31,17 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn validate(&self) -> Result<(), AgentConfigError> {
-        validate_unique_nonempty(
-            self.ssh
-                .authorized_users
-                .iter()
-                .map(|user| user.name.as_str()),
-            "ssh authorized user name",
-        )?;
-        for user in &self.ssh.authorized_users {
-            validate_login_name(&user.name, "ssh authorized user name")?;
-            if user.authorized_keys.iter().any(|key| key.trim().is_empty()) {
+        if let Some(ca) = &self.ssh.trusted_ca {
+            if ca.trim().contains(['\n', '\r']) {
                 return Err(AgentConfigError::new(
-                    "ssh authorized key must not be empty",
+                    "ssh.trusted_ca must contain exactly one public key line",
                 ));
+            }
+            let key = ssh_key::PublicKey::from_openssh(ca).map_err(|error| {
+                AgentConfigError::new(format!("invalid ssh.trusted_ca: {error}"))
+            })?;
+            if key.algorithm() != ssh_key::Algorithm::Ed25519 {
+                return Err(AgentConfigError::new("ssh.trusted_ca must be Ed25519"));
             }
         }
 
@@ -306,18 +304,8 @@ fn validate_usable_ipv4(address: Ipv4Addr, field: &str) -> Result<(), AgentConfi
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSshConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub authorized_users: Vec<AgentSshAuthorizedUser>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AgentSshAuthorizedUser {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub authorized_keys: Vec<String>,
-    #[serde(default)]
-    pub allow_without_auth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_ca: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -477,10 +465,10 @@ pub enum UserdataRunPolicy {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AgentConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
-        CertificateAuthorityConfig, MountConfig, NetworkConfig, NetworkDnsConfig,
-        NetworkInterfaceConfig, NetworkIpv4Config, ProvisionConfig, ResizeRootfsConfig, UserConfig,
-        UserdataConfig, UserdataContentType, UserdataRunPolicy,
+        AgentConfig, AgentRosettaConfig, AgentSshConfig, CertificateAuthorityConfig, MountConfig,
+        NetworkConfig, NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config,
+        ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
+        UserdataRunPolicy,
     };
 
     #[test]
@@ -510,7 +498,7 @@ mod tests {
         );
         assert!(config.provision.users.is_empty());
         assert!(config.provision.network.is_none());
-        assert!(config.ssh.authorized_users.is_empty());
+        assert!(config.ssh.trusted_ca.is_none());
         assert_eq!(
             format!("{}/rosetta", crate::ROSETTA_MOUNT_PATH),
             crate::ROSETTA_INTERPRETER_PATH
@@ -618,15 +606,6 @@ provision:
     }
 
     #[test]
-    fn removed_forward_config_is_rejected() {
-        let error =
-            serde_yaml_ng::from_str::<AgentConfig>("forward:\n  enabled: true\n  port: 4000\n")
-                .expect_err("removed forward config must be rejected");
-
-        assert!(error.to_string().contains("unknown field `forward`"));
-    }
-
-    #[test]
     fn userdata_run_defaults_to_once() {
         let raw = r#"
 provision:
@@ -700,11 +679,14 @@ provision:
                 }),
             },
             ssh: AgentSshConfig {
-                authorized_users: vec![AgentSshAuthorizedUser {
-                    name: "silo".to_string(),
-                    authorized_keys: vec!["ssh-ed25519 AAAAC3NzaSilo".to_string()],
-                    allow_without_auth: false,
-                }],
+                trusted_ca: Some(
+                    ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(
+                        &[1; 32],
+                    ))
+                    .public_key()
+                    .to_openssh()
+                    .unwrap(),
+                ),
             },
         };
 
@@ -718,14 +700,22 @@ provision:
     #[test]
     fn validation_accepts_supported_login_names() {
         for name in ["silo", "silo-user", "Silo_2", "machine$"] {
-            let mut config = config_with_user(name);
-            config.ssh.authorized_users.push(AgentSshAuthorizedUser {
-                name: name.to_string(),
-                authorized_keys: vec!["ssh-ed25519 AAAAC3NzaSilo".to_string()],
-                allow_without_auth: false,
-            });
+            let config = config_with_user(name);
             config.validate().expect("login name should be valid");
         }
+    }
+
+    #[test]
+    fn ssh_trust_requires_a_parsed_ed25519_public_key() {
+        let mut config = AgentConfig::default();
+        for invalid in ["", "ssh-ed25519 broken", "ssh-rsa broken", "not a key"] {
+            config.ssh.trusted_ca = Some(invalid.into());
+            assert!(config.validate().is_err());
+        }
+        let key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[1; 32]));
+        config.ssh.trusted_ca = Some(key.public_key().to_openssh().unwrap());
+        config.validate().unwrap();
+        assert!(serde_json::from_str::<AgentSshConfig>(r#"{"authorized_users":[]}"#).is_err());
     }
 
     #[test]
@@ -838,8 +828,18 @@ provision:
     }
 
     #[test]
-    fn deserialization_rejects_non_ip_dns_server() {
-        let json = r#"{
+    fn invalid_agent_config_parse_cases() {
+        for (label, result, expected) in [
+            (
+                "removed_forward",
+                serde_yaml_ng::from_str::<AgentConfig>("forward:\n  enabled: true\n  port: 4000\n")
+                    .map_err(|err| err.to_string()),
+                Some("unknown field `forward`"),
+            ),
+            (
+                "non_ip_dns_server",
+                serde_json::from_str::<AgentConfig>(
+                    r#"{
             "provision": {
                 "network": {
                     "interfaces": [{
@@ -853,9 +853,17 @@ provision:
                     }]
                 }
             }
-        }"#;
-
-        serde_json::from_str::<AgentConfig>(json).expect_err("invalid DNS server must fail");
+        }"#,
+                )
+                .map_err(|err| err.to_string()),
+                None,
+            ),
+        ] {
+            let message = result.expect_err(label);
+            if let Some(text) = expected {
+                assert!(message.contains(text), "{label}: {message}");
+            }
+        }
     }
 
     fn valid_network_config() -> NetworkConfig {

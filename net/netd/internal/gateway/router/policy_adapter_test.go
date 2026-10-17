@@ -13,6 +13,7 @@ import (
 )
 
 func TestPolicyDecisionCarriesL4MatchMetadata(t *testing.T) {
+	t.Parallel()
 	compiled := policytest.LoadPolicy(t, `
 settings { default_action = "deny" }
 endpoint "ip" "app" {
@@ -35,9 +36,11 @@ rule "allow-app" {
 	if decision.Action != hooks.RouteAllowDirect || decision.RuleName != "allow-app" || decision.MatchedL4 == nil || *decision.MatchedL4 != want {
 		t.Fatalf("unexpected route decision: %#v", decision)
 	}
+
 }
 
 func TestPolicyDecisionCarriesCredentialMetadata(t *testing.T) {
+	t.Parallel()
 	compiled := policytest.LoadPolicy(t, `
 settings { default_action = "deny" }
 endpoint "https" "api" {
@@ -62,9 +65,11 @@ rule "allow-api" {
 	if decision.Credential == nil || decision.Credential.Kind != "header_token" || decision.Credential.Name != "internal-api" || decision.Credential.Header != "X-Internal-Token" || decision.Credential.Prefix != "Token " {
 		t.Fatalf("unexpected credential metadata: %#v", decision.Credential)
 	}
+
 }
 
 func TestPolicyDecisionCarriesPackageFacetMetadata(t *testing.T) {
+	t.Parallel()
 	compiled, err := policy.LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
   "settings": {"default_action": "deny", "audit": {}},
@@ -94,4 +99,5 @@ func TestPolicyDecisionCarriesPackageFacetMetadata(t *testing.T) {
 	if decision.Action != hooks.RouteAllowDirect || decision.RuleName != "allow-old" || decision.Package == nil || decision.Package.Name != "example" || decision.Package.AgeHours != 48 {
 		t.Fatalf("unexpected package decision: %#v", decision)
 	}
+
 }

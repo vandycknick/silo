@@ -84,6 +84,7 @@ struct MachineCreateGuard {
     agent_mode: Option<MachineAgent>,
     machine_parent: Option<OwnedDirectory>,
     committed: bool,
+    secret_store: std::sync::Arc<dyn silo_secrets::SecretStore>,
 }
 
 /// Builder for creating a machine.
@@ -416,6 +417,7 @@ async fn create_machine_config_with_name(
             reason: "root disk size must be greater than 0".to_string(),
         });
     }
+    crate::machine::reference::validate_new_machine_name(&name)?;
     if matches!(request.cpus, Some(0)) {
         return Err(LibVmError::InvalidCreateRequest {
             name,
@@ -508,6 +510,12 @@ async fn create_machine_config_with_name(
 
     let network = request.network.unwrap_or_default().into();
     runtime.validate_machine_network_config(&network).await?;
+    let tailscale = runtime.validate_tailscale_vsock(&network, &spec)?;
+    let materialized = match request.resolved_oci_image.as_ref() {
+        Some(image) => runtime.materialize_resolved_oci_image(image).await?,
+        None => runtime.materialize_image(&image_source).await?,
+    };
+    let _name_lock = runtime.lock_machine_names().await?;
     let create = create_machine_guard(
         runtime,
         MachineCreatePlan {
@@ -525,10 +533,9 @@ async fn create_machine_config_with_name(
     )
     .await?;
 
-    let materialized = match request.resolved_oci_image.as_ref() {
-        Some(image) => runtime.materialize_resolved_oci_image(image).await?,
-        None => runtime.materialize_image(&image_source).await?,
-    };
+    if tailscale {
+        runtime.ensure_tailscale_directory(create.id)?;
+    }
     let root_disk_size = request.disk_size_bytes.unwrap_or(materialized.size_bytes);
     if root_disk_size == 0 {
         return Err(LibVmError::InvalidCreateRequest {
@@ -600,9 +607,16 @@ async fn create_machine_guard(
         agent_mode,
         machine_parent: None,
         committed: false,
+        secret_store: runtime.secret_store_arc(),
     };
 
     create.create_machine_dir(runtime)?;
+    crate::ssh_ca::resolve(runtime.secret_store(), id, true).map_err(|error| {
+        LibVmError::MachinePreparationFailed {
+            reference: create.name.clone(),
+            message: format!("create machine SSH CA: {error}"),
+        }
+    })?;
     write_machine_config(create.dir(), &create.name, &create.spec)?;
 
     Ok(create)
@@ -728,6 +742,12 @@ impl Drop for MachineCreateGuard {
             return;
         }
 
+        if self.machine_parent.is_some() {
+            if let Err(error) = crate::ssh_ca::delete_scope(self.secret_store.as_ref(), self.id) {
+                tracing::error!(machine = %self.id, %error, "delete SSH CA scope during create rollback");
+            }
+        }
+
         if let Some(machine_parent) = self.machine_parent.take() {
             let _ = machine_parent.remove_tree(&self.id.to_string());
         }
@@ -805,6 +825,7 @@ mod tests {
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
             components,
             None,
         )
@@ -819,6 +840,7 @@ mod tests {
             paths,
             store.clone(),
             RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
             components,
             None,
         )
@@ -995,6 +1017,45 @@ mod tests {
             .await
             .expect("create machine");
         let id = machine.machine_id();
+        let original_config = store
+            .machine_config(id)
+            .await
+            .expect("read original config")
+            .expect("machine config exists");
+        let seeded_id = MachineId::new();
+        let seeded_config = crate::store::models::MachineConfig {
+            id: seeded_id,
+            lock_id: crate::lock_manager::LockId::from(42),
+            name: "reopen-stage-two".to_string(),
+            spec: VmSpec {
+                hardware: Some(Hardware {
+                    cpus: Some(2),
+                    memory: Some(1024),
+                    nested_virtualization: Some(false),
+                    rosetta: Some(false),
+                }),
+                ..VmSpec::current()
+            },
+            retention: MachineRetention::Ephemeral,
+            process: process.clone(),
+            template_name: Some("rust-worker".to_string()),
+            agent_mode: Some(crate::MachineAgent::Disabled),
+            machine_dir: paths.machine(seeded_id).dir().to_path_buf(),
+            created_at: 1,
+            modified_at: 1,
+            image_ref: "test-image:latest".to_string(),
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+            guest: crate::machine::MachineGuestConfig::default(),
+        };
+        let mut seeded_state = crate::runtime::core::stopped_machine_state(seeded_id, None);
+        seeded_state.updated_at = 1;
+        store
+            .add_machine(&seeded_config, &seeded_state)
+            .await
+            .expect("insert seeded machine");
         drop(machine);
         drop(runtime);
         drop(store);
@@ -1007,12 +1068,30 @@ mod tests {
             .await
             .expect("read durable config")
             .expect("machine config exists");
-        assert_eq!(config.retention, MachineRetention::Ephemeral);
-        assert_eq!(config.process, process);
-        assert_eq!(config.template_name.as_deref(), Some("rust-worker"));
-        assert_eq!(config.agent_mode, Some(crate::MachineAgent::Disabled));
-        assert_eq!(config.spec.forwards, vec![forward]);
-        assert!(config.spec.vsock.expect("vsock config").enabled);
+        for (label, expected) in [("builder", original_config), ("seeded", seeded_config)] {
+            assert_eq!(
+                reopened.machine_config(expected.id).await.expect(label),
+                Some(expected),
+                "{label}: whole config after sqlite reopen"
+            );
+        }
+        assert_eq!(config.retention, MachineRetention::Ephemeral, "builder");
+        assert_eq!(config.process, process, "builder");
+        assert_eq!(
+            config.template_name.as_deref(),
+            Some("rust-worker"),
+            "builder"
+        );
+        assert_eq!(
+            config.agent_mode,
+            Some(crate::MachineAgent::Disabled),
+            "builder"
+        );
+        assert_eq!(config.spec.forwards, vec![forward], "builder");
+        assert!(
+            config.spec.vsock.expect("builder: vsock config").enabled,
+            "builder"
+        );
     }
 
     #[tokio::test]

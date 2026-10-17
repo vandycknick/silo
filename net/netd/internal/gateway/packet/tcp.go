@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/inetaf/tcpproxy"
@@ -54,7 +55,7 @@ func TCP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Addres
 		}
 
 		natLock.Lock()
-		if replaced, ok := nat[localAddress]; ok {
+		if replaced, ok := nat[localAddress]; ok && !route.IsTailnetDestination(flow.DestIP) {
 			localAddress = replaced
 		}
 		natLock.Unlock()
@@ -81,6 +82,23 @@ func TCP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Addres
 			return
 		}
 		inbound := gonet.NewTCPConn(&wq, ep)
+		if decision.Tunnel != nil {
+			ip, ok := netip.AddrFromSlice(flow.DestIP)
+			if !ok {
+				_ = inbound.Close()
+				route.RecordFlowOutcome(flow, decision, "tunnel_error")
+				return
+			}
+			outbound, reason, err := route.DialTunnel(ctx, netip.AddrPortFrom(ip.Unmap(), flow.DestPort))
+			if err != nil {
+				_ = inbound.Close()
+				route.RecordFlowOutcome(flow, decision, reason)
+				return
+			}
+			proxyTCP(inbound, outbound)
+			route.RecordFlow(flow, decision)
+			return
+		}
 		target := net.JoinHostPort(localAddress.String(), fmt.Sprint(id.LocalPort))
 		endpointType, handled, dispatchErr := dispatcher.Handle(ctx, inbound, flow, target, decision)
 		if handled {

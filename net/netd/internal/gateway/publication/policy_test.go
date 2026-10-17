@@ -9,6 +9,7 @@ import (
 )
 
 func TestPolicyValidatesPublicationRequests(t *testing.T) {
+	t.Parallel()
 	guestIP := netip.MustParseAddr("192.168.127.2")
 	tests := []struct {
 		name       string
@@ -59,6 +60,7 @@ func TestPolicyValidatesPublicationRequests(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func request(local, remote string, protocol types.TransportProtocol) types.ExposeRequest {

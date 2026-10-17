@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::virt::error::VirtError;
 
@@ -21,10 +22,12 @@ struct MachineIdentifierState {
 }
 
 impl MachineIdentifier {
+    #[cfg(any(target_os = "macos", test))]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MachineIdentifierState {
@@ -38,6 +41,7 @@ impl MachineIdentifier {
         self.lock().bytes.clone()
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn is_empty(&self) -> bool {
         self.lock().bytes.is_empty()
     }
@@ -48,6 +52,7 @@ impl MachineIdentifier {
         self.lock().generated
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn set_generated_bytes(&self, bytes: Vec<u8>) {
         let mut state = self.lock();
         state.bytes = bytes;
@@ -230,6 +235,18 @@ impl VmConfig {
     #[cfg(feature = "mock-backend")]
     pub fn mock(&self) -> &MockOptions {
         &self.mock
+    }
+
+    pub(crate) fn park_timeout(&self) -> Duration {
+        #[cfg(feature = "mock-backend")]
+        if let Some(path) = self.mock().scenario.as_deref() {
+            if let Ok(scenario) = test_utils::Scenario::load(path) {
+                if let Some(timeout_ms) = scenario.forward.park_timeout_ms {
+                    return Duration::from_millis(timeout_ms);
+                }
+            }
+        }
+        crate::forward::inbound::PARK_TIMEOUT
     }
 
     /// Set the mock scenario path on an already-built config (used when the

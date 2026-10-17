@@ -18,9 +18,10 @@ The short version:
 
 Only network policies are implemented today. Kernel and userspace policies are the direction.
 
-The optional system appliance is managed by the separate `silod` executable.
-`silo daemon up` starts it through the native service manager; the CLI does not
-run the daemon loop. Direct CLI VM operations continue to use libvm in process.
+The optional system appliance is managed by the Silo daemon, `silo daemon run`,
+which `silo daemon up` registers with the native service manager; ordinary CLI
+commands never run the daemon loop. Direct CLI VM operations continue to use
+libvm in process.
 
 Each running VM is supervised by one `silo-vmm` process, Silo's virtual machine
 monitor (VMM). It manages VM configuration, execution, and lifecycle across
@@ -30,6 +31,24 @@ With the default krun backend, libkrun runs in a private worker: the same
 krun runtime binary. Runtime packages ship it as `bin/silo-vmm` (or
 `Contents/Helpers/silo-vmm` in `Silo.app`). See the
 [silo-vmm architecture and qualification notes](docs/architecture/silo-vmm.md).
+
+## Development tests
+
+Run `make test` inside `nix develop` for the host-supported Rust suites and netd
+tests. Rust tests use cargo-nextest with process isolation and a single workspace
+pass; integration tests share a prebuilt mock `silo-vmm`. `make test-unit` runs
+Rust unit tests only, while `make test-integration` runs Rust integration tests
+and netd tests. Both Rust unit commands also test rprobe without default features.
+The test runner warms netd's Go build cache before starting parallel Rust tests,
+so real-process fixtures do not spend their test timeout compiling cold dependencies.
+
+With `CI=true`, nextest uses the `ci` profile and writes JUnit results under
+`target/nextest/ci/junit.xml` (under `CARGO_TARGET_DIR` when overridden).
+Real-VM qualification is separate; see the [smoke suite](smoke/README.md).
+
+Taild admission tests run on Linux and macOS. Their successful fixture-registry
+pull subtests run only on Linux: macOS registry verification uses the keychain,
+not the fixture's `SSL_CERT_FILE`. Pre-pull rejection checks still run on both.
 
 ## CLI
 
@@ -84,6 +103,20 @@ silo shell dev
 VM without starting an application workload. Image process settings are retained
 with the machine and provide the default command for `silo exec dev` when no
 command follows `--`.
+
+Copy regular files to and from a running VM:
+
+```bash
+silo cp ./patch.diff dev:/root/patch.diff
+silo cp dev:/root/shot.png ./shot.png
+```
+
+Use `-` for stdin/stdout. Uploads accept `--mode OCTAL`, numeric
+`--owner UID[:GID]`, `--parents` (`-p`), and best-effort (not atomic)
+`--no-clobber` (`-n`). Guest paths must be absolute; prefix local paths
+containing `:` with `./` or `/`. Downloads replace the local target atomically.
+Use `--format json` for a transfer summary, except when downloading to stdout
+(`-`), where stdout carries only file bytes. Human summaries go to stderr.
 
 ## Templates
 

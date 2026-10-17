@@ -30,7 +30,7 @@ pub struct Cmd {
     )]
     pub environment: Vec<(String, String)>,
 
-    /// Attach a TTY to the guest command.
+    /// Attach a TTY through agent RPC; raw input and resize begin after process Started.
     #[arg(long, short = 't')]
     pub tty: bool,
 

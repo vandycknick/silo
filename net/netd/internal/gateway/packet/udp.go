@@ -57,7 +57,7 @@ func UDP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Addres
 		}
 
 		natLock.Lock()
-		if replaced, ok := nat[localAddress]; ok {
+		if replaced, ok := nat[localAddress]; ok && !route.IsTailnetDestination(flow.DestIP) {
 			localAddress = replaced
 		}
 		natLock.Unlock()
@@ -70,6 +70,10 @@ func UDP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Addres
 		}
 		if decision.Action == hooks.RouteDeny {
 			route.RecordFlow(flow, decision)
+			return false
+		}
+		if decision.Tunnel != nil {
+			route.RecordFlowOutcome(flow, decision, "tunnel_error")
 			return false
 		}
 

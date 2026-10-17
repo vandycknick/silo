@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride};
-use crate::LibVmError;
+use crate::{LibVmError, RegistryPolicy};
 
 /// Builder for opening a local libvm runtime.
 ///
@@ -45,6 +45,12 @@ impl RuntimeBuilder {
     /// Sets runtime networking defaults.
     pub fn networking(mut self, networking: RuntimeNetworkingConfig) -> Self {
         self.config = self.config.with_networking(networking);
+        self
+    }
+
+    /// Sets the registry policy applied before contacting OCI registries.
+    pub fn registry_policy(mut self, policy: RegistryPolicy) -> Self {
+        self.config = self.config.with_registry_policy(policy);
         self
     }
 

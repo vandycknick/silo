@@ -3,6 +3,7 @@ package policy
 import "testing"
 
 func TestBuiltinRegistry(t *testing.T) {
+	t.Parallel()
 	registry := BuiltinRegistry()
 
 	https, ok := registry.Endpoint("https")
@@ -28,4 +29,5 @@ func TestBuiltinRegistry(t *testing.T) {
 	if registries.Family != EndpointFamilyPackage || registries.Transport != TransportTLSTerminate || registries.TLSMode != TLSModeTerminate || registries.Schema != EndpointSchemaRegistries {
 		t.Fatalf("unexpected registries definition: %#v", registries)
 	}
+
 }

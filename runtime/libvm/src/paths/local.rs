@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use crate::paths::defaults::{default_run_root, ensure_run_root, resolve_default_home};
 use crate::paths::machine::{
     MachinePaths, EXEC_LOG_FILE_NAME, LOGS_DIR_NAME, MACHINES_DIR_NAME,
     NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_DIR_NAME, NETWORK_SERVICE_LOG_FILE_NAME,
@@ -21,9 +20,12 @@ const LOCKS_DIR_NAME: &str = "locks";
 /// ```text
 /// <home>/            persistent state (~/.silo or SILO_HOME)
 ///   state.db  machines/<id>/  logs/machines/<id>/  images/  keys/
-/// <run_root>/        generated sockets, pidfiles, locks (/tmp/silo-<euid>)
+/// <run_root>/        generated sockets, pidfiles, locks
 ///   machines/<id>/  networks/<nid>/  locks/
 /// ```
+///
+/// Generated state defaults to `/tmp/silo-<euid>` unless `SILO_RUN_ROOT`
+/// (absolute) overrides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalRoots {
     home: PathBuf,
@@ -43,13 +45,6 @@ impl LocalRoots {
             home: home.into(),
             run_root: run_root.into(),
         }
-    }
-
-    pub(crate) fn from_env() -> Result<Self, LibVmError> {
-        let home = resolve_default_home()?;
-        let run_root = default_run_root();
-        ensure_run_root(&run_root)?;
-        Ok(Self::with_roots(home, run_root))
     }
 
     pub(crate) fn home(&self) -> &Path {
@@ -103,10 +98,6 @@ impl LocalPaths {
     #[cfg(test)]
     pub(crate) fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self::from_roots(LocalRoots::new(data_dir))
-    }
-
-    pub(crate) fn from_env() -> Result<Self, LibVmError> {
-        Ok(Self::from_roots(LocalRoots::from_env()?))
     }
 
     pub(crate) fn from_roots(roots: LocalRoots) -> Self {
@@ -499,7 +490,7 @@ mod tests {
         let uid = nix::unistd::geteuid().as_raw();
         let roots = LocalRoots::with_roots(
             "/Users/a-rather-long-account-name/.silo",
-            format!("/tmp/silo-{uid}"),
+            format!("{}/silo-{uid}", crate::paths::defaults::RUN_ROOT_PARENT),
         );
         let paths = LocalPaths::from_roots(roots);
         let machine_socket = paths.machine(MachineId::new()).vmm_socket_path();

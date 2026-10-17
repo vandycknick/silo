@@ -6,19 +6,25 @@ import (
 	"testing"
 )
 
-func TestOpenRejectsCancelledContextBeforeLoadingBridge(t *testing.T) {
+func TestOpenRejectsInvalidInputsBeforeLoadingBridge(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := Open(ctx)
-	if !IsErrorKind(err, ErrorCancelled) {
-		t.Fatalf("Open() error = %v, want ErrorCancelled", err)
+	tests := []struct {
+		name    string
+		context context.Context
+		options []RuntimeOption
+		want    ErrorKind
+	}{
+		{name: "cancelled context", context: ctx, want: ErrorCancelled},
+		{name: "blank runtime path", context: context.Background(), options: []RuntimeOption{WithRuntimeRoot("   ")}, want: ErrorInvalidArgument},
 	}
-}
-
-func TestOpenRejectsBlankRuntimePathBeforeLoadingBridge(t *testing.T) {
-	_, err := Open(context.Background(), WithRuntimeRoot("   "))
-	if !IsErrorKind(err, ErrorInvalidArgument) {
-		t.Fatalf("Open() error = %v, want ErrorInvalidArgument", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Open(test.context, test.options...)
+			if !IsErrorKind(err, test.want) {
+				t.Fatalf("Open() error = %v, want %v", err, test.want)
+			}
+		})
 	}
 }
 

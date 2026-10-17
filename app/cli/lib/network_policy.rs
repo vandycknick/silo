@@ -76,27 +76,27 @@ mod tests {
     const MINIMAL_JSON: &str = r#"{ "version": 1, "metadata": { "source": "test" } }"#;
 
     #[test]
-    fn resolves_absolute_json_policy() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("policy.json");
-        fs::write(&path, MINIMAL_JSON).expect("write policy");
-
-        let policy = resolve_network_policy_source(path.to_str().expect("utf8"), None)
-            .expect("resolve policy");
-
-        assert_eq!(policy.metadata()["source"], "test");
-    }
-
-    #[test]
-    fn resolves_named_json_policy_from_config_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let policies = dir.path().join("policies");
-        fs::create_dir(&policies).expect("create policies dir");
-        fs::write(policies.join("github.json"), MINIMAL_JSON).expect("write policy");
-
-        let policy = resolve_network_policy_source("github", Some(dir.path())).expect("resolve");
-
-        assert_eq!(policy.metadata()["source"], "test");
+    fn resolves_json_policy_sources() {
+        for (label, named) in [("absolute", false), ("named", true)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = if named {
+                let policies = dir.path().join("policies");
+                fs::create_dir(&policies).expect("create policies dir");
+                policies.join("github.json")
+            } else {
+                dir.path().join("policy.json")
+            };
+            fs::write(&path, MINIMAL_JSON).expect("write policy");
+            let source = if named {
+                "github"
+            } else {
+                path.to_str().expect("utf8")
+            };
+            let config_dir = if named { Some(dir.path()) } else { None };
+            let policy = resolve_network_policy_source(source, config_dir)
+                .unwrap_or_else(|err| panic!("{label}: {err}"));
+            assert_eq!(policy.metadata()["source"], "test", "{label}");
+        }
     }
 
     #[test]
