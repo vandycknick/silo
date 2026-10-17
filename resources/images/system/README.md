@@ -36,13 +36,12 @@ publishes the two images by digest and creates the multi-platform index only
 after both builds pass. `make rootfs` emits the OCI
 root filesystem tar consumed by the existing image-to-ext4 path.
 
-Publication is manual and protected by the `system-image-release` GitHub
-environment. It first publishes revision-scoped candidates, then creates the
-requested release tag from their immutable index. Native boot and runtime
-qualification is not currently part of this workflow. The workflow emits
-`system-image.env`; release CLI builds consume its immutable
-`SILO_SYSTEM_IMAGE=...@sha256:...` value. Release builds without this input have no
-floating image default. Debug builds alone retain the explicit `:dev` default.
+Every push to `main` that touches the image publishes it as `latest`, which the
+CLI bakes in as its default (`ghcr.io/vandycknick/silo/system:latest`, unless
+`SILO_SYSTEM_IMAGE` is set at compile time). Running daemons pick up a new
+`latest` on their periodic update check. A manual run with `publish_dev`
+publishes any branch as `dev` instead. Native boot and runtime qualification is
+not currently part of this workflow.
 
 `make verify` checks the source contract without requiring a running Docker
 daemon. A container build additionally validates packages, configuration,

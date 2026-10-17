@@ -14,9 +14,11 @@ use utils::HumanSize;
 
 use crate::daemon::record::DaemonRecord;
 
-#[cfg(debug_assertions)]
-const DEVELOPMENT_IMAGE: &str = "ghcr.io/vandycknick/silo/system:dev";
-const RELEASE_IMAGE: Option<&str> = option_env!("SILO_SYSTEM_IMAGE");
+/// Baked in at compile time; set `SILO_SYSTEM_IMAGE` while building to override it.
+const DEFAULT_IMAGE: &str = match option_env!("SILO_SYSTEM_IMAGE") {
+    Some(image) => image,
+    None => "ghcr.io/vandycknick/silo/system:latest",
+};
 
 const DEFAULT_CPUS: u8 = 4;
 const DEFAULT_MEMORY: &str = "8GiB";
@@ -177,10 +179,10 @@ pub(crate) fn resolve(
     }
     shares.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let image = match &overrides.image {
-        Some(image) => image.clone(),
-        None => default_image()?,
-    };
+    let image = overrides
+        .image
+        .clone()
+        .unwrap_or_else(|| DEFAULT_IMAGE.to_string());
     if image.trim().is_empty() {
         bail!("system image cannot be empty");
     }
@@ -216,21 +218,6 @@ pub(crate) fn resolve(
     })
 }
 
-fn default_image() -> eyre::Result<String> {
-    if let Some(image) = RELEASE_IMAGE {
-        if !image.contains("@sha256:") {
-            bail!("the build-time SILO_SYSTEM_IMAGE must use an immutable sha256 digest");
-        }
-        return Ok(image.to_string());
-    }
-    #[cfg(debug_assertions)]
-    {
-        Ok(DEVELOPMENT_IMAGE.to_string())
-    }
-    #[cfg(not(debug_assertions))]
-    bail!("this release has no qualified default system image; specify --system-image explicitly")
-}
-
 fn parse_size(value: &str, field: &str) -> eyre::Result<u64> {
     HumanSize::from_str(value)
         .map_err(|error| eyre::eyre!("invalid system {field}: {error}"))?
@@ -255,7 +242,9 @@ mod tests {
     use silod_spec::arguments::{Backend, PublishBind, Share, SystemOverrides};
 
     use crate::daemon::record::DaemonRecord;
-    use crate::daemon::system_config::{resolve, ResolvedSystemConfig, SystemBackend};
+    use crate::daemon::system_config::{
+        resolve, ResolvedSystemConfig, SystemBackend, DEFAULT_IMAGE,
+    };
     use silod_spec::paths::DaemonPaths;
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -420,9 +409,8 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn debug_build_follows_the_development_image() {
+    fn omitted_image_uses_the_baked_in_default() {
         let temp = tempfile::tempdir().expect("temp home");
         let desired = resolve(
             &SystemOverrides::default(),
@@ -431,8 +419,6 @@ mod tests {
             None,
         )
         .expect("resolve");
-        let expected =
-            option_env!("SILO_SYSTEM_IMAGE").unwrap_or("ghcr.io/vandycknick/silo/system:dev");
-        assert_eq!(desired.image, expected);
+        assert_eq!(desired.image, DEFAULT_IMAGE);
     }
 }

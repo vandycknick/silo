@@ -121,9 +121,9 @@ from `config.yaml` reverts it on the next `up`. The exceptions are settings
 fixed when the installation was created: the backend and the root and data disk
 sizes keep their recorded values unless set explicitly.
 
-Release builds use the qualified image digest embedded via `SILO_SYSTEM_IMAGE`.
-Development builds otherwise use `ghcr.io/vandycknick/silo/system:dev`. A release
-built without an embedded image requires an explicit image override.
+Every build bakes in `ghcr.io/vandycknick/silo/system:latest` as the default
+system image. Set `SILO_SYSTEM_IMAGE` at compile time to bake in a different
+reference, or pass `--system-image` to override it at runtime.
 
 To override defaults, optionally add a strict version-1 `daemon` section to
 `~/.config/silo/config.yaml` (or the equivalent `XDG_CONFIG_HOME` path).
