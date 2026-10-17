@@ -437,6 +437,7 @@ fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     ]);
     release::configure_guest_init_command(
         &mut cargo,
+        context.host,
         context.profile == Profile::Release,
         context.workspace_root,
         context.target_dir,
@@ -486,6 +487,7 @@ fn rprobe_cargo_command(context: &BuildContext<'_>) -> Result<Command, Component
     ]);
     release::configure_guest_init_command(
         &mut cargo,
+        context.host,
         context.profile == Profile::Release,
         context.workspace_root,
         context.target_dir,

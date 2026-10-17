@@ -6,6 +6,7 @@ use std::process::Command;
 use thiserror::Error;
 
 use crate::command;
+use crate::targets::HostTarget;
 
 const APPLE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 pub const MACOS_DEPLOYMENT_TARGET: &str = "26.0";
@@ -121,12 +122,13 @@ pub fn configure_command(
 
 pub fn configure_guest_init_command(
     command: &mut Command,
+    host: HostTarget,
     profile_is_release: bool,
     workspace_root: &Path,
     target_dir: &Path,
 ) {
     let mut flags = vec!["-C".to_string(), "panic=abort".to_string()];
-    if profile_is_release && env::consts::OS == "macos" {
+    if profile_is_release && host == HostTarget::MacosArm64 {
         flags.extend(remapped_rustflag_parts(workspace_root, target_dir));
         flags.extend(["-C".to_string(), "strip=symbols".to_string()]);
     }
