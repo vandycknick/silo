@@ -450,7 +450,28 @@ fn build_rprobe(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     if context.host != HostTarget::LinuxArm64 {
         return Err(ComponentError::UnsupportedRprobeHost);
     }
-    let mut cargo = cargo_command(context)?;
+    command::run(rprobe_cargo_command(context)?)?;
+    let binary = context
+        .target_dir
+        .join("aarch64-unknown-linux-musl")
+        .join(context.profile.directory())
+        .join("silo-rprobe");
+    let profile = context.target_dir.join(context.profile.directory());
+    crate::rprobe::build_kernel(
+        context.workspace_root,
+        &binary,
+        &profile.join("rprobe-build"),
+        &profile.join("assets"),
+    )?;
+    Ok(())
+}
+
+/// rprobe is a static musl guest binary, so it must not get the host-product
+/// release toolchain from `release::configure_command`. That config pins the
+/// host linker to the runner's `/usr/bin/cc`, which cargo also uses for build
+/// scripts even under `--target`, mixing distro binutils/crt with Nix rustc.
+fn rprobe_cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> {
+    let mut cargo = toolchain_cargo_command(context)?;
     cargo.args([
         "build",
         "--locked",
@@ -470,20 +491,7 @@ fn build_rprobe(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         context.target_dir,
     );
     context.profile.apply_cargo(&mut cargo);
-    command::run(cargo)?;
-    let binary = context
-        .target_dir
-        .join("aarch64-unknown-linux-musl")
-        .join(context.profile.directory())
-        .join("silo-rprobe");
-    let profile = context.target_dir.join(context.profile.directory());
-    crate::rprobe::build_kernel(
-        context.workspace_root,
-        &binary,
-        &profile.join("rprobe-build"),
-        &profile.join("assets"),
-    )?;
-    Ok(())
+    Ok(cargo)
 }
 
 fn build_initramfs(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -502,18 +510,21 @@ fn build_initramfs(context: &BuildContext<'_>) -> Result<(), ComponentError> {
 }
 
 fn cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> {
-    let cargo_program = release::tool("cargo")?;
-    let mut cargo = Command::new(&cargo_program);
-    cargo
-        .current_dir(context.workspace_root)
-        .env("CARGO_TARGET_DIR", context.target_dir);
+    let mut cargo = toolchain_cargo_command(context)?;
     release::configure_command(
         &mut cargo,
         context.profile == Profile::Release,
         context.workspace_root,
         context.target_dir,
     )?;
-    cargo.env("CARGO_TARGET_DIR", context.target_dir);
+    Ok(cargo)
+}
+
+fn toolchain_cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> {
+    let mut cargo = Command::new(release::tool("cargo")?);
+    cargo
+        .current_dir(context.workspace_root)
+        .env("CARGO_TARGET_DIR", context.target_dir);
     Ok(cargo)
 }
 
@@ -528,8 +539,8 @@ pub(crate) fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -
 #[cfg(test)]
 mod tests {
     use crate::components::{
-        build_rprobe, rprobe_test_command, workspace_test_command, BuildContext, ComponentError,
-        TestSuite,
+        build_rprobe, rprobe_cargo_command, rprobe_test_command, workspace_test_command,
+        BuildContext, ComponentError, TestSuite,
     };
     use crate::profiles::Profile;
     use crate::targets::HostTarget;
@@ -548,6 +559,43 @@ mod tests {
                 build_rprobe(&context),
                 Err(ComponentError::UnsupportedRprobeHost)
             ));
+        }
+    }
+
+    #[test]
+    fn release_probe_build_keeps_the_build_toolchain_for_build_scripts() {
+        // Regression: host-product release config pinned CARGO_TARGET_<host>_LINKER
+        // to /usr/bin/cc, which cargo applies to build scripts too, and they died
+        // with SIGILL on ubuntu-26.04-arm. The probe gets guest rustflags only.
+        for profile in [Profile::Debug, Profile::Release] {
+            let context = BuildContext {
+                workspace_root: Path::new("/workspace"),
+                target_dir: Path::new("/build"),
+                profile,
+                host: HostTarget::LinuxArm64,
+            };
+            let command = rprobe_cargo_command(&context).expect("probe cargo command");
+            let mut env: Vec<_> = command
+                .get_envs()
+                .map(|(key, value)| (key.to_str().unwrap(), value.map(|v| v.to_str().unwrap())))
+                .collect();
+            env.sort_unstable();
+            assert_eq!(
+                env,
+                [
+                    ("CARGO_ENCODED_RUSTFLAGS", Some("-C\u{1f}panic=abort")),
+                    ("CARGO_TARGET_DIR", Some("/build")),
+                    ("RUSTFLAGS", Some("-C panic=abort")),
+                ]
+            );
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(args.contains(&"--release"), profile == Profile::Release);
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--target", "aarch64-unknown-linux-musl"]));
         }
     }
 

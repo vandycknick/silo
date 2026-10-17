@@ -242,9 +242,9 @@ async fn run(
     let pid_guard = PidGuard::create(&args.pidfile).await?;
     let mut parent_loss_monitor = Some(sync_reporter.monitor_parent_loss(startup_cancel.clone())?);
     let primary_machine = startup::PrimaryMachine::default();
-    let mut signal_task =
-        match spawn_startup_signal_handler(startup_cancel.clone(), primary_machine.clone()) {
-            Ok(task) => Some(task),
+    let (mut signal_task, shutdown_signals) =
+        match install_signal_handlers(startup_cancel.clone(), primary_machine.clone()) {
+            Ok((task, signals)) => (Some(task), signals),
             Err(error) => {
                 if let Some(monitor) = parent_loss_monitor.take() {
                     monitor.shutdown().await;
@@ -306,7 +306,7 @@ async fn run(
                     if let Some(monitor) = parent_loss_monitor.take() {
                         monitor.shutdown().await;
                     }
-                    shutdown::run(runtime, initialized.context, handles).await
+                    shutdown::run(runtime, initialized.context, handles, shutdown_signals).await
                 }
                 Err(err) => match initialized.context.forwards.shutdown().await {
                     Ok(()) => Err(err),
@@ -339,41 +339,39 @@ async fn run(
     .await
 }
 
-fn spawn_startup_signal_handler(
+/// Registers every SIGINT/SIGTERM listener this generation uses.
+///
+/// The task handles startup: the first signal cancels startup, later ones
+/// force-stop the primary VM. The returned [`shutdown::ShutdownSignals`] only
+/// buffer until `shutdown::run` takes them over, so a stop request that lands
+/// while the startup task is torn down after readiness still stops the VM.
+///
+/// The startup listeners register first, so every signal the buffer holds also
+/// reached startup; none can sit unnoticed while startup runs to completion.
+fn install_signal_handlers(
     cancelled: tokio_util::sync::CancellationToken,
     primary_machine: startup::PrimaryMachine,
-) -> eyre::Result<tokio::task::JoinHandle<()>> {
-    #[cfg(unix)]
-    {
-        let mut interrupt =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        Ok(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = interrupt.recv() => {},
-                    _ = terminate.recv() => {},
-                }
-                if cancelled.is_cancelled() {
-                    if let Some(machine) = primary_machine.get() {
-                        if let Err(error) = machine.force_stop().await {
-                            tracing::warn!(%error, "startup force-stop failed");
-                        }
-                    }
-                } else {
-                    cancelled.cancel();
-                }
+) -> eyre::Result<(tokio::task::JoinHandle<()>, shutdown::ShutdownSignals)> {
+    let mut startup_signals = shutdown::ShutdownSignals::register()?;
+    let shutdown_signals = shutdown::ShutdownSignals::register()?;
+    let task = tokio::spawn(async move {
+        loop {
+            if let Err(error) = startup_signals.recv().await {
+                tracing::warn!(%error, "startup signal listener stopped");
+                return;
             }
-        }))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            cancelled.cancel();
-        }))
-    }
+            if cancelled.is_cancelled() {
+                if let Some(machine) = primary_machine.get() {
+                    if let Err(error) = machine.force_stop().await {
+                        tracing::warn!(%error, "startup force-stop failed");
+                    }
+                }
+            } else {
+                cancelled.cancel();
+            }
+        }
+    });
+    Ok((task, shutdown_signals))
 }
 
 #[cfg(target_os = "macos")]
@@ -454,7 +452,41 @@ mod tests {
 
     use clap::Parser;
 
-    use crate::{raise_open_file_limit, write_serial_generation_boundary, Args};
+    use crate::{
+        install_signal_handlers, raise_open_file_limit, write_serial_generation_boundary, Args,
+    };
+
+    #[tokio::test]
+    async fn stop_signals_survive_the_startup_to_shutdown_handoff() {
+        use nix::sys::signal::{raise, Signal};
+        use std::time::Duration;
+
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let (startup, mut shutdown_signals) =
+            install_signal_handlers(cancelled.clone(), crate::startup::PrimaryMachine::default())
+                .expect("install signal handlers");
+
+        // Late in startup: the startup handler consumes the signal, yet the
+        // generation it just published must still stop.
+        raise(Signal::SIGINT).expect("raise SIGINT while startup listens");
+        tokio::time::timeout(Duration::from_secs(5), cancelled.cancelled())
+            .await
+            .expect("startup handler observes the signal");
+        startup.abort();
+        let _ = startup.await;
+        tokio::time::timeout(Duration::from_secs(5), shutdown_signals.recv())
+            .await
+            .expect("shutdown observes a signal the startup handler consumed")
+            .expect("shutdown listener stays registered");
+
+        // Inside the handoff: the startup listeners are gone and shutdown has
+        // not polled yet. Tokio drops this signal unless a listener survived.
+        raise(Signal::SIGTERM).expect("raise SIGTERM during the handoff");
+        tokio::time::timeout(Duration::from_secs(5), shutdown_signals.recv())
+            .await
+            .expect("shutdown observes a signal delivered before it polled")
+            .expect("shutdown listener stays registered");
+    }
 
     #[test]
     fn startup_raises_the_soft_open_file_limit_to_the_hard_limit() {

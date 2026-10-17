@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::virt::VmExit;
 use protocol::v1::VmState;
-use tokio::signal;
+use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::services::ServiceHandles;
@@ -11,14 +11,48 @@ use crate::services::ServiceHandles;
 const VM_STOP_TIMEOUT: Duration = Duration::from_secs(65);
 const SERVICE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// SIGINT and SIGTERM listeners for one consumer.
+///
+/// Tokio drops a signal delivered while no listener for it is registered, so
+/// a stop request is only reliable if one listener stays registered from
+/// before readiness is published until shutdown completes. Register once and
+/// hand the value over; never drop it and register again later.
+pub(crate) struct ShutdownSignals {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl ShutdownSignals {
+    pub(crate) fn register() -> std::io::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// Wait for the next SIGINT or SIGTERM, including one delivered since
+    /// registration or the previous call. Cancel safe.
+    pub(crate) async fn recv(&mut self) -> std::io::Result<()> {
+        let received = tokio::select! {
+            received = self.interrupt.recv() => received,
+            received = self.terminate.recv() => received,
+        };
+        received.ok_or_else(|| std::io::Error::other("signal listener closed"))
+    }
+}
+
 pub async fn run(
     runtime: RuntimeContext,
     ctx: DaemonContext,
     mut handles: ServiceHandles,
+    mut signals: ShutdownSignals,
 ) -> eyre::Result<()> {
     let mut errors = Vec::new();
     let trigger = tokio::select! {
-        result = wait_for_signal() => {
+        // A signal already pending when another trigger fires must start the
+        // stop, not sit in the listener and escalate it in graceful_stop.
+        biased;
+        result = signals.recv() => {
             if let Err(error) = result { errors.push(error.to_string()); }
             tracing::info!(instance = %ctx.machine.name(), "shutdown signal received");
             ShutdownTrigger::Requested("shutdown requested")
@@ -50,7 +84,7 @@ pub async fn run(
             if let Err(error) = ctx.store.set_vm_state(VmState::Stopping, message) {
                 errors.push(error.to_string());
             }
-            if let Err(error) = graceful_stop(&ctx).await {
+            if let Err(error) = graceful_stop(&ctx, &mut signals).await {
                 errors.push(error.to_string());
             }
             match wait_for_machine_stop(&ctx.machine).await {
@@ -117,7 +151,7 @@ async fn stop_forwards(handles: &mut ServiceHandles) {
     }
 }
 
-async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<()> {
+async fn graceful_stop(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> eyre::Result<()> {
     let mut stop_task = tokio::spawn({
         let machine = ctx.machine.clone();
         async move { machine.stop().await }
@@ -125,7 +159,7 @@ async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<()> {
 
     tokio::select! {
         result = &mut stop_task => return result.map_err(eyre::Report::from)?.map_err(eyre::Report::from),
-        result = wait_for_signal() => {
+        result = signals.recv() => {
             if let Err(error) = result { tracing::warn!(%error, "shutdown signal listener failed"); }
             tracing::warn!(instance = %ctx.machine.name(), "second shutdown signal received; escalating backend stop");
         }
@@ -231,26 +265,6 @@ async fn cleanup(_runtime: &RuntimeContext, ctx: &DaemonContext) -> eyre::Result
 
     tracing::info!(instance = %ctx.machine.name(), "instance stopped");
     Ok(())
-}
-
-async fn wait_for_signal() -> std::io::Result<()> {
-    let ctrl_c = signal::ctrl_c();
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())?
-            .recv()
-            .await
-            .ok_or_else(|| std::io::Error::other("SIGTERM listener closed"))
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<std::io::Result<()>>();
-
-    tokio::select! {
-        result = ctrl_c => result,
-        result = terminate => result,
-    }
 }
 
 #[cfg(test)]
