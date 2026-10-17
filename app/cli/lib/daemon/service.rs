@@ -15,7 +15,7 @@ use silod_spec::status::{ComponentState, CorePhase, DaemonStatus, SystemPhase, S
 use crate::ui::Spinner;
 
 #[cfg(target_os = "linux")]
-const SERVICE_NAME: &str = "silo-system.service";
+const SERVICE_NAME: &str = "silo-daemon.service";
 
 /// Identifies a Silo-created service definition. Preserve the ID when rewriting it.
 const MARKER_PREFIX: &str = "Silo-Installation-ID: ";
@@ -712,7 +712,7 @@ fn native_service_path() -> eyre::Result<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(home.join("Library/LaunchAgents/io.silo.system.plist"));
+        return Ok(home.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist")));
     }
     #[allow(unreachable_code)]
     Err(eyre::eyre!(
@@ -895,7 +895,7 @@ fn render_native(
         .collect::<eyre::Result<Vec<_>>>()?
         .concat();
     Ok(format!(
-        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo daemon manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\n{environment}ExecStart={}\nExecStop={}\nRestart=on-failure\nRestartPreventExitStatus=2\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo daemon\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nSyslogIdentifier=silo-daemon\n{environment}ExecStart={}\nExecStop={}\nRestart=on-failure\nRestartPreventExitStatus=2\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         command, stop_command
     ).into_bytes())
 }
@@ -953,7 +953,7 @@ fn systemd_environment(key: &str, path: &Path) -> eyre::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-const LAUNCHD_LABEL: &str = "io.silo.system";
+const LAUNCHD_LABEL: &str = "sh.silo.daemon";
 
 #[cfg(target_os = "macos")]
 fn render_native(
@@ -1783,7 +1783,7 @@ mod tests {
         let service = ServiceConfig {
             executable: PathBuf::from("/Applications/Silo & Co/silo"),
             native_service_path: PathBuf::from(
-                "/Users/me/Library/LaunchAgents/io.silo.system.plist",
+                "/Users/me/Library/LaunchAgents/sh.silo.daemon.plist",
             ),
             paths: DaemonPaths::new("/Users/me/.silo"),
             environment: crate::daemon::service::ServiceEnvironment {

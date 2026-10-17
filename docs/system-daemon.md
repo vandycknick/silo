@@ -413,7 +413,7 @@ the service manager does not relaunch it in a loop. The service stays enabled;
 the next `up` or login starts it again. On macOS the process's stdout/stderr
 are captured in `~/.silo/logs/daemon/native.log`, which is where
 panics and failures that happen before the supervisor publishes a status record
-appear; on Linux use `journalctl --user -u silo-system.service`.
+appear; on Linux use `journalctl --user -u silo-daemon.service`.
 
 The launchd agent restarts only after an unsuccessful exit, allows 90 seconds
 for the manager to detach before SIGKILL, uses `AbandonProcessGroup`, and runs
