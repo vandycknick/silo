@@ -14,6 +14,12 @@ func TestPlanningNative(t *testing.T) {
 	if os.Getenv("SILO_GO_FFI_PATH") == "" && os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
 		t.Skip("actual native bridge required")
 	}
+	// An embedded bridge materializes into $SILO_HOME/cache on first load. That is
+	// SDK load state, not planning state, so pin the bridge under its own home first.
+	t.Setenv("SILO_HOME", t.TempDir())
+	if _, err := VerifiedNativeABIVersion(); err != nil {
+		t.Fatal(err)
+	}
 	root := t.TempDir()
 	home := filepath.Join(root, "absent-home")
 	t.Setenv("SILO_HOME", home)
