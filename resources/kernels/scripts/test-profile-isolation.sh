@@ -40,7 +40,7 @@ if [ "$(sed -n 's/^output=//p' "$temp_dir/workload-default")" != "$temp_dir/targ
     printf 'default workload output no longer matches the publisher contract\n' >&2
     exit 1
 fi
-if [ "$(sed -n 's/^reference=//p' "$temp_dir/workload-default")" != 7.2.2 ]; then
+if [ "$(sed -n 's/^reference=//p' "$temp_dir/workload-default")" != "$(make -s -C "$kernel_root" kernel-version)" ]; then
     printf 'default workload reference no longer matches the publisher contract\n' >&2
     exit 1
 fi
