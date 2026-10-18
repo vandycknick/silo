@@ -154,7 +154,7 @@ def scenario(layout, work, driver, isolation, failure=None):
         config.joinpath("config.yaml").write_text("daemon:\n  version: '1'\n  system:\n    enabled: false\n  tailscale:\n    enabled: true\n    control-url: 'http://127.0.0.1:%d'\n    enrollment:\n      mode: none\n" % blocked.getsockname()[1])
         log = work / "daemon.log"
         with log.open("w+") as output:
-            daemon = subprocess.Popen([*isolation, str(bin_dir / "silo"), "daemon", "run"], env=environment, stdout=output, stderr=output, start_new_session=True)
+            daemon = subprocess.Popen([*isolation, str(cli), "daemon", "run"], env=environment, stdout=output, stderr=output, start_new_session=True)
             try:
                 status_path = home / "daemon/status.json"
                 deadline = time.monotonic() + 45
