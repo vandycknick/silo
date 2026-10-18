@@ -57,6 +57,16 @@ def assert_no_sdk(home):
             raise RuntimeError(f"unexpected SDK installation/materialization: {path}")
 
 
+def maps_file(mappings, path):
+    # vmmap reports /private/tmp files as /tmp/..., so compare resolved paths.
+    target = path.resolve()
+    for line in mappings.splitlines():
+        start = line.find(" /")
+        if start != -1 and Path(line[start + 1:].strip()).resolve() == target:
+            return True
+    return False
+
+
 def signature(path):
     checked(["codesign", "--verify", "--strict", path])
     result = subprocess.run(["codesign", "-d", "--verbose=4", str(path)], capture_output=True, text=True, timeout=30)
@@ -182,7 +192,7 @@ def scenario(layout, work, driver, isolation, failure=None):
                                 mappings = Path(f"/proc/{pid}/maps").read_text()
                             else:
                                 mappings = checked(["vmmap", str(pid)])
-                            if str(bridge.resolve()) in mappings:
+                            if maps_file(mappings, bridge):
                                 admitted = checked([*isolation, driver, "--inspect", "--endpoint", status["control_endpoint"], "--home", home, "--config-dir", config, "--bridge", bridge.resolve(), "--components-root", layout], env=environment)
                                 selection = json.loads(admitted)
                                 if selection["generation"] != status["generation"]:
@@ -285,7 +295,8 @@ def main():
             held.write_bytes(original)
             try:
                 if sys.platform == "darwin":
-                    checked(["install_name_tool", "-id", held, held])
+                    # A relative id fits the shipped header padding; a deep temp path does not.
+                    checked(["install_name_tool", "-id", "@loader_path/" + held.name, held])
                     checked(["codesign", "--force", "--sign", "-", held])
                 for kind, declaration in (
                     ("ABI mismatch", "unsigned int silo_ffi_abi_version(void) { return 0; }"),
