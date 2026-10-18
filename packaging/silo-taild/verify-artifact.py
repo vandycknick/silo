@@ -289,15 +289,20 @@ def main():
                 scenario(package, root / "dependency-failure", driver, isolation, "native loader")
             finally:
                 bridge.write_bytes(original)
-            # Deliberately incompatible wrappers link the actual shipped bridge,
+            # Deliberately incompatible wrappers load the actual shipped bridge,
             # exercising native admission, never mocking management or tsnet.
             held = bridge.with_name("admission-original" + bridge.suffix)
             held.write_bytes(original)
+            link_target = held
+            if sys.platform == "darwin":
+                # Apple ld rejects linking against the shipped bridge ("mis-aligned
+                # LINKEDIT string pool"), so link a stub that installs as the held
+                # copy; dyld then loads the real, untouched bridge at runtime.
+                stub_source = root / "admission-stub.c"
+                stub_source.write_text("void silo_runtime_open(void) {}\n")
+                link_target = root / "admission-stub.dylib"
+                checked([os.environ.get("CC", "cc"), "-dynamiclib", "-install_name", "@loader_path/" + held.name, stub_source, "-o", link_target])
             try:
-                if sys.platform == "darwin":
-                    # A relative id fits the shipped header padding; a deep temp path does not.
-                    checked(["install_name_tool", "-id", "@loader_path/" + held.name, held])
-                    checked(["codesign", "--force", "--sign", "-", held])
                 for kind, declaration in (
                     ("ABI mismatch", "unsigned int silo_ffi_abi_version(void) { return 0; }"),
                     ("version mismatch", 'const char *silo_ffi_sdk_version(void) { return "999.0.0"; }'),
@@ -305,7 +310,7 @@ def main():
                 ):
                     source = root / "incompatible.c"
                     source.write_text("extern void silo_runtime_open(void);\nvoid *anchor = (void *)&silo_runtime_open;\n" + declaration + "\n")
-                    checked([os.environ.get("CC", "cc"), "-dynamiclib" if sys.platform == "darwin" else "-shared", "-fPIC", source, held, "-o", bridge])
+                    checked([os.environ.get("CC", "cc"), "-dynamiclib" if sys.platform == "darwin" else "-shared", "-fPIC", source, link_target, "-o", bridge])
                     if sys.platform == "darwin":
                         checked(["codesign", "--force", "--sign", "-", bridge])
                     if kind == "missing dependency":
