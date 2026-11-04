@@ -1,37 +1,24 @@
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use containerregistry_image::MediaType;
-use flate2::read::GzDecoder;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use oci_client::client::{BlobResponse, SizedStream};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
+use crate::changeset::{ChangesetLimits, LayerInput};
 use crate::digest::Sha256Digest;
-use crate::ext4_writer::Ext4Writer;
-use crate::layer::apply_layer;
 use crate::lock::FileLock;
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::registry::{ImageConfig, RegistryClient, ResolvedImage, ResolvedLayer};
 use crate::{OciError, OciResult, Platform, RegistryPolicy};
 
-const BLOBS_DIR_NAME: &str = "blobs";
-const METADATA_VERSION: u32 = 2;
+const BLOBS_DIR_NAME: &str = "source-blobs";
 const DEFAULT_ROOTFS_SIZE_BYTES: u64 = 512 * 1024 * 1024;
-const INDEX_FILE_NAME: &str = "index.json";
-const INDEX_VERSION: u32 = 1;
-const MANIFESTS_DIR_NAME: &str = "manifests";
-const METADATA_FILE_NAME: &str = "metadata.json";
 const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
-const ROOTFS_FILE_NAME: &str = "rootfs.img";
-const ROOTFS_FILESYSTEM: &str = "ext4";
-const STAGING_DIR_NAME: &str = ".staging";
+const ROOTFS_FILE_NAME: &str = "root.raw";
 const TMP_DIR_NAME: &str = "tmp";
 
 #[derive(Debug, Clone)]
@@ -43,6 +30,8 @@ pub struct MaterializeOptions {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Materialization {
+    /// The requested size is a minimum. Final geometry also includes all live
+    /// composed inode data and the formatter's required filesystem metadata.
     FlatExt4 { size_bytes: u64 },
 }
 
@@ -66,71 +55,9 @@ impl MaterializeOptions {
     }
 }
 
+/// Verified OCI metadata accompanying staged bytes. Never persisted by OCI.
 #[derive(Debug, Clone)]
-pub struct FlatExt4Artifact {
-    pub path: PathBuf,
-    pub requested_reference: String,
-    pub image_id: String,
-    pub manifest_digest: String,
-    pub platform: Platform,
-}
-
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum PublishedRootfs {
-    FlatExt4(FlatExt4Artifact),
-}
-
-impl PublishedRootfs {
-    pub fn flat_ext4(&self) -> &FlatExt4Artifact {
-        match self {
-            Self::FlatExt4(artifact) => artifact,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum StoredRootfsImageSource {
-    OciRegistry,
-    Disk,
-}
-
-#[derive(Debug, Clone)]
-pub struct ImageStore {
-    root: PathBuf,
-    policy: RegistryPolicy,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StoreIndex {
-    version: u32,
-    #[serde(default)]
-    tags: BTreeMap<String, TagRecord>,
-}
-
-impl Default for StoreIndex {
-    fn default() -> Self {
-        Self {
-            version: INDEX_VERSION,
-            tags: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TagRecord {
-    image_ref: String,
-    platform: Platform,
-    manifest_digest: String,
-    updated_at_unix: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootfsMetadata {
-    pub version: u32,
-    pub image_ref: String,
-    pub image_id: String,
     pub requested_reference: String,
     pub selected_reference: String,
     pub manifest_digest: String,
@@ -138,60 +65,16 @@ pub struct RootfsMetadata {
     pub config: ImageConfig,
     pub layers: Vec<RootfsLayerMetadata>,
     pub platform: Platform,
-    pub filesystem: String,
-    pub rootfs_file: String,
     pub created_at_unix: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredRootfsImageMetadata {
-    version: u32,
-    image_ref: String,
-    image_id: String,
-    source: StoredRootfsImageSource,
-    requested_reference: String,
-    selected_reference: String,
-    manifest_digest: String,
-    config_digest: String,
-    config: ImageConfig,
-    layers: Vec<RootfsLayerMetadata>,
-    platform: Platform,
-    filesystem: String,
-    rootfs_file: String,
-    created_at_unix: i64,
-}
-
-impl From<StoredRootfsImageMetadata> for RootfsMetadata {
-    fn from(metadata: StoredRootfsImageMetadata) -> Self {
-        Self {
-            version: metadata.version,
-            image_ref: metadata.image_ref,
-            image_id: metadata.image_id,
-            requested_reference: metadata.requested_reference,
-            selected_reference: metadata.selected_reference,
-            manifest_digest: metadata.manifest_digest,
-            config_digest: metadata.config_digest,
-            config: metadata.config,
-            layers: metadata.layers,
-            platform: metadata.platform,
-            filesystem: metadata.filesystem,
-            rootfs_file: metadata.rootfs_file,
-            created_at_unix: metadata.created_at_unix,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RootfsLayerMetadata {
-    #[serde(rename = "digest")]
     pub blob_digest: String,
     pub media_type: String,
     pub size_bytes: u64,
     pub diff_id: String,
 }
-
-type ImageMetadata = StoredRootfsImageMetadata;
-type ImageLayerMetadata = RootfsLayerMetadata;
 
 impl From<&ResolvedLayer> for RootfsLayerMetadata {
     fn from(layer: &ResolvedLayer) -> Self {
@@ -204,17 +87,42 @@ impl From<&ResolvedLayer> for RootfsLayerMetadata {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ManifestMetadata {
-    version: u32,
-    requested_reference: String,
-    selected_reference: String,
-    manifest_digest: String,
-    config_digest: String,
-    config: ImageConfig,
-    platform: Platform,
-    layers: Vec<ImageLayerMetadata>,
-    resolved_at_unix: i64,
+/// An owned staging directory, removed on failure, cancellation, or drop.
+#[derive(Debug)]
+pub struct StagedRootfs {
+    pub path: PathBuf,
+    pub metadata: RootfsMetadata,
+    _staging: StagingDir,
+}
+
+/// Caller-allocated key for disposable staging, not a retained storage operation.
+#[derive(Debug, Clone)]
+pub struct StagingOperation(String);
+
+impl TryFrom<String> for StagingOperation {
+    type Error = OciError;
+
+    fn try_from(value: String) -> OciResult<Self> {
+        let valid = value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                }
+            });
+        if !valid {
+            return Err(OciError::InvalidOperationId { value });
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Registry acquisition and flattening, with no mutable image catalog.
+#[derive(Debug, Clone)]
+pub struct OciMaterializer {
+    root: PathBuf,
+    policy: RegistryPolicy,
 }
 
 struct LayerBlob {
@@ -233,10 +141,6 @@ struct LayerDownloadRequest<'a> {
     progress: Option<&'a ProgressReporter>,
 }
 
-struct ImageMetadataInput<'a> {
-    resolved: &'a ResolvedImage,
-}
-
 struct LayerStreamWrite<'a> {
     path: &'a Path,
     stream: SizedStream,
@@ -248,7 +152,7 @@ struct LayerStreamWrite<'a> {
     progress: Option<&'a ProgressReporter>,
 }
 
-impl ImageStore {
+impl OciMaterializer {
     pub fn open(root: impl AsRef<Path>, policy: RegistryPolicy) -> OciResult<Self> {
         Ok(Self {
             root: root.as_ref().to_path_buf(),
@@ -267,13 +171,14 @@ impl ImageStore {
             .await
     }
 
-    /// Materializes a previously resolved OCI image into the local rootfs cache.
+    /// Flattens a verified resolution into owned temporary bytes for libvm publication.
     pub async fn materialize(
         &self,
         resolved: &ResolvedImage,
         options: &MaterializeOptions,
+        operation: &StagingOperation,
         progress: Option<ProgressReporter>,
-    ) -> OciResult<PublishedRootfs> {
+    ) -> OciResult<StagedRootfs> {
         if resolved.platform != options.platform {
             return Err(OciError::PlatformMismatch {
                 reference: resolved.requested_reference.clone(),
@@ -281,81 +186,85 @@ impl ImageStore {
                 actual: resolved.platform.to_string(),
             });
         }
+        let Materialization::FlatExt4 { size_bytes } = options.materialization;
+        if resolved.layers.len() > 1024
+            || size_bytes == 0
+            || size_bytes > 1024 * 1024 * 1024 * 1024
+            || size_bytes % 512 != 0
+        {
+            return Err(OciError::ImageConfig {
+                reference: resolved.requested_reference.clone(),
+                message:
+                    "materialization exceeds the layer/stream bounds or has invalid disk geometry"
+                        .into(),
+            });
+        }
         self.policy.check(&resolved.reference)?;
         let registry = RegistryClient::new()?;
         registry
             .authenticate_pull(&resolved.reference, &resolved.requested_reference)
             .await?;
-        self.materialize_resolved_oci(&registry, resolved, options, progress.as_ref())
-            .await
+        self.create_rootfs(
+            &registry,
+            &resolved.requested_reference,
+            resolved,
+            options,
+            operation,
+            progress.as_ref(),
+        )
+        .await
     }
 
-    /// Pulls or reuses an OCI registry reference.
-    pub async fn get_or_create(
+    /// Acquire and structurally verify one ordered layer occurrence. Publication
+    /// and parent-dependent composition remain the caller's responsibility.
+    pub async fn ingest_changeset(
         &self,
-        image_ref: &str,
-        options: &MaterializeOptions,
+        resolved: &ResolvedImage,
+        layer_index: usize,
+        operation: &StagingOperation,
+        limits: &crate::changeset::ChangesetLimits,
         progress: Option<ProgressReporter>,
-    ) -> OciResult<PublishedRootfs> {
-        self.get_or_create_remote_oci(image_ref, options, progress.as_ref())
-            .await
-    }
-
-    /// Returns a cached OCI registry reference.
-    pub fn get_cached(
-        &self,
-        image_ref: &str,
-        options: &MaterializeOptions,
-    ) -> OciResult<Option<PublishedRootfs>> {
-        self.cached_remote_oci(image_ref, options)
-    }
-
-    /// Removes the mutable tag mapping for an OCI reference without deleting its artifact.
-    /// Digest-pinned references have no mutable mapping and return `false`.
-    pub fn remove_reference(&self, image_ref: &str, platform: &Platform) -> OciResult<bool> {
-        let keys: Vec<String> = self
-            .policy
-            .candidates(image_ref)?
-            .iter()
-            .filter(|reference| reference.digest().is_none())
-            .map(|reference| tag_key(&reference.to_string(), platform))
-            .collect();
-        if keys.is_empty() {
-            return Ok(false);
+    ) -> OciResult<crate::changeset::StagedChangeset> {
+        limits.validate()?;
+        if resolved.layers.len() as u64 > limits.max_layers {
+            return Err(crate::changeset::ChangesetError::Limit {
+                resource: "layer occurrences",
+                actual: resolved.layers.len() as u64,
+                maximum: limits.max_layers,
+            }
+            .into());
         }
-
-        let _index_lock = FileLock::exclusive(&self.index_lock_path())?;
-        let mut index = self.read_index()?;
-        let removed = keys.iter().any(|key| index.tags.remove(key).is_some());
-        if removed {
-            self.write_index(&index)?;
-        }
-        Ok(removed)
-    }
-
-    pub fn metadata(&self, image: &PublishedRootfs) -> OciResult<RootfsMetadata> {
-        let image = image.flat_ext4();
-        let Some(dir) = image.path.parent() else {
-            return Err(OciError::CorruptCacheEntry {
-                path: image.path.clone(),
-                reason: "rootfs path has no parent directory".to_string(),
-            });
-        };
-
-        Ok(read_metadata(&dir.join(METADATA_FILE_NAME))?.into())
-    }
-
-    async fn get_or_create_remote_oci(
-        &self,
-        image_ref: &str,
-        options: &MaterializeOptions,
-        progress: Option<&ProgressReporter>,
-    ) -> OciResult<PublishedRootfs> {
-        let resolved = self
-            .resolve_remote_oci(image_ref, &options.platform, progress)
+        let layer = resolved.layers.get(layer_index).ok_or_else(|| {
+            crate::changeset::ChangesetError::Invalid(
+                "layer occurrence index outside manifest".into(),
+            )
+        })?;
+        self.policy.check(&resolved.reference)?;
+        let registry = RegistryClient::new()?;
+        registry
+            .authenticate_pull(&resolved.reference, &resolved.requested_reference)
             .await?;
-        self.materialize(&resolved, options, progress.cloned())
-            .await
+        let path = self
+            .get_or_download_layer(LayerDownloadRequest {
+                registry: &registry,
+                reference: &resolved.reference,
+                image_ref: &resolved.requested_reference,
+                layer,
+                index: layer_index + 1,
+                total: resolved.layers.len(),
+                progress: progress.as_ref(),
+            })
+            .await?;
+        let input = layer_input(layer)?;
+        let root = self.root.clone();
+        let operation = operation.clone();
+        let limits = *limits;
+        tokio::task::spawn_blocking(move || {
+            crate::changeset::ingest_layer(&path, &input, &root, &operation, &limits)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(OciError::from)
     }
 
     async fn resolve_remote_oci(
@@ -408,161 +317,104 @@ impl ImageStore {
             }))
     }
 
-    async fn materialize_resolved_oci(
-        &self,
-        registry: &RegistryClient,
-        resolved: &ResolvedImage,
-        options: &MaterializeOptions,
-        progress: Option<&ProgressReporter>,
-    ) -> OciResult<PublishedRootfs> {
-        fs::create_dir_all(&self.root)?;
-        let maps_to_tag = RegistryClient::parse_reference(&resolved.requested_reference)?
-            .digest()
-            .is_none();
-        let image_ref = &resolved.requested_reference;
-
-        let _image_lock = FileLock::exclusive(
-            &self.image_lock_path(&resolved.manifest_digest, &options.platform)?,
-        )?;
-        self.write_manifest_metadata(resolved)?;
-
-        emit_progress(
-            progress,
-            ProgressEvent::CheckingCache {
-                image_ref: image_ref.to_string(),
-            },
-        );
-        if let Some(image) =
-            self.cached_image(image_ref, &resolved.manifest_digest, &options.platform)?
-        {
-            emit_progress(
-                progress,
-                ProgressEvent::CacheHit {
-                    image_ref: image_ref.to_string(),
-                },
-            );
-            if maps_to_tag {
-                self.update_tag_mapping(image_ref, &options.platform, &resolved.manifest_digest)?;
-            }
-            return Ok(image);
-        }
-        emit_progress(
-            progress,
-            ProgressEvent::CacheMiss {
-                image_ref: image_ref.to_string(),
-            },
-        );
-
-        let image = self
-            .create_rootfs(registry, image_ref, resolved, options, progress)
-            .await?;
-        if maps_to_tag {
-            self.update_tag_mapping(image_ref, &options.platform, &resolved.manifest_digest)?;
-        }
-        Ok(image)
-    }
-
-    fn cached_remote_oci(
-        &self,
-        image_ref: &str,
-        options: &MaterializeOptions,
-    ) -> OciResult<Option<PublishedRootfs>> {
-        for reference in self.policy.candidates(image_ref)? {
-            let canonical_ref = reference.to_string();
-            let cached = match reference.digest() {
-                Some(digest) => self.cached_image(&canonical_ref, digest, &options.platform)?,
-                None => {
-                    let index = self.read_index()?;
-                    match index.tags.get(&tag_key(&canonical_ref, &options.platform)) {
-                        Some(tag) => self.cached_image(
-                            &canonical_ref,
-                            &tag.manifest_digest,
-                            &options.platform,
-                        )?,
-                        None => None,
-                    }
-                }
-            };
-            if cached.is_some() {
-                return Ok(cached);
-            }
-        }
-        Ok(None)
-    }
-
     async fn create_rootfs(
         &self,
         registry: &RegistryClient,
         image_ref: &str,
         resolved: &ResolvedImage,
         options: &MaterializeOptions,
+        operation: &StagingOperation,
         progress: Option<&ProgressReporter>,
-    ) -> OciResult<PublishedRootfs> {
-        let image_id = &resolved.manifest_digest;
-        let final_dir = self.image_dir(image_id, &options.platform)?;
-        if final_dir.exists() {
-            if let Some(image) = self.cached_image(image_ref, image_id, &options.platform)? {
-                emit_progress(
-                    progress,
-                    ProgressEvent::CacheHit {
-                        image_ref: image_ref.to_string(),
-                    },
-                );
-                return Ok(image);
-            }
-        }
-
+    ) -> OciResult<StagedRootfs> {
         let blobs = self
             .ensure_layer_blobs(registry, image_ref, resolved, progress)
             .await?;
-        let staging = StagingDir::create(&self.root)?;
-        let stage_rootfs = staging.path().join(ROOTFS_FILE_NAME);
+        let metadata = RootfsMetadata {
+            requested_reference: resolved.requested_reference.clone(),
+            selected_reference: resolved.selected_reference.clone(),
+            manifest_digest: resolved.manifest_digest.clone(),
+            config_digest: resolved.config_digest.clone(),
+            config: resolved.config.clone(),
+            layers: resolved
+                .layers
+                .iter()
+                .map(RootfsLayerMetadata::from)
+                .collect(),
+            platform: resolved.platform.clone(),
+            created_at_unix: now_unix(),
+        };
+        let root = self.root.clone();
+        let operation = operation.clone();
+        let progress = progress.cloned();
         let Materialization::FlatExt4 { size_bytes } = options.materialization;
-        let mut writer = Ext4Writer::create(&stage_rootfs, size_bytes)?;
-
-        let total = blobs.len();
-        for blob in &blobs {
-            emit_progress(
-                progress,
-                ProgressEvent::ApplyingLayer {
-                    index: blob.index,
-                    total,
-                    digest: Some(blob.layer.digest.clone()),
-                },
-            );
-            let reader = layer_reader_from_path(&blob.layer.media_type, &blob.path)?;
-            apply_layer(reader, &mut writer)?;
-        }
-
-        emit_progress(progress, ProgressEvent::MaterializingRootfs);
-        writer.finish()?;
-        emit_progress(progress, ProgressEvent::PublishingRootfs);
-        self.write_metadata(staging.path(), ImageMetadataInput { resolved })?;
-
-        if let Some(parent) = final_dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if final_dir.exists() {
-            if let Some(image) = self.cached_image(image_ref, image_id, &options.platform)? {
+        // Retained fresh flat creation also hashes/decodes large layer files.
+        // Keep that work, its temporary publication lock and cleanup on the worker.
+        tokio::task::spawn_blocking(move || {
+            let staging = StagingDir::create(&root, &operation)?;
+            let stage_rootfs = staging.path().join(ROOTFS_FILE_NAME);
+            let limits = ChangesetLimits::default();
+            let mut composer = crate::changeset::namespace::NamespaceComposer::new(&limits)?;
+            let mut packs = Vec::new();
+            let total = blobs.len();
+            for (occurrence, blob) in blobs.iter().enumerate() {
                 emit_progress(
-                    progress,
-                    ProgressEvent::CacheHit {
-                        image_ref: image_ref.to_string(),
+                    progress.as_ref(),
+                    ProgressEvent::ApplyingLayer {
+                        index: blob.index,
+                        total,
+                        digest: Some(blob.layer.digest.clone()),
                     },
                 );
-                return Ok(image);
+                let layer = crate::changeset::ingest_layer(
+                    &blob.path,
+                    &layer_input(&blob.layer)?,
+                    &staging.path().join("layers").join(blob.index.to_string()),
+                    &operation,
+                    &limits,
+                )?;
+                composer = composer.apply(layer.changeset())?;
+                crate::changeset::limits::reserve_vec(&mut packs, 1)?;
+                packs.push(Some(layer.scope(&staging, occurrence)?));
+                for body in composer.reclaimed_bodies() {
+                    let slot = packs.get_mut(body.entry.layer as usize).ok_or_else(|| {
+                        crate::changeset::ChangesetError::Invalid(
+                            "reclaimed body has no layer occurrence".into(),
+                        )
+                    })?;
+                    let pack = slot.as_mut().ok_or_else(|| {
+                        crate::changeset::ChangesetError::Invalid(
+                            "reclaimed body has no live payload pack".into(),
+                        )
+                    })?;
+                    if !pack.discard(body.entry.ordinal) {
+                        return Err(crate::changeset::ChangesetError::Invalid(
+                            "reclaimed body has no admitted payload".into(),
+                        )
+                        .into());
+                    }
+                    if pack.is_empty() {
+                        *slot = None;
+                    }
+                }
+                if let Some(slot) = packs
+                    .last_mut()
+                    .filter(|slot| slot.as_ref().is_some_and(|pack| pack.is_empty()))
+                {
+                    *slot = None;
+                }
             }
-        }
-        fs::rename(staging.path(), &final_dir)?;
-        staging.disarm();
-
-        Ok(PublishedRootfs::FlatExt4(FlatExt4Artifact {
-            path: final_dir.join(ROOTFS_FILE_NAME),
-            requested_reference: image_ref.to_string(),
-            image_id: image_id.to_string(),
-            manifest_digest: resolved.manifest_digest.clone(),
-            platform: options.platform.clone(),
-        }))
+            let namespace = composer.finish();
+            emit_progress(progress.as_ref(), ProgressEvent::MaterializingRootfs);
+            crate::flat_ext4::render(&stage_rootfs, &namespace, &packs, size_bytes)?;
+            drop(packs);
+            Ok(StagedRootfs {
+                path: stage_rootfs,
+                metadata,
+                _staging: staging,
+            })
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
     }
 
     async fn ensure_layer_blobs(
@@ -622,9 +474,20 @@ impl ImageStore {
         } = request;
         let blob_path = self.blob_path(&layer.digest)?;
         let part_path = self.blob_part_path(&layer.digest)?;
-        let _lock = FileLock::exclusive(&self.blob_lock_path(&layer.digest)?)?;
+        let lock_path = self.blob_lock_path(&layer.digest)?;
+        let digest = layer.digest.clone();
+        let expected_size = layer.size_bytes;
+        // Each blocking verifier owns the publication lock until it finishes,
+        // including when its awaiting async task is cancelled.
+        let (lock, blob_path, digest, cached) = tokio::task::spawn_blocking(move || {
+            let lock = FileLock::exclusive(&lock_path)?;
+            let cached = verified_blob_exists(&blob_path, &digest, expected_size)?;
+            Ok::<_, OciError>((lock, blob_path, digest, cached))
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
 
-        if verified_blob_exists(&blob_path, &layer.digest)? {
+        if cached {
             emit_progress(
                 progress,
                 ProgressEvent::LayerDownloadSkipped {
@@ -638,14 +501,24 @@ impl ImageStore {
         remove_file_if_exists(&blob_path)?;
 
         if let Some(parent) = blob_path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dirs(parent)?;
         }
         if let Some(parent) = part_path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dirs(parent)?;
         }
 
         let mut offset = partial_download_offset(&part_path, layer)?;
-        if offset == layer.size_bytes && layer_digest_matches(&part_path, &layer.digest)? {
+        let (lock, part_path, digest, complete_part_matches) = if offset == layer.size_bytes {
+            tokio::task::spawn_blocking(move || {
+                let matches = layer_digest_matches(&part_path, &digest);
+                (lock, part_path, digest, matches)
+            })
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+        } else {
+            (lock, part_path, digest, Ok(false))
+        };
+        if complete_part_matches? {
             emit_progress(
                 progress,
                 ProgressEvent::LayerDownloadVerifying {
@@ -738,7 +611,12 @@ impl ImageStore {
                 digest: layer.digest.clone(),
             },
         );
-        verify_layer_file(&part_path, layer)?;
+        let (_lock, part_path) = tokio::task::spawn_blocking(move || {
+            verify_layer_file(&part_path, &digest, expected_size)?;
+            Ok::<_, OciError>((lock, part_path))
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
         promote_layer_part(&part_path, &blob_path)?;
         emit_progress(
             progress,
@@ -749,112 +627,6 @@ impl ImageStore {
             },
         );
         Ok(blob_path)
-    }
-
-    fn cached_image(
-        &self,
-        image_ref: &str,
-        image_id: &str,
-        platform: &Platform,
-    ) -> OciResult<Option<PublishedRootfs>> {
-        let dir = self.image_dir(image_id, platform)?;
-        if !dir.exists() {
-            return Ok(None);
-        }
-
-        let rootfs_path = dir.join(ROOTFS_FILE_NAME);
-        if !rootfs_path.is_file() {
-            return Err(OciError::CorruptCacheEntry {
-                path: dir,
-                reason: format!("missing {ROOTFS_FILE_NAME}"),
-            });
-        }
-
-        let metadata_path = dir.join(METADATA_FILE_NAME);
-        let metadata = read_metadata(&metadata_path)?;
-        if metadata.version != METADATA_VERSION {
-            return Err(OciError::CorruptCacheEntry {
-                path: metadata_path,
-                reason: format!(
-                    "metadata version {} does not match expected version {METADATA_VERSION}",
-                    metadata.version
-                ),
-            });
-        }
-        if metadata.image_id != image_id {
-            return Err(OciError::CorruptCacheEntry {
-                path: metadata_path,
-                reason: format!(
-                    "metadata image id {} does not match cache image id {image_id}",
-                    metadata.image_id
-                ),
-            });
-        }
-        if metadata.manifest_digest != image_id {
-            return Err(OciError::CorruptCacheEntry {
-                path: metadata_path,
-                reason: format!(
-                    "metadata manifest digest {} does not match cache image id {image_id}",
-                    metadata.manifest_digest
-                ),
-            });
-        }
-        if metadata.source != StoredRootfsImageSource::OciRegistry {
-            return Err(OciError::CorruptCacheEntry {
-                path: metadata_path,
-                reason: "metadata source is not oci-registry".to_string(),
-            });
-        }
-        if metadata.platform != *platform {
-            return Err(OciError::CorruptCacheEntry {
-                path: metadata_path,
-                reason: format!(
-                    "metadata platform {} does not match cache platform {platform}",
-                    metadata.platform
-                ),
-            });
-        }
-        if metadata.filesystem != ROOTFS_FILESYSTEM {
-            return Err(OciError::CorruptCacheEntry {
-                path: metadata_path,
-                reason: format!(
-                    "metadata filesystem {} does not match expected {ROOTFS_FILESYSTEM}",
-                    metadata.filesystem
-                ),
-            });
-        }
-        if metadata.rootfs_file != ROOTFS_FILE_NAME {
-            return Err(OciError::CorruptCacheEntry {
-                path: metadata_path,
-                reason: format!("metadata rootfs file is {}", metadata.rootfs_file),
-            });
-        }
-        Ok(Some(PublishedRootfs::FlatExt4(FlatExt4Artifact {
-            path: rootfs_path,
-            requested_reference: image_ref.to_string(),
-            image_id: image_id.to_string(),
-            manifest_digest: metadata.manifest_digest,
-            platform: platform.clone(),
-        })))
-    }
-
-    fn image_dir(&self, image_id: &str, platform: &Platform) -> OciResult<PathBuf> {
-        Ok(self
-            .root
-            .join(image_id_path_component(image_id)?)
-            .join(platform.cache_key()))
-    }
-
-    fn image_lock_path(&self, image_id: &str, platform: &Platform) -> OciResult<PathBuf> {
-        Ok(self.root.join(TMP_DIR_NAME).join(format!(
-            "image-{}-{}.lock",
-            image_id_path_component(image_id)?,
-            platform.cache_key()
-        )))
-    }
-
-    fn index_lock_path(&self) -> PathBuf {
-        self.root.join(TMP_DIR_NAME).join("index.lock")
     }
 
     fn blob_path(&self, digest: &str) -> OciResult<PathBuf> {
@@ -874,172 +646,17 @@ impl ImageStore {
         let (algorithm, encoded) = digest_path_components(digest)?;
         Ok(self
             .root
-            .join(TMP_DIR_NAME)
-            .join(format!("{}-{}.download.lock", algorithm, encoded)))
-    }
-
-    fn manifest_dir(&self, manifest_digest: &str) -> OciResult<PathBuf> {
-        Ok(self
-            .root
-            .join(MANIFESTS_DIR_NAME)
-            .join(image_id_path_component(manifest_digest)?))
-    }
-
-    fn write_metadata(&self, dir: &Path, input: ImageMetadataInput<'_>) -> OciResult<()> {
-        let resolved = input.resolved;
-        let metadata = ImageMetadata {
-            version: METADATA_VERSION,
-            image_ref: resolved.requested_reference.clone(),
-            image_id: resolved.manifest_digest.clone(),
-            source: StoredRootfsImageSource::OciRegistry,
-            requested_reference: resolved.requested_reference.clone(),
-            selected_reference: resolved.selected_reference.clone(),
-            manifest_digest: resolved.manifest_digest.clone(),
-            config_digest: resolved.config_digest.clone(),
-            config: resolved.config.clone(),
-            layers: resolved
-                .layers
-                .iter()
-                .map(ImageLayerMetadata::from)
-                .collect(),
-            platform: resolved.platform.clone(),
-            filesystem: ROOTFS_FILESYSTEM.to_string(),
-            rootfs_file: ROOTFS_FILE_NAME.to_string(),
-            created_at_unix: now_unix(),
-        };
-        let data = serde_json::to_vec_pretty(&metadata)?;
-        fs::write(dir.join(METADATA_FILE_NAME), data)?;
-        Ok(())
-    }
-
-    fn write_manifest_metadata(&self, resolved: &ResolvedImage) -> OciResult<()> {
-        let dir = self.manifest_dir(&resolved.manifest_digest)?;
-        fs::create_dir_all(&dir)?;
-        let metadata = ManifestMetadata {
-            version: METADATA_VERSION,
-            requested_reference: resolved.requested_reference.clone(),
-            selected_reference: resolved.selected_reference.clone(),
-            manifest_digest: resolved.manifest_digest.clone(),
-            config_digest: resolved.config_digest.clone(),
-            config: resolved.config.clone(),
-            platform: resolved.platform.clone(),
-            layers: resolved
-                .layers
-                .iter()
-                .map(ImageLayerMetadata::from)
-                .collect(),
-            resolved_at_unix: now_unix(),
-        };
-        let path = dir.join(METADATA_FILE_NAME);
-        write_json_atomically(&path, &metadata)
-    }
-
-    fn update_tag_mapping(
-        &self,
-        image_ref: &str,
-        platform: &Platform,
-        manifest_digest: &str,
-    ) -> OciResult<()> {
-        let _index_lock = FileLock::exclusive(&self.index_lock_path())?;
-        let mut index = self.read_index()?;
-        index.tags.insert(
-            tag_key(image_ref, platform),
-            TagRecord {
-                image_ref: image_ref.to_string(),
-                platform: platform.clone(),
-                manifest_digest: manifest_digest.to_string(),
-                updated_at_unix: now_unix(),
-            },
-        );
-        self.write_index(&index)
-    }
-
-    fn read_index(&self) -> OciResult<StoreIndex> {
-        let path = self.root.join(INDEX_FILE_NAME);
-        match fs::read(&path) {
-            Ok(data) => {
-                let index = serde_json::from_slice::<StoreIndex>(&data).map_err(|err| {
-                    OciError::CorruptCacheEntry {
-                        path: path.clone(),
-                        reason: err.to_string(),
-                    }
-                })?;
-                if index.version != INDEX_VERSION {
-                    return Err(OciError::CorruptCacheEntry {
-                        path,
-                        reason: format!(
-                            "index version {} does not match expected version {INDEX_VERSION}",
-                            index.version
-                        ),
-                    });
-                }
-                Ok(index)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StoreIndex::default()),
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    fn write_index(&self, index: &StoreIndex) -> OciResult<()> {
-        fs::create_dir_all(&self.root)?;
-        let path = self.root.join(INDEX_FILE_NAME);
-        write_json_atomically(&path, index)
+            .join("locks/publication")
+            .join(format!("source-{}-{}.lock", algorithm, encoded)))
     }
 }
 
-fn write_json_atomically(path: &Path, value: &impl Serialize) -> OciResult<()> {
-    let data = serde_json::to_vec_pretty(value)?;
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::other(format!(
-            "cache metadata path {} has no parent",
-            path.display()
-        ))
-    })?;
-    fs::create_dir_all(parent)?;
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::other(format!(
-            "cache metadata path {} has no file name",
-            path.display()
-        ))
-    })?;
-
-    for attempt in 0..1024_u32 {
-        let temp_path = parent.join(format!(
-            ".{}.{}-{}-{attempt}.tmp",
-            file_name.to_string_lossy(),
-            std::process::id(),
-            now_unix_nanos()
-        ));
-        let mut file = match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
-        };
-        let write_result = (|| -> std::io::Result<()> {
-            file.write_all(&data)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp_path, path)
-        })();
-        if let Err(err) = write_result {
-            let _ = fs::remove_file(&temp_path);
-            return Err(err.into());
-        }
-        return Ok(());
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "could not create an owned cache temporary file for {}",
-            path.display()
-        ),
-    )
-    .into())
+fn create_private_dirs(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 fn emit_progress(progress: Option<&ProgressReporter>, event: ProgressEvent) {
@@ -1082,14 +699,27 @@ async fn write_layer_stream(request: LayerStreamWrite<'_>) -> OciResult<()> {
         .write(true)
         .append(append)
         .truncate(!append)
+        .mode(0o600)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
         .open(path)
         .await?;
     let mut downloaded = start_offset;
     let mut last_progress = start_offset;
 
     while let Some(chunk) = stream.try_next().await? {
+        let actual = downloaded.saturating_add(chunk.len() as u64);
+        if actual > layer.size_bytes {
+            drop(file);
+            remove_file_if_exists(path)?;
+            return Err(OciError::LayerSizeMismatch {
+                digest: layer.digest.clone(),
+                path: path.to_path_buf(),
+                expected: layer.size_bytes,
+                actual,
+            });
+        }
         file.write_all(&chunk).await?;
-        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        downloaded = actual;
         if downloaded.saturating_sub(last_progress) >= PROGRESS_STEP_BYTES
             || downloaded >= layer.size_bytes
         {
@@ -1123,11 +753,18 @@ async fn write_layer_stream(request: LayerStreamWrite<'_>) -> OciResult<()> {
 }
 
 fn partial_download_offset(path: &Path, layer: &ResolvedLayer) -> OciResult<u64> {
-    let metadata = match fs::metadata(path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(err) => return Err(err.into()),
     };
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "partial OCI input is not a regular file",
+        )
+        .into());
+    }
 
     let size = metadata.len();
     if size > layer.size_bytes {
@@ -1137,8 +774,8 @@ fn partial_download_offset(path: &Path, layer: &ResolvedLayer) -> OciResult<u64>
     Ok(size)
 }
 
-fn verified_blob_exists(path: &Path, digest: &str) -> OciResult<bool> {
-    let metadata = match fs::metadata(path) {
+fn verified_blob_exists(path: &Path, digest: &str, expected_size: u64) -> OciResult<bool> {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err.into()),
@@ -1147,6 +784,14 @@ fn verified_blob_exists(path: &Path, digest: &str) -> OciResult<bool> {
         remove_file_if_exists(path)?;
         return Ok(false);
     }
+    if metadata.len() != expected_size {
+        return Err(OciError::LayerSizeMismatch {
+            digest: digest.into(),
+            path: path.into(),
+            expected: expected_size,
+            actual: metadata.len(),
+        });
+    }
     if layer_digest_matches(path, digest)? {
         return Ok(true);
     }
@@ -1154,24 +799,24 @@ fn verified_blob_exists(path: &Path, digest: &str) -> OciResult<bool> {
     Ok(false)
 }
 
-fn verify_layer_file(path: &Path, layer: &ResolvedLayer) -> OciResult<()> {
+fn verify_layer_file(path: &Path, digest: &str, expected_size: u64) -> OciResult<()> {
     let actual_size = fs::metadata(path)?.len();
-    if actual_size != layer.size_bytes {
+    if actual_size != expected_size {
         remove_file_if_exists(path)?;
         return Err(OciError::LayerSizeMismatch {
-            digest: layer.digest.clone(),
+            digest: digest.into(),
             path: path.to_path_buf(),
-            expected: layer.size_bytes,
+            expected: expected_size,
             actual: actual_size,
         });
     }
 
     let actual_digest = sha256_file(path)?;
-    let expected_digest = Sha256Digest::parse(&layer.digest)?;
+    let expected_digest = Sha256Digest::parse(digest)?;
     if actual_digest != expected_digest {
         remove_file_if_exists(path)?;
         return Err(OciError::LayerDigestMismatch {
-            digest: layer.digest.clone(),
+            digest: digest.into(),
             path: path.to_path_buf(),
             actual: actual_digest.hex(),
         });
@@ -1187,7 +832,7 @@ fn layer_digest_matches(path: &Path, digest: &str) -> OciResult<bool> {
 
 fn promote_layer_part(part_path: &Path, blob_path: &Path) -> OciResult<()> {
     if let Some(parent) = blob_path.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_dirs(parent)?;
     }
     remove_file_if_exists(blob_path)?;
     fs::rename(part_path, blob_path)?;
@@ -1202,61 +847,39 @@ fn remove_file_if_exists(path: &Path) -> OciResult<()> {
     }
 }
 
-fn read_metadata(path: &Path) -> OciResult<ImageMetadata> {
-    let data = fs::read(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            OciError::CorruptCacheEntry {
-                path: path.to_path_buf(),
-                reason: "metadata file is missing".to_string(),
-            }
-        } else {
-            OciError::Io(err)
-        }
-    })?;
-    serde_json::from_slice(&data).map_err(|err| OciError::CorruptCacheEntry {
-        path: path.to_path_buf(),
-        reason: err.to_string(),
+fn layer_input(layer: &ResolvedLayer) -> OciResult<LayerInput> {
+    Ok(LayerInput {
+        blob_digest: layer.digest.parse()?,
+        media_type: layer.media_type.clone(),
+        size_bytes: layer.size_bytes,
+        diff_id: layer.diff_id.parse()?,
     })
-}
-
-fn layer_reader_from_path(media_type: &str, path: &Path) -> OciResult<Box<dyn Read>> {
-    let media_type =
-        MediaType::from_str(media_type).map_err(|err| OciError::UnsupportedLayerMediaType {
-            media_type: format!("{media_type}: {err}"),
-        })?;
-    let file = fs::File::open(path)?;
-    layer_reader_from_read(&media_type, BufReader::new(file))
-}
-
-fn layer_reader_from_read(
-    media_type: &MediaType,
-    reader: impl Read + 'static,
-) -> OciResult<Box<dyn Read>> {
-    match media_type {
-        MediaType::OciLayer | MediaType::OciLayerNondistributable => Ok(Box::new(reader)),
-        MediaType::OciLayerGzip
-        | MediaType::DockerLayerGzip
-        | MediaType::OciLayerNondistributableGzip => Ok(Box::new(GzDecoder::new(reader))),
-        MediaType::OciLayerZstd | MediaType::OciLayerNondistributableZstd => {
-            Ok(Box::new(zstd::Decoder::new(reader)?))
-        }
-        MediaType::Other(value) if value == "application/vnd.docker.image.rootfs.diff.tar" => {
-            Ok(Box::new(reader))
-        }
-        other => Err(OciError::UnsupportedLayerMediaType {
-            media_type: other.as_str().to_string(),
-        }),
-    }
 }
 
 fn digest_path_components(digest: &str) -> OciResult<(&'static str, String)> {
     Ok(("sha256", Sha256Digest::parse(digest)?.hex()))
 }
 
+fn open_source_blob(path: &Path) -> OciResult<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits() | nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OCI input is not a regular file",
+        )
+        .into());
+    }
+    Ok(file)
+}
+
 fn sha256_file(path: &Path) -> OciResult<Sha256Digest> {
-    let mut file = fs::File::open(path)?;
+    let mut file = open_source_blob(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = [0_u8; 16 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -1272,15 +895,6 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     Sha256Digest::from_bytes(bytes).hex()
 }
 
-fn image_id_path_component(image_id: &str) -> OciResult<String> {
-    let (algorithm, encoded) = Sha256Digest::cache_components(image_id)?;
-    Ok(format!("{algorithm}-{encoded}"))
-}
-
-fn tag_key(image_ref: &str, platform: &Platform) -> String {
-    format!("{}|{}", image_ref, platform.cache_key())
-}
-
 fn now_unix() -> i64 {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1289,519 +903,714 @@ fn now_unix() -> i64 {
     seconds.min(i64::MAX as u64) as i64
 }
 
-struct StagingDir {
+#[derive(Debug)]
+pub(crate) struct StagingDir {
     path: PathBuf,
-    armed: bool,
+    _lease: FileLock,
 }
 
 impl StagingDir {
-    fn create(root: &Path) -> OciResult<Self> {
-        let parent = root.join(STAGING_DIR_NAME);
-        fs::create_dir_all(&parent)?;
-        let path = parent.join(format!("{}-{}", std::process::id(), now_unix_nanos()));
-        fs::create_dir(&path)?;
-        Ok(Self { path, armed: true })
+    pub(crate) fn create(root: &Path, operation: &StagingOperation) -> OciResult<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        // OCI owns only unpublished temporary bytes. Canonical generation
+        // leases and durable semantic roots belong to the runtime catalog.
+        let name = format!("stage-{}", operation.0);
+        let lease = FileLock::shared(&root.join("locks/publication").join(format!("{name}.lock")))?;
+        let parent = root.join(TMP_DIR_NAME);
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&parent)?;
+        let path = parent.join(&name);
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self {
+            path,
+            _lease: lease,
+        })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
-    }
-
-    fn disarm(mut self) {
-        self.armed = false;
     }
 }
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_dir_all(&self.path);
-        }
+        let _ = fs::remove_dir_all(&self.path);
     }
-}
-
-fn now_unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-    use std::str::FromStr;
-    use std::sync::{Arc, Barrier};
-
     use crate::registry::ResolvedLayer;
     use crate::store::{
-        digest_path_components, image_id_path_component, layer_download_concurrency,
-        layer_reader_from_path, sha256_bytes, tag_key, verify_layer_file, ImageMetadata,
-        ImageStore, MaterializeOptions, StoredRootfsImageSource, INDEX_FILE_NAME,
-        METADATA_FILE_NAME, METADATA_VERSION, ROOTFS_FILESYSTEM, ROOTFS_FILE_NAME,
+        digest_path_components, layer_download_concurrency, sha256_bytes, verified_blob_exists,
+        verify_layer_file, OciMaterializer, StagingDir,
     };
-    use crate::{
-        FlatExt4Artifact, ImageConfig, OciError, Platform, PublishedRootfs, RegistryAction,
-        RegistryPolicy, RegistryRule, ResolvedImage,
-    };
+    use crate::{OciError, Platform, RegistryAction, RegistryPolicy};
+    use std::io::Read;
 
-    const HISTORICAL_CACHE_METADATA_V2: &[u8] =
-        include_bytes!("../testdata/cache-metadata-v2.json");
-    const HISTORICAL_STORE_INDEX_V1: &[u8] = include_bytes!("../testdata/store-index-v1.json");
-    const TEST_IMAGE_ID: &str =
-        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-
-    #[test]
-    fn image_id_and_platform_define_cache_path() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let path = store
-            .image_dir(TEST_IMAGE_ID, &Platform::linux_amd64())
-            .expect("cache path");
-
-        assert_eq!(
-            path,
-            temp.path()
-                .join(format!("sha256-{}/linux-amd64", "d".repeat(64)))
-        );
+    fn operation(index: u64) -> crate::StagingOperation {
+        crate::StagingOperation::try_from(format!("00000000-0000-4000-8000-{index:012x}")).unwrap()
     }
 
-    #[test]
-    fn uppercase_image_id_preserves_existing_cache_path_spelling() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let image_id = format!("sha256:{}", "AB".repeat(32));
-        let path = store
-            .image_dir(&image_id, &Platform::linux_amd64())
-            .expect("cache path");
-
-        assert_eq!(
-            path,
-            temp.path()
-                .join(format!("sha256-{}/linux-amd64", "AB".repeat(32)))
-        );
+    fn append_test_file(builder: &mut tar::Builder<Vec<u8>>, path: &str, bytes: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        builder.append_data(&mut header, path, bytes).unwrap();
     }
 
-    #[test]
-    fn validates_existing_cache_metadata() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let platform = Platform::linux_arm64();
-        let dir = store
-            .image_dir(TEST_IMAGE_ID, &platform)
-            .expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"disk").expect("write rootfs");
-        std::fs::write(
-            dir.join("metadata.json"),
-            serde_json::to_vec_pretty(&ImageMetadata {
-                version: METADATA_VERSION,
-                image_ref: "index.docker.io/library/alpine:latest".to_string(),
-                image_id: TEST_IMAGE_ID.to_string(),
-                source: StoredRootfsImageSource::OciRegistry,
-                requested_reference: "index.docker.io/library/alpine:latest".to_string(),
-                selected_reference: format!("index.docker.io/library/alpine@{TEST_IMAGE_ID}"),
-                manifest_digest: TEST_IMAGE_ID.to_string(),
-                config_digest: "sha256:config".to_string(),
-                config: ImageConfig {
-                    entrypoint: Some(vec!["/bin/init".to_string()]),
-                    cmd: Some(Vec::new()),
-                    env: Some(vec!["PATH=/usr/bin".to_string()]),
-                    working_dir: Some("".to_string()),
-                    user: Some("1000".to_string()),
-                    labels: Some(Default::default()),
-                    stop_signal: Some("SIGTERM".to_string()),
-                },
-                layers: Vec::new(),
-                platform: platform.clone(),
-                filesystem: ROOTFS_FILESYSTEM.to_string(),
-                rootfs_file: ROOTFS_FILE_NAME.to_string(),
-                created_at_unix: 1,
+    fn test_tar(path: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        append_test_file(&mut builder, path, bytes);
+        builder.into_inner().unwrap()
+    }
+
+    fn materialize_cached_layers(
+        root: &std::path::Path,
+        layers: Vec<(&str, Vec<u8>, Option<String>)>,
+        minimum_size: u64,
+    ) -> crate::OciResult<crate::StagedRootfs> {
+        let producer = OciMaterializer::open(root, RegistryPolicy::default()).unwrap();
+        let reference = "example.invalid/flat:fixture";
+        let layers = layers
+            .into_iter()
+            .map(|(media_type, bytes, diff_id)| {
+                let digest = format!("sha256:{}", sha256_bytes(&bytes));
+                let blob = producer.blob_path(&digest).unwrap();
+                std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+                std::fs::write(&blob, &bytes).unwrap();
+                ResolvedLayer {
+                    diff_id: diff_id.unwrap_or_else(|| digest.clone()),
+                    digest,
+                    media_type: media_type.into(),
+                    size_bytes: bytes.len() as u64,
+                }
             })
-            .expect("serialize metadata"),
+            .collect();
+        let resolved = crate::registry::ResolvedImage {
+            requested_reference: reference.into(),
+            selected_reference: reference.into(),
+            manifest_digest: format!("sha256:{}", sha256_bytes(b"fixture manifest")),
+            config_digest: format!("sha256:{}", sha256_bytes(b"fixture config")),
+            config: crate::registry::ImageConfig::default(),
+            platform: Platform::linux_amd64(),
+            reference: crate::registry::RegistryClient::parse_reference(reference).unwrap(),
+            layers,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(
+                producer.create_rootfs(
+                    &crate::registry::RegistryClient::new().unwrap(),
+                    reference,
+                    &resolved,
+                    &crate::MaterializeOptions::new(Platform::linux_amd64())
+                        .with_flat_ext4_size_bytes(minimum_size),
+                    &operation(101),
+                    None,
+                ),
+            )
+    }
+
+    fn flat_inode_xattrs(
+        image: &std::path::Path,
+        inode: &disk_image::ext4::types::Inode,
+    ) -> std::collections::BTreeMap<(u8, Vec<u8>), Vec<u8>> {
+        use std::io::{Seek, SeekFrom};
+
+        fn entries(
+            bytes: &[u8],
+            mut offset: usize,
+            value_base: usize,
+            output: &mut std::collections::BTreeMap<(u8, Vec<u8>), Vec<u8>>,
+        ) {
+            assert_eq!(&bytes[..4], &0xea02_0000_u32.to_le_bytes());
+            while bytes[offset..offset + 4] != [0; 4] {
+                let name_length = usize::from(bytes[offset]);
+                let index = bytes[offset + 1];
+                let value_offset = usize::from(u16::from_le_bytes(
+                    bytes[offset + 2..offset + 4].try_into().unwrap(),
+                ));
+                let value_length =
+                    u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                let name = bytes[offset + 16..offset + 16 + name_length].to_vec();
+                let start = value_base + value_offset;
+                assert!(output
+                    .insert((index, name), bytes[start..start + value_length].to_vec())
+                    .is_none());
+                offset += (16 + name_length + 3) & !3;
+            }
+        }
+
+        let mut result = std::collections::BTreeMap::new();
+        if inode.inline_xattrs[..4] != [0; 4] {
+            entries(&inode.inline_xattrs, 4, 4, &mut result);
+        }
+        let block = u64::from(inode.xattr_block_lo) | (u64::from(inode.xattr_block_hi) << 32);
+        if block != 0 {
+            let mut file = std::fs::File::open(image).unwrap();
+            file.seek(SeekFrom::Start(block * 4096)).unwrap();
+            let mut bytes = [0; 4096];
+            file.read_exact(&mut bytes).unwrap();
+            entries(&bytes, 32, 0, &mut result);
+        }
+        result
+    }
+
+    #[test]
+    fn production_flat_materialization_preserves_acl_capability_and_hardlink_metadata() {
+        use base64::Engine;
+        use std::io::Cursor;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        let near_limit = vec![b'x'; 2750];
+        archive
+            .append_pax_extensions([
+                ("SCHILY.xattr.user.near-limit", near_limit.as_slice()),
+                (
+                    "SCHILY.acl.access",
+                    b"user::rw-,user:1234:r--,group::r--,mask::r--,other::r--".as_slice(),
+                ),
+            ])
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_uid(0);
+        file.set_gid(0);
+        file.set_mtime(42);
+        file.set_size(b"original-hardlink\n".len() as u64);
+        file.set_cksum();
+        archive
+            .append_data(
+                &mut file,
+                "overlay-fixture/a",
+                Cursor::new(b"original-hardlink\n"),
+            )
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_mode(0o700);
+        link.set_uid(99);
+        link.set_gid(98);
+        link.set_mtime(17);
+        link.set_size(0);
+        link.set_entry_type(tar::EntryType::Link);
+        archive
+            .append_link(&mut link, "overlay-fixture/b", "overlay-fixture/a")
+            .unwrap();
+        let capability = [1, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let capability_text = base64::engine::general_purpose::STANDARD.encode(capability);
+        archive
+            .append_pax_extensions([(
+                "LIBARCHIVE.xattr.security.capability",
+                capability_text.as_bytes(),
+            )])
+            .unwrap();
+        file.set_size(b"capability".len() as u64);
+        file.set_cksum();
+        archive
+            .append_data(
+                &mut file,
+                "overlay-fixture/capability",
+                Cursor::new(b"capability"),
+            )
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+        let staged = materialize_cached_layers(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar", bytes, None)],
+            64 * 1024 * 1024,
         )
-        .expect("write metadata");
+        .unwrap();
+        let mut reader = disk_image::ext4::Reader::new(&staged.path).unwrap();
+        let node = reader.tree().lookup(b"/overlay-fixture/a").unwrap();
+        let number = reader.tree().node(node).inode;
+        let inode = reader.get_inode(number).unwrap();
+        let attrs = flat_inode_xattrs(&staged.path, &inode);
+        assert_eq!(
+            attrs.get(&(1, b"near-limit".to_vec())),
+            Some(&near_limit),
+            "production-created lower must retain the source user xattr"
+        );
+        // ext4's on-disk ACL v1 has short object records, unlike the Linux API
+        // xattr v2 retained by the normalized changeset.
+        let disk_acl = vec![
+            1, 0, 0, 0, 1, 0, 6, 0, 2, 0, 4, 0, 210, 4, 0, 0, 4, 0, 4, 0, 16, 0, 4, 0, 32, 0, 4, 0,
+        ];
+        assert_eq!(attrs.get(&(2, Vec::new())), Some(&disk_acl));
+        assert_eq!(
+            reader.hardlinks.get(b"overlay-fixture/b".as_slice()),
+            Some(&number)
+        );
+        assert_eq!(inode.links_count, 2);
+        assert_eq!(inode.mode & 0o7777, 0o644);
+        assert_eq!(inode.uid_full(), 0);
+        assert_eq!(inode.gid_full(), 0);
+        assert_eq!(inode.mtime, 42);
+        assert_eq!(
+            reader.read_file("/overlay-fixture/a", 0, None).unwrap(),
+            b"original-hardlink\n"
+        );
+        let node = reader
+            .tree()
+            .lookup(b"/overlay-fixture/capability")
+            .unwrap();
+        let number = reader.tree().node(node).inode;
+        let inode = reader.get_inode(number).unwrap();
+        assert_eq!(
+            flat_inode_xattrs(&staged.path, &inode).get(&(6, b"capability".to_vec())),
+            Some(&capability.to_vec())
+        );
+    }
 
-        let image = store
-            .cached_image(
-                "index.docker.io/library/alpine:latest",
-                TEST_IMAGE_ID,
-                &platform,
+    #[test]
+    fn production_flat_materialization_composes_whiteouts_aliases_and_source_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut lower = tar::Builder::new(Vec::new());
+        append_test_file(&mut lower, "d/old", b"old");
+        append_test_file(&mut lower, "d/keep", b"keep");
+        append_test_file(&mut lower, "target", b"original");
+        let mut link = tar::Header::new_gnu();
+        link.set_mode(0o777);
+        link.set_uid(0);
+        link.set_gid(0);
+        link.set_mtime(1);
+        link.set_size(0);
+        link.set_entry_type(tar::EntryType::Link);
+        lower.append_link(&mut link, "alias", "target").unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_mode(0o777);
+        link.set_uid(0);
+        link.set_gid(0);
+        link.set_mtime(1);
+        link.set_size(0);
+        link.set_entry_type(tar::EntryType::Symlink);
+        lower.append_link(&mut link, "dirlink", "d").unwrap();
+        let mut upper = tar::Builder::new(Vec::new());
+        // Markers apply to untouched lower objects, not this layer's new ones.
+        append_test_file(&mut upper, "dirlink/new", b"new");
+        append_test_file(&mut upper, "d/.wh..wh..opq", b"");
+        append_test_file(&mut upper, "d/.wh.old", b"");
+        append_test_file(&mut upper, "target", b"replacement");
+        upper
+            .append_pax_extensions([
+                ("SCHILY.xattr.user.root", b"\0\xff".as_slice()),
+                ("mtime", b"2147483648.123456789".as_slice()),
+            ])
+            .unwrap();
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_mode(0o710);
+        directory.set_uid(54);
+        directory.set_gid(56);
+        directory.set_mtime(2);
+        directory.set_size(0);
+        directory.set_cksum();
+        upper
+            .append_data(&mut directory, ".", std::io::empty())
+            .unwrap();
+        let mut owned = tar::Header::new_gnu();
+        owned.set_mode(0o6754);
+        owned.set_uid(0x1234_5678);
+        owned.set_gid(0x9abc_def0);
+        owned.set_mtime(7);
+        owned.set_size(5);
+        owned.set_cksum();
+        upper
+            .append_data(&mut owned, "d/owned", b"owned".as_slice())
+            .unwrap();
+        upper
+            .append_pax_extensions([("SCHILY.xattr.user.directory", b"final".as_slice())])
+            .unwrap();
+        directory.set_mode(0o750);
+        directory.set_uid(68);
+        directory.set_gid(69);
+        directory.set_mtime(9);
+        directory.set_cksum();
+        upper
+            .append_data(&mut directory, "d", std::io::empty())
+            .unwrap();
+        let staged = materialize_cached_layers(
+            temp.path(),
+            vec![
+                (
+                    "application/vnd.oci.image.layer.v1.tar",
+                    lower.into_inner().unwrap(),
+                    None,
+                ),
+                (
+                    "application/vnd.oci.image.layer.v1.tar",
+                    upper.into_inner().unwrap(),
+                    None,
+                ),
+            ],
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let mut reader = disk_image::ext4::Reader::new(&staged.path).unwrap();
+        assert!(!reader.exists("d/old"));
+        assert!(!reader.exists("d/keep"));
+        assert!(!reader.exists("lost+found"));
+        assert_eq!(reader.read_file("d/new", 0, None).unwrap(), b"new");
+        assert_eq!(reader.read_file("dirlink/new", 0, None).unwrap(), b"new");
+        assert_eq!(reader.read_file("alias", 0, None).unwrap(), b"original");
+        assert_eq!(reader.read_file("target", 0, None).unwrap(), b"replacement");
+        assert_ne!(
+            reader.stat("alias").unwrap().0,
+            reader.stat("target").unwrap().0
+        );
+        let inode = reader.stat("d/owned").unwrap().1;
+        assert_eq!(inode.mode & 0o7777, 0o6754);
+        assert_eq!(inode.uid_full(), 0x1234_5678);
+        assert_eq!(inode.gid_full(), 0x9abc_def0);
+        assert_eq!(inode.mtime, 7);
+        let root = reader.stat("/").unwrap().1;
+        assert_eq!(root.mode & 0o7777, 0o710);
+        assert_eq!(root.uid_full(), 54);
+        assert_eq!(root.gid_full(), 56);
+        assert_eq!(root.mtime, 0x8000_0000);
+        assert_eq!(root.mtime_extra, (123_456_789 << 2) | 1);
+        assert_eq!(
+            flat_inode_xattrs(&staged.path, &root).get(&(1, b"root".to_vec())),
+            Some(&vec![0, 255])
+        );
+        let directory = reader.stat("d").unwrap().1;
+        assert_eq!(directory.mode & 0o7777, 0o750);
+        assert_eq!(directory.uid_full(), 68);
+        assert_eq!(directory.gid_full(), 69);
+        assert_eq!(directory.mtime, 9);
+        assert_eq!(
+            flat_inode_xattrs(&staged.path, &directory).get(&(1, b"directory".to_vec())),
+            Some(&b"final".to_vec())
+        );
+    }
+
+    #[test]
+    fn production_flat_materialization_preserves_raw_names_targets_and_special_inodes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("LIBARCHIVE.xattr.user.%FF", b"AP8K".as_slice())])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1);
+        header.set_size(3);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                PathBuf::from(OsString::from_vec(b"raw-\xff".to_vec())),
+                b"raw".as_slice(),
             )
-            .expect("cache validation")
-            .expect("cache hit");
-
-        assert!(matches!(
-            image,
-            PublishedRootfs::FlatExt4(FlatExt4Artifact {
-                ref path,
-                ref requested_reference,
-                ref image_id,
-                platform: ref image_platform,
-                ..
-            }) if path == &dir.join(ROOTFS_FILE_NAME)
-                && requested_reference == "index.docker.io/library/alpine:latest"
-                && image_id == TEST_IMAGE_ID
-                && image_platform == &platform
-        ));
-        let metadata = store.metadata(&image).expect("read metadata");
-        assert_eq!(
-            metadata.selected_reference,
-            format!("index.docker.io/library/alpine@{TEST_IMAGE_ID}")
-        );
-        assert_eq!(
-            metadata.config.entrypoint,
-            Some(vec!["/bin/init".to_string()])
-        );
-        assert_eq!(metadata.config.cmd, Some(Vec::new()));
-        assert_eq!(metadata.config.working_dir.as_deref(), Some(""));
-        assert_eq!(metadata.config.labels, Some(Default::default()));
-    }
-
-    #[test]
-    fn reads_historical_cache_metadata_v2_without_schema_drift() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let platform = Platform::linux_amd64();
-        let image_id = "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea";
-        let dir = store.image_dir(image_id, &platform).expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"rootfs").expect("write rootfs");
-        std::fs::write(dir.join("metadata.json"), HISTORICAL_CACHE_METADATA_V2)
-            .expect("write historical metadata");
-
-        let image = store
-            .cached_image(
-                "registry.example.test/team/demo:stable",
-                image_id,
-                &platform,
-            )
-            .expect("read historical cache metadata")
-            .expect("cache hit");
-        let metadata = store.metadata(&image).expect("read historical metadata");
-
-        assert_eq!(metadata.version, METADATA_VERSION);
-        assert_eq!(metadata.image_id, image_id);
-        assert_eq!(metadata.config.working_dir.as_deref(), Some("/workspace"));
-        assert_eq!(metadata.layers.len(), 1);
-        assert_eq!(
-            metadata.layers[0].media_type,
-            "application/vnd.oci.image.layer.v1.tar+gzip"
-        );
-    }
-
-    #[test]
-    fn private_metadata_source_accepts_the_legacy_disk_value() {
-        let mut metadata = serde_json::from_slice::<ImageMetadata>(HISTORICAL_CACHE_METADATA_V2)
-            .expect("read historical metadata");
-        metadata.source = StoredRootfsImageSource::Disk;
-        let stored = serde_json::to_vec(&metadata).expect("serialize historical disk metadata");
-        let decoded = serde_json::from_slice::<ImageMetadata>(&stored)
-            .expect("read historical disk metadata");
-
-        assert_eq!(decoded.source, StoredRootfsImageSource::Disk);
-    }
-
-    #[test]
-    fn reads_historical_store_index_v1_without_schema_drift() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        std::fs::write(temp.path().join("index.json"), HISTORICAL_STORE_INDEX_V1)
-            .expect("write historical index");
-
-        let index = store.read_index().expect("read historical index");
-        let tag = index
-            .tags
-            .get("registry.example.test/team/demo:stable|linux-amd64")
-            .expect("historical tag");
-
-        assert_eq!(index.version, 1);
-        assert_eq!(tag.platform, Platform::linux_amd64());
-        assert_eq!(
-            tag.manifest_digest,
-            "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea"
-        );
-    }
-
-    #[test]
-    fn historical_index_and_metadata_resolve_as_one_cache_entry() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let options = MaterializeOptions::new(Platform::linux_amd64());
-        let image_id = "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea";
-        let dir = store
-            .image_dir(image_id, &options.platform)
-            .expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(temp.path().join(INDEX_FILE_NAME), HISTORICAL_STORE_INDEX_V1)
-            .expect("write historical index");
-        std::fs::write(dir.join(METADATA_FILE_NAME), HISTORICAL_CACHE_METADATA_V2)
-            .expect("write historical metadata");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"rootfs").expect("write rootfs");
-
-        let rootfs = store
-            .get_cached("registry.example.test/team/demo:stable", &options)
-            .expect("read historical cache")
-            .expect("historical cache hit");
-
-        assert_eq!(rootfs.flat_ext4().image_id, image_id);
-        assert_eq!(
-            rootfs.flat_ext4().requested_reference,
-            "registry.example.test/team/demo:stable"
-        );
-    }
-
-    #[test]
-    fn layer_readers_decode_supported_media_types_from_files() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let payload = b"layer contents from a real compressed file\n";
-        let raw_path = temp.path().join("layer.tar");
-        let gzip_path = temp.path().join("layer.tar.gz");
-        let zstd_path = temp.path().join("layer.tar.zst");
-        std::fs::write(&raw_path, payload).expect("write raw layer");
-
-        let gzip_file = std::fs::File::create(&gzip_path).expect("create gzip layer");
-        let mut gzip = flate2::write::GzEncoder::new(gzip_file, flate2::Compression::default());
-        std::io::Write::write_all(&mut gzip, payload).expect("compress gzip layer");
-        gzip.finish().expect("finish gzip layer");
-
-        let zstd = zstd::stream::encode_all(payload.as_slice(), 0).expect("compress zstd layer");
-        std::fs::write(&zstd_path, zstd).expect("write zstd layer");
-
-        for (media_type, path) in [
-            ("application/vnd.oci.image.layer.v1.tar", &raw_path),
-            (
-                "application/vnd.oci.image.layer.nondistributable.v1.tar",
-                &raw_path,
-            ),
-            ("application/vnd.docker.image.rootfs.diff.tar", &raw_path),
-            ("application/vnd.oci.image.layer.v1.tar+gzip", &gzip_path),
-            (
-                "application/vnd.docker.image.rootfs.diff.tar.gzip",
-                &gzip_path,
-            ),
-            (
-                "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
-                &gzip_path,
-            ),
-            ("application/vnd.oci.image.layer.v1.tar+zstd", &zstd_path),
-            (
-                "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd",
-                &zstd_path,
-            ),
+            .unwrap();
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_path("symlink").unwrap();
+        header.set_link_name_literal(b"raw-\xff").unwrap();
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+        for (path, kind, major, minor) in [
+            ("char", tar::EntryType::Char, 0xfff, 0xfffff),
+            ("block", tar::EntryType::Block, 0xabc, 0xcdef),
+            ("fifo", tar::EntryType::Fifo, 0, 0),
         ] {
-            let mut decoded = Vec::new();
-            layer_reader_from_path(media_type, path)
-                .expect("supported layer media type")
-                .read_to_end(&mut decoded)
-                .expect("read layer contents");
-            assert_eq!(decoded, payload, "{media_type}");
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_uid(23);
+            header.set_gid(24);
+            header.set_mtime(3);
+            header.set_size(0);
+            header.set_entry_type(kind);
+            header.set_device_major(major).unwrap();
+            header.set_device_minor(minor).unwrap();
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::empty())
+                .unwrap();
+        }
+        builder
+            .append_pax_extensions([("SCHILY.filetype", b"socket".as_slice())])
+            .unwrap();
+        append_test_file(&mut builder, "socket", b"");
+        let staged = materialize_cached_layers(
+            temp.path(),
+            vec![(
+                "application/vnd.oci.image.layer.v1.tar",
+                builder.into_inner().unwrap(),
+                None,
+            )],
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let mut reader = disk_image::ext4::Reader::new(&staged.path).unwrap();
+        assert_eq!(reader.read_file(b"raw-\xff", 0, None).unwrap(), b"raw");
+        assert_eq!(reader.read_link("symlink").unwrap(), b"raw-\xff");
+        assert_eq!(reader.read_file("symlink", 0, None).unwrap(), b"raw");
+        assert_eq!(
+            reader
+                .xattrs(b"raw-\xff")
+                .unwrap()
+                .get(b"user.\xff".as_slice()),
+            Some(&vec![0, 255, 10])
+        );
+        for (path, kind, major, minor) in [
+            ("char", 0o020000, 0xfff_u32, 0xfffff_u32),
+            ("block", 0o060000, 0xabc, 0xcdef),
+        ] {
+            let inode = reader.stat_no_follow(path).unwrap().1;
+            assert_eq!(inode.mode, kind | 0o600);
+            assert_eq!(inode.uid_full(), 23);
+            assert_eq!(inode.gid_full(), 24);
+            let encoded = u32::from_le_bytes(inode.block[4..8].try_into().unwrap());
+            assert_eq!(inode.block[..4], [0; 4]);
+            assert_eq!(
+                encoded,
+                (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+            );
+        }
+        assert_eq!(reader.stat_no_follow("fifo").unwrap().1.mode, 0o010600);
+        assert_eq!(reader.stat_no_follow("socket").unwrap().1.mode, 0o140644);
+    }
+
+    #[test]
+    fn production_flat_materialization_preserves_sparse_logical_bytes_without_allocating_holes() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let length = 256 * 1024 * 1024 + 17;
+        let size = length.to_string();
+        let map = format!("0,1,{},1", length - 1);
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([
+                ("GNU.sparse.size", size.as_bytes()),
+                ("GNU.sparse.numblocks", b"2".as_slice()),
+                ("GNU.sparse.map", map.as_bytes()),
+            ])
+            .unwrap();
+        append_test_file(&mut builder, "sparse", b"AB");
+        let staged = materialize_cached_layers(
+            temp.path(),
+            vec![(
+                "application/vnd.oci.image.layer.v1.tar",
+                builder.into_inner().unwrap(),
+                None,
+            )],
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&staged.path).unwrap();
+        assert!(
+            metadata.len() < length as u64,
+            "sizing uses stored data, not the logical hole"
+        );
+        assert!(metadata.blocks() * 512 < 32 * 1024 * 1024);
+        let mut reader = disk_image::ext4::Reader::new(&staged.path).unwrap();
+        let inode = reader.stat("sparse").unwrap().1;
+        assert_eq!(inode.file_size(), length as u64);
+        assert_eq!(reader.read_file("sparse", 0, Some(2)).unwrap(), b"A\0");
+        assert_eq!(
+            reader
+                .read_file("sparse", length as u64 - 2, Some(2))
+                .unwrap(),
+            b"\0B"
+        );
+        assert_eq!(
+            reader
+                .read_file("sparse", 128 * 1024 * 1024, Some(4096))
+                .unwrap(),
+            vec![0; 4096]
+        );
+    }
+
+    #[test]
+    fn production_flat_materialization_rejects_malformed_layers_and_forward_links_atomically() {
+        let mut malformed = Vec::new();
+        for (key, value) in [
+            ("path", b"../escape".as_slice()),
+            ("path", b"nul\0suffix".as_slice()),
+            ("SCHILY.xattr.trusted.overlay.opaque", b"y".as_slice()),
+        ] {
+            let mut builder = tar::Builder::new(Vec::new());
+            builder.append_pax_extensions([(key, value)]).unwrap();
+            append_test_file(&mut builder, "placeholder", b"x");
+            malformed.push(builder.into_inner().unwrap());
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("linkpath", b"target\0suffix".as_slice())])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o777);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1);
+        header.set_size(0);
+        header.set_entry_type(tar::EntryType::Symlink);
+        builder.append_link(&mut header, "link", "target").unwrap();
+        malformed.push(builder.into_inner().unwrap());
+        malformed.push(test_tar(".wh.", b""));
+        let mut builder = tar::Builder::new(Vec::new());
+        header.set_entry_type(tar::EntryType::Link);
+        builder.append_link(&mut header, "link", "target").unwrap();
+        append_test_file(&mut builder, "target", b"x");
+        malformed.push(builder.into_inner().unwrap());
+        for bytes in malformed {
+            let temp = tempfile::tempdir().unwrap();
+            let result = materialize_cached_layers(
+                temp.path(),
+                vec![("application/vnd.oci.image.layer.v1.tar", bytes, None)],
+                64 * 1024 * 1024,
+            );
+            assert!(matches!(
+                result,
+                Err(OciError::Changeset(_)) | Err(OciError::Namespace(_))
+            ));
+            assert!(!temp
+                .path()
+                .join("tmp")
+                .join(format!("stage-{}", operation(101).0))
+                .exists());
+            assert!(!temp.path().join("escape").exists());
         }
     }
 
     #[test]
-    fn layer_reader_rejects_unsupported_media_type() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let path = temp.path().join("layer.tar");
-        std::fs::write(&path, b"layer").expect("write layer");
-
-        let err = match layer_reader_from_path("application/vnd.example.layer.v1.tar", &path) {
-            Ok(_) => panic!("unsupported layer media type should fail"),
-            Err(err) => err,
-        };
-
-        assert!(matches!(err, OciError::UnsupportedLayerMediaType { .. }));
+    fn source_blob_paths_are_content_addressed() {
+        let temp = tempfile::tempdir().unwrap();
+        let producer = OciMaterializer::open(temp.path(), RegistryPolicy::default()).unwrap();
+        let hash = sha256_bytes(b"layer");
+        assert_eq!(
+            producer.blob_path(&format!("sha256:{hash}")).unwrap(),
+            temp.path().join("source-blobs/sha256").join(hash)
+        );
+        assert!(digest_path_components("sha512:bad").is_err());
     }
 
     #[test]
-    fn corrupt_cache_metadata_is_reported() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let platform = Platform::linux_amd64();
-        let dir = store
-            .image_dir(TEST_IMAGE_ID, &platform)
-            .expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"disk").expect("write rootfs");
-        std::fs::write(dir.join("metadata.json"), b"not json").expect("write metadata");
-
-        let err = store
-            .cached_image("alpine:latest", TEST_IMAGE_ID, &platform)
-            .expect_err("corrupt metadata should fail");
-
-        assert!(err.to_string().contains("corrupt"));
+    fn corrupt_source_blob_is_removed_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("blob");
+        std::fs::write(&path, b"wrong").unwrap();
+        assert!(
+            !verified_blob_exists(&path, &format!("sha256:{}", sha256_bytes(b"right")), 5).unwrap()
+        );
+        assert!(!path.exists());
     }
 
     #[test]
-    fn cache_metadata_manifest_must_match_its_image_id() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let platform = Platform::linux_amd64();
-        let mut metadata = serde_json::from_slice::<ImageMetadata>(HISTORICAL_CACHE_METADATA_V2)
-            .expect("read historical metadata");
-        let image_id = metadata.image_id.clone();
-        metadata.manifest_digest = format!("sha256:{}", "ff".repeat(32));
-        let dir = store.image_dir(&image_id, &platform).expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"rootfs").expect("write rootfs");
-        std::fs::write(
-            dir.join(METADATA_FILE_NAME),
-            serde_json::to_vec(&metadata).expect("serialize metadata"),
-        )
-        .expect("write metadata");
+    fn staging_cleanup_does_not_remove_other_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = StagingDir::create(temp.path(), &operation(1)).unwrap();
+        let second = StagingDir::create(temp.path(), &operation(2)).unwrap();
+        let path = first.path().to_owned();
+        std::fs::write(path.join("root.raw"), b"staged").unwrap();
+        drop(first);
+        assert!(!path.exists());
+        assert!(second.path().is_dir());
+    }
 
-        let err = store
-            .cached_image(
-                "registry.example.test/team/demo:stable",
-                &image_id,
-                &platform,
+    #[test]
+    fn denied_resolution_does_not_create_local_state_or_contact_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("absent");
+        let policy =
+            RegistryPolicy::new(RegistryAction::Deny, vec!["docker.io".into()], vec![]).unwrap();
+        let producer = OciMaterializer::open(&root, policy).unwrap();
+        let result = futures_util::FutureExt::now_or_never(producer.resolve(
+            "example.test/demo:latest",
+            &Platform::linux_amd64(),
+            None,
+        ))
+        .expect("policy rejection must complete synchronously");
+        assert!(result.is_err());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn production_flat_materialization_decodes_all_supported_media_types() {
+        use std::io::Write;
+
+        let payload = b"layer contents from a real compressed file\n";
+        let raw = test_tar("contents", payload);
+        let diff_id = format!("sha256:{}", sha256_bytes(&raw));
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let gzip = encoder.finish().unwrap();
+        let zstd = zstd::stream::encode_all(raw.as_slice(), 0).unwrap();
+        for (media_type, bytes) in [
+            ("application/vnd.oci.image.layer.v1.tar", &raw),
+            (
+                "application/vnd.oci.image.layer.nondistributable.v1.tar",
+                &raw,
+            ),
+            ("application/vnd.docker.image.rootfs.diff.tar", &raw),
+            ("application/vnd.oci.image.layer.v1.tar+gzip", &gzip),
+            ("application/vnd.docker.image.rootfs.diff.tar.gzip", &gzip),
+            (
+                "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+                &gzip,
+            ),
+            ("application/vnd.oci.image.layer.v1.tar+zstd", &zstd),
+            (
+                "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd",
+                &zstd,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let staged = materialize_cached_layers(
+                temp.path(),
+                vec![(media_type, bytes.clone(), Some(diff_id.clone()))],
+                64 * 1024 * 1024,
             )
-            .expect_err("mismatched manifest should fail");
-
-        assert!(err.to_string().contains("metadata manifest digest"));
+            .unwrap();
+            let mut reader = disk_image::ext4::Reader::new(&staged.path).unwrap();
+            assert_eq!(
+                reader.read_file("contents", 0, None).unwrap(),
+                payload,
+                "{media_type}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_cache_metadata_from_the_previous_schema() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let platform = Platform::linux_amd64();
-        let dir = store
-            .image_dir(TEST_IMAGE_ID, &platform)
-            .expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"disk").expect("write rootfs");
-        std::fs::write(
-            dir.join("metadata.json"),
-            r#"{
-                "version": 1,
-                "image_ref": "index.docker.io/library/alpine:latest",
-                "image_id": "sha256:def456",
-                "source": "oci-registry",
-                "requested_reference": "index.docker.io/library/alpine:latest",
-                "selected_reference": "index.docker.io/library/alpine@sha256:def456",
-                "manifest_digest": "sha256:def456",
-                "config_digest": "sha256:config",
-                "config": {},
-                "layers": [],
-                "platform": { "os": "linux", "architecture": "amd64" },
-                "filesystem": "ext4",
-                "rootfs_file": "rootfs.img",
-                "created_at_unix": 1
-            }"#,
-        )
-        .expect("write metadata");
-
-        let err = store
-            .cached_image(
-                "index.docker.io/library/alpine:latest",
-                TEST_IMAGE_ID,
-                &platform,
-            )
-            .expect_err("v1 metadata should fail");
-
-        assert!(err.to_string().contains("metadata version 1"));
-    }
-
-    #[test]
-    fn cache_metadata_filesystem_mismatch_is_reported() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let platform = Platform::linux_amd64();
-        let dir = store
-            .image_dir(TEST_IMAGE_ID, &platform)
-            .expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"disk").expect("write rootfs");
-        std::fs::write(
-            dir.join("metadata.json"),
-            serde_json::to_vec_pretty(&ImageMetadata {
-                version: METADATA_VERSION,
-                image_ref: "index.docker.io/library/alpine:latest".to_string(),
-                image_id: TEST_IMAGE_ID.to_string(),
-                source: StoredRootfsImageSource::OciRegistry,
-                requested_reference: "index.docker.io/library/alpine:latest".to_string(),
-                selected_reference: format!("index.docker.io/library/alpine@{TEST_IMAGE_ID}"),
-                manifest_digest: TEST_IMAGE_ID.to_string(),
-                config_digest: "sha256:config".to_string(),
-                config: ImageConfig::default(),
-                layers: Vec::new(),
-                platform: platform.clone(),
-                filesystem: "xfs".to_string(),
-                rootfs_file: ROOTFS_FILE_NAME.to_string(),
-                created_at_unix: 1,
-            })
-            .expect("serialize metadata"),
-        )
-        .expect("write metadata");
-
-        let err = store
-            .cached_image(
-                "index.docker.io/library/alpine:latest",
-                TEST_IMAGE_ID,
-                &platform,
-            )
-            .expect_err("filesystem mismatch should fail");
-
-        assert!(err.to_string().contains("metadata filesystem"));
-    }
-
-    #[test]
-    fn image_id_path_rejects_invalid_id() {
-        let err = image_id_path_component("not-an-id").expect_err("image id should fail");
-
-        assert!(err.to_string().contains("only sha256"));
-    }
-
-    #[test]
-    fn digest_path_components_rejects_non_sha256_digests() {
-        let err = digest_path_components("sha512:abc").expect_err("digest should fail");
-
-        assert!(err.to_string().contains("only sha256"));
-    }
-
-    #[test]
-    fn blob_cache_paths_are_content_addressed() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let digest = format!("sha256:{}", sha256_bytes(b"layer"));
-        let encoded = digest.strip_prefix("sha256:").expect("digest prefix");
-
-        assert_eq!(
-            store.blob_path(&digest).expect("blob path"),
-            temp.path().join("blobs/sha256").join(encoded)
+    fn production_flat_materialization_rejects_unsupported_media_type_and_cleans_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = materialize_cached_layers(
+            temp.path(),
+            vec![(
+                "application/vnd.example.layer.v1.tar",
+                test_tar("contents", b"x"),
+                None,
+            )],
+            64 * 1024 * 1024,
         );
-        assert_eq!(
-            store.blob_part_path(&digest).expect("part path"),
-            temp.path().join(format!("tmp/sha256-{encoded}.part"))
-        );
-        assert_eq!(
-            store.blob_lock_path(&digest).expect("lock path"),
-            temp.path()
-                .join(format!("tmp/sha256-{encoded}.download.lock"))
-        );
-    }
-
-    #[test]
-    fn uppercase_blob_digest_uses_the_existing_lowercase_cache_path() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let digest = format!("sha256:{}", "AB".repeat(32));
-        let encoded = "ab".repeat(32);
-
-        assert_eq!(
-            store.blob_path(&digest).expect("blob path"),
-            temp.path().join("blobs/sha256").join(&encoded)
-        );
-        assert_eq!(
-            store.blob_part_path(&digest).expect("part path"),
-            temp.path().join(format!("tmp/sha256-{encoded}.part"))
-        );
-        assert_eq!(
-            store.blob_lock_path(&digest).expect("lock path"),
-            temp.path()
-                .join(format!("tmp/sha256-{encoded}.download.lock"))
-        );
+        assert!(matches!(
+            result,
+            Err(OciError::Changeset(
+                crate::changeset::ChangesetError::Unsupported(_)
+            ))
+        ));
+        assert!(!temp
+            .path()
+            .join("tmp")
+            .join(format!("stage-{}", operation(101).0))
+            .exists());
     }
 
     #[test]
@@ -1824,7 +1633,8 @@ mod tests {
             diff_id: "sha256:diff".to_string(),
         };
 
-        let err = verify_layer_file(&path, &layer).expect_err("digest mismatch should fail");
+        let err = verify_layer_file(&path, &layer.digest, layer.size_bytes)
+            .expect_err("digest mismatch should fail");
 
         assert!(err.to_string().contains("has digest"));
         assert!(!path.exists());
@@ -1842,193 +1652,341 @@ mod tests {
             diff_id: "sha256:diff".to_string(),
         };
 
-        verify_layer_file(&path, &layer).expect("matching digest should pass");
+        verify_layer_file(&path, &layer.digest, layer.size_bytes)
+            .expect("matching digest should pass");
 
         assert!(path.exists());
     }
 
     #[test]
-    fn concurrent_tag_updates_preserve_every_mapping() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let thread_count = 16;
-        let barrier = Arc::new(Barrier::new(thread_count));
+    fn production_flat_materialization_hashes_padding_and_every_gzip_member() {
+        use std::io::Write;
 
-        std::thread::scope(|scope| {
-            let mut threads = Vec::with_capacity(thread_count);
-            for index in 0..thread_count {
-                let root = temp.path().to_path_buf();
-                let barrier = Arc::clone(&barrier);
-                threads.push(scope.spawn(move || {
-                    let store =
-                        ImageStore::open(root, RegistryPolicy::default()).expect("open store");
-                    let reference = format!("example.test/demo-{index}:latest");
-                    let digest = format!("sha256:{index:064x}");
-                    barrier.wait();
-                    store
-                        .update_tag_mapping(&reference, &Platform::linux_amd64(), &digest)
-                        .expect("update tag mapping");
-                }));
-            }
-            for thread in threads {
-                thread.join().expect("join tag update");
-            }
-        });
+        let padding = vec![0_u8; 2048];
+        let suffix = vec![0_u8; 1024];
+        let mut decoded = padding.clone();
+        decoded.extend_from_slice(&suffix);
+        let mut compressed = Vec::new();
+        for bytes in [padding.as_slice(), suffix.as_slice()] {
+            let mut member =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            member.write_all(bytes).unwrap();
+            compressed.extend(member.finish().unwrap());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let staged = materialize_cached_layers(
+            temp.path(),
+            vec![(
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                compressed.clone(),
+                Some(format!("sha256:{}", sha256_bytes(&decoded))),
+            )],
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        drop(staged);
+        let result = materialize_cached_layers(
+            temp.path(),
+            vec![(
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                compressed,
+                Some(format!("sha256:{}", sha256_bytes(&padding))),
+            )],
+            64 * 1024 * 1024,
+        );
+        assert!(matches!(
+            result,
+            Err(OciError::Changeset(
+                crate::changeset::ChangesetError::Invalid(_)
+            ))
+        ));
+        assert!(!temp
+            .path()
+            .join("tmp")
+            .join(format!("stage-{}", operation(101).0))
+            .exists());
+    }
 
-        let store = ImageStore::open(temp.path(), RegistryPolicy::default()).expect("open store");
-        let index = store.read_index().expect("read shared index");
-        assert_eq!(index.tags.len(), thread_count);
-        for entry in 0..thread_count {
-            let key = tag_key(
-                &format!("example.test/demo-{entry}:latest"),
-                &Platform::linux_amd64(),
-            );
-            assert_eq!(
-                index
-                    .tags
-                    .get(&key)
-                    .map(|record| record.manifest_digest.as_str()),
-                Some(format!("sha256:{entry:064x}").as_str())
-            );
+    #[test]
+    fn source_symlinks_cannot_redirect_cache_reads_or_partial_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().join("external");
+        let link = temp.path().join("layer.part");
+        std::fs::write(&external, b"right").unwrap();
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+        let layer = ResolvedLayer {
+            digest: format!("sha256:{}", sha256_bytes(b"right")),
+            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+            size_bytes: 5,
+            diff_id: format!("sha256:{}", sha256_bytes(b"right")),
+        };
+        assert!(crate::store::partial_download_offset(&link, &layer).is_err());
+        assert!(crate::store::open_source_blob(&link).is_err());
+        assert!(!verified_blob_exists(&link, &layer.digest, layer.size_bytes).unwrap());
+        assert_eq!(std::fs::read(&external).unwrap(), b"right");
+        assert!(!link.exists());
+    }
+
+    #[test]
+    fn invalid_flatten_geometry_fails_before_registry_or_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("absent");
+        let producer = OciMaterializer::open(&root, RegistryPolicy::default()).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let reference = format!("example.invalid/demo@{digest}");
+        let image = crate::ResolvedImage {
+            requested_reference: reference.clone(),
+            selected_reference: reference.clone(),
+            manifest_digest: digest.clone(),
+            config_digest: digest,
+            config: crate::ImageConfig::default(),
+            platform: Platform::linux_amd64(),
+            reference: reference.parse().unwrap(),
+            layers: Vec::new(),
+        };
+        for size in [0, 513, (1_u64 << 40) + 512] {
+            let options = crate::MaterializeOptions::new(Platform::linux_amd64())
+                .with_flat_ext4_size_bytes(size);
+            let result = futures_util::FutureExt::now_or_never(producer.materialize(
+                &image,
+                &options,
+                &operation(1),
+                None,
+            ))
+            .expect("invalid geometry cannot wait on a registry");
+            assert!(matches!(result, Err(OciError::ImageConfig { .. })));
+        }
+        assert!(!root.exists());
+    }
+    #[test]
+    fn cached_source_requires_exact_descriptor_size_even_when_digest_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("blob");
+        std::fs::write(&path, b"right").unwrap();
+        let digest = format!("sha256:{}", sha256_bytes(b"right"));
+        assert!(matches!(
+            verified_blob_exists(&path, &digest, 4),
+            Err(OciError::LayerSizeMismatch {
+                expected: 4,
+                actual: 5,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"right");
+        assert!(verified_blob_exists(&path, &digest, 5).unwrap());
+    }
+
+    #[test]
+    fn staged_bytes_hold_only_a_temporary_publication_lock() {
+        use nix::fcntl::{Flock, FlockArg};
+        let temp = tempfile::tempdir().unwrap();
+        let operation = operation(1);
+        let staging = StagingDir::create(temp.path(), &operation).unwrap();
+        assert!(!temp.path().join("locks/leases").exists());
+        let path = temp
+            .path()
+            .join("locks/publication")
+            .join(format!("stage-{}.lock", operation.0));
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(Flock::lock(contender, FlockArg::LockExclusiveNonblock).is_err());
+        drop(staging);
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(Flock::lock(contender, FlockArg::LockExclusiveNonblock).is_ok());
+        for invalid in ["../escape", "00000000-0000-4000-8000-00000000000A"] {
+            assert!(crate::StagingOperation::try_from(invalid.to_string()).is_err());
         }
     }
 
-    fn deny_by_default(search: &[&str]) -> RegistryPolicy {
-        RegistryPolicy::new(
-            RegistryAction::Deny,
-            search.iter().map(|s| s.to_string()).collect(),
-            vec![RegistryRule::new("ghcr.io/allowed", RegistryAction::Allow)],
-        )
-        .expect("valid policy")
+    #[test]
+    fn source_blob_checksum_and_verification_fit_a_small_thread_stack() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("blob");
+        let bytes = vec![0x5a; 128 * 1024 + 113];
+        std::fs::write(&path, &bytes).unwrap();
+        let digest = crate::digest::Sha256Digest::from_bytes(&bytes).to_string();
+        let size = bytes.len() as u64;
+        let empty = temp.path().join("empty");
+        std::fs::write(&empty, []).unwrap();
+        let empty_digest = crate::digest::Sha256Digest::from_bytes(&[]).to_string();
+        std::thread::Builder::new()
+            .name("small-stack-source-verification".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                assert!(verified_blob_exists(&path, &digest, size).unwrap());
+                verify_layer_file(&path, &digest, size).unwrap();
+                assert!(crate::store::layer_digest_matches(&path, &digest).unwrap());
+                assert!(verified_blob_exists(&empty, &empty_digest, 0).unwrap());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
-    fn resolve_rejects_denied_references_before_contacting_a_registry() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store =
-            ImageStore::open(temp.path(), deny_by_default(&["docker.io"])).expect("open store");
-
-        // `now_or_never` only completes if nothing awaited network I/O.
-        let err = futures_util::FutureExt::now_or_never(store.resolve(
-            "example.test/x:latest",
-            &Platform::linux_amd64(),
-            None,
-        ))
-        .expect("policy check must not await the registry")
-        .expect_err("denied");
-        assert_eq!(
-            err.to_string(),
-            "image \"example.test/x:latest\" is denied by the registry policy default"
-        );
-
-        let err = futures_util::FutureExt::now_or_never(store.get_or_create(
-            "nixos/nix",
-            &MaterializeOptions::new(Platform::linux_amd64()),
-            None,
-        ))
-        .expect("policy check must not await the registry")
-        .expect_err("denied");
-        assert!(matches!(
-            &err,
-            OciError::RegistryPolicyDenied { reference, rule: None }
-                if reference == "docker.io/nixos/nix:latest"
-        ));
+    fn cancelled_source_verification_waiter_does_not_release_worker_publication_lock() {
+        use nix::fcntl::{Flock, FlockArg};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<bool>>, bool);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(self.1);
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let bytes = vec![0x5a; 2 * 1024 * 1024 + 113];
+        std::fs::write(&source, &bytes).unwrap();
+        let digest = crate::digest::Sha256Digest::from_bytes(&bytes).to_string();
+        let size = bytes.len() as u64;
+        let lock_path = temp.path().join("locks/publication/source.lock");
+        let worker_lock = lock_path.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let waiter = tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
+                    let _lock = crate::lock::FileLock::exclusive(&worker_lock).unwrap();
+                    // Deterministically pause the real verification worker
+                    // after lock acquisition, before its full-file checksum.
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let result = crate::store::verified_blob_exists(&source, &digest, size);
+                    let verified = matches!(&result, Ok(true));
+                    (result, NotifyOnDrop(Some(done_tx), verified))
+                })
+                .await
+            });
+            // A blocking receive here would prevent this current-thread
+            // runtime from ever polling the waiter that launches the worker.
+            started_rx.await.unwrap();
+            waiter.abort();
+            assert!(matches!(waiter.await,Err(error) if error.is_cancelled()));
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            assert!(Flock::lock(contender, FlockArg::LockExclusiveNonblock).is_err());
+            release_tx.send(()).unwrap();
+            assert!(done_rx.await.unwrap());
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            let _exclusive = Flock::lock(contender, FlockArg::LockExclusiveNonblock).unwrap();
+        });
     }
 
     #[test]
-    fn resolve_reports_the_first_denial_when_every_candidate_is_denied() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), deny_by_default(&["quay.io", "docker.io"]))
-            .expect("open store");
-
-        let err = futures_util::FutureExt::now_or_never(store.resolve(
-            "nixos/nix",
-            &Platform::linux_amd64(),
-            None,
-        ))
-        .expect("policy check must not await the registry")
-        .expect_err("denied");
-        assert!(matches!(
-            &err,
-            OciError::RegistryPolicyDenied { reference, .. }
-                if reference == "quay.io/nixos/nix:latest"
-        ));
+    fn production_flat_materialization_handles_empty_inputs_without_leaking_scoped_packs() {
+        for layers in [
+            Vec::new(),
+            vec![(
+                "application/vnd.oci.image.layer.v1.tar",
+                vec![0; 1024],
+                None,
+            )],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let staged = materialize_cached_layers(temp.path(), layers, 64 * 1024 * 1024).unwrap();
+            let mut reader = disk_image::ext4::Reader::new(&staged.path).unwrap();
+            assert!(reader.list_dir("/").unwrap().is_empty());
+            let root = reader.stat("/").unwrap().1;
+            assert_eq!(root.mode & 0o7777, 0o755);
+            assert_eq!(root.mtime, 0);
+            let directory = staged.path.parent().unwrap();
+            assert!(!std::fs::read_dir(directory).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b"layer-")
+            }));
+            let root_path = staged.path.clone();
+            drop(staged);
+            assert!(!root_path.exists());
+        }
     }
 
     #[test]
-    fn materialize_rechecks_policy_on_the_transport_reference() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store =
-            ImageStore::open(temp.path(), deny_by_default(&["docker.io"])).expect("open store");
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let resolved = ResolvedImage {
-            requested_reference: "ghcr.io/allowed/x:latest".to_string(),
-            selected_reference: format!("example.test/x@{digest}"),
-            manifest_digest: digest.clone(),
-            config_digest: digest.clone(),
-            config: ImageConfig::default(),
-            platform: Platform::linux_amd64(),
-            reference: oci_client::Reference::from_str(&format!("example.test/x@{digest}"))
-                .expect("reference"),
-            layers: Vec::new(),
-        };
-
-        let err = futures_util::FutureExt::now_or_never(store.materialize(
-            &resolved,
-            &MaterializeOptions::new(Platform::linux_amd64()),
-            None,
-        ))
-        .expect("policy check must not await the registry")
-        .expect_err("denied");
-        assert!(matches!(
-            &err,
-            OciError::RegistryPolicyDenied { reference, .. }
-                if reference == &format!("example.test/x@{digest}")
-        ));
-    }
-
-    #[test]
-    fn short_name_cache_lookup_and_removal_search_every_registry_without_policy() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let store = ImageStore::open(temp.path(), deny_by_default(&["ghcr.io", "docker.io"]))
-            .expect("open store");
-        let options = MaterializeOptions::new(Platform::linux_amd64());
-        let metadata = serde_json::from_slice::<ImageMetadata>(HISTORICAL_CACHE_METADATA_V2)
-            .expect("read historical metadata");
-        let image_id = metadata.image_id.clone();
-        let dir = store
-            .image_dir(&image_id, &options.platform)
-            .expect("cache path");
-        std::fs::create_dir_all(&dir).expect("create cache dir");
-        std::fs::write(dir.join(METADATA_FILE_NAME), HISTORICAL_CACHE_METADATA_V2)
-            .expect("write metadata");
-        std::fs::write(dir.join(ROOTFS_FILE_NAME), b"rootfs").expect("write rootfs");
-        store
-            .update_tag_mapping(
-                "docker.io/acme/tool:latest",
-                &options.platform,
-                &metadata.manifest_digest,
+    fn production_flat_materialization_refuses_unrepresentable_symlinks_after_normalized_admission()
+    {
+        for length in [4095, 4096] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = vec![b't'; length];
+            let mut builder = tar::Builder::new(Vec::new());
+            builder
+                .append_pax_extensions([("linkpath", target.as_slice())])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(1);
+            header.set_size(0);
+            builder
+                .append_link(&mut header, "link", "placeholder")
+                .unwrap();
+            let bytes = builder.into_inner().unwrap();
+            let source = temp.path().join("source.tar");
+            std::fs::write(&source, &bytes).unwrap();
+            let digest = crate::changeset::ContentDigest::of_bytes(&bytes);
+            let admitted = crate::changeset::ingest_layer(
+                &source,
+                &crate::changeset::LayerInput {
+                    blob_digest: digest,
+                    media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+                    size_bytes: bytes.len() as u64,
+                    diff_id: digest,
+                },
+                &temp.path().join("normalized"),
+                &operation(101),
+                &crate::changeset::ChangesetLimits::default(),
             )
-            .expect("map tag");
-
-        let rootfs = store
-            .get_cached("acme/tool", &options)
-            .expect("read cache")
-            .expect("cache hit through the second search registry");
-        assert_eq!(
-            rootfs.flat_ext4().requested_reference,
-            "docker.io/acme/tool:latest"
-        );
-        assert_eq!(rootfs.flat_ext4().image_id, image_id);
-
-        assert!(store
-            .remove_reference("acme/tool", &options.platform)
-            .expect("remove tag"));
-        assert!(store
-            .get_cached("acme/tool", &options)
-            .expect("read cache")
-            .is_none());
-        assert!(!store
-            .remove_reference("acme/tool", &options.platform)
-            .expect("remove missing tag"));
+            .unwrap();
+            assert!(
+                matches!(
+                    &admitted.changeset().entries[0].kind,
+                    crate::changeset::EntryKind::Symlink { target: actual } if actual == &target
+                ),
+                "normalized admission retains both boundary inputs unchanged"
+            );
+            drop(admitted);
+            let result = materialize_cached_layers(
+                temp.path(),
+                vec![("application/vnd.oci.image.layer.v1.tar", bytes, None)],
+                64 * 1024 * 1024,
+            );
+            if length == 4095 {
+                let staged = result.unwrap();
+                let mut reader = disk_image::ext4::Reader::new(&staged.path).unwrap();
+                assert_eq!(reader.read_link("link").unwrap(), target);
+                drop(staged);
+            } else {
+                assert!(matches!(result, Err(OciError::FlatExt4 { .. })));
+            }
+            assert!(!temp
+                .path()
+                .join("tmp")
+                .join(format!("stage-{}", operation(101).0))
+                .exists());
+        }
     }
 }

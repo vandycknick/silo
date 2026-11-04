@@ -15,10 +15,14 @@ impl Sha256Digest {
                 digest: value.to_string(),
             });
         };
-        if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if encoded.len() != 64
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(OciError::InvalidDigest {
                 digest: value.to_string(),
-                message: "sha256 digests must be 64 hexadecimal characters".to_string(),
+                message: "sha256 digests must be 64 lowercase hexadecimal characters".to_string(),
             });
         }
 
@@ -41,14 +45,6 @@ impl Sha256Digest {
     pub(crate) fn hex(self) -> String {
         hex_encode(&self.0)
     }
-
-    pub(crate) fn cache_components(value: &str) -> OciResult<(&'static str, String)> {
-        Self::parse(value)?;
-        let encoded = value
-            .strip_prefix("sha256:")
-            .expect("validated SHA-256 digest prefix");
-        Ok(("sha256", encoded.to_string()))
-    }
 }
 
 impl Display for Sha256Digest {
@@ -61,7 +57,6 @@ fn hex_value(value: u8) -> u8 {
     match value {
         b'0'..=b'9' => value - b'0',
         b'a'..=b'f' => value - b'a' + 10,
-        b'A'..=b'F' => value - b'A' + 10,
         _ => 0,
     }
 }
@@ -82,15 +77,9 @@ mod tests {
     use crate::digest::Sha256Digest;
 
     #[test]
-    fn accepts_uppercase_hex_and_displays_lowercase() {
-        let digest = Sha256Digest::parse(&format!("sha256:{}", "AB".repeat(32)))
-            .expect("parse uppercase digest");
-
+    fn rejects_noncanonical_uppercase_digest_spelling() {
+        assert!(Sha256Digest::parse(&format!("sha256:{}", "AB".repeat(32))).is_err());
+        let digest = Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
         assert_eq!(digest.to_string(), format!("sha256:{}", "ab".repeat(32)));
-        assert_eq!(
-            Sha256Digest::cache_components(&format!("sha256:{}", "AB".repeat(32)))
-                .expect("cache components"),
-            ("sha256", "AB".repeat(32))
-        );
     }
 }

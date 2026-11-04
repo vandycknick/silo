@@ -1,7 +1,7 @@
+pub mod changeset;
 mod digest;
 mod error;
-mod ext4_writer;
-mod layer;
+mod flat_ext4;
 mod lock;
 mod platform;
 mod policy;
@@ -15,6 +15,6 @@ pub use crate::policy::{RegistryAction, RegistryPolicy, RegistryRule};
 pub use crate::progress::{ProgressEvent, ProgressReporter};
 pub use crate::registry::{ImageConfig, ResolvedImage};
 pub use crate::store::{
-    FlatExt4Artifact, ImageStore, Materialization, MaterializeOptions, PublishedRootfs,
-    RootfsLayerMetadata, RootfsMetadata,
+    Materialization, MaterializeOptions, OciMaterializer, RootfsLayerMetadata, RootfsMetadata,
+    StagedRootfs, StagingOperation,
 };

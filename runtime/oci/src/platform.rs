@@ -39,15 +39,6 @@ impl Platform {
         }
     }
 
-    pub(crate) fn cache_key(&self) -> String {
-        let mut key = format!("{}-{}", self.os, self.architecture);
-        if let Some(variant) = &self.variant {
-            key.push('-');
-            key.push_str(variant);
-        }
-        sanitize_component(&key)
-    }
-
     pub(crate) fn matches_config(
         &self,
         os: &str,
@@ -74,28 +65,14 @@ impl Display for Platform {
     }
 }
 
-pub(crate) fn sanitize_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use crate::Platform;
 
     #[test]
-    fn platform_display_and_cache_key_use_oci_names() {
+    fn platform_display_uses_oci_names() {
         let platform = Platform::linux_arm64();
 
         assert_eq!(platform.to_string(), "linux/arm64");
-        assert_eq!(platform.cache_key(), "linux-arm64");
     }
 }

@@ -1,0 +1,5238 @@
+{
+  "cases": [
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+          "indexRoot": "sha256:e5fb8190643d84b871b609684f3f63267f1bc1c808875a71dd53c3ad12ec50ef",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:62c7a17af8e7cc1a9088becf523602a15633c6f1b8b1c0d492e6f165f61a560e",
+          "result": "sha256:5d3ce7586eef9a974470b7618f247595675b98506470618b8550bbb02e5553aa",
+          "size": 1024,
+          "tar": "empty-repeated/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+          "indexRoot": "sha256:e5fb8190643d84b871b609684f3f63267f1bc1c808875a71dd53c3ad12ec50ef",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:62c7a17af8e7cc1a9088becf523602a15633c6f1b8b1c0d492e6f165f61a560e",
+          "result": "sha256:5d3ce7586eef9a974470b7618f247595675b98506470618b8550bbb02e5553aa",
+          "size": 1024,
+          "tar": "empty-repeated/layer-1.tar"
+        },
+        {
+          "diffId": "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+          "indexRoot": "sha256:e5fb8190643d84b871b609684f3f63267f1bc1c808875a71dd53c3ad12ec50ef",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:62c7a17af8e7cc1a9088becf523602a15633c6f1b8b1c0d492e6f165f61a560e",
+          "result": "sha256:5d3ce7586eef9a974470b7618f247595675b98506470618b8550bbb02e5553aa",
+          "size": 1024,
+          "tar": "empty-repeated/layer-2.tar"
+        }
+      ],
+      "matrix": [
+        "N01"
+      ],
+      "name": "empty-repeated"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:cc786e0d1732a213fac9e8ee2e2e9f503767ace69a31fa76f0f7ad6054f8885f",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:1702c2a5f112e35eb9009e81a5a95a9f138a3ffb5113791d2ad53c87cb1ff1a1",
+          "result": "sha256:945c9fd0344960dacee801682c2c71e2d6c61801628f939a4b75847f00da457d",
+          "size": 2048,
+          "tar": "replace-repeated/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:4694c8172c7f4675636f4c01cd94800b4cef060cdf0c4c8e8737d2574502cb8e",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:b432e2af46fa6ff8bd23b4626a31dca98512e02f6ca11247b6bb6ab7d94102af",
+          "result": "sha256:03fab8586df99a0640e8171625f0c1caee95569636479dbb070516a65f7a0d1f",
+          "size": 2048,
+          "tar": "replace-repeated/layer-1.tar"
+        },
+        {
+          "diffId": "sha256:4694c8172c7f4675636f4c01cd94800b4cef060cdf0c4c8e8737d2574502cb8e",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:b432e2af46fa6ff8bd23b4626a31dca98512e02f6ca11247b6bb6ab7d94102af",
+          "result": "sha256:03fab8586df99a0640e8171625f0c1caee95569636479dbb070516a65f7a0d1f",
+          "size": 2048,
+          "tar": "replace-repeated/layer-2.tar"
+        }
+      ],
+      "matrix": [
+        "N02"
+      ],
+      "name": "replace-repeated"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZC9uZXc",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZC9uZXc",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:1334b392651698c2a8476bc0b02f1ebdc087aa4d8cb20dd042cf0f0c4365f942",
+          "indexRoot": "sha256:5d0efd54f324b7bb678edb410fdbdfe8b4ae647d9bc8e12d1d080cbc8cdf4c5c",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:4363ea933e3a26a220d34d35e6e549bf5394756e2c20022fc8cc236eebb89356",
+          "result": "sha256:0f79540c17ad8ede5cd33b64c9a8d4480bced2b65f6c1354c0efdf0a07a5d045",
+          "size": 2048,
+          "tar": "opaque-reverse/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:f1785f86ac11dd6c5f8159e5fc4cd4b506ef404f5ec3d9db83562ae637717927",
+          "indexRoot": "sha256:fe1a033395ecb8bfb728690a9ab268379faf2d49849d30eb360659cfdff2b768",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:8405e9506aeddffb512f3f4c0bc649bcf570c628f4ba45a9b91feafee21d7919",
+          "result": "sha256:b16b92b43d093f8f13b889c8c4e603bf95b14ca616726ff7a1aa2b844c24bfc0",
+          "size": 2560,
+          "tar": "opaque-reverse/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N03"
+      ],
+      "name": "opaque-reverse"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZC9uZXc",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZC9uZXc",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:1334b392651698c2a8476bc0b02f1ebdc087aa4d8cb20dd042cf0f0c4365f942",
+          "indexRoot": "sha256:5d0efd54f324b7bb678edb410fdbdfe8b4ae647d9bc8e12d1d080cbc8cdf4c5c",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:4363ea933e3a26a220d34d35e6e549bf5394756e2c20022fc8cc236eebb89356",
+          "result": "sha256:0f79540c17ad8ede5cd33b64c9a8d4480bced2b65f6c1354c0efdf0a07a5d045",
+          "size": 2048,
+          "tar": "opaque-first/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:88a5cd688fe396bbb1d13b068f9ec89564476f94f7073dcf5944aa8829df4586",
+          "indexRoot": "sha256:0bd0341c6ae234cf5780b9de71836cc184596432063c105499008c1c7e5a12a5",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:3c165e8a1b1b4aeea373ad92a437358d1c2d24041bfd6fc8d2013b0eb9c308fd",
+          "result": "sha256:40088a31b113570f39b607bad90438f10d3b0eabf44ec714c3a5d221df70176d",
+          "size": 2560,
+          "tar": "opaque-first/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N03"
+      ],
+      "name": "opaque-first"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YS9i",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YS9iL2M",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YS9iL2MvZm9v",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YS9iL2MvZm9v",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:1cc12a5a7c1947c1bc074168fda575ce59d82fe9244b035d703c4454e278b3e0",
+          "indexRoot": "sha256:65ac6afc58d33002fc02cd34d01e799a0be40f84ba8f34b2e3ace5393d293f28",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:c1ad4224b292c1dc4c3d9b12c756fd99e6efe3f21232448f083cb90b63003ac8",
+          "result": "sha256:1f5187a96701f85169fc15b1252c41fd8d90c3e9b4485425837532b0b3ed9277",
+          "size": 2048,
+          "tar": "opaque-implicit-ancestors/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:15c8c99ad26a96702ddf804fa4ec34351ed4189650628b5f1ee44d52e95684d1",
+          "indexRoot": "sha256:f04b0d1049a2990f17a9f10e46718b43969b403325a51da3fd75c93a0d7dd00c",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:13596686fbf45d384380ca02a8707cba16283b5ee3acc37af8f04bdf976b5411",
+          "result": "sha256:e771c10211779ae9098f77c23c6f0b655cbe854a60a910c5b0416350233a5c74",
+          "size": 2560,
+          "tar": "opaque-implicit-ancestors/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N04"
+      ],
+      "name": "opaque-implicit-ancestors"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YS9i",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YS9iL2M",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YS9iL2MvZm9v",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YS9iL2MvZm9v",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:1cc12a5a7c1947c1bc074168fda575ce59d82fe9244b035d703c4454e278b3e0",
+          "indexRoot": "sha256:65ac6afc58d33002fc02cd34d01e799a0be40f84ba8f34b2e3ace5393d293f28",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:c1ad4224b292c1dc4c3d9b12c756fd99e6efe3f21232448f083cb90b63003ac8",
+          "result": "sha256:1f5187a96701f85169fc15b1252c41fd8d90c3e9b4485425837532b0b3ed9277",
+          "size": 2048,
+          "tar": "opaque-explicit-ancestors/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:274ee51b6b86b611d4ceb0a89564ec5eba7d900860f24072a8de380c62ddd5a5",
+          "indexRoot": "sha256:5526d8bbe5e74b6c80c59787470131b0d1f830338ffa09edea64a4fb5c8cc01c",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:fc552290773af80cc443284c6f77bc2d7d20e9ec305bc14acfa6dd3eb8e38e5f",
+          "result": "sha256:3557bc61abfccec464b9f4934f9d154100a73206e578c3e1537a532af8c82cfa",
+          "size": 4096,
+          "tar": "opaque-explicit-ancestors/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N04"
+      ],
+      "name": "opaque-explicit-ancestors"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:cc786e0d1732a213fac9e8ee2e2e9f503767ace69a31fa76f0f7ad6054f8885f",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:1702c2a5f112e35eb9009e81a5a95a9f138a3ffb5113791d2ad53c87cb1ff1a1",
+          "result": "sha256:945c9fd0344960dacee801682c2c71e2d6c61801628f939a4b75847f00da457d",
+          "size": 2048,
+          "tar": "whiteout-reverse/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:4af1e14dc7b6e1deb7c28500a1d41b2046317cec51d0adb34c63dfac8ee6b43d",
+          "indexRoot": "sha256:f48dd9211dd112d314d631e925e8d02fb79e7212ff3aad7be978150aed5d8925",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:1eb61e98fc4d65b0710683b85fe979ba83e8f85187fe2b5fb5ffe1ab107c4b7c",
+          "result": "sha256:4e7b4e14e83b036a9cae6a4ec0488193895e0f4ff2a8429e8557a6c2594a7fdb",
+          "size": 2560,
+          "tar": "whiteout-reverse/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N05"
+      ],
+      "name": "whiteout-reverse"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:cc786e0d1732a213fac9e8ee2e2e9f503767ace69a31fa76f0f7ad6054f8885f",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:1702c2a5f112e35eb9009e81a5a95a9f138a3ffb5113791d2ad53c87cb1ff1a1",
+          "result": "sha256:945c9fd0344960dacee801682c2c71e2d6c61801628f939a4b75847f00da457d",
+          "size": 2048,
+          "tar": "whiteout-first/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:089309edca002798d7850b52400d0990d2f98018f24efd5f93913f57ddf8133e",
+          "indexRoot": "sha256:772d7b7b46359f50cad85acf998a099db4b4a90a6ed291776d8fcc54b3ba185b",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:27d02b43a7e172b7ad7bd193735733da8061f0308cc9cf18358b6b9729987214",
+          "result": "sha256:758930c512a40b7d76bc4b482b5eb95df6d10ad688ed53dd46c01a080f4cf435",
+          "size": 2560,
+          "tar": "whiteout-first/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N05"
+      ],
+      "name": "whiteout-first"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZA",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:429d981bc6334b6b9d18cec12c23cb39ab037df2400c5b14c2911942023a943a",
+          "indexRoot": "sha256:81875776be20730843a5f127a4b371e7c7d0801be52bca1712af6f5fa1f5f321",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:234c5f9e5b608b4b62177081254ed778917d6f294847e04b6ff9868143d96df9",
+          "result": "sha256:b42829bcb608ecd4b814b7446f68921b676d3f2f3c1372e052a3013327b069f4",
+          "size": 2048,
+          "tar": "directory-to-file/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:3f67a03115df4b64c05e38b1f533bf0b459632442b074bc64118d660f6b7f8ba",
+          "indexRoot": "sha256:dd5cb646278445ff2e3a25bbecd1001403b9aab1fb3750f47fcc08303df450c3",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:11f20f97b0879e19900018bf7b1432bd9718e0fe9ea0964467178aad78efc68c",
+          "result": "sha256:afdbe890b51436f8bd5187b99e48c9cf2c9d0ba0b99b32c82ca72e4034cd2f36",
+          "size": 2048,
+          "tar": "directory-to-file/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N06"
+      ],
+      "name": "directory-to-file"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZA",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": "dGFyZ2V0",
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:429d981bc6334b6b9d18cec12c23cb39ab037df2400c5b14c2911942023a943a",
+          "indexRoot": "sha256:81875776be20730843a5f127a4b371e7c7d0801be52bca1712af6f5fa1f5f321",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:234c5f9e5b608b4b62177081254ed778917d6f294847e04b6ff9868143d96df9",
+          "result": "sha256:b42829bcb608ecd4b814b7446f68921b676d3f2f3c1372e052a3013327b069f4",
+          "size": 2048,
+          "tar": "directory-to-symlink/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:7a48dd30ff6cada551e95e5f569a53a4e981b97d7cfc006930c6f44100711a28",
+          "indexRoot": "sha256:dc96abf380232b74447600747d0e44c005b203b3fdd1d763ea65f3392c98f5bf",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:821a9cc66212dfb8c84e8c3c90db9a350a5da1cde4db2c2f7ca612b6bff9fb2d",
+          "result": "sha256:71e8fa1c7af87a55d3c59d0ab011253f7f4c79105142eeeebc87b6ce4097716b",
+          "size": 1536,
+          "tar": "directory-to-symlink/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N06"
+      ],
+      "name": "directory-to-symlink"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZC9jaGlsZA",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZC9jaGlsZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:7a48dd30ff6cada551e95e5f569a53a4e981b97d7cfc006930c6f44100711a28",
+          "indexRoot": "sha256:dc96abf380232b74447600747d0e44c005b203b3fdd1d763ea65f3392c98f5bf",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:821a9cc66212dfb8c84e8c3c90db9a350a5da1cde4db2c2f7ca612b6bff9fb2d",
+          "result": "sha256:71e8fa1c7af87a55d3c59d0ab011253f7f4c79105142eeeebc87b6ce4097716b",
+          "size": 1536,
+          "tar": "symlink-to-directory/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:6061a9c6b92c959a29c2e60550f6edb76514ba2ab91f9793b158c86f5a0d2e53",
+          "indexRoot": "sha256:ca524ec3379e9b22c8bee236c67352ca787206beba15692704d26957f5b3d2ae",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:ffb6aab6b6e6602b52d267606a34435fad1eb3b69f3bcd5e1093a249c808457a",
+          "result": "sha256:5ffe698ff9a940811832ec1ed564920a1c8dd1d91ba73af1369c215f1ed7ec52",
+          "size": 2560,
+          "tar": "symlink-to-directory/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N06"
+      ],
+      "name": "symlink-to-directory"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 448,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 9,
+          "path": "cC9x",
+          "target": null,
+          "uid": 7,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cC9xL2ZpbGU",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cC9xL2ZpbGU",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:18f5384d58bcb1bba0bcd9e6a6781d1a6ac2cc280c330ecbab6cb7931b721552",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cC9xL25leHQ",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cC9xL25leHQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:9f2a4ce20b25a0c2456a91dfd0000323b4e611fce58fc2b073c472f45e68a9ab",
+          "indexRoot": "sha256:ac554cf12a79c8ac6f6cbc0ca107ca45c26feb22a8baa7250e55de2a9612b68e",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:4f0e4f97a0b28ac5bf48c306249d05aaf0be22c2d62de29473bc0d7369961100",
+          "result": "sha256:7df358c9cf114836c48f0b6abd07c43e79e8c22201753301f0a4f8704d853d21",
+          "size": 2560,
+          "tar": "directory-attributes/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:5d1a70cdf5d2d6173e0a4c95a7b603af4af58f84817c37b5744f77fe49d47e72",
+          "indexRoot": "sha256:b295f5206b20e5170c98a565a47f4fd151f5d3d2ec22e86d1bc163e316836f19",
+          "packLength": 4096,
+          "packStream": "sha256:082b47529edc92da52b78b8e4aa430fd7f131af5c7b00e97e74d7861c543e56e",
+          "recipe": "sha256:db298ed4bb13c0dd18ef5e9d810ad48f0d3078b481559098f33c1e3edbb3f5f1",
+          "result": "sha256:3707861a92d613c1537bfd18caa86bf7a18badae6288d66a070dcfa096a52daa",
+          "size": 2048,
+          "tar": "directory-attributes/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N06",
+        "N07"
+      ],
+      "name": "directory-attributes"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Yg",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:cc786e0d1732a213fac9e8ee2e2e9f503767ace69a31fa76f0f7ad6054f8885f",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:1702c2a5f112e35eb9009e81a5a95a9f138a3ffb5113791d2ad53c87cb1ff1a1",
+          "result": "sha256:945c9fd0344960dacee801682c2c71e2d6c61801628f939a4b75847f00da457d",
+          "size": 2048,
+          "tar": "link-before-replace/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:500c8069675a2ad0325433b4c7c05808645e4fcb77739fdf5073571e23cfddf6",
+          "indexRoot": "sha256:8cfe7e5623d8e934ea8ace6b9437be25b8ff1b950c826b4957be5684ea83bf0c",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:57cf62a7cc5bc0cf340ae88cb3394459e1182f9e3e37a2a8dd8207d40513b968",
+          "result": "sha256:1d7cfe76579f330f647e8c667ebe2a8a0863f242a19d4c1f9e4d07e09ed6dd0f",
+          "size": 2560,
+          "tar": "link-before-replace/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N08"
+      ],
+      "name": "link-before-replace"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:9d6f965ac832e40a5df6c06afe983e3b449c07b843ff51ce76204de05c690d11",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Yg",
+          "kind": "regular",
+          "length": 9,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:63592c87145e0dcb2391c05372964f00fd9b5b6b8e8493ede438159a46fe9acb",
+          "indexRoot": "sha256:76169a0e7536519501d8a24f65f51d7702d511ab7d7f18b13aca0d2a07096650",
+          "packLength": 4096,
+          "packStream": "sha256:80c7b4e1fad346d77b2418bb59cbb827a285330df2a9a04e9d796bd313ff3af1",
+          "recipe": "sha256:402f9cb4f0e5e8194e4f9ecb8ffe79199c22fdf9d8c54ade61ce1264e22fc47f",
+          "result": "sha256:4bee7a0876e92cc52a07f54b8158bdf9fdc6589d75c7e86ddcf3e78070d7464f",
+          "size": 2048,
+          "tar": "link-before-replace-other-parent/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:500c8069675a2ad0325433b4c7c05808645e4fcb77739fdf5073571e23cfddf6",
+          "indexRoot": "sha256:8cfe7e5623d8e934ea8ace6b9437be25b8ff1b950c826b4957be5684ea83bf0c",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:57cf62a7cc5bc0cf340ae88cb3394459e1182f9e3e37a2a8dd8207d40513b968",
+          "result": "sha256:1d7cfe76579f330f647e8c667ebe2a8a0863f242a19d4c1f9e4d07e09ed6dd0f",
+          "size": 2560,
+          "tar": "link-before-replace-other-parent/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N08",
+        "V15"
+      ],
+      "name": "link-before-replace-other-parent"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Yg",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Yg",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yw",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:cc786e0d1732a213fac9e8ee2e2e9f503767ace69a31fa76f0f7ad6054f8885f",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:1702c2a5f112e35eb9009e81a5a95a9f138a3ffb5113791d2ad53c87cb1ff1a1",
+          "result": "sha256:945c9fd0344960dacee801682c2c71e2d6c61801628f939a4b75847f00da457d",
+          "size": 2048,
+          "tar": "link-chain-delete/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:b9fdca8df6912cb8775be34fcb5074da4da0f4f6d7921bf79cce58fa5209dce5",
+          "indexRoot": "sha256:c2c67aded60eebea63a0f9cc32b4f0848ba027bfb250d9b1c9a19dfde622d2e8",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:a94f0304c30d744abb04d161fdcb870552c8dddc3ff0d7dfa8e662aabccec9f6",
+          "result": "sha256:80f821fe63cb39afd81f0cae54e9e06dd167f48ade264f85bf0fdc478293e38c",
+          "size": 3072,
+          "tar": "link-chain-delete/layer-1.tar"
+        },
+        {
+          "diffId": "sha256:0099c66e8a4d89f9fd8014297c5e899d31c602dc1cb7ba8cf147296db3901e1c",
+          "indexRoot": "sha256:50d206d10a976cc6e7dec0736f212a2665049142d57b4c589eecb8ee9bfbfe6c",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:d78c162d2cb8193cea88cbbbcff2b7a4dd3e226977039231634dfe4ed48c4339",
+          "result": "sha256:dfc1ee2cf4f5afab2c61cd80f1317ef76ce6fab743547aa096296f1ef9d1b81a",
+          "size": 1536,
+          "tar": "link-chain-delete/layer-2.tar"
+        }
+      ],
+      "matrix": [
+        "N09"
+      ],
+      "name": "link-chain-delete"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:500c8069675a2ad0325433b4c7c05808645e4fcb77739fdf5073571e23cfddf6",
+          "indexRoot": "sha256:8cfe7e5623d8e934ea8ace6b9437be25b8ff1b950c826b4957be5684ea83bf0c",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:57cf62a7cc5bc0cf340ae88cb3394459e1182f9e3e37a2a8dd8207d40513b968",
+          "result": "sha256:1d7cfe76579f330f647e8c667ebe2a8a0863f242a19d4c1f9e4d07e09ed6dd0f",
+          "size": 2560,
+          "tar": "forward-link/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "N10"
+      ],
+      "name": "forward-link"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:cc786e0d1732a213fac9e8ee2e2e9f503767ace69a31fa76f0f7ad6054f8885f",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:1702c2a5f112e35eb9009e81a5a95a9f138a3ffb5113791d2ad53c87cb1ff1a1",
+          "result": "sha256:945c9fd0344960dacee801682c2c71e2d6c61801628f939a4b75847f00da457d",
+          "size": 2048,
+          "tar": "self-link/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:0f063f049901e19dde52ba8c9fd55b174609db658e91ff4fe58427d97030d96e",
+          "indexRoot": "sha256:93723c941c985d5969432295fdd88c19354638548a8782bb7db1825f97e8adf5",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:15dd5fc37fa0f70a587d260c0d6686bcedcd09a41d9bb7bf046299957443998c",
+          "result": "sha256:dc671973b337c98d9319ca572dfe218abec2db7af9346899ae27e253fb17c3ff",
+          "size": 1536,
+          "tar": "self-link/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N11"
+      ],
+      "name": "self-link"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:b68bd4eaf120b8e977c09429241308ba13d6e16b9bad32fd439a2f9175939a8f",
+          "indexRoot": "sha256:3e333b24bccc3f4e22e69df581046b0c5ac5ce96800cdc1fd0c68e07bd56b780",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:11e64d1db54dc152ca23f6215756d6a0ec543d5db8f83f20cd20d7892674cb2f",
+          "result": "sha256:064ee09c7bbc1fb85d492c0032cd001742fee9854346613c00bc5312648cb15d",
+          "size": 2048,
+          "tar": "cyclic-link/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "N11"
+      ],
+      "name": "cyclic-link"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:2b6d1c103d5b26f0c56452be51e56f549efe0645bd4c7a800bec069a4033766f",
+          "indexRoot": "sha256:7aeedd7ed27c2b1ac5d0627f6fd4b696aa44367380339807c4c61dca84c111b3",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:07ca4294073af4633a4c49aacc2c97406b741d3802225815822a7435b7ea37c0",
+          "result": "sha256:801b21c74efddcefc932fe2e5202e9613b3de4bca89e006f2eceab9aecf63743",
+          "size": 2048,
+          "tar": "directory-link/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "N11"
+      ],
+      "name": "directory-link"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:c36fd12993d9aefae0c31f45d6807f28c3fb715aefdfc91580cc558430120c78",
+          "indexRoot": "sha256:488242d07cfd0ac63e21da1636efa859ad35bf64165e23dd9c8dbabf81db0923",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:5d137a6776dc833c0b2863c49154aaf0d4224ef83f98902673a8b6ad343756e9",
+          "result": "sha256:98634ba577e403cc3cf79c178f08120cd1d9cfe7b2a50ba5ed6255733a81547b",
+          "size": 2560,
+          "tar": "same-inode-relink/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:95056767112afefeb23170d23954dc521d0e554f5e012029b3b4a4a25fb3cf44",
+          "indexRoot": "sha256:8d5315dcad0433141de7b5c9e51598b08f9601847064b0fe6e17f4596607dcdf",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:e070d322306dac721b65b1ae357f78934841029dbf013c3f38ebdae6ec8762b6",
+          "result": "sha256:b31eef4d04d623e9c2915d4826025c268ab70f49387b4570f77b332988736de2",
+          "size": 1536,
+          "tar": "same-inode-relink/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N12"
+      ],
+      "name": "same-inode-relink"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cw",
+          "kind": "symlink",
+          "length": null,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cw",
+          "target": "bWlzc2luZw",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cw",
+          "kind": "symlink",
+          "length": null,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dA",
+          "target": "bWlzc2luZw",
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:80dedd7c3041a8300723c21b571535e4bb4bf45881f45962a9e3cb479d0b9de0",
+          "indexRoot": "sha256:78e13fdd4e4692b71559cb68f0a3b274543bcb54f6e8884d4877545f72396a0e",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:e038486e6356038adf6945df843188bb95fb98466c3d3e306f6968cd8a9651b5",
+          "result": "sha256:3e6333b5ae04b5c38e9eea39b1843392db527041949e702de077272f9a2f4f69",
+          "size": 1536,
+          "tar": "hardlink-dangling-symlink/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:13bb8a0c35f0da4191fbdc051af2edc906c761b090dc8b8c73cd9dfab54fd1c5",
+          "indexRoot": "sha256:3c9f847523aaf9cf911e1ed2481d9820e11b9ec7c49fd2b49dfda12330f8dfdd",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:45750545f503845004c36b83ec59d3885afb5a091dfbc99dcc17d64de064841c",
+          "result": "sha256:e421ff5c0524ff9a6f1f9bbed4af072070779aeb2f7dc2dedceed1e794dd8f5a",
+          "size": 1536,
+          "tar": "hardlink-dangling-symlink/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N13"
+      ],
+      "name": "hardlink-dangling-symlink"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Ymlu",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Ymlu",
+          "target": "dXNyL2Jpbg",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNy",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNyL2Jpbg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "dXNyL2Jpbi90b29s",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNyL2Jpbi90b29s",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:f7456af7d6f373fd9bec557c5d8edaf70ae1e747339244caf9a6f05464626b65",
+          "indexRoot": "sha256:26bea2d28b5eadffd65c5c5ffcab88ff265e44191f33a4453bb06180c6414f69",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:ed80021d92a4396ad56ab4f99f3e206773a7658b612579deab19784497112724",
+          "result": "sha256:82b9834339910de1080a1c05ead89a797f1408a49d81c006f2b26582c2e2cdca",
+          "size": 2048,
+          "tar": "usrmerge-parent/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:af9d8a3477c0b287cc3982d7791e95a303934b6e5f13bf9a4111ac368d0c4102",
+          "indexRoot": "sha256:6ee85602e3e55ea86c3cf392f2820b7beaf05d165898ed02098deb0099563be5",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:1276e89ec801b45dabc333ef11e9e4c72bd26ba29fe37ec37c7aff1deae6a285",
+          "result": "sha256:cd8e73b2dfa7b15875079926acc7dfb0872fa152555981980ee919f48c5ed7dc",
+          "size": 2048,
+          "tar": "usrmerge-parent/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N14"
+      ],
+      "name": "usrmerge-parent"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cmVsYXRpdmU",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cmVsYXRpdmU",
+          "target": "cy8uLi9iaW4",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cw",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cw",
+          "target": "Ly4uLy4uL3Vzci9iaW4",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNy",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNyL2Jpbg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "dXNyL2Jpbi90b29s",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNyL2Jpbi90b29s",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:7f306b85e73e63c0f811d5e7ae85ebd48869b48edf7d57f763d7dd1561faa630",
+          "indexRoot": "sha256:d72052eb7217eebf79ffb05573479a20801d3df0c1e88ce1ffbc4d8ffbc5ac74",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:eafdd387cdfca66be229444a78adec353145ca5abfcede9032e54b4571544e6f",
+          "result": "sha256:8876f391471a7c5ad3bdcafb1ea76898ed6019b7f253207f65d760c3e738aba8",
+          "size": 2560,
+          "tar": "absolute-parent-clamp/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:33a74f6df8edda165eeec0f31767580da0dd4cd49abd24c9c864e193b67d1ef7",
+          "indexRoot": "sha256:3ef2d7b2c787cfb6f9670eaac9457a773c4394c26b9a998cd1bb15760e387677",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:42f5686010ff99903b6e5fbf6dafab6302b3409cfb3b0eb6bc04b348011e2bbf",
+          "result": "sha256:568f1b8c845cb5826e3a2deaeba5b281ed56c6ba40bc7d932b9437056804b066",
+          "size": 2048,
+          "tar": "absolute-parent-clamp/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N15"
+      ],
+      "name": "absolute-parent-clamp"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:80dedd7c3041a8300723c21b571535e4bb4bf45881f45962a9e3cb479d0b9de0",
+          "indexRoot": "sha256:78e13fdd4e4692b71559cb68f0a3b274543bcb54f6e8884d4877545f72396a0e",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:e038486e6356038adf6945df843188bb95fb98466c3d3e306f6968cd8a9651b5",
+          "result": "sha256:3e6333b5ae04b5c38e9eea39b1843392db527041949e702de077272f9a2f4f69",
+          "size": 1536,
+          "tar": "dangling-parent/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:1e6a6812c7d968ffdcb12f6324ce80fb7bad4050825f409a1a25221ce9351ce3",
+          "indexRoot": "sha256:24d384855611e24465efcc0ae5a2582fbc332c0089858b5a3f6f75be1437f2e1",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:6e30c2546f9fc8a020770dee1d47c082516aa4a0a29cafce86b818afee0d3705",
+          "result": "sha256:1d6727e5f7afafca5d3874b7530f80cbc9f20bddb2866bb46a6a015ee2bb52ad",
+          "size": 2048,
+          "tar": "dangling-parent/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N16"
+      ],
+      "name": "dangling-parent"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:bc977daac5a43a57f6d52d5b7adb36930fe3d420a25469dd4ed6d17346b0dec5",
+          "indexRoot": "sha256:f3a32f28e50ce898007ce27ef9617eb31206279a6113c0980b3da0d90db78570",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:0d25eb804daf4d858c34569e6d2f93a219dd7697f5978810b4c7df51bb136acc",
+          "result": "sha256:68af4a303a1c744f5c497c8894ac2b403ce9fa067e3b7b991dfa030a032820ce",
+          "size": 2048,
+          "tar": "looping-parent/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:1e6a6812c7d968ffdcb12f6324ce80fb7bad4050825f409a1a25221ce9351ce3",
+          "indexRoot": "sha256:24d384855611e24465efcc0ae5a2582fbc332c0089858b5a3f6f75be1437f2e1",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:6e30c2546f9fc8a020770dee1d47c082516aa4a0a29cafce86b818afee0d3705",
+          "result": "sha256:1d6727e5f7afafca5d3874b7530f80cbc9f20bddb2866bb46a6a015ee2bb52ad",
+          "size": 2048,
+          "tar": "looping-parent/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N16"
+      ],
+      "name": "looping-parent"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Ymlu",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Ymlu",
+          "target": "dXNyL2Jpbg",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNy",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNyL2Jpbg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "dXNyL2Jpbi94",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dXNyL2Jpbi94",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:f7456af7d6f373fd9bec557c5d8edaf70ae1e747339244caf9a6f05464626b65",
+          "indexRoot": "sha256:26bea2d28b5eadffd65c5c5ffcab88ff265e44191f33a4453bb06180c6414f69",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:ed80021d92a4396ad56ab4f99f3e206773a7658b612579deab19784497112724",
+          "result": "sha256:82b9834339910de1080a1c05ead89a797f1408a49d81c006f2b26582c2e2cdca",
+          "size": 2048,
+          "tar": "resolved-alias-collision/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:a34e2001501926957ede00e21aba8e8973bea321d661dcb314cb7e403ff2b72f",
+          "indexRoot": "sha256:a87727c02dd43de16095561e03a9952a4ec0581a1a302e6da9a2cc4446a1c62a",
+          "packLength": 8192,
+          "packStream": "sha256:cc2e66de171f9903c473712004f02d417600e96f575b31f266552812d0dc3b62",
+          "recipe": "sha256:077086c4fe45a9546129066abf23f34514ef2839debe75b1247384741cdc94ab",
+          "result": "sha256:b4729c0ae2ef8cf0cd588d13d9444f6bb9a2c26c56892894d39dee43269a3ed3",
+          "size": 3072,
+          "tar": "resolved-alias-collision/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N17"
+      ],
+      "name": "resolved-alias-collision"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZA",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": "b3RoZXI",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "b3RoZXI",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:6ca7ea2feefc88ecb5ed6356ed963f47dc9137f82526fdd25d618ea626d0803f",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "b3RoZXIveA",
+          "kind": "regular",
+          "length": 4,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "b3RoZXIveA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "dGFyZ2V0",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:4ea3a37cfff243e27eb3299d19d304a54f1aa7037b1b724981f903467762dcdd",
+          "indexRoot": "sha256:fcaa580f2a83afeb5cd6c2e49099c1fa3d83ec01b07dabd55d7db0c805b9fcf6",
+          "packLength": 8192,
+          "packStream": "sha256:ee5fddba2e7d68311806719d04c73347b93a868b1f1785cd5af16090736c4bd6",
+          "recipe": "sha256:84f528d498ad0db7bf7c0892d10871db1b9e950c6cb215da43cecae9364d7238",
+          "result": "sha256:8f84f3080ab0cea52884c60f83ea1f3a1baa833425d617273e2a406968ca95cc",
+          "size": 3584,
+          "tar": "whiteout-lower-symlink/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:fc911549fc53810d3e42a3fae7078a6865239e2bd2d0780ece95285d14c21eac",
+          "indexRoot": "sha256:4f4888f646b9d428ce7bf2a14365b482cc05dba6f2f93034b52584a74ef4c0d2",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:20302f53cb2020a7153ebd4ea6b757760252f7aff83b976a58dd3d490db6c2a8",
+          "result": "sha256:c3982a0403db85bd4cd740c75e81b3c28741323f91e8f08f72b1a2f10186606d",
+          "size": 2048,
+          "tar": "whiteout-lower-symlink/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N18"
+      ],
+      "name": "whiteout-lower-symlink"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:92ef93fd35f976d0af8c36e99ba33edbc3915758d708e3c512c9f2eb6faf1db2",
+          "indexRoot": "sha256:277df852908d820c8fddc49cd43547dfd7c1ead0f2aaf5b11f6bda0dbc52bf60",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:bbf269609125153efcffa0489ca99a78bfb2ca855e2083da269a511d50355449",
+          "result": "sha256:824fcf16131324409428a89f16027ffb8294da4c63f8c25a221698fe31f81563",
+          "size": 1536,
+          "tar": "absent-whiteout/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "N19"
+      ],
+      "name": "absent-whiteout"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yg",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:cc786e0d1732a213fac9e8ee2e2e9f503767ace69a31fa76f0f7ad6054f8885f",
+          "indexRoot": "sha256:536ab4142c744a838b40ac2d778d2468ae2e76d02c8323697d8ab20dc1d20d52",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:1702c2a5f112e35eb9009e81a5a95a9f138a3ffb5113791d2ad53c87cb1ff1a1",
+          "result": "sha256:945c9fd0344960dacee801682c2c71e2d6c61801628f939a4b75847f00da457d",
+          "size": 2048,
+          "tar": "advisory-link-metadata/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:4ec928ecd7ea3bffce38c76995d0db8316a1c668efd34207f88255d61cd9bd80",
+          "indexRoot": "sha256:17ab99d6d49e53f4491b5a65c6690f3d843df30cc4da0bf66d814488f1ac806d",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:a73e3b97aaa01490cc1f7bbccac620ed9186d69576a803b157c933029c4806d7",
+          "result": "sha256:6ee85399ab2ad9f4ee644377a93bd109c15a5cb85db40706262d4d36b8e71cf0",
+          "size": 2560,
+          "tar": "advisory-link-metadata/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "M07"
+      ],
+      "name": "advisory-link-metadata"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bGluay3-",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "bGluay3-",
+          "target": "cmF3Lf8",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:d7439bee24773bcbfa2d0a97947ee36227b10d1022b1a55847e928965bb6bfde",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cmF3LWxpbms",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cmF3LWxpbms",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "dXNlci5iaW5hcnk",
+              "value": "AP8K"
+            }
+          ]
+        },
+        {
+          "content": "sha256:d7439bee24773bcbfa2d0a97947ee36227b10d1022b1a55847e928965bb6bfde",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cmF3LWxpbms",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cmF3Lf8",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "dXNlci5iaW5hcnk",
+              "value": "AP8K"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:2c9b916940d4f09fa7a1749a3e7e5d976024aa27499dd750eeac63052698c479",
+          "indexRoot": "sha256:04751bd6079dcf9e2152f686e38ed259b5d245365bd4494c71fd900cb2c6b0d3",
+          "packLength": 4096,
+          "packStream": "sha256:f510e698ed8d00f32e476007037ea35730a6acd21dbb4d36aad380d53cb45185",
+          "recipe": "sha256:cdb36b34fa7da4194ab57f8c36f984257ad9ccff76765b1d837ed84193690fde",
+          "result": "sha256:14e38fb8a39a8148b7ec3c01d804bb0fe632411cc488e9018393b9779ade58b4",
+          "size": 5120,
+          "tar": "binary-name-attrs/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M02",
+        "M08"
+      ],
+      "name": "binary-name-attrs"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:0f04b2e78cf51dc1f7e492243e8d2047a75fc35326748586844804fbf85bd8e5",
+          "indexRoot": "sha256:a2f548aade90b5f95e3f47187229cef7a75f97ec8809fd0857f178090888f748",
+          "packLength": 4096,
+          "packStream": "sha256:f510e698ed8d00f32e476007037ea35730a6acd21dbb4d36aad380d53cb45185",
+          "recipe": "sha256:7c2007485c8eddfd4a8af9aa893a9f8d956d7b73302e8dd51867de3c191cede7",
+          "result": "sha256:68b00e09917b44a7d2eb8bf86e98c836e3a0e271324105f84d390795ef93ced5",
+          "size": 3072,
+          "tar": "hardlink-attr-conflict/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:bead65b43c060e0cb0331f207661c9e6c4e96e579b31e9994e9bc5125782a589",
+          "indexRoot": "sha256:d3bea90865a2f6a5f476373546f8fde4983e1665588dbdae5f089c5cdbb6c85e",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:4b096231506b7263b87d6d7c12e60755fbcb4dfe4fbd54bc7ecb86b684c16414",
+          "result": "sha256:196d472f66eef7cc18c877e7b26fa54864bc350784ae8e95f2188999cd5d9326",
+          "size": 2560,
+          "tar": "hardlink-attr-conflict/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "M07"
+      ],
+      "name": "hardlink-attr-conflict"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 8,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 1016,
+          "mtimeNanos": 10,
+          "mtimeSeconds": 9,
+          "path": "",
+          "target": null,
+          "uid": 7,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:8ce86a6ae65d3692e7305e2c58ac62eebd97d3d943e093f577da25c36988246b",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bmFub3M",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 123456789,
+          "mtimeSeconds": 1,
+          "path": "bmFub3M",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:4e2d74ccbb6ea7faaf416aa917f7b3a71178c45e319a0a3c87d37502a0487497",
+          "indexRoot": "sha256:8a485b56b329e55385ed6e63ed4a65c415efc2e2fe3875df5cde1a6cf5ca0c03",
+          "packLength": 4096,
+          "packStream": "sha256:b337d6f2effa2ace30c9c1b552dbbb7d678771b43768ba1e04000820ee058677",
+          "recipe": "sha256:e90436f846e4bfad11f0989522921efcef2a2b62bcba455751093213c1fe2da0",
+          "result": "sha256:903424109f3c7f4b1ca8b4796fc551dc3f6e6dbf566dca6bea7e9d4357cc4545",
+          "size": 4608,
+          "tar": "root-slash-metadata/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "N01",
+        "M02",
+        "M05"
+      ],
+      "name": "root-slash-metadata"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 8,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 1016,
+          "mtimeNanos": 10,
+          "mtimeSeconds": 9,
+          "path": "",
+          "target": null,
+          "uid": 7,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:8ce86a6ae65d3692e7305e2c58ac62eebd97d3d943e093f577da25c36988246b",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bmFub3M",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 123456789,
+          "mtimeSeconds": 1,
+          "path": "bmFub3M",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:cae654536daf63f12a8c9917c29d72eb2266a26284934b94d02e1ee832fe2b86",
+          "indexRoot": "sha256:8a485b56b329e55385ed6e63ed4a65c415efc2e2fe3875df5cde1a6cf5ca0c03",
+          "packLength": 4096,
+          "packStream": "sha256:b337d6f2effa2ace30c9c1b552dbbb7d678771b43768ba1e04000820ee058677",
+          "recipe": "sha256:fe2b1c04e1deed798be023a9dca83c73f7bb4e35358323b64bece996a66f832e",
+          "result": "sha256:0fddf0ef47596c1381427a9314f59d6b6149978162f51b734101d5c9c9ca104c",
+          "size": 4608,
+          "tar": "root-metadata/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M02",
+        "M05"
+      ],
+      "name": "root-metadata"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": 8,
+          "deviceMinor": 0,
+          "gid": 0,
+          "group": "YmxvY2s",
+          "kind": "block-device",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YmxvY2s",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Zmlmbw",
+          "kind": "fifo",
+          "length": null,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Zmlmbw",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Zmlmbw",
+          "kind": "fifo",
+          "length": null,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Zmlmby1saW5r",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": 1,
+          "deviceMinor": 3,
+          "gid": 0,
+          "group": "bnVsbA",
+          "kind": "character-device",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "bnVsbA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "c29ja2V0",
+          "kind": "socket",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "c29ja2V0",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:2b5f0c2520e8d6d801c33b7c42e2217e275153045c2fd161fd280155dc8a6e75",
+          "indexRoot": "sha256:d5cae46b023cf047de17ebfd905da23a31c85a3f8cafc4f71273c947c2cef9e0",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:22b19ad377f3b9e77edd50ea9b161feae729640d3e02721514bf1471232d3e8b",
+          "result": "sha256:cefacc8ae536eff5c9afee7217a11f5af87d5f5675bb8d5060151b07f910a9e8",
+          "size": 4608,
+          "tar": "special-inodes/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M11",
+        "M12"
+      ],
+      "name": "special-inodes"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 1,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YQ",
+          "kind": "regular",
+          "length": 1,
+          "links": 2,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YWxpYXM",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:768921a22b8e190c2cfafeb0688f0d58a5f76ee4c7fb369758a208c7ba5e9acb",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YmM",
+          "kind": "regular",
+          "length": 2,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YmM",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZW1wdHk",
+          "kind": "regular",
+          "length": 0,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZW1wdHk",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:b37d9d14d7a3f18ed2275899903dd33d8b73e811cfdcd1e900b939b570586257",
+          "indexRoot": "sha256:931add9b59a08c8cdb52aa11f7f468aef99d16aa28b574c7840dd40a1f49d6bb",
+          "packLength": 8192,
+          "packStream": "sha256:af97fb55e0fc238b5d3f1a6543192b55340c0338da23bd385d7dc220e796690b",
+          "recipe": "sha256:5663ba12787117db945878bdaa05c4f8021d39780d7dfafdb87b91f35911eace",
+          "result": "sha256:921670539031c3bb942ead0746156b04c395e40f3772f98f0faec87a6177a618",
+          "size": 5120,
+          "tar": "pack-A-empty-BC/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V01"
+      ],
+      "name": "pack-A-empty-BC"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZW5k",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZW5kL3Rvb2w",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZW5kL3Rvb2w",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czA",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czA",
+          "target": "czE",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czE",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czE",
+          "target": "czI",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czEw",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czEw",
+          "target": "czEx",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czEx",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czEx",
+          "target": "czEy",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czEy",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czEy",
+          "target": "czEz",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czEz",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czEz",
+          "target": "czE0",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czE0",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czE0",
+          "target": "czE1",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czE1",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czE1",
+          "target": "czE2",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czE2",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czE2",
+          "target": "czE3",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czE3",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czE3",
+          "target": "czE4",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czE4",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czE4",
+          "target": "czE5",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czE5",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czE5",
+          "target": "czIw",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czI",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czI",
+          "target": "czM",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czIw",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czIw",
+          "target": "czIx",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czIx",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czIx",
+          "target": "czIy",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czIy",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czIy",
+          "target": "czIz",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czIz",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czIz",
+          "target": "czI0",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czI0",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czI0",
+          "target": "czI1",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czI1",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czI1",
+          "target": "czI2",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czI2",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czI2",
+          "target": "czI3",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czI3",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czI3",
+          "target": "czI4",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czI4",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czI4",
+          "target": "czI5",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czI5",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czI5",
+          "target": "czMw",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czM",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czM",
+          "target": "czQ",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czMw",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czMw",
+          "target": "czMx",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czMx",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czMx",
+          "target": "czMy",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czMy",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czMy",
+          "target": "czMz",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czMz",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czMz",
+          "target": "czM0",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czM0",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czM0",
+          "target": "czM1",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czM1",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czM1",
+          "target": "czM2",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czM2",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czM2",
+          "target": "czM3",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czM3",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czM3",
+          "target": "czM4",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czM4",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czM4",
+          "target": "czM5",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czM5",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czM5",
+          "target": "ZW5k",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czQ",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czQ",
+          "target": "czU",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czU",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czU",
+          "target": "czY",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czY",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czY",
+          "target": "czc",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czc",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czc",
+          "target": "czg",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czg",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czg",
+          "target": "czk",
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "czk",
+          "kind": "symlink",
+          "length": null,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "czk",
+          "target": "czEw",
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:c9cb9908ed51681c939b8634e4939229d6226293d3785d5276522f5955017ea2",
+          "indexRoot": "sha256:8f9f7f8596145fa7d5e864ccbd5f08c91a63cd77b98fba62fff16d188b9914a9",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:19d7e03a45a51f660b1251b331e341df48f5977e1f848883b72b55ac6c764a00",
+          "result": "sha256:47f206e5f6d55578f5803a59609b2a7bb252d7d49d92d9fc8469317f9e4b9739",
+          "size": 22016,
+          "tar": "parent-40-hops/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:28d7bb8d21bf13ab38884e1462d405d7140e18bcc6ae6dde1b4205dac9282dc1",
+          "indexRoot": "sha256:2d598859d784d5539787539bd07ba7925af2ed571bbe1e86b546341a7217eafb",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:b37ad7393d186d7a4e25cf31380ed3699a25410c116532f960839998027b329f",
+          "result": "sha256:9cbba6121c24d0d21a85336246c2284b2c86929526623ce941382cd70a488ffa",
+          "size": 2048,
+          "tar": "parent-40-hops/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N15"
+      ],
+      "name": "parent-40-hops"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:d26f57fd3e414b6cf4116411818f3bbd474a4d06981e3c093d989b70015fca07",
+          "indexRoot": "sha256:3c2099a5d168566f45aaa2ceba050bc34d0681c55210c24d18a2c9bcdaf66f06",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:be98dad99f62658229ecd358b7829d71f03d31edebd9536111efa0e429d9956d",
+          "result": "sha256:1853296873ccf51899cf0bafabbf63cbb02eef72a002c3c9913948eb98103552",
+          "size": 22528,
+          "tar": "parent-41-hops/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:28d7bb8d21bf13ab38884e1462d405d7140e18bcc6ae6dde1b4205dac9282dc1",
+          "indexRoot": "sha256:2d598859d784d5539787539bd07ba7925af2ed571bbe1e86b546341a7217eafb",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:b37ad7393d186d7a4e25cf31380ed3699a25410c116532f960839998027b329f",
+          "result": "sha256:9cbba6121c24d0d21a85336246c2284b2c86929526623ce941382cd70a488ffa",
+          "size": 2048,
+          "tar": "parent-41-hops/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "N15"
+      ],
+      "name": "parent-41-hops"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:a02a3fdc657e769343d575bbb24d4e68b63ff326c1627e7130ff57980e9494f6",
+          "indexRoot": "sha256:f9e9d78b1dfe0961183900f555f5ff5f986b584e9ecd0ae3c36343534735407b",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:d363a1094f9b8ca027392af89128b93639771c15d0597bc4e5f6b078679ffbbb",
+          "result": "sha256:da0673116f9c0dce10d26dd3b122271382a07083163a7536a04651f909e79d02",
+          "size": 12288,
+          "tar": "resolved-destination-overflow/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:2e095eb8da365404b6a57bf514833d467659d2774f43671c76132bce3166c44c",
+          "indexRoot": "sha256:25b247d1479f086f7c8b4e3faa065484f65eca30701df18089c8f3bd433622c6",
+          "packLength": 4096,
+          "packStream": "sha256:7f46b24c6d9584d70ec730782d7bbabc65efb259ee6b6f8ec9e335ce1f45782d",
+          "recipe": "sha256:998cd29f3e27ab4d111cdbbd58f28ce7f7571a85a99568fb47486505273672db",
+          "result": "sha256:a9d4995b4639bcd59f3a8851c76826d1d2b31739736d8a657a093ab7b0d9b02c",
+          "size": 2048,
+          "tar": "resolved-destination-overflow/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "V11"
+      ],
+      "name": "resolved-destination-overflow"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b2ac5b9769301df050e3010e4de7a8d2d43966fafdaf100f972edc997af3da87",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "c3BhcnNl",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "c3BhcnNl",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:81c136e053b7a83256ab46d4c59c3cf87f48c3a7ec6d9ed92471bd7b6a941a0f",
+          "indexRoot": "sha256:32ab96cb8c7a8427576fc8a2ea2e6fc7af6d311ff66e1218ea1a8c7932a70fae",
+          "packLength": 8192,
+          "packStream": "sha256:36e03e78161d8f590f2ebbe543626594c508dbd051f8eec4b1b5b9fced8bb125",
+          "recipe": "sha256:37c7b598eb5798b0729d5503624d4793b08a31f078cb3f6bb004af303b413241",
+          "result": "sha256:9edb504065a03aae63706a9d3793b82baaeea29241e534695ca8170a830dccb8",
+          "size": 2048,
+          "tar": "sparse-old-gnu/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "sparse-old-gnu"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b587fa297299ce9c602e58292b51379402bf7b1074f6b18679c2fb871c917ca8",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "aG9sZQ",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "aG9sZQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:0df8a482fe2ea6297807647c365279aa3c4f9fa76081456b39d33072bd1283e3",
+          "indexRoot": "sha256:d498761e75905df42f5c947da591330e729c726b5829ac49a0b9cb119c2659e0",
+          "packLength": 8192,
+          "packStream": "sha256:54938a47c57c50f35ad22dee595d7b2547ef0790231873349424bde155480067",
+          "recipe": "sha256:8df0c6f7fa92f4bad145a3166d33a1d9b1513dfcc8fb674ea5158f6cc2c6b101",
+          "result": "sha256:ca061a9cd3e5250e2d6a954c0816cd6f90aed72d23b76ec4ca3b9634b03ba723",
+          "size": 1536,
+          "tar": "all-hole-old-gnu/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "all-hole-old-gnu"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b2ac5b9769301df050e3010e4de7a8d2d43966fafdaf100f972edc997af3da87",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "c3BhcnNl",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "c3BhcnNl",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:f9711808a1ee8987b1de58ac086de4cfd880627226fae09cb20944336abb3314",
+          "indexRoot": "sha256:32ab96cb8c7a8427576fc8a2ea2e6fc7af6d311ff66e1218ea1a8c7932a70fae",
+          "packLength": 8192,
+          "packStream": "sha256:36e03e78161d8f590f2ebbe543626594c508dbd051f8eec4b1b5b9fced8bb125",
+          "recipe": "sha256:b537409c280101cbcdb878d40c5e3bf164af7181d6244bf499c2fb9c92a64562",
+          "result": "sha256:9c27514e65148d5e535abe3dadc6676e7fb9ce928c531e5443dbf226c1c74f4c",
+          "size": 3072,
+          "tar": "sparse-pax-0.0/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "sparse-pax-0.0"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b587fa297299ce9c602e58292b51379402bf7b1074f6b18679c2fb871c917ca8",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "aG9sZQ",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "aG9sZQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:bf116218254e6f71337bfa521b573bb3c3938e1e84b9aff8339b6d3647052835",
+          "indexRoot": "sha256:d498761e75905df42f5c947da591330e729c726b5829ac49a0b9cb119c2659e0",
+          "packLength": 8192,
+          "packStream": "sha256:54938a47c57c50f35ad22dee595d7b2547ef0790231873349424bde155480067",
+          "recipe": "sha256:466ce107ed02d3bb98ec0d37edce564160a919e6eb9a032b1af990137e3caf43",
+          "result": "sha256:1abe3f9a52888b8abe34322b98dec2644749edb7aa61a56b4f855b42235339c1",
+          "size": 2560,
+          "tar": "all-hole-pax-0.0/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "all-hole-pax-0.0"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b2ac5b9769301df050e3010e4de7a8d2d43966fafdaf100f972edc997af3da87",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "c3BhcnNl",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "c3BhcnNl",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:92d0af751b50d19542cdff21412f18164b9eece7b59c1194985c29cbf2e9e7c4",
+          "indexRoot": "sha256:32ab96cb8c7a8427576fc8a2ea2e6fc7af6d311ff66e1218ea1a8c7932a70fae",
+          "packLength": 8192,
+          "packStream": "sha256:36e03e78161d8f590f2ebbe543626594c508dbd051f8eec4b1b5b9fced8bb125",
+          "recipe": "sha256:9973a2a59879f658b8a07d719062a87197dcfad8a49989f0bf59a1b47c1e7ccc",
+          "result": "sha256:f202550544fa4ec11b86d0920cb062f7c4fc35b98a5bb8cca3bdd88729be909a",
+          "size": 3072,
+          "tar": "sparse-pax-0.1/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "sparse-pax-0.1"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b587fa297299ce9c602e58292b51379402bf7b1074f6b18679c2fb871c917ca8",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "aG9sZQ",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "aG9sZQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:72389d60678e69ab382206a61c6c6d99b5a174c4633e749f41a3878f1569cecf",
+          "indexRoot": "sha256:d498761e75905df42f5c947da591330e729c726b5829ac49a0b9cb119c2659e0",
+          "packLength": 8192,
+          "packStream": "sha256:54938a47c57c50f35ad22dee595d7b2547ef0790231873349424bde155480067",
+          "recipe": "sha256:b37352c64670c19890032671be47b2441231f110acb5fa8af2df77de1fde03ad",
+          "result": "sha256:669332c2801a276bca213b0163a35e4d1ef763d7ae36b793d667a848af9c8c90",
+          "size": 2560,
+          "tar": "all-hole-pax-0.1/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "all-hole-pax-0.1"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b2ac5b9769301df050e3010e4de7a8d2d43966fafdaf100f972edc997af3da87",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "c3BhcnNl",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "c3BhcnNl",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:b1bf7db4a06f3ddff7253f270f7f3892ce21a2f75c1a2ff949d035b9f768d6e4",
+          "indexRoot": "sha256:32ab96cb8c7a8427576fc8a2ea2e6fc7af6d311ff66e1218ea1a8c7932a70fae",
+          "packLength": 8192,
+          "packStream": "sha256:36e03e78161d8f590f2ebbe543626594c508dbd051f8eec4b1b5b9fced8bb125",
+          "recipe": "sha256:fffc57f01200543d44d0c8dea84c6c38abd35d73874aef24c0eeefc68c1b1511",
+          "result": "sha256:06a422a90577a0976e179279cb2f66b1291df6170f98b4909ebb3fa796c428dd",
+          "size": 3584,
+          "tar": "sparse-pax-1.0/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "sparse-pax-1.0"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:b587fa297299ce9c602e58292b51379402bf7b1074f6b18679c2fb871c917ca8",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "aG9sZQ",
+          "kind": "regular",
+          "length": 4097,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "aG9sZQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:88e72a83405a81e4d30eb5801103ecfe26af43034cc761a365e2f124fc58a9e7",
+          "indexRoot": "sha256:d498761e75905df42f5c947da591330e729c726b5829ac49a0b9cb119c2659e0",
+          "packLength": 8192,
+          "packStream": "sha256:54938a47c57c50f35ad22dee595d7b2547ef0790231873349424bde155480067",
+          "recipe": "sha256:010c39d5b656d9c01b8fbf8363a8e8bf5aad200aabf5c7d7f9f64ac796f03129",
+          "result": "sha256:6cd2b216b1f51bd4047fe7238816cd38622895da50d8157ed0061fe966c3cd43",
+          "size": 3072,
+          "tar": "all-hole-pax-1.0/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V02"
+      ],
+      "name": "all-hole-pax-1.0"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:3ffa3a2a394d840b4f191dee68be39d2079beff0dd50035b04306c6ed1a26832",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bGFyZ2U",
+          "kind": "regular",
+          "length": 8388611,
+          "links": 1,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "bGFyZ2U",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:a8914c925f458cc4f3eab61466427f676c1cfcacd71487a6b15df62e87ddfc9e",
+          "indexRoot": "sha256:c3e7b3d4f4418170a84aebe88dd6538e89d25bb3c4e055082ae8f0f19637457f",
+          "packLength": 8392704,
+          "packStream": "sha256:185dd783820a9baf4b055012be984245c7639d439c159e898cd207811146fa94",
+          "recipe": "sha256:c4ce8764b32a3ce33c07b7ea5de90ac4d3e5e58ebdd6c0a0792093c28fdfe35b",
+          "result": "sha256:fcf8298fb4d4a1c309f5bb1a0c8ff90ebfffddf0f2096f645a603117a5ad0afd",
+          "size": 8390656,
+          "tar": "stream-full-zero-and-short-tail/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "V16"
+      ],
+      "name": "stream-full-zero-and-short-tail"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YWNs",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YWNs",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c3lzdGVtLnBvc2l4X2FjbF9hY2Nlc3M",
+              "value": "AgAAAAEABgD_____AgAEAAcAAAAEAAQA_____xAABAD_____IAAEAP____8"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:752d8042de30406bc875dcbe8f9819c6e7bd90700bc491853d2e41c4ad2f3fb7",
+          "indexRoot": "sha256:f6a5680caa4045d114704a33beb3d9a40933f4d96bcdb33ad2b6ba740858724c",
+          "packLength": 4096,
+          "packStream": "sha256:5f84e23ed22bac16d80811143139147d5568e6dc943f10f011dc56a9169d1892",
+          "recipe": "sha256:d8fce2b2420e5e27ed27155d04d9554af2e88289b2f880496bfa9cf740a583ae",
+          "result": "sha256:5c30b27f9aae351ba941c5c62a9053d04304a9e3b4ffee952f235ae10dfbce3a",
+          "size": 3072,
+          "tar": "metadata-access-acl-binary/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-access-acl-binary"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YWNs",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YWNs",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c3lzdGVtLnBvc2l4X2FjbF9hY2Nlc3M",
+              "value": "AgAAAAEABgD_____AgAEAAcAAAAEAAQA_____xAABAD_____IAAEAP____8"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:971de49730999ba33c5fae75677b341f9a0bda00b5fb6c3236102567eeef5999",
+          "indexRoot": "sha256:f6a5680caa4045d114704a33beb3d9a40933f4d96bcdb33ad2b6ba740858724c",
+          "packLength": 4096,
+          "packStream": "sha256:5f84e23ed22bac16d80811143139147d5568e6dc943f10f011dc56a9169d1892",
+          "recipe": "sha256:63a24d2ea25177a9095e27a1c2defd1f18a145fe2944c36af381bf4b426364ae",
+          "result": "sha256:e52123f71438b5ec4cf679e9ab039a93088ae73be58c654ee3bb3b52de55cfae",
+          "size": 3072,
+          "tar": "metadata-access-acl-text/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-access-acl-text"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YWNs",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YWNs",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c3lzdGVtLnBvc2l4X2FjbF9hY2Nlc3M",
+              "value": "AgAAAAEABgD_____AgAFAAcAAAAEAAQA_____xAABAD_____IAAEAP____8"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:59e66dc93e0458c0dd9e4791d6a6250b1faee62f2823e2cdb1291f28243f0c11",
+          "indexRoot": "sha256:5e3f27f1f8144ea9d8893ae78174e91789908d0c077ae0fc7863bb651d6d35ae",
+          "packLength": 4096,
+          "packStream": "sha256:5f84e23ed22bac16d80811143139147d5568e6dc943f10f011dc56a9169d1892",
+          "recipe": "sha256:7fbefc0e544f7ca35aac00ee25d869d08f116a3f81e67bf0d9a369bed968cade",
+          "result": "sha256:a6aad58645c76e8621ea374370f34af5c3747c81c5714ead2ba9a7fa08fed118",
+          "size": 3072,
+          "tar": "metadata-access-acl-alternate-valid/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-access-acl-alternate-valid"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 448,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c3lzdGVtLnBvc2l4X2FjbF9kZWZhdWx0",
+              "value": "AgAAAAEABwD_____AgAFAAcAAAAEAAUA_____xAABQD_____IAAFAP____8"
+            }
+          ]
+        },
+        {
+          "content": "sha256:3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZC9jaGlsZA",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZC9jaGlsZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:48ad35fe62201c39851b8c60168a4c47d9d08657134e78e4de8ce936422dd52b",
+          "indexRoot": "sha256:9c7691dd0b21a3306bd87f2bcdc747aea48143498a59a8cc3b4d9d11b9b115ff",
+          "packLength": 4096,
+          "packStream": "sha256:7e8c32389d11f5d7033b06a02238ba8fa8b70b7db614cc0ab83790e871df52cf",
+          "recipe": "sha256:92a793ebea27245b01388807a413db0a13ade582e90ccdca16f84a309f9afd8a",
+          "result": "sha256:ff2cf637e7e1a47b2be7359612bc795946df532d65902753029715cc1c4e1724",
+          "size": 3584,
+          "tar": "metadata-default-acl-directory/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-default-acl-directory"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 448,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c3lzdGVtLnBvc2l4X2FjbF9kZWZhdWx0",
+              "value": "AgAAAAEABwD_____AgAFAAcAAAAEAAUA_____xAABQD_____IAAFAP____8"
+            }
+          ]
+        },
+        {
+          "content": "sha256:3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Y2hpbGQ",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Y2hpbGQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:640bef2db1b82d5b067c9611a142584dc33250e3dd66edf120b22dd08d3af092",
+          "indexRoot": "sha256:57a197940710bf1cc1a43915b03c3c97cc27f512d62d291573c5a77ff546d4bd",
+          "packLength": 4096,
+          "packStream": "sha256:7e8c32389d11f5d7033b06a02238ba8fa8b70b7db614cc0ab83790e871df52cf",
+          "recipe": "sha256:fcbea084d6b01549a50d617ef61fcff772354c25c98335ace7fa809a8c72f758",
+          "result": "sha256:aa50c99f901667f8e54ec3f6e1f1706ae56827518f00fbf5279812233dd57200",
+          "size": 3584,
+          "tar": "metadata-default-acl-root-text/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M02",
+        "M08"
+      ],
+      "name": "metadata-default-acl-root-text"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Y2FwLTQw",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 3565,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Y2FwLTQw",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuY2FwYWJpbGl0eQ",
+              "value": "AAAAAgAAAAAAAAAAAAEAAAAAAAA"
+            }
+          ]
+        },
+        {
+          "content": "sha256:6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Y2FwLXYx",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 3565,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Y2FwLXYx",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuY2FwYWJpbGl0eQ",
+              "value": "AQAAAQEAAAAAAAAA"
+            }
+          ]
+        },
+        {
+          "content": "sha256:6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Y2FwLXYy",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 3565,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Y2FwLXYy",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuY2FwYWJpbGl0eQ",
+              "value": "AQAAAgEAAAAAAAAAAAAAAAAAAAA"
+            }
+          ]
+        },
+        {
+          "content": "sha256:6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Y2FwLXYz",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 3565,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Y2FwLXYz",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuY2FwYWJpbGl0eQ",
+              "value": "AQAAAwEAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }
+          ]
+        },
+        {
+          "content": "sha256:6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Y2FwLXYzLWhpZ2gtcm9vdA",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 3565,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Y2FwLXYzLWhpZ2gtcm9vdA",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuY2FwYWJpbGl0eQ",
+              "value": "AQAAAwEAAAAAAAAAAAAAAAAAAAD-____"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:0ef1c4c11cef04cc14d13b8cb0bd57c9358eefbcc69b68962e478c5cb1153c24",
+          "indexRoot": "sha256:5147a18021e0ced0b2d412e9082370f6ce5d75a00c8076fdb1312e2b097b39d0",
+          "packLength": 20480,
+          "packStream": "sha256:6794fb33887bca41bfcf962eef81dee236c9d4198bb7936ebc6566c995b5fa5f",
+          "recipe": "sha256:a45a473107f3acd07f1e4ee989f1ecfd6e35af77b9dc5c2aba2ec03bf0aea1b9",
+          "result": "sha256:35cfe7e4dfbfe9f28de598253ca7c74054499cb5d57c4207a6fc5bd44d8f7f65",
+          "size": 11264,
+          "tar": "metadata-capability-revisions/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M06",
+        "M08"
+      ],
+      "name": "metadata-capability-revisions"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:72dfcfb0c470ac255cde83fb8fe38de8a128188e03ea5ba5b2a93adbea1062fa",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bGFiZWw",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "bGFiZWw",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuc2VsaW51eA",
+              "value": "c3lzdGVtX3U6b2JqZWN0X3I6Y29udGFpbmVyX2ZpbGVfdDpzMAA"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:4977f18537f653e6d70e6d734920c7141cce46f0533c9a76e030f36ef82de7d6",
+          "indexRoot": "sha256:0dc07cfa4f41575de402b46084e27098973e2a11278908f527d695b7f4ed9913",
+          "packLength": 4096,
+          "packStream": "sha256:0a141c4cc2e04df87794e487a5fc731a94c70d9e160fcd9a908fc7100f4ff776",
+          "recipe": "sha256:af80ab81f4c5993e15acfb71d7b42beeb3feab2aebef5a2fe130cae893fe76fc",
+          "result": "sha256:498f18241e5e667da378be36155100ac2873c86874c6ed153f85b5d2289aee5f",
+          "size": 3072,
+          "tar": "metadata-selinux-raw/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-selinux-raw"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:72dfcfb0c470ac255cde83fb8fe38de8a128188e03ea5ba5b2a93adbea1062fa",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bGFiZWw",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "bGFiZWw",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuc2VsaW51eA",
+              "value": "c3lzdGVtX3U6b2JqZWN0X3I6Y29udGFpbmVyX2ZpbGVfdDpzMAA"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:6827a5503b754459bc2807cee27aae95d00ed2e163d61a2aa52c197ba637d620",
+          "indexRoot": "sha256:0dc07cfa4f41575de402b46084e27098973e2a11278908f527d695b7f4ed9913",
+          "packLength": 4096,
+          "packStream": "sha256:0a141c4cc2e04df87794e487a5fc731a94c70d9e160fcd9a908fc7100f4ff776",
+          "recipe": "sha256:0d1c5b1a576d99b30d410ceb283817f7f06ca207b846d108328437beae83576e",
+          "result": "sha256:1972527da5ea1aac89366805762eca2e6afd9cdb64f98f143a43b83cc4d2dfbd",
+          "size": 3072,
+          "tar": "metadata-selinux-rht/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-selinux-rht"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:72dfcfb0c470ac255cde83fb8fe38de8a128188e03ea5ba5b2a93adbea1062fa",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bGFiZWw",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "bGFiZWw",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuc2VsaW51eA",
+              "value": "c3lzdGVtX3U6b2JqZWN0X3I6Y29udGFpbmVyX2ZpbGVfdDpzMA"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:028ed1c68f814626ef363520b50d3f26d0cff17b73d2b580a8a93c23d82f4b36",
+          "indexRoot": "sha256:8bbabb123632555414feadf4c7b3ac77a4e4a5afe4c4ffb5578d0991b1eb2a4f",
+          "packLength": 4096,
+          "packStream": "sha256:0a141c4cc2e04df87794e487a5fc731a94c70d9e160fcd9a908fc7100f4ff776",
+          "recipe": "sha256:18c7286236e4d97b2bc3f12c8c758398652aeb20e124fe0f8d7470f4b074d1e7",
+          "result": "sha256:a84cdc716fb119a870fb527fa2449dfb3539cd7b42f25cd82e2d39594ede4878",
+          "size": 3072,
+          "tar": "metadata-selinux-without-terminal-nul/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-selinux-without-terminal-nul"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:c3641f8544d7c02f3580b07c0f9887f0c6a27ff5ab1d4a3e29caf197cfc299ae",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "YXQ",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "YXQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NA",
+              "value": "QA"
+            }
+          ]
+        },
+        {
+          "content": "sha256:9556b82499cc0aaf86aee7f0d253e17c61b7ef73d48a295f37d98f08b04ffa7f",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "bGFiZWwyNTU",
+          "kind": "regular",
+          "length": 3,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "bGFiZWwyNTU",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NA",
+              "value": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh"
+            }
+          ]
+        },
+        {
+          "content": "sha256:8de0b3c47f112c59745f717a626932264c422a7563954872e237b223af4ad643",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "c21hY2s",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "c21hY2s",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NA",
+              "value": "YWxwaGE"
+            },
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NEVYRUM",
+              "value": "ZXhlYw"
+            },
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NE1NQVA",
+              "value": "bW1hcA"
+            }
+          ]
+        },
+        {
+          "content": "sha256:684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "c3Rhcg",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "c3Rhcg",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NA",
+              "value": "Kg"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:d5a0292dd8c73d306b6a0b04304e2f0c1e5de23f96d00f2b47c704d35c978705",
+          "indexRoot": "sha256:ed2a43771452d3e8d659d7d0fd96722d0fc7a8baa90a6ef2674782fa89a0b48b",
+          "packLength": 16384,
+          "packStream": "sha256:6f35d7e8a9a8ad3a8df6bb564fa9f8b95af0e4959d6e09f66a3c22ef4b1b0078",
+          "recipe": "sha256:da100f4fc21e8463a2abefa88f04422068ac4110d0294e4f0f6fc067eb5f76c0",
+          "result": "sha256:f1e65f68d75e04c7c34792a405267e0456ab62ad66662d641265ee9879e324c6",
+          "size": 9216,
+          "tar": "metadata-smack-labels/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-smack-labels"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NA",
+              "value": "YWxwaGE"
+            },
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NFRSQU5TTVVURQ",
+              "value": "VFJVRQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZC9jaGlsZA",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZC9jaGlsZA",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:b0674c900870a2c24b2157ad44c75ef15c4f47ce12f22b4cd9b32f3b004fdcf8",
+          "indexRoot": "sha256:5daefb5772c7e4f2816acfbff518dc770a6654095c07a8f61ab7fbd49362d2d1",
+          "packLength": 4096,
+          "packStream": "sha256:7e8c32389d11f5d7033b06a02238ba8fa8b70b7db614cc0ab83790e871df52cf",
+          "recipe": "sha256:143d6e8e516cdf885535a1c3720277977b1c5b7d411cebb4cdaaf35360461fd6",
+          "result": "sha256:0df8c2285ffa0b7f5cd121d932cdc0602391ca8c964ff2293e106cc3ffdea160",
+          "size": 3584,
+          "tar": "metadata-smack-transmute-directory/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-smack-transmute-directory"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NA",
+              "value": "YWxwaGE"
+            },
+            {
+              "name": "c2VjdXJpdHkuU01BQ0s2NFRSQU5TTVVURQ",
+              "value": "VFJVRQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Y2hpbGQ",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Y2hpbGQ",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:bdc5bc73b296692c316d182dde8422cc22ef9a481a1a4e74a8586c5ed4de601b",
+          "indexRoot": "sha256:d609088008ffb3eb2880376d28a8878a3aac94ca50e689c63bc2f8c64284e274",
+          "packLength": 4096,
+          "packStream": "sha256:7e8c32389d11f5d7033b06a02238ba8fa8b70b7db614cc0ab83790e871df52cf",
+          "recipe": "sha256:a605e037c3d4eb2d72d964490b96bca7fec3544738a78f85985e0d2277740a04",
+          "result": "sha256:34d46aa64fc5532a79d24d89b5b1203547aa39434bd6ec97bcad65ca87b01cee",
+          "size": 3584,
+          "tar": "metadata-smack-transmute-root/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08"
+      ],
+      "name": "metadata-smack-transmute-root"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Yg",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yg",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuY2FwYWJpbGl0eQ",
+              "value": "AQAAAgEAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "name": "c3lzdGVtLnBvc2l4X2FjbF9hY2Nlc3M",
+              "value": "AgAAAAEABgD_____AgAEAAcAAAAEAAQA_____xAABAD_____IAAEAP____8"
+            },
+            {
+              "name": "dXNlci5tYXJrZXI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "Yg",
+          "kind": "regular",
+          "length": 3,
+          "links": 2,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "Yw",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "c2VjdXJpdHkuY2FwYWJpbGl0eQ",
+              "value": "AQAAAgEAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "name": "c3lzdGVtLnBvc2l4X2FjbF9hY2Nlc3M",
+              "value": "AgAAAAEABgD_____AgAEAAcAAAAEAAQA_____xAABAD_____IAAEAP____8"
+            },
+            {
+              "name": "dXNlci5tYXJrZXI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:09a10813b0a167082b77d45f3a93546b3f1505e089746040c4a9068689e4a286",
+          "indexRoot": "sha256:7313a0ffca522e084aec4aed1a9f480c4f9fc7747b8f10cc058748188947a511",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:60899a3880068d664a34326a7a3718df00db890a086ba05e13dcd315586254d5",
+          "result": "sha256:437dc436246a567ab909a6299e6deeb74b32a6a37f357712cb18f9d83552e4a9",
+          "size": 3072,
+          "tar": "metadata-hardlink-chain/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:05d18e039f3071fb3bc65943581f1cf8d713cb58449aa612dc9f3a72ddf62f1d",
+          "indexRoot": "sha256:6fac1b5e9fdec87e20cb0ebda78418e6cd8e90ab3f8ae0bad5da04cc1d30f949",
+          "packLength": 4096,
+          "packStream": "sha256:cf0a1882984e2badb64f2d7c54c854d7b85bd077d0c31328e218d5d2d23fdf62",
+          "recipe": "sha256:92315f11d55987fbf66ab7967102c23a103db1683bec9810bca44efbc18d1295",
+          "result": "sha256:c322fabd8e5df5d96dc2a58029a0909762e608021452d848d88d61ac674e2ac5",
+          "size": 4096,
+          "tar": "metadata-hardlink-chain/layer-1.tar"
+        },
+        {
+          "diffId": "sha256:083cc2f40dac317c4ede3786ae035a383e572a0bb10c6ad777ac4d0597d9598a",
+          "indexRoot": "sha256:82f7fcf298f2c18d8560da3d54917ccb67c4db98d4287a23730bd9557e7e9b0e",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:d5b6df0892566bb34b42e0dc3b52eef6789d25089ba2667920790ad0ca4cd78d",
+          "result": "sha256:d2e44ec5e2ef22d2bf8e7883d406ba8abfcff54c1bf45e3a62e7e5c85f1a9f83",
+          "size": 1536,
+          "tar": "metadata-hardlink-chain/layer-2.tar"
+        }
+      ],
+      "matrix": [
+        "M07",
+        "M08",
+        "N09"
+      ],
+      "name": "metadata-hardlink-chain"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:09a10813b0a167082b77d45f3a93546b3f1505e089746040c4a9068689e4a286",
+          "indexRoot": "sha256:7313a0ffca522e084aec4aed1a9f480c4f9fc7747b8f10cc058748188947a511",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:60899a3880068d664a34326a7a3718df00db890a086ba05e13dcd315586254d5",
+          "result": "sha256:437dc436246a567ab909a6299e6deeb74b32a6a37f357712cb18f9d83552e4a9",
+          "size": 3072,
+          "tar": "metadata-hardlink-acl-conflict-binary/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:5f0cc6186ae706dffbcc9254fa8af3a3095e1d91e22455ec22547791b16ffd00",
+          "indexRoot": "sha256:f91d75293d25275932ab794ed0243ad9c983ad31de34a4eeac991d075dc47e24",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:48f6e34ba647975e51a3e53c4bd3318bf775bd60bea1c08fb5c145730a5beb60",
+          "result": "sha256:a0e6e588547c265f23844c9622a3980062498e4c8a4cc06402111f3a07c818ea",
+          "size": 2560,
+          "tar": "metadata-hardlink-acl-conflict-binary/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "M07"
+      ],
+      "name": "metadata-hardlink-acl-conflict-binary"
+    },
+    {
+      "expected": [],
+      "expectedRejected": true,
+      "layers": [
+        {
+          "diffId": "sha256:09a10813b0a167082b77d45f3a93546b3f1505e089746040c4a9068689e4a286",
+          "indexRoot": "sha256:7313a0ffca522e084aec4aed1a9f480c4f9fc7747b8f10cc058748188947a511",
+          "packLength": 4096,
+          "packStream": "sha256:6834454261fa12050cde307f8ceac56e69f1e1c5a22266b1b23928ed6aab7cdc",
+          "recipe": "sha256:60899a3880068d664a34326a7a3718df00db890a086ba05e13dcd315586254d5",
+          "result": "sha256:437dc436246a567ab909a6299e6deeb74b32a6a37f357712cb18f9d83552e4a9",
+          "size": 3072,
+          "tar": "metadata-hardlink-acl-conflict-text/layer-0.tar"
+        },
+        {
+          "diffId": "sha256:a7077653b1f378dff331a01dfce078ed5d25752988331419aefa3c21e964eda7",
+          "indexRoot": "sha256:f91d75293d25275932ab794ed0243ad9c983ad31de34a4eeac991d075dc47e24",
+          "packLength": 0,
+          "packStream": "sha256:192b20355cf58aabc1ad0e56920978ddafc4563a62e8074d7b276e94990f741e",
+          "recipe": "sha256:bb4e5f88fddce5cc556cdc29ed7fe109a8ef519a0b49dbb7cc1e6979272cf782",
+          "result": "sha256:d86771bebb1aacf71f60ca91c494284b4b75b60d570415bb93c0f85597c43289",
+          "size": 2560,
+          "tar": "metadata-hardlink-acl-conflict-text/layer-1.tar"
+        }
+      ],
+      "matrix": [
+        "M07"
+      ],
+      "name": "metadata-hardlink-acl-conflict-text"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:8c2574892063f995fdf756bce07f46c1a5193e54cd52837ed91e32008ccf41ac",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "cmF3LW5hbWVz",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "cmF3LW5hbWVz",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "c3BhY2U"
+            },
+            {
+              "name": "dXNlci5hK2I",
+              "value": "cGx1cw"
+            },
+            {
+              "name": "dXNlci7DqQ",
+              "value": "dXRmOA"
+            },
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:497bb8c79e5268085a9d9e2f27e61edbe8063a70faf9a3f35aa6c526fc64813d",
+          "indexRoot": "sha256:587b46a85512636963b9fd66e0fbc4c8a2638dd1d1f1c97a12c60a8baab1371a",
+          "packLength": 4096,
+          "packStream": "sha256:bdb090bc0ddcf696630619b6427d54ff9c509f3aed4c1aead4652f65e26c8fde",
+          "recipe": "sha256:1d148665899d6a8194e2915cbe60a1beb42a60d3b10293ccb12129f1a26035c2",
+          "result": "sha256:22c2b452e2497eb05f4cb561403b00c8bdc1f752e17dd52d7a4ea786a9aa8a93",
+          "size": 3072,
+          "tar": "metadata-raw-schily-names/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08",
+        "M14"
+      ],
+      "name": "metadata-raw-schily-names"
+    },
+    {
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:a9f51566bd6705f7ea6ad54bb9deb449f795582d6529a0e22207b8981233ec58",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": "ZW5jb2RlZC1uYW1lcw",
+          "kind": "regular",
+          "length": 1,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "ZW5jb2RlZC1uYW1lcw",
+          "target": null,
+          "uid": 0,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": ""
+            },
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "bGl0ZXJhbC1wZXJjZW50MjU"
+            },
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "bGl0ZXJhbC1wZXJjZW50M0Q"
+            },
+            {
+              "name": "dXNlci5hJWI",
+              "value": "cGVyY2VudA"
+            },
+            {
+              "name": "dXNlci5hPWI",
+              "value": "-_8ACj0"
+            },
+            {
+              "name": "dXNlci7DqQ",
+              "value": "dXRmOA"
+            },
+            {
+              "name": "dXNlci7_",
+              "value": "cmF3"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "diffId": "sha256:d496a5b7ab8dd3bacdbcbd8f6b0133b1db806c7a193f481d5ba21eeedaf3c61f",
+          "indexRoot": "sha256:6a2a3144dab0c8bc741f4ab5a16eee39c3aa5adc56f1f3f0bcf6c3c25619a5fd",
+          "packLength": 4096,
+          "packStream": "sha256:4c5856268a72d213eb8cae468e1761629bc3c1e42c46a42bcccbc6f0c5f76262",
+          "recipe": "sha256:2d491701c7549495f5414e371173c3c5401715f89b99886b3277d30307075a36",
+          "result": "sha256:5fbede4eed45582d85694275d804a40d0f36c4aa94dccd017b5a99fd95409123",
+          "size": 3072,
+          "tar": "metadata-libarchive-raw-names/layer-0.tar"
+        }
+      ],
+      "matrix": [
+        "M08",
+        "M14"
+      ],
+      "name": "metadata-libarchive-raw-names"
+    }
+  ],
+  "generator": "changeset_conformance::tests::generate_goldens",
+  "schema": 1,
+  "source": "declarative independent operations; no production expectations"
+}

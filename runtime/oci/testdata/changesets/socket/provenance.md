@@ -1,0 +1,3 @@
+# Independent real socket specimen
+
+A real Linux AF_UNIX socket was archived with pinned schilytools/star exustar dump and independently extracted with star. Both were collected using lstat, not by the Silo decoder. Source/extracted root metadata and any differences remain in provenance.json; no field is filtered. The archive retains upstream dev/inode/nlink/ctime facts, so regenerating the specimen is acquisition, not a reproducible tar claim. Re-ingesting the retained exact archive must be fully repeatable. Containerd's socket-as-regular behavior is measured separately by the named comparison command.

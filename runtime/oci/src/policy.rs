@@ -114,7 +114,7 @@ impl RegistryPolicy {
     }
 
     /// Expands `image_ref` into the fully qualified references to try, in order.
-    pub(crate) fn candidates(&self, image_ref: &str) -> OciResult<Vec<Reference>> {
+    pub fn candidates(&self, image_ref: &str) -> OciResult<Vec<Reference>> {
         if !is_short_name(image_ref) {
             return Ok(vec![RegistryClient::parse_reference(image_ref)?]);
         }
