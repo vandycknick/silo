@@ -168,7 +168,10 @@ the exclusive OFD and catalog capability. Recovery recognizes the original or
 quarantine name after interruption, then rechecks durable absence before retiring
 pins. Traversal stays bound to the verified open directory, with no-follow parent
 entry identity checks before traversal and final directory unlink; it never
-reopens a mutable quarantine name to select the tree. Quarantine entries are not
+reopens a mutable quarantine name to select the tree. Each enumeration opens
+`.` relative to the retained directory FD to obtain an independent cursor and
+fresh filesystem enumeration state, including Btrfs's open-time entry boundary.
+Quarantine entries are not
 configurable resources, including a reserved spelling that symlinks outside the
 catalog. Reservation is checked lexically before resource symlink resolution.
 New disks/shares or containing mounts cannot intersect a cleaning candidate; an

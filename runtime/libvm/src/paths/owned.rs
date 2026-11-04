@@ -1,4 +1,4 @@
-use std::ffi::{CStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -352,50 +352,25 @@ fn unlink_verified_directory(
 }
 
 fn directory_entries(fd: &OwnedFd, path: &Path) -> Result<Vec<OsString>, LibVmError> {
-    // nix does not expose a descriptor-relative directory iterator. fdopendir
-    // lets us enumerate the already validated descriptor without reopening it.
-    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
-        return Err(invalid(path, std::io::Error::last_os_error()));
-    }
-    let directory = unsafe { libc::fdopendir(duplicate) };
-    if directory.is_null() {
-        let error = std::io::Error::last_os_error();
-        let _ = unsafe { libc::close(duplicate) };
-        return Err(invalid(path, error));
-    }
-
+    // A dup shares both the cursor and filesystem-specific enumeration state.
+    // Btrfs bounds a stream at open time, so reopen "." through the held inode
+    // to see current entries without resolving the replaceable pathname.
+    let mut directory = nix::dir::Dir::openat(
+        fd,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| invalid(path, error))?;
     let mut entries = Vec::new();
-    loop {
-        clear_errno();
-        let entry = unsafe { libc::readdir(directory) };
-        if entry.is_null() {
-            let error = std::io::Error::last_os_error();
-            let close_result = unsafe { libc::closedir(directory) };
-            if error.raw_os_error() != Some(0) {
-                return Err(invalid(path, error));
-            }
-            if close_result != 0 {
-                return Err(invalid(path, std::io::Error::last_os_error()));
-            }
-            return Ok(entries);
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+    for entry in directory.iter() {
+        let entry = entry.map_err(|error| invalid(path, error))?;
+        let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
             entries.push(OsString::from_vec(name.to_vec()));
         }
     }
-}
-
-fn clear_errno() {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        *libc::__error() = 0;
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
+    Ok(entries)
 }
 
 fn unlink_at(
@@ -621,6 +596,21 @@ mod tests {
             std::fs::read(replacement.path().join("keep")).unwrap(),
             b"not admitted"
         );
+    }
+
+    #[test]
+    fn repeated_removal_refreshes_the_retained_directory_stream() {
+        use crate::paths::owned::remove_directory_contents;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = OwnedDirectory::open_root(&temp.path().join("owned")).unwrap();
+        root.write_file("first", b"first generation").unwrap();
+        remove_directory_contents(root.fd(), root.path()).unwrap();
+        assert!(!root.path().join("first").exists());
+
+        root.write_file("second", b"second generation").unwrap();
+        remove_directory_contents(root.fd(), root.path()).unwrap();
+        assert!(!root.path().join("second").exists());
     }
 
     #[test]
