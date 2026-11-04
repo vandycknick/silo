@@ -7,10 +7,14 @@ import (
 )
 
 var nativeErrorKinds = map[string]ErrorKind{
-	"SecretResolution":      ErrorSecretResolution,
-	"MissingNetworkSecrets": ErrorMissingNetworkSecrets,
-	"HomeUnavailable":       ErrorHomeUnavailable,
-	"ConfigDirUnavailable":  ErrorConfigDirUnavailable, "RelativeEnvironmentPath": ErrorRelativeEnvironmentPath,
+	"LiveOperationUnsupported": ErrorLiveOperationUnsupported,
+	"LiveDiscovery":            ErrorLiveDiscovery,
+	"LiveProtocol":             ErrorLiveProtocol,
+	"LiveObservation":          ErrorLiveObservation,
+	"SecretResolution":         ErrorSecretResolution,
+	"MissingNetworkSecrets":    ErrorMissingNetworkSecrets,
+	"HomeUnavailable":          ErrorHomeUnavailable,
+	"ConfigDirUnavailable":     ErrorConfigDirUnavailable, "RelativeEnvironmentPath": ErrorRelativeEnvironmentPath,
 	"InvalidRunRoot": ErrorInvalidRunRoot, "InvalidOwnedPath": ErrorInvalidOwnedPath,
 	"InvalidMachineName": ErrorInvalidMachineName, "InvalidMachineIdPrefix": ErrorInvalidMachineIDPrefix,
 	"MachineAlreadyExists": ErrorMachineAlreadyExists, "MachineNameGenerationFailed": ErrorMachineNameGenerationFailed,

@@ -2568,48 +2568,7 @@ fn pull_policy_from_string(policy: &str) -> Result<ImagePullPolicy> {
 }
 
 fn to_napi_error(error: LibVmError) -> Error {
-    let variant = match &error {
-        LibVmError::HomeUnavailable => "HomeUnavailable",
-        LibVmError::ConfigDirUnavailable => "ConfigDirUnavailable",
-        LibVmError::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",
-        LibVmError::InvalidMachineName { .. } => "InvalidMachineName",
-        LibVmError::InvalidMachineIdPrefix { .. } => "InvalidMachineIdPrefix",
-        LibVmError::MachineAlreadyExists { .. } => "MachineAlreadyExists",
-        LibVmError::MachineNameGenerationFailed { .. } => "MachineNameGenerationFailed",
-        LibVmError::MachineNotFound { .. } => "MachineNotFound",
-        LibVmError::ImageNotFound { .. } => "ImageNotFound",
-        LibVmError::ImageInUse { .. } => "ImageInUse",
-        LibVmError::Image { .. } => "Image",
-        LibVmError::MachineIdAlreadyExists { .. } => "MachineIdAlreadyExists",
-        LibVmError::MachineAlreadyRunning { .. } => "MachineAlreadyRunning",
-        LibVmError::MachineNotRunning { .. } => "MachineNotRunning",
-        LibVmError::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
-        LibVmError::MonitorConnection { .. } => "MonitorConnection",
-        LibVmError::MonitorProtocol { .. } => "MonitorProtocol",
-        LibVmError::GuestPathNotFound { .. } => "GuestPathNotFound",
-        LibVmError::GuestSession { .. } => "GuestSession",
-        LibVmError::MachinePreparationFailed { .. } => "MachinePreparationFailed",
-        LibVmError::NetworkRuntime { .. } => "NetworkRuntime",
-        LibVmError::VmMonExecutableNotFound { .. } => "VmMonExecutableNotFound",
-        LibVmError::VmMonExecutableInvalid { .. } => "VmMonExecutableInvalid",
-        LibVmError::BootAssetNotFound { .. } => "BootAssetNotFound",
-        LibVmError::BootAssetInvalid { .. } => "BootAssetInvalid",
-        LibVmError::InvalidCreateRequest { .. } => "InvalidCreateRequest",
-        LibVmError::InvalidMachineUpdate { .. } => "InvalidMachineUpdate",
-        LibVmError::InvalidMachineConfig { .. } => "InvalidMachineConfig",
-        LibVmError::UnsupportedHostArchitecture { .. } => "UnsupportedHostArchitecture",
-        LibVmError::CorruptState { .. } => "CorruptState",
-        LibVmError::VmSpecSerializeFailed { .. } => "VmSpecSerializeFailed",
-        LibVmError::VmSpecLoadFailed { .. } => "VmSpecLoadFailed",
-        LibVmError::AmbiguousIdPrefix { .. } => "AmbiguousIdPrefix",
-        LibVmError::StateDecode { .. } => "StateDecode",
-        LibVmError::StateDatabaseConfigMismatch { .. } => "StateDatabaseConfigMismatch",
-        LibVmError::Database(_) => "Database",
-        LibVmError::DatabaseMigration(_) => "DatabaseMigration",
-        LibVmError::Io(_) => "Io",
-        LibVmError::RootDisk { .. } => "RootDisk",
-        _ => "LibVmError",
-    };
+    let variant = error.variant();
     Error::new(Status::GenericFailure, format!("[{variant}] {error}"))
 }
 

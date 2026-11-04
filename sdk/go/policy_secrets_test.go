@@ -50,7 +50,7 @@ tailscale "vm" {}`)
 		t.Fatal(check, e)
 	}
 	disk := filepath.Join(home, "source.raw")
-	write(disk, "never booted disk fixture")
+	write(disk, strings.Repeat("\x00", 512))
 	m, e := r.CreateMachine(ctx, DiskImage(disk), WithName("scope-check"), WithVsock(true))
 	if e != nil {
 		t.Fatal(e)

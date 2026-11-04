@@ -14,7 +14,7 @@ func nativeAttachmentMachine(t *testing.T) *Machine {
 	t.Helper()
 	runtime, home := phase7Runtime(t)
 	disk := filepath.Join(home, "attachment.raw")
-	if err := os.WriteFile(disk, []byte("stopped-native-fixture"), 0600); err != nil {
+	if err := os.WriteFile(disk, make([]byte, 512), 0600); err != nil {
 		t.Fatal(err)
 	}
 	machine, err := runtime.CreateMachine(context.Background(), DiskImage(disk), WithName("attachment-native"))

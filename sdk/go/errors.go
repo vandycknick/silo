@@ -6,6 +6,10 @@ import "errors"
 type ErrorKind string
 
 const (
+	ErrorLiveOperationUnsupported    ErrorKind = "LiveOperationUnsupported"
+	ErrorLiveDiscovery               ErrorKind = "LiveDiscovery"
+	ErrorLiveProtocol                ErrorKind = "LiveProtocol"
+	ErrorLiveObservation             ErrorKind = "LiveObservation"
 	ErrorSecretResolution            ErrorKind = "SecretResolution"
 	ErrorMissingNetworkSecrets       ErrorKind = "MissingNetworkSecrets"
 	ErrorUnknown                     ErrorKind = "Unknown"

@@ -108,7 +108,7 @@ func TestPhase7NativePolicyAndStoppedMachineContracts(t *testing.T) {
 		t.Fatalf("optional key readiness: %v %v", ready, err)
 	}
 	disk := filepath.Join(home, "input.raw")
-	if err := os.WriteFile(disk, []byte("root-disk"), 0600); err != nil {
+	if err := os.WriteFile(disk, make([]byte, 512), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.CreateMachine(ctx, DiskImage(disk), WithName("without-vsock"), WithMachineNetwork(PrivateNetwork(policy))); err == nil {
@@ -221,7 +221,7 @@ verdict = "allow"
 		t.Fatalf("home readiness: %v %v", ready, err)
 	}
 	disk := filepath.Join(home, "input.raw")
-	if err := os.WriteFile(disk, []byte("root-disk"), 0600); err != nil {
+	if err := os.WriteFile(disk, make([]byte, 512), 0600); err != nil {
 		t.Fatal(err)
 	}
 	good, err := runtime.CreateMachine(ctx, DiskImage(disk), WithName("healthy"))
@@ -285,7 +285,7 @@ func TestPhase7ConcurrentExactNames(t *testing.T) {
 	runtime, home := phase7Runtime(t)
 	ctx := context.Background()
 	disk := filepath.Join(home, "input.raw")
-	if err := os.WriteFile(disk, []byte("root-disk"), 0600); err != nil {
+	if err := os.WriteFile(disk, make([]byte, 512), 0600); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
