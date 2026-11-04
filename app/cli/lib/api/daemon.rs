@@ -37,11 +37,9 @@ impl DaemonVmService {
     pub(crate) async fn probe(
         config: &RuntimeConfig,
         host: &HostPaths,
+        admission: silo_vm_control::transport::Admission,
     ) -> eyre::Result<Option<Self>> {
-        let Some(selected) =
-            silo_vm_control::transport::probe(host, silo_vm_control::transport::Admission::Ready)
-                .await?
-        else {
+        let Some(selected) = silo_vm_control::transport::probe(host, admission).await? else {
             return Ok(None);
         };
         let channel = selected.channel;

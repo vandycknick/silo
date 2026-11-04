@@ -44,7 +44,7 @@ and TCP uses `tcp://<node>:<port>`. URLs use configured DNS for stopped VMs or
 verified DNS for ready nodes, and are omitted when node DNS is unavailable.
 These are configuration, not per-forward health checks. VMs without Tailscale or
 configured forwards omit `forwards`. Both `show --json` and `ls --json` include
-this projection; the local Rust CLI's `silo show` is unchanged.
+this projection; the local Rust CLI uses the separate `silo info` command.
 
 Document records contain `kind`, `name`, `tier` (`yours` or `operator`), and `owner`
 only for principal-owned files. Show/create/edit/validate include canonical `content`;

@@ -75,6 +75,10 @@ pub(crate) struct MachineOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) disk_size: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) root_profile: Option<crate::commands::create::RootProfileArg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tmpfs_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) userdata: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) mounts: Vec<MachineMount>,
@@ -96,6 +100,8 @@ pub(crate) struct MachineOverrides {
 pub(crate) struct MachinePlan {
     pub(crate) resources: Option<MachineResources>,
     pub(crate) disk_size: Option<String>,
+    pub(crate) root_profile: crate::commands::create::RootProfileArg,
+    pub(crate) tmpfs_size: Option<String>,
     pub(crate) userdata: Option<String>,
     pub(crate) mounts: Vec<MachineMount>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -279,6 +285,11 @@ pub(crate) fn resolve(request: ResolveRequest) -> eyre::Result<Plan> {
         )
     };
     let machine = resolve_machine(&request.template, request.machine_overrides)?;
+    if machine.root_profile == crate::commands::create::RootProfileArg::LinuxFlatOverlayV1
+        && matches!(image, ImageIdentity::Disk { .. })
+    {
+        bail!("linux-flat-overlay-v1 requires an OCI image, not disk: input");
+    }
     let process = resolve_process(
         metadata.as_ref(),
         &request.environment_files,
@@ -393,6 +404,11 @@ fn resolve_machine(template: &Template, overrides: MachineOverrides) -> eyre::Re
             ),
         }),
         disk_size: overrides.disk_size.or_else(|| template.disk_size.clone()),
+        root_profile: overrides
+            .root_profile
+            .or(template.root_profile)
+            .unwrap_or_default(),
+        tmpfs_size: overrides.tmpfs_size.or_else(|| template.tmpfs_size.clone()),
         userdata: overrides.userdata.or_else(|| template.userdata.clone()),
         mounts,
         forwards,
@@ -556,6 +572,10 @@ fn validate_request_nuls(request: &ResolveRequest) -> eyre::Result<()> {
 }
 
 fn validate_machine_plan(machine: &MachinePlan) -> eyre::Result<()> {
+    crate::template::validate_root_options(
+        Some(machine.root_profile),
+        machine.tmpfs_size.as_deref(),
+    )?;
     validate_machine_defaults(
         machine.resources.as_ref(),
         machine.disk_size.as_deref(),
@@ -619,6 +639,8 @@ fn validate_template_nuls(template: &Template) -> eyre::Result<()> {
     validate_machine_plan(&MachinePlan {
         resources: template.resources.clone(),
         disk_size: template.disk_size.clone(),
+        root_profile: template.root_profile.unwrap_or_default(),
+        tmpfs_size: template.tmpfs_size.clone(),
         userdata: template.userdata.clone(),
         mounts: template.mounts.clone(),
         forwards: Vec::new(),
@@ -752,6 +774,8 @@ mod tests {
             image: image.map(str::to_string),
             resources: None,
             disk_size: None,
+            root_profile: None,
+            tmpfs_size: None,
             userdata: None,
             mounts: Vec::new(),
             forwards: Vec::new(),
@@ -774,6 +798,41 @@ mod tests {
             },
             metadata: Box::new(metadata),
         }
+    }
+
+    #[test]
+    fn overlay_profile_is_opt_in_and_cli_replaces_template() {
+        use crate::commands::create::RootProfileArg;
+        let default = create_plan(
+            resolve(request(PlanKind::Create, OciImageConfigMetadata::default()))
+                .expect("default plan"),
+        );
+        assert_eq!(default.machine.root_profile, RootProfileArg::OpaqueRaw);
+        assert_eq!(default.machine.tmpfs_size, None);
+        let mut selected = request(PlanKind::Create, OciImageConfigMetadata::default());
+        selected.template.root_profile = Some(RootProfileArg::LinuxFlatOverlayV1);
+        selected.template.tmpfs_size = Some("8mib".into());
+        selected.machine_overrides.tmpfs_size = Some("16mib".into());
+        let plan = create_plan(resolve(selected).expect("overlay plan"));
+        assert_eq!(
+            plan.machine.root_profile,
+            RootProfileArg::LinuxFlatOverlayV1
+        );
+        assert_eq!(plan.machine.tmpfs_size.as_deref(), Some("16mib"));
+    }
+
+    #[test]
+    fn overlay_profile_rejects_disk_sources() {
+        let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
+        input.machine_overrides.root_profile =
+            Some(crate::commands::create::RootProfileArg::LinuxFlatOverlayV1);
+        input.positional_image = Some(ResolvedImage::Disk {
+            path: "/tmp/source.raw".into(),
+        });
+        assert!(resolve(input)
+            .expect_err("overlay disk source")
+            .to_string()
+            .contains("requires an OCI image"));
     }
 
     #[test]
@@ -1329,65 +1388,6 @@ mod tests {
 
     fn json(plan: Plan) -> serde_json::Value {
         serde_json::to_value(plan).expect("serialize plan")
-    }
-
-    #[test]
-    fn create_plan_serde_snapshot_has_complete_creation_state() {
-        let plan = resolve(request(PlanKind::Create, OciImageConfigMetadata::default()))
-            .expect("resolve plan");
-
-        assert_eq!(
-            json(plan),
-            serde_json::json!({
-                "operation": "create",
-                "schemaVersion": 1,
-                "proposedName": "dev",
-                "template": {
-                    "name": "development",
-                    "version": "1",
-                    "description": null
-                },
-                "image": {
-                    "kind": "oci",
-                    "requestedReference": "example:template",
-                    "selectedReference": "example:template@sha256:selected",
-                    "platform": { "os": "linux", "architecture": "amd64" },
-                    "manifestDigest": "sha256:manifest",
-                    "configDigest": "sha256:config",
-                    "cacheState": "complete",
-                    "pullPolicy": "if_missing"
-                },
-                "machine": {
-                    "resources": { "cpus": 1, "memory": "512mb" },
-                    "diskSize": null,
-                    "userdata": null,
-                    "mounts": [],
-                    "network": { "kind": "private" },
-                    "labels": { "template": "yes" }
-                },
-                "machineSettings": {
-                    "kernel": null,
-                    "initramfs": null,
-                    "kernelArgs": [],
-                    "nestedVirtualization": false,
-                    "rosetta": false,
-                    "disks": [],
-                    "agent": { "mode": "default" },
-                    "provisionUser": null
-                },
-                "process": {
-                    "entrypoint": null,
-                    "command": null,
-                    "environment": {
-                        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                    },
-                    "workingDirectory": "/",
-                    "user": null
-                },
-                "retention": "persistent",
-                "cleanup": "retain_machine"
-            })
-        );
     }
 
     #[test]

@@ -9,7 +9,9 @@ pub mod daemon;
 pub mod default;
 pub mod exec;
 pub mod forward;
+pub mod info;
 pub mod list;
+pub mod live;
 pub mod logs;
 pub mod network;
 pub mod restart;
@@ -18,9 +20,9 @@ pub mod run;
 pub mod secret;
 pub mod set;
 pub mod shell;
-pub mod show;
 pub mod start;
 pub mod stop;
+pub mod system;
 pub mod template;
 
 #[derive(Debug, Subcommand)]
@@ -44,8 +46,13 @@ pub enum Command {
     Forward(forward::Cmd),
     #[command(visible_alias = "ls")]
     List(list::Cmd),
-    #[command(visible_alias = "status")]
-    Show(show::Cmd),
+    Info(info::Cmd),
+    System(system::Cmd),
+    Pause(live::Pause),
+    Snapshot(live::Snapshot),
+    Fork(live::Fork),
+    Restore(live::Restore),
+    Image(live::Image),
     Logs(logs::Cmd),
     Network(network::Cmd),
     Template(template::Cmd),
@@ -53,6 +60,17 @@ pub enum Command {
 }
 
 impl Command {
+    pub(crate) fn transport_admission(&self) -> silo_vm_control::transport::Admission {
+        use silo_vm_control::transport::Admission;
+        match self {
+            Self::Pause(_) | Self::System(_) => Admission::Owned,
+            Self::Snapshot(command) if command.is_live() => Admission::Owned,
+            Self::Fork(command) if command.live => Admission::Owned,
+            Self::Restore(command) if command.execution => Admission::Owned,
+            _ => Admission::Ready,
+        }
+    }
+
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         match self {
             Self::Run(command) => command.run(context).await,
@@ -70,7 +88,13 @@ impl Command {
             Self::Cp(command) => command.run(context).await,
             Self::Forward(command) => command.run(context).await,
             Self::List(command) => command.run(context).await,
-            Self::Show(command) => command.run(context).await,
+            Self::Info(command) => command.run(context).await,
+            Self::System(command) => command.run(context).await,
+            Self::Pause(command) => command.run(context).await,
+            Self::Snapshot(command) => command.run(context).await,
+            Self::Fork(command) => command.run(context).await,
+            Self::Restore(command) => command.run(context).await,
+            Self::Image(command) => command.run(context).await,
             Self::Logs(command) => command.run(context).await,
             Self::Network(command) => command.run(context).await,
             Self::Template(command) => command.run(context).await,

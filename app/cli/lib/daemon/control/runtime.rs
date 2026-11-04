@@ -16,6 +16,128 @@ impl w::runtime_service_server::RuntimeService for Service {
     type ResolveImageStream = Stream<w::ResolveImageEvent>;
     type PullImageStream = Stream<w::ImageProgress>;
 
+    async fn restore_execution(
+        &self,
+        _: Request<w::LiveRestoreRequest>,
+    ) -> Result<Response<()>, Status> {
+        let report = self.live_capabilities().await?;
+        libvm::require_host_live_operation(&report, vm_spec::live::LiveOperation::Restore)
+            .map_err(native)?;
+        Ok(Response::new(()))
+    }
+
+    async fn restore_snapshot(
+        &self,
+        r: Request<w::RestoreStorageSnapshotRequest>,
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let value = r.get_ref().clone();
+        let reference = silo_vm_control::stopped::reference_from_wire(
+            crate::daemon::control::required(value.snapshot)?,
+        )
+        .map_err(conversion)?;
+        let options = libvm::RestoreOptions {
+            name: silo_vm_control::stopped::name(value.name).map_err(conversion)?,
+            external_resources: silo_vm_control::stopped::policy_from_wire(
+                crate::daemon::control::required(value.external_resources)?,
+            )
+            .map_err(conversion)?,
+        };
+        libvm::preflight_restore_snapshot(&self.config, &reference, &options.external_resources)
+            .await
+            .map_err(native)?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let machine = state
+                    .runtime()
+                    .await?
+                    .restore_snapshot(reference, options)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::snapshots::snapshot_to_wire(
+                    &machine.inspect().await.map_err(native)?,
+                )
+                .map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(result))
+    }
+
+    async fn inspect_storage_snapshot(
+        &self,
+        r: Request<w::StorageSnapshotRef>,
+    ) -> Result<Response<w::StorageSnapshotInfo>, Status> {
+        let reference =
+            silo_vm_control::stopped::reference_from_wire(r.into_inner()).map_err(conversion)?;
+        let runtime = self.runtime().await?;
+        let info = libvm::SnapshotStore::open(runtime.local_home())
+            .await
+            .map_err(native)?
+            .inspect(&reference)
+            .await
+            .map_err(native)?;
+        Ok(Response::new(
+            silo_vm_control::stopped::info_to_wire(&info).map_err(conversion)?,
+        ))
+    }
+
+    async fn list_storage_snapshots(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<w::StorageSnapshotList>, Status> {
+        let runtime = self.runtime().await?;
+        let infos = libvm::SnapshotStore::open(runtime.local_home())
+            .await
+            .map_err(native)?
+            .list()
+            .await
+            .map_err(native)?;
+        let snapshots = infos
+            .iter()
+            .map(silo_vm_control::stopped::info_to_wire)
+            .collect::<Result<_, _>>()
+            .map_err(conversion)?;
+        Ok(Response::new(w::StorageSnapshotList { snapshots }))
+    }
+
+    async fn release_snapshot_retention(
+        &self,
+        r: Request<w::StorageSnapshotRef>,
+    ) -> Result<Response<()>, Status> {
+        let reference = silo_vm_control::stopped::reference_from_wire(r.get_ref().clone())
+            .map_err(conversion)?;
+        let state = self.clone();
+        self.mutate(&r, true, async move {
+            let runtime = state.runtime().await?;
+            libvm::SnapshotStore::open(runtime.local_home())
+                .await
+                .map_err(native)?
+                .release_retention(&reference)
+                .await
+                .map_err(native)?;
+            Ok(())
+        })
+        .await?;
+        Ok(Response::new(()))
+    }
+
+    async fn remove_image_alias(&self, r: Request<w::Name>) -> Result<Response<()>, Status> {
+        let alias = silo_vm_control::stopped::alias(&r.get_ref().name).map_err(conversion)?;
+        let state = self.clone();
+        self.mutate(&r, true, async move {
+            let runtime = state.runtime().await?;
+            libvm::SnapshotStore::open(runtime.local_home())
+                .await
+                .map_err(native)?
+                .remove_alias(&alias)
+                .await
+                .map_err(native)?;
+            Ok(())
+        })
+        .await?;
+        Ok(Response::new(()))
+    }
+
     async fn resolve_image(
         &self,
         r: Request<w::ResolveImageRequest>,

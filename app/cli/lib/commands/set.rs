@@ -14,6 +14,10 @@ const SETTINGS: &[(&str, &str)] = &[
     ("memory=SIZE", "Set RAM size"),
     ("disk=SIZE", "Set desired root disk size"),
     (
+        "tmpfs-size=SIZE|off",
+        "Select sized /tmp tmpfs or restore disk-backed /tmp on a stopped overlay VM",
+    ),
+    (
         "network=private|none|NAME|name:NAME",
         "Set the network target",
     ),
@@ -135,6 +139,17 @@ impl ParsedSet {
                 "cpus" => update = update.cpus(parse_cpus(value)?),
                 "memory" => update = update.memory(parse_memory(value)?),
                 "disk" => update = update.root_disk_size(parse_disk(value)?),
+                "tmpfs-size" => {
+                    let policy = if value == "off" {
+                        libvm::TemporaryDirectoryPolicy::DiskBacked
+                    } else {
+                        libvm::TemporaryDirectoryPolicy::Tmpfs {
+                            capacity_bytes: parse_disk(value)?,
+                        }
+                    };
+                    policy.validate()?;
+                    update = update.temporary_directory(policy);
+                }
                 "network" => {
                     let network =
                         MachineNetworkSelection::parse(value).map_err(eyre::Report::msg)?;
@@ -175,13 +190,14 @@ fn normalize_key(key: &str) -> eyre::Result<&'static str> {
         "cpus" | "cpu" => Ok("cpus"),
         "memory" | "mem" => Ok("memory"),
         "disk" | "root-disk" | "root_disk" => Ok("disk"),
+        "tmpfs-size" => Ok("tmpfs-size"),
         "network" | "net" => Ok("network"),
         "nested-virtualization" | "nested_virtualization" => Ok("nested-virtualization"),
         "rosetta" => Ok("rosetta"),
         "agent" => Ok("agent"),
         "user" => Ok("user"),
         _ => Err(eyre::eyre!(
-            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, network, nested-virtualization, rosetta, agent, user"
+            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, tmpfs-size, network, nested-virtualization, rosetta, agent, user"
         )),
     }
 }
@@ -230,6 +246,27 @@ mod tests {
     use libvm::{MachineUserUpdate, Memory};
 
     use crate::commands::set::ParsedSet;
+
+    #[test]
+    fn tmpfs_policy_is_sized_or_explicitly_removed() {
+        assert_eq!(
+            ParsedSet::parse(&["dev".into(), "tmpfs-size=8mib".into()])
+                .expect("sized tmpfs")
+                .update
+                .temporary_directory,
+            Some(libvm::TemporaryDirectoryPolicy::Tmpfs {
+                capacity_bytes: 8 * 1024 * 1024
+            })
+        );
+        assert_eq!(
+            ParsedSet::parse(&["dev".into(), "tmpfs-size=off".into()])
+                .expect("disk backed")
+                .update
+                .temporary_directory,
+            Some(libvm::TemporaryDirectoryPolicy::DiskBacked)
+        );
+        assert!(ParsedSet::parse(&["tmpfs-size=0".into()]).is_err());
+    }
 
     #[test]
     fn reclaim_is_not_a_user_setting() {

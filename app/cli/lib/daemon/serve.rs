@@ -172,6 +172,9 @@ pub(crate) async fn run(args: Run) -> eyre::Result<()> {
         generation,
         publisher.clone(),
     ));
+    if let Err(error) = state.publish_live_capabilities().await {
+        tracing::warn!(%error, "manager capability discovery unavailable");
+    }
     let server = match socket_ownership.bind(state.clone()) {
         Ok(server) => server,
         Err(error) => {

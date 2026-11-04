@@ -8,6 +8,17 @@ impl w::daemon_service_server::DaemonService for Service {
         Ok(Response::new(ControlState::get_status(self).await?))
     }
 
+    async fn get_live_capabilities(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<w::LiveHostReport>, Status> {
+        let report = self.live_capabilities().await?;
+        Ok(Response::new(
+            silo_vm_control::live::host_to_wire(&report)
+                .map_err(crate::daemon::control::conversion)?,
+        ))
+    }
+
     async fn get_runtime_info(&self, _: Request<()>) -> Result<Response<w::RuntimeInfo>, Status> {
         let c = self.components().await?;
         Ok(Response::new(w::RuntimeInfo {

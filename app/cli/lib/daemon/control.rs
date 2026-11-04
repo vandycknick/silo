@@ -78,6 +78,7 @@ pub(crate) struct ControlState {
     pub(super) shutdown_only: bool,
     components: OnceCell<ResolvedRuntimeComponents>,
     runtime: OnceCell<Runtime>,
+    live_query: OnceCell<libvm::LiveCapabilityQuery>,
     publisher: Arc<crate::daemon::status::StatusPublisher>,
     admission: Mutex<Admission>,
     capacity: Arc<Semaphore>,
@@ -101,6 +102,7 @@ impl ControlState {
             shutdown_only: false,
             components: OnceCell::new(),
             runtime: OnceCell::new(),
+            live_query: OnceCell::new(),
             publisher,
             admission: Mutex::new(Admission {
                 sealed: false,
@@ -193,6 +195,46 @@ impl ControlState {
         self.components
             .get_or_try_init(|| async { self.config.resolve_components().map_err(native) })
             .await
+    }
+    pub(super) async fn live_capabilities(&self) -> Result<vm_spec::live::LiveHostReport, Status> {
+        match self.runtime.get() {
+            Some(runtime) => runtime.live_capabilities().await.map_err(native),
+            None => self
+                .live_query
+                .get_or_try_init(|| async {
+                    libvm::LiveCapabilityQuery::open(&self.config).map_err(native)
+                })
+                .await?
+                .host_report()
+                .await
+                .map_err(native),
+        }
+    }
+
+    pub(super) async fn require_machine_live(
+        &self,
+        reference: &libvm::MachineRef,
+        operation: vm_spec::live::LiveOperation,
+    ) -> Result<(), Status> {
+        let observation = match self.runtime.get() {
+            Some(runtime) => runtime.observe_live(reference).await.map_err(native)?,
+            None => {
+                let reader = libvm::LiveObservationReader::open(&self.config).map_err(native)?;
+                if !reader.catalog_exists().map_err(native)? {
+                    libvm::require_host_live_operation(&self.live_capabilities().await?, operation)
+                        .map_err(native)?;
+                }
+                reader.observe(reference).await.map_err(native)?
+            }
+        };
+        // This pure guard precedes admit/mutate and every operational reservation.
+        libvm::require_live_operation(&observation, operation).map_err(native)
+    }
+    pub(crate) async fn publish_live_capabilities(&self) -> Result<(), Status> {
+        let report = self.live_capabilities().await?;
+        self.publisher
+            .set_manager_live(report)
+            .map_err(|_| Status::internal("cannot publish manager capabilities"))
     }
     pub(super) async fn runtime(&self) -> Result<Runtime, Status> {
         let components = self.components().await?.clone();

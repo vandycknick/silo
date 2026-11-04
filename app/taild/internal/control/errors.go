@@ -34,10 +34,22 @@ func rpcError(ctx context.Context, err error) error {
 	if s.Code() == codes.DeadlineExceeded {
 		return context.DeadlineExceeded
 	}
-	for _, detail := range s.Details() {
-		d, ok := detail.(*w.ErrorDetail)
-		if !ok || d.Kind < 1 || d.Kind > 8 || d.Code < 1 || d.Code > 7 {
-			continue
+	d, detailErr := managementErrorDetail(s)
+	if detailErr != nil {
+		return invalidResponse()
+	}
+	if d != nil {
+		if d.Kind < 1 || d.Kind > 8 || d.Code < 1 || d.Code > 8 {
+			return invalidResponse()
+		}
+		if d.Code == w.ErrorCode_ERROR_CODE_LIVE_OPERATION_UNSUPPORTED {
+			if s.Code() != codes.FailedPrecondition || !validLiveRefusal(d.LiveUnsupported) {
+				return invalidResponse()
+			}
+			return &LiveOperationUnsupported{Detail: d.LiveUnsupported}
+		}
+		if d.LiveUnsupported != nil || d.GetNativeVariant() == string(silo.ErrorLiveOperationUnsupported) {
+			return invalidResponse()
 		}
 		kind := nativeKind(d.GetNativeVariant())
 		switch d.Code {
@@ -86,8 +98,27 @@ func rpcError(ctx context.Context, err error) error {
 	}
 	return &silo.Error{Kind: silo.ErrorUnknown, Message: "daemon management unavailable"}
 }
+func managementErrorDetail(s *status.Status) (*w.ErrorDetail, error) {
+	var result *w.ErrorDetail
+	for _, detail := range s.Proto().Details {
+		if detail == nil || !detail.MessageIs(&w.ErrorDetail{}) {
+			continue
+		}
+		if result != nil {
+			return nil, invalidResponse()
+		}
+		result = &w.ErrorDetail{}
+		if err := detail.UnmarshalTo(result); err != nil {
+			return nil, invalidResponse()
+		}
+	}
+	return result, nil
+}
+
 func nativeKind(variant string) silo.ErrorKind {
 	switch silo.ErrorKind(variant) {
+	case silo.ErrorLiveOperationUnsupported, silo.ErrorLiveDiscovery, silo.ErrorLiveProtocol, silo.ErrorLiveObservation:
+		return silo.ErrorKind(variant)
 	case silo.ErrorImageReferenceRejected, silo.ErrorMachineNotFound, silo.ErrorMachineAlreadyExists, silo.ErrorMachineAlreadyRunning, silo.ErrorMachineNotRunning, silo.ErrorMachineStaleGeneration, silo.ErrorInvalidMachineUpdate, silo.ErrorInvalidArgument, silo.ErrorInvalidCreateRequest, silo.ErrorInvalidMachineName, silo.ErrorImage, silo.ErrorImageNotFound, silo.ErrorMachinePreparationFailed, silo.ErrorMachineStartCleanupFailed, silo.ErrorEntrypointLaunchFailed, silo.ErrorRootDisk, silo.ErrorGuestSession, silo.ErrorNetworkRuntime, silo.ErrorMonitorConnection, silo.ErrorMachineLogSourceUnavailable, silo.ErrorCorruptState, silo.ErrorDatabase, silo.ErrorIO, silo.ErrorInvalidMachineConfig, silo.ErrorSecretResolution, silo.ErrorMissingNetworkSecrets:
 		return silo.ErrorKind(variant)
 	case silo.ErrorHomeUnavailable, silo.ErrorConfigDirUnavailable, silo.ErrorRelativeEnvironmentPath, silo.ErrorInvalidRunRoot, silo.ErrorInvalidOwnedPath, silo.ErrorInvalidMachineIDPrefix, silo.ErrorMachineNameGenerationFailed, silo.ErrorImageInUse, silo.ErrorImagePullPolicyUnsupported, silo.ErrorLocalDiskCanonicalize, silo.ErrorLocalDiskMetadata, silo.ErrorLocalDiskNotRegularFile, silo.ErrorLocalDiskUnreadable, silo.ErrorMachineIDAlreadyExists, silo.ErrorMonitorProtocol, silo.ErrorVMMonExecutableNotFound, silo.ErrorVMMonExecutableInvalid, silo.ErrorRuntimeComponentInvalid, silo.ErrorRuntimeComponentsNotFound, silo.ErrorBootAssetNotFound, silo.ErrorBootAssetInvalid, silo.ErrorUnsupportedHostArchitecture, silo.ErrorVMSpecSerializeFailed, silo.ErrorVMSpecLoadFailed, silo.ErrorAmbiguousIDPrefix, silo.ErrorStateDecode, silo.ErrorStateDatabaseConfigMismatch, silo.ErrorDatabaseMigration:

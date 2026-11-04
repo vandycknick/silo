@@ -124,8 +124,33 @@ func convertSnapshot(v *w.MachineSnapshot) (*Snapshot, error) {
 			return nil, invalidResponse()
 		}
 	}
+	if v.LiveEvidence == nil {
+		return nil, invalidResponse()
+	}
+	switch *v.LiveEvidence {
+	case w.LiveEvidenceState_LIVE_EVIDENCE_STATE_RUN:
+		if v.Live == nil || v.ProspectiveLive != nil {
+			return nil, invalidResponse()
+		}
+	case w.LiveEvidenceState_LIVE_EVIDENCE_STATE_PROSPECTIVE:
+		if v.Live != nil || v.ProspectiveLive == nil {
+			return nil, invalidResponse()
+		}
+	case w.LiveEvidenceState_LIVE_EVIDENCE_STATE_UNAVAILABLE:
+		if v.Live != nil || v.ProspectiveLive != nil {
+			return nil, invalidResponse()
+		}
+	default:
+		return nil, invalidResponse()
+	}
+	if v.Live != nil && (!validLiveMachine(v.Live) || !sameMachineID(v.Live.GetMachineId(), v.Id) || v.RunId == nil || v.Live.GetRunId() != *v.RunId) {
+		return nil, invalidResponse()
+	}
+	if v.ProspectiveLive != nil && !validLiveHost(v.ProspectiveLive) {
+		return nil, invalidResponse()
+	}
 	d := &silo.MachineData{ID: v.Id, Name: v.Name, RunID: v.RunId, MachineDir: string(v.MachineDir), ImageRef: v.ImageRef, TemplateName: v.TemplateName, Labels: v.Labels, Metadata: v.Metadata, LastError: v.LastError}
-	out := &Snapshot{MachineData: d, NetworkObservation: v.NetworkObservation}
+	out := &Snapshot{MachineData: d, NetworkObservation: v.NetworkObservation, Live: v.Live, ProspectiveLive: v.ProspectiveLive}
 	var e error
 	retention, e := enum(int32(v.Retention), "", "persistent", "ephemeral")
 	if e != nil {

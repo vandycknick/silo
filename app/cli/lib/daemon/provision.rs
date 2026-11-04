@@ -240,6 +240,18 @@ pub(crate) fn validate_installation(
     Ok(())
 }
 
+fn installation_data_disk(disks: &[vm_spec::Disk]) -> Option<&vm_spec::Disk> {
+    let mut attached = disks
+        .iter()
+        .filter(|disk| disk.role == vm_spec::DiskRole::Data);
+    let disk = attached.next()?;
+    if attached.next().is_some() {
+        None
+    } else {
+        Some(disk)
+    }
+}
+
 pub(crate) fn validate_machine(
     machine: &MachineData,
     record: &DaemonRecord,
@@ -259,15 +271,9 @@ pub(crate) fn validate_machine(
         .as_ref()
         .map(|storage| storage.disks.as_slice())
         .unwrap_or_default();
-    // The machine's own root disk is recorded as a relative path inside its data
-    // directory; every other attachment must be the installation data image.
-    let attached: Vec<_> = disks
-        .iter()
-        .filter(|disk| disk.path.is_absolute())
-        .collect();
-    let valid_attachment = match attached.as_slice() {
-        [disk] => attachment_matches_data_image(&disk.path, disk.read_only, data_image)?,
-        _ => false,
+    let valid_attachment = match installation_data_disk(disks) {
+        Some(disk) => attachment_matches_data_image(&disk.path, disk.read_only, data_image)?,
+        None => false,
     };
     if !valid_attachment {
         bail!(
@@ -302,6 +308,47 @@ mod tests {
         validate_installation, SystemHardware,
     };
     use crate::daemon::record::tests::fixture;
+
+    #[test]
+    fn installation_data_discovery_uses_role_not_position_or_absolute_path() {
+        let disk = |role, path: &str, id: &str| vm_spec::Disk {
+            path: path.into(),
+            role,
+            format: if role == vm_spec::DiskRole::RootLower {
+                vm_spec::DiskFormat::Vmdk
+            } else {
+                vm_spec::DiskFormat::Raw
+            },
+            geometry: vm_spec::DiskGeometry {
+                length: 64 * 1024 * 1024,
+                logical_sector_size: 512,
+            },
+            block_id: vm_spec::BlockId::new(id).expect("test serial"),
+            read_only: role == vm_spec::DiskRole::RootLower,
+        };
+        let mut disks = vec![
+            disk(
+                vm_spec::DiskRole::RootLower,
+                "/absolute/lower.vmdk",
+                "silo-root-lower",
+            ),
+            disk(
+                vm_spec::DiskRole::RootUpper,
+                "/absolute/upper.raw",
+                "silo-root-upper",
+            ),
+            disk(vm_spec::DiskRole::Data, "relative-data.raw", "silo-data-0"),
+        ];
+        assert_eq!(
+            crate::daemon::provision::installation_data_disk(&disks)
+                .expect("data role")
+                .path,
+            std::path::Path::new("relative-data.raw")
+        );
+        assert!(crate::daemon::provision::installation_data_disk(&disks[..2]).is_none());
+        disks.push(disk(vm_spec::DiskRole::Data, "/another.raw", "silo-data-1"));
+        assert!(crate::daemon::provision::installation_data_disk(&disks).is_none());
+    }
 
     #[test]
     fn persisted_data_share_and_endpoint_changes_fail_closed() {

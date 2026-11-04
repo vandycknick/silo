@@ -169,7 +169,7 @@ func run() error {
 	}
 	machines := w.NewMachineServiceClient(connection)
 	name, cpus, bytes, diskSize := "packaged-native-acceptance", uint32(1), *memory<<20, uint64(1<<30)
-	stream, err := machines.CreateMachine(ctx, &w.CreateMachineRequest{Configuration: &w.NormalizedMachineCreate{Name: &name, Cpus: &cpus, MemoryBytes: &bytes, RootDiskSizeBytes: &diskSize, Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}}, Source: &w.CreateMachineRequest_DiskPath{DiskPath: []byte(*disk)}})
+	stream, err := machines.CreateMachine(ctx, &w.CreateMachineRequest{Configuration: &w.NormalizedMachineCreate{Name: &name, Cpus: &cpus, MemoryBytes: &bytes, RootDiskSizeBytes: &diskSize, Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, RootProfile: w.RootProfile_ROOT_PROFILE_OPAQUE_RAW.Enum(), TemporaryDirectory: &w.TemporaryDirectoryPolicy{Backing: &w.TemporaryDirectoryPolicy_DiskBacked{DiskBacked: &emptypb.Empty{}}}}, Source: &w.CreateMachineRequest_DiskPath{DiskPath: []byte(*disk)}})
 	if err != nil {
 		return err
 	}

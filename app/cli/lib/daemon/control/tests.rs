@@ -681,11 +681,13 @@ async fn shutdown_only_real_transport_enforces_every_protocol_method() {
             let method = declaration.split('(').next().unwrap();
             if matches!(
                 (service, method),
-                ("DaemonService", "GetStatus" | "DrainMutations")
-                    | (
-                        "MachineService",
-                        "ListMachines" | "InspectInventory" | "InspectMachine" | "StopMachine"
-                    )
+                (
+                    "DaemonService",
+                    "GetStatus" | "GetLiveCapabilities" | "DrainMutations"
+                ) | (
+                    "MachineService",
+                    "ListMachines" | "InspectInventory" | "InspectMachine" | "StopMachine"
+                )
             ) {
                 continue;
             }
@@ -742,4 +744,278 @@ async fn shutdown_only_real_transport_enforces_every_protocol_method() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
+    use vm_spec::live::{LiveBackend, LiveLane, LiveOperation, LiveReasonCode};
+    use w::{
+        daemon_service_client::DaemonServiceClient, machine_service_client::MachineServiceClient,
+        runtime_service_client::RuntimeServiceClient,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut owner = state(root.path());
+    let config = libvm::RuntimeConfig::local(root.path().join("home"))
+        .with_supervisor_path(test_utils::mock_vmm_binary())
+        .with_virt_backend(libvm::VirtBackendOverride::Vz)
+        .with_run_root(root.path().join("run"));
+    Arc::get_mut(&mut owner).unwrap().config = config;
+    owner.begin_stopping().await.unwrap();
+    owner.seal_mutations().await;
+    let permits = owner.capacity.clone().acquire_many_owned(64).await.unwrap();
+    let status_before = std::fs::read(owner.host.home().join("daemon/status.json")).unwrap();
+    let control = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner.clone(), control.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let socket = control.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut daemon = DaemonServiceClient::new(channel.clone());
+    assert_eq!(
+        daemon.get_status(()).await.unwrap().into_inner().core,
+        w::CorePhase::Stopping as i32
+    );
+    let mut machines = MachineServiceClient::new(channel.clone());
+    let mut runtime = RuntimeServiceClient::new(channel);
+    let host = daemon.get_live_capabilities(()).await.unwrap().into_inner();
+    let host = silo_vm_control::live::host_from_wire(host).unwrap();
+    assert_eq!(host.backend, LiveBackend::Vz);
+    assert_eq!(host.scope, vm_spec::live::LiveScope::Host);
+    let request = || w::LiveMachineRequest {
+        machine: Some(w::MachineRef {
+            reference: Some(w::machine_ref::Reference::Name("not-created".into())),
+        }),
+    };
+    let results = [
+        (
+            LiveOperation::Pause,
+            machines.pause_machine(request()).await.unwrap_err(),
+        ),
+        (
+            LiveOperation::Capture,
+            machines
+                .capture_execution(w::LiveCaptureRequest {
+                    machine: request().machine,
+                    name: None,
+                })
+                .await
+                .unwrap_err(),
+        ),
+        (
+            LiveOperation::Fork,
+            machines
+                .fork_execution(w::LiveForkRequest {
+                    machine: request().machine,
+                    name: Some("child".into()),
+                })
+                .await
+                .unwrap_err(),
+        ),
+        (
+            LiveOperation::Restore,
+            runtime
+                .restore_execution(w::LiveRestoreRequest {
+                    checkpoint: b"/must/not/be/opened".to_vec(),
+                    name: Some("child".into()),
+                })
+                .await
+                .unwrap_err(),
+        ),
+    ];
+    for (expected, status) in results {
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        match silo_vm_control::errors::status_to_native_error(&status).unwrap() {
+            libvm::LibVmError::LiveOperationUnsupported {
+                operation,
+                backend,
+                lane,
+                reason,
+            } => {
+                assert_eq!(operation, expected);
+                assert_eq!(backend, LiveBackend::Vz);
+                assert_eq!(lane, LiveLane::NotApplicable);
+                assert_eq!(reason.code, LiveReasonCode::BackendExcluded);
+            }
+            error => panic!("not a typed live refusal: {error:?}"),
+        }
+    }
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    assert_eq!(owner.capacity.available_permits(), 0);
+    assert!(!root.path().join("run").exists());
+    assert!(!owner.host.home().join("state.db").exists());
+    assert_eq!(
+        std::fs::read(owner.host.home().join("daemon/status.json")).unwrap(),
+        status_before
+    );
+    drop(permits);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stopped_retention_mutations_obey_sealed_admission_without_runtime_initialization() {
+    use w::runtime_service_server::RuntimeService;
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    owner.begin_stopping().await.unwrap();
+    owner.seal_mutations().await;
+    let service = Service(owner.clone());
+    let reference =
+        silo_vm_control::stopped::reference_to_wire(&"image:checkpoint".parse().unwrap());
+    assert_eq!(
+        service
+            .release_snapshot_retention(Request::new(reference))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable,
+    );
+    assert_eq!(
+        service
+            .remove_image_alias(Request::new(w::Name {
+                name: "checkpoint".into()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable,
+    );
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    assert_eq!(owner.capacity.available_permits(), 64);
+    assert!(!owner.host.home().join("state.db").exists());
+}
+
+#[tokio::test]
+async fn malformed_stopped_contracts_fail_before_native_initialization() {
+    use w::{machine_service_server::MachineService, runtime_service_server::RuntimeService};
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let service = Service(owner.clone());
+    let machine = Some(w::MachineRef {
+        reference: Some(w::machine_ref::Reference::Name("source".into())),
+    });
+    assert_eq!(
+        service
+            .fork_stopped(Request::new(w::StoppedForkRequest {
+                machine: machine.clone(),
+                name: Some("child".into()),
+                external_resources: None,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert_eq!(
+        service
+            .snapshot_stopped(Request::new(w::CreateStorageSnapshotRequest {
+                machine: machine.clone(),
+                name: None,
+                external_resources: Some(w::ExternalResourcePolicy::default()),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert_eq!(
+        service
+            .restore_snapshot(Request::new(w::RestoreStorageSnapshotRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert_eq!(
+        service
+            .remove_image_alias(Request::new(w::Name {
+                name: "sha256:invalid".into()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    let reject = || {
+        Some(silo_vm_control::stopped::policy_to_wire(
+            &libvm::ExternalResourcePolicy::Reject,
+        ))
+    };
+    for name in ["INVALID", "trailing-", "contains space"] {
+        assert_eq!(
+            service
+                .fork_stopped(Request::new(w::StoppedForkRequest {
+                    machine: machine.clone(),
+                    name: Some(name.into()),
+                    external_resources: reject(),
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+        );
+        assert_eq!(
+            service
+                .restore_snapshot(Request::new(w::RestoreStorageSnapshotRequest {
+                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(
+                        &"image:checkpoint".parse().unwrap()
+                    )),
+                    name: Some(name.into()),
+                    external_resources: reject(),
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument,
+        );
+    }
+    assert_eq!(
+        service
+            .snapshot_stopped(Request::new(w::CreateStorageSnapshotRequest {
+                machine: machine.clone(),
+                name: Some("invalid alias".into()),
+                external_resources: reject(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    let mappings = libvm::ExternalResourcePolicy::Map {
+        mappings: vec![libvm::ExternalResourceMapping {
+            resource: libvm::ExternalResourceKey::Disk { order: 1 },
+            path: "/must/not/open.raw".into(),
+        }],
+    };
+    assert_eq!(
+        service
+            .snapshot_stopped(Request::new(w::CreateStorageSnapshotRequest {
+                machine,
+                name: None,
+                external_resources: Some(silo_vm_control::stopped::policy_to_wire(&mappings)),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    assert!(!owner.host.home().join("state.db").exists());
 }

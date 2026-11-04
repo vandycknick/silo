@@ -24,6 +24,22 @@ pub(crate) fn execution_exit_code(error: &Report) -> Option<i32> {
 }
 
 pub fn print(error: &Report, verbose: u8) {
+    if let Some(libvm::LibVmError::LiveOperationUnsupported {
+        operation,
+        backend,
+        lane,
+        reason,
+    }) = error.downcast_ref::<libvm::LibVmError>()
+    {
+        let refusal = vm_spec::live::LiveOperationUnsupported {
+            operation: *operation,
+            backend: *backend,
+            lane: *lane,
+            reason: reason.clone(),
+        };
+        eprintln!("{} {}", crate::ui::error_label(), live_refusal(&refusal));
+        return;
+    }
     // The exit-code wrapper is always outermost; eyre reports its context
     // wrapper in the chain, so `is::<ExecutionExit>` on the cause never matches.
     let causes = error
@@ -49,6 +65,15 @@ pub fn print(error: &Report, verbose: u8) {
     }
 }
 
+fn live_refusal(value: &vm_spec::live::LiveOperationUnsupported) -> String {
+    let alternative = if value.backend == vm_spec::live::LiveBackend::Vz {
+        "use silo stop, then an ordinary stopped-storage snapshot (not an execution checkpoint)"
+    } else {
+        "use ordinary boot or a stopped-storage workflow; no live fallback is performed"
+    };
+    format!("{value}; {alternative}")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::errors::{execution_exit_code, ExecutionExit};
@@ -58,5 +83,23 @@ mod tests {
         let error = eyre::eyre!("guest stream failed").wrap_err(ExecutionExit::new(125));
 
         assert_eq!(execution_exit_code(&error), Some(125));
+    }
+
+    #[test]
+    fn vz_refusal_is_one_line_and_names_only_existing_command() {
+        let value = vm_spec::live::LiveOperationUnsupported {
+            operation: vm_spec::live::LiveOperation::Pause,
+            backend: vm_spec::live::LiveBackend::Vz,
+            lane: vm_spec::live::LiveLane::NotApplicable,
+            reason: vm_spec::live::LiveUnsupportedReason::new(
+                vm_spec::live::LiveReasonCode::BackendExcluded,
+            ),
+        };
+        let line = crate::errors::live_refusal(&value);
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains("backend-excluded (backend=vz, lane=not-applicable)"));
+        assert!(line.contains("silo stop"));
+        assert!(line.contains("stopped-storage snapshot"));
+        assert!(!line.contains("silo snapshot"));
     }
 }

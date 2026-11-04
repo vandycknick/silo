@@ -19,6 +19,8 @@ type Snapshot struct {
 	*silo.MachineData
 	PolicyJSON         string
 	NetworkObservation *w.NetworkObservation
+	Live               *w.LiveMachineReport
+	ProspectiveLive    *w.LiveHostReport
 }
 type InventoryEntry struct {
 	ID, Name string
@@ -36,6 +38,7 @@ type StartResult struct {
 type ReadinessResult struct {
 	Outcome w.ReadinessOutcome
 	Data    *Snapshot
+	Status  *w.MonitorStatus
 }
 
 func reference(ref string) *w.MachineRef {
@@ -161,11 +164,7 @@ func (c *Client) WaitReady(ctx context.Context, id, run string, timeout time.Dur
 	if e != nil {
 		return ReadinessResult{}, rpcError(ctx, e)
 	}
-	if v == nil || v.Outcome < 1 || v.Outcome > 3 {
-		return ReadinessResult{}, invalidResponse()
-	}
-	d, e := convertSnapshot(v.Data)
-	return ReadinessResult{Outcome: v.Outcome, Data: d}, e
+	return convertReadiness(v, id, run)
 }
 func (c *Client) SetSecret(ctx context.Context, id, name string, value []byte) error {
 	_, e := c.Machines.SetMachineSecret(ctx, &w.SetMachineSecretRequest{Id: id, Name: name, Value: value})

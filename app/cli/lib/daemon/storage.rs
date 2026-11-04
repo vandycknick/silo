@@ -64,6 +64,7 @@ fn create_data_image(
         Some(0),
         Some(0),
         None,
+        None,
     )?;
     formatter.create(
         "/containerd",
@@ -73,6 +74,7 @@ fn create_data_image(
         None,
         Some(0),
         Some(0),
+        None,
         None,
     )?;
     let layout = DataLayout {
@@ -86,9 +88,10 @@ fn create_data_image(
         make_mode(file_mode::S_IFREG, 0o600),
         None,
         None,
-        Some(&mut bytes.as_slice()),
+        Some(disk_image::ext4::FileData::Dense(&mut bytes.as_slice())),
         Some(0),
         Some(0),
+        None,
         None,
     )?;
     formatter

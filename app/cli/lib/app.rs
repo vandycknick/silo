@@ -31,7 +31,7 @@ impl Cli {
     }
 
     pub async fn run(self) -> eyre::Result<()> {
-        let mut context = Context::new(self.verbose);
+        let mut context = Context::new(self.verbose, self.command.transport_admission());
         self.command.run(&mut context).await
     }
 }
@@ -48,7 +48,7 @@ mod tests {
 
     use crate::commands::Command;
 
-    use super::Cli;
+    use crate::app::Cli;
 
     #[test]
     fn parses_list_alias() {
@@ -58,10 +58,67 @@ mod tests {
     }
 
     #[test]
-    fn parses_status_alias() {
-        let cli = Cli::try_parse_from(["silo", "status"]).expect("status alias should parse");
+    fn live_commands_have_explicit_artifact_kinds() {
+        let cli = Cli::try_parse_from(["silo", "info", "vm"]).expect("info parses");
+        assert!(matches!(cli.command, Command::Info(_)));
+        assert!(Cli::try_parse_from(["silo", "system", "info"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "show", "vm"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "status", "vm"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "daemon", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "pause", "vm"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "create", "vm", "--live"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "create", "vm"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "vm", "--live"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "fork", "vm", "--name", "child"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "fork", "vm", "--name", "child", "--live"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["silo", "restore", "image:checkpoint", "--name", "child"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["silo", "snapshot", "inspect", "image:checkpoint"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "snapshot", "remove", "image:checkpoint"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "image", "remove", "image:checkpoint"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint", "--execution"]).is_ok());
+        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint"]).is_err());
+    }
 
-        assert!(matches!(cli.command, Command::Show(_)));
+    #[test]
+    fn live_refusal_transport_admits_owned_stopping_daemon_without_relaxing_other_commands() {
+        use silo_vm_control::transport::Admission;
+        for args in [
+            vec!["silo", "pause", "vm"],
+            vec!["silo", "snapshot", "create", "vm", "--live"],
+            vec!["silo", "fork", "vm", "--name", "child", "--live"],
+            vec!["silo", "restore", "checkpoint", "--execution"],
+            vec!["silo", "system", "info"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args)
+                    .unwrap()
+                    .command
+                    .transport_admission(),
+                Admission::Owned
+            );
+        }
+        for args in [
+            vec!["silo", "info", "vm"],
+            vec!["silo", "list"],
+            vec!["silo", "start", "vm"],
+            vec!["silo", "stop", "vm"],
+            vec!["silo", "fork", "vm", "--name", "child"],
+            vec!["silo", "snapshot", "create", "vm"],
+            vec!["silo", "snapshot", "remove", "image:checkpoint"],
+            vec!["silo", "image", "remove", "image:checkpoint"],
+            vec!["silo", "restore", "image:checkpoint", "--name", "child"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args)
+                    .unwrap()
+                    .command
+                    .transport_admission(),
+                Admission::Ready
+            );
+        }
     }
 
     #[test]
@@ -95,5 +152,191 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
 
         assert!(!help.contains("cleanup"));
+    }
+
+    #[test]
+    fn stopped_external_resource_flags_are_explicit_and_mode_specific() {
+        for args in [
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--external-requirements",
+            ],
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--map-disk",
+                "1=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "snapshot",
+                "create",
+                "vm",
+                "--external-requirements",
+            ],
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--map-share",
+                "work=/tmp/work",
+            ],
+            vec![
+                "silo",
+                "restore",
+                "image:checkpoint",
+                "--name",
+                "child",
+                "--map-disk",
+                "1=/tmp/data.raw",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
+        }
+        for args in [
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--live",
+                "--external-requirements",
+            ],
+            vec![
+                "silo",
+                "snapshot",
+                "create",
+                "vm",
+                "--live",
+                "--map-share",
+                "work=/tmp/work",
+            ],
+            vec![
+                "silo",
+                "snapshot",
+                "create",
+                "vm",
+                "--map-share",
+                "work=/tmp/work",
+            ],
+            vec![
+                "silo",
+                "snapshot",
+                "create",
+                "vm",
+                "--map-disk",
+                "1=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "snapshot",
+                "create",
+                "vm",
+                "--live",
+                "--external-requirements",
+            ],
+            vec![
+                "silo",
+                "restore",
+                "checkpoint",
+                "--execution",
+                "--map-disk",
+                "1=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--map-disk",
+                "-1=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--map-disk",
+                "1=relative.raw",
+            ],
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--map-disk",
+                "0=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--map-disk",
+                "16=/tmp/data.raw",
+            ],
+            vec![
+                "silo",
+                "fork",
+                "vm",
+                "--name",
+                "child",
+                "--external-requirements",
+                "--map-disk",
+                "1=/tmp/data.raw",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn stopped_help_distinguishes_retention_from_alias_removal_and_exact_bytes() {
+        let mut command = Cli::command();
+        let snapshot = command.find_subcommand_mut("snapshot").unwrap();
+        let help = snapshot.render_long_help().to_string();
+        assert!(help.contains("credentials"));
+        assert!(help.contains("dirty journals"));
+        assert!(help.contains("opaque raw"));
+        let remove = snapshot
+            .find_subcommand_mut("remove")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(remove.contains("Release explicit snapshot retention"));
+        assert!(remove.contains("Aliases"));
+        let image_remove = command
+            .find_subcommand_mut("image")
+            .unwrap()
+            .find_subcommand_mut("remove")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(image_remove.contains("only an image: alias"));
+        assert!(image_remove.contains("never release"));
+        for name in ["fork", "restore"] {
+            let help = command
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(help.contains("catalog-owned secret-scope recovery"));
+            assert!(help.contains("with_secret_store"));
+            assert!(help.contains("secret-provider path remains supported"));
+        }
     }
 }
