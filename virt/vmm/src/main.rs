@@ -4,8 +4,16 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+#[cfg(test)]
+#[path = "../build_inputs.rs"]
+mod build_inputs;
+mod capabilities;
 mod clock_sync;
 mod context;
+#[cfg(test)]
+#[path = "../dependency_source.rs"]
+mod dependency_source;
+mod durable_file;
 mod exec_log;
 mod execution;
 mod exit_command;
@@ -92,21 +100,26 @@ fn main() -> eyre::Result<()> {
     if krun::worker::invoked_as_worker() {
         return krun::worker::main();
     }
+    if let Some(result) = capabilities::dispatch() {
+        return result;
+    }
     let args = Args::parse();
     let inherited_fds = InheritedPipeFds::from_env()?;
 
-    let inherited_fds = if args.foreground {
+    let mut inherited_fds = if args.foreground {
         inherited_fds
     } else {
         inherited_fds.require_for_daemon()?
     };
 
     if !args.foreground {
-        daemonize(&args, inherited_fds)?;
+        daemonize(&args, &inherited_fds)?;
     }
 
+    let storage_lease = inherited_fds.take_storage_lease()?;
     let start_request = StartRequestPipe::from_fd(inherited_fds.startpipe)
-        .map_err(|err| eyre::eyre!("open start request pipe: {err}"))?;
+        .map_err(|err| eyre::eyre!("open start request pipe: {err}"))?
+        .with_storage_lease(storage_lease.clone());
     let sync_reporter = SyncReporter::from_fd(inherited_fds.syncpipe)
         .map_err(|err| eyre::eyre!("open syncpipe reporter: {err}"))?;
     let machine_log_dir = inherited_fds.machine_log_dir;
@@ -155,7 +168,7 @@ fn main() -> eyre::Result<()> {
     let mut serial_file = secure_file::open_append(&args.serial_log)?;
     write_serial_generation_boundary(&mut serial_file, &args.id, &args.run_id)?;
 
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| eyre::eyre!("build tokio runtime: {err}"))?
@@ -166,7 +179,10 @@ fn main() -> eyre::Result<()> {
             serial_file,
             machine_log_dir,
             exit_runner,
-        ))
+        ));
+    // The entry owner outlives backend finalization and durable exit publication.
+    drop(storage_lease);
+    result
 }
 
 fn write_serial_generation_boundary(
@@ -375,7 +391,7 @@ fn install_signal_handlers(
 }
 
 #[cfg(target_os = "macos")]
-fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
+fn daemonize(args: &Args, inherited_fds: &InheritedPipeFds) -> eyre::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -417,7 +433,7 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
     for arg in &args.exit_command_args {
         cmd.arg("--exit-command-arg").arg(arg);
     }
-    inherited_fds.clear_cloexec()?;
+    inherited_fds.configure_reexec(&mut cmd)?;
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setsid()
@@ -434,7 +450,7 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn daemonize(_args: &Args, _inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
+fn daemonize(_args: &Args, _inherited_fds: &InheritedPipeFds) -> eyre::Result<()> {
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Parent { .. }) => std::process::exit(0),
         Ok(nix::unistd::ForkResult::Child) => {}

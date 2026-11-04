@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::krun::error::{KrunBackendError, Result};
 use crate::krun::rosetta::{RosettaLaunchConfig, ROSETTA_MOUNT_TAG};
+use protocol::shutdown::WorkerStorageContext;
+use vm_spec::Disk;
 
 pub const DEFAULT_ID: &str = "anonymous-instance";
 const STANDALONE_VSOCK_CID: u64 = 3;
@@ -20,19 +22,12 @@ pub struct KrunConfig {
     pub disks: Vec<Disk>,
     pub mounts: Vec<Mount>,
     pub vsock_mux: bool,
+    pub storage_context: WorkerStorageContext,
     pub vsock_cid: Option<u64>,
     pub network: Network,
     pub stdio_console: bool,
     pub balloon: bool,
     pub rosetta: Option<RosettaLaunchConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Disk {
-    pub block_id: String,
-    pub path: PathBuf,
-    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -85,6 +80,7 @@ impl Default for KrunConfig {
             disks: Vec::new(),
             mounts: Vec::new(),
             vsock_mux: false,
+            storage_context: WorkerStorageContext::default(),
             vsock_cid: None,
             network: Network::None,
             stdio_console: false,
@@ -94,7 +90,31 @@ impl Default for KrunConfig {
     }
 }
 
+pub(crate) fn validate_worker_storage(config: &KrunConfig) -> std::result::Result<(), String> {
+    config.storage_context.validate()?;
+    let mut bindings = config.storage_context.raw_handles.iter();
+    for (index, disk) in config.disks.iter().enumerate() {
+        if disk.format != vm_spec::DiskFormat::Raw {
+            continue;
+        }
+        let binding = bindings
+            .next()
+            .ok_or("Raw backing is missing from worker descriptor coverage")?;
+        if binding.disk_index as usize != index
+            || binding.length_bytes != disk.geometry.length
+            || binding.read_only != disk.read_only
+        {
+            return Err("Raw backing binding differs from the current disk contract".to_string());
+        }
+    }
+    if bindings.next().is_some() {
+        return Err("worker descriptor coverage includes a non-Raw or absent disk".to_string());
+    }
+    Ok(())
+}
+
 pub fn validate_config(config: &KrunConfig) -> Result<()> {
+    vm_spec::Storage::validate_disks(&config.disks).map_err(KrunBackendError::InvalidConfig)?;
     if config.cpus == 0 {
         return Err(KrunBackendError::InvalidConfig(
             "krun requires at least one vCPU".to_string(),

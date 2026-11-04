@@ -9,6 +9,7 @@ use crate::services::ServiceHandles;
 
 // Allow the backend's graceful stop budget before requesting escalation.
 const VM_STOP_TIMEOUT: Duration = Duration::from_secs(65);
+const GUEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(55);
 const SERVICE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SIGINT and SIGTERM listeners for one consumer.
@@ -76,9 +77,6 @@ pub async fn run(
     };
 
     handles.mark_stopping().await;
-    ctx.shutdown.cancel();
-    stop_forwards(&mut handles).await;
-    stop_vsock_surface(&mut handles).await;
     match trigger {
         ShutdownTrigger::Requested(message) => {
             if let Err(error) = ctx.store.set_vm_state(VmState::Stopping, message) {
@@ -99,6 +97,12 @@ pub async fn run(
             }
         }
     }
+
+    // The internal connection and guest status observers must survive the
+    // handshake and writer drains. Public teardown may now close transport.
+    ctx.shutdown.cancel();
+    stop_forwards(&mut handles).await;
+    stop_vsock_surface(&mut handles).await;
 
     handles.mark_not_serving().await;
     handles.server_shutdown.cancel();
@@ -152,6 +156,40 @@ async fn stop_forwards(handles: &mut ServiceHandles) {
 }
 
 async fn graceful_stop(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> eyre::Result<()> {
+    let protocol = tokio::select! {
+        result = crate::guest::shutdown::orderly_shutdown(ctx) => result,
+        result = signals.recv() => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "shutdown signal listener failed");
+            }
+            tracing::warn!("second shutdown signal received during guest drain; forcing stop");
+            ctx.machine.force_stop().await?;
+            return Ok(());
+        }
+        () = tokio::time::sleep(GUEST_SHUTDOWN_TIMEOUT) => {
+            Err(eyre::eyre!("guest orderly shutdown deadline elapsed"))
+        }
+    };
+    if protocol.is_ok() {
+        // orderly_shutdown retains the RPC through machine.wait(): success is
+        // already terminal. The select above bounds receipt AND poweroff, not
+        // just queuing ALLOW_POWEROFF.
+        return Ok(());
+    }
+    // A failed/missing exchange is never a certificate. The backend still owns
+    // escalation and reaping; cancellation must not abandon that owner.
+    if let Err(error) = &protocol {
+        tracing::warn!(%error, "guest orderly shutdown not completed; stopping backend");
+    }
+    let stopped = stop_backend(ctx, signals).await;
+    match (protocol, stopped) {
+        (Err(protocol), Err(stop)) => Err(eyre::eyre!("{protocol}; backend stop failed: {stop}")),
+        (Err(protocol), Ok(())) => Err(protocol),
+        (Ok(()), result) => result,
+    }
+}
+
+async fn stop_backend(ctx: &DaemonContext, signals: &mut ShutdownSignals) -> eyre::Result<()> {
     let mut stop_task = tokio::spawn({
         let machine = ctx.machine.clone();
         async move { machine.stop().await }

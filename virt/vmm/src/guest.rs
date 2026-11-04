@@ -1,3 +1,6 @@
+#[path = "guest/shutdown.rs"]
+pub(crate) mod shutdown;
+#[path = "guest/ssh.rs"]
 mod ssh;
 
 use std::sync::Arc;

@@ -72,18 +72,29 @@ another role's number), and `dup2`s them onto a fixed table:
 | 5 | watchdog: POLLHUP means the monitor is gone | FIFO, read-only |
 | 6 | console | TTY (PTY slave), read-write |
 | 7 | vsock mux, present iff `config.vsock_mux` | connected `SOCK_STREAM` |
+| 8 | generation lease | euid-owned regular file, mode 0600, nlink 1, read-write, exact device/inode binding |
+| 9..24 | retained Raw backing handles, in manifest order | at most 16, exact config binding and access |
 
-The worker validates every role, direction and type, rejects descriptors that
-alias the same resource (on macOS also the two ends of one pipe, through
-`proc_pidfdinfo`), and fails closed if anything above the table is open. Only
-then does it adopt the descriptors and restore close-on-exec on them. No
-configuration travels through argv or the environment.
+The worker validates the entire set before taking ownership, restores CLOEXEC,
+and rejects unexpected descriptors, including fd 7 when the mux is absent.
+Protocol/lease roles must not alias a resource (on macOS, neither end of one
+pipe may fill another role, checked through `proc_pidfdinfo`). Raw disks may
+share a backing inode when the existing disk contract permits it; each still
+has a distinct descriptor and manifest binding. No configuration travels
+through argv or the environment. FD 8 is required even while config is withheld,
+and the worker retains its storage descriptors through actual process exit.
+
+The manager likewise changes only its child's inheritance flags. The
+qualified executable FD stays open but CLOEXEC during pre-exec cleanup so
+Linux can resolve its retained ELF; it does not survive into the monitor.
+Native Linux worker re-exec uses `/proc/self/exe`, never the restaged pathname.
 
 `KrunConfig` is the single wire type. The monitor validates and serializes it
 and closes fd 3, which marks the end of the config. The worker reads to EOF
-under a 16 MiB cap, decodes with `deny_unknown_fields`, and never echoes decode
-errors (they could contain private values). The engine validates the config
-once at entry. Rosetta launch data is a typed field with a redacted `Debug`.
+under a 16 MiB cap, decodes with `deny_unknown_fields`, and validates before host
+admission or native logging. Decode and validation errors do not echo private
+request values. The engine independently validates at entry. Rosetta launch
+data is a typed field with a redacted `Debug`.
 
 | Resource | Bound |
 | --- | --- |
@@ -102,6 +113,33 @@ Worker events are `startup_stage`, `backend_started`, `startup_failed` and
 `host_memory_reclaim`. Stages advance `spawned -> admission -> build ->
 started`; a config failure reports `spawned`. `backend_started` acknowledges
 construction, not guest readiness.
+
+## Typed Storage Attachments
+
+The current VM spec is `0.2.0`. The monitor, backend-neutral configuration and
+private `KrunConfig` all carry `vm_spec::Disk` directly: required path, role,
+format, exact virtual geometry, validated block ID and read-only access.
+There is no private ordered-only disk decoder or defaulted attachment metadata.
+Both monitor backend validation and the worker use
+`vm_spec::Storage::validate_disks` for the same root-pair, ordering, uniqueness
+and geometry rules. User data attachments follow the explicitly typed roots.
+
+For the opt-in development flat-overlay profile, libvm supplies a generated
+VMDK `RootLower` with serial `silo-root-lower` and read-only access, followed by
+a raw writable `RootUpper` with serial `silo-root-upper`. Its VMDK geometry is
+the virtual lower length, not the descriptor's host file size. The engine maps
+only the closed `Raw` and `Vmdk` types to libkrun and passes the supplied serial
+unchanged. It never infers a format from a filename or a role from an index.
+VZ rejects VMDK and either managed overlay role before framework attachment
+construction. Opaque raw roots retain their existing explicit boot contract.
+
+Guest flush behavior remains libkrun `SyncMode::Relaxed`, not `None`. Native
+libkrun diagnostics still flow through the worker's stdout/stderr pipe into the
+bounded monitor diagnostic tail, including actual host I/O errors. The pinned
+native request-error log preserves the host errno but does not identify the
+attachment role; a bounded host-exhaustion qualification must establish which
+backing was exhausted rather than relabeling a guest `EIO` as host `ENOSPC`.
+The worker diagnostic tail is not a lossless audit channel.
 
 ## Ownership and Stopping
 
@@ -134,6 +172,10 @@ had a process, and the diagnostic tail.
   Linux's normal stop. Force intent alone never rewrites another signal.
 - An earlier startup error stays the primary error.
 
+The lifecycle outcome named `clean` is not a storage shutdown certificate.
+Neither a zero worker exit, device drop nor observed process reap proves the
+future `storageShutdown`, `hostFlushCompleted` or `attachmentsClosed` facts.
+
 `finalize.rs` is the only code that ends a generation. It stops a failed live
 machine, reads the cached exit, writes `vm.exit.json` (with the `backend`
 block described in ADR 0018), reports failure on the syncpipe, removes the
@@ -145,10 +187,12 @@ When `--exit-command` is given, `main()` forks an idle runner immediately after
 daemonizing and taking the machine lock. At that point the process is still
 single-threaded: the tracing appender, which starts the first thread, is set up
 afterwards. The runner points stdio at `/dev/null`, closes every other
-descriptor (so it never holds `vm.lock`, whose flock state belongs to the open
-file description, nor the log directory or supervisor pipes) and blocks on a
-pipe. Finalization writes one byte; if the monitor dies first, EOF releases the
-runner. It then execs the command with `SILO_MACHINE_ID` and
+descriptor (including machine/storage locks, retained backing handles, log
+directories and supervisor pipes), and blocks on a pipe only if sanitation
+succeeds. Cleanup failure immediately exits the runner instead of retaining
+storage ownership while waiting. Finalization writes one byte; if the monitor
+dies first, EOF releases the runner. It removes `_VM_STORAGE_LEASES` from the
+environment before execing the command with `SILO_MACHINE_ID` and
 `SILO_MACHINE_RUN_ID`. The monitor exits without reaping it; it is reparented.
 
 ## Confinement
@@ -188,8 +232,8 @@ both end the generation cleanly.
 | `virt/vmm/src/krun/` | `KrunConfig`, engine, host checks, Rosetta data. |
 | `virt/vmm/src/krun/worker/` | Worker entry, descriptor adoption (`fds.rs`), wire format (`wire.rs`), HVF admission. |
 
-See [process and native test instructions](../../virt/vmm/tests/README.md),
-[packaging](../../PACKAGING.md) and [native dependencies](../libkrun-deps.md).
+See [process and native test instructions](../../virt/vmm/tests/README.md)
+and [packaging](../../PACKAGING.md).
 
 ## Qualification
 

@@ -4,9 +4,10 @@
 mod inherit;
 
 use crate::krun::worker::wire;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct Worker {
     child: Child,
     _keepalive: OwnedFd,
+    _storage_lease: File,
     serial: Option<(File, File)>,
     events: Option<std::thread::JoinHandle<()>>,
 }
@@ -25,8 +27,64 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 impl Worker {
-    pub(crate) fn start(supervisor: &Path, config: crate::krun::KrunConfig) -> io::Result<Self> {
+    pub(crate) fn start(
+        supervisor: &Path,
+        storage_directory: &Path,
+        mut config: crate::krun::KrunConfig,
+    ) -> io::Result<Self> {
+        if !config.disks.is_empty() {
+            return Err(io::Error::other(
+                "Rosetta responder qualification does not admit block attachments",
+            ));
+        }
+        let directory = std::fs::symlink_metadata(storage_directory)?;
+        if !directory.is_dir()
+            || directory.mode() & 0o7777 != 0o700
+            || directory.uid() != nix::unistd::geteuid().as_raw()
+        {
+            return Err(io::Error::other(
+                "responder storage directory must be an owned 0700 directory",
+            ));
+        }
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let run_directory = storage_directory.join(&operation_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&run_directory)?;
+        File::open(storage_directory)?.sync_all()?;
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(nix::fcntl::OFlag::O_CLOEXEC.bits())
+            .open(run_directory.join(format!("{operation_id}.lease")))?;
+        lease.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // Close-only ownership is required: Flock<T>::drop would unlock the
+        // same OFD while the worker still owns its inherited descriptor.
+        #[allow(deprecated)]
+        nix::fcntl::flock(lease.as_raw_fd(), nix::fcntl::FlockArg::LockSharedNonblock)?;
+        lease.sync_all()?;
+        File::open(&run_directory)?.sync_all()?;
+        let metadata = lease.metadata()?;
+        let context = protocol::shutdown::WorkerStorageContext {
+            version: 1,
+            machine_id: uuid::Uuid::new_v4().to_string(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            storage_lease: protocol::shutdown::StorageLeaseBinding {
+                operation_id,
+                file_device: metadata.dev(),
+                file_inode: metadata.ino(),
+            },
+            raw_handles: Vec::new(),
+        };
+        config.storage_context = context.clone();
         let bytes = wire::encode_config(&config)?;
+        crate::krun::storage_holder::publish(
+            &run_directory.join("vm.storage-holder.json"),
+            &context,
+            None,
+        )?;
         let (config, send) = pipe()?;
         let (receive, events) = pipe()?;
         let (watchdog, keepalive) = pipe()?;
@@ -43,16 +101,31 @@ impl Worker {
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        inherit::install(&mut command, &[&config, &events, &watchdog, &console]);
+        inherit::install(
+            &mut command,
+            &[
+                (config.as_raw_fd(), 3),
+                (events.as_raw_fd(), 4),
+                (watchdog.as_raw_fd(), 5),
+                (console.as_raw_fd(), 6),
+                (lease.as_raw_fd(), 8),
+            ],
+        )?;
         let mut worker = Self {
             child: command.spawn()?,
             _keepalive: keepalive,
+            _storage_lease: lease,
             serial: Some(serial),
             events: None,
         };
         drop(command);
         drop(config);
         drop(events);
+        crate::krun::storage_holder::publish(
+            &run_directory.join("vm.storage-holder.json"),
+            &context,
+            Some(worker.child.id()),
+        )?;
         worker.events = Some(
             std::thread::Builder::new()
                 .name("rprobe-worker-events".to_string())

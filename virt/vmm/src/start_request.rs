@@ -14,6 +14,8 @@ pub(crate) struct VmmStartRequest {
     version: u32,
     machine_id: String,
     machine_run_id: String,
+    pub(crate) storage_lease: protocol::shutdown::StorageLeaseBinding,
+    pub(crate) storage_shutdown: protocol::shutdown::StorageShutdownContext,
     pub(crate) startup_command: Option<StartupCommand>,
     // Optional additive field within version 1: absent means the
     // platform-default backend. NEVER feature-gate this field — both sides of
@@ -37,6 +39,10 @@ pub(crate) struct VirtBackendRequest {
     /// Absolute path to a mock scenario file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+    /// Exact frozen scenario bytes, supplied by backend selection.
+    pub(crate) scenario_json: Option<String>,
+    /// Lowercase SHA-256 of scenario_json's UTF-8 bytes.
+    pub(crate) scenario_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -71,6 +77,7 @@ pub(crate) struct StartupEnvironmentVariable {
 
 pub(crate) struct StartRequestPipe {
     file: Option<File>,
+    storage_lease: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
 impl StartRequestPipe {
@@ -79,10 +86,30 @@ impl StartRequestPipe {
             Some(fd) => {
                 crate::startup::set_cloexec(fd, true)?;
                 let file = unsafe { File::from_raw_fd(fd) };
-                Ok(Self { file: Some(file) })
+                Ok(Self {
+                    file: Some(file),
+                    storage_lease: None,
+                })
             }
-            None => Ok(Self { file: None }),
+            None => Ok(Self {
+                file: None,
+                storage_lease: None,
+            }),
         }
+    }
+
+    pub(crate) fn with_storage_lease(
+        mut self,
+        lease: std::sync::Arc<std::os::fd::OwnedFd>,
+    ) -> Self {
+        self.storage_lease = Some(lease);
+        self
+    }
+
+    pub(crate) fn storage_lease(&self) -> io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
+        self.storage_lease
+            .clone()
+            .ok_or_else(|| invalid_data("missing inherited generation lease"))
     }
 
     pub(crate) async fn read(
@@ -91,24 +118,9 @@ impl StartRequestPipe {
         expected_machine_run_id: &str,
     ) -> io::Result<VmmStartRequest> {
         let Some(file) = self.file.take() else {
-            tracing::info!(
-                event = "start_request_idle",
-                "no inherited start request pipe; using foreground idle mode"
-            );
-            return validate_start_request(
-                VmmStartRequest {
-                    version: VMM_START_REQUEST_VERSION,
-                    machine_id: expected_machine_id.to_string(),
-                    machine_run_id: expected_machine_run_id.to_string(),
-                    startup_command: None,
-                    virt_backend: None,
-                    rosetta_intent: None,
-                    asset_directory: None,
-                    startup_budget_ms: None,
-                },
-                expected_machine_id,
-                expected_machine_run_id,
-            );
+            return Err(invalid_data(
+                "managed launch requires an inherited start request pipe",
+            ));
         };
         tracing::info!(
             event = "start_request_wait",
@@ -122,6 +134,16 @@ impl StartRequestPipe {
             .read_to_end(&mut encoded)
             .await?;
         let request = decode_start_request(&encoded, expected_machine_id, expected_machine_run_id)?;
+        let lease = self.storage_lease()?;
+        use std::os::fd::AsFd;
+        let stat = nix::sys::stat::fstat(lease.as_fd())?;
+        if stat.st_dev as u64 != request.storage_lease.file_device
+            || stat.st_ino as u64 != request.storage_lease.file_inode
+        {
+            return Err(invalid_data(
+                "storageLease does not match inherited generation lease",
+            ));
+        }
         tracing::info!(
             event = "start_request_accepted",
             startup_command = request.startup_command.is_some(),
@@ -190,6 +212,15 @@ fn validate_start_request(
             "silo-vmm start request machineRunId does not match --run-id",
         ));
     }
+    request.storage_lease.validate().map_err(invalid_data)?;
+    request.storage_shutdown.validate().map_err(invalid_data)?;
+    if request.storage_shutdown.machine_id != request.machine_id
+        || request.storage_shutdown.run_id != request.machine_run_id
+    {
+        return Err(invalid_data(
+            "storageShutdown identity does not match start request",
+        ));
+    }
     if let Some(command) = &request.startup_command {
         parse_uuid("startupCommand.executionId", &command.execution_id)?;
         validate_process(&command.process)?;
@@ -225,10 +256,27 @@ impl VmmStartRequest {
     }
 }
 
-fn validate_backend_request(backend: &VirtBackendRequest) -> io::Result<()> {
+pub(crate) fn validate_backend_request(backend: &VirtBackendRequest) -> io::Result<()> {
     match backend.kind.as_str() {
-        "mock" => Ok(()),
-        "krun" | "vz" if backend.scenario.is_none() => Ok(()),
+        "mock" => {
+            match (&backend.scenario, &backend.scenario_json, &backend.scenario_digest) {
+                (None, None, None) => Ok(()),
+                (Some(path), Some(json), Some(digest)) if path.is_absolute() => {
+                    crate::capabilities::validate_scenario_bytes(json.as_bytes(), digest)
+                        .map_err(|error| invalid_data(error.to_string()))
+                }
+                _ => Err(invalid_data(
+                    "mock scenario requires an absolute path, scenarioJson and matching scenarioDigest",
+                )),
+            }
+        }
+        "krun" | "vz"
+            if backend.scenario.is_none()
+                && backend.scenario_json.is_none()
+                && backend.scenario_digest.is_none() =>
+        {
+            Ok(())
+        }
         "krun" | "vz" => Err(invalid_data(format!(
             "silo-vmm start request backend {:?} cannot include a mock scenario",
             backend.kind
@@ -285,9 +333,13 @@ fn valid_environment_name(name: &str) -> bool {
         })
 }
 
-fn parse_uuid(field: &str, value: &str) -> io::Result<uuid::Uuid> {
-    uuid::Uuid::parse_str(value)
-        .map_err(|error| invalid_data(format!("{field} must be a UUID: {error}")))
+pub(crate) fn parse_uuid(field: &str, value: &str) -> io::Result<uuid::Uuid> {
+    let id = uuid::Uuid::parse_str(value)
+        .map_err(|error| invalid_data(format!("{field} must be a UUID: {error}")))?;
+    if id.is_nil() {
+        return Err(invalid_data(format!("{field} must not be the nil UUID")));
+    }
+    Ok(id)
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -305,19 +357,11 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn missing_inherited_pipe_is_explicit_idle_mode() {
+    async fn managed_start_requires_an_inherited_request_pipe() {
         let machine_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
-        let mut pipe = StartRequestPipe::from_fd(None).expect("open idle start request");
-
-        let request = pipe
-            .read(&machine_id, &run_id)
-            .await
-            .expect("read idle request");
-
-        assert_eq!(request.machine_id, machine_id);
-        assert_eq!(request.machine_run_id, run_id);
-        assert!(request.startup_command.is_none());
+        let mut pipe = StartRequestPipe::from_fd(None).expect("construct missing-pipe input");
+        assert!(pipe.read(&machine_id, &run_id).await.is_err());
     }
 
     #[test]
@@ -353,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_requests_derive_budget_from_startup_command_presence() {
+    fn current_requests_derive_budget_from_startup_command_presence() {
         let machine_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let idle = encode(json!({
@@ -361,7 +405,7 @@ mod tests {
             "machineId": machine_id,
             "machineRunId": run_id,
         }));
-        let idle = decode_start_request(&idle, &machine_id, &run_id).expect("decode legacy idle");
+        let idle = decode_start_request(&idle, &machine_id, &run_id).expect("decode current idle");
         assert_eq!(idle.effective_startup_budget_ms(), 30_000);
 
         let startup = encode(json!({
@@ -374,7 +418,7 @@ mod tests {
             }
         }));
         let startup =
-            decode_start_request(&startup, &machine_id, &run_id).expect("decode legacy startup");
+            decode_start_request(&startup, &machine_id, &run_id).expect("decode current startup");
         assert_eq!(startup.effective_startup_budget_ms(), 330_000);
     }
 
@@ -521,6 +565,58 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_start_reader_rejects_matching_nil_machine_and_run_ids() {
+        let nil = Uuid::nil().to_string();
+        let valid = Uuid::new_v4().to_string();
+        for (machine_id, run_id) in [(&nil, &valid), (&valid, &nil)] {
+            let request = encode(json!({
+                "version": VMM_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+            }));
+            let error =
+                decode_start_request(&request, machine_id, run_id).expect_err("nil identity");
+            assert!(
+                error.to_string().contains("must not be the nil UUID"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_start_scenario_requires_exact_frozen_bytes_and_digest() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let json = "{ }";
+        let valid = json!({
+            "version": VMM_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "virtBackend": {
+                "kind": "mock", "scenario": "/missing/source.json",
+                "scenarioJson": json,
+                "scenarioDigest": crate::capabilities::scenario_digest(json.as_bytes())
+            }
+        });
+        decode_start_request(&encode(valid.clone()), &machine_id, &run_id)
+            .expect("frozen bytes accepted");
+        for field in ["scenario", "scenarioJson", "scenarioDigest"] {
+            let mut missing = valid.clone();
+            missing["virtBackend"]
+                .as_object_mut()
+                .expect("backend")
+                .remove(field);
+            assert!(decode_start_request(&encode(missing), &machine_id, &run_id).is_err());
+        }
+        let mut changed = valid.clone();
+        changed["virtBackend"]["scenarioJson"] = json!("{}");
+        assert!(decode_start_request(&encode(changed), &machine_id, &run_id).is_err());
+        let mut relative = valid;
+        relative["virtBackend"]["scenario"] = json!("relative.json");
+        assert!(decode_start_request(&encode(relative), &machine_id, &run_id).is_err());
+    }
+
+    #[test]
     fn strict_reader_rejects_framing_and_schema_errors() {
         let machine_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
@@ -621,9 +717,49 @@ mod tests {
         assert!(decode_start_request(&encode(oversized), &machine_id, &run_id).is_err());
     }
 
-    fn encode(value: serde_json::Value) -> Vec<u8> {
+    fn encode(mut value: serde_json::Value) -> Vec<u8> {
+        value["storageLease"] = json!({
+            "operationId": "33333333-3333-4333-8333-333333333333",
+            "fileDevice": 1, "fileInode": 1
+        });
+        value["storageShutdown"] = json!({
+            "version": 1,
+            "machineId": value["machineId"],
+            "runId": value["machineRunId"],
+            "manifest": {"kind": "unsupported", "reason": "unit fixture has no attachments"}
+        });
         let mut encoded = serde_json::to_vec(&value).expect("encode JSON");
         encoded.push(b'\n');
         encoded
+    }
+
+    #[test]
+    fn managed_request_requires_exact_current_storage_metadata() {
+        let machine = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        let encoded = encode(json!({"version":1,"machineId":machine,"machineRunId":run}));
+        let current: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        for field in ["storageLease", "storageShutdown"] {
+            let mut missing = current.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let mut bytes = serde_json::to_vec(&missing).unwrap();
+            bytes.push(b'\n');
+            assert!(decode_start_request(&bytes, &machine, &run).is_err());
+        }
+        for field in ["operationId", "fileDevice", "fileInode"] {
+            let mut missing = current.clone();
+            missing["storageLease"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let mut bytes = serde_json::to_vec(&missing).unwrap();
+            bytes.push(b'\n');
+            assert!(decode_start_request(&bytes, &machine, &run).is_err());
+        }
+        let mut wrong = current;
+        wrong["storageShutdown"]["runId"] = json!(Uuid::new_v4().to_string());
+        let mut bytes = serde_json::to_vec(&wrong).unwrap();
+        bytes.push(b'\n');
+        assert!(decode_start_request(&bytes, &machine, &run).is_err());
     }
 }

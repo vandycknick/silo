@@ -6,7 +6,7 @@
 //! socketpairs handed out by `connect_vsock`. Executions run real host
 //! subprocesses sandboxed under `<base_directory>/mock-guest-root/`, so
 //! stdio, exit codes, and signal plumbing stay honest. Behavior is scripted
-//! by a [`test_utils::Scenario`] (path in `VmConfig::mock().scenario`).
+//! by the immutable [`test_utils::Scenario`] in `VmConfig::mock()`.
 //!
 //! Scope: this fakes the silo-vmm<->guest contract, not the hypervisor. Real
 //! krun/vz behavior, kernel vsock semantics, and actual guest boots still
@@ -45,7 +45,7 @@ const SSH_PORT: u32 = agent_spec::SSH_VSOCK_PORT;
 #[derive(Debug)]
 pub(crate) struct MockBackend {
     config: VmConfig,
-    scenario: Scenario,
+    scenario: Arc<Scenario>,
     guest: Arc<guest::MockGuest>,
     running: AsyncMutex<Option<RunningGuest>>,
     exit: Arc<Mutex<Option<VmExit>>>,
@@ -65,21 +65,7 @@ struct RunningGuest {
 impl MockBackend {
     pub(crate) fn new(config: VmConfig) -> Result<Self, VirtError> {
         validate_common(&config)?;
-        let scenario = match config.mock().scenario.as_deref() {
-            Some(path) => {
-                if !path.is_absolute() {
-                    return Err(VirtError::InvalidConfig {
-                        name: config.name().to_string(),
-                        reason: format!("mock scenario path must be absolute: {}", path.display()),
-                    });
-                }
-                Scenario::load(path).map_err(|err| VirtError::InvalidConfig {
-                    name: config.name().to_string(),
-                    reason: format!("failed to load mock scenario: {err}"),
-                })?
-            }
-            None => Scenario::default(),
-        };
+        let scenario = config.mock().resolved_scenario.clone().unwrap_or_default();
 
         let guest_root = config.base_directory().join(GUEST_ROOT_DIR);
         let guest = Arc::new(guest::MockGuest::new(scenario.clone(), guest_root));
@@ -514,6 +500,7 @@ fn limited_stream(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use test_utils::Scenario;
     use tokio::net::UnixStream;
@@ -622,7 +609,9 @@ mod tests {
             .base_directory(&root)
             .kernel(Path::new("/mock-kernel"))
             .build();
-        config.set_mock_scenario(&scenario_path);
+        config.set_resolved_mock_scenario(Arc::new(
+            Scenario::load(&scenario_path).expect("load scenario"),
+        ));
         let backend = MockBackend::new(config).expect("mock backend");
         backend.start().await.expect("start mock");
         let capacity = VsockCapacity::test_with_limit("mock-unsupported-forward", 2);

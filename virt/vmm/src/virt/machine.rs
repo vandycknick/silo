@@ -205,6 +205,18 @@ impl VirtualMachine {
         self.inner.backend.try_wait().await
     }
 
+    /// Finish checked attachment cleanup after every native owner is terminal.
+    /// A terminal exit code itself supplies none of the storage facts.
+    pub(crate) async fn finalize_storage(
+        &self,
+        guest_protocol_completed: bool,
+    ) -> Result<crate::virt::StorageFinalization, VirtError> {
+        self.inner
+            .backend
+            .finalize_storage(guest_protocol_completed)
+            .await
+    }
+
     /// Fence readiness publication as soon as death is observed, including
     /// while the backend is draining its immutable terminal report.
     pub(crate) async fn ensure_alive(&self) -> Result<(), VirtError> {
@@ -381,7 +393,7 @@ mod tests {
         VirtualMachine {
             inner: Arc::new(MachineInner {
                 name: "capacity-test".to_string(),
-                kind: BackendKind::default_for_host().expect("test host backend kind"),
+                kind: BackendKind::Krun,
                 serial_console: Arc::new(SerialConsole::new(backend_trait.clone())),
                 backend: backend_trait,
                 vsock_capacity: VsockCapacity::test_with_limit("capacity-test", limit),

@@ -8,6 +8,10 @@ fn main() {
 #[path = "rprobe/worker.rs"]
 mod rprobe_worker;
 
+#[cfg(target_os = "macos")]
+#[path = "../durable_file.rs"]
+mod durable_file;
+
 // The harness drives the production worker protocol and config types; the
 // rest of the krun module is compiled but unused here.
 #[cfg(target_os = "macos")]
@@ -95,6 +99,9 @@ mod macos {
         guest_kernel: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
         guest_initramfs: Option<PathBuf>,
+        /// Owned 0700 directory for the stable helper lease and holder record.
+        #[arg(long, value_name = "PATH")]
+        storage_directory: Option<PathBuf>,
         #[arg(long, value_name = "PATH", default_value = DEFAULT_HOST_ROOT)]
         host_root: PathBuf,
     }
@@ -118,6 +125,7 @@ mod macos {
         supervisor: PathBuf,
         kernel: PathBuf,
         initramfs: PathBuf,
+        storage_directory: PathBuf,
     }
 
     struct SourceSnapshot {
@@ -453,9 +461,9 @@ mod macos {
     }
 
     fn helper_inputs(args: &Args) -> Result<Option<HelperInputs>> {
-        match (&args.supervisor, &args.guest_kernel, &args.guest_initramfs) {
-            (None, None, None) => Ok(None),
-            (Some(supervisor), Some(kernel), Some(initramfs)) => {
+        match (&args.supervisor, &args.guest_kernel, &args.guest_initramfs, &args.storage_directory) {
+            (None, None, None, None) => Ok(None),
+            (Some(supervisor), Some(kernel), Some(initramfs), Some(storage_directory)) => {
                 for (kind, path) in [
                     ("silo-vmm worker executable", supervisor),
                     ("guest kernel", kernel),
@@ -469,10 +477,11 @@ mod macos {
                     supervisor: supervisor.clone(),
                     kernel: kernel.clone(),
                     initramfs: initramfs.clone(),
+                    storage_directory: storage_directory.clone(),
                 }))
             }
             _ => Err(eyre!(
-                "--supervisor, --guest-kernel and --guest-initramfs must be supplied together"
+                "--supervisor, --guest-kernel, --guest-initramfs and --storage-directory must be supplied together"
             )),
         }
     }
@@ -629,6 +638,7 @@ mod macos {
     ) -> Result<HelperOutcome> {
         let mut vm = Worker::start(
             &inputs.supervisor,
+            &inputs.storage_directory,
             crate::krun::KrunConfig {
                 cpus: 1,
                 memory_mib: 512,

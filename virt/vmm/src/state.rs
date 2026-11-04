@@ -11,6 +11,16 @@ use protocol::v1::{
     VmState,
 };
 use tokio::sync::watch;
+use vm_spec::live::{
+    LiveBackend, LiveCapabilityVector, LiveLane, LiveMachineReport, LiveScope, LIVE_SCHEMA_VERSION,
+};
+
+pub(crate) struct RunLiveProfile {
+    pub(crate) run_id: String,
+    pub(crate) backend: LiveBackend,
+    pub(crate) lane: LiveLane,
+    pub(crate) live: LiveCapabilityVector,
+}
 
 const TIMESTAMP_MIN_SECONDS: i64 = -62_135_596_800;
 const TIMESTAMP_MAX_SECONDS: i64 = 253_402_300_799;
@@ -83,6 +93,7 @@ struct State {
     name: String,
     actual_backend: String,
     monitor_id: String,
+    live: LiveMachineReport,
     vm_state: VmState,
     vm_changed_at: SystemTime,
     running_since: Option<SystemTime>,
@@ -132,17 +143,31 @@ impl InstanceStore {
         machine_id: String,
         name: String,
         agent_enabled: bool,
-        actual_backend: String,
-    ) -> Self {
+        profile: RunLiveProfile,
+    ) -> Result<Self, StoreError> {
         let now = SystemTime::now();
         let (generation, _) = watch::channel(0);
         let (identity_reset, _) = watch::channel(0);
         let (ready_agent_identity, _) = watch::channel(None);
+        let monitor_id = uuid::Uuid::new_v4().to_string();
+        let live = LiveMachineReport {
+            schema_version: LIVE_SCHEMA_VERSION,
+            scope: LiveScope::Machine,
+            machine_id: machine_id.clone(),
+            run_id: profile.run_id,
+            monitor_id: monitor_id.clone(),
+            backend: profile.backend,
+            lane: profile.lane,
+            topology_revision: 1,
+            live: profile.live,
+        };
+        live.validate().map_err(StoreError::Validation)?;
         let mut state = State {
             machine_id,
             name,
-            actual_backend,
-            monitor_id: uuid::Uuid::new_v4().to_string(),
+            actual_backend: profile.backend.as_str().to_string(),
+            monitor_id,
+            live,
             vm_state: VmState::Starting,
             vm_changed_at: now,
             running_since: None,
@@ -164,12 +189,12 @@ impl InstanceStore {
             ssh_verification: None,
         };
         state.last_log_snapshot = Some(state_log_snapshot(&state, Instant::now()));
-        Self {
+        Ok(Self {
             state: Mutex::new(state),
             generation,
             identity_reset,
             ready_agent_identity,
-        }
+        })
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
@@ -191,6 +216,15 @@ impl InstanceStore {
             })
     }
 
+    /// Shutdown is also needed for a responsive agent whose workloads or SSH
+    /// are not ready. Bind to the observed identity, not the readiness policy.
+    pub(crate) fn shutdown_agent_identity(&self) -> Result<ReadyAgentIdentity, StoreError> {
+        let state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
+        identity_from_state(&state).ok_or_else(|| {
+            StoreError::Protocol("an observed guest agent identity is required".to_string())
+        })
+    }
+
     pub(crate) fn is_stopping(&self) -> Result<bool, StoreError> {
         self.state
             .lock()
@@ -207,8 +241,8 @@ impl InstanceStore {
     pub(crate) fn status(&self) -> Result<HostStatus, StoreError> {
         self.state
             .lock()
-            .map(|state| project_status(&state, Instant::now(), SystemTime::now()))
             .map_err(|_| StoreError::Poisoned)
+            .and_then(|state| project_status(&state, Instant::now(), SystemTime::now()))
     }
 
     pub(crate) fn metrics(&self) -> Result<HostMetrics, StoreError> {
@@ -674,13 +708,39 @@ pub(crate) fn new_instance_store(
     new_instance_store_with_backend(machine_id, name, agent_enabled, "mock".to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn new_instance_store_with_backend(
     machine_id: String,
     name: String,
     agent_enabled: bool,
     actual_backend: String,
 ) -> InstanceStore {
-    InstanceStore::new(machine_id, name, agent_enabled, actual_backend)
+    let backend = match actual_backend.as_str() {
+        "krun" => LiveBackend::Krun,
+        "vz" => LiveBackend::Vz,
+        _ => LiveBackend::Mock,
+    };
+    let lane = if backend == LiveBackend::Krun {
+        LiveLane::KvmX86_64
+    } else {
+        LiveLane::NotApplicable
+    };
+    InstanceStore::new(
+        machine_id,
+        name,
+        agent_enabled,
+        RunLiveProfile {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            backend,
+            lane,
+            live: LiveCapabilityVector::all_unsupported(if backend == LiveBackend::Krun {
+                vm_spec::live::LiveReasonCode::NotDelivered
+            } else {
+                vm_spec::live::LiveReasonCode::BackendExcluded
+            }),
+        },
+    )
+    .expect("valid test state")
 }
 
 fn observation<T>(value: T, freshness: Duration) -> Result<Observation<T>, StoreError> {
@@ -1035,6 +1095,9 @@ fn validate_metrics(metrics: &AgentMetrics) -> Result<(), StoreError> {
         .snapshot
         .as_ref()
         .ok_or_else(|| invalid("metrics.snapshot is required"))?;
+    if let Some(root) = &snapshot.root_storage {
+        protocol::validate_root_storage_metrics(root).map_err(|error| invalid(&error))?;
+    }
     if let Some(memory) = &snapshot.memory {
         let total = memory
             .total_bytes
@@ -1300,7 +1363,16 @@ fn readiness(state: &State, now: Instant) -> WaitOutcome {
     }
 }
 
-fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostStatus {
+fn project_status(
+    state: &State,
+    now: Instant,
+    observed_at: SystemTime,
+) -> Result<HostStatus, StoreError> {
+    let live = state
+        .live
+        .clone()
+        .try_into()
+        .map_err(StoreError::Validation)?;
     let (ready, reason) = readiness_detail(state, now);
     let agent = if state.agent_enabled {
         HostAgent {
@@ -1319,8 +1391,9 @@ fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostS
             mode: Some(protocol::v1::host_agent::Mode::Disabled(DisabledAgent {})),
         }
     };
-    HostStatus {
-        run_id: None,
+    Ok(HostStatus {
+        run_id: Some(state.live.run_id.clone()),
+        live: Some(live),
         machine_id: Some(state.machine_id.clone()),
         name: Some(state.name.clone()),
         monitor: Some(MonitorSnapshot {
@@ -1339,7 +1412,7 @@ fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostS
             reason: Some(reason as i32),
         }),
         agent: Some(agent),
-    }
+    })
 }
 
 fn project_metrics(state: &State, now: Instant, observed_at: SystemTime) -> HostMetrics {
@@ -1547,7 +1620,7 @@ mod tests {
     }
 
     fn ssh_store() -> InstanceStore {
-        let store = new_instance_store("machine-1".into(), "ssh-test".into(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "ssh-test".into(), true);
         store.set_vm_state(VmState::Running, "running").unwrap();
         store
             .observe_status(ssh_status(1), Duration::from_secs(300))
@@ -1900,7 +1973,7 @@ mod tests {
     #[tokio::test]
     async fn ready_status_wakes_generation_waiters() {
         let store = Arc::new(new_instance_store(
-            "machine-1".to_string(),
+            uuid::Uuid::new_v4().to_string(),
             "test".to_string(),
             true,
         ));
@@ -1927,7 +2000,7 @@ mod tests {
 
     #[test]
     fn logging_snapshot_ignores_heartbeat_refreshes() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -1957,7 +2030,7 @@ mod tests {
 
     #[test]
     fn logging_snapshot_tracks_guest_status_and_readiness() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -1986,7 +2059,7 @@ mod tests {
 
     #[test]
     fn logging_snapshot_records_time_derived_staleness_on_next_mutation() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -2017,7 +2090,7 @@ mod tests {
 
     #[test]
     fn identity_replacement_clears_retained_metrics() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .observe_status(
                 ready_status("00000000-0000-4000-8000-000000000002"),
@@ -2035,7 +2108,7 @@ mod tests {
 
     #[test]
     fn capability_cache_is_identity_scoped_and_does_not_change_readiness() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -2084,7 +2157,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_identity_subscription_observes_instance_and_boot_replacement() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .set_vm_state(VmState::Running, "running")
             .expect("vm state");
@@ -2125,7 +2198,7 @@ mod tests {
 
     #[test]
     fn invalid_observation_is_not_a_poisoned_store() {
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         let error = store
             .observe_status(AgentStatus::default(), Duration::from_secs(15))
             .expect_err("invalid status");
@@ -2141,7 +2214,7 @@ mod tests {
         report.code = Some("STARTING".to_string());
         report.message = Some("agent starting".to_string());
 
-        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        let store = new_instance_store(uuid::Uuid::new_v4().to_string(), "test".to_string(), true);
         store
             .observe_status(status, Duration::from_secs(15))
             .expect("starting status");
@@ -2165,7 +2238,7 @@ mod tests {
     #[test]
     fn metrics_report_the_backend_that_created_the_monitor() {
         let store = crate::state::new_instance_store_with_backend(
-            "machine-1".to_string(),
+            uuid::Uuid::new_v4().to_string(),
             "test".to_string(),
             true,
             "krun".to_string(),
@@ -2173,6 +2246,189 @@ mod tests {
         assert_eq!(
             store.metrics().expect("metrics").actual_backend.as_deref(),
             Some("krun")
+        );
+    }
+
+    #[test]
+    fn capabilities_store_rejects_nil_identity_and_invalid_outbound_evidence() {
+        let valid = uuid::Uuid::new_v4().to_string();
+        let nil = uuid::Uuid::nil().to_string();
+        for (machine_id, run_id) in [(&nil, &valid), (&valid, &nil)] {
+            let result = crate::state::InstanceStore::new(
+                machine_id.clone(),
+                "invalid".into(),
+                false,
+                crate::state::RunLiveProfile {
+                    run_id: run_id.clone(),
+                    backend: vm_spec::live::LiveBackend::Mock,
+                    lane: vm_spec::live::LiveLane::NotApplicable,
+                    live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                        vm_spec::live::LiveReasonCode::BackendExcluded,
+                    ),
+                },
+            );
+            assert!(matches!(result, Err(StoreError::Validation(_))));
+        }
+        let store = new_instance_store(valid, "outbound".into(), false);
+        store.state.lock().expect("state").live.run_id = nil;
+        assert!(matches!(store.status(), Err(StoreError::Validation(_))));
+    }
+
+    #[test]
+    fn capabilities_live_status_preserves_actual_run_across_state_changes() {
+        let machine_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut live = vm_spec::live::LiveCapabilityVector::all_unsupported(
+            vm_spec::live::LiveReasonCode::BackendExcluded,
+        );
+        live.pause = vm_spec::live::LiveCapability {
+            native: true,
+            availability: vm_spec::live::LiveAvailability::Supported,
+        };
+        let store = crate::state::InstanceStore::new(
+            machine_id.clone(),
+            "actual-run".into(),
+            false,
+            crate::state::RunLiveProfile {
+                run_id: run_id.clone(),
+                backend: vm_spec::live::LiveBackend::Mock,
+                lane: vm_spec::live::LiveLane::HvfArm64,
+                live: live.clone(),
+            },
+        )
+        .expect("valid state");
+        let initial = store.status().expect("initial");
+        let evidence =
+            vm_spec::live::LiveMachineReport::try_from(initial.live.expect("mandatory live"))
+                .expect("valid report");
+        assert_eq!(evidence.machine_id, machine_id);
+        assert_eq!(evidence.run_id, run_id);
+        assert_eq!(evidence.live, live);
+        assert_eq!(evidence.backend, vm_spec::live::LiveBackend::Mock);
+        store
+            .set_vm_state(VmState::Running, "running")
+            .expect("running");
+        store
+            .set_vm_state(VmState::Stopped, "stopped")
+            .expect("stopped");
+        let terminal = store.status().expect("terminal");
+        assert_eq!(
+            vm_spec::live::LiveMachineReport::try_from(terminal.live.expect("live"))
+                .expect("report"),
+            evidence
+        );
+        assert_eq!(
+            store.metrics().expect("metrics").actual_backend.as_deref(),
+            Some("mock")
+        );
+    }
+    fn root_metrics() -> protocol::v1::RootStorageMetrics {
+        use protocol::v1::{
+            RootStorageKind, RootStorageMetrics, TemporaryDirectoryKind, TemporaryDirectoryMetrics,
+        };
+        RootStorageMetrics {
+            kind: Some(RootStorageKind::LinuxFlatOverlayV1 as i32),
+            upper_profile: Some("silo-upper-ext4-v1".into()),
+            upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
+            upper_backing_bytes: Some(67_112_960),
+            upper_filesystem_bytes: Some(67_108_864),
+            unusable_tail_bytes: Some(4096),
+            filesystem_overhead_bytes: Some(5_668_864),
+            upper_usable_bytes: Some(61_440_000),
+            upper_used_bytes: Some(53_248_000),
+            upper_free_bytes: Some(8_192_000),
+            upper_available_bytes: Some(4_096_000),
+            upper_total_inodes: Some(8192),
+            upper_free_inodes: Some(0),
+            upper_available_inodes: Some(0),
+            shared_lower_logical_bytes: Some(268_435_456),
+            temporary_directory: Some(TemporaryDirectoryMetrics {
+                kind: Some(TemporaryDirectoryKind::Upper as i32),
+                capacity_bytes: Some(61_440_000),
+                used_bytes: Some(53_248_000),
+                free_bytes: Some(8_192_000),
+                available_bytes: Some(4_096_000),
+                persistent: Some(true),
+                memory_charged: Some(false),
+            }),
+        }
+    }
+
+    #[test]
+    fn root_metrics_relay_preserves_exact_payload_and_existing_staleness() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        for freshness in [Duration::ZERO, Duration::from_secs(300)] {
+            let store = new_instance_store(
+                uuid::Uuid::new_v4().to_string(),
+                "root-metrics".into(),
+                true,
+            );
+            store.set_vm_state(VmState::Running, "running").unwrap();
+            store
+                .observe_status(ready_status(instance), Duration::from_secs(300))
+                .unwrap();
+            let mut metrics = metrics_for(instance);
+            let root = root_metrics();
+            metrics
+                .report
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .root_storage = Some(root.clone());
+            store.observe_metrics(metrics.clone(), freshness).unwrap();
+            let observation = store.metrics().unwrap().metrics.unwrap();
+            assert_eq!(observation.agent_instance_id.as_deref(), Some(instance));
+            assert_eq!(observation.report, metrics.report);
+            assert_eq!(
+                observation.report.unwrap().snapshot.unwrap().root_storage,
+                Some(root)
+            );
+            assert_eq!(
+                observation.freshness,
+                Some(if freshness.is_zero() {
+                    protocol::v1::Freshness::Stale as i32
+                } else {
+                    protocol::v1::Freshness::Fresh as i32
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn root_metrics_relay_rejects_invalid_payload_without_replacing_last_observation() {
+        let instance = "00000000-0000-4000-8000-000000000002";
+        let store = new_instance_store(
+            uuid::Uuid::new_v4().to_string(),
+            "root-metrics".into(),
+            true,
+        );
+        store
+            .observe_status(ready_status(instance), Duration::from_secs(300))
+            .unwrap();
+        let valid = metrics_for(instance);
+        store
+            .observe_metrics(valid.clone(), Duration::from_secs(300))
+            .unwrap();
+        let mut invalid = valid.clone();
+        let mut root = root_metrics();
+        root.upper_used_bytes = Some(u64::MAX);
+        invalid
+            .report
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .root_storage = Some(root);
+        assert!(matches!(
+            store.observe_metrics(invalid, Duration::from_secs(300)),
+            Err(StoreError::Validation(_))
+        ));
+        assert_eq!(
+            store.metrics().unwrap().metrics.unwrap().report,
+            valid.report
         );
     }
 }

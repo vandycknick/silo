@@ -22,7 +22,9 @@ use vz::{
 
 use crate::virt::backend::{StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
-use crate::virt::config::{validate_common, MachineIdentifier, NetworkMode, VmConfig};
+use crate::virt::config::{
+    validate_common, validate_vz_disks, MachineIdentifier, NetworkMode, VmConfig,
+};
 use crate::virt::error::VirtError;
 use crate::virt::exit::StartupStage;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
@@ -428,8 +430,9 @@ impl VirtualMachineDelegate for ExitDelegate {
 }
 
 fn validate(config: &VmConfig) -> Result<(), VirtError> {
-    validate_support()?;
     validate_common(config)?;
+    validate_vz_disks(config)?;
+    validate_support()?;
     validate_machine_config(config)
 }
 
@@ -439,6 +442,7 @@ fn validate_support() -> Result<(), VirtError> {
 }
 
 fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration), VirtError> {
+    validate_vz_disks(config)?;
     let serial_port = SerialPortConfiguration::virtio_console().map_err(vz_error)?;
 
     let mut builder = VirtualMachine::builder()

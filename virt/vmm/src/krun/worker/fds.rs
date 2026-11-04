@@ -11,7 +11,10 @@
 //! | 6  | console: PTY slave                                |
 //! | 7  | vsock mux: connected stream socket, iff configured |
 //!
-//! Nothing above the last role may be open.
+//! | 8  | generation lease: shared-flock regular file       |
+//! | 9+ | Raw backing handles, in manifest order (max 16)   |
+//!
+//! The optional mux hole stays closed; no other descriptor may be open.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -26,6 +29,10 @@ pub(crate) const EVENTS_FD: RawFd = 4;
 pub(crate) const WATCHDOG_FD: RawFd = 5;
 pub(crate) const CONSOLE_FD: RawFd = 6;
 pub(crate) const MUX_FD: RawFd = 7;
+pub(crate) const STORAGE_LEASE_FD: RawFd = 8;
+pub(crate) const FIRST_RAW_FD: RawFd = 9;
+const MAX_RAW_HANDLES: usize = 16;
+const MAX_INHERITED_FDS: usize = 6 + MAX_RAW_HANDLES;
 
 pub(crate) struct Bootstrap {
     pub(crate) config: OwnedFd,
@@ -33,6 +40,8 @@ pub(crate) struct Bootstrap {
     pub(crate) watchdog: OwnedFd,
     pub(crate) console: OwnedFd,
     pub(crate) mux: Option<OwnedFd>,
+    pub(crate) storage_lease: OwnedFd,
+    pub(crate) raw_handles: Vec<OwnedFd>,
 }
 
 #[derive(Clone, Copy)]
@@ -42,17 +51,56 @@ enum Role {
     Watchdog,
     Console,
     Mux,
+    StorageLease,
+    Raw,
 }
 
 impl Bootstrap {
     /// Adopt the fixed descriptor table. The mux is optional; whether it must be
     /// present is decided by the config, which is read afterwards.
     pub(crate) fn adopt_fixed() -> io::Result<Self> {
-        // nix's fcntl API requires an already-valid AsFd; probe the number first.
-        let mux = (unsafe { nix::libc::fcntl(MUX_FD, nix::libc::F_GETFD) } >= 0).then_some(MUX_FD);
-        let highest = mux.unwrap_or(CONSOLE_FD);
-        ensure_nothing_open_above(highest)?;
-        Self::adopt(CONFIG_FD, EVENTS_FD, WATCHDOG_FD, CONSOLE_FD, mux)
+        let mux = descriptor_open(MUX_FD)?.then_some(MUX_FD);
+        let mut raw_handles = [0; MAX_RAW_HANDLES];
+        let mut raw_count = 0;
+        let mut hole = false;
+        for raw in FIRST_RAW_FD..FIRST_RAW_FD + MAX_RAW_HANDLES as RawFd {
+            if descriptor_open(raw)? {
+                if hole {
+                    return Err(invalid("Raw descriptor table contains a hole"));
+                }
+                raw_handles[raw_count] = raw;
+                raw_count += 1;
+            } else {
+                hole = true;
+            }
+        }
+        let raw_handles = &raw_handles[..raw_count];
+        let mut allowed = [0; MAX_INHERITED_FDS];
+        let mut count = 0;
+        for raw in [
+            CONFIG_FD,
+            EVENTS_FD,
+            WATCHDOG_FD,
+            CONSOLE_FD,
+            STORAGE_LEASE_FD,
+        ]
+        .into_iter()
+        .chain(mux)
+        .chain(raw_handles.iter().copied())
+        {
+            allowed[count] = raw;
+            count += 1;
+        }
+        ensure_exact_descriptors(&allowed[..count])?;
+        Self::adopt(
+            CONFIG_FD,
+            EVENTS_FD,
+            WATCHDOG_FD,
+            CONSOLE_FD,
+            mux,
+            STORAGE_LEASE_FD,
+            raw_handles,
+        )
     }
 
     /// Adopt descriptors only after validating all roles, access and aliases.
@@ -62,19 +110,30 @@ impl Bootstrap {
         watchdog: RawFd,
         console: RawFd,
         mux: Option<RawFd>,
+        storage_lease: RawFd,
+        raw_handles: &[RawFd],
     ) -> io::Result<Self> {
+        if raw_handles.len() > MAX_RAW_HANDLES {
+            return Err(invalid("too many inherited Raw backing handles"));
+        }
         let roles = [
             (config, Role::Config),
             (events, Role::Events),
             (watchdog, Role::Watchdog),
             (console, Role::Console),
         ];
-        let mut identities = Vec::new();
+        let mut identities = [((0_u64, 0_u64), false); MAX_INHERITED_FDS];
         #[cfg(target_os = "macos")]
-        let mut pipes = Vec::new();
-        let mut numbers = Vec::new();
-        for (raw, role) in roles.into_iter().chain(mux.map(|raw| (raw, Role::Mux))) {
-            if raw < 3 || numbers.contains(&raw) {
+        let mut pipes = [None; 3];
+        let mut numbers = [-1; MAX_INHERITED_FDS];
+        let mut count = 0;
+        for (raw, role) in roles
+            .into_iter()
+            .chain(mux.map(|raw| (raw, Role::Mux)))
+            .chain(std::iter::once((storage_lease, Role::StorageLease)))
+            .chain(raw_handles.iter().map(|&raw| (raw, Role::Raw)))
+        {
+            if raw < 3 || numbers[..count].contains(&raw) {
                 return Err(invalid("invalid or duplicated bootstrap descriptor"));
             }
             // nix's fcntl API requires an already-valid AsFd. Probe the untrusted
@@ -86,18 +145,23 @@ impl Bootstrap {
             // and this scope neither closes nor transfers any descriptor.
             let fd = unsafe { BorrowedFd::borrow_raw(raw) };
             let stat = fstat(fd)?;
-            let identity = (stat.st_dev, stat.st_ino);
-            if identities.contains(&identity) {
+            let identity = (stat.st_dev as u64, stat.st_ino as u64);
+            if identities[..count].iter().any(|&(prior, prior_raw)| {
+                prior == identity && !(prior_raw && matches!(role, Role::Raw))
+            }) {
                 return Err(invalid("bootstrap roles alias the same resource"));
             }
             let kind = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
             #[cfg(target_os = "macos")]
             if kind == SFlag::S_IFIFO {
                 let identity = pipe_identity(raw)?;
-                if pipes.contains(&identity) {
+                if pipes.contains(&Some(identity)) {
                     return Err(invalid("bootstrap roles alias the same pipe"));
                 }
-                pipes.push(identity);
+                let Some(slot) = pipes.iter_mut().find(|slot| slot.is_none()) else {
+                    return Err(invalid("too many inherited bootstrap pipes"));
+                };
+                *slot = Some(identity);
             }
             let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
             let access = flags & OFlag::O_ACCMODE;
@@ -113,14 +177,19 @@ impl Bootstrap {
                     }
                     getpeername::<UnixAddr>(raw)?;
                 }
+                Role::StorageLease => validate_lease_metadata(fd)?,
+                Role::Raw
+                    if matches!(kind, SFlag::S_IFREG | SFlag::S_IFBLK | SFlag::S_IFCHR)
+                        && matches!(access, OFlag::O_RDONLY | OFlag::O_RDWR) => {}
                 _ => return Err(invalid("bootstrap descriptor has wrong type or access")),
             }
-            numbers.push(raw);
-            identities.push(identity);
+            numbers[count] = raw;
+            identities[count] = (identity, matches!(role, Role::Raw));
+            count += 1;
         }
         // No descriptor has been adopted yet, so a validation error never closes
         // an unowned or duplicate resource. Every validated descriptor is unique.
-        for raw in &numbers {
+        for raw in &numbers[..count] {
             let fd = unsafe { BorrowedFd::borrow_raw(*raw) };
             let flags = FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD)?);
             fcntl(fd, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))?;
@@ -133,13 +202,57 @@ impl Bootstrap {
                 watchdog: OwnedFd::from_raw_fd(watchdog),
                 console: OwnedFd::from_raw_fd(console),
                 mux: mux.map(|fd| OwnedFd::from_raw_fd(fd)),
+                storage_lease: OwnedFd::from_raw_fd(storage_lease),
+                raw_handles: raw_handles
+                    .iter()
+                    .map(|&raw| OwnedFd::from_raw_fd(raw))
+                    .collect(),
             }
         })
     }
 }
 
-/// Fail closed if the worker inherited anything beyond its contract.
-fn ensure_nothing_open_above(highest: RawFd) -> io::Result<()> {
+fn descriptor_open(raw: RawFd) -> io::Result<bool> {
+    // An untrusted raw number must be probed before constructing BorrowedFd.
+    if unsafe { nix::libc::fcntl(raw, nix::libc::F_GETFD) } >= 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(nix::libc::EBADF) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn validate_lease_metadata(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let stat = fstat(fd)?;
+    let access = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?) & OFlag::O_ACCMODE;
+    if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
+        || stat.st_uid != nix::unistd::geteuid().as_raw()
+        || stat.st_mode & 0o7777 != 0o600
+        || stat.st_nlink != 1
+        || access != OFlag::O_RDWR
+    {
+        return Err(invalid("invalid inherited generation lease"));
+    }
+    Ok(())
+}
+
+/// Validate identity without acquiring, converting, or unlocking the shared OFD.
+pub(crate) fn validate_lease(fd: BorrowedFd<'_>, device: u64, inode: u64) -> io::Result<()> {
+    validate_lease_metadata(fd)?;
+    let stat = fstat(fd)?;
+    if stat.st_dev as u64 != device || stat.st_ino as u64 != inode {
+        return Err(invalid(
+            "generation lease inode does not match launch binding",
+        ));
+    }
+    Ok(())
+}
+
+/// Fail closed for unexpected descriptors, including optional-role holes.
+fn ensure_exact_descriptors(allowed: &[RawFd]) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     const FD_DIR: &str = "/proc/self/fd";
     #[cfg(target_os = "macos")]
@@ -158,7 +271,7 @@ fn ensure_nothing_open_above(highest: RawFd) -> io::Result<()> {
         let Ok(fd) = name.parse::<RawFd>() else {
             continue;
         };
-        if fd > highest && fd != own {
+        if fd >= 3 && !allowed.contains(&fd) && fd != own {
             return Err(invalid("worker inherited an unexpected descriptor"));
         }
     }
@@ -166,7 +279,7 @@ fn ensure_nothing_open_above(highest: RawFd) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn pipe_identity(fd: RawFd) -> io::Result<(u64, u64)> {
+pub(crate) fn pipe_identity(fd: RawFd) -> io::Result<(u64, u64)> {
     // Darwin assigns distinct inodes to the ends of an anonymous pipe. Its
     // proc_info.h ABI exposes opaque handles linking those ends; nix does not
     // wrap PROC_PIDFDPIPEINFO, and libc only exposes the query and vinfo_stat.
@@ -268,6 +381,8 @@ mod tests {
             watchdog.as_raw_fd(),
             pty.slave.as_raw_fd(),
             None,
+            request.as_raw_fd(),
+            &[],
         )
         .is_err());
         for fd in [&request, &events, &watchdog, &pty.slave] {
@@ -284,7 +399,9 @@ mod tests {
             write.as_raw_fd(),
             read.as_raw_fd(),
             pty.slave.as_raw_fd(),
-            None
+            None,
+            read.as_raw_fd(),
+            &[],
         )
         .is_err());
         nix::fcntl::fcntl(&read, nix::fcntl::FcntlArg::F_GETFD).expect("still owned");
@@ -294,7 +411,9 @@ mod tests {
             write.as_raw_fd(),
             alias.as_raw_fd(),
             pty.slave.as_raw_fd(),
-            None
+            None,
+            read.as_raw_fd(),
+            &[],
         )
         .is_err());
         assert!(Bootstrap::adopt(
@@ -302,8 +421,61 @@ mod tests {
             write.as_raw_fd(),
             read.as_raw_fd(),
             pty.slave.as_raw_fd(),
-            None
+            None,
+            read.as_raw_fd(),
+            &[],
         )
         .is_err());
+    }
+
+    #[test]
+    fn inherited_lease_metadata_rejects_unsafe_inodes_without_taking_ownership() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let root =
+            std::env::temp_dir().join(format!("worker-lease-validation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("operation.lease");
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let stat = nix::sys::stat::fstat(&lease).unwrap();
+        let validate = |fd: std::os::fd::BorrowedFd<'_>| {
+            crate::krun::worker::fds::validate_lease(fd, stat.st_dev as u64, stat.st_ino as u64)
+        };
+        validate(lease.as_fd()).unwrap();
+        assert!(crate::krun::worker::fds::validate_lease(
+            lease.as_fd(),
+            stat.st_dev as u64,
+            stat.st_ino as u64 + 1
+        )
+        .is_err());
+        assert!(
+            validate(std::fs::File::open(&path).unwrap().as_fd()).is_err(),
+            "read-only lease"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            validate(lease.as_fd()).is_err(),
+            "mode must be exactly 0600"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&path, root.join("alias")).unwrap();
+        assert!(validate(lease.as_fd()).is_err(), "nlink must be one");
+        std::fs::remove_file(root.join("alias")).unwrap();
+        assert!(
+            validate(std::fs::File::open(&root).unwrap().as_fd()).is_err(),
+            "directory lease"
+        );
+        let (pipe, _) = nix::unistd::pipe().unwrap();
+        assert!(validate(pipe.as_fd()).is_err(), "pipe lease");
+        validate(lease.as_fd()).unwrap();
+        nix::fcntl::fcntl(&lease, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

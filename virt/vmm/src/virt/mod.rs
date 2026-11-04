@@ -9,9 +9,8 @@
 //! `krun` (libkrun via a helper process) on Linux and macOS, `vz`
 //! (Virtualization.framework) on macOS, and — behind the `mock-backend`
 //! feature — an in-process mock that fakes the guest side for tests.
-//! Selection is pinned per platform today ([`BackendKind::default_for_host`])
-//! but every machine can be created on an explicit backend via
-//! [`VirtualMachine::with_backend`].
+//! The startup capability selection resolves the backend once; every machine
+//! is created on that explicit backend via [`VirtualMachine::with_backend`].
 
 // The re-exports below are the module's full public surface. Which of them
 // are referenced varies by target platform, compiled features, and test cfg,
@@ -29,10 +28,12 @@ mod stream;
 
 pub use backend::BackendKind;
 pub use backend::HostMemoryReclaimReport;
+pub(crate) use backend::StorageFinalization;
 pub(crate) use capacity::VsockLease;
+pub(crate) use config::StorageLaunch;
 pub use config::{
-    DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, RosettaIntent,
-    RosettaProfile, SharedDirectory, VmConfig, VmConfigBuilder, VzOptions,
+    KrunOptions, MachineIdentifier, MockOptions, NetworkMode, RosettaIntent, RosettaProfile,
+    SharedDirectory, VmConfig, VmConfigBuilder, VzOptions,
 };
 pub use error::VirtError;
 pub use exit::VmExit;

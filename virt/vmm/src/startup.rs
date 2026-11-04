@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use crate::machine::{
     machine_identifier_path_from_dir, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
 };
 use crate::start_request::StartRequestPipe;
-use crate::state::{new_instance_store_with_backend, InstanceStore};
+use crate::state::{InstanceStore, RunLiveProfile};
 use protocol::v1::VmState;
 
 pub const ENV_STARTPIPE: &str = "_VM_STARTPIPE";
@@ -25,14 +25,16 @@ pub const ENV_SYNCPIPE: &str = "_VM_SYNCPIPE";
 pub const ENV_MACHINE_LOG_DIR: &str = "_VM_MACHINE_LOG_DIR";
 pub const ENV_MACHINE_LOCK: &str = "_VM_MACHINE_LOCK";
 pub const ENV_NETD_EXIT: &str = "_VM_NETD_EXIT";
+pub const ENV_STORAGE_LEASES: &str = "_VM_STORAGE_LEASES";
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct InheritedPipeFds {
     pub startpipe: Option<RawFd>,
     pub syncpipe: Option<RawFd>,
     pub machine_log_dir: Option<RawFd>,
     pub machine_lock: Option<RawFd>,
     pub netd_exit: Option<RawFd>,
+    pub storage_lease: Option<RawFd>,
 }
 
 impl InheritedPipeFds {
@@ -43,6 +45,7 @@ impl InheritedPipeFds {
             machine_log_dir: parse_env_fd(ENV_MACHINE_LOG_DIR)?,
             machine_lock: parse_env_fd(ENV_MACHINE_LOCK)?,
             netd_exit: parse_env_fd(ENV_NETD_EXIT)?,
+            storage_lease: Some(parse_storage_lease_env()?),
         };
         let mut seen = std::collections::BTreeSet::new();
         for fd in [
@@ -51,6 +54,7 @@ impl InheritedPipeFds {
             fds.machine_log_dir,
             fds.machine_lock,
             fds.netd_exit,
+            fds.storage_lease,
         ]
         .into_iter()
         .flatten()
@@ -59,6 +63,10 @@ impl InheritedPipeFds {
                 fd > 2 && seen.insert(fd),
                 "inherited descriptors must be distinct and above stderr"
             );
+        }
+        fds.validate_set()?;
+        for fd in fds.descriptors().into_iter().flatten() {
+            set_cloexec(fd, true)?;
         }
         Ok(fds)
     }
@@ -72,25 +80,157 @@ impl InheritedPipeFds {
         Ok(self)
     }
 
-    #[cfg(target_os = "macos")]
-    pub fn clear_cloexec(self) -> eyre::Result<()> {
-        for fd in [
+    fn descriptors(&self) -> [Option<RawFd>; 6] {
+        [
             self.startpipe,
             self.syncpipe,
             self.machine_log_dir,
             self.machine_lock,
             self.netd_exit,
+            self.storage_lease,
         ]
-        .into_iter()
-        .flatten()
-        {
-            set_cloexec(fd, false).map_err(|err| eyre::eyre!("clear CLOEXEC on fd {fd}: {err}"))?;
+    }
+
+    /// Validate every number and resource before any role takes ownership.
+    fn validate_set(&self) -> eyre::Result<()> {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use nix::sys::stat::{fstat, SFlag};
+        let mut identities = Vec::new();
+        let mut numbers = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mut pipes = Vec::new();
+        for (index, raw) in self.descriptors().into_iter().enumerate() {
+            let Some(raw) = raw else { continue };
+            eyre::ensure!(
+                raw >= 3 && !numbers.contains(&raw),
+                "invalid or duplicated inherited descriptor"
+            );
+            numbers.push(raw);
+            // nix requires a valid FD before constructing a borrow.
+            eyre::ensure!(
+                unsafe { nix::libc::fcntl(raw, nix::libc::F_GETFD) } >= 0,
+                "invalid inherited descriptor {raw}"
+            );
+            let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+            let stat = fstat(fd)?;
+            let identity = (stat.st_dev, stat.st_ino);
+            eyre::ensure!(
+                !identities.contains(&identity),
+                "inherited descriptor roles alias a resource"
+            );
+            identities.push(identity);
+            let kind = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+            #[cfg(target_os = "macos")]
+            if kind == SFlag::S_IFIFO {
+                let identity = crate::krun::worker::fds::pipe_identity(raw)?;
+                eyre::ensure!(!pipes.contains(&identity), "inherited roles alias a pipe");
+                pipes.push(identity);
+            }
+            let access =
+                OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?) & OFlag::O_ACCMODE;
+            let valid = match index {
+                0 => kind == SFlag::S_IFIFO && access == OFlag::O_RDONLY,
+                1 | 4 => kind == SFlag::S_IFIFO && access == OFlag::O_WRONLY,
+                2 => kind == SFlag::S_IFDIR,
+                3 => {
+                    kind == SFlag::S_IFREG
+                        && access == OFlag::O_RDWR
+                        && stat.st_uid == nix::unistd::geteuid().as_raw()
+                        && stat.st_nlink == 1
+                }
+                5 => {
+                    kind == SFlag::S_IFREG
+                        && access == OFlag::O_RDWR
+                        && stat.st_uid == nix::unistd::geteuid().as_raw()
+                        && stat.st_mode & 0o7777 == 0o600
+                        && stat.st_nlink == 1
+                }
+                _ => false,
+            };
+            eyre::ensure!(
+                valid,
+                "inherited descriptor has invalid type, access or ownership"
+            );
         }
         Ok(())
     }
 
-    pub fn take_netd_exit(self) -> eyre::Result<Option<File>> {
-        let Some(fd) = self.netd_exit else {
+    #[cfg(target_os = "macos")]
+    pub fn configure_reexec(&self, command: &mut std::process::Command) -> io::Result<()> {
+        use std::os::unix::process::CommandExt;
+        let descriptors = self.descriptors();
+        let mut ceiling =
+            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?
+                .0
+                .min(i32::MAX as u64) as i32;
+        let mut directory = nix::dir::Dir::open(
+            "/dev/fd",
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        for entry in directory.iter() {
+            let entry = entry?;
+            if let Some(raw) = entry
+                .file_name()
+                .to_str()
+                .ok()
+                .and_then(|name| name.parse::<i32>().ok())
+            {
+                ceiling = ceiling.max(raw.saturating_add(1));
+            }
+        }
+        drop(directory);
+        // SAFETY: fixed numeric allowlist and allocation-free fcntl errors.
+        unsafe {
+            command.pre_exec(move || {
+                // Darwin lacks close_range(CLOEXEC). Scan the precomputed soft
+                // limit without allocating or closing pre-exec-only handles.
+                for raw in 3..ceiling {
+                    let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
+                    if flags < 0 {
+                        if *nix::libc::__error() == nix::libc::EBADF {
+                            continue;
+                        }
+                        return Err(io::Error::last_os_error());
+                    }
+                    if nix::libc::fcntl(raw, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                for raw in descriptors.into_iter().flatten() {
+                    let fd = BorrowedFd::borrow_raw(raw);
+                    let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD)
+                        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+                    nix::fcntl::fcntl(
+                        fd,
+                        nix::fcntl::FcntlArg::F_SETFD(
+                            nix::fcntl::FdFlag::from_bits_retain(flags)
+                                & !nix::fcntl::FdFlag::FD_CLOEXEC,
+                        ),
+                    )
+                    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    pub fn take_storage_lease(&mut self) -> eyre::Result<Arc<OwnedFd>> {
+        let raw = self
+            .storage_lease
+            .take()
+            .ok_or_else(|| eyre::eyre!("required generation lease is missing"))?;
+        // SAFETY: the complete set was validated before entry, and this role is
+        // adopted exactly once. Closing never unlocks other copies of the OFD.
+        Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+
+    pub fn take_netd_exit(&mut self) -> eyre::Result<Option<File>> {
+        let Some(fd) = self.netd_exit.take() else {
             return Ok(None);
         };
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -110,14 +250,31 @@ impl InheritedPipeFds {
         Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
 
-    pub fn take_machine_lock(self) -> eyre::Result<Option<File>> {
-        let Some(fd) = self.machine_lock else {
+    pub fn take_machine_lock(&mut self) -> eyre::Result<Option<File>> {
+        let Some(fd) = self.machine_lock.take() else {
             return Ok(None);
         };
         set_cloexec(fd, true)
             .map_err(|err| eyre::eyre!("set CLOEXEC on inherited machine lock fd {fd}: {err}"))?;
         Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
+}
+
+fn parse_storage_lease_env() -> eyre::Result<RawFd> {
+    let encoded = std::env::var(ENV_STORAGE_LEASES)
+        .map_err(|_| eyre::eyre!("{ENV_STORAGE_LEASES} is required for managed launch"))?;
+    parse_storage_lease(&encoded)
+}
+
+fn parse_storage_lease(encoded: &str) -> eyre::Result<RawFd> {
+    eyre::ensure!(
+        encoded.len() <= 64,
+        "storage lease environment exceeds 64 bytes"
+    );
+    let [raw]: [RawFd; 1] = serde_json::from_str(encoded)
+        .map_err(|error| eyre::eyre!("invalid storage lease descriptor array: {error}"))?;
+    eyre::ensure!(raw >= 3, "storage lease descriptor must be above stderr");
+    Ok(raw)
 }
 
 pub struct SyncReporter {
@@ -255,21 +412,42 @@ impl ParentLossMonitor {
 
 /// Retains the primary VM even when initialization returns before a context exists.
 #[derive(Clone, Default)]
-pub(crate) struct PrimaryMachine(Arc<std::sync::Mutex<Option<VirtualMachine>>>);
+pub(crate) struct PrimaryMachine {
+    machine: Arc<std::sync::Mutex<Option<VirtualMachine>>>,
+    shutdown: Arc<std::sync::Mutex<Option<Arc<crate::guest::shutdown::ShutdownState>>>>,
+}
 
 impl PrimaryMachine {
     pub(crate) fn get(&self) -> Option<VirtualMachine> {
-        self.0
+        self.machine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    fn set(&self, machine: VirtualMachine) {
-        *self
-            .0
+    pub(crate) fn shutdown_state(
+        &self,
+    ) -> eyre::Result<Option<Arc<crate::guest::shutdown::ShutdownState>>> {
+        self.shutdown
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(machine);
+            .map(|state| state.clone())
+            .map_err(|_| eyre::eyre!("primary shutdown state poisoned"))
+    }
+
+    fn set(
+        &self,
+        machine: VirtualMachine,
+        shutdown: Arc<crate::guest::shutdown::ShutdownState>,
+    ) -> eyre::Result<()> {
+        *self
+            .machine
+            .lock()
+            .map_err(|_| eyre::eyre!("primary machine state poisoned"))? = Some(machine);
+        *self
+            .shutdown
+            .lock()
+            .map_err(|_| eyre::eyre!("primary shutdown state poisoned"))? = Some(shutdown);
+        Ok(())
     }
 }
 
@@ -307,6 +485,9 @@ pub async fn init(
         serial_file,
         primary_machine,
     } = inputs;
+    let machine_uuid = crate::start_request::parse_uuid("machine ID", machine_id)?;
+    let run_uuid = crate::start_request::parse_uuid("machine run ID", machine_run_id)?;
+    let storage_lease = start_request.storage_lease()?;
     let start_request = tokio::select! {
         biased;
         () = startup_cancel.cancelled() => return Err(eyre::eyre!("startup cancelled before launch request")),
@@ -314,6 +495,10 @@ pub async fn init(
     };
     let startup_deadline = tokio::time::Instant::now()
         + std::time::Duration::from_millis(start_request.effective_startup_budget_ms());
+    let shutdown_state = Arc::new(
+        crate::guest::shutdown::ShutdownState::new(start_request.storage_shutdown)
+            .map_err(eyre::Report::msg)?,
+    );
     let spec = load_spec(runtime)?;
     spec.validate().map_err(|error| {
         eyre::eyre!(
@@ -323,7 +508,9 @@ pub async fn init(
     })?;
     let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
-    let selected_backend = resolve_backend(start_request.virt_backend.as_ref())?;
+    let backend_selection =
+        crate::capabilities::ResolvedSelection::from_start(start_request.virt_backend.as_ref())?;
+    let selected_backend = backend_selection.backend_kind()?;
     let rosetta_intent = resolve_rosetta_intent(
         &spec,
         selected_backend,
@@ -355,7 +542,7 @@ pub async fn init(
         .transpose()?;
     let mux_filename =
         vm_spec::effective_vsock_filename(spec.vsock.as_ref()).and_then(|path| path.to_str());
-    let machine_config = vm_spec_machine_config(VmSpecInputs {
+    let mut machine_config = vm_spec_machine_config(VmSpecInputs {
         name,
         id: machine_id,
         data_dir: runtime.dir(),
@@ -366,11 +553,36 @@ pub async fn init(
         rosetta_intent,
         prepared_rosetta,
     })?;
-    let (machine, park_timeout) = create_virtual_machine(
-        selected_backend,
-        start_request.virt_backend.as_ref(),
-        machine_config.config,
-    )?;
+    machine_config.config = machine_config
+        .config
+        .with_storage_launch(crate::virt::StorageLaunch {
+            machine_id: machine_id.to_string(),
+            run_id: machine_run_id.to_string(),
+            holder_path: runtime.runtime_dir().join("vm.storage-holder.json"),
+            binding: start_request.storage_lease,
+            lease: storage_lease,
+        });
+    #[cfg(feature = "mock-backend")]
+    let machine_config = {
+        let mut machine_config = machine_config;
+        backend_selection.configure_mock(&mut machine_config.config);
+        machine_config
+    };
+    let host_live = backend_selection.host_report()?;
+    let machine_live = backend_selection.machine_vector(host_live.live, &machine_config.config);
+    let store = Arc::new(InstanceStore::new(
+        machine_uuid.hyphenated().to_string(),
+        name.to_string(),
+        guest_services_enabled,
+        RunLiveProfile {
+            run_id: run_uuid.hyphenated().to_string(),
+            backend: host_live.backend,
+            lane: host_live.lane,
+            live: machine_live,
+        },
+    )?);
+    let (machine, park_timeout) = create_virtual_machine(selected_backend, machine_config.config)?;
+    primary_machine.set(machine.clone(), shutdown_state.clone())?;
     let forwards = crate::forward::ForwardTable::prepare_machine(
         &spec.forwards,
         runtime.runtime_dir(),
@@ -382,7 +594,6 @@ pub async fn init(
         forwards.set_agent_availability(crate::forward::GuestHalfAvailability::Unsupported);
     }
 
-    primary_machine.set(machine.clone());
     let serial_console = machine.serial();
     serial_console
         .add_sink(tokio::fs::File::from_std(serial_file))
@@ -393,17 +604,6 @@ pub async fn init(
             std::fs::write(machine_identifier_path, machine_identifier.bytes())?;
         }
     }
-
-    let machine_id = uuid::Uuid::parse_str(machine_id)
-        .map_err(|error| eyre::eyre!("invalid machine UUID {machine_id}: {error}"))?;
-    let machine_run_id = uuid::Uuid::parse_str(machine_run_id)
-        .map_err(|error| eyre::eyre!("invalid machine run UUID {machine_run_id}: {error}"))?;
-    let store = Arc::new(new_instance_store_with_backend(
-        machine_id.hyphenated().to_string(),
-        name.to_string(),
-        guest_services_enabled,
-        selected_backend.name().to_string(),
-    ));
 
     store.set_vm_state(VmState::Starting, "vm starting")?;
     let registration = tokio::select! {
@@ -462,8 +662,8 @@ pub async fn init(
 
     Ok(InitResult {
         context: DaemonContext {
-            machine_id,
-            machine_run_id,
+            machine_id: machine_uuid,
+            machine_run_id: run_uuid,
             guest_services_enabled,
             machine,
             serial_console,
@@ -471,6 +671,7 @@ pub async fn init(
             forwards,
             stop_requested: CancellationToken::new(),
             shutdown: CancellationToken::new(),
+            shutdown_state,
         },
         startup_command: start_request.startup_command,
         vsock_surface,
@@ -533,48 +734,6 @@ async fn prepare_rosetta(
     Ok(None)
 }
 
-/// Construct the machine on the backend the start request selects; absent
-/// selection means the platform default. Selecting "mock" in a silo-vmm built
-/// without the mock-backend feature fails cleanly (surfaced on the syncpipe
-/// as a start failure).
-fn resolve_backend(
-    virt_backend: Option<&crate::start_request::VirtBackendRequest>,
-) -> eyre::Result<crate::virt::BackendKind> {
-    let kind = match virt_backend {
-        None => crate::virt::BackendKind::default_for_host()?,
-        Some(backend) if backend.kind == "krun" => crate::virt::BackendKind::Krun,
-        Some(backend) if backend.kind == "vz" => crate::virt::BackendKind::Vz,
-        Some(backend) if backend.kind == "mock" => {
-            #[cfg(feature = "mock-backend")]
-            {
-                crate::virt::BackendKind::Mock
-            }
-            #[cfg(not(feature = "mock-backend"))]
-            {
-                return Err(crate::virt::VirtError::UnsupportedBackend {
-                    kind: "mock",
-                    reason: "silo-vmm was built without the mock-backend feature".to_string(),
-                }
-                .into());
-            }
-        }
-        Some(backend) => {
-            return Err(eyre::eyre!(
-                "start request selected unknown virt backend {:?}",
-                backend.kind
-            ))
-        }
-    };
-    if !crate::virt::BackendKind::compiled().contains(&kind) {
-        return Err(crate::virt::VirtError::UnsupportedBackend {
-            kind: kind.name(),
-            reason: "backend is not compiled into this silo-vmm binary".to_string(),
-        }
-        .into());
-    }
-    Ok(kind)
-}
-
 fn resolve_rosetta_intent(
     spec: &VmSpec,
     backend: crate::virt::BackendKind,
@@ -626,21 +785,8 @@ fn resolve_rosetta_intent(
 
 fn create_virtual_machine(
     kind: crate::virt::BackendKind,
-    request: Option<&crate::start_request::VirtBackendRequest>,
     config: crate::virt::VmConfig,
 ) -> eyre::Result<(VirtualMachine, std::time::Duration)> {
-    #[cfg(feature = "mock-backend")]
-    let config = {
-        let mut config = config;
-        if kind == crate::virt::BackendKind::Mock {
-            if let Some(scenario) = request.and_then(|request| request.scenario.as_ref()) {
-                config.set_mock_scenario(scenario.clone());
-            }
-        }
-        config
-    };
-    #[cfg(not(feature = "mock-backend"))]
-    let _ = request;
     let park_timeout = config.park_timeout();
     Ok((VirtualMachine::with_backend(kind, config)?, park_timeout))
 }
@@ -785,6 +931,51 @@ mod tests {
         parse_network_arg, resolve_rosetta_intent, secure_machine_dir, SyncReporter,
     };
 
+    #[tokio::test]
+    async fn capabilities_nil_identities_fail_before_spec_or_backend_setup() {
+        let root = std::env::temp_dir().join(format!("silo-vmm-nil-{}", uuid::Uuid::new_v4()));
+        let runtime = crate::context::RuntimeContext::new(
+            root.join("data"),
+            root.join("run"),
+            root.join("missing-config"),
+            root.join("socket"),
+        );
+        let nil = uuid::Uuid::nil().to_string();
+        let valid = uuid::Uuid::new_v4().to_string();
+        for (machine_id, run_id) in [(&nil, &valid), (&valid, &nil)] {
+            let primary = crate::startup::PrimaryMachine::default();
+            let mut request =
+                crate::start_request::StartRequestPipe::from_fd(None).expect("idle request");
+            let result = crate::startup::init(
+                &runtime,
+                crate::startup::InitInputs {
+                    primary_machine: &primary,
+                    machine_id,
+                    machine_run_id: run_id,
+                    name: "nil-identity",
+                    network_args: &[],
+                    agent_enabled: false,
+                    serial_file: std::fs::File::open("/dev/null").expect("null"),
+                },
+                &mut request,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("nil identity must fail before startup"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("must not be the nil UUID"),
+                "{error}"
+            );
+            assert!(
+                !root.exists(),
+                "invalid startup must not create runtime state"
+            );
+        }
+    }
+
     fn rosetta_spec(enabled: bool) -> vm_spec::VmSpec {
         vm_spec::VmSpec {
             hardware: Some(vm_spec::Hardware {
@@ -896,8 +1087,21 @@ mod tests {
         let mut writer = std::fs::File::from(write_fd);
         std::io::Write::write_all(&mut writer, b"{invalid}\n").expect("write malformed request");
         drop(writer);
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("operation.lease"))
+            .expect("lease");
+        #[allow(deprecated)]
+        nix::fcntl::flock(lease.as_raw_fd(), nix::fcntl::FlockArg::LockSharedNonblock)
+            .expect("SH lease");
         let mut start_request = StartRequestPipe::from_fd(Some(read_fd.into_raw_fd()))
-            .expect("open start request pipe");
+            .expect("open start request pipe")
+            .with_storage_lease(std::sync::Arc::new(std::os::fd::OwnedFd::from(lease)));
         let machine_id = uuid::Uuid::new_v4().to_string();
         let run_id = uuid::Uuid::new_v4().to_string();
         let runtime = RuntimeContext::new(
@@ -994,13 +1198,39 @@ mod tests {
         std::fs::create_dir(&directory).expect("create test directory");
         let serial_file =
             std::fs::File::create(directory.join("serial.log")).expect("create serial file");
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("operation.lease"))
+            .expect("lease");
+        #[allow(deprecated)]
+        nix::fcntl::flock(lease.as_raw_fd(), nix::fcntl::FlockArg::LockSharedNonblock)
+            .expect("SH lease");
+        let stat = nix::sys::stat::fstat(&lease).expect("lease stat");
+        let target_len = encoded.len();
+        let mut request: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("fixture request");
+        request["storageLease"]["fileDevice"] = serde_json::json!(stat.st_dev as u64);
+        request["storageLease"]["fileInode"] = serde_json::json!(stat.st_ino as u64);
+        let mut encoded = serde_json::to_vec(&request).expect("bound fixture request");
+        // Keep the framing boundary under test while replacing maximal-width
+        // fixture identities with the actual inherited inode.
+        assert!(encoded.len() < target_len);
+        encoded.resize(target_len - 1, b' ');
+        encoded.push(b'\n');
+        let lease = std::sync::Arc::new(std::os::fd::OwnedFd::from(lease));
         let (read_fd, write_fd) = pipe().expect("create start pipe");
         let writer = tokio::task::spawn_blocking(move || {
             let mut writer = std::fs::File::from(write_fd);
             std::io::Write::write_all(&mut writer, &encoded).expect("write start request");
         });
         let mut start_request = StartRequestPipe::from_fd(Some(read_fd.into_raw_fd()))
-            .expect("open start request pipe");
+            .expect("open start request pipe")
+            .with_storage_lease(lease);
         let runtime = RuntimeContext::new(
             directory.clone(),
             directory.clone(),
@@ -1032,7 +1262,15 @@ mod tests {
         error
     }
 
-    fn encode_start_request(value: serde_json::Value) -> Vec<u8> {
+    fn encode_start_request(mut value: serde_json::Value) -> Vec<u8> {
+        value["storageLease"] = serde_json::json!({
+            "operationId":"33333333-3333-4333-8333-333333333333",
+            "fileDevice":u64::MAX, "fileInode":u64::MAX
+        });
+        value["storageShutdown"] = serde_json::json!({
+            "version":1, "machineId":value["machineId"], "runId":value["machineRunId"],
+            "manifest":{"kind":"unsupported","reason":"startup ordering fixture"}
+        });
         let mut encoded = serde_json::to_vec(&value).expect("encode start request");
         encoded.push(b'\n');
         encoded
@@ -1050,15 +1288,24 @@ mod tests {
         set_cloexec(start_read.as_raw_fd(), true).expect("set start CLOEXEC");
         set_cloexec(sync_write.as_raw_fd(), true).expect("set sync CLOEXEC");
 
-        InheritedPipeFds {
+        let inherited = InheritedPipeFds {
             startpipe: Some(start_read.as_raw_fd()),
             syncpipe: Some(sync_write.as_raw_fd()),
             machine_log_dir: None,
             machine_lock: None,
             netd_exit: None,
-        }
-        .clear_cloexec()
-        .expect("preserve inherited pipes");
+            storage_lease: None,
+        };
+        let mut child = std::process::Command::new("/bin/sh");
+        child.arg("-c").arg(format!(
+            "test -e /dev/fd/{} && test -e /dev/fd/{}",
+            start_read.as_raw_fd(),
+            sync_write.as_raw_fd()
+        ));
+        inherited
+            .configure_reexec(&mut child)
+            .expect("configure daemon child");
+        assert!(child.status().expect("daemon reexec inheritance").success());
 
         for fd in [start_read.as_raw_fd(), sync_write.as_raw_fd()] {
             let flags = nix::fcntl::fcntl(
@@ -1066,7 +1313,7 @@ mod tests {
                 nix::fcntl::FcntlArg::F_GETFD,
             )
             .expect("read fd flags");
-            assert!(!nix::fcntl::FdFlag::from_bits_retain(flags)
+            assert!(nix::fcntl::FdFlag::from_bits_retain(flags)
                 .contains(nix::fcntl::FdFlag::FD_CLOEXEC));
         }
     }
@@ -1076,12 +1323,13 @@ mod tests {
         use std::os::fd::{AsRawFd, IntoRawFd};
         let (mut reader, writer) = std::io::pipe().expect("pipe");
         let fd = writer.into_raw_fd();
-        let inherited = crate::startup::InheritedPipeFds {
+        let mut inherited = crate::startup::InheritedPipeFds {
             startpipe: None,
             syncpipe: None,
             machine_log_dir: None,
             machine_lock: None,
             netd_exit: Some(fd),
+            storage_lease: None,
         };
         let lease = inherited
             .take_netd_exit()
@@ -1128,28 +1376,30 @@ mod tests {
 
         let (start_read, start_write) = pipe().expect("create start pipe");
         let (sync_read, sync_write) = pipe().expect("create sync pipe");
-        InheritedPipeFds {
+        let inherited = InheritedPipeFds {
             startpipe: Some(start_read.as_raw_fd()),
             syncpipe: Some(sync_write.as_raw_fd()),
             machine_log_dir: None,
             machine_lock: None,
             netd_exit: None,
-        }
-        .clear_cloexec()
-        .expect("preserve inherited pipes");
+            storage_lease: None,
+        };
         let script = format!(
             "IFS= read -r line <&{}; printf 'received:%s\\n' \"$line\" >&{}",
             start_read.as_raw_fd(),
             sync_write.as_raw_fd()
         );
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(script)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn inherited-fd child");
+            .stderr(Stdio::null());
+        inherited
+            .configure_reexec(&mut command)
+            .expect("configure daemon child");
+        let mut child = command.spawn().expect("spawn inherited-fd child");
         drop(start_read);
         drop(sync_write);
 
@@ -1304,5 +1554,82 @@ mod tests {
                 mac: "02:00:00:00:00:01".to_string()
             }
         );
+    }
+
+    #[test]
+    fn generation_lease_environment_is_one_bounded_integer_array() {
+        use crate::startup::parse_storage_lease;
+        assert_eq!(parse_storage_lease("[3]").unwrap(), 3);
+        assert_eq!(parse_storage_lease("[2147483647]").unwrap(), i32::MAX);
+        assert_eq!(
+            parse_storage_lease(&format!("{}[3]", " ".repeat(61))).unwrap(),
+            3
+        );
+        for invalid in [
+            "",
+            "3",
+            "[]",
+            "[3,4]",
+            "[3,3]",
+            "[2]",
+            "[-1]",
+            "[2147483648]",
+            "[3.0]",
+            "[3e0]",
+            "[\"3\"]",
+            "[true]",
+            "[null]",
+            "[03]",
+            "[3]x",
+        ] {
+            assert!(parse_storage_lease(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(parse_storage_lease(&format!("{}[3]", " ".repeat(62))).is_err());
+    }
+
+    #[test]
+    fn inherited_set_rejects_aliases_before_ownership_and_lease_is_taken_once() {
+        use crate::startup::InheritedPipeFds;
+        use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "monitor-inheritance-{}.lease",
+            uuid::Uuid::new_v4()
+        ));
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let duplicate = lease.try_clone().unwrap();
+        let mut inherited = InheritedPipeFds {
+            startpipe: None,
+            syncpipe: None,
+            machine_log_dir: None,
+            machine_lock: Some(duplicate.as_raw_fd()),
+            netd_exit: None,
+            storage_lease: Some(lease.as_raw_fd()),
+        };
+        assert!(
+            inherited.validate_set().is_err(),
+            "distinct numbers alias the same inode"
+        );
+        nix::fcntl::fcntl(&lease, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        nix::fcntl::fcntl(&duplicate, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        inherited.machine_lock = None;
+        inherited.validate_set().unwrap();
+        let raw = lease.into_raw_fd();
+        assert_eq!(inherited.storage_lease, Some(raw));
+        let adopted = inherited.take_storage_lease().unwrap();
+        assert!(
+            inherited.take_storage_lease().is_err(),
+            "cannot double-adopt a raw descriptor"
+        );
+        nix::fcntl::fcntl(adopted.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        drop(adopted);
+        drop(duplicate);
+        std::fs::remove_file(path).unwrap();
     }
 }
