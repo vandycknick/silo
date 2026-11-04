@@ -9,8 +9,6 @@ pub enum ReadError {
     CouldNotReadSuperBlock(PathBuf, u64, usize),
     #[error("not a valid ext4 superblock")]
     InvalidSuperBlock,
-    #[error("deep extents (depth > 1) are not supported")]
-    DeepExtentsUnsupported,
     #[error("extents invalid or corrupted")]
     InvalidExtents,
     #[error("invalid extended attribute entry")]
@@ -52,7 +50,7 @@ pub enum FormatError {
     UnsupportedFiletype,
     #[error("maximum links exceeded for path: {0}")]
     MaximumLinksExceeded(PathBuf),
-    #[error("{0} exceeds max file size (128 GiB)")]
+    #[error("{0} exceeds max file size (1 TiB)")]
     FileTooBig(u64),
     #[error("'{0}' is an invalid link")]
     InvalidLink(PathBuf),
@@ -80,9 +78,25 @@ pub enum FormatError {
     XattrInsufficientSpace(u32),
     #[error("malformed extended attribute buffer")]
     MalformedXattrBuffer,
+    #[error("malformed POSIX ACL xattr")]
+    MalformedAcl,
+    #[error("invalid raw xattr name {0:?}")]
+    InvalidXattrName(Vec<u8>),
+    #[error("duplicate xattr name")]
+    DuplicateXattr,
+    #[error("device ID is outside Linux's 12-bit major / 20-bit minor encoding")]
+    InvalidDevice,
+    #[error("symlink target length {length} exceeds the ext4 maximum {maximum} bytes")]
+    SymlinkTargetTooLong { length: u64, maximum: u64 },
+    #[error("invalid inode metadata or content: {0}")]
+    InvalidMetadata(&'static str),
+    #[error("invalid sparse file ranges: {0}")]
+    InvalidSparse(&'static str),
+    #[error("filesystem size calculation overflow")]
+    SizeOverflow,
     #[error("cannot convert string '{0}' to ASCII")]
     InvalidAsciiString(String),
-    #[error("invalid path encoding for '{0}', must be ascii or utf8")]
+    #[error("invalid ext4 path '{0}'")]
     InvalidPathEncoding(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),

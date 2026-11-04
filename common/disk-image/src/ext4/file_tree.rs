@@ -2,8 +2,6 @@
 // being built.  Each node holds an inode number, name, optional block ranges,
 // and pointers (indices) into the flat `nodes` vector.
 
-use std::path::{Path, PathBuf};
-
 pub type InodeNumber = u32;
 
 /// A block range [start, end) in units of filesystem blocks.
@@ -16,7 +14,7 @@ pub struct BlockRange {
 /// A node in the in-memory file tree.
 pub struct FileTreeNode {
     pub inode: InodeNumber,
-    pub name: String,
+    pub name: Vec<u8>,
     /// Indices into `FileTree::nodes` for this node's children.
     pub children: Vec<usize>,
     /// Index into `FileTree::nodes` for the parent (None for root).
@@ -37,10 +35,10 @@ pub struct FileTree {
 
 impl FileTree {
     /// Create a new file tree with a single root node.
-    pub fn new(root_inode: InodeNumber, name: &str) -> Self {
+    pub fn new(root_inode: InodeNumber, name: impl AsRef<[u8]>) -> Self {
         let root = FileTreeNode {
             inode: root_inode,
-            name: name.to_string(),
+            name: name.as_ref().to_vec(),
             children: Vec::new(),
             parent: None,
             blocks: None,
@@ -76,14 +74,11 @@ impl FileTree {
     /// The path is split into components.  A leading "/" or empty first component
     /// is skipped so that both "/foo/bar" and "foo/bar" resolve identically.
     /// Returns `None` if any component is not found.
-    pub fn lookup(&self, path: &Path) -> Option<usize> {
+    pub fn lookup(&self, path: impl AsRef<[u8]>) -> Option<usize> {
         let mut current = self.root;
 
-        for component in path.components() {
-            let name = component.as_os_str().to_str()?;
-
-            // Skip the root directory prefix.
-            if name == "/" || name.is_empty() {
+        for name in path.as_ref().split(|byte| *byte == b'/') {
+            if name.is_empty() {
                 continue;
             }
 
@@ -115,11 +110,11 @@ impl FileTree {
     ///
     /// The node itself remains in the vector (indices are stable), but the
     /// parent no longer references it.
-    pub fn remove_child(&mut self, parent: usize, name: &str) {
+    pub fn remove_child(&mut self, parent: usize, name: impl AsRef<[u8]>) {
         let pos = self.nodes[parent]
             .children
             .iter()
-            .position(|&child_idx| self.nodes[child_idx].name == name);
+            .position(|&child_idx| self.nodes[child_idx].name == name.as_ref());
 
         if let Some(pos) = pos {
             self.nodes[parent].children.remove(pos);
@@ -127,12 +122,12 @@ impl FileTree {
     }
 
     /// Reconstruct the full path of a node by walking the parent chain.
-    pub fn node_path(&self, idx: usize) -> PathBuf {
+    pub fn node_path(&self, idx: usize) -> Vec<u8> {
         let mut parts = Vec::new();
         let mut current = idx;
 
         loop {
-            parts.push(self.nodes[current].name.as_str());
+            parts.push(self.nodes[current].name.as_slice());
             match self.nodes[current].parent {
                 Some(parent) => current = parent,
                 None => break,
@@ -141,9 +136,16 @@ impl FileTree {
 
         parts.reverse();
 
-        let mut path = PathBuf::new();
-        for part in &parts {
-            path.push(part);
+        let mut path = Vec::new();
+        for part in parts {
+            if part == b"/" || part == b"." {
+                continue;
+            }
+            path.push(b'/');
+            path.extend_from_slice(part);
+        }
+        if path.is_empty() {
+            path.push(b'/');
         }
         path
     }
@@ -151,14 +153,14 @@ impl FileTree {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ext4::file_tree::*;
 
     #[test]
     fn test_new_tree_has_root() {
         let tree = FileTree::new(2, "/");
         assert_eq!(tree.root(), 0);
         assert_eq!(tree.node(0).inode, 2);
-        assert_eq!(tree.node(0).name, "/");
+        assert_eq!(tree.node(0).name, b"/");
     }
 
     #[test]
@@ -166,7 +168,7 @@ mod tests {
         let mut tree = FileTree::new(2, "/");
         let child = FileTreeNode {
             inode: 11,
-            name: "etc".to_string(),
+            name: b"etc".to_vec(),
             children: Vec::new(),
             parent: None,
             blocks: None,
@@ -177,7 +179,7 @@ mod tests {
 
         let grandchild = FileTreeNode {
             inode: 12,
-            name: "passwd".to_string(),
+            name: b"passwd".to_vec(),
             children: Vec::new(),
             parent: None,
             blocks: None,
@@ -187,19 +189,19 @@ mod tests {
         tree.add_child(etc_idx, grandchild);
 
         // Lookup with leading slash.
-        assert_eq!(tree.lookup(Path::new("/etc/passwd")), Some(2));
+        assert_eq!(tree.lookup("/etc/passwd"), Some(2));
 
         // Lookup without leading slash.
-        assert_eq!(tree.lookup(Path::new("etc/passwd")), Some(2));
+        assert_eq!(tree.lookup("etc/passwd"), Some(2));
 
         // Lookup directory itself.
-        assert_eq!(tree.lookup(Path::new("/etc")), Some(1));
+        assert_eq!(tree.lookup("/etc"), Some(1));
 
         // Lookup root.
-        assert_eq!(tree.lookup(Path::new("/")), Some(0));
+        assert_eq!(tree.lookup("/"), Some(0));
 
         // Missing path.
-        assert_eq!(tree.lookup(Path::new("/etc/shadow")), None);
+        assert_eq!(tree.lookup("/etc/shadow"), None);
     }
 
     #[test]
@@ -207,7 +209,7 @@ mod tests {
         let mut tree = FileTree::new(2, "/");
         let child_a = FileTreeNode {
             inode: 11,
-            name: "a".to_string(),
+            name: b"a".to_vec(),
             children: Vec::new(),
             parent: None,
             blocks: None,
@@ -216,7 +218,7 @@ mod tests {
         };
         let child_b = FileTreeNode {
             inode: 12,
-            name: "b".to_string(),
+            name: b"b".to_vec(),
             children: Vec::new(),
             parent: None,
             blocks: None,
@@ -230,7 +232,7 @@ mod tests {
 
         tree.remove_child(tree.root(), "a");
         assert_eq!(tree.node(tree.root()).children.len(), 1);
-        assert_eq!(tree.node(tree.node(tree.root()).children[0]).name, "b");
+        assert_eq!(tree.node(tree.node(tree.root()).children[0]).name, b"b");
     }
 
     #[test]
@@ -238,7 +240,7 @@ mod tests {
         let mut tree = FileTree::new(2, "/");
         let etc = FileTreeNode {
             inode: 11,
-            name: "etc".to_string(),
+            name: b"etc".to_vec(),
             children: Vec::new(),
             parent: None,
             blocks: None,
@@ -249,7 +251,7 @@ mod tests {
 
         let passwd = FileTreeNode {
             inode: 12,
-            name: "passwd".to_string(),
+            name: b"passwd".to_vec(),
             children: Vec::new(),
             parent: None,
             blocks: None,
@@ -259,6 +261,6 @@ mod tests {
         let passwd_idx = tree.add_child(etc_idx, passwd);
 
         let path = tree.node_path(passwd_idx);
-        assert_eq!(path, PathBuf::from("/etc/passwd"));
+        assert_eq!(path, b"/etc/passwd");
     }
 }

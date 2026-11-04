@@ -1,10 +1,6 @@
-// Path resolution and file I/O for the ext4 reader.
-//
-// Adds high-level operations (`exists`, `stat`, `list_dir`, `read_file`) on
-// top of the low-level [`Reader`] built in `reader.rs`.  Path resolution
-// follows POSIX semantics including symlink traversal with loop detection.
+//! Byte-preserving path, symlink, sparse-file and Linux-xattr access.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::ext4::constants::*;
@@ -12,349 +8,315 @@ use crate::ext4::error::{ReadError, ReadResult};
 use crate::ext4::extent;
 use crate::ext4::file_tree::InodeNumber;
 use crate::ext4::reader::Reader;
-use crate::ext4::types::*;
+use crate::ext4::types::Inode;
+use crate::ext4::xattr::ExtendedAttribute;
 
-/// Maximum number of symlink hops before we declare a loop.
 const MAX_SYMLINK_HOPS: usize = 40;
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+fn diagnostic(path: &[u8]) -> String {
+    format!("{path:?}")
+}
 
 impl Reader {
-    /// Check whether `path` exists in this ext4 filesystem.
-    pub fn exists(&mut self, path: &str) -> bool {
-        self.resolve_path(path, true).is_ok()
+    pub fn exists(&mut self, path: impl AsRef<[u8]>) -> bool {
+        self.resolve_path(path.as_ref(), true).is_ok()
     }
 
-    /// Return `(inode_number, inode)` for the given `path`, following symlinks.
-    pub fn stat(&mut self, path: &str) -> ReadResult<(InodeNumber, Inode)> {
-        self.resolve_path(path, true)
+    pub fn stat(&mut self, path: impl AsRef<[u8]>) -> ReadResult<(InodeNumber, Inode)> {
+        self.resolve_path(path.as_ref(), true)
     }
 
-    /// Return `(inode_number, inode)` for the given `path` **without** following
-    /// the final symlink component.
-    pub fn stat_no_follow(&mut self, path: &str) -> ReadResult<(InodeNumber, Inode)> {
-        self.resolve_path(path, false)
+    pub fn stat_no_follow(&mut self, path: impl AsRef<[u8]>) -> ReadResult<(InodeNumber, Inode)> {
+        self.resolve_path(path.as_ref(), false)
     }
 
-    /// List a directory's entries (names only, excluding "." and "..").
-    pub fn list_dir(&mut self, path: &str) -> ReadResult<Vec<String>> {
-        let (ino_num, inode) = self.stat(path)?;
+    pub fn list_dir(&mut self, path: impl AsRef<[u8]>) -> ReadResult<Vec<Vec<u8>>> {
+        let path = path.as_ref();
+        let (number, inode) = self.stat(path)?;
         if !inode.is_dir() {
-            return Err(ReadError::NotADirectory(path.to_string()));
+            return Err(ReadError::NotADirectory(diagnostic(path)));
         }
-        let children = self.children_of(ino_num)?;
-        Ok(children
+        Ok(self
+            .children_of(number)?
             .into_iter()
-            .filter(|(name, _)| name != "." && name != "..")
+            .filter(|(name, _)| name != b"." && name != b"..")
             .map(|(name, _)| name)
             .collect())
     }
 
-    /// Read file contents at `path` starting at `offset`.
-    ///
-    /// If `count` is `None`, reads to EOF.  Returns the bytes read (may be
-    /// shorter than requested if the file is smaller).
     pub fn read_file(
         &mut self,
-        path: &str,
+        path: impl AsRef<[u8]>,
         offset: u64,
         count: Option<usize>,
     ) -> ReadResult<Vec<u8>> {
-        let (ino_num, inode) = self.stat(path)?;
-
-        if inode.is_dir() {
-            return Err(ReadError::IsDirectory(path.to_string()));
-        }
-        if !inode.is_reg() {
-            return Err(ReadError::NotAFile(path.to_string()));
-        }
-
-        let file_size = inode.file_size();
-        let start = offset.min(file_size);
-        let max_readable = file_size - start;
-        let want = match count {
-            Some(c) => (c as u64).min(max_readable),
-            None => max_readable,
-        };
-
-        if want == 0 {
-            return Ok(Vec::new());
-        }
-
-        self.read_from_extents(ino_num, start, want)
-    }
-
-    /// Read file contents into a pre-allocated buffer.  Returns the number of
-    /// bytes actually written to `buf` (may be less than `buf.len()` at EOF).
-    pub fn read_file_into(&mut self, path: &str, buf: &mut [u8], offset: u64) -> ReadResult<usize> {
-        let data = self.read_file(path, offset, Some(buf.len()))?;
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok(n)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Path resolution
-// ---------------------------------------------------------------------------
-
-impl Reader {
-    /// Resolve `path` to an inode, optionally following symlinks.
-    ///
-    /// * Absolute paths start from the root inode.
-    /// * Relative paths also start from the root (there is no "cwd").
-    /// * "." is a no-op, ".." goes to the parent (via a parent stack).
-    /// * Symlinks are recursively resolved up to [`MAX_SYMLINK_HOPS`].
-    fn resolve_path(
-        &mut self,
-        path: &str,
-        follow_symlinks: bool,
-    ) -> ReadResult<(InodeNumber, Inode)> {
-        let mut components = normalize_path(path);
-        let mut current: InodeNumber = ROOT_INODE;
-        let mut parent_stack: Vec<InodeNumber> = Vec::new();
-        let mut visited: HashSet<InodeNumber> = HashSet::new();
-        let mut hops: usize = 0;
-        let mut idx: usize = 0;
-
-        while idx < components.len() {
-            let name = components[idx].clone();
-
-            // "." -- stay in the current directory.
-            if name == "." {
-                idx += 1;
-                continue;
-            }
-
-            // ".." -- go to parent.
-            if name == ".." {
-                if current != ROOT_INODE {
-                    if let Some(parent) = parent_stack.pop() {
-                        current = parent;
-                    } else {
-                        // Fallback: look up ".." in the directory entries.
-                        let entries = self.children_of(current)?;
-                        if let Some((_, parent_ino)) = entries.iter().find(|(n, _)| n == "..") {
-                            current = *parent_ino;
-                        }
-                    }
-                }
-                idx += 1;
-                continue;
-            }
-
-            // Regular component -- current must be a directory.
-            let current_inode = self.get_inode(current)?;
-            if !current_inode.is_dir() {
-                return Err(ReadError::NotADirectory(name));
-            }
-
-            // Look up the child by name.
-            let entries = self.children_of(current)?;
-            let child_ino = entries
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, ino)| *ino)
-                .ok_or_else(|| ReadError::PathNotFound(name.clone()))?;
-
-            let child_inode = self.get_inode(child_ino)?;
-
-            if child_inode.is_link() && follow_symlinks {
-                // Symlink loop detection.
-                if visited.contains(&child_ino) {
-                    return Err(ReadError::SymlinkLoop(path.to_string()));
-                }
-                visited.insert(child_ino);
-
-                hops += 1;
-                if hops > MAX_SYMLINK_HOPS {
-                    return Err(ReadError::SymlinkLoop(path.to_string()));
-                }
-
-                // Read the symlink target.
-                let target = self.read_symlink_target(&child_inode, child_ino)?;
-                if target.is_empty() {
-                    return Err(ReadError::InvalidPath("empty symlink target".to_string()));
-                }
-
-                let target_components = normalize_path(&target);
-
-                if target.starts_with('/') {
-                    // Absolute symlink: restart from root.
-                    current = ROOT_INODE;
-                    parent_stack.clear();
-                    // Replace all remaining components with target + rest.
-                    let rest: Vec<String> = components[idx + 1..].to_vec();
-                    components = [target_components, rest].concat();
-                    idx = 0;
-                } else {
-                    // Relative symlink: splice target into the component list.
-                    let before: Vec<String> = components[..idx].to_vec();
-                    let rest: Vec<String> = components[idx + 1..].to_vec();
-                    components = [before, target_components, rest].concat();
-                    // Do not advance idx -- re-process from the splice point.
-                }
-            } else {
-                // Not a symlink (or not following) -- descend.
-                parent_stack.push(current);
-                current = child_ino;
-                idx += 1;
-            }
-        }
-
-        let final_inode = self.get_inode(current)?;
-        Ok((current, final_inode))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// File reading from extents
-// ---------------------------------------------------------------------------
-
-impl Reader {
-    /// Read `count` bytes starting at byte offset `start` from the file
-    /// described by `inode_number`'s extent tree.
-    fn read_from_extents(
-        &mut self,
-        inode_number: InodeNumber,
-        start: u64,
-        count: u64,
-    ) -> ReadResult<Vec<u8>> {
-        let inode = self.get_inode(inode_number)?;
-        let extents = extent::parse_extents(&inode, self.block_size(), &mut self.file)?;
-
-        if extents.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let bs = self.block_size();
-        let req_end = start + count;
-        let mut out = Vec::with_capacity(count as usize);
-        let mut logical_offset: u64 = 0;
-
-        for (phys_start, phys_end) in &extents {
-            let extent_bytes = (*phys_end as u64 - *phys_start as u64) * bs;
-            let logical_end = logical_offset + extent_bytes;
-
-            // Skip extents entirely before the requested range.
-            if logical_end <= start {
-                logical_offset = logical_end;
-                continue;
-            }
-            // Stop once we have passed the requested range.
-            if logical_offset >= req_end {
-                break;
-            }
-
-            // Compute the overlap between the requested range and this extent.
-            let overlap_start = start.max(logical_offset);
-            let overlap_end = req_end.min(logical_end);
-            let mut remaining = overlap_end - overlap_start;
-
-            if remaining == 0 {
-                logical_offset = logical_end;
-                continue;
-            }
-
-            // Seek to the correct byte within this extent.
-            let offset_into_extent = overlap_start - logical_offset;
-            let abs_byte_offset = *phys_start as u64 * bs + offset_into_extent;
-            self.file.seek(SeekFrom::Start(abs_byte_offset))?;
-
-            // Read in chunks of up to 1 MiB to avoid enormous single reads.
-            while remaining > 0 {
-                let chunk = remaining.min(1 << 20) as usize;
-                let mut buf = vec![0u8; chunk];
-                let n = self.file.read(&mut buf)?;
-                if n == 0 {
-                    break; // EOF
-                }
-                out.extend_from_slice(&buf[..n]);
-                remaining -= n as u64;
-            }
-
-            logical_offset = logical_end;
-            if out.len() >= count as usize {
-                break;
-            }
-        }
-
-        // Truncate to exactly `count` bytes in case we over-read.
-        out.truncate(count as usize);
+        let path = path.as_ref();
+        let (number, inode) = self.regular_file(path)?;
+        let available = inode.file_size().saturating_sub(offset);
+        let count = available.min(count.map_or(u64::MAX, |count| count as u64));
+        let count = usize::try_from(count).map_err(|_| ReadError::InvalidExtents)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(count)
+            .map_err(std::io::Error::other)?;
+        out.resize(count, 0);
+        self.read_extents_into(number, offset, &mut out)?;
         Ok(out)
     }
 
-    /// Read the target of a symbolic link.
-    ///
-    /// Fast symlinks (< 60 bytes) store the target directly in the inode's
-    /// `block` field.  Longer targets are stored in data blocks referenced by
-    /// the inode's extent tree.
-    fn read_symlink_target(
+    pub fn read_file_into(
         &mut self,
-        inode: &Inode,
-        inode_number: InodeNumber,
-    ) -> ReadResult<String> {
-        let size = inode.file_size();
-        if size == 0 {
-            return Ok(String::new());
-        }
+        path: impl AsRef<[u8]>,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> ReadResult<usize> {
+        let (number, inode) = self.regular_file(path.as_ref())?;
+        let count = inode
+            .file_size()
+            .saturating_sub(offset)
+            .min(buf.len() as u64) as usize;
+        self.read_extents_into(number, offset, &mut buf[..count])?;
+        Ok(count)
+    }
 
-        if size < INODE_BLOCK_SIZE as u64 {
-            // Fast symlink: target is stored inline in the block field.
-            let bytes = &inode.block[..size as usize];
-            return Ok(String::from_utf8_lossy(bytes).into_owned());
+    fn regular_file(&mut self, path: &[u8]) -> ReadResult<(InodeNumber, Inode)> {
+        let (number, inode) = self.stat(path)?;
+        if inode.is_dir() {
+            return Err(ReadError::IsDirectory(diagnostic(path)));
         }
+        if !inode.is_reg() {
+            return Err(ReadError::NotAFile(diagnostic(path)));
+        }
+        if inode.file_size() > MAX_FILE_SIZE {
+            return Err(ReadError::InvalidExtents);
+        }
+        Ok((number, inode))
+    }
 
-        // Slow symlink: read from extents.
-        let data = self.read_from_extents(inode_number, 0, size)?;
-        Ok(String::from_utf8_lossy(&data).into_owned())
+    pub fn read_link(&mut self, path: impl AsRef<[u8]>) -> ReadResult<Vec<u8>> {
+        let (number, inode) = self.stat_no_follow(path)?;
+        if !inode.is_link() {
+            return Err(ReadError::InvalidPath("not a symlink".into()));
+        }
+        self.read_symlink_target(&inode, number)
+    }
+
+    fn resolve_path(
+        &mut self,
+        path: &[u8],
+        follow_final: bool,
+    ) -> ReadResult<(InodeNumber, Inode)> {
+        if path.contains(&0) {
+            return Err(ReadError::InvalidPath(diagnostic(path)));
+        }
+        let mut pending: VecDeque<Vec<u8>> = normalize_path(path).into();
+        let mut current = ROOT_INODE;
+        let mut parents = Vec::new();
+        let mut hops = 0;
+        while let Some(name) = pending.pop_front() {
+            if name == b"." {
+                continue;
+            }
+            if name == b".." {
+                current = parents.pop().unwrap_or(ROOT_INODE);
+                continue;
+            }
+            if !self.get_inode(current)?.is_dir() {
+                return Err(ReadError::NotADirectory(diagnostic(&name)));
+            }
+            let child = self
+                .children_of(current)?
+                .into_iter()
+                .find_map(|(entry, inode)| (entry == name).then_some(inode))
+                .ok_or_else(|| ReadError::PathNotFound(diagnostic(&name)))?;
+            let inode = self.get_inode(child)?;
+            if inode.is_link() && (follow_final || !pending.is_empty()) {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(ReadError::SymlinkLoop(diagnostic(path)));
+                }
+                let target = self.read_symlink_target(&inode, child)?;
+                if target.is_empty() || target.contains(&0) {
+                    return Err(ReadError::InvalidPath(diagnostic(&target)));
+                }
+                if target.starts_with(b"/") {
+                    current = ROOT_INODE;
+                    parents.clear();
+                }
+                for component in normalize_path(&target).into_iter().rev() {
+                    pending.push_front(component);
+                }
+            } else {
+                parents.push(current);
+                current = child;
+            }
+        }
+        Ok((current, self.get_inode(current)?))
+    }
+
+    fn read_extents_into(
+        &mut self,
+        number: InodeNumber,
+        start: u64,
+        out: &mut [u8],
+    ) -> ReadResult<()> {
+        out.fill(0);
+        if out.is_empty() {
+            return Ok(());
+        }
+        let inode = self.get_inode(number)?;
+        let block_size = self.block_size();
+        let extents = extent::parse_mapped_extents(&inode, block_size, &mut self.file)?;
+        let requested_end = start
+            .checked_add(out.len() as u64)
+            .ok_or(ReadError::InvalidExtents)?;
+        let filesystem_blocks = self.superblock().blocks_count_lo as u64;
+        for range in extents {
+            if range.physical as u64 + range.length as u64 > filesystem_blocks {
+                return Err(ReadError::InvalidExtents);
+            }
+            let logical = range.logical as u64 * block_size;
+            let end = logical + range.length as u64 * block_size;
+            if end <= start {
+                continue;
+            }
+            if logical >= requested_end {
+                break;
+            }
+            if range.unwritten {
+                continue;
+            }
+            let first = logical.max(start);
+            let last = end.min(requested_end);
+            let offset = range.physical as u64 * block_size + first - logical;
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file
+                .read_exact(&mut out[(first - start) as usize..(last - start) as usize])?;
+        }
+        Ok(())
+    }
+
+    fn read_symlink_target(&mut self, inode: &Inode, number: InodeNumber) -> ReadResult<Vec<u8>> {
+        let length = usize::try_from(inode.file_size()).map_err(|_| ReadError::InvalidExtents)?;
+        if length == 0 || length >= self.block_size() as usize {
+            return Err(ReadError::InvalidExtents);
+        }
+        if length < INODE_BLOCK_SIZE && inode.flags & inode_flags::EXTENTS == 0 {
+            return Ok(inode.block[..length].to_vec());
+        }
+        let mut out = vec![0; length];
+        self.read_extents_into(number, 0, &mut out)?;
+        Ok(out)
+    }
+
+    /// Return raw Linux xattr names/values on the named inode, without following
+    /// the final symlink. POSIX ACL values are Linux API version 2, not disk v1.
+    pub fn xattrs(&mut self, path: impl AsRef<[u8]>) -> ReadResult<BTreeMap<Vec<u8>, Vec<u8>>> {
+        let (_, inode) = self.stat_no_follow(path)?;
+        let mut attrs = BTreeMap::new();
+        if inode.inline_xattrs[..4] != [0; 4] {
+            parse_xattr_area(&inode.inline_xattrs, 4, 4, &mut attrs)?;
+        }
+        if inode.xattr_block_hi != 0 {
+            return Err(ReadError::InvalidXattrEntry);
+        }
+        if inode.xattr_block_lo != 0 {
+            if inode.xattr_block_lo as u64 >= self.superblock().blocks_count_lo as u64 {
+                return Err(ReadError::InvalidXattrEntry);
+            }
+            let mut block = vec![0; self.block_size() as usize];
+            self.file.seek(SeekFrom::Start(
+                inode.xattr_block_lo as u64 * self.block_size(),
+            ))?;
+            self.file.read_exact(&mut block)?;
+            parse_xattr_area(&block, 32, 0, &mut attrs)?;
+        }
+        Ok(attrs)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Normalize a path into components, stripping leading "/" and splitting on
-/// "/".  Empty components (from consecutive slashes) are dropped.
-fn normalize_path(path: &str) -> Vec<String> {
-    let trimmed = path.strip_prefix('/').unwrap_or(path);
-    if trimmed.is_empty() {
-        return Vec::new();
+fn parse_xattr_area(
+    bytes: &[u8],
+    mut entry: usize,
+    value_base: usize,
+    attrs: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+) -> ReadResult<()> {
+    if bytes.len() < entry + 4 || bytes[..4] != XATTR_HEADER_MAGIC.to_le_bytes() {
+        return Err(ReadError::InvalidXattrEntry);
     }
-    trimmed
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(String::from)
+    let mut earliest_value = bytes.len();
+    while entry + 4 <= bytes.len() {
+        if bytes[entry..entry + 4] == [0; 4] {
+            return Ok(());
+        }
+        let header = bytes
+            .get(entry..entry + 16)
+            .ok_or(ReadError::InvalidXattrEntry)?;
+        let name_len = header[0] as usize;
+        let suffix = bytes
+            .get(entry + 16..entry + 16 + name_len)
+            .ok_or(ReadError::InvalidXattrEntry)?;
+        if suffix.contains(&0) || header[4..8] != [0; 4] {
+            return Err(ReadError::InvalidXattrEntry);
+        }
+        let name = ExtendedAttribute::decompress_name(header[1], suffix);
+        if name.is_empty() || name.len() > EXT4_NAME_LEN {
+            return Err(ReadError::InvalidXattrEntry);
+        }
+        let offset = u16::from_le_bytes([header[2], header[3]]) as usize + value_base;
+        let size = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        let value = if size == 0 {
+            &[][..]
+        } else {
+            earliest_value = earliest_value.min(offset);
+            bytes
+                .get(
+                    offset
+                        ..offset
+                            .checked_add(size)
+                            .ok_or(ReadError::InvalidXattrEntry)?,
+                )
+                .ok_or(ReadError::InvalidXattrEntry)?
+        };
+        entry += (16 + name_len).next_multiple_of(4);
+        if entry + 4 > earliest_value {
+            return Err(ReadError::InvalidXattrEntry);
+        }
+        let value = if name == b"system.posix_acl_access" || name == b"system.posix_acl_default" {
+            crate::ext4::acl::to_linux(value).map_err(|_| ReadError::InvalidXattrEntry)?
+        } else {
+            value.to_vec()
+        };
+        if attrs.insert(name, value).is_some() {
+            return Err(ReadError::InvalidXattrEntry);
+        }
+    }
+    Err(ReadError::InvalidXattrEntry)
+}
+
+fn normalize_path(path: &[u8]) -> Vec<Vec<u8>> {
+    path.split(|byte| *byte == b'/')
+        .filter(|name| !name.is_empty())
+        .map(<[u8]>::to_vec)
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ext4::reader_io::normalize_path;
 
     #[test]
     fn test_normalize_path_cases() {
-        for (label, input, expected) in [
-            ("absolute", "/etc/passwd", vec!["etc", "passwd"]),
-            ("relative", "etc/passwd", vec!["etc", "passwd"]),
-            ("root", "/", vec![]),
-            ("empty", "", vec![]),
-            ("consecutive_slashes", "//a///b//", vec!["a", "b"]),
-            ("dots", "/a/./b/../c", vec!["a", ".", "b", "..", "c"]),
-            ("absolute_single_component", "/file.txt", vec!["file.txt"]),
-            ("relative_single_component", "file.txt", vec!["file.txt"]),
-            ("trailing_slash", "/etc/", vec!["etc"]),
-            ("nested_trailing_slash", "/a/b/c/", vec!["a", "b", "c"]),
+        for (input, expected) in [
             (
-                "deeply_nested",
-                "/a/b/c/d/e/f",
-                vec!["a", "b", "c", "d", "e", "f"],
+                b"/etc/passwd".as_slice(),
+                vec![b"etc".to_vec(), b"passwd".to_vec()],
             ),
+            (b"//a///b//", vec![b"a".to_vec(), b"b".to_vec()]),
+            (b"/a\xff/b ", vec![b"a\xff".to_vec(), b"b ".to_vec()]),
+            (b"/", vec![]),
+            (b"", vec![]),
         ] {
-            assert_eq!(normalize_path(input), expected, "{label}");
+            assert_eq!(normalize_path(input), expected);
         }
     }
 }

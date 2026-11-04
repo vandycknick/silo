@@ -40,7 +40,7 @@ fn dir_file_type(mode: u16) -> u8 {
 #[allow(clippy::too_many_arguments)]
 pub fn write_dir_entry<W: Write>(
     writer: &mut W,
-    name: &str,
+    name: impl AsRef<[u8]>,
     inode: u32,
     mode: u16,
     link_inode: Option<u32>,
@@ -48,7 +48,17 @@ pub fn write_dir_entry<W: Write>(
     block_size: u32,
     left: &mut i32,
 ) -> io::Result<()> {
-    let name_bytes = name.as_bytes();
+    let name_bytes = name.as_ref();
+    if name_bytes.is_empty()
+        || name_bytes.len() > EXT4_NAME_LEN
+        || name_bytes.contains(&0)
+        || name_bytes.contains(&b'/')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid ext4 directory name",
+        ));
+    }
     let entry_size = align_up(DirectoryEntry::SIZE + name_bytes.len(), 4);
 
     // Minimum trailing entry is 12 bytes (header 8 + 4 for alignment).
@@ -139,7 +149,7 @@ pub fn finish_dir_entry_block<W: Write>(
 ///
 /// Returns a vector of `(name, inode_number)` pairs.  Deleted entries
 /// (inode == 0) and entries with zero-length names are skipped.
-pub fn parse_dir_entries(data: &[u8]) -> Vec<(String, u32)> {
+pub fn parse_dir_entries(data: &[u8]) -> Vec<(Vec<u8>, u32)> {
     let mut entries = Vec::new();
     let mut offset = 0;
 
@@ -156,7 +166,7 @@ pub fn parse_dir_entries(data: &[u8]) -> Vec<(String, u32)> {
             let name_end = name_start + entry.name_len as usize;
 
             if name_end <= data.len() {
-                let name = String::from_utf8_lossy(&data[name_start..name_end]).into_owned();
+                let name = data[name_start..name_end].to_vec();
                 entries.push((name, entry.inode));
             }
         }
@@ -169,7 +179,8 @@ pub fn parse_dir_entries(data: &[u8]) -> Vec<(String, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ext4::constants::file_mode;
+    use crate::ext4::dir::*;
 
     #[test]
     fn test_align_up() {
@@ -235,9 +246,9 @@ mod tests {
         // Parse back.
         let entries = parse_dir_entries(&buf);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], (".".to_string(), 2));
-        assert_eq!(entries[1], ("..".to_string(), 2));
-        assert_eq!(entries[2], ("hello.txt".to_string(), 11));
+        assert_eq!(entries[0], (b".".to_vec(), 2));
+        assert_eq!(entries[1], (b"..".to_vec(), 2));
+        assert_eq!(entries[2], (b"hello.txt".to_vec(), 11));
     }
 
     #[test]
@@ -277,7 +288,7 @@ mod tests {
         let entries = parse_dir_entries(&buf);
         assert_eq!(entries.len(), 1);
         // The inode number should be the link target (42), not the original (99).
-        assert_eq!(entries[0], ("link.txt".to_string(), 42));
+        assert_eq!(entries[0], (b"link.txt".to_vec(), 42));
     }
 
     #[test]

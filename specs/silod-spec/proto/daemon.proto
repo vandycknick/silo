@@ -10,6 +10,7 @@ service DaemonService {
  rpc GetRuntimeInfo(google.protobuf.Empty) returns (RuntimeInfo);
  rpc ReportTailscaleStatus(TailscaleStatusReport) returns (google.protobuf.Empty);
  rpc DrainMutations(DrainMutationsRequest) returns (google.protobuf.Empty);
+ rpc GetLiveCapabilities(google.protobuf.Empty) returns (LiveHostReport);
 }
 service MachineService {
  rpc ListMachines(google.protobuf.Empty) returns (stream MachineInventoryEntry);
@@ -28,6 +29,11 @@ service MachineService {
  rpc RemoveAfterRun(MachineRunRef) returns (google.protobuf.Empty);
  rpc ReadLogs(ReadLogsRequest) returns (stream LogChunk);
  rpc SetMachineSecret(SetMachineSecretRequest) returns (google.protobuf.Empty);
+ rpc PauseMachine(LiveMachineRequest) returns (google.protobuf.Empty);
+ rpc CaptureExecution(LiveCaptureRequest) returns (google.protobuf.Empty);
+ rpc ForkExecution(LiveForkRequest) returns (google.protobuf.Empty);
+ rpc ForkStopped(StoppedForkRequest) returns (MachineSnapshot);
+ rpc SnapshotStopped(CreateStorageSnapshotRequest) returns (StorageSnapshotInfo);
 }
 service NetworkService {
  rpc ListNetworkDefinitions(google.protobuf.Empty) returns (stream NetworkDefinition);
@@ -43,6 +49,12 @@ service RuntimeService {
  rpc ParseResource(ParseResourceRequest) returns (Size);
  rpc NormalizePolicy(NormalizePolicyRequest) returns (PolicyDocument);
  rpc CheckPolicySecrets(CheckPolicySecretsRequest) returns (PolicySecretsResult);
+ rpc RestoreExecution(LiveRestoreRequest) returns (google.protobuf.Empty);
+ rpc RestoreSnapshot(RestoreStorageSnapshotRequest) returns (MachineSnapshot);
+ rpc InspectStorageSnapshot(StorageSnapshotRef) returns (StorageSnapshotInfo);
+ rpc ListStorageSnapshots(google.protobuf.Empty) returns (StorageSnapshotList);
+ rpc ReleaseSnapshotRetention(StorageSnapshotRef) returns (google.protobuf.Empty);
+ rpc RemoveImageAlias(Name) returns (google.protobuf.Empty);
 }
 message Name { string name = 1; }
 message MachineRef { oneof reference { string id = 1; string name = 2; string id_prefix = 3; } }
@@ -56,7 +68,10 @@ message Agent { oneof mode { google.protobuf.Empty default_agent = 1; google.pro
 message User { string name = 1; uint32 uid = 2; uint32 gid = 3; string home = 4; }
 message GuestConfig { Agent agent = 1; User user = 2; }
 message Mount { bytes source = 1; string tag = 2; bool read_only = 3; }
-message Disk { bytes path = 1; bool read_only = 2; }
+enum DiskRole { DISK_ROLE_UNSPECIFIED = 0; DISK_ROLE_ROOT = 1; DISK_ROLE_ROOT_LOWER = 2; DISK_ROLE_ROOT_UPPER = 3; DISK_ROLE_DATA = 4; }
+enum DiskFormat { DISK_FORMAT_UNSPECIFIED = 0; DISK_FORMAT_RAW = 1; DISK_FORMAT_VMDK = 2; }
+message DiskGeometry { uint64 length = 1; uint32 logical_sector_size = 2; }
+message Disk { bytes path = 1; optional bool read_only = 2; optional DiskRole role = 3; optional DiskFormat format = 4; DiskGeometry geometry = 5; optional string block_id = 6; }
 message Address { oneof address { string tcp = 1; bytes unix = 2; } }
 message Endpoint { oneof endpoint { Address host = 1; Address guest = 2; uint32 vsock = 3; } }
 message Forward { Endpoint listen = 1; Endpoint connect = 2; optional uint32 unix_mode = 3; optional string name = 4; }
@@ -78,7 +93,9 @@ message NetworkDefinition { string name = 1; NetworkTopology topology = 2; Netwo
 message OptionalNetworkDefinition { NetworkDefinition definition = 1; }
 message CreateNetworkDefinitionRequest { NetworkDefinition definition = 1; }
 message SetMachineNetworkRequest { MachineRef machine = 1; ResolvedNetwork network = 2; }
-message NormalizedMachineCreate { optional string name = 1; optional string template_name = 2; map<string,string> labels = 3; ProcessConfig process = 4; Retention retention = 5; optional bytes kernel = 6; optional bytes initramfs = 7; repeated string kernel_args = 8; bool nested_virtualization = 9; bool rosetta = 10; repeated bytes disks = 11; repeated Mount mounts = 12; repeated Forward forwards = 13; optional bool vsock = 14; optional uint32 cpus = 15; optional uint64 memory_bytes = 16; optional uint64 root_disk_size_bytes = 17; optional string userdata = 18; ResolvedNetwork network = 19; Agent agent = 20; User provision_user = 21; }
+enum RootProfile { ROOT_PROFILE_UNSPECIFIED = 0; ROOT_PROFILE_OPAQUE_RAW = 1; ROOT_PROFILE_LINUX_FLAT_OVERLAY_V1 = 2; }
+message TemporaryDirectoryPolicy { oneof backing { google.protobuf.Empty disk_backed = 1; uint64 tmpfs_capacity_bytes = 2; } }
+message NormalizedMachineCreate { optional string name = 1; optional string template_name = 2; map<string,string> labels = 3; ProcessConfig process = 4; Retention retention = 5; optional bytes kernel = 6; optional bytes initramfs = 7; repeated string kernel_args = 8; bool nested_virtualization = 9; bool rosetta = 10; repeated bytes disks = 11; repeated Mount mounts = 12; repeated Forward forwards = 13; optional bool vsock = 14; optional uint32 cpus = 15; optional uint64 memory_bytes = 16; optional uint64 root_disk_size_bytes = 17; optional string userdata = 18; ResolvedNetwork network = 19; Agent agent = 20; User provision_user = 21; optional RootProfile root_profile = 22; TemporaryDirectoryPolicy temporary_directory = 23; }
 enum PullPolicy { PULL_POLICY_UNSPECIFIED = 0; PULL_POLICY_IF_MISSING = 1; PULL_POLICY_ALWAYS = 2; PULL_POLICY_NEVER = 3; }
 enum CacheState { CACHE_STATE_UNSPECIFIED = 0; CACHE_STATE_COMPLETE = 1; CACHE_STATE_MISSING = 2; }
 message OciIdentity { string requested_reference = 1; string selected_reference = 2; string platform = 3; string manifest_digest = 4; string config_digest = 5; PullPolicy pull_policy = 6; }
@@ -102,7 +119,7 @@ message RemoveMachineRequest { MachineRef machine = 1; }
 message PolicyUpdate { oneof update { string set = 1; google.protobuf.Empty clear = 2; } }
 message PublicationUpdate { oneof update { PublishBind set = 1; google.protobuf.Empty clear = 2; } }
 message UserUpdate { oneof update { User set = 1; google.protobuf.Empty clear = 2; } }
-message MachineUpdate { optional string name = 1; StringMap labels = 2; optional uint32 cpus = 3; optional uint64 memory_bytes = 4; optional uint64 root_disk_size_bytes = 5; optional bool nested_virtualization = 6; optional bool rosetta = 7; ForwardList forwards = 8; Vsock vsock = 9; ResolvedNetwork network = 10; PolicyUpdate policy = 11; PublicationUpdate publication = 12; GuestConfig guest = 13; UserUpdate user = 14; }
+message MachineUpdate { optional string name = 1; StringMap labels = 2; optional uint32 cpus = 3; optional uint64 memory_bytes = 4; optional uint64 root_disk_size_bytes = 5; optional bool nested_virtualization = 6; optional bool rosetta = 7; ForwardList forwards = 8; Vsock vsock = 9; ResolvedNetwork network = 10; PolicyUpdate policy = 11; PublicationUpdate publication = 12; GuestConfig guest = 13; UserUpdate user = 14; TemporaryDirectoryPolicy temporary_directory = 15; }
 message UpdateMachineRequest { MachineRef machine = 1; MachineUpdate update = 2; }
 message WaitReadyRequest { string id = 1; optional string expected_run = 2; google.protobuf.Duration timeout = 3; }
 message StopRunRequest { MachineRunRef machine = 1; google.protobuf.Duration timeout = 2; optional google.protobuf.Duration force_after = 3; }
@@ -124,7 +141,7 @@ enum ProvisionStepStatus { PROVISION_STEP_STATUS_UNSPECIFIED = 0; PROVISION_STEP
 enum ProvisionFailurePolicy { PROVISION_FAILURE_POLICY_UNSPECIFIED = 0; PROVISION_FAILURE_POLICY_BEST_EFFORT = 1; PROVISION_FAILURE_POLICY_FAIL_BOOT = 2; }
 message ProvisionStepReport { string id = 1; ProvisionStepStatus status = 2; ProvisionFailurePolicy failure_policy = 3; bool changed = 4; optional string backend = 5; google.protobuf.Duration duration = 6; optional string message = 7; optional string error_chain = 8; }
 message ProvisionReport { ProvisionStatus status = 1; google.protobuf.Timestamp started_at = 2; google.protobuf.Timestamp finished_at = 3; google.protobuf.Duration duration = 4; repeated ProvisionStepReport steps = 5; optional string message = 6; }
-message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; }
+message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; LiveMachineReport live = 29; LiveHostReport prospective_live = 30; optional LiveEvidenceState live_evidence = 31; }
 message MachineInventoryEntry { string id = 1; string name = 2; MachineSnapshot data = 3; repeated MachineIssue issues = 4; }
 message MachineStart { string run_id = 1; MachineSnapshot data = 2; }
 enum ReadinessOutcome { READINESS_OUTCOME_UNSPECIFIED = 0; READINESS_OUTCOME_READY = 1; READINESS_OUTCOME_TERMINAL = 2; READINESS_OUTCOME_TIMED_OUT = 3; }
@@ -151,8 +168,8 @@ enum PolicySecretsState { POLICY_SECRETS_STATE_UNSPECIFIED = 0; POLICY_SECRETS_S
 message SecretDiagnostic { string slot = 1; optional string key = 2; string code = 3; }
 message PolicySecretsResult { PolicySecretsState state = 1; repeated SecretDiagnostic diagnostics = 2; repeated SecretRequirement requirements = 3; repeated SecretSlot slots = 4; }
 enum ErrorKind { ERROR_KIND_UNSPECIFIED = 0; ERROR_KIND_INVALID = 1; ERROR_KIND_MISSING = 2; ERROR_KIND_DUPLICATE = 3; ERROR_KIND_CONFLICT = 4; ERROR_KIND_LIMIT = 5; ERROR_KIND_DENIED = 6; ERROR_KIND_UNAVAILABLE = 7; ERROR_KIND_INTERNAL = 8; }
-enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; }
-message ErrorDetail { ErrorKind kind = 1; ErrorCode code = 2; string safe_message = 3; optional string reference = 4; optional string expected_run = 5; optional string current_run = 6; optional string program = 7; optional string native_variant = 8; optional LaunchFailureReason launch_failure_reason = 9; }
+enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; ERROR_CODE_LIVE_OPERATION_UNSUPPORTED = 8; }
+message ErrorDetail { ErrorKind kind = 1; ErrorCode code = 2; string safe_message = 3; optional string reference = 4; optional string expected_run = 5; optional string current_run = 6; optional string program = 7; optional string native_variant = 8; optional LaunchFailureReason launch_failure_reason = 9; LiveOperationUnsupported live_unsupported = 10; }
 enum LaunchFailureReason { LAUNCH_FAILURE_REASON_UNSPECIFIED = 0; LAUNCH_FAILURE_REASON_COMMAND_NOT_FOUND = 1; LAUNCH_FAILURE_REASON_INVALID_PROCESS_SPEC = 2; LAUNCH_FAILURE_REASON_WORKING_DIRECTORY_NOT_FOUND = 3; LAUNCH_FAILURE_REASON_WORKING_DIRECTORY_NOT_DIRECTORY = 4; LAUNCH_FAILURE_REASON_INVALID_IDENTITY = 5; LAUNCH_FAILURE_REASON_IDENTITY_NOT_FOUND = 6; LAUNCH_FAILURE_REASON_PERMISSION_DENIED = 7; LAUNCH_FAILURE_REASON_SPAWN_FAILED = 8; LAUNCH_FAILURE_REASON_CANCELLED_BEFORE_START = 9; }
 enum NodeState { NODE_STATE_UNSPECIFIED = 0; NODE_STATE_CONNECTING = 1; NODE_STATE_APPROVAL_REQUIRED = 2; NODE_STATE_READY = 3; NODE_STATE_DISCONNECTED = 4; NODE_STATE_FAILED = 5; NODE_STATE_STOPPED = 6; }
 message NodeStatus { string machine_id = 1; string run_id = 2; google.protobuf.Timestamp updated_at = 3; NodeState state = 4; optional string approval_url = 5; optional string dns_name = 6; optional string node_id = 7; repeated string tags = 8; repeated string addresses = 9; google.protobuf.Timestamp key_expiry = 10; optional string error_code = 11; bool key_expiry_known = 12; uint32 version = 13; }
@@ -163,7 +180,7 @@ enum CorePhase { CORE_PHASE_UNSPECIFIED = 0; CORE_PHASE_STARTING = 1; CORE_PHASE
 enum ComponentState { COMPONENT_STATE_UNSPECIFIED = 0; COMPONENT_STATE_DISABLED = 1; COMPONENT_STATE_STARTING = 2; COMPONENT_STATE_NEEDS_AUTH = 3; COMPONENT_STATE_READY = 4; COMPONENT_STATE_DEGRADED = 5; COMPONENT_STATE_FAILED = 6; }
 enum ShutdownProtection { SHUTDOWN_PROTECTION_UNSPECIFIED = 0; SHUTDOWN_PROTECTION_ACTIVE = 1; SHUTDOWN_PROTECTION_UNAVAILABLE = 2; SHUTDOWN_PROTECTION_UNSUPPORTED = 3; }
 message ComponentStatus { bool enabled = 1; ComponentState state = 2; optional string diagnostic = 3; optional string approval_url = 4; optional string dns_name = 5; uint64 restart_count = 6; ShutdownProtection shutdown_protection = 7; }
-message DaemonStatus { string product_version = 1; uint32 protocol_major = 2; string generation = 3; bytes home = 4; bytes config_dir = 5; CorePhase core = 6; SystemStatus system = 7; ComponentStatus tailscale = 8; uint32 schema = 9; uint32 pid = 10; string process_start = 11; bytes control_endpoint = 12; google.protobuf.Timestamp updated_at = 13; optional string last_error = 14; }
+message DaemonStatus { string product_version = 1; uint32 protocol_major = 2; string generation = 3; bytes home = 4; bytes config_dir = 5; CorePhase core = 6; SystemStatus system = 7; ComponentStatus tailscale = 8; uint32 schema = 9; uint32 pid = 10; string process_start = 11; bytes control_endpoint = 12; google.protobuf.Timestamp updated_at = 13; optional string last_error = 14; LiveHostReport manager_live = 15; LiveHostReport appliance_live = 16; optional uint32 live_schema_version = 17; }
 message RuntimeComponents { bytes supervisor_path = 1; bytes netd_path = 2; bytes kernel_path = 3; bytes initramfs_path = 4; bytes agent_path = 5; bytes asset_dir = 6; }
 message RuntimeInfo { string generation = 1; bytes home = 2; RuntimeComponents components = 3; }
 message TailscaleStatusReport { string helper_generation = 1; ComponentStatus status = 2; optional string instance = 3; }
@@ -194,8 +211,53 @@ message AgentStatusReport { google.protobuf.Timestamp observed_at = 1; AgentStat
 message AgentStatusObservation { google.protobuf.Timestamp received_at = 1; google.protobuf.Timestamp stale_at = 2; Freshness freshness = 3; optional StaleReason stale_reason = 4; AgentStatusReport report = 5; }
 message EnabledAgent { AgentConnection connection = 1; AgentIdentity identity = 2; AgentStatusObservation status = 3; repeated string services = 4; }
 message AgentStatus { oneof status { google.protobuf.Empty disabled = 1; EnabledAgent enabled = 2; } }
-message MonitorStatus { string machine_id = 1; optional string run_id = 2; string name = 3; MonitorSnapshot monitor = 4; VmSnapshot vm = 5; ReadinessState readiness = 6; AgentStatus agent = 7; }
+message MonitorStatus { string machine_id = 1; optional string run_id = 2; string name = 3; MonitorSnapshot monitor = 4; VmSnapshot vm = 5; ReadinessState readiness = 6; AgentStatus agent = 7; LiveMachineReport live = 8; }
 
 enum SystemPhase { SYSTEM_PHASE_UNSPECIFIED = 0; SYSTEM_PHASE_PREPARING_STORAGE = 1; SYSTEM_PHASE_CREATING = 2; SYSTEM_PHASE_STARTING_VM = 3; SYSTEM_PHASE_WAITING_GUEST = 4; SYSTEM_PHASE_ACTIVATING_ENGINE = 5; SYSTEM_PHASE_RETRYING = 6; SYSTEM_PHASE_READY = 7; SYSTEM_PHASE_DEGRADED = 8; SYSTEM_PHASE_UPGRADING = 9; SYSTEM_PHASE_FAILED = 10; SYSTEM_PHASE_STOPPING = 11; SYSTEM_PHASE_STOPPED = 12; }
 enum MemoryReclaimOutcome { MEMORY_RECLAIM_OUTCOME_UNSPECIFIED = 0; MEMORY_RECLAIM_OUTCOME_RECLAIMED = 1; MEMORY_RECLAIM_OUTCOME_PARTIAL = 2; MEMORY_RECLAIM_OUTCOME_NOTHING = 3; MEMORY_RECLAIM_OUTCOME_FAILED = 4; }
-message SystemStatus { SystemPhase phase = 1; optional string machine_id = 2; optional string run_id = 3; optional string image_digest = 4; optional string configured_image = 5; optional uint64 memory_bytes = 6; optional string actual_backend = 7; bytes docker_socket = 8; optional string last_error = 9; uint64 restart_count = 10; google.protobuf.Timestamp update_checked_at = 11; optional string update_error = 12; optional MemoryReclaimOutcome memory_reclaim_outcome = 13; optional string memory_reclaim_mode = 14; optional uint64 memory_reclaim_observed_cache_delta_bytes = 15; google.protobuf.Timestamp memory_reclaim_at = 16; optional uint64 memory_reclaim_runs = 17; bool host_memory_reclaim_requested = 18; optional bool host_memory_reclaim_effective = 19; optional string host_memory_reclaim_qualification = 20; optional uint64 host_memory_reclaim_released_bytes = 21; optional uint64 host_memory_reclaim_failed_operations = 22; }
+message SystemStatus { SystemPhase phase = 1; optional string machine_id = 2; optional string run_id = 3; optional string image_digest = 4; optional string configured_image = 5; optional uint64 memory_bytes = 6; optional string actual_backend = 7; bytes docker_socket = 8; optional string last_error = 9; uint64 restart_count = 10; google.protobuf.Timestamp update_checked_at = 11; optional string update_error = 12; optional MemoryReclaimOutcome memory_reclaim_outcome = 13; optional string memory_reclaim_mode = 14; optional uint64 memory_reclaim_observed_cache_delta_bytes = 15; google.protobuf.Timestamp memory_reclaim_at = 16; optional uint64 memory_reclaim_runs = 17; bool host_memory_reclaim_requested = 18; optional bool host_memory_reclaim_effective = 19; optional string host_memory_reclaim_qualification = 20; optional uint64 host_memory_reclaim_released_bytes = 21; optional uint64 host_memory_reclaim_failed_operations = 22; LiveMachineReport live = 23; LiveHostReport prospective_live = 24; optional uint32 live_schema_version = 25; }
+
+message LiveMachineRequest { MachineRef machine = 1; }
+message LiveCaptureRequest { MachineRef machine = 1; optional string name = 2; }
+message LiveForkRequest { MachineRef machine = 1; optional string name = 2; }
+message LiveRestoreRequest { bytes checkpoint = 1; optional string name = 2; }
+// Stopped artifacts are distinct from MachineSnapshot, the observational read model.
+message StorageSnapshotRef { oneof reference { string id = 1; string image_alias = 2; } }
+message ExternalResourceKey { oneof resource { uint32 disk_order = 1; string share_tag = 2; } }
+message ExternalResourceMapping { ExternalResourceKey resource = 1; bytes path = 2; }
+message ExternalResourceMappings { repeated ExternalResourceMapping values = 1; }
+message ExternalResourcePolicy { oneof policy { google.protobuf.Empty reject = 1; google.protobuf.Empty require_mappings = 2; ExternalResourceMappings mappings = 3; } }
+message StoppedForkRequest { MachineRef machine = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
+// Creation records external requirements, never destination host mappings.
+// external_resources accepts only reject or require_mappings on this RPC.
+message CreateStorageSnapshotRequest { MachineRef machine = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
+message RestoreStorageSnapshotRequest { StorageSnapshotRef snapshot = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
+enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_KIND_STOPPED_STORAGE = 1; }
+message StorageSnapshotInfo { string id = 1; string record_digest = 2; optional bool retained = 3; repeated string aliases = 4; optional int64 created_at = 5; StorageCaptureKind capture_kind = 6; }
+message StorageSnapshotList { repeated StorageSnapshotInfo snapshots = 1; }
+enum LiveOperation { LIVE_OPERATION_UNSPECIFIED = 0; LIVE_OPERATION_PAUSE = 1; LIVE_OPERATION_CAPTURE = 2; LIVE_OPERATION_RESTORE = 3; LIVE_OPERATION_FORK = 4; LIVE_OPERATION_INCREMENTAL = 5; }
+enum LiveBackend { LIVE_BACKEND_UNSPECIFIED = 0; LIVE_BACKEND_KRUN = 1; LIVE_BACKEND_VZ = 2; LIVE_BACKEND_MOCK = 3; }
+enum LiveLane { LIVE_LANE_UNSPECIFIED = 0; LIVE_LANE_KVM_X86_64 = 1; LIVE_LANE_KVM_ARM64_GIC_V3 = 2; LIVE_LANE_HVF_ARM64 = 3; LIVE_LANE_NOT_APPLICABLE = 4; }
+enum LiveScope { LIVE_SCOPE_UNSPECIFIED = 0; LIVE_SCOPE_HOST = 1; LIVE_SCOPE_MACHINE = 2; }
+enum LiveReasonCode { LIVE_REASON_CODE_UNSPECIFIED = 0; LIVE_REASON_CODE_BACKEND_EXCLUDED = 1; LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR = 2; LIVE_REASON_CODE_LANE_NOT_QUALIFIED = 3; LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE = 4; LIVE_REASON_CODE_BUILD_EXCLUDED = 5; LIVE_REASON_CODE_NOT_DELIVERED = 6; LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED = 7; }
+message LiveDeviceSubject {
+ oneof subject {
+  google.protobuf.Empty virtiofs = 1;
+  google.protobuf.Empty rosetta = 2;
+  google.protobuf.Empty tap = 3;
+  google.protobuf.Empty gpu = 4;
+  google.protobuf.Empty nested = 5;
+  google.protobuf.Empty tee = 6;
+  string guest_profile = 7;
+ }
+}
+message LiveUnsupportedReason { optional LiveReasonCode code = 1; LiveDeviceSubject subject = 2; }
+message LiveCapability {
+ optional bool native = 1;
+ oneof availability { google.protobuf.Empty supported = 2; LiveUnsupportedReason unsupported = 3; }
+}
+message LiveCapabilityVector { LiveCapability pause = 1; LiveCapability capture = 2; LiveCapability restore = 3; LiveCapability fork = 4; LiveCapability incremental = 5; }
+message LiveHostReport { optional uint32 schema_version = 1; optional LiveScope scope = 2; optional LiveBackend backend = 3; optional LiveLane lane = 4; LiveCapabilityVector live = 5; optional string build_identity = 6; optional string qualification_identity = 7; optional string scenario_digest = 8; }
+message LiveMachineReport { optional uint32 schema_version = 1; optional LiveScope scope = 2; optional string machine_id = 3; optional string run_id = 4; optional string monitor_id = 5; optional LiveBackend backend = 6; optional LiveLane lane = 7; optional uint64 topology_revision = 8; LiveCapabilityVector live = 9; }
+message LiveOperationUnsupported { optional LiveOperation operation = 1; optional LiveBackend backend = 2; optional LiveLane lane = 3; LiveUnsupportedReason reason = 4; }
+enum LiveEvidenceState { LIVE_EVIDENCE_STATE_UNSPECIFIED = 0; LIVE_EVIDENCE_STATE_RUN = 1; LIVE_EVIDENCE_STATE_PROSPECTIVE = 2; LIVE_EVIDENCE_STATE_UNAVAILABLE = 3; }

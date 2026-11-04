@@ -27,10 +27,22 @@ pub struct AgentConfig {
     pub provision: ProvisionConfig,
     #[serde(default)]
     pub ssh: AgentSshConfig,
+    /// Trusted per-launch identity and complete attachment inventory.
+    /// Required on the wire, never filled from an incoming shutdown request.
+    pub storage_shutdown: protocol::shutdown::StorageShutdownContext,
 }
 
 impl AgentConfig {
     pub fn validate(&self) -> Result<(), AgentConfigError> {
+        self.validate_provisioning()?;
+        self.storage_shutdown
+            .validate()
+            .map_err(AgentConfigError::new)
+    }
+
+    /// Validate reusable provisioning before a run identity has been allocated.
+    /// This is not sufficient to admit an injected launch configuration.
+    pub fn validate_provisioning(&self) -> Result<(), AgentConfigError> {
         if let Some(ca) = &self.ssh.trusted_ca {
             if ca.trim().contains(['\n', '\r']) {
                 return Err(AgentConfigError::new(
@@ -76,16 +88,9 @@ impl AgentConfig {
             validate_nonempty(&authority.pem, "certificate authority pem")?;
         }
         if let Some(network) = &self.provision.network {
-            validate_network_config(network)?;
+            network.validate()?;
         }
-        validate_unique_nonempty(
-            self.provision.mounts.iter().map(|mount| mount.tag.as_str()),
-            "mount tag",
-        )?;
-        for mount in &self.provision.mounts {
-            validate_absolute_path(&mount.path, "mount path")?;
-            validate_nonempty(&mount.fstype, "mount fstype")?;
-        }
+        normalized_mount_plan(&self.provision.mounts)?;
         if self.provision.rosetta.enabled {
             if !self.provision.enabled {
                 return Err(AgentConfigError::new(
@@ -102,12 +107,11 @@ impl AgentConfig {
                     "enabled rosetta mount path must be {ROSETTA_MOUNT_PATH:?}"
                 )));
             }
-            if self
-                .provision
-                .mounts
-                .iter()
-                .any(|mount| mount.tag == ROSETTA_MOUNT_TAG || mount.path == ROSETTA_MOUNT_PATH)
-            {
+            if self.provision.mounts.iter().any(|mount| {
+                mount.tag == ROSETTA_MOUNT_TAG
+                    || normalize_mount_target(&mount.path)
+                        .is_ok_and(|path| paths_overlap(&path, ROSETTA_MOUNT_PATH))
+            }) {
                 return Err(AgentConfigError::new(format!(
                     "mount tag {ROSETTA_MOUNT_TAG:?} and path {ROSETTA_MOUNT_PATH:?} are reserved for enabled rosetta"
                 )));
@@ -371,6 +375,13 @@ pub struct NetworkConfig {
     pub interfaces: Vec<NetworkInterfaceConfig>,
 }
 
+impl NetworkConfig {
+    /// Validate the single managed IPv4 attachment for provisioning or activation.
+    pub fn validate(&self) -> Result<(), AgentConfigError> {
+        validate_network_config(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRosettaConfig {
@@ -408,6 +419,13 @@ pub struct NetworkInterfaceConfig {
     pub dns: NetworkDnsConfig,
 }
 
+impl NetworkInterfaceConfig {
+    /// Parse the configured Ethernet address without changing its byte order.
+    pub fn mac_address_bytes(&self) -> Result<[u8; 6], AgentConfigError> {
+        parse_mac_address(&self.mac_address)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkIpv4Config {
@@ -433,6 +451,98 @@ pub struct MountConfig {
     pub fstype: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+}
+
+/// A mount with a normalized target, ordered before any child target.
+#[derive(Debug)]
+pub struct PlannedMount<'a> {
+    pub config: &'a MountConfig,
+    pub target: String,
+}
+
+/// Validates the complete plan without touching the guest filesystem.
+pub fn normalized_mount_plan(
+    mounts: &[MountConfig],
+) -> Result<Vec<PlannedMount<'_>>, AgentConfigError> {
+    validate_unique_nonempty(mounts.iter().map(|mount| mount.tag.as_str()), "mount tag")?;
+    let mut plan = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        validate_nonempty(&mount.fstype, "mount fstype")?;
+        if mount.fstype != "virtiofs" {
+            return Err(AgentConfigError::new(
+                "user mount plans support only directory virtiofs shares",
+            ));
+        }
+        validate_unique_nonempty(mount.options.iter().map(String::as_str), "mount option")?;
+        if mount.options.iter().any(|option| {
+            !matches!(
+                option.as_str(),
+                "ro" | "rw" | "nofail" | "nosuid" | "nodev" | "noexec"
+            )
+        }) || (mount.options.iter().any(|option| option == "ro")
+            && mount.options.iter().any(|option| option == "rw"))
+        {
+            return Err(AgentConfigError::new(
+                "mount options must select unambiguous virtiofs access and fixed VFS flags",
+            ));
+        }
+        if mount.tag.contains('\0')
+            || mount.fstype.contains('\0')
+            || mount.options.iter().any(|option| option.contains('\0'))
+        {
+            return Err(AgentConfigError::new("mount fields must not contain NUL"));
+        }
+        let target = normalize_mount_target(&mount.path)?;
+        plan.push(PlannedMount {
+            config: mount,
+            target,
+        });
+    }
+    plan.sort_by(|left, right| {
+        left.target
+            .split('/')
+            .count()
+            .cmp(&right.target.split('/').count())
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    if plan.windows(2).any(|pair| pair[0].target == pair[1].target) {
+        return Err(AgentConfigError::new(
+            "normalized mount targets must be unique",
+        ));
+    }
+    Ok(plan)
+}
+
+fn normalize_mount_target(value: &str) -> Result<String, AgentConfigError> {
+    if !value.starts_with('/') || value.contains('\0') || value.split('/').any(|part| part == "..")
+    {
+        return Err(AgentConfigError::new(
+            "mount target must be absolute without traversal or NUL",
+        ));
+    }
+    let mut target = String::new();
+    for part in value
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        target.push('/');
+        target.push_str(part);
+    }
+    if target.is_empty() || paths_overlap(&target, "/run/silo") {
+        return Err(AgentConfigError::new(
+            "mount target hides protected root maintenance state",
+        ));
+    }
+    Ok(target)
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    fn ancestor(parent: &str, child: &str) -> bool {
+        child
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+    }
+    ancestor(left, right) || ancestor(right, left)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -471,10 +581,142 @@ mod tests {
         UserdataRunPolicy,
     };
 
+    fn launch_config() -> AgentConfig {
+        AgentConfig {
+            storage_shutdown: protocol::shutdown::StorageShutdownContext {
+                version: 1,
+                machine_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "22222222-2222-4222-8222-222222222222".into(),
+                manifest: protocol::shutdown::StorageManifest::Unsupported {
+                    reason: "unit fixture has no storage attachments".into(),
+                },
+            },
+            ..AgentConfig::default()
+        }
+    }
+
+    #[test]
+    fn launch_identity_is_required_and_not_defaulted() {
+        assert!(serde_json::from_str::<AgentConfig>("{}").is_err());
+        assert!(AgentConfig::default().validate().is_err());
+        let mut config = launch_config();
+        config.validate().unwrap();
+        config.storage_shutdown.run_id = "00000000-0000-0000-0000-000000000000".into();
+        assert!(config.validate().is_err());
+        let duplicate = r#"{"storage_shutdown":{"version":1,"version":1,"machineId":"11111111-1111-4111-8111-111111111111","runId":"22222222-2222-4222-8222-222222222222","manifest":{"kind":"unsupported","reason":"fixture"}}}"#;
+        assert!(serde_json::from_str::<AgentConfig>(duplicate).is_err());
+    }
+
+    fn mount_config(tag: &str, path: &str) -> MountConfig {
+        MountConfig {
+            tag: tag.to_string(),
+            path: path.to_string(),
+            fstype: "virtiofs".to_string(),
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mount_plan_accepts_only_directory_virtiofs_operations() {
+        for option in ["bind", "rbind", "move", "remount", "ro,rw", "size=1M"] {
+            let mut mount = mount_config("share", "/workspace");
+            mount.options.push(option.to_string());
+            assert!(crate::normalized_mount_plan(&[mount]).is_err(), "{option}");
+        }
+        let mut mount = mount_config("share", "/workspace");
+        mount.options = vec!["ro".to_string(), "rw".to_string()];
+        assert!(crate::normalized_mount_plan(&[mount]).is_err());
+        let mut mount = mount_config("share", "/workspace");
+        mount.fstype = "ext4".to_string();
+        assert!(crate::normalized_mount_plan(&[mount]).is_err());
+        let mut mount = mount_config("share", "/workspace");
+        mount.options = ["ro", "nofail", "nosuid", "nodev", "noexec"]
+            .map(str::to_string)
+            .to_vec();
+        assert!(crate::normalized_mount_plan(&[mount]).is_ok());
+    }
+
+    #[test]
+    fn mount_plan_normalizes_and_orders_parents_before_children() {
+        let mounts = [
+            mount_config("child", "/workspace//./child/"),
+            mount_config("parent", "/workspace/"),
+            mount_config("other", "/other"),
+        ];
+        let plan = crate::normalized_mount_plan(&mounts).expect("valid plan");
+        let targets: Vec<_> = plan.iter().map(|mount| mount.target.as_str()).collect();
+        assert_eq!(targets, ["/other", "/workspace", "/workspace/child"]);
+    }
+
+    #[test]
+    fn mount_plan_rejects_normalized_duplicates_and_traversal() {
+        assert!(crate::normalized_mount_plan(&[
+            mount_config("a", "/work"),
+            mount_config("b", "//work/./")
+        ])
+        .is_err());
+        for target in [
+            "relative",
+            "/work/../other",
+            "/work/../../run",
+            "/nul\0path",
+        ] {
+            assert!(
+                crate::normalized_mount_plan(&[mount_config("a", target)]).is_err(),
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_plan_protects_root_maintenance_ancestors_and_descendants() {
+        for target in [
+            "/",
+            "//./",
+            "/run",
+            "/run/",
+            "/run/silo",
+            "/run//silo/./rootfs",
+            "/run/silo/rootfs/upperfs",
+        ] {
+            assert!(
+                crate::normalized_mount_plan(&[mount_config("a", target)]).is_err(),
+                "{target:?}"
+            );
+        }
+        for target in ["/run/other", "/runner", "/run/silophone", "/tmp"] {
+            assert!(
+                crate::normalized_mount_plan(&[mount_config("a", target)]).is_ok(),
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_plan_validation_applies_even_when_provisioning_is_disabled() {
+        let mut config = AgentConfig::default();
+        config
+            .provision
+            .mounts
+            .push(mount_config("hidden-state", "/run"));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn mount_plan_cannot_hide_enabled_rosetta_through_parent_or_normalization() {
+        for target in ["/mnt", "/mnt//rosetta/./", "/mnt/rosetta/child"] {
+            let mut config = AgentConfig::default();
+            config.provision.enabled = true;
+            config.provision.rosetta.enabled = true;
+            config.provision.mounts.push(mount_config("other", target));
+            assert!(config.validate().is_err(), "{target:?}");
+        }
+    }
+
     #[test]
     fn guest_cache_reclaim_is_not_a_config_option() {
-        let config: AgentConfig = serde_json::from_str("{}").expect("defaults");
-        config.validate().expect("valid defaults");
+        let config = launch_config();
+        config.validate().expect("valid launch");
         assert!(serde_json::to_value(config)
             .expect("encode")
             .get("memory_reclaim")
@@ -508,6 +750,11 @@ mod tests {
     #[test]
     fn provision_config_deserializes_unprefixed_shape() {
         let raw = r#"
+storage_shutdown:
+  version: 1
+  machineId: 11111111-1111-4111-8111-111111111111
+  runId: 22222222-2222-4222-8222-222222222222
+  manifest: {kind: unsupported, reason: fixture}
 provision:
   enabled: true
   hostname: demo
@@ -608,6 +855,11 @@ provision:
     #[test]
     fn userdata_run_defaults_to_once() {
         let raw = r#"
+storage_shutdown:
+  version: 1
+  machineId: 11111111-1111-4111-8111-111111111111
+  runId: 22222222-2222-4222-8222-222222222222
+  manifest: {kind: unsupported, reason: fixture}
 provision:
   enabled: true
   userdata:
@@ -626,6 +878,7 @@ provision:
     #[test]
     fn agent_config_round_trips_through_json() {
         let original = AgentConfig {
+            storage_shutdown: launch_config().storage_shutdown,
             provision: ProvisionConfig {
                 enabled: true,
                 hostname: Some("demo".to_string()),
@@ -707,7 +960,7 @@ provision:
 
     #[test]
     fn ssh_trust_requires_a_parsed_ed25519_public_key() {
-        let mut config = AgentConfig::default();
+        let mut config = launch_config();
         for invalid in ["", "ssh-ed25519 broken", "ssh-rsa broken", "not a key"] {
             config.ssh.trusted_ca = Some(invalid.into());
             assert!(config.validate().is_err());
@@ -764,7 +1017,7 @@ provision:
 
     #[test]
     fn validation_accepts_absent_network() {
-        AgentConfig::default()
+        launch_config()
             .validate()
             .expect("absent networking should be valid");
     }
@@ -898,7 +1151,7 @@ provision:
                 }],
                 ..ProvisionConfig::default()
             },
-            ..AgentConfig::default()
+            ..launch_config()
         }
     }
 

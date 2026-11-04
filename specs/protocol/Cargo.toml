@@ -9,6 +9,11 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
+vm-spec = { path = "../vm-spec" }
+rootfs-spec = { path = "../rootfs-spec" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+uuid = "1.24.0"
 
 [build-dependencies]
 prost-build = "0.14.4"

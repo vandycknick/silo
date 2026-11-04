@@ -85,7 +85,8 @@ fn formatter_rejects_parent_and_current_directory_entries() {
             make_mode(file_mode::S_IFREG, 0o644),
             None,
             None,
-            Some(&mut "invalid".as_bytes()),
+            Some(disk_image::ext4::FileData::Dense(&mut "invalid".as_bytes())),
+            None,
             None,
             None,
             None,
@@ -104,11 +105,12 @@ fn formatter_validates_file_type_before_writing_payload() {
         0x1000 | 0o644,
         None,
         None,
-        Some(&mut "invalid".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "invalid".as_bytes())),
+        None,
         None,
         None,
         None,
     );
 
-    assert!(matches!(result, Err(FormatError::UnsupportedFiletype)));
+    assert!(matches!(result, Err(FormatError::InvalidMetadata(_))));
 }

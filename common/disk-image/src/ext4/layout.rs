@@ -1,5 +1,14 @@
 //! Shared ext4 block-group layout calculations.
 
+/// Generic OCI policy, intentionally distinct from the fixed upper's 64-block
+/// active-plus-reserved descriptor budget.
+pub(crate) fn generic_descriptor_area(descriptor_blocks: u32, block_size: u32) -> u32 {
+    descriptor_blocks
+        + descriptor_blocks
+            .saturating_mul(31)
+            .min((block_size / 4).saturating_sub(descriptor_blocks))
+}
+
 pub(crate) fn group_count(blocks: u64, first_data_block: u32, blocks_per_group: u32) -> u32 {
     let data_blocks = blocks.saturating_sub(first_data_block as u64);
     data_blocks.div_ceil(blocks_per_group as u64) as u32

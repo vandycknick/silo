@@ -27,8 +27,8 @@ pub struct Reader {
     inodes: HashMap<InodeNumber, Inode>,
     tree: FileTree,
     /// Paths that are hard links to already-seen inodes.
-    /// Key: path string (e.g. "usr/bin/link"), Value: target inode number.
-    pub hardlinks: HashMap<String, InodeNumber>,
+    /// Raw root-relative path bytes; aliases share the same inode number.
+    pub hardlinks: HashMap<Vec<u8>, InodeNumber>,
 }
 
 impl Reader {
@@ -76,20 +76,18 @@ impl Reader {
 
             for (name, child_ino) in children {
                 // Skip the "." and ".." pseudo-entries.
-                if name == "." || name == ".." {
+                if name == b"." || name == b".." {
                     continue;
                 }
 
                 // If we have already seen this inode, this entry is a hard link.
                 if reader.inodes.contains_key(&child_ino) {
-                    let parent_path = reader.tree.node_path(parent_idx);
-                    let full = parent_path.join(&name);
-                    // Store as a forward-slash path without leading "/".
-                    let key = full
-                        .to_string_lossy()
-                        .trim_start_matches('/')
-                        .trim_start_matches("./")
-                        .to_string();
+                    let mut full = reader.tree.node_path(parent_idx);
+                    if !full.ends_with(b"/") {
+                        full.push(b'/');
+                    }
+                    full.extend_from_slice(&name);
+                    let key = full.strip_prefix(b"/").unwrap_or(&full).to_vec();
                     reader.hardlinks.insert(key, child_ino);
                     continue;
                 }
@@ -230,7 +228,7 @@ impl Reader {
     fn get_dir_entries(
         &mut self,
         inode_number: InodeNumber,
-    ) -> ReadResult<Vec<(String, InodeNumber)>> {
+    ) -> ReadResult<Vec<(Vec<u8>, InodeNumber)>> {
         let inode = self.get_inode(inode_number)?;
         let extents = extent::parse_extents(&inode, self.block_size(), &mut self.file)?;
         let bs = self.block_size() as usize;
@@ -257,7 +255,7 @@ impl Reader {
 
     /// List the children of a directory inode (public wrapper around
     /// [`get_dir_entries`]).
-    pub fn children_of(&mut self, number: InodeNumber) -> ReadResult<Vec<(String, InodeNumber)>> {
+    pub fn children_of(&mut self, number: InodeNumber) -> ReadResult<Vec<(Vec<u8>, InodeNumber)>> {
         self.get_dir_entries(number)
     }
 
@@ -321,7 +319,8 @@ mod tests {
                 make_mode(file_mode::S_IFREG, 0o644),
                 None,
                 None,
-                Some(&mut "a".as_bytes()),
+                Some(crate::ext4::FileData::Dense(&mut "a".as_bytes())),
+                None,
                 None,
                 None,
                 None,
@@ -336,6 +335,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
             fmt.create(
@@ -343,7 +343,8 @@ mod tests {
                 make_mode(file_mode::S_IFREG, 0o600),
                 None,
                 None,
-                Some(&mut "g".as_bytes()),
+                Some(crate::ext4::FileData::Dense(&mut "g".as_bytes())),
+                None,
                 None,
                 None,
                 None,
@@ -354,17 +355,17 @@ mod tests {
         let children = reader.children_of(ROOT_INODE).unwrap();
 
         // Filter out "." and ".." to get real entries.
-        let names: Vec<&str> = children
+        let names: Vec<&[u8]> = children
             .iter()
-            .filter(|(n, _)| n != "." && n != "..")
-            .map(|(n, _)| n.as_str())
+            .filter(|(n, _)| n != b"." && n != b"..")
+            .map(|(n, _)| n.as_slice())
             .collect();
 
         // lost+found is always created by the formatter, plus our three entries.
-        assert!(names.contains(&"lost+found"));
-        assert!(names.contains(&"alpha"));
-        assert!(names.contains(&"beta"));
-        assert!(names.contains(&"gamma.txt"));
+        assert!(names.contains(&b"lost+found".as_slice()));
+        assert!(names.contains(&b"alpha".as_slice()));
+        assert!(names.contains(&b"beta".as_slice()));
+        assert!(names.contains(&b"gamma.txt".as_slice()));
         assert_eq!(names.len(), 4);
     }
 

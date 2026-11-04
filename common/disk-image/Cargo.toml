@@ -13,6 +13,7 @@ categories = ["filesystem", "os"]
 exclude = ["/tests", "/.github"]
 
 [dependencies]
+rootfs-spec = { path = "../../specs/rootfs-spec" }
 thiserror = "2.0.19"
 uuid = { version = "1.24.0", features = ["v4"] }
 
