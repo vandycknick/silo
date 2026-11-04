@@ -1,10 +1,11 @@
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "linux"))]
 use nix::unistd::pipe;
 use serde::Deserialize;
 use tokio::io::unix::AsyncFd;
@@ -45,22 +46,31 @@ pub(crate) struct VmmLaunch<'a> {
     pub(crate) startup_command: Option<&'a VmmStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
     pub(crate) machine_lock: &'a MachineLifetimeLock,
+    pub(crate) qualification: Option<&'a crate::QualifiedOverlayBoot>,
+    pub(crate) storage_lease: &'a crate::storage::locks::StorageLock,
+    pub(crate) storage_lease_binding: protocol::shutdown::StorageLeaseBinding,
+    pub(crate) storage_shutdown: &'a protocol::shutdown::StorageShutdownContext,
 }
 
 impl VmSupervisor {
     pub(crate) async fn spawn(&self, launch: &VmmLaunch<'_>) -> Result<(), LibVmError> {
         let startup_budget = startup_budget(launch);
         let startup_deadline = Instant::now() + startup_budget;
-        let (start_read, start_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
-        let (sync_read, sync_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
-        configure_pipe_inheritance(&start_read, &start_write, &sync_read, &sync_write)?;
+        let (start_read, start_write) = launch_pipe()?;
+        let (sync_read, sync_write) = launch_pipe()?;
         let machine_log_dir = launch.machine_log_dir.duplicate_inheritable()?;
         let machine_lock = launch.machine_lock.duplicate_inheritable()?;
+        let storage_lease = launch.storage_lease.duplicate_inheritable()?;
 
-        let mut command = Command::new(self.executable());
+        let mut command = monitor_command(
+            self.executable(),
+            launch
+                .qualification
+                .map(|qualification| qualification.native_executable_fd()),
+        )?;
         command
             .arg("--id")
-            .arg(launch.machine_id.to_string())
+            .arg(uuid::Uuid::from(launch.machine_id).to_string())
             .arg("--name")
             .arg(launch.name)
             .arg("--data-dir")
@@ -97,57 +107,49 @@ impl VmSupervisor {
             machine_log_dir.as_raw_fd().to_string(),
         );
         command.env(ENV_VM_MACHINE_LOCK, machine_lock.as_raw_fd().to_string());
-        let log_fd = machine_log_dir.as_raw_fd();
-        let lock_fd = machine_lock.as_raw_fd();
-        unsafe {
-            command.pre_exec(move || {
-                for raw in [log_fd, lock_fd] {
-                    nix::fcntl::fcntl(
-                        std::os::fd::BorrowedFd::borrow_raw(raw),
-                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-                    )
-                    .map_err(io::Error::other)?;
-                }
-                Ok(())
-            });
-        }
-
-        // The writer stays CLOEXEC in the caller, including while other VMs
-        // launch concurrently. Only this VMM child receives it.
+        command.env(
+            "_VM_STORAGE_LEASES",
+            format!("[{}]", storage_lease.as_raw_fd()),
+        );
         if let Some(writer) = launch.network.exit_writer() {
-            let raw = writer.as_raw_fd();
-            command.env("_VM_NETD_EXIT", raw.to_string());
-            unsafe {
-                command.pre_exec(move || {
-                    let fd = std::os::fd::BorrowedFd::borrow_raw(raw);
-                    nix::fcntl::fcntl(
-                        fd,
-                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-                    )
-                    .map_err(io::Error::other)?;
-                    Ok(())
-                });
-            }
+            command.env("_VM_NETD_EXIT", writer.as_raw_fd().to_string());
         } else {
             command.env_remove("_VM_NETD_EXIT");
         }
+        install_child_inheritance(
+            &mut command,
+            [
+                Some(start_read.as_raw_fd()),
+                Some(sync_write.as_raw_fd()),
+                Some(machine_log_dir.as_raw_fd()),
+                Some(machine_lock.as_raw_fd()),
+                Some(storage_lease.as_raw_fd()),
+                launch.network.exit_writer().map(AsRawFd::as_raw_fd),
+            ],
+        )?;
 
-        let child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        if let Some(qualification) = launch.qualification {
+            qualification.recheck_native_executable()?;
+        }
+        let child = command.spawn()?;
 
         drop(start_read);
         drop(sync_write);
         drop(machine_log_dir);
         drop(machine_lock);
+        drop(storage_lease);
         wait_for_vmm_launcher(child).await?;
 
         let start_request = VmmStartRequest::new(
-            launch.machine_id.to_string(),
+            uuid::Uuid::from(launch.machine_id).to_string(),
             launch.run_id,
             launch.startup_command.cloned(),
+            launch.storage_lease_binding.clone(),
+            launch.storage_shutdown.clone(),
         )
         .with_virt_backend(self.virt_backend_request())
         .with_rosetta_intent(launch.rosetta_intent)
@@ -160,6 +162,31 @@ impl VmSupervisor {
             startup_deadline.saturating_duration_since(Instant::now()),
         )
         .await
+    }
+}
+
+fn monitor_command(executable: &Path, qualified: Option<BorrowedFd<'_>>) -> io::Result<Command> {
+    match qualified {
+        None => Ok(Command::new(executable)),
+        Some(descriptor) => {
+            #[cfg(target_os = "linux")]
+            {
+                // The retained ELF is resolved before exec closes CLOEXEC FDs.
+                // Keep the parent's descriptor CLOEXEC during concurrent starts.
+                Ok(Command::new(format!(
+                    "/proc/self/fd/{}",
+                    descriptor.as_raw_fd()
+                )))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = descriptor;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "qualified native executable FD launch requires Linux",
+                ))
+            }
+        }
     }
 }
 
@@ -351,23 +378,108 @@ async fn read_syncpipe(syncpipe: OwnedFd) -> io::Result<StartupResult> {
     ))
 }
 
-fn clear_cloexec(fd: &OwnedFd) -> io::Result<()> {
-    set_cloexec(fd, false)
+fn launch_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    #[cfg(not(target_os = "linux"))]
+    let (read, write) = {
+        // Darwin has no pipe2. The lifetime lease itself always uses atomic
+        // CLOEXEC creation/duplication; these pipes are marked before spawn.
+        let (read, write) = pipe()?;
+        set_cloexec(&read, true)?;
+        set_cloexec(&write, true)?;
+        (read, write)
+    };
+    Ok((normalize_launch_fd(read)?, normalize_launch_fd(write)?))
 }
 
-fn configure_pipe_inheritance(
-    start_read: &OwnedFd,
-    start_write: &OwnedFd,
-    sync_read: &OwnedFd,
-    sync_write: &OwnedFd,
-) -> io::Result<()> {
-    // silo-vmm daemonizes itself, so only its two child-side descriptors survive exec.
-    clear_cloexec(start_read)?;
-    clear_cloexec(sync_write)?;
-    set_cloexec(start_write, true)?;
-    set_cloexec(sync_read, true)
+fn normalize_launch_fd(fd: OwnedFd) -> io::Result<OwnedFd> {
+    if fd.as_raw_fd() >= 3 {
+        return Ok(fd);
+    }
+    let raw = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(3))?;
+    // SAFETY: the duplicate is new and exclusively owned by this call.
+    Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) })
 }
 
+fn install_child_inheritance(command: &mut Command, allowed: [Option<i32>; 6]) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let ceiling = {
+        let mut ceiling =
+            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?
+                .0
+                .min(i32::MAX as u64) as i32;
+        // Existing descriptors may exceed a subsequently lowered soft limit.
+        let mut directory = nix::dir::Dir::open(
+            "/dev/fd",
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        for entry in directory.iter() {
+            let entry = entry?;
+            if let Some(raw) = entry
+                .file_name()
+                .to_str()
+                .ok()
+                .and_then(|name| name.parse::<i32>().ok())
+            {
+                ceiling = ceiling.max(raw.saturating_add(1));
+            }
+        }
+        ceiling
+    };
+    // SAFETY: only numeric OS operations and inline errno errors after fork.
+    unsafe {
+        command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            {
+                // nix has no close_range(CLOEXEC). Do not close the qualified
+                // executable FD: the kernel resolves it before CLOEXEC applies.
+                if nix::libc::syscall(
+                    nix::libc::SYS_close_range,
+                    3_u32,
+                    u32::MAX,
+                    nix::libc::CLOSE_RANGE_CLOEXEC,
+                ) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            for raw in 3..ceiling {
+                let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
+                if flags < 0 {
+                    if *nix::libc::__error() == nix::libc::EBADF {
+                        continue;
+                    }
+                    return Err(io::Error::last_os_error());
+                }
+                if nix::libc::fcntl(raw, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            for raw in allowed.into_iter().flatten() {
+                let fd = BorrowedFd::borrow_raw(raw);
+                let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD)
+                    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+                nix::fcntl::fcntl(
+                    fd,
+                    nix::fcntl::FcntlArg::F_SETFD(
+                        nix::fcntl::FdFlag::from_bits_retain(flags)
+                            & !nix::fcntl::FdFlag::FD_CLOEXEC,
+                    ),
+                )
+                .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
 fn set_cloexec(fd: &OwnedFd, enabled: bool) -> io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
@@ -407,8 +519,6 @@ mod tests {
 
     use std::os::fd::OwnedFd;
 
-    use nix::unistd::pipe;
-
     use crate::machine::{ExecutionLaunchFailureReason, HostCommand};
 
     use crate::supervisor::start_request::{
@@ -417,8 +527,8 @@ mod tests {
     };
 
     use crate::supervisor::launch::{
-        append_exit_command_args, configure_pipe_inheritance, handoff_start_request, read_syncpipe,
-        StartupResult,
+        append_exit_command_args, handoff_start_request, install_child_inheritance, launch_pipe,
+        read_syncpipe, StartupResult,
     };
 
     /// A pipe no concurrently spawned test child can inherit. Tests that observe a
@@ -440,22 +550,77 @@ mod tests {
 
     #[test]
     fn only_child_pipe_ends_survive_exec() {
-        let (start_read, start_write) = pipe().expect("create start pipe");
-        let (sync_read, sync_write) = pipe().expect("create sync pipe");
-
-        configure_pipe_inheritance(&start_read, &start_write, &sync_read, &sync_write)
-            .expect("configure pipe inheritance");
-
-        assert!(!cloexec(&start_read));
+        use std::os::fd::AsRawFd;
+        let (start_read, start_write) = launch_pipe().expect("start pipe");
+        let (sync_read, sync_write) = launch_pipe().expect("sync pipe");
+        let mut child = Command::new("/bin/sh");
+        child.arg("-c").arg(format!(
+            "test -e /dev/fd/{} && test -e /dev/fd/{} && test ! -e /dev/fd/{} && test ! -e /dev/fd/{}",
+            start_read.as_raw_fd(), sync_write.as_raw_fd(), start_write.as_raw_fd(), sync_read.as_raw_fd()
+        ));
+        install_child_inheritance(
+            &mut child,
+            [
+                Some(start_read.as_raw_fd()),
+                Some(sync_write.as_raw_fd()),
+                None,
+                None,
+                None,
+                None,
+            ],
+        )
+        .expect("child allowlist");
+        assert!(cloexec(&start_read));
         assert!(cloexec(&start_write));
         assert!(cloexec(&sync_read));
-        assert!(!cloexec(&sync_write));
+        assert!(cloexec(&sync_write));
+        assert!(child.status().expect("actual child").success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_elf_fd_is_resolved_before_cloexec_and_absent_after_exec() {
+        use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+        let executable = std::fs::File::open("/bin/sh").expect("ELF executable");
+        let raw = nix::fcntl::fcntl(&executable, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(120))
+            .expect("high retained executable");
+        let retained = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut command = crate::supervisor::launch::monitor_command(
+            std::path::Path::new("/nonexistent/staged/executable"),
+            Some(retained.as_fd()),
+        )
+        .expect("retained ELF command");
+        install_child_inheritance(&mut command, [None; 6]).expect("install cleanup");
+        command
+            .arg("-c")
+            .arg(format!("test ! -e /proc/self/fd/{}", retained.as_raw_fd()));
+        assert!(command.status().expect("execute retained ELF").success());
+        assert!(cloexec(&retained), "parent executable must stay CLOEXEC");
     }
 
     fn cloexec(fd: &std::os::fd::OwnedFd) -> bool {
         let flags =
             nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).expect("read descriptor flags");
         nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+    }
+
+    fn storage_lease() -> protocol::shutdown::StorageLeaseBinding {
+        protocol::shutdown::StorageLeaseBinding {
+            operation_id: "33333333-3333-4333-8333-333333333333".into(),
+            file_device: 1,
+            file_inode: 2,
+        }
+    }
+
+    fn storage_shutdown() -> protocol::shutdown::StorageShutdownContext {
+        protocol::shutdown::StorageShutdownContext {
+            version: 1,
+            machine_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            run_id: "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3".into(),
+            manifest: protocol::shutdown::StorageManifest::Unsupported {
+                reason: "pipe-only fixture has no attachments".into(),
+            },
+        }
     }
 
     #[tokio::test]
@@ -465,6 +630,8 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            storage_lease(),
+            storage_shutdown(),
         );
 
         handoff_start_request(write_fd, &request, Duration::from_secs(1))
@@ -482,8 +649,8 @@ mod tests {
     async fn handoff_timeout_closes_a_blocked_writer() {
         let (read_fd, write_fd) = private_pipe();
         let request = crate::supervisor::start_request::VmmStartRequest::new(
-            uuid::Uuid::nil().to_string(),
-            uuid::Uuid::nil().to_string(),
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             Some(crate::supervisor::start_request::VmmStartupCommand {
                 execution_id: uuid::Uuid::nil(),
                 process: crate::supervisor::start_request::VmmProcessSpec {
@@ -496,6 +663,8 @@ mod tests {
                     user: None,
                 },
             }),
+            storage_lease(),
+            storage_shutdown(),
         );
 
         let error = handoff_start_request(write_fd, &request, Duration::from_millis(20))
@@ -514,8 +683,8 @@ mod tests {
     async fn cancelling_handoff_closes_a_blocked_writer() {
         let (read_fd, write_fd) = private_pipe();
         let request = crate::supervisor::start_request::VmmStartRequest::new(
-            uuid::Uuid::nil().to_string(),
-            uuid::Uuid::nil().to_string(),
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             Some(crate::supervisor::start_request::VmmStartupCommand {
                 execution_id: uuid::Uuid::nil(),
                 process: crate::supervisor::start_request::VmmProcessSpec {
@@ -528,6 +697,8 @@ mod tests {
                     user: None,
                 },
             }),
+            storage_lease(),
+            storage_shutdown(),
         );
         let handoff = tokio::spawn(async move {
             handoff_start_request(write_fd, &request, Duration::from_secs(30)).await
@@ -577,8 +748,8 @@ mod tests {
 
     fn large_start_request(value: String) -> VmmStartRequest {
         VmmStartRequest::new(
-            uuid::Uuid::nil().to_string(),
-            uuid::Uuid::nil().to_string(),
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             Some(VmmStartupCommand {
                 execution_id: uuid::Uuid::nil(),
                 process: VmmProcessSpec {
@@ -591,6 +762,8 @@ mod tests {
                     user: None,
                 },
             }),
+            storage_lease(),
+            storage_shutdown(),
         )
     }
 
@@ -703,5 +876,54 @@ mod tests {
                 OsString::from("0123456789abcdef0123456789abcdef"),
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vmdk_monitor_exec_uses_retained_elf_after_atomic_path_replacement() {
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("selected-monitor");
+        let replacement = temp.path().join("replacement-monitor");
+        std::fs::copy("/bin/sh", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = std::fs::File::open(&executable).unwrap();
+        let flags = nix::fcntl::fcntl(retained.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(
+            nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
+        let mut magic = [0; 4];
+        std::os::unix::fs::FileExt::read_exact_at(&retained, &mut magic, 0).unwrap();
+        assert_eq!(&magic, b"\x7fELF");
+        std::fs::copy("/bin/false", &replacement).unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+
+        let mut command =
+            crate::supervisor::launch::monitor_command(&executable, Some(retained.as_fd()))
+                .unwrap();
+        let output = command
+            .args([
+                "-c",
+                &format!(
+                    "test ! -e /proc/self/fd/{} || exit 91; printf retained-qualified-native",
+                    retained.as_raw_fd()
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"retained-qualified-native");
+        assert_eq!(
+            nix::fcntl::fcntl(retained.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap(),
+            flags
+        );
+
+        let control = crate::supervisor::launch::monitor_command(&executable, None)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert_eq!(control.status.code(), Some(1));
+        assert!(control.stdout.is_empty());
     }
 }

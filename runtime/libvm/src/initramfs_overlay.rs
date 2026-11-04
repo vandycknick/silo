@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -8,33 +8,59 @@ use cpio::newc::ModeFileType;
 use cpio::NewcBuilder;
 use eyre::Context;
 
+use crate::boot_qualification::QualifiedAsset;
+
 const DIRECTORY_MODE: u32 = 0o755;
 const AGENT_MODE: u32 = 0o755;
 const CONFIG_MODE: u32 = 0o600;
 
+pub(crate) enum CompositeBase<'a> {
+    Path(&'a Path),
+    Qualified(&'a crate::QualifiedOverlayBoot),
+    Retained(&'a QualifiedAsset),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CompositeAgent<'a> {
+    Path(&'a Path),
+    Retained(&'a QualifiedAsset),
+}
+
 pub(crate) fn write_composite(
-    base_path: &Path,
-    agent_path: &Path,
-    config: &[u8],
+    base: CompositeBase<'_>,
+    agent_payload: Option<(CompositeAgent<'_>, &[u8])>,
+    root_bootstrap: Option<&[u8]>,
     destination: &Path,
 ) -> eyre::Result<()> {
-    if config.len() > MAX_AGENT_CONFIG_SIZE_BYTES {
-        eyre::bail!(
-            "serialized agent config exceeds {} byte limit",
-            MAX_AGENT_CONFIG_SIZE_BYTES
-        );
+    if let Some(root) = root_bootstrap {
+        if root.len() > rootfs_spec::MAX_JSON_BYTES {
+            eyre::bail!("root bootstrap exceeds bounded wire limit");
+        }
     }
-    let config_size = u32::try_from(config.len()).context("agent config is too large for newc")?;
-    let mut agent =
-        File::open(agent_path).with_context(|| format!("open agent {}", agent_path.display()))?;
-    let agent_metadata = agent
-        .metadata()
-        .with_context(|| format!("inspect agent {}", agent_path.display()))?;
-    if !agent_metadata.is_file() {
-        eyre::bail!("agent is not a regular file: {}", agent_path.display());
+    if let Some((_, config)) = agent_payload {
+        if config.len() > MAX_AGENT_CONFIG_SIZE_BYTES {
+            eyre::bail!(
+                "serialized agent config exceeds {} byte limit",
+                MAX_AGENT_CONFIG_SIZE_BYTES
+            );
+        }
     }
-    let agent_size = u32::try_from(agent_metadata.len())
-        .with_context(|| format!("agent is too large for newc: {}", agent_path.display()))?;
+    let opened_agent = match agent_payload {
+        Some((CompositeAgent::Path(path), _)) => Some(QualifiedAsset::open(path)?),
+        _ => None,
+    };
+    let agent_payload = agent_payload
+        .map(|(source, config)| -> eyre::Result<_> {
+            let agent = match source {
+                CompositeAgent::Path(_) => opened_agent
+                    .as_ref()
+                    .ok_or_else(|| eyre::eyre!("opened agent is missing"))?,
+                CompositeAgent::Retained(asset) => asset,
+            };
+            let size = u32::try_from(agent.length()).context("agent is too large for newc")?;
+            Ok((agent, config, size))
+        })
+        .transpose()?;
 
     let parent = destination.parent().ok_or_else(|| {
         eyre::eyre!(
@@ -53,10 +79,16 @@ pub(crate) fn write_composite(
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("protect temporary initramfs {}", temporary.display()))?;
 
-    let mut base = File::open(base_path)
-        .with_context(|| format!("open base initramfs {}", base_path.display()))?;
-    let base_size = io::copy(&mut base, &mut output)
-        .with_context(|| format!("copy base initramfs {}", base_path.display()))?;
+    let base_size = match base {
+        CompositeBase::Path(path) => {
+            let mut source = File::open(path)
+                .with_context(|| format!("open base initramfs {}", path.display()))?;
+            io::copy(&mut source, &mut output)
+                .with_context(|| format!("copy base initramfs {}", path.display()))?
+        }
+        CompositeBase::Qualified(qualification) => qualification.copy_initramfs(&mut output)?,
+        CompositeBase::Retained(asset) => asset.copy_into(&mut output)?,
+    };
     let padding = (4 - (base_size % 4)) % 4;
     if padding != 0 {
         output
@@ -64,16 +96,32 @@ pub(crate) fn write_composite(
             .context("align initramfs overlay")?;
     }
 
-    write_directory(&mut output, 1)?;
-    write_agent(&mut output, &mut agent, agent_path, agent_size, 2)?;
-    write_bytes(
-        &mut output,
-        "agent/config.json",
-        config,
-        config_size,
-        CONFIG_MODE,
-        3,
-    )?;
+    if let Some((agent, config, size)) = agent_payload {
+        write_directory(&mut output, 1)?;
+        write_agent(&mut output, agent, size, 2)?;
+        write_bytes(
+            &mut output,
+            "agent/config.json",
+            config,
+            u32::try_from(config.len()).context("agent config is too large for newc")?,
+            CONFIG_MODE,
+            3,
+        )?;
+    }
+    if let Some(root) = root_bootstrap {
+        entry("silo", 4, DIRECTORY_MODE, ModeFileType::Directory)
+            .write(&mut output, 0)
+            .finish()
+            .context("write root bootstrap directory")?;
+        write_bytes(
+            &mut output,
+            "silo/rootfs.json",
+            root,
+            u32::try_from(root.len()).context("root bootstrap is too large for newc")?,
+            CONFIG_MODE,
+            5,
+        )?;
+    }
     cpio::newc::trailer(&mut output).context("write initramfs overlay trailer")?;
     output.flush().context("flush composite initramfs")?;
     output.sync_all().context("sync composite initramfs")?;
@@ -115,34 +163,15 @@ fn write_directory(writer: &mut File, inode: u32) -> eyre::Result<()> {
 
 fn write_agent(
     writer: &mut File,
-    source: &mut File,
-    path: &Path,
+    source: &QualifiedAsset,
     size: u32,
     inode: u32,
 ) -> eyre::Result<()> {
     let mut entry_writer =
         entry("agent/silo-agent", inode, AGENT_MODE, ModeFileType::Regular).write(writer, size);
-    let copied = io::copy(
-        &mut Read::by_ref(source).take(u64::from(size)),
-        &mut entry_writer,
-    )
-    .with_context(|| format!("read agent {}", path.display()))?;
+    let copied = source.copy_into(&mut entry_writer)?;
     if copied != u64::from(size) {
-        eyre::bail!(
-            "agent changed while composing initramfs: {}",
-            path.display()
-        );
-    }
-    let mut extra = [0_u8; 1];
-    if source
-        .read(&mut extra)
-        .with_context(|| format!("finish reading agent {}", path.display()))?
-        != 0
-    {
-        eyre::bail!(
-            "agent changed while composing initramfs: {}",
-            path.display()
-        );
+        eyre::bail!("agent changed while composing initramfs");
     }
     entry_writer
         .finish()
@@ -206,7 +235,16 @@ mod tests {
         std::fs::write(&base, b"base-bytes").expect("write base");
         std::fs::write(&agent, b"agent-bytes").expect("write agent");
 
-        write_composite(&base, &agent, br#"{}"#, &output).expect("compose initramfs");
+        write_composite(
+            crate::initramfs_overlay::CompositeBase::Path(&base),
+            Some((
+                crate::initramfs_overlay::CompositeAgent::Path(&agent),
+                br#"{}"#,
+            )),
+            None,
+            &output,
+        )
+        .expect("compose initramfs");
 
         let bytes = std::fs::read(&output).expect("read output");
         assert_eq!(&bytes[..10], b"base-bytes");
@@ -263,9 +301,27 @@ mod tests {
         std::fs::write(&base, b"base").expect("write base");
         std::fs::write(&agent, b"agent").expect("write agent");
 
-        write_composite(&base, &agent, b"first", &output).expect("first composite");
+        write_composite(
+            crate::initramfs_overlay::CompositeBase::Path(&base),
+            Some((
+                crate::initramfs_overlay::CompositeAgent::Path(&agent),
+                b"first",
+            )),
+            None,
+            &output,
+        )
+        .expect("first composite");
         let first_len = std::fs::metadata(&output).expect("first metadata").len();
-        write_composite(&base, &agent, b"other", &output).expect("second composite");
+        write_composite(
+            crate::initramfs_overlay::CompositeBase::Path(&base),
+            Some((
+                crate::initramfs_overlay::CompositeAgent::Path(&agent),
+                b"other",
+            )),
+            None,
+            &output,
+        )
+        .expect("second composite");
         let second = std::fs::read(&output).expect("second output");
 
         assert_eq!(second.len() as u64, first_len);
@@ -284,9 +340,12 @@ mod tests {
         std::fs::write(&output, b"previous").expect("write previous");
 
         let error = write_composite(
-            &base,
-            &agent,
-            &vec![0; MAX_AGENT_CONFIG_SIZE_BYTES + 1],
+            crate::initramfs_overlay::CompositeBase::Path(&base),
+            Some((
+                crate::initramfs_overlay::CompositeAgent::Path(&agent),
+                &vec![0; MAX_AGENT_CONFIG_SIZE_BYTES + 1],
+            )),
+            None,
             &output,
         )
         .expect_err("oversized config must fail");
@@ -296,5 +355,36 @@ mod tests {
             std::fs::read(&output).expect("previous output"),
             b"previous"
         );
+    }
+
+    #[test]
+    fn root_bootstrap_is_injected_without_agent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("base");
+        let output = temp.path().join("composite");
+        std::fs::write(&base, b"base").unwrap();
+        let root = br#"{"schemaVersion":1,"root":{"kind":"opaque-raw-v1"}}"#;
+        write_composite(
+            crate::initramfs_overlay::CompositeBase::Path(&base),
+            None,
+            Some(root),
+            &output,
+        )
+        .unwrap();
+        let bytes = std::fs::read(output).unwrap();
+        let input = Cursor::new(&bytes[4..]);
+        let directory = cpio::NewcReader::new(input).unwrap();
+        assert_eq!(directory.entry().name(), "silo");
+        assert_eq!(directory.entry().uid(), 0);
+        let mut root_entry = cpio::NewcReader::new(directory.finish().unwrap()).unwrap();
+        assert_eq!(root_entry.entry().name(), "silo/rootfs.json");
+        assert_eq!(root_entry.entry().mode() & 0o777, 0o600);
+        assert_eq!(root_entry.entry().uid(), 0);
+        assert_eq!(root_entry.entry().gid(), 0);
+        let mut contents = Vec::new();
+        root_entry.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, root);
+        let trailer = cpio::NewcReader::new(root_entry.finish().unwrap()).unwrap();
+        assert!(trailer.entry().is_trailer());
     }
 }

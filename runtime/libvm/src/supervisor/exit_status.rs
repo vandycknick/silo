@@ -5,68 +5,26 @@ use std::path::Path;
 use nix::fcntl::{open, openat, renameat, OFlag};
 use nix::sys::stat::{fchmod, fstat, Mode, SFlag};
 use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-/// Exit status written by silo-vmm, or libvm after a confirmed force-kill.
-///
-/// This is silo-vmm telemetry, not the machine lifecycle state stored in SQLite.
-/// The runtime uses it as one input while reconciling `MachineState` after a
-/// monitor exits or disappears.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct VmmExitStatus {
-    pub(crate) machine_id: String,
-    pub(crate) run_id: String,
-    pub(crate) pid: i32,
-    pub(crate) exited_at: i64,
-    pub(crate) outcome: VmmExitOutcome,
-    pub(crate) error: Option<String>,
-    pub(crate) backend: Option<VmmBackendExit>,
+use protocol::shutdown::CurrentExitRecord;
+
+pub(crate) fn storage_outcome(
+    status: &CurrentExitRecord,
+    machine_id: &str,
+    run_id: &str,
+) -> crate::StorageStopOutcome {
+    match status.classify(machine_id, run_id) {
+        protocol::shutdown::StorageStopOutcome::Clean => crate::StorageStopOutcome::Clean,
+        protocol::shutdown::StorageStopOutcome::Forced => crate::StorageStopOutcome::Forced,
+        protocol::shutdown::StorageStopOutcome::Unknown => crate::StorageStopOutcome::Unknown,
+    }
 }
 
-/// Backend detail of the terminal outcome. Stored for diagnosis, never
-/// interpreted by reconciliation and never a replacement for the monitor pid.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct VmmBackendExit {
-    pub(crate) kind: String,
-    pub(crate) stage: String,
-    pub(crate) force_reason: Option<String>,
-    pub(crate) process: Option<VmmProcessExit>,
-    pub(crate) diagnostic: Option<VmmDiagnostic>,
-}
-
-/// Wait status of the process that ran the VMM, when the backend owns one.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct VmmProcessExit {
-    pub(crate) pid: u32,
-    pub(crate) raw_status: i32,
-    pub(crate) code: Option<i32>,
-    pub(crate) signal: Option<i32>,
-    pub(crate) core_dumped: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct VmmDiagnostic {
-    pub(crate) tail: String,
-    pub(crate) truncated: bool,
-}
-
-/// High-level outcome reported in a silo-vmm exit status file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum VmmExitOutcome {
-    Clean,
-    Error,
-    Forced,
-}
-
-pub(crate) fn read(path: &Path) -> io::Result<Option<VmmExitStatus>> {
+pub(crate) fn read(path: &Path) -> io::Result<Option<CurrentExitRecord>> {
     let fd = match open(
         path,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
@@ -87,21 +45,22 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<VmmExitStatus>> {
             ),
         ));
     }
+    if stat.st_nlink != 1 {
+        return Err(invalid(path, "does not have exactly one link"));
+    }
     if stat.st_mode & 0o7777 != 0o600 {
         return Err(invalid(
             path,
             format!("has mode {:o}, expected 600", stat.st_mode & 0o7777),
         ));
     }
-    let mut raw = String::new();
-    File::from(fd).read_to_string(&mut raw)?;
-    let status = serde_json::from_str(&raw).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("parse silo-vmm exit status from {}: {err}", path.display()),
-        )
-    })?;
-    Ok(Some(status))
+    let mut raw = Vec::new();
+    File::from(fd)
+        .take((protocol::STRUCTURED_16_MIB + 1) as u64)
+        .read_to_end(&mut raw)?;
+    CurrentExitRecord::decode(&raw)
+        .map(Some)
+        .map_err(|message| invalid(path, message))
 }
 
 /// Records a confirmed forced exit while the caller still owns the machine's
@@ -113,6 +72,15 @@ pub(crate) fn write_forced(
     run_id: &str,
     pid: i32,
 ) -> io::Result<i64> {
+    protocol::shutdown::validate_uuid(machine_id)
+        .and_then(|()| protocol::shutdown::validate_uuid(run_id))
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if pid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid monitor pid",
+        ));
+    }
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct ForcedExit<'a> {
@@ -183,105 +151,42 @@ fn invalid(path: &Path, message: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::supervisor::exit_status::{read, storage_outcome};
     use std::os::unix::fs::{symlink, PermissionsExt};
 
-    use crate::supervisor::exit_status::read;
-
     #[test]
-    fn exit_status_requires_current_private_schema() {
-        let temp = tempfile::tempdir().expect("create temporary directory");
+    fn private_exit_reader_preserves_forced_despite_malformed_evidence() {
+        let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("vm.exit.json");
-        std::fs::write(
-            &path,
-            r#"{"machineId":"machine-1","runId":"run-1","pid":42,"exitedAt":99,"outcome":"clean","error":null}"#,
-        )
-        .expect("write exit status");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .expect("secure exit status");
+        let machine = uuid::Uuid::new_v4().to_string();
+        let run = uuid::Uuid::new_v4().to_string();
+        let raw = format!(
+            r#"{{"machineId":"{machine}","runId":"{run}","pid":42,"exitedAt":99,"outcome":"forced","storageShutdown":{{"version":1,"guestProtocolCompleted":true,"guestProtocolCompleted":false}}}}"#
+        );
+        std::fs::write(&path, raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let status = read(&path).unwrap().unwrap();
+        assert_eq!(
+            storage_outcome(&status, &machine, &run),
+            crate::StorageStopOutcome::Forced
+        );
+        assert_eq!(
+            storage_outcome(&status, &machine, &uuid::Uuid::new_v4().to_string()),
+            crate::StorageStopOutcome::Unknown
+        );
+    }
 
-        let status = read(&path)
-            .expect("read exit status")
-            .expect("exit status exists");
-        assert_eq!(status.machine_id, "machine-1");
-        assert_eq!(status.run_id, "run-1");
-        assert_eq!(status.pid, 42);
-
-        std::fs::write(
-            &path,
-            r#"{"runId":"run-1","pid":42,"exitedAt":99,"outcome":"clean"}"#,
-        )
-        .expect("write legacy exit status");
+    #[test]
+    fn private_exit_reader_rejects_malformed_outer_and_unsafe_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vm.exit.json");
+        std::fs::write(&path, b"{").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(read(&path).is_err());
-    }
-
-    #[test]
-    fn backend_detail_is_additive_and_keeps_supervisor_identity() {
-        let status: crate::supervisor::exit_status::VmmExitStatus =
-            serde_json::from_value(serde_json::json!({
-                "machineId": "machine-1", "runId": "run-1", "pid": 42,
-                "exitedAt": 99, "outcome": "forced", "error": null,
-                "backend": { "kind": "krun", "stage": "started", "forceReason": "stop",
-                    "process": { "pid": 43, "rawStatus": 9, "code": null, "signal": 9,
-                        "coreDumped": false },
-                    "diagnostic": { "tail": "tail", "truncated": false },
-                    "futureField": true }
-            }))
-            .expect("read additive backend detail");
-        assert_eq!(status.pid, 42);
-        let backend = status.backend.expect("backend");
-        assert_eq!(backend.kind, "krun");
-        assert_eq!(backend.force_reason.as_deref(), Some("stop"));
-        assert_eq!(backend.process.expect("process").pid, 43);
-        assert_eq!(backend.diagnostic.expect("diagnostic").tail, "tail");
-        assert_eq!(
-            status.outcome,
-            crate::supervisor::exit_status::VmmExitOutcome::Forced
-        );
-    }
-
-    #[test]
-    fn backend_detail_is_optional_at_every_level() {
-        let status: crate::supervisor::exit_status::VmmExitStatus =
-            serde_json::from_value(serde_json::json!({
-                "machineId": "machine-1", "runId": "run-1", "pid": 42,
-                "exitedAt": 99, "outcome": "clean", "error": null,
-                "backend": { "kind": "vz", "stage": "started", "forceReason": null }
-            }))
-            .expect("read backend without process");
-        let backend = status.backend.expect("backend");
-        assert!(backend.process.is_none());
-        assert!(backend.diagnostic.is_none());
-
-        let status: crate::supervisor::exit_status::VmmExitStatus =
-            serde_json::from_value(serde_json::json!({
-                "machineId": "machine-1", "runId": "run-1", "pid": 42,
-                "exitedAt": 99, "outcome": "error", "error": "startup cancelled"
-            }))
-            .expect("read record without backend");
-        assert!(status.backend.is_none());
-    }
-
-    #[test]
-    fn exit_status_rejects_unsafe_objects() {
-        let temp = tempfile::tempdir().expect("create temporary directory");
-        let permissive = temp.path().join("permissive.json");
-        std::fs::write(
-            &permissive,
-            r#"{"machineId":"machine-1","runId":"run-1","pid":42,"exitedAt":99,"outcome":"clean"}"#,
-        )
-        .expect("write permissive exit status");
-        std::fs::set_permissions(&permissive, std::fs::Permissions::from_mode(0o644))
-            .expect("set permissive mode");
-        assert!(read(&permissive).is_err());
-
-        let target = temp.path().join("target.json");
-        std::fs::write(&target, b"target").expect("write symlink target");
-        let link = temp.path().join("link.json");
-        symlink(&target, &link).expect("create symlink");
+        let link = temp.path().join("link");
+        symlink(&path, &link).unwrap();
         assert!(read(&link).is_err());
-        assert_eq!(
-            std::fs::read(&target).expect("read symlink target"),
-            b"target"
-        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read(&path).is_err());
     }
 }

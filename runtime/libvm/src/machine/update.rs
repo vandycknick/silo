@@ -51,6 +51,8 @@ pub struct MachineUpdate {
     pub memory: Option<Memory>,
     /// New desired root disk size in bytes.
     pub root_disk_size: Option<u64>,
+    /// Explicit `/tmp` policy for a stopped flat-overlay machine.
+    pub temporary_directory: Option<crate::TemporaryDirectoryPolicy>,
     /// New nested virtualization setting.
     pub nested_virtualization: Option<bool>,
     /// New Rosetta setting.
@@ -113,6 +115,12 @@ impl MachineUpdate {
     /// Sets the desired root disk size in bytes.
     pub fn root_disk_size(mut self, root_disk_size: u64) -> Self {
         self.root_disk_size = Some(root_disk_size);
+        self
+    }
+
+    /// Changes disk-backed or explicitly sized tmpfs `/tmp` on the next boot.
+    pub fn temporary_directory(mut self, policy: crate::TemporaryDirectoryPolicy) -> Self {
+        self.temporary_directory = Some(policy);
         self
     }
 
@@ -198,6 +206,7 @@ impl MachineUpdate {
             && self.cpus.is_none()
             && self.memory.is_none()
             && self.root_disk_size.is_none()
+            && self.temporary_directory.is_none()
             && self.nested_virtualization.is_none()
             && self.rosetta.is_none()
             && self.forwards.is_none()

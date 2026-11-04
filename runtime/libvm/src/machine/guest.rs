@@ -60,7 +60,9 @@ impl MachineUserConfig {
             },
             ..agent_spec::AgentConfig::default()
         };
-        config.validate().map_err(|error| error.to_string())
+        config
+            .validate_provisioning()
+            .map_err(|error| error.to_string())
     }
 }
 

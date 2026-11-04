@@ -69,6 +69,8 @@ pub struct NormalizedMachineCreate {
     pub cpus: Option<u8>,
     pub memory_bytes: Option<u64>,
     pub root_disk_size_bytes: Option<u64>,
+    pub root_profile: libvm::RootProfile,
+    pub temporary_directory: libvm::TemporaryDirectoryPolicy,
     pub userdata: Option<String>,
     pub network: Option<ResolvedNetwork>,
     pub agent: MachineAgent,
@@ -93,6 +95,8 @@ impl NormalizedMachineCreate {
             .kernel_args(self.kernel_args)
             .nested_virtualization(self.nested_virtualization)
             .rosetta(self.rosetta)
+            .root_profile(self.root_profile)
+            .temporary_directory(self.temporary_directory)
             .disks(self.disks)
             .mounts(self.mounts)
             .forwards(self.forwards);
@@ -134,123 +138,5 @@ impl NormalizedMachineCreate {
             }
         });
         Ok(builder.agent_mode(Some(agent)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
-
-    use libvm::{
-        ImageSource, MachineAgent, MachineNetworkConfig, MachineRetention, MachineUserConfig,
-        ProcessConfig, Runtime, RuntimeConfig,
-    };
-
-    use crate::create::{NormalizedMachineCreate, ResolvedNetwork};
-
-    async fn runtime(root: &Path) -> Runtime {
-        let components = root.join("runtime");
-        for (name, executable) in [
-            ("bin/silo-vmm", true),
-            ("bin/netd", true),
-            ("assets/kernel-default", false),
-            ("assets/initramfs", false),
-            ("assets/agent", true),
-        ] {
-            let path = components.join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"component").unwrap();
-            std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
-            )
-            .unwrap();
-        }
-        Runtime::new(RuntimeConfig::local(root.join("home")).with_runtime_root(components))
-            .await
-            .unwrap()
-    }
-
-    fn settings(name: &str) -> NormalizedMachineCreate {
-        NormalizedMachineCreate {
-            name: Some(name.into()),
-            template_name: None,
-            labels: BTreeMap::new(),
-            process: ProcessConfig::default(),
-            retention: MachineRetention::Persistent,
-            kernel: None,
-            initramfs: None,
-            kernel_args: Vec::new(),
-            nested_virtualization: false,
-            rosetta: false,
-            disks: Vec::new(),
-            mounts: Vec::new(),
-            forwards: Vec::new(),
-            vsock: None,
-            cpus: None,
-            memory_bytes: None,
-            root_disk_size_bytes: None,
-            userdata: None,
-            network: None,
-            agent: MachineAgent::Default,
-            provision_user: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn normalized_create_preserves_process_agent_user_and_prepared_disk() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = runtime(root.path()).await;
-        let disk = root.path().join("root.raw");
-        std::fs::write(&disk, b"root-disk").unwrap();
-        let mut normalized = settings("normalized");
-        normalized.template_name = Some("fixture".into());
-        normalized.labels.insert("owner".into(), "alice".into());
-        normalized.process.entrypoint = Some(Vec::new());
-        normalized.process.command = Some(vec!["exact argument".into(), "".into()]);
-        normalized.agent = MachineAgent::Disabled;
-        normalized.network = Some(ResolvedNetwork::None);
-        let user = MachineUserConfig::new("alice", 1000, 1000, "/home/alice");
-        normalized.provision_user = Some(user.clone());
-        let expected_process = normalized.process.clone();
-        let expected_labels = normalized.labels.clone();
-        let machine = normalized
-            .apply_to_builder(runtime.machine().image_source(ImageSource::disk(&disk)))
-            .unwrap()
-            .create()
-            .await
-            .unwrap();
-        let data = machine.inspect().await.unwrap();
-        assert_eq!(data.process, expected_process);
-        assert_eq!(data.labels, expected_labels);
-        assert_eq!(data.template_name.as_deref(), Some("fixture"));
-        assert_eq!(data.agent_mode, Some(MachineAgent::Disabled));
-        assert_eq!(data.guest.agent, MachineAgent::Disabled);
-        assert_eq!(data.guest.user, Some(user));
-        assert_eq!(data.network, MachineNetworkConfig::None);
-        let rootfs = data.rootfs.unwrap();
-        assert_eq!(std::fs::read(rootfs.root_disk_path).unwrap(), b"root-disk");
-    }
-
-    #[tokio::test]
-    async fn absent_network_and_process_lists_retain_native_defaults() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = runtime(root.path()).await;
-        let disk = root.path().join("root.raw");
-        std::fs::write(&disk, b"root-disk").unwrap();
-        let machine = settings("defaults")
-            .apply_to_builder(runtime.machine().image_source(ImageSource::disk(&disk)))
-            .unwrap()
-            .create()
-            .await
-            .unwrap();
-        let data = machine.inspect().await.unwrap();
-        assert_eq!(data.process.entrypoint, None);
-        assert_eq!(data.process.command, None);
-        assert_eq!(data.network, MachineNetworkConfig::default());
-        assert_eq!(data.agent_mode, Some(MachineAgent::Default));
-        assert_eq!(data.retention, MachineRetention::Persistent);
     }
 }

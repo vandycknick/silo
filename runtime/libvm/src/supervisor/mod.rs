@@ -17,6 +17,7 @@ mod launch;
 mod launch_spec;
 pub(crate) mod process;
 pub(crate) mod start_request;
+pub(crate) mod storage_holder;
 
 pub use client::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub(crate) use client::{forward_rpc_error, ForwardClientError, VmmClient, VmmClientError};
@@ -28,7 +29,7 @@ pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecI
 pub(crate) struct VmSupervisor {
     paths: LocalPaths,
     executable: PathBuf,
-    virt_backend: Option<crate::runtime::VirtBackendOverride>,
+    selection: std::sync::Arc<crate::runtime::capabilities::ResolvedBackendSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub(crate) struct VmmLaunchInputs {
     pub(crate) agent_enabled: bool,
     pub(crate) rosetta_intent: start_request::VmmRosettaIntent,
     pub(crate) asset_directory: PathBuf,
+    pub(crate) storage_shutdown: protocol::shutdown::StorageShutdownContext,
 }
 
 impl VmSupervisor {
@@ -43,12 +45,12 @@ impl VmSupervisor {
     pub(crate) fn new(
         paths: LocalPaths,
         executable: PathBuf,
-        virt_backend: Option<crate::runtime::VirtBackendOverride>,
+        selection: std::sync::Arc<crate::runtime::capabilities::ResolvedBackendSelection>,
     ) -> Self {
         Self {
             paths,
             executable,
-            virt_backend,
+            selection,
         }
     }
 
@@ -58,22 +60,7 @@ impl VmSupervisor {
 
     /// Explicit backend selection forwarded in every start request.
     pub(crate) fn virt_backend_request(&self) -> Option<start_request::VmmVirtBackend> {
-        self.virt_backend.as_ref().map(|selection| match selection {
-            crate::runtime::VirtBackendOverride::Krun => start_request::VmmVirtBackend {
-                kind: "krun".to_string(),
-                scenario: None,
-            },
-            crate::runtime::VirtBackendOverride::Vz => start_request::VmmVirtBackend {
-                kind: "vz".to_string(),
-                scenario: None,
-            },
-            crate::runtime::VirtBackendOverride::Mock { scenario } => {
-                start_request::VmmVirtBackend {
-                    kind: "mock".to_string(),
-                    scenario: scenario.clone(),
-                }
-            }
-        })
+        Some(self.selection.request())
     }
 
     pub(crate) fn rosetta_intent_request(
@@ -182,7 +169,8 @@ mod tests {
             let supervisor = VmSupervisor::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
                 "/tmp/silo-vmm".into(),
-                Some(selection),
+                crate::runtime::capabilities::ResolvedBackendSelection::resolve(Some(&selection))
+                    .expect("selection"),
             );
             let request = supervisor.virt_backend_request().expect("backend request");
             assert_eq!(request.kind, expected);
@@ -198,7 +186,10 @@ mod tests {
         let supervisor = VmSupervisor::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
             "/operator/silo-vmm".into(),
-            Some(VirtBackendOverride::Krun),
+            crate::runtime::capabilities::ResolvedBackendSelection::resolve(Some(
+                &VirtBackendOverride::Krun,
+            ))
+            .expect("selection"),
         );
         let config = rosetta_machine_config();
         assert_eq!(
@@ -222,7 +213,8 @@ mod tests {
             let supervisor = VmSupervisor::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
                 "/operator/silo-vmm".into(),
-                backend,
+                crate::runtime::capabilities::ResolvedBackendSelection::resolve(backend.as_ref())
+                    .expect("selection"),
             );
             assert_eq!(
                 supervisor
@@ -239,7 +231,10 @@ mod tests {
         let supervisor = VmSupervisor::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
             "/operator/silo-vmm".into(),
-            Some(VirtBackendOverride::Vz),
+            crate::runtime::capabilities::ResolvedBackendSelection::resolve(Some(
+                &VirtBackendOverride::Vz,
+            ))
+            .expect("selection"),
         );
 
         let mut custom_agent = rosetta_machine_config();

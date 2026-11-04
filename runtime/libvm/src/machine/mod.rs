@@ -6,6 +6,7 @@ mod handle;
 mod inspect;
 mod lifecycle;
 mod lifecycle_options;
+pub(crate) mod live;
 mod logs;
 mod memory;
 mod mounts;
@@ -14,14 +15,18 @@ mod node_status;
 mod process;
 mod reference;
 pub(crate) mod root_disk;
+pub(crate) mod root_storage;
 mod secrets;
 mod session;
 mod start;
+pub(crate) mod stopped;
+#[cfg(all(test, target_os = "linux"))]
+mod stopped_storage;
 mod streams;
 mod update;
 mod vsock;
 
-pub use builder::MachineBuilder;
+pub use builder::{MachineBuilder, RootProfile};
 pub use forward::{
     MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
     MachineForwardStatus,
@@ -38,6 +43,7 @@ pub use lifecycle_options::{
     MachineExit, MachineExitOutcome, MachineKillOptions, MachineRunId, MachineStart,
     MachineStopOptions, MachineWaitOptions, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
+pub use live::{require_live_operation, LiveObservationReader, MachineLiveObservation};
 pub use logs::{
     MachineLogChunk, MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream,
 };
@@ -48,6 +54,7 @@ pub use node_status::{
     MachineNodeState, MachineNodeStatus,
 };
 pub use process::{MachineRetention, ProcessConfig};
+pub use reference::validate_new_machine_name;
 pub use reference::MachineRef;
 pub use session::host::AttachmentSignal;
 pub(crate) use session::launch_failure_reason;
@@ -65,6 +72,11 @@ pub use start::{
     EgressCredentials, EgressSecret, Entrypoint, HostCommand, LaunchCredentials,
     MachineStartOptions,
 };
+pub use stopped::{
+    preflight_restore_snapshot, preflight_stopped, ExternalResourceKey, ExternalResourceMapping,
+    ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions, RestoreOptions,
+    SnapshotConfiguration, SnapshotOptions,
+};
 pub use streams::{
     FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,
     MachineAgentIdentity, MachineAgentMetricReport, MachineAgentMetricsObservation,
@@ -79,8 +91,9 @@ pub use streams::{
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
     MachineNetworkInterfaceMetrics, MachineProvisionOverallStatus, MachineProvisioningReport,
     MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
-    MachineSshBackend, MachineSshListenerReport, MachineStaleReason, MachineSystemInfo,
-    MachineVmSnapshot, MachineVmState,
+    MachineRootStorageKind, MachineRootStorageMetrics, MachineSshBackend, MachineSshListenerReport,
+    MachineStaleReason, MachineSystemInfo, MachineTemporaryDirectoryKind,
+    MachineTemporaryDirectoryMetrics, MachineVmSnapshot, MachineVmState,
 };
 pub use update::{GuestPublishUpdate, MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 

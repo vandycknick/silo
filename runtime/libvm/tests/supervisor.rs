@@ -40,14 +40,10 @@ fn write_file(path: &Path, contents: &[u8], mode: u32) {
 fn write_runtime_root(root: &Path) -> PathBuf {
     write_file(&root.join("bin/netd"), b"#!/bin/sh\nexit 0\n", 0o755);
     let supervisor = root.join("bin/silo-vmm");
-    // macOS policy-scans the first exec of every new executable inode for
-    // about a second, one at a time, so a fresh copy per test queues parallel
-    // launches past the 5s daemonize budget. Hard links share the inode
-    // mock_vmm_binary already executed; other filesystems fall back to a copy.
-    if std::fs::hard_link(test_utils::mock_vmm_binary(), &supervisor).is_err() {
-        std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
-            .expect("install mock-enabled silo-vmm");
-    }
+    // Each fixture owns its inode: parallel link/chmod operations must not
+    // change the executable fingerprint another test is authenticating.
+    std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
+        .expect("install mock-enabled silo-vmm");
     std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755))
         .expect("make silo-vmm executable");
     write_file(&root.join("assets/kernel-default"), b"kernel", 0o644);
@@ -2431,7 +2427,7 @@ async fn machine_start_reports_entrypoint_command_not_found() {
 }
 
 #[tokio::test]
-async fn machine_entrypoint_completion_stops_with_a_clean_exit() {
+async fn scenario_entrypoint_completion_is_noncertifying_without_shutdown_authority() {
     let env = test_env("startup-command-completion", &Scenario::default()).await;
     let machine = create_machine(&env, "mock-startup-command-completion").await;
 
@@ -2444,8 +2440,19 @@ async fn machine_entrypoint_completion_stops_with_a_clean_exit() {
         .expect("entrypoint completion stops silo-vmm before timeout")
         .expect("reconcile entrypoint completion");
 
-    assert_eq!(exit.outcome, MachineExitOutcome::Clean);
-    assert_eq!(exit.machine.status, MachineStatus::Stopped);
+    // Scenario execution completes a real process, but its guest service has no
+    // storage-shutdown authority. Entrypoint completion must not manufacture a
+    // clean storage certificate from that process's successful exit.
+    assert!(matches!(exit.outcome, MachineExitOutcome::Error { .. }));
+    assert!(matches!(exit.machine.status, MachineStatus::Error { .. }));
+    assert_eq!(
+        exit.machine
+            .storage
+            .as_ref()
+            .expect("durable storage")
+            .stop_outcome,
+        libvm::StorageStopOutcome::Forced,
+    );
 
     machine
         .remove_after_run(start.run_id)

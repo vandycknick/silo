@@ -59,20 +59,6 @@ impl ImageSource {
     pub fn disk(path: impl Into<PathBuf>) -> Self {
         Self::Disk(path.into())
     }
-
-    pub(crate) fn kind(&self) -> ImageSourceKind {
-        match self {
-            Self::Oci(_) => ImageSourceKind::Oci,
-            Self::Disk(_) => ImageSourceKind::Disk,
-        }
-    }
-
-    pub(crate) fn source_reference(&self) -> String {
-        match self {
-            Self::Oci(reference) => reference.clone(),
-            Self::Disk(path) => path.display().to_string(),
-        }
-    }
 }
 
 /// Stable source kind recorded for a materialized machine image.
@@ -190,7 +176,7 @@ pub(crate) enum ResolvedOciImageMaterialization {
 /// Options for removing image references.
 #[derive(Debug, Clone, Default)]
 pub struct ImageRemoveOptions {
-    /// Remove a reference even when machines still pin its manifest.
+    /// Reserved override for records with actual shared storage dependencies.
     pub force: bool,
 }
 
@@ -348,7 +334,7 @@ impl Images {
         self.runtime.image_detail(reference).await
     }
 
-    /// Removes an image reference when no machine pins its manifest.
+    /// Removes an image reference; independent private machine roots are unaffected.
     pub async fn remove(&self, reference: &str) -> Result<(), LibVmError> {
         self.remove_with(reference, ImageRemoveOptions::default())
             .await
@@ -363,7 +349,7 @@ impl Images {
         self.runtime.remove_image(reference, options).await
     }
 
-    /// Prunes image metadata and artifacts that no machine references.
+    /// Prunes unreferenced image metadata and bytes not retained by active operations.
     pub async fn prune(&self) -> Result<ImagePruneReport, LibVmError> {
         self.runtime.prune_images().await
     }
@@ -371,6 +357,7 @@ impl Images {
 
 pub(crate) struct MaterializedImage {
     pub(crate) rootfs_path: PathBuf,
+    pub(crate) stream: Option<crate::storage::identity::StreamId>,
     pub(crate) requested_reference: String,
     pub(crate) selected_reference: Option<String>,
     pub(crate) source_kind: ImageSourceKind,
@@ -378,4 +365,6 @@ pub(crate) struct MaterializedImage {
     pub(crate) manifest_digest: Option<String>,
     pub(crate) config_digest: Option<String>,
     pub(crate) size_bytes: u64,
+    pub(crate) platform: Platform,
+    pub(crate) _lease: Option<crate::storage::locks::StorageLock>,
 }

@@ -57,6 +57,47 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         ..Default::default()
     };
     let code = match v {
+        E::LiveOperationUnsupported {
+            operation,
+            backend,
+            lane,
+            reason,
+        } => {
+            let value = vm_spec::live::LiveOperationUnsupported {
+                operation: *operation,
+                backend: *backend,
+                lane: *lane,
+                reason: reason.clone(),
+            };
+            let wire = match crate::live::unsupported_to_wire(&value) {
+                Ok(wire) => wire,
+                Err(error) => {
+                    return native_error_to_status(&E::LiveProtocol {
+                        message: error.to_string(),
+                    })
+                }
+            };
+            d.kind = 4;
+            d.code = 8;
+            d.safe_message = value.to_string();
+            d.live_unsupported = Some(wire);
+            tonic::Code::FailedPrecondition
+        }
+        E::LiveDiscovery { .. } => {
+            d.kind = 7;
+            d.safe_message = "live capability discovery unavailable".into();
+            tonic::Code::Unavailable
+        }
+        E::LiveObservation { reference, .. } => {
+            d.kind = 7;
+            d.reference = Some(reference.clone());
+            d.safe_message = "live machine observation unavailable".into();
+            tonic::Code::Unavailable
+        }
+        E::LiveProtocol { .. } => {
+            d.safe_message = "invalid live capability protocol evidence".into();
+            tonic::Code::DataLoss
+        }
         E::MachineAlreadyRunning { reference } => {
             d.kind = 4;
             d.code = 1;
@@ -193,7 +234,28 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         return Err(invalid("error.kind", "invalid enum"));
     }
     use libvm::LibVmError as E;
+    if d.code != 8 && d.live_unsupported.is_some() {
+        return Err(invalid("error.live_unsupported", "unexpected live detail"));
+    }
     Ok(match d.code {
+        8 => {
+            if v.code() != tonic::Code::FailedPrecondition || d.kind != 4 {
+                return Err(invalid(
+                    "error.live_unsupported",
+                    "expected failed precondition/conflict",
+                ));
+            }
+            let value = crate::live::unsupported_from_wire(required(
+                d.live_unsupported,
+                "error.live_unsupported",
+            )?)?;
+            E::LiveOperationUnsupported {
+                operation: value.operation,
+                backend: value.backend,
+                lane: value.lane,
+                reason: value.reason,
+            }
+        }
         1 => E::MachineAlreadyRunning {
             reference: required(d.reference, "error.reference")?,
         },
@@ -233,6 +295,20 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             }
         }
         7 => match required(d.native_variant, "error.native_variant")?.as_str() {
+            "LiveDiscovery" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
+                E::LiveDiscovery {
+                    message: d.safe_message,
+                }
+            }
+            "LiveObservation" if v.code() == tonic::Code::Unavailable && d.kind == 7 => {
+                E::LiveObservation {
+                    reference: required(d.reference, "error.reference")?,
+                    message: d.safe_message,
+                }
+            }
+            "LiveProtocol" if v.code() == tonic::Code::DataLoss && d.kind == 8 => E::LiveProtocol {
+                message: d.safe_message,
+            },
             "MachineNotFound" => E::MachineNotFound {
                 reference: required(d.reference, "error.reference")?,
             },
@@ -258,4 +334,125 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         },
         _ => return Err(invalid("error.code", "invalid enum")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::errors::{
+        native_error_to_status, status_to_native_error, RpcStatus, ERROR_DETAIL_TYPE,
+    };
+    use prost::Message;
+    use silod_spec::daemon::v1 as w;
+    use vm_spec::live::*;
+
+    #[test]
+    fn live_failed_precondition_roundtrips_every_operation_reason_and_subject() {
+        let reasons = [
+            LiveUnsupportedReason::new(LiveReasonCode::BackendExcluded),
+            LiveUnsupportedReason::new(LiveReasonCode::HostOsBelowFloor),
+            LiveUnsupportedReason::new(LiveReasonCode::LaneNotQualified),
+            LiveUnsupportedReason::new(LiveReasonCode::HypervisorUnavailable),
+            LiveUnsupportedReason::new(LiveReasonCode::BuildExcluded),
+            LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
+            LiveUnsupportedReason::device(LiveDeviceSubject::Virtiofs),
+            LiveUnsupportedReason::device(LiveDeviceSubject::Rosetta),
+            LiveUnsupportedReason::device(LiveDeviceSubject::Tap),
+            LiveUnsupportedReason::device(LiveDeviceSubject::Gpu),
+            LiveUnsupportedReason::device(LiveDeviceSubject::Nested),
+            LiveUnsupportedReason::device(LiveDeviceSubject::Tee),
+            LiveUnsupportedReason::device(LiveDeviceSubject::GuestProfile {
+                profile: "restricted-v1".into(),
+            }),
+        ];
+        for operation in LiveOperation::ALL {
+            for reason in &reasons {
+                let input = libvm::LibVmError::LiveOperationUnsupported {
+                    operation,
+                    backend: LiveBackend::Mock,
+                    lane: LiveLane::NotApplicable,
+                    reason: reason.clone(),
+                };
+                let status = native_error_to_status(&input);
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                match status_to_native_error(&status).unwrap() {
+                    libvm::LibVmError::LiveOperationUnsupported {
+                        operation: actual,
+                        backend,
+                        lane,
+                        reason: actual_reason,
+                    } => {
+                        assert_eq!(actual, operation);
+                        assert_eq!(backend, LiveBackend::Mock);
+                        assert_eq!(lane, LiveLane::NotApplicable);
+                        assert_eq!(&actual_reason, reason);
+                    }
+                    error => panic!("lost typed live refusal: {error:?}"),
+                }
+            }
+        }
+    }
+
+    fn status(detail: w::ErrorDetail, code: tonic::Code) -> tonic::Status {
+        let rich = RpcStatus {
+            code: code as i32,
+            message: "not interpreted".into(),
+            details: vec![prost_types::Any {
+                type_url: ERROR_DETAIL_TYPE.into(),
+                value: detail.encode_to_vec(),
+            }],
+        };
+        tonic::Status::with_details(code, "not interpreted", rich.encode_to_vec().into())
+    }
+
+    #[test]
+    fn live_errors_require_typed_detail_and_correct_status_category() {
+        let detail = w::ErrorDetail {
+            kind: 4,
+            code: 8,
+            ..Default::default()
+        };
+        assert!(
+            status_to_native_error(&status(detail.clone(), tonic::Code::FailedPrecondition))
+                .is_err()
+        );
+        let mut detail = detail;
+        detail.live_unsupported = Some(
+            crate::live::unsupported_to_wire(&LiveOperationUnsupported {
+                operation: LiveOperation::Pause,
+                backend: LiveBackend::Vz,
+                lane: LiveLane::NotApplicable,
+                reason: LiveUnsupportedReason::new(LiveReasonCode::BackendExcluded),
+            })
+            .unwrap(),
+        );
+        assert!(
+            status_to_native_error(&status(detail.clone(), tonic::Code::Unimplemented)).is_err()
+        );
+        detail.live_unsupported.as_mut().unwrap().operation = Some(999);
+        assert!(status_to_native_error(&status(detail, tonic::Code::FailedPrecondition)).is_err());
+        assert!(status_to_native_error(&tonic::Status::failed_precondition(
+            "pause unsupported: backend-excluded"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn invalid_outbound_live_refusal_becomes_typed_protocol_failure() {
+        let invalid = libvm::LibVmError::LiveOperationUnsupported {
+            operation: LiveOperation::Capture,
+            backend: LiveBackend::Vz,
+            lane: LiveLane::KvmX86_64,
+            reason: LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
+        };
+        let status = native_error_to_status(&invalid);
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(matches!(
+            status_to_native_error(&status).unwrap(),
+            libvm::LibVmError::LiveProtocol { .. }
+        ));
+        let rich = RpcStatus::decode(status.details()).unwrap();
+        let detail = w::ErrorDetail::decode(rich.details[0].value.as_slice()).unwrap();
+        assert_eq!(detail.code, 7);
+        assert!(detail.live_unsupported.is_none());
+    }
 }

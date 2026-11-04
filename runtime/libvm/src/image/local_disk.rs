@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use crate::LibVmError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,30 +33,18 @@ pub(crate) fn resolve_local_disk(path: &Path) -> Result<LocalDiskSource, LibVmEr
     })?;
 
     Ok(LocalDiskSource {
-        image_id: format!(
-            "local-disk-sha256:{}",
-            sha256_hex(canonical_path.to_string_lossy().as_bytes())
-        ),
+        image_id: crate::storage::stream::StreamHasher::new()
+            .hash_file(&canonical_path)
+            .map_err(crate::image::oci::storage_error)?
+            .id()
+            .to_string(),
         canonical_path,
     })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-
-    use sha2::{Digest, Sha256};
 
     use crate::image::local_disk::resolve_local_disk;
     use crate::{LibVmError, ReadOnlyRuntime, RuntimeConfig};
@@ -75,14 +61,11 @@ mod tests {
         let canonical = real.canonicalize().expect("canonical local disk");
 
         assert_eq!(source.canonical_path, canonical);
-        let expected_digest = Sha256::digest(canonical.to_string_lossy().as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(
-            source.image_id,
-            format!("local-disk-sha256:{expected_digest}")
-        );
+        let expected = crate::storage::stream::StreamHasher::new()
+            .hash_reader(b"local disk".as_slice())
+            .unwrap()
+            .id();
+        assert_eq!(source.image_id, expected.to_string());
     }
 
     #[test]

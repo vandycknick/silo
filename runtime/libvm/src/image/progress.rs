@@ -108,9 +108,6 @@ impl From<oci::ProgressEvent> for ImageProgress {
                 layer_count,
                 total_download_bytes,
             },
-            oci::ProgressEvent::CheckingCache { image_ref } => Self::CheckingCache { image_ref },
-            oci::ProgressEvent::CacheHit { image_ref } => Self::CacheHit { image_ref },
-            oci::ProgressEvent::CacheMiss { image_ref } => Self::CacheMiss { image_ref },
             oci::ProgressEvent::LayerDownloadStarted {
                 index,
                 total,
@@ -172,7 +169,6 @@ impl From<oci::ProgressEvent> for ImageProgress {
                 digest,
             },
             oci::ProgressEvent::MaterializingRootfs => Self::MaterializingRootfs,
-            oci::ProgressEvent::PublishingRootfs => Self::PublishingRootfs,
         }
     }
 }

@@ -545,12 +545,21 @@ pub fn monitor_status_to_wire(
         vm: Some(vm_to_wire(&v.vm)?),
         readiness: Some(readiness_state_to_wire(&v.readiness)?),
         agent: Some(agent_to_wire(&v.agent)?),
+        live: Some(crate::live::machine_to_wire(&v.live)?),
     })
 }
 pub fn monitor_status_from_wire(
     v: w::MonitorStatus,
 ) -> Result<libvm::MachineMonitorStatus, ConversionError> {
     validate_uuid(&v.machine_id, "monitor.machine_id")?;
+    let live = crate::live::machine_from_wire(required(v.live, "monitor.live")?)?;
+    let monitor = monitor_from_wire(required(v.monitor, "monitor")?)?;
+    if live.machine_id != v.machine_id
+        || v.run_id.as_deref() != Some(live.run_id.as_str())
+        || live.monitor_id != monitor.instance_id
+    {
+        return Err(invalid("monitor.live", "run/monitor identity mismatch"));
+    }
     Ok(libvm::MachineMonitorStatus {
         machine_id: v.machine_id,
         run_id: v
@@ -558,10 +567,11 @@ pub fn monitor_status_from_wire(
             .map(|v| v.parse().map_err(|_| invalid("run_id", "invalid UUID")))
             .transpose()?,
         name: v.name,
-        monitor: monitor_from_wire(required(v.monitor, "monitor")?)?,
+        monitor,
         vm: vm_from_wire(required(v.vm, "vm")?)?,
         readiness: readiness_state_from_wire(required(v.readiness, "readiness")?)?,
         agent: agent_from_wire(required(v.agent, "agent")?)?,
+        live,
     })
 }
 pub fn readiness_to_wire(

@@ -191,6 +191,15 @@ impl RuntimeConfig {
         Ok(home)
     }
 
+    /// Resolve existing-state paths without initializing the generated root.
+    pub(crate) fn observation_roots(&self) -> Result<LocalRoots, LibVmError> {
+        let run_root = match &self.run_root {
+            Some(path) => absolute_path("run_root", path.clone().into_os_string())?,
+            None => default_run_root()?,
+        };
+        Ok(LocalRoots::with_roots(self.resolve_home()?, run_root))
+    }
+
     /// Both runtime roots; creates and validates the run root.
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
         let run_root = match &self.run_root {
@@ -425,11 +434,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = base.join("runtime-components");
-        for name in ["silo-vmm", "netd", "krun"] {
+        for name in ["silo-vmm", "netd"] {
             let path = root.join("bin").join(name);
             std::fs::create_dir_all(path.parent().expect("helper parent"))
                 .expect("create helper parent");
-            std::fs::write(&path, b"helper").expect("write helper");
+            if name == "silo-vmm" {
+                std::fs::copy(test_utils::mock_vmm_binary(), &path)
+                    .expect("copy real scenario-capable monitor into private runtime root");
+            } else {
+                std::fs::write(&path, b"helper").expect("write unused networking helper fixture");
+            }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("set helper mode");
         }
@@ -478,7 +492,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let home = temp.path().join("home");
         let runtime_root = complete_runtime_root(temp.path());
-        let config = RuntimeConfig::local(&home).with_runtime_root(&runtime_root);
+        let config = RuntimeConfig::local(&home)
+            .with_runtime_root(&runtime_root)
+            .with_virt_backend(VirtBackendOverride::Mock { scenario: None });
 
         let runtime = Runtime::new(config.clone())
             .await
@@ -521,7 +537,8 @@ mod tests {
         let runtime_root = complete_runtime_root(temp.path());
         let config = RuntimeConfig::local(temp.path().join("home"))
             .with_runtime_root(runtime_root)
-            .with_run_root(&run_root);
+            .with_run_root(&run_root)
+            .with_virt_backend(VirtBackendOverride::Mock { scenario: None });
 
         let runtime = Runtime::new(config).await.expect("open fresh runtime");
         assert_eq!(runtime.local_paths().roots().run_root(), run_root);

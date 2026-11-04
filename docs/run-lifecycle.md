@@ -63,7 +63,7 @@ exits:
 ```bash
 silo run --detach --name worker ubuntu:26.04 -- sleep 300
 silo logs worker --stream exec --follow
-silo show worker
+silo info worker
 ```
 
 When `sleep` exits, `worker` becomes stopped and remains available. You can then
@@ -99,5 +99,44 @@ only the machine name to stdout. This keeps command substitution reliable:
 
 ```bash
 machine=$(silo run --detach ubuntu:26.04 -- sleep 300)
-silo show "$machine"
+silo info "$machine"
 ```
+
+## Storage shutdown and recovery
+
+Lifecycle `stopped` is not a storage-consistency certificate. `silo stop`
+first attempts the bounded, run-bound guest orderly-shutdown protocol.
+Storage-clean additionally requires all three independent facts: successful
+guest writer/filesystem shutdown, checked host synchronization after native
+owners terminate, and closure of every qualified attachment handle.
+
+`silo info NAME --format json` exposes the observed terminal
+`storage_stop_outcome` (`clean`, `forced`, `unknown`, or null when storage
+metadata is unavailable). The human-readable view labels it **Last storage
+stop**. This is not a statement that a currently running VM is safe to copy.
+Inspection is read-only: it may classify a current terminal exit before that
+result is committed to the catalog. An explicit lifecycle command such as
+`silo stop NAME` performs durable reconciliation, including for an already
+terminal run, and retires its operation pins only after ownership is settled.
+`vm.exit.json` in the machine log directory retains exact-run evidence and
+diagnostics. A manager-written forced fence can omit `storageShutdown`
+because the killed monitor did not establish finalizer facts; absence does
+not imply either clean storage or observed attachment closure.
+
+Force-stop and native errors cannot certify clean. Missing or incomplete
+current-run shutdown evidence becomes unknown only after attachment holders
+are ruled out. Writable host directory shares, externally writable Data
+disks, unsupported guest authority and unqualified backends remain usable
+but do not receive an all-storage certificate.
+
+Killing a monitor does not authorize deleting or replacing its disks: the
+actual worker may still own attachments and its inherited generation lease.
+Silo retains durable holder identities and operation dependencies until all
+holders are terminal and an independent nonblocking lease probe permits
+reconciliation. Start, removal, replacement and collection fail closed while
+that ownership is unresolved. Do not manually remove lease/holder files to
+clear a busy error. Inspect logs and let the owned worker terminate.
+
+This release is a hard state-format cutover. Reinstall and explicitly reset
+all prior Silo state; no automatic wipe, migration or old-record reader is
+provided. Keep any needed data outside the old Silo state before resetting it.

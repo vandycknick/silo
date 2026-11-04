@@ -156,7 +156,7 @@ mod tests {
     async fn actual_machine_create_remove_and_failed_create_own_ca_scope() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, "root-disk").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let runtime = crate::Runtime::open(
             crate::paths::LocalPaths::new(home.path().join("silo")),
             crate::RuntimeNetworkingConfig::default(),
@@ -198,7 +198,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, "root-disk").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let selected =
             Arc::new(FileStore::with_store_file(external.path().join("custom.json")).unwrap());
         let runtime = crate::Runtime::open(
@@ -341,6 +341,12 @@ mod tests {
             user: None,
             ssh_trusted_ca: resolved.ssh_trusted_ca.as_deref().unwrap(),
             tls_certificate: resolved.tls_certificate.as_deref(),
+            storage_shutdown: &crate::guest_agent::storage_shutdown_context(
+                &uuid::Uuid::from(config.id).to_string(),
+                &uuid::Uuid::new_v4().to_string(),
+                &config.spec,
+            )
+            .unwrap(),
         })
         .unwrap();
         assert_eq!(
@@ -397,7 +403,7 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let external = tempfile::tempdir().unwrap();
             let disk = home.path().join("root.raw");
-            std::fs::write(&disk, "root-disk").unwrap();
+            std::fs::write(&disk, [0x64; 512]).unwrap();
             let selected = Arc::new(FileStore::new(external.path()));
             let runtime = crate::Runtime::open(
                 crate::paths::LocalPaths::new(home.path().join("silo")),

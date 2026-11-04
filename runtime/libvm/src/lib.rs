@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod boot_qualification;
 mod constants;
 mod error;
 mod guest_agent;
@@ -16,11 +17,34 @@ pub mod planning;
 mod runtime;
 mod secrets;
 mod ssh_ca;
+pub mod storage;
 mod store;
 mod supervisor;
 mod utils;
 
+pub use crate::boot_qualification::{
+    OverlayBootQualificationError, QualifiedOverlayBoot, UnqualifiedOverlayBootIdentity,
+};
 pub use crate::error::LibVmError;
+pub use crate::machine::{
+    preflight_restore_snapshot, preflight_stopped, validate_new_machine_name, ExternalResourceKey,
+    ExternalResourceMapping, ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions,
+    RestoreOptions, SnapshotConfiguration, SnapshotOptions,
+};
+pub use crate::machine::{require_live_operation, LiveObservationReader, MachineLiveObservation};
+pub use crate::runtime::{
+    require_host_live_operation, LiveCapabilityQuery, ResolvedBackendSelection,
+};
+pub use crate::store::models::storage::{
+    BackendRequirement, BootBinding, BootFileRole, BootProfile, DirectCommandLinePolicy,
+    DiskOwnership, DiskStorage, EfiFirmware, Ext4Profile, ExternalResource, FenceRecord,
+    FenceState, GuestArchitecture, IncludedDisk, LinuxPlatform, MachineRoot, MachineStorageRecord,
+    OverlayLower, OverlayProfile, PartitionTable, PrivatePath, RawLayout, RootSelector,
+    StorageOperationKind, StorageOperationRecord, StorageOperationState, StorageProfile,
+    StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
+};
+pub use crate::store::snapshot_store::{SnapshotInfo, SnapshotRef, SnapshotStore};
+pub use vm_spec::{live, BlockId, DiskFormat};
 pub mod policy_secrets;
 pub use crate::image::{
     ImageBuilder, ImageCacheState, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress,
@@ -55,13 +79,15 @@ pub use crate::machine::{
     MachineProvisionFailurePolicy, MachineProvisionOverallStatus, MachineProvisionReport,
     MachineProvisionStatus, MachineProvisionStepReport, MachineProvisionStepStatus,
     MachineProvisioningReport, MachineReadiness, MachineReadinessOutcome, MachineReadinessReason,
-    MachineReadinessState, MachineRef, MachineRetention, MachineRootfs, MachineRunId,
-    MachineSshBackend, MachineSshListenerReport, MachineStaleReason, MachineStart,
-    MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineTailscale,
-    MachineUpdate, MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState,
-    MachineWaitOptions, Memory, NetworkPolicyUpdate, ProcessConfig, SshExitStatus,
-    SshShellAttachment, SshShellControl, SshShellOptions, SshShellOptionsBuilder, SshShellSignal,
-    StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineReadinessState, MachineRef, MachineRetention, MachineRootStorageKind,
+    MachineRootStorageMetrics, MachineRootfs, MachineRunId, MachineSshBackend,
+    MachineSshListenerReport, MachineStaleReason, MachineStart, MachineStartOptions, MachineStatus,
+    MachineStopOptions, MachineSystemInfo, MachineTailscale, MachineTemporaryDirectoryKind,
+    MachineTemporaryDirectoryMetrics, MachineUpdate, MachineUserConfig, MachineUserUpdate,
+    MachineVmSnapshot, MachineVmState, MachineWaitOptions, Memory, NetworkPolicyUpdate,
+    ProcessConfig, RootProfile, SshExitStatus, SshShellAttachment, SshShellControl,
+    SshShellOptions, SshShellOptionsBuilder, SshShellSignal, StdinMode,
+    DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,

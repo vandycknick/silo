@@ -12,10 +12,11 @@ pub(crate) struct VmmStartRequest {
     version: u32,
     machine_id: String,
     machine_run_id: String,
+    storage_lease: protocol::shutdown::StorageLeaseBinding,
+    storage_shutdown: protocol::shutdown::StorageShutdownContext,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_command: Option<VmmStartupCommand>,
-    // Optional additive field within version 1; must stay schema-compatible
-    // with silo-vmm's strict (deny_unknown_fields) reader.
+    // Runtime always sends its frozen prospective selection explicitly.
     #[serde(skip_serializing_if = "Option::is_none")]
     virt_backend: Option<VmmVirtBackend>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,6 +33,10 @@ pub(crate) struct VmmVirtBackend {
     pub(crate) kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scenario_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scenario_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,6 +75,8 @@ impl VmmStartRequest {
         machine_id: impl Into<String>,
         machine_run_id: impl Into<String>,
         startup_command: Option<VmmStartupCommand>,
+        storage_lease: protocol::shutdown::StorageLeaseBinding,
+        storage_shutdown: protocol::shutdown::StorageShutdownContext,
     ) -> Self {
         let startup_budget_ms = if startup_command.is_some() {
             330_000
@@ -80,6 +87,8 @@ impl VmmStartRequest {
             version: VMM_START_REQUEST_VERSION,
             machine_id: machine_id.into(),
             machine_run_id: machine_run_id.into(),
+            storage_lease,
+            storage_shutdown,
             startup_command,
             virt_backend: None,
             rosetta_intent: None,
@@ -113,6 +122,15 @@ impl VmmStartRequest {
 }
 
 pub(crate) fn encode_start_request(request: &VmmStartRequest) -> io::Result<Vec<u8>> {
+    protocol::shutdown::validate_uuid(&request.machine_id)
+        .and_then(|()| protocol::shutdown::validate_uuid(&request.machine_run_id))
+        .and_then(|()| request.storage_lease.validate())
+        .and_then(|()| {
+            request
+                .storage_shutdown
+                .validate_binding(&request.machine_id, &request.machine_run_id)
+        })
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let mut encoded = serde_json::to_vec(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     encoded.push(b'\n');
@@ -138,19 +156,44 @@ mod tests {
         VmmStartRequest, VmmStartupCommand, VMM_START_REQUEST_MAX_BYTES,
     };
 
+    fn lease() -> protocol::shutdown::StorageLeaseBinding {
+        protocol::shutdown::StorageLeaseBinding {
+            operation_id: "33333333-3333-4333-8333-333333333333".into(),
+            file_device: 1,
+            file_inode: 2,
+        }
+    }
+
+    fn context() -> protocol::shutdown::StorageShutdownContext {
+        protocol::shutdown::StorageShutdownContext {
+            version: 1,
+            machine_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            run_id: "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3".into(),
+            manifest: protocol::shutdown::StorageManifest::Unsupported {
+                reason: "fixture has no storage".into(),
+            },
+        }
+    }
     #[test]
-    fn disabled_rosetta_carries_only_the_native_startup_budget_addition() {
+    fn start_request_carries_the_exact_trusted_launch_context() {
         let request = VmmStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         )
         .with_rosetta_intent(VmmRosettaIntent::Disabled {});
+        let value = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(
-            String::from_utf8(encode_start_request(&request).expect("encode request"))
-                .expect("UTF-8 request"),
-            "{\"version\":1,\"machineId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"machineRunId\":\"9e7d6ad8-f804-4936-9633-1fd3df6bd7d3\",\"startupBudgetMs\":30000}\n"
+            value["storageShutdown"],
+            serde_json::to_value(context()).unwrap()
         );
+        assert_eq!(
+            value["storageLease"],
+            serde_json::to_value(lease()).unwrap()
+        );
+        assert!(value.get("rosettaIntent").is_none());
     }
 
     #[test]
@@ -172,6 +215,8 @@ mod tests {
                     user: Some("1000:1000".to_string()),
                 },
             }),
+            lease(),
+            context(),
         );
         let encoded = encode_start_request(&request).expect("encode request");
         let value: serde_json::Value =
@@ -191,6 +236,8 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         );
         let encoded = encode_start_request(&request).expect("encode request");
         let value: serde_json::Value =
@@ -205,6 +252,8 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         )
         .with_rosetta_intent(VmmRosettaIntent::Enabled {});
         let encoded = encode_start_request(&request).expect("encode request");
@@ -225,6 +274,8 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
+            lease(),
+            context(),
         )
         .with_rosetta_intent(VmmRosettaIntent::Enabled {});
         let encoded = encode_start_request(&request).expect("encode request");
@@ -259,10 +310,26 @@ mod tests {
         assert!(encode_start_request(&oversized).is_err());
     }
 
+    #[test]
+    fn start_request_refuses_context_from_another_run_before_handoff() {
+        let mut request = request_with_environment_value(String::new());
+        request.storage_shutdown.run_id = Uuid::new_v4().to_string();
+        assert_eq!(
+            encode_start_request(&request).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        request.storage_shutdown = context();
+        request.storage_lease.operation_id = Uuid::nil().to_string();
+        assert_eq!(
+            encode_start_request(&request).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
     fn request_with_environment_value(value: String) -> VmmStartRequest {
         VmmStartRequest::new(
-            Uuid::nil().to_string(),
-            Uuid::nil().to_string(),
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             Some(VmmStartupCommand {
                 execution_id: Uuid::nil(),
                 process: VmmProcessSpec {
@@ -275,6 +342,8 @@ mod tests {
                     user: None,
                 },
             }),
+            lease(),
+            context(),
         )
     }
 }

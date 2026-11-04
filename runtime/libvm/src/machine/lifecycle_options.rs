@@ -139,7 +139,8 @@ impl MachineKillOptions {
         Self::default()
     }
 
-    /// Sets how long libvm waits after forcing the monitor to exit.
+    /// Sets the shared deadline for monitor termination, attachment-holder
+    /// termination, and exclusive storage-lease reconciliation after force stop.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.wait = self.wait.timeout(timeout);
         self

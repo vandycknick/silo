@@ -212,6 +212,7 @@ fn admit_status(
         status.product_version == env!("CARGO_PKG_VERSION") && status.protocol_major == 1,
         "daemon product/protocol mismatch; restart with the matching silo installation"
     );
+    crate::live::validate_daemon_status(status)?;
     crate::validate_uuid(&status.generation, "daemon.generation")?;
     let home = crate::path_from_wire(status.home.clone())?;
     let config = crate::path_from_wire(status.config_dir.clone())?;
@@ -273,6 +274,17 @@ mod tests {
             Ok(tonic::Response::new(self.0.clone()))
         }
 
+        async fn get_live_capabilities(
+            &self,
+            _: tonic::Request<()>,
+        ) -> Result<tonic::Response<w::LiveHostReport>, tonic::Status> {
+            self.0
+                .manager_live
+                .clone()
+                .map(tonic::Response::new)
+                .ok_or_else(|| tonic::Status::unavailable("fixture has no live evidence"))
+        }
+
         async fn get_runtime_info(
             &self,
             _: tonic::Request<()>,
@@ -305,6 +317,7 @@ mod tests {
             home: crate::path_to_wire(&std::fs::canonicalize(host.home()).unwrap()),
             config_dir: crate::path_to_wire(&std::fs::canonicalize(host.config_dir()).unwrap()),
             core: core as i32,
+            live_schema_version: Some(1),
             ..Default::default()
         }
     }
@@ -498,6 +511,7 @@ mod tests {
             home: crate::path_to_wire(&home),
             config_dir: crate::path_to_wire(&home),
             core: silod_spec::daemon::v1::CorePhase::Ready as i32,
+            live_schema_version: Some(1),
             ..Default::default()
         };
         admit_status(&status, &host, Admission::Ready).unwrap();
