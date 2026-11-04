@@ -1390,7 +1390,7 @@ host bind. The section stays rejected; see the non-decisions below.
 - Whether the SDKs expose session-scoped forwards as a first-class object with a
   cancellation-safe handle, given the Go FFI's current mutation-cancellation
   constraints.
-- Whether `silo show` should display active forwards and publications, which
+- Whether `silo info` should display active forwards and publications, which
   for publications requires a host-side inventory netd does not yet serve.
 - Whether a `vsock:` connect endpoint should be validated at forward
   creation by an immediate probe, or remain lazy as specified.
