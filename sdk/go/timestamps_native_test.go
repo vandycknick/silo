@@ -38,7 +38,7 @@ func TestNativeMachineTimestampsNearCreate(t *testing.T) {
 	r, home := phase7Runtime(t)
 	ctx := context.Background()
 	disk := filepath.Join(home, "input.raw")
-	if err := os.WriteFile(disk, []byte("root-disk"), 0600); err != nil {
+	if err := os.WriteFile(disk, make([]byte, 512), 0600); err != nil {
 		t.Fatal(err)
 	}
 	before := time.Now()

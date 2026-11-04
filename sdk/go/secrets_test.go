@@ -21,7 +21,7 @@ func TestNativeMachineScopedSecrets(t *testing.T) {
 	}
 	defer r.Close()
 	disk := filepath.Join(home, "input.raw")
-	if err = os.WriteFile(disk, []byte("stopped fixture"), 0600); err != nil {
+	if err = os.WriteFile(disk, make([]byte, 512), 0600); err != nil {
 		t.Fatal(err)
 	}
 	m, err := r.CreateMachine(ctx, DiskImage(disk), WithName("secret-vm"))

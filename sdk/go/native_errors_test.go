@@ -17,3 +17,17 @@ func TestUnknownNativeErrorPreservesVariant(t *testing.T) {
 		t.Fatalf("mapped error = %#v", siloError)
 	}
 }
+
+func TestLiveCapabilitiesNativeErrorKinds(t *testing.T) {
+	for variant, kind := range map[string]ErrorKind{
+		"LiveOperationUnsupported": ErrorLiveOperationUnsupported,
+		"LiveDiscovery":            ErrorLiveDiscovery,
+		"LiveProtocol":             ErrorLiveProtocol,
+		"LiveObservation":          ErrorLiveObservation,
+	} {
+		var converted *Error
+		if !errors.As(fromNativeError(&ffi.NativeError{Variant: variant, Message: "not parsed"}), &converted) || converted.Kind != kind || converted.NativeVariant != variant {
+			t.Fatalf("lost live error kind %s", variant)
+		}
+	}
+}

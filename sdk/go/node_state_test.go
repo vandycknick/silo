@@ -41,7 +41,7 @@ func TestNodeStateLeaseCrossProcess(t *testing.T) {
 	}
 	r, home := phase7Runtime(t)
 	disk := filepath.Join(home, "input.raw")
-	if err := os.WriteFile(disk, []byte("stopped fixture"), 0600); err != nil {
+	if err := os.WriteFile(disk, make([]byte, 512), 0600); err != nil {
 		t.Fatal(err)
 	}
 	m, err := r.CreateMachine(ctx, DiskImage(disk), WithName("leased"))
