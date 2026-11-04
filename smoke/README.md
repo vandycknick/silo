@@ -932,9 +932,13 @@ a pass/skip, without an explicit process-visible ext4 input. Copy-provider outpu
 must separately show the actual sparse/streaming fallback method on that mount;
 native byte equivalence alone does not prove which syscall strategy ran.
 The owner-authorized image/mountpoint is not assumed usable until `findmnt`
-inside the executing process observes ext4. At implementation time that
-visibility remains unresolved. `/tmp` tmpfs is not durable ext4 evidence;
-`/home` results retain their actual observed type (historically Btrfs).
+inside the executing process observes ext4. The Linux qualification run used
+an isolated loop-mounted ext4 image and observed `SparseCopy` for both children;
+all 26 native stopped cases passed there. `/tmp` tmpfs and `/home` Btrfs results
+do not substitute for that ext4 evidence. On a small test filesystem, run
+bounded batches: preserve text logs and reports outside the mount, then remove
+successful disposable payloads before the next batch. `--keep` retains full
+workspaces, so an entire retained suite requires substantially more capacity.
 
 If a writable reflink-enabled XFS mount becomes available, rerun the same
 copy/integration and native cases there with the required `xfs` type, excluding
