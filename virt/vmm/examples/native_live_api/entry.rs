@@ -26,6 +26,16 @@ struct Launch {
     generation_proof_mode: u8,
     #[serde(default)]
     proof: Option<RestoreProof>,
+    #[serde(default)]
+    silo_fixture: Option<SiloFixture>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SiloFixture {
+    machine_id: String,
+    run_id: String,
+    mac: [u8; 6],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -151,6 +161,26 @@ pub(crate) fn main() -> eyre::Result<()> {
         launch.proof.is_none() || restore,
         "restore-only proof mode on a cold launch"
     );
+    if let Some(fixture) = &launch.silo_fixture {
+        protocol::shutdown::validate_uuid(&fixture.machine_id)
+            .map_err(|error| eyre::eyre!(error))?;
+        protocol::shutdown::validate_uuid(&fixture.run_id).map_err(|error| eyre::eyre!(error))?;
+        ensure!(
+            fixture.mac != [0; 6] && fixture.mac[0] & 1 == 0,
+            "unicast fixture MAC"
+        );
+        ensure!(
+            launch.generation_proof_mode == 0 && launch.proof.is_none(),
+            "real Silo guest cannot use diagnostic proof modes"
+        );
+        if !restore {
+            ensure!(
+                field::<16>(&launch.binding.join("source-run"))?
+                    == *uuid::Uuid::parse_str(&fixture.run_id)?.as_bytes(),
+                "source capture binding differs from guest run"
+            );
+        }
+    }
     if let Some(proof) = launch.proof {
         reply(
             "RESTORE_CONSTRUCTION_WAITING",
@@ -188,8 +218,19 @@ pub(crate) fn main() -> eyre::Result<()> {
     };
     let result = if let Some(directory) = &launch.restore {
         let files = state_files.ok_or_else(|| eyre::eyre!("restore state roles missing"))?;
-        let (inputs, resources) =
-            restored_inputs(directory, files, &raw_handles, &console, mux, endpoints)?;
+        let mac = launch
+            .silo_fixture
+            .as_ref()
+            .map_or([2, 0, 0, 0, 0, 2], |fixture| fixture.mac);
+        let (inputs, resources) = restored_inputs(
+            directory,
+            files,
+            &raw_handles,
+            &console,
+            mux,
+            endpoints,
+            mac,
+        )?;
         let build_deadline = if launch.proof == Some(RestoreProof::InstallTimeout) {
             Instant::now() + Duration::from_millis(1500)
         } else {
@@ -255,10 +296,14 @@ pub(crate) fn main() -> eyre::Result<()> {
                 read_only: false,
             });
         }
-        let mut cmdline = format!(
-            "console=hvc0 rdinit=/init panic=-1 probe.echo_port={}",
-            launch.echo_port
-        );
+        let mut cmdline = if launch.silo_fixture.is_some() {
+            "root=/dev/vda rootfstype=ext4 rw console=hvc0".to_string()
+        } else {
+            format!(
+                "console=hvc0 rdinit=/init panic=-1 probe.echo_port={}",
+                launch.echo_port
+            )
+        };
         ensure!(
             launch.generation_proof_mode <= 4,
             "generation proof mode bound"
@@ -270,7 +315,10 @@ pub(crate) fn main() -> eyre::Result<()> {
             ));
         }
         let config = crate::krun::KrunConfig {
-            id: "native-api-proof".into(),
+            id: launch.silo_fixture.as_ref().map_or_else(
+                || "native-api-proof".into(),
+                |fixture| fixture.machine_id.clone(),
+            ),
             cpus: 2,
             memory_mib: 512,
             kernel: Some(launch.kernel.clone()),
@@ -282,7 +330,10 @@ pub(crate) fn main() -> eyre::Result<()> {
             balloon: true,
             network: crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
                 peer_path: "/caller-owned/already-connected".into(),
-                mac: [2, 0, 0, 0, 0, 1],
+                mac: launch
+                    .silo_fixture
+                    .as_ref()
+                    .map_or([2, 0, 0, 0, 0, 1], |fixture| fixture.mac),
             }),
             ..crate::krun::KrunConfig::default()
         };
@@ -455,6 +506,7 @@ fn restored_inputs(
     console: &std::os::fd::OwnedFd,
     mux: std::os::fd::OwnedFd,
     endpoints: StandaloneEndpoints,
+    mac: [u8; 6],
 ) -> eyre::Result<(RestoreInputs, RestoreResources)> {
     let manifest = load(&directory.join("api-capture.json"))?;
     let binding = parse_binding(&manifest["binding"])?;
@@ -498,7 +550,7 @@ fn restored_inputs(
     resources.networks.push(RestoreNetwork {
         attachment: attachment("net0")?,
         socket: network.into(),
-        mac: [2, 0, 0, 0, 0, 2],
+        mac,
     });
     resources.vsocks.push(RestoreVsock {
         attachment: attachment("vsock")?,

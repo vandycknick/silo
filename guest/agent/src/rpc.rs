@@ -80,6 +80,7 @@ impl AgentServer {
             workloads,
             process_supervisor.clone(),
             forwards.clone(),
+            sender.clone(),
         );
         let server = Self {
             state: AgentState {
@@ -475,6 +476,23 @@ fn status(
             lifecycle: None,
         }),
     }
+}
+
+/// Re-observe kernel-owned system facts once, after an effect that replaced them (activation's
+/// managed network identity). Status reads stay syscall-free; unchanged facts wake no watcher.
+pub(crate) fn refresh_system(status: &watch::Sender<AgentStatus>) {
+    let system = get_system_info().ok();
+    status.send_if_modified(|status| {
+        let Some(report) = status.report.as_mut() else {
+            return false;
+        };
+        if report.system == system {
+            return false;
+        }
+        report.system = system;
+        report.observed_at = Some(now());
+        true
+    });
 }
 
 const MAX_STATUS_DETAIL_BYTES: usize = 512;

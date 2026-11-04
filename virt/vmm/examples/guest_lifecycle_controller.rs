@@ -1,5 +1,11 @@
 //! Explicit smoke executable, never a Cargo test. Uses production VM/worker/mux.
+//!
+//! Cold mode: `guest-lifecycle-controller FIXTURE_JSON` owns one normal VM.
+//! Attach mode: `guest-lifecycle-controller --attach REQUEST_JSON` owns only an
+//! inherited, already-connected native mux stream (see `attach`).
 #![allow(dead_code)]
+#[path = "guest_lifecycle_controller/attach/mod.rs"]
+mod attach;
 #[cfg(test)]
 #[path = "../build_inputs.rs"]
 mod build_inputs;
@@ -78,20 +84,30 @@ struct Fixture {
     expect_unsupported: bool,
 }
 
-fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<std::process::ExitCode> {
     if krun::worker::invoked_as_worker() {
-        return krun::worker::main();
+        krun::worker::main()?;
+        return Ok(std::process::ExitCode::SUCCESS);
     }
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or_else(|| eyre::eyre!("fixture JSON path required"))?;
-    let bytes = std::fs::read(path)?;
+    let mut arguments = std::env::args_os().skip(1);
+    let first = arguments
+        .next()
+        .ok_or_else(|| eyre::eyre!("fixture JSON path or --attach REQUEST_JSON required"))?;
+    if first == "--attach" {
+        let request = arguments
+            .next()
+            .ok_or_else(|| eyre::eyre!("--attach requires a REQUEST_JSON path"))?;
+        ensure!(arguments.next().is_none(), "unexpected attach argument");
+        return Ok(attach::main(std::path::Path::new(&request)));
+    }
+    let bytes = std::fs::read(first)?;
     ensure!(bytes.len() <= 65536, "oversized fixture");
     let fixture: Fixture = serde_json::from_slice(&bytes)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run(fixture))
+    runtime.block_on(run(fixture))?;
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 async fn run(fixture: Fixture) -> eyre::Result<()> {

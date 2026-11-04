@@ -7,6 +7,7 @@ import socket
 import subprocess
 import time
 from typing import Any
+from uuid import UUID
 
 from .errors import SmokeAssertion
 from .workspace import Workspace
@@ -50,6 +51,16 @@ def query(db: Path, sql: str) -> list[tuple[str, ...]]:
 
 def _name(name: str) -> str:
     return "'" + name.replace("'", "''") + "'"
+
+
+def machine_id(ws: Workspace, name: str) -> str:
+    # Path lookup needs catalog identity, not live status reconciliation.
+    # Keep this in the separate read-only process used by all catalog oracles.
+    rows = query(ws.state_db(), f"SELECT id FROM machine_config WHERE name={_name(name)}")
+    assert len(rows) == 1
+    identity = UUID(rows[0][0]).hex
+    assert identity == rows[0][0]
+    return identity
 
 
 def _state_value(ws: Workspace, name: str, expression: str) -> str | None:

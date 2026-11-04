@@ -60,9 +60,57 @@ named unsupported before the real kernel freeze changes.
 These are cold guest API oracles only. They do not qualify native pause,
 capture, restored generation/reseed ordering, restored network replacement,
 inherited listener/session reset, activation hooks, or restored identity/
-shutdown cutover. Those real restore/generation lanes require the later
-provider-complete native path and exact host generation barrier; no absent
-lane is counted as passing and no cold activation substitutes for that barrier.
+shutdown cutover. Those lanes are the restored activation tests below; no
+absent lane is counted as passing and no cold activation substitutes for the
+exact host generation barrier.
+
+### Restored guest activation (Phase 12)
+
+`silo_smoke/guest_restored.py` joins the standalone `native-live-api` owner
+(`--silo-fixture` real-Silo boot) with the attach-only guest controller
+(`guest-lifecycle-controller --attach`). It never uses the diagnostic native
+init, console oracles or echo streams. Build, stage and point at the exact
+inputs first:
+
+```sh
+cargo build --locked -p silo-vmm --example guest-lifecycle-controller --example native-live-api
+make stage
+export SILO_NATIVE_ROOT=/home/nickvd/Projects/worktrees/libkrun/silo-production
+export SILO_SMOKE_KERNEL_CONFIG="$KERNEL_BUILD/.config"   # staged kernel's emitted config
+export CC=/usr/bin/gcc                                     # needs static libc for the guest probe
+make smoke SMOKE_ARGS='-m "not slow and not sdk" -k "freeze or generation or activation" --keep'
+make smoke SMOKE_ARGS='-m "slow and not sdk" -k activation --keep'
+```
+
+`SILO_SMOKE_NATIVE_LIVE_API` overrides the entry path; `SILO_SMOKE_RESTORED_EVIDENCE`
+selects a parent directory for per-cohort evidence (default: the workspace,
+which is removed after a passing run unless `--keep`). The kernel config must
+contain `CONFIG_VMGENID=y` and `CONFIG_VIRTIO_SILO_VMGENID=y`.
+
+One cold AgentPid1 source (populated private root `disk0`, ext4 data `disk1`,
+complete two-block shutdown manifest, real netd behind a transparent
+datagram relay) starts a persistent userdata witness, renames its managed NIC
+and seeds neighbours, proves source wire/gateway positives, holds captured
+exec/SSH/forward sessions, collects same-boot capture profile files and freezes
+through the real guest RPC before native pause and one full capture. Children
+restore that read-only cut sequentially, each with its own subnet, MAC and
+netd. Per child: parked/fenced native state, `generation-fresh`, CPU release,
+exact timely native ACK correlated with the driver's `generation_state`, guest
+`Activate` (replay, conflict, stale source Thaw), destination `Thaw`, and only
+then native command `activate`, which is provider fence release, never guest
+activation. After release the child must reach its new gateway, answer paired
+destination ARP/ICMP probes but not its old address on the same wire, emit no
+source identity, relay its selected listener with the destination token, and
+reject the old instance, cursor and listener. The positive test runs two
+children and an ordinary source ClockOnly resume/Thaw. Slow tests cover hook
+failure/timeout/background descendants, listener conflict, lost Activate reply
+replay, lost Thaw with a real next-epoch freeze, and captured-topology refusal;
+failed children stay frozen and fenced and are stopped/reaped by their native
+owner. `restored-report.json`, `attach/`, `wire.jsonl`, native command logs and
+`inputs.json` under the cohort evidence directory are the evidence.
+Activated status must report the destination IPv4 and no captured source IPv4.
+The agent refreshes kernel-observed system facts once at activation completion
+(including failure), notifying status watchers without syscalls on each read.
 
 Options override environment variables. Paths should be absolute when supplied
 explicitly. The Makefile sets binary and runtime directories for the selected
@@ -133,6 +181,16 @@ Capacity checks obtain the same two independent guest statvfs projections with
 one `stat` invocation, still comparing each fresh post-effect metrics frame
 against both real filesystems. Stopped byte/inode oracles, full logical hashing,
 copy/replay order, fresh boots and exact-boot closure checks are unchanged.
+
+Phase 12 measured 199 `info` invocations taking 101.91 seconds in the six
+stopped fork/replay and exact-boot snapshot cases. Identity-only path and SQL
+lookups now use the existing independent read-only catalog process, without
+caching machine identities or reconciling live state. Explicit CLI state,
+readiness and clean-stop assertions remain. The same six cases passed before
+and after, taking 291.08 and 233.94 seconds respectively; `info` calls fell to
+80. These are targeted-run timings, not a full-suite speed claim. Raw commands
+and timings are retained in `.tmp/plan/evidence/phase-12/stopped-speedup.json`
+and its adjacent `stopped-{before,after}-command-times.jsonl` files.
 
 The Phase 9 complete default baseline is
 `.tmp/phase09-corrected-default.xml`, with its command and call-only durations in
@@ -632,13 +690,13 @@ publication. Raw CLI errors are evidence, not pinned display text. Guest
 candidate rejection similarly keeps explicit workload/rescue prohibition and
 the active-journal no-write oracle, not incidental diagnostic substrings.
 
-Exact-tail growth uses a bounded smoke executable at
-`smoke/fixtures/overlay-capacity/main.go`, built against the existing public Go
-SDK and staged Go FFI library. It calls `Machine.Update` with
-`RootDiskSize: silo.Bytes(EXACT_BYTES)` against the same private Home/runtime;
-there is no parser expansion or production shim. Whole-MiB growth retains the
-accepted CLI `disk=NMiB` grammar. The fixture reuses host Go build/module caches
-and records build/runtime output. Dirty recovery captures the exact run's
+Exact-tail growth uses the existing public Rust `storage_acceptance` consumer,
+built with `cargo build -p libvm --example storage_acceptance`. Its
+`set-root-capacity MACHINE BYTES` action calls `Machine::update` with the exact
+byte count against the same private Home/runtime and checks the returned
+published capacity. No retiring SDK, parser expansion or production shim is
+involved. Whole-MiB growth retains the accepted CLI `disk=NMiB` grammar.
+The fixture records runtime output. Dirty recovery captures the exact run's
 SIGKILL terminal artifact and waits for both owned monitor/worker PIDs to be
 gone; a terminal Error label is not confused with a live process or rewritten
 to Stopped. Directory-scale inspection follows actual guest PID1 shutdown and
@@ -662,7 +720,7 @@ reads/capacity checks and host-byte verification; immutable lower hash and
 actual lower-RO/upper-RW/Data-RW evidence remain mandatory. This is not Phase5
 host-flush certification.
 
-The byte-exact SDK consumer also covers shrink, overlimit and non-sector-aligned
+The byte-exact Rust consumer also covers shrink, overlimit and non-sector-aligned
 capacity refusals after a successful same-size stopped-update calibration.
 Those values cannot be represented by the CLI's integer MiB/GiB grammar, so
 parser rejection is never counted as storage-admission proof. The existing
@@ -1035,6 +1093,13 @@ diagnostic kernel. `partial` requires the distinct fixture in
 applied after the production driver patch, instead of the earlier generation
 fault patch. Preserve the ordinary kernel configuration and keep these
 diagnostic kernels separate from production inputs.
+For the guest-protocol driver-absence control, also run `--case absent` with
+an otherwise identical kernel built with `CONFIG_VMGENID=y` and
+`# CONFIG_VIRTIO_SILO_VMGENID is not set`. Verify the emitted configuration
+against the image's embedded configuration. The device must remain present,
+with no processed acknowledgement and a failed five-second deadline, followed
+by acknowledged stop and process reap. A diagnostic driver refusing probe is
+separate evidence, not a substitute for this driver-disabled build.
 The pending-generation cohort captures and resumes the exact source request
 within its original deadline. It authenticates and seals the immutable capture
 outputs after the source's exact ACK, before restoring the child. Output identity

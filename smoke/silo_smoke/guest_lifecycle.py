@@ -77,8 +77,11 @@ def _run_controller(silo: Silo, executable: Path, fixture: Path, directory: Path
     return subprocess.CompletedProcess(command, process.returncode, output, errors)
 
 
-def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
-    executable = controller()
+def private_root(silo: Silo, image: str, prefix: str) -> tuple[dict, Path]:
+    """Create a stopped machine and return a private copy of its populated root.
+
+    The catalog's stopped root is never booted or mutated; only private bytes are.
+    """
     name = "guest-freezer-" + uuid4().hex[:8]
     silo.create(name, image, "--cpus", "2", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
     configuration = stopped.configuration(silo, name)
@@ -86,28 +89,33 @@ def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
     source = Path(disk["path"])
     if not source.is_absolute():
         source = overlay.machine_dir(silo, name) / source
-    directory = silo.ws.root / ("guest-lifecycle-" + uuid4().hex[:8])
+    directory = silo.ws.root / (prefix + uuid4().hex[:8])
     directory.mkdir(mode=0o700)
     root = directory / "root.raw"
-    # Copy private bytes, never boot or mutate the catalog's stopped root.
     subprocess.run(["cp", "--reflink=auto", "--sparse=always", str(source), str(root)], check=True, capture_output=True, timeout=120)
     root.chmod(0o600)
     disk["path"] = str(root)
-    machine, run_id = str(uuid4()), str(uuid4())
-    manifest = {"kind": "complete", "attachments": [{"kind": "block", **{
-        key: disk[key] for key in ("blockId", "role", "format", "geometry", "readOnly")
-    }, "exclusiveWriter": True}]}
+    return disk, directory
+
+
+def block_attachment(disk: dict) -> dict:
+    """Exact shutdown-manifest block entry for one resolved launch disk."""
+    return {"kind": "block", **{key: disk[key] for key in ("blockId", "role", "format", "geometry", "readOnly")},
+            "exclusiveWriter": True}
+
+
+def ssh_material(directory: Path) -> str:
+    """Fresh CA plus `client`/`client-cert.pub` for root; returns the trusted CA line."""
     ca = directory / "ca"
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ca)], check=True, capture_output=True, timeout=30)
     subject = directory / "client"
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(subject)], check=True, capture_output=True, timeout=30)
     subprocess.run(["ssh-keygen", "-q", "-s", str(ca), "-I", "guest-freezer-smoke", "-n", "root", "-V", "-1m:+5m", str(subject.with_suffix(".pub"))], check=True, capture_output=True, timeout=30)
-    agent_config = {
-        "provision": {"enabled": True, "userdata": {"content": "#!/bin/sh\ncat /proc/self/cgroup >/lifecycle-userdata-membership\n", "content_type": "shell_script", "run": "always"}},
-        "ssh": {"trusted_ca": ca.with_suffix(".pub").read_text().strip()},
-        "storage_shutdown": {"version": 1, "machineId": machine, "runId": run_id, "manifest": manifest},
-    }
-    assets = silo.ws.config.runtime_dir / "assets"
+    return ca.with_suffix(".pub").read_text().strip()
+
+
+def composite_initramfs(assets: Path, directory: Path, agent_config: dict) -> Path:
+    """Staged Silo init initramfs plus the staged agent and this fixture's config."""
     base = (assets / "initramfs").read_bytes()
     composite = directory / "initramfs"
     composite.write_bytes(base + b"\0" * (-len(base) % 4) + cpio([
@@ -116,10 +124,31 @@ def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
         ("agent/config.json", json.dumps(agent_config, separators=(",", ":")).encode(), 0o100600),
     ]))
     composite.chmod(0o600)
+    return composite
+
+
+def private_kernel(assets: Path, directory: Path) -> tuple[Path, Path]:
+    """Private snapshot of the staged (or explicitly overridden) kernel and its source."""
     kernel = directory / "kernel"
     kernel_source = Path(os.environ.get("SILO_SMOKE_GUEST_LIFECYCLE_KERNEL", str(assets / "kernel-default"))).resolve()
     shutil.copyfile(kernel_source, kernel)
     kernel.chmod(0o600)
+    return kernel, kernel_source
+
+
+def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
+    executable = controller()
+    disk, directory = private_root(silo, image, "guest-lifecycle-")
+    machine, run_id = str(uuid4()), str(uuid4())
+    manifest = {"kind": "complete", "attachments": [block_attachment(disk)]}
+    agent_config = {
+        "provision": {"enabled": True, "userdata": {"content": "#!/bin/sh\ncat /proc/self/cgroup >/lifecycle-userdata-membership\n", "content_type": "shell_script", "run": "always"}},
+        "ssh": {"trusted_ca": ssh_material(directory)},
+        "storage_shutdown": {"version": 1, "machineId": machine, "runId": run_id, "manifest": manifest},
+    }
+    assets = silo.ws.config.runtime_dir / "assets"
+    composite = composite_initramfs(assets, directory, agent_config)
+    kernel, kernel_source = private_kernel(assets, directory)
     fixture = {"kernel": str(kernel), "initramfs": str(composite), "directory": str(directory),
                "machine_id": machine, "run_id": run_id, "root": disk, "expect_unsupported": unsupported}
     fixture_path = directory / "fixture.json"

@@ -246,11 +246,11 @@ def probe(silo: Silo, name: str, *args: str, timeout: float = 90) -> dict:
 
 
 def machine_dir(silo: Silo, name: str) -> Path:
-    return silo.ws.silo_home / "machines" / silo.machine_id(name)
+    return silo.ws.silo_home / "machines" / procs.machine_id(silo.ws, name)
 
 
 def upper(silo: Silo, name: str) -> Path:
-    machine_id = silo.machine_id(name)
+    machine_id = procs.machine_id(silo.ws, name)
     rows = procs.query(silo.ws.state_db(), "SELECT json(record_json) FROM machine_storage WHERE machine_id='" + machine_id + "'")
     assert len(rows) == 1
     root = json.loads(rows[0][0])["root"]
