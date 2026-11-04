@@ -4,8 +4,7 @@ libkrun
 Copyright 2020-2026 The libkrun authors
 https://github.com/vandycknick/libkrun
 
-Silo builds libkrun from the source revision pinned in Cargo.lock:
-10b6f752ba8ea735c3d9edaa549599dcf3f98d18.
+@LIBKRUN_SOURCE_BINDING@
 
 libkrun is licensed under the Apache License, Version 2.0. The complete
 license text is distributed at LICENSES/APACHE-2.0.txt.

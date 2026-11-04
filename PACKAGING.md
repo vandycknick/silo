@@ -36,9 +36,16 @@ not removed or migrated.
 
 Generated `LICENSES/taild` material comes from the exact Go module graph;
 missing license material is fatal. Review `modules.json`, SBOM and provenance.
-Runtime notices retain the locked libkrun revision, vendored signal-registry
-attribution and Apache license. Product provenance records actual helper and
-bridge hashes. These are archive outputs, not distro-package/signature claims.
+Runtime notices retain the exact locked libkrun revision for Git sources.
+For an explicit local native patch, staging reuses the native build's dependency
+resolver and reads the copied monitor's compiled source revision, content
+fingerprint and clean/dirty/unknown state through the excluded VZ capability
+query, which performs no KVM/HVF discovery. Validation binds notices to those
+compiled observations rather than relabeling patched bytes with the declared
+Git baseline. Dirty/unknown source is not a source attestation or a live
+qualification. Vendored signal-registry attribution and the Apache license are
+retained. Product provenance records actual helper and bridge hashes. These are
+archive outputs, not distro-package/signature claims.
 
 For bounded cold builds, build release components separately and inspect any
 timeout instead of blindly retrying. `make taild PROFILE=release` already

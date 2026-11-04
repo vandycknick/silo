@@ -75,6 +75,10 @@ pub enum RuntimeError {
     Invalid(String),
     #[error(transparent)]
     Archive(#[from] crate::archive::ArchiveError),
+    #[error(transparent)]
+    Command(#[from] crate::command::CommandError),
+    #[error(transparent)]
+    Release(#[from] crate::release::ReleaseError),
 }
 
 pub fn assemble_development(
@@ -91,11 +95,7 @@ pub fn assemble_development(
         let init = guest_binary(context, "init");
         write_initramfs(&InitramfsOptions::new(init, temporary.join("initramfs")))?;
         set_mode(&temporary.join("initramfs"), 0o644)?;
-        copy_regular_file(
-            &guest_binary(context, "agent"),
-            &temporary.join("agent"),
-            0o755,
-        )?;
+        package_guest_agent(&guest_binary(context, "agent"), &temporary.join("agent"))?;
         if let Some(rprobe) = rprobe {
             copy_regular_file(rprobe, &temporary.join("rprobe"), 0o644)?;
         } else {
@@ -178,11 +178,13 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
         }
         create_directory(&temporary.join("LICENSES"))?;
         let notices = temporary.join("THIRD_PARTY_NOTICES");
-        fs::write(&notices, release_notices(context.workspace_root)?).map_err(|source| {
-            RuntimeError::Metadata {
-                path: notices.clone(),
-                source,
-            }
+        fs::write(
+            &notices,
+            release_notices(context.workspace_root, &bin.join("silo-vmm"))?,
+        )
+        .map_err(|source| RuntimeError::Metadata {
+            path: notices.clone(),
+            source,
         })?;
         set_mode(&notices, 0o644)?;
         copy_regular_file(
@@ -312,9 +314,9 @@ pub fn validate_stage_against_adjacent(
         path: notices_path,
         source,
     })?;
-    if notices != release_notices(context.workspace_root)? {
+    if notices != release_notices(context.workspace_root, &stage.join("bin/silo-vmm"))? {
         return Err(RuntimeError::Invalid(
-            "runtime notices do not match current locked sources".into(),
+            "runtime notices do not match resolved sources and compiled monitor binding".into(),
         ));
     }
     compare_regular_files(
@@ -357,50 +359,137 @@ pub fn validate_stage_against_adjacent(
     Ok(())
 }
 
-fn release_notices(workspace: &Path) -> Result<Vec<u8>, RuntimeError> {
+fn release_notices(workspace: &Path, monitor: &Path) -> Result<Vec<u8>, RuntimeError> {
     let read = |name: &str| {
         fs::read_to_string(workspace.join(name)).map_err(|source| RuntimeError::Metadata {
             path: workspace.join(name),
             source,
         })
     };
+    let manifest = read("Cargo.toml")?;
     let lock = read("Cargo.lock")?;
-    let revisions: BTreeSet<_> = lock
-        .lines()
-        .filter(|line| {
-            line.starts_with("source = \"git+https://github.com/vandycknick/libkrun.git?")
-        })
-        .filter_map(|line| {
-            line.rsplit_once('#')
-                .map(|(_, revision)| revision.trim_end_matches('"'))
-        })
-        .collect();
-    let revision = revisions
-        .iter()
+    let source = crate::dependency_source::resolve_dependency(&manifest, &lock)
+        .map_err(|error| RuntimeError::Invalid(error.into()))?;
+    let identity = match source {
+        crate::dependency_source::DependencySource::Git { .. } => None,
+        crate::dependency_source::DependencySource::Path { .. } => {
+            // VZ is explicitly excluded by capability discovery. It returns
+            // immutable linked build facts without opening KVM or loading HVF.
+            let mut command = std::process::Command::new(monitor);
+            command
+                .args(["capabilities", "--backend", "vz", "--json"])
+                .stdin(std::process::Stdio::null());
+            let output = crate::command::output(command)?;
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(|error| RuntimeError::Invalid(error.to_string()))?;
+            if report["schemaVersion"] != 1
+                || report["scope"] != "host"
+                || report["backend"] != "vz"
+            {
+                return Err(RuntimeError::Invalid(
+                    "invalid build-only monitor capability report".into(),
+                ));
+            }
+            Some(
+                report["buildIdentity"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        RuntimeError::Invalid("monitor lacks compiled build identity".into())
+                    })?
+                    .to_owned(),
+            )
+        }
+    };
+    render_release_notices(workspace, source, identity.as_deref())
+}
+
+struct PathSourceNotice<'a> {
+    state: &'a str,
+    revision: &'a str,
+    content: &'a str,
+    inputs: &'a str,
+}
+
+fn path_source_notice(identity: &str) -> Result<PathSourceNotice<'_>, RuntimeError> {
+    let invalid = || RuntimeError::Invalid("invalid compiled native path source binding".into());
+    let mut parts = identity.split(':');
+    if parts.next() != Some("v2") || parts.next() != Some("path") {
+        return Err(invalid());
+    }
+    let state = parts.next().ok_or_else(invalid)?;
+    let revision = parts.next().ok_or_else(invalid)?;
+    let content = parts
         .next()
-        .filter(|revision| {
-            revisions.len() == 1
-                && revision.len() == 40
-                && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-        .ok_or_else(|| {
-            RuntimeError::Invalid("Cargo.lock must pin one exact libkrun revision".into())
-        })?;
-    let template = read("packaging/release/THIRD_PARTY_NOTICES")?;
-    let mut lines: Vec<_> = template.lines().map(str::to_owned).collect();
-    let marker = lines
-        .iter()
-        .position(|line| {
-            line == "Silo builds libkrun from the source revision pinned in Cargo.lock:"
-        })
-        .ok_or_else(|| {
-            RuntimeError::Invalid("libkrun notice template lacks revision marker".into())
-        })?;
-    let pin = lines
-        .get_mut(marker + 1)
-        .ok_or_else(|| RuntimeError::Invalid("libkrun notice template lacks revision".into()))?;
-    *pin = format!("{revision}.");
-    let mut notices = lines.join("\n") + "\n";
+        .and_then(|value| value.strip_prefix("content="))
+        .ok_or_else(invalid)?;
+    let inputs = parts
+        .next()
+        .and_then(|value| value.strip_prefix("inputs="))
+        .ok_or_else(invalid)?;
+    let hex = |value: &str, length: usize| {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if parts.next().is_some()
+        || !matches!(state, "clean" | "dirty" | "unknown")
+        || !(hex(revision, 40)
+            || hex(revision, 64)
+            || (state == "unknown" && revision == "unknown"))
+        || !(hex(content, 64) || (state == "unknown" && content == "unknown"))
+        || !hex(inputs, 64)
+    {
+        return Err(invalid());
+    }
+    Ok(PathSourceNotice {
+        state,
+        revision,
+        content,
+        inputs,
+    })
+}
+
+fn render_release_notices(
+    workspace: &Path,
+    source: crate::dependency_source::DependencySource<'_>,
+    compiled_identity: Option<&str>,
+) -> Result<Vec<u8>, RuntimeError> {
+    let binding = match source {
+        crate::dependency_source::DependencySource::Git { revision } => {
+            format!(
+                "Silo builds libkrun from the source revision pinned in Cargo.lock:\n{revision}."
+            )
+        }
+        crate::dependency_source::DependencySource::Path { crate_path } => {
+            let identity = compiled_identity.ok_or_else(|| {
+                RuntimeError::Invalid(
+                    "path-source notices require compiled monitor identity".into(),
+                )
+            })?;
+            let observed = path_source_notice(identity)?;
+            format!(
+                "Silo builds libkrun from an explicitly resolved local source checkout.\n\
+                 Workspace-resolved source path: {crate_path}\n\
+                 Compiled source HEAD observation: {}\n\
+                 Compiled worktree state: {}\n\
+                 Compiled source-content fingerprint: {}\n\
+                 Compiled monitor-input fingerprint: {}\n\
+                 HEAD is not an attestation of dirty/unknown bytes or live qualification.",
+                observed.revision, observed.state, observed.content, observed.inputs,
+            )
+        }
+    };
+    let path = workspace.join("packaging/release/THIRD_PARTY_NOTICES");
+    let template =
+        fs::read_to_string(&path).map_err(|source| RuntimeError::Metadata { path, source })?;
+    const MARKER: &str = "@LIBKRUN_SOURCE_BINDING@";
+    if template.matches(MARKER).count() != 1 {
+        return Err(RuntimeError::Invalid(
+            "libkrun notice template must contain one source binding marker".into(),
+        ));
+    }
+    let mut notices = template.replacen(MARKER, &binding, 1);
     if workspace
         .join("vendor/signal-hook-registry/LICENSE-APACHE")
         .is_file()
@@ -448,7 +537,72 @@ fn manifest_bytes(context: &BuildContext<'_>, stage: &Path) -> Result<Vec<u8>, R
         validate_regular_file(&stage.join(name), false, None)?;
         files.insert(name.into(), crate::archive::sha256(&stage.join(name))?);
     }
-    serde_json::to_vec_pretty(&serde_json::json!({"version": version.trim(), "target": context.host.runtime_target(), "files": files})).map_err(|error| RuntimeError::Invalid(error.to_string()))
+    let candidate = candidate_boot_metadata(context, &files)?;
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "version": version.trim(),
+        "target": context.host.runtime_target(),
+        "files": files,
+        "managedOverlayCandidate": candidate,
+    }))
+    .map_err(|error| RuntimeError::Invalid(error.to_string()))
+}
+
+fn candidate_boot_metadata(
+    context: &BuildContext<'_>,
+    files: &std::collections::BTreeMap<String, String>,
+) -> Result<serde_json::Value, RuntimeError> {
+    let provenance_path = context
+        .target_dir
+        .join("kernel-provenance")
+        .join(context.host.runtime_target())
+        .join(format!("{}.json", context.profile.directory()));
+    let provenance: serde_json::Value = match fs::read(&provenance_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            RuntimeError::Invalid(format!(
+                "invalid kernel provenance {}: {error}",
+                provenance_path.display()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(source) => {
+            return Err(RuntimeError::Metadata {
+                path: provenance_path,
+                source,
+            })
+        }
+    };
+    let kernel_digest = files
+        .get("assets/kernel-default")
+        .map(|hex| format!("sha256:{hex}"));
+    let initramfs_digest = files
+        .get("assets/initramfs")
+        .map(|hex| format!("sha256:{hex}"));
+    let native_digest = files.get("bin/silo-vmm").map(|hex| format!("sha256:{hex}"));
+    let artifact = provenance.get("artifactConfig").filter(|config| {
+        kernel_digest
+            .as_deref()
+            .is_some_and(|digest| config["kernel"]["digest"].as_str() == Some(digest))
+    });
+    // Missing local-build config provenance is reported, never replaced with a
+    // source-fragment hash, host uname, or a guessed positive qualification.
+    Ok(serde_json::json!({
+        "qualification": "requires-exact-boot-evidence",
+        "guestArchitecture": context.host.oci_architecture(),
+        "rootProfile": "linux-flat-overlay-v1",
+        "upperProfile": "silo-upper-ext4-v1",
+        "overlayProfile": "silo-overlay-v1",
+        "renderingAbi": "linux-overlayfs-mountinfo-v1",
+        "attachmentFamily": "krun-virtio-blk-v1",
+        "kernelDigest": kernel_digest,
+        "baseInitramfsDigest": initramfs_digest,
+        "nativeExecutableDigest": native_digest,
+        "kernelArtifact": artifact,
+        "configEvidence": if artifact.is_some() {
+            "authenticated-oci-resolved-config"
+        } else {
+            "unavailable-requires-actual-build-evidence"
+        },
+    }))
 }
 
 fn write_manifest(context: &BuildContext<'_>, stage: &Path) -> Result<(), RuntimeError> {
@@ -585,6 +739,49 @@ fn validate_directory_entries(
         )));
     }
     Ok(())
+}
+
+/// Package only the guest payload, retaining the original Cargo artifact and
+/// its DWARF outside the VM. Large debug sections are not runtime agent data:
+/// carrying them in initramfs can exhaust the kernel's initial tmpfs budget.
+fn package_guest_agent(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
+    validate_regular_file(source, true, None)?;
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(RuntimeError::Invalid(format!(
+                "guest agent destination already exists: {}",
+                destination.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(RuntimeError::Metadata {
+                path: destination.to_path_buf(),
+                source,
+            })
+        }
+    }
+    // llvm-tools is already a declared Rust toolchain component. Its ELF tools
+    // are host executables supporting both guest architectures, but rustup/Nix
+    // do not place them on PATH. Resolve the active compiler's toolchain rather
+    // than a native-only system objcopy or an incomplete Zig subcommand.
+    let rustc = crate::release::tool("rustc")?;
+    let library_directory = crate::release::tool_output(&rustc, &["--print", "target-libdir"])?;
+    let tool = Path::new(&library_directory)
+        .parent()
+        .filter(|directory| directory.is_absolute())
+        .ok_or_else(|| {
+            RuntimeError::Invalid("rustc returned an invalid host target-libdir".into())
+        })?
+        .join("bin/llvm-objcopy");
+    let tool =
+        fs::canonicalize(&tool).map_err(|source| RuntimeError::Metadata { path: tool, source })?;
+    validate_regular_file(&tool, true, None)?;
+    let mut strip = std::process::Command::new(tool);
+    strip.arg("--strip-debug").arg(source).arg(destination);
+    crate::command::run(strip)?;
+    set_mode(destination, 0o755)?;
+    validate_regular_file(destination, true, Some(0o755))
 }
 
 fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<(), RuntimeError> {
@@ -764,22 +961,157 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn notices_use_locked_revision_instead_of_stale_template_pin() {
-        let root = std::env::temp_dir().join(format!("silo-notices-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("packaging/release")).unwrap();
-        let revision = "0123456789abcdef0123456789abcdef01234567";
-        std::fs::write(root.join("Cargo.lock"), format!("source = \"git+https://github.com/vandycknick/libkrun.git?rev={revision}#{revision}\"\n")).unwrap();
+    fn overlay_candidate_metadata_requires_matching_actual_kernel_provenance() {
+        use crate::components::BuildContext;
+        use crate::profiles::Profile;
+        use crate::targets::HostTarget;
+        use std::collections::BTreeMap;
+
+        let root =
+            std::env::temp_dir().join(format!("silo-overlay-provenance-{}", std::process::id()));
+        let provenance = root.join("kernel-provenance/linux-amd64-gnu");
+        std::fs::create_dir_all(&provenance).unwrap();
+        let context = BuildContext {
+            workspace_root: &root,
+            target_dir: &root,
+            profile: Profile::Debug,
+            host: HostTarget::LinuxX86_64,
+        };
+        let files = BTreeMap::from([
+            ("assets/kernel-default".to_string(), "a".repeat(64)),
+            ("assets/initramfs".to_string(), "b".repeat(64)),
+            ("bin/silo-vmm".to_string(), "e".repeat(64)),
+        ]);
+        let artifact = serde_json::json!({
+            "kernel": {"digest": format!("sha256:{}", "a".repeat(64))},
+            "resolvedConfig": {"digest": format!("sha256:{}", "c".repeat(64))},
+        });
         std::fs::write(
-            root.join("packaging/release/THIRD_PARTY_NOTICES"),
-            "Silo builds libkrun from the source revision pinned in Cargo.lock:\nstale.\n",
+            provenance.join("debug.json"),
+            serde_json::to_vec(&serde_json::json!({"artifactConfig": artifact})).unwrap(),
         )
         .unwrap();
-        let notices = String::from_utf8(crate::runtime::release_notices(&root).unwrap()).unwrap();
-        assert!(notices.contains(revision));
-        assert!(!notices.contains("stale"));
-        std::fs::write(root.join("Cargo.lock"), "").unwrap();
-        assert!(crate::runtime::release_notices(&root).is_err());
+        let candidate = crate::runtime::candidate_boot_metadata(&context, &files).unwrap();
+        assert_eq!(candidate["kernelArtifact"], artifact);
+        assert_eq!(
+            candidate["configEvidence"],
+            "authenticated-oci-resolved-config"
+        );
+        assert_eq!(candidate["qualification"], "requires-exact-boot-evidence");
+        assert_eq!(
+            candidate["nativeExecutableDigest"],
+            format!("sha256:{}", "e".repeat(64))
+        );
+        let mut changed = files;
+        changed.insert("assets/kernel-default".to_string(), "d".repeat(64));
+        let candidate = crate::runtime::candidate_boot_metadata(&context, &changed).unwrap();
+        assert!(candidate["kernelArtifact"].is_null());
+        assert_eq!(
+            candidate["configEvidence"],
+            "unavailable-requires-actual-build-evidence"
+        );
+        std::fs::write(provenance.join("debug.json"), b"{").unwrap();
+        assert!(crate::runtime::candidate_boot_metadata(&context, &changed).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notices_use_locked_git_revision_without_executing_monitor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("packaging/release")).unwrap();
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(root.join("Cargo.toml"), format!(
+            "[workspace.dependencies]\nlibkrun = {{ git = \"https://github.com/vandycknick/libkrun.git\", rev = \"{revision}\" }}\n"
+        )).unwrap();
+        std::fs::write(root.join("Cargo.lock"), format!(
+            "[[package]]\nname = \"libkrun\"\nsource = \"git+https://github.com/vandycknick/libkrun.git?rev={revision}#{revision}\"\n"
+        )).unwrap();
+        std::fs::write(
+            root.join("packaging/release/THIRD_PARTY_NOTICES"),
+            "License heading\n@LIBKRUN_SOURCE_BINDING@\nLicense tail\n",
+        )
+        .unwrap();
+        let absent_monitor = root.join("not-an-executable");
+        let notices =
+            String::from_utf8(crate::runtime::release_notices(root, &absent_monitor).unwrap())
+                .unwrap();
+        assert_eq!(notices, format!(
+            "License heading\nSilo builds libkrun from the source revision pinned in Cargo.lock:\n{revision}.\nLicense tail\n"
+        ));
+        std::fs::write(root.join("Cargo.lock"), "").unwrap();
+        assert!(crate::runtime::release_notices(root, &absent_monitor).is_err());
+    }
+
+    #[test]
+    fn notices_bind_compiled_path_revision_content_and_unknown_state_without_old_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("packaging/release")).unwrap();
+        let baseline = "a".repeat(40);
+        let manifest = format!(
+            "[workspace.dependencies]\nlibkrun = {{ git = \"https://github.com/vandycknick/libkrun.git\", rev = \"{baseline}\" }}\n\
+             [patch.\"https://github.com/vandycknick/libkrun.git\"]\nlibkrun = {{ path = \"/production/src/libkrun\" }}\n"
+        );
+        let source = crate::dependency_source::resolve_dependency(
+            &manifest,
+            "[[package]]\nname = \"libkrun\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packaging/release/THIRD_PARTY_NOTICES"),
+            "@LIBKRUN_SOURCE_BINDING@\nApache license remains unchanged.\n",
+        )
+        .unwrap();
+        let content = "c".repeat(64);
+        let inputs = "d".repeat(64);
+        let mut observed = Vec::new();
+        for state in ["clean", "dirty", "unknown"] {
+            let revision = if state == "unknown" {
+                "unknown".into()
+            } else {
+                "b".repeat(40)
+            };
+            let identity = format!("v2:path:{state}:{revision}:content={content}:inputs={inputs}");
+            let notices =
+                crate::runtime::render_release_notices(root, source, Some(&identity)).unwrap();
+            let text = String::from_utf8(notices.clone()).unwrap();
+            assert!(text.contains("Workspace-resolved source path: /production/src/libkrun"));
+            assert!(text.contains(&format!("Compiled source HEAD observation: {revision}")));
+            assert!(text.contains(&format!("Compiled worktree state: {state}")));
+            assert!(text.contains(&format!("Compiled source-content fingerprint: {content}")));
+            assert!(text.contains("not an attestation"));
+            assert!(text.ends_with("Apache license remains unchanged.\n"));
+            assert!(!text.contains(&baseline));
+            assert!(!text.contains("pinned in Cargo.lock"));
+            observed.push(notices);
+        }
+        assert_ne!(observed[0], observed[1]);
+        assert_ne!(observed[1], observed[2]);
+        let changed = format!(
+            "v2:path:clean:{}:content={}:inputs={inputs}",
+            "b".repeat(40),
+            "e".repeat(64)
+        );
+        assert_ne!(
+            crate::runtime::render_release_notices(root, source, Some(&changed)).unwrap(),
+            observed[0]
+        );
+        assert!(crate::runtime::render_release_notices(root, source, None).is_err());
+        for invalid in [
+            format!("{baseline}:old-build"),
+            format!("v2:git:revision-bound:{baseline}:content={content}:inputs={inputs}"),
+            format!("v2:path:clean:unknown:content={content}:inputs={inputs}"),
+        ] {
+            assert!(crate::runtime::render_release_notices(root, source, Some(&invalid)).is_err());
+        }
+        for template in [
+            "no source marker",
+            "@LIBKRUN_SOURCE_BINDING@\n@LIBKRUN_SOURCE_BINDING@",
+        ] {
+            std::fs::write(root.join("packaging/release/THIRD_PARTY_NOTICES"), template).unwrap();
+            assert!(crate::runtime::render_release_notices(root, source, Some(&changed)).is_err());
+        }
     }
     #[test]
     fn manifest_hashes_current_components_and_rejects_symlinks() {
@@ -795,7 +1127,10 @@ mod tests {
         std::fs::write(root.join("THIRD_PARTY_NOTICES"), b"notices").unwrap();
         std::fs::write(root.join("LICENSES/APACHE-2.0.txt"), b"license").unwrap();
         std::fs::write(root.join("bin/netd"), b"actual netd").unwrap();
+        std::fs::write(root.join("bin/silo-vmm"), b"actual monitor and worker").unwrap();
         std::fs::write(root.join("assets/agent"), b"actual agent").unwrap();
+        std::fs::write(root.join("assets/kernel-default"), b"actual kernel").unwrap();
+        std::fs::write(root.join("assets/initramfs"), b"actual base archive").unwrap();
         let context = BuildContext {
             workspace_root: &root,
             target_dir: &root,
@@ -806,6 +1141,29 @@ mod tests {
         let manifest: serde_json::Value = serde_json::from_slice(&first).unwrap();
         assert_eq!(manifest["target"], "linux-amd64-gnu");
         assert_eq!(manifest["version"], "0.1.0");
+        assert_eq!(
+            manifest["managedOverlayCandidate"]["qualification"],
+            "requires-exact-boot-evidence"
+        );
+        assert_eq!(
+            manifest["managedOverlayCandidate"]["configEvidence"],
+            "unavailable-requires-actual-build-evidence"
+        );
+        assert!(manifest["managedOverlayCandidate"]["kernelArtifact"].is_null());
+        assert_eq!(
+            manifest["managedOverlayCandidate"]["kernelDigest"],
+            format!(
+                "sha256:{}",
+                crate::archive::sha256(&root.join("assets/kernel-default")).unwrap()
+            )
+        );
+        assert_eq!(
+            manifest["managedOverlayCandidate"]["nativeExecutableDigest"],
+            format!(
+                "sha256:{}",
+                crate::archive::sha256(&root.join("bin/silo-vmm")).unwrap()
+            )
+        );
         assert_eq!(
             manifest["files"]["assets/agent"],
             crate::archive::sha256(&root.join("assets/agent")).unwrap()
@@ -824,6 +1182,115 @@ mod tests {
         assert_eq!(
             crate::runtime::HELPERS,
             [("silo-vmm", 0o755), ("netd", 0o755)]
+        );
+    }
+
+    fn elf_section<'a>(elf: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+        assert_eq!(&elf[..6], b"\x7fELF\x02\x01");
+        let section_offset = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+        let entry_size = u16::from_le_bytes(elf[58..60].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(elf[60..62].try_into().unwrap()) as usize;
+        let names_index = u16::from_le_bytes(elf[62..64].try_into().unwrap()) as usize;
+        let data = |header: &[u8]| {
+            let offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
+            let size = u64::from_le_bytes(header[32..40].try_into().unwrap()) as usize;
+            &elf[offset..offset + size]
+        };
+        let names_header = section_offset + names_index * entry_size;
+        let names = data(&elf[names_header..names_header + entry_size]);
+        for index in 0..count {
+            let offset = section_offset + index * entry_size;
+            let header = &elf[offset..offset + entry_size];
+            let name_offset = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+            let section_name = names[name_offset..]
+                .split(|byte| *byte == 0)
+                .next()
+                .unwrap();
+            if section_name == name {
+                return Some(data(header));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn staged_guest_agent_removes_dwarf_without_mutating_debug_artifact_or_loadable_code() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let c_source = temp.path().join("agent.c");
+        std::fs::write(
+            &c_source,
+            b"int main(void) { volatile int value = 23; return value; }\n",
+        )
+        .unwrap();
+        let zig = crate::release::tool("zig").unwrap();
+        for target in ["x86_64-linux-musl", "aarch64-linux-musl"] {
+            let source = temp.path().join(format!("agent-debug-{target}"));
+            let destination = temp.path().join(format!("agent-packaged-{target}"));
+            let repeated = temp.path().join(format!("agent-repeated-{target}"));
+            let mut build = std::process::Command::new(&zig);
+            build
+                .args(["cc", "-target", target, "-g", "-O0"])
+                .arg(&c_source)
+                .arg("-o")
+                .arg(&source);
+            crate::command::run(build).unwrap();
+            let original = std::fs::read(&source).unwrap();
+            assert!(elf_section(&original, b".debug_info").is_some());
+
+            crate::runtime::package_guest_agent(&source, &destination).unwrap();
+            crate::runtime::package_guest_agent(&source, &repeated).unwrap();
+            let packaged = std::fs::read(&destination).unwrap();
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            assert!(packaged.len() < original.len());
+            assert_eq!(
+                &packaged[18..20],
+                &original[18..20],
+                "guest ELF architecture must remain unchanged"
+            );
+            assert!(elf_section(&packaged, b".debug_info").is_none());
+            assert!(elf_section(&packaged, b".symtab").is_some());
+            assert_eq!(
+                elf_section(&packaged, b".text"),
+                elf_section(&original, b".text")
+            );
+            assert_eq!(
+                elf_section(&packaged, b".eh_frame"),
+                elf_section(&original, b".eh_frame")
+            );
+            assert_eq!(std::fs::read(&repeated).unwrap(), packaged);
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+            if cfg!(target_os = "linux") && target.starts_with(std::env::consts::ARCH) {
+                let output = std::process::Command::new(&destination).output().unwrap();
+                assert_eq!(output.status.code(), Some(23));
+            }
+        }
+    }
+
+    #[test]
+    fn staged_guest_agent_refuses_an_existing_output_before_running_packaging() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unmodified-debug-source");
+        let destination = temp.path().join("existing-output");
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&destination, b"retain existing output").unwrap();
+        assert!(matches!(
+            crate::runtime::package_guest_agent(&source, &destination),
+            Err(crate::runtime::RuntimeError::Invalid(_))
+        ));
+        assert_eq!(std::fs::read(source).unwrap(), b"source bytes");
+        assert_eq!(
+            std::fs::read(destination).unwrap(),
+            b"retain existing output"
         );
     }
 }

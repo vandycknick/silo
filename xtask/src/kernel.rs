@@ -291,6 +291,7 @@ fn resolve_oci_kernel(
     let config = fetch_or_cached_blob(cache_root, &artifacts.config, repository, options.offline)?;
     let config = parse_json(&config, "kernel artifact config")?;
     validate_config(&config, context, options.profile)?;
+    validate_config_artifacts(&config, &artifacts, options.profile)?;
     let mut kernel_path = None;
     for layer in &artifacts.layers {
         let bytes = fetch_or_cached_blob(cache_root, layer, repository, options.offline)?;
@@ -316,6 +317,7 @@ fn resolve_oci_kernel(
             "manifest": manifest_descriptor.value,
             "config": artifacts.config.value,
             "layers": artifacts.layers.iter().map(|layer| layer.value.clone()).collect::<Vec<_>>(),
+            "artifactConfig": config,
         }),
     ))
 }
@@ -458,8 +460,16 @@ fn validate_config(
     context: &BuildContext<'_>,
     profile: KernelProfile,
 ) -> Result<(), KernelError> {
+    require_string_value(config, "profile", "kernel artifact config", profile.name())?;
+    let version = required_string(config, "kernelVersion", "kernel artifact config")?;
+    let track = required_string(config, "track", "kernel artifact config")?;
+    let expected_runtime = root_runtime_metadata(profile, track, version)?;
+    if config.get("rootRuntime") != Some(&expected_runtime) {
+        return Err(KernelError::Invalid(
+            "rootRuntime must describe candidate eligibility, not boot qualification".to_string(),
+        ));
+    }
     if profile == KernelProfile::Rprobe {
-        require_string_value(config, "profile", "kernel artifact config", profile.name())?;
         require_string_value(
             config,
             "purpose",
@@ -524,6 +534,80 @@ fn validate_config(
             KernelError::Invalid("kernel artifact config source digest is missing".to_string())
         })?;
     validate_digest(source_digest)?;
+    Ok(())
+}
+
+fn root_runtime_metadata(
+    profile: KernelProfile,
+    track: &str,
+    version: &str,
+) -> Result<Value, KernelError> {
+    let mut components = version.split('.');
+    let mut next = || {
+        components.next().and_then(|value| {
+            if value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+                || (value.len() > 1 && value.starts_with('0'))
+            {
+                None
+            } else {
+                value.parse::<u32>().ok()
+            }
+        })
+    };
+    let parsed = (next(), next(), next());
+    let (Some(major), Some(minor), Some(patch)) = parsed else {
+        return Err(KernelError::Invalid(format!(
+            "invalid numeric kernel version {version:?}"
+        )));
+    };
+    if components.next().is_some() {
+        return Err(KernelError::Invalid(format!(
+            "invalid numeric kernel version {version:?}"
+        )));
+    }
+    Ok(json!({
+        "opaqueRaw": profile == KernelProfile::Workload,
+        "managedOverlay": {
+            "eligible": profile == KernelProfile::Workload
+                && track != "longterm5"
+                && (major, minor, patch) >= (6, 6, 0),
+            "minimumKernelVersion": "6.6",
+            "rootProfile": "linux-flat-overlay-v1",
+            "upperProfile": "silo-upper-ext4-v1",
+            "overlayProfile": "silo-overlay-v1",
+            "renderingAbi": "linux-overlayfs-mountinfo-v1",
+            "attachmentFamily": "krun-virtio-blk-v1",
+            "qualification": "requires-exact-boot-evidence"
+        }
+    }))
+}
+
+fn validate_config_artifacts(
+    config: &Value,
+    artifacts: &ManifestArtifacts,
+    profile: KernelProfile,
+) -> Result<(), KernelError> {
+    for (field, media_type) in [
+        ("kernel", profile.image_type()),
+        ("resolvedConfig", KCONFIG_MEDIA_TYPE),
+    ] {
+        let declared = config.get(field).ok_or_else(|| {
+            KernelError::Invalid(format!("kernel artifact config {field} is missing"))
+        })?;
+        let layer = artifacts
+            .layers
+            .iter()
+            .find(|layer| layer.media_type == media_type)
+            .ok_or_else(|| KernelError::Invalid(format!("missing {field} descriptor")))?;
+        if declared.get("digest").and_then(Value::as_str) != Some(layer.digest.as_str())
+            || declared.get("size").and_then(Value::as_u64) != Some(layer.size)
+        {
+            return Err(KernelError::Invalid(format!(
+                "kernel artifact config {field} identity differs from authenticated manifest"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1021,4 +1105,80 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), KernelError> {
             source,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kernel::{
+        root_runtime_metadata, validate_config_artifacts, Descriptor, KernelProfile,
+        ManifestArtifacts, KCONFIG_MEDIA_TYPE, KERNEL_MEDIA_TYPE,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn overlay_kernel_metadata_has_a_floor_but_never_grants_qualification() {
+        for (track, version, eligible) in [
+            ("stable", "7.2.2", true),
+            ("longterm", "6.18.48", true),
+            ("longterm", "6.6.0", true),
+            ("longterm", "6.5.99", false),
+            ("longterm5", "5.15.219", false),
+            ("longterm5", "7.2.2", false),
+        ] {
+            let metadata = root_runtime_metadata(KernelProfile::Workload, track, version).unwrap();
+            assert_eq!(metadata["opaqueRaw"], true);
+            assert_eq!(metadata["managedOverlay"]["eligible"], eligible);
+            assert_eq!(
+                metadata["managedOverlay"]["qualification"],
+                "requires-exact-boot-evidence"
+            );
+        }
+        let probe = root_runtime_metadata(KernelProfile::Rprobe, "stable", "7.2.2").unwrap();
+        assert_eq!(probe["opaqueRaw"], false);
+        assert_eq!(probe["managedOverlay"]["eligible"], false);
+        for version in [
+            "",
+            "6",
+            "6.6",
+            "6.6.0.1",
+            "06.6.0",
+            "6.6.-1",
+            "6.6.0-rc1",
+            "4294967296.0.0",
+        ] {
+            assert!(root_runtime_metadata(KernelProfile::Workload, "stable", version).is_err());
+        }
+    }
+
+    #[test]
+    fn overlay_kernel_metadata_binds_actual_manifest_kernel_and_config() {
+        let layer = |media_type: &str, byte: char, size| Descriptor {
+            media_type: media_type.to_string(),
+            digest: format!("sha256:{}", byte.to_string().repeat(64)),
+            size,
+            value: json!({}),
+        };
+        let kernel = layer(KERNEL_MEDIA_TYPE, 'a', 100);
+        let kconfig = layer(KCONFIG_MEDIA_TYPE, 'b', 200);
+        let config = json!({
+            "kernel": {"digest": kernel.digest, "size": kernel.size},
+            "resolvedConfig": {"digest": kconfig.digest, "size": kconfig.size}
+        });
+        let artifacts = ManifestArtifacts {
+            config: layer("config", 'c', 300),
+            layers: vec![kernel, kconfig],
+        };
+        assert!(validate_config_artifacts(&config, &artifacts, KernelProfile::Workload).is_ok());
+        for field in ["kernel", "resolvedConfig"] {
+            let mut wrong = config.clone();
+            wrong[field]["digest"] = json!(format!("sha256:{}", "d".repeat(64)));
+            assert!(
+                validate_config_artifacts(&wrong, &artifacts, KernelProfile::Workload).is_err()
+            );
+            wrong[field] = json!({"digest": config[field]["digest"], "size": 1});
+            assert!(
+                validate_config_artifacts(&wrong, &artifacts, KernelProfile::Workload).is_err()
+            );
+        }
+    }
 }

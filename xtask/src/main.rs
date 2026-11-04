@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::components::{
-    build_all, build_component, clippy, format, test_all, test_integration, test_units,
-    BuildContext, Component,
+    build_all, build_component, build_runtime, clippy, format, test_all, test_integration,
+    test_units, BuildContext, Component,
 };
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel::KernelOptions;
@@ -16,9 +16,12 @@ use crate::targets::HostTarget;
 
 mod app;
 mod archive;
+mod changesets;
 mod command;
 mod components;
 mod coverage;
+#[path = "../../virt/vmm/dependency_source.rs"]
+mod dependency_source;
 mod go_sdk;
 mod initramfs;
 mod kernel;
@@ -140,6 +143,36 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = Profile::Release)]
         profile: Profile,
     },
+    ChangesetFixtures {
+        #[arg(long, value_name = "DIRECTORY")]
+        out: Option<PathBuf>,
+    },
+    ChangesetExtractor {
+        #[arg(long)]
+        offline: bool,
+    },
+    ChangesetAcquire {
+        #[arg(long)]
+        image: String,
+        #[arg(long, value_name = "DIRECTORY")]
+        out: Option<PathBuf>,
+    },
+    ChangesetSocket {
+        #[arg(long, value_name = "DIRECTORY")]
+        out: Option<PathBuf>,
+    },
+    ChangesetMetadata {
+        #[arg(long, value_name = "DIRECTORY")]
+        out: Option<PathBuf>,
+    },
+    QualifyChangesets {
+        #[arg(long, value_name = "DIRECTORY")]
+        acquired: Option<PathBuf>,
+        #[arg(long, value_name = "DIRECTORY")]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        user_namespace: bool,
+    },
     AssembleGoSdk {
         #[arg(long, value_name = "PATH")]
         packages_root: Option<PathBuf>,
@@ -244,14 +277,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             kernel,
             rprobe,
         } => {
-            build_release_or_development(
-                &workspace_root,
-                &target_dir,
-                profile,
-                kernel,
-                true,
-                &rprobe,
-            )?;
+            let context = build_context(&workspace_root, &target_dir, profile)?;
+            build_runtime(&context)?;
+            assemble_runtime(&context, kernel, true, &rprobe)?;
         }
         Commands::Archive {
             kernel,
@@ -389,6 +417,24 @@ fn run() -> Result<(), Box<dyn Error>> {
         Commands::QualifyGoBridge { profile } => {
             go_sdk::qualify_bridge(&build_context(&workspace_root, &target_dir, profile)?)?;
         }
+        Commands::ChangesetFixtures { out } => {
+            changesets::fixtures(&workspace_root, &target_dir, out)?
+        }
+        Commands::ChangesetExtractor { offline } => {
+            changesets::extractor(&workspace_root, &target_dir, offline)?
+        }
+        Commands::ChangesetAcquire { image, out } => {
+            changesets::acquire(&workspace_root, &target_dir, &image, out)?
+        }
+        Commands::ChangesetSocket { out } => changesets::socket(&workspace_root, &target_dir, out)?,
+        Commands::ChangesetMetadata { out } => {
+            changesets::metadata(&workspace_root, &target_dir, out)?
+        }
+        Commands::QualifyChangesets {
+            acquired,
+            out,
+            user_namespace,
+        } => changesets::qualify(&workspace_root, &target_dir, acquired, out, user_namespace)?,
         Commands::AssembleGoSdk { packages_root } => {
             let packages_root = packages_root
                 .map(|path| {
@@ -462,10 +508,19 @@ fn build_release_or_development(
 ) -> Result<(), Box<dyn Error>> {
     let context = build_context(workspace_root, target_dir, profile)?;
     build_all(&context)?;
-    let kernel = kernel::resolve(&context, &kernel_options)?;
+    assemble_runtime(&context, kernel_options, stage, rprobe)
+}
+
+fn assemble_runtime(
+    context: &BuildContext<'_>,
+    kernel_options: KernelOptions,
+    stage: bool,
+    rprobe: &RprobeAssetOptions,
+) -> Result<(), Box<dyn Error>> {
+    let kernel = kernel::resolve(context, &kernel_options)?;
     let probe = if context.host == HostTarget::MacosArm64 {
         Some(kernel::resolve_rprobe(
-            &context,
+            context,
             &rprobe.acquisition,
             rprobe.rprobe_assets.as_deref(),
         )?)
@@ -473,12 +528,12 @@ fn build_release_or_development(
         None
     };
     runtime::assemble_development(
-        &context,
+        context,
         &kernel,
         probe.as_ref().map(|artifact| artifact.path.as_path()),
     )?;
     if stage {
-        runtime::stage(&context)?;
+        runtime::stage(context)?;
     }
     Ok(())
 }
