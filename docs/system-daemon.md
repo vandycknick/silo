@@ -196,16 +196,20 @@ guest has touched, so a busy engine's host footprint can grow toward `memory`
 while idle.
 
 Memory reclamation is automatic, with no daemon policy knobs. silo-vmm enables a
-balloon; libkrun advertises free-page reporting only when the backend supports
-it and its qualification succeeds. Otherwise the basic balloon remains.
-`HostMemoryRemapper` maintains compatible private RAM mappings independently of
-the balloon and its reporting capability.
+balloon; libkrun selects reporting according to backend support and, on HVF,
+qualification. Capture-tracked boot RAM and restored file-private RAM inhibit
+destructive reclaim and the HVF periodic remapper. Negotiated reporting can
+still complete without discarding backing; that is not discard qualification.
 
 The managed agent's `GuestCacheReclaimer` detects negotiated reporting and
 writable cgroup v2 reclaim interfaces. After two idle minutes it requests
 bounded file-cache reclaim, with no global cache-drop fallback. Unsupported
 guests retain their cache. `daemon status` reports the last guest reclaim run
-and host qualification/cumulative advised bytes, not current physical savings.
+and actual host backing, inhibition reason, qualification and cumulative advised
+bytes, not current physical savings. Native fields remain absent before the
+first report. Tracked/restored RAM reports reclaim ineffective with qualification
+`not-run`; ordinary untracked Linux RAM can reclaim with `not-run` because it
+does not use the HVF qualification probe.
 
 Remove the retired `memory-reclaim`, `memory-reclaim-after`, and
 `host-memory-reclaim` YAML keys when upgrading. See

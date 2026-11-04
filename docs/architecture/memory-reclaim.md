@@ -35,10 +35,30 @@ Qualification failure is a capability fallback, not a VM-start failure. Errors
 that prevent safe cleanup of a qualification probe remain fatal. Linux retains
 its existing reporting implementation.
 
+Capture-tracked boot RAM and restored file-private RAM are structurally
+inhibited: reports can complete, but neither destructive advice nor the HVF
+periodic remapper runs. Restores preserve negotiated device features without
+inheriting permission to discard their new backing. A successful acknowledge-only
+report is not discard-to-zero qualification.
+
+Native status and `daemon status` expose actual `backing` (`boot` or
+`restored-private`) and inhibition `reason` (`none`, `tracked-capture`, or
+`restored-private-mapping`). Inhibited RAM reports requested/effective false,
+qualification `not-run`, and zero advised bytes/extents. Fields remain absent
+until the first native report. Ordinary untracked Linux RAM can report
+qualification `not-run` with effective reclaim: its existing Linux advice path
+does not depend on the HVF probe.
+
+Counters belong to the current host process, not a captured device generation.
+Released bytes/extents count successful advice, including repeated ranges, not
+physical savings. Inhibited skipped reports count completed operations only
+after successful used-ring publication; malformed or failed publications do not
+count as successful skips.
+
 ## HostMemoryReclaimer
 
 The guest kernel holds reported pages out of allocation until the host completes
-the report. For validated ranges of registered private RAM, the host:
+the report. For eligible ordinary private-anonymous RAM on HVF, the host:
 
 1. Removes the GPA mapping with `hv_vm_unmap`.
 2. Advises each native host page with `MADV_FREE`.
@@ -60,9 +80,10 @@ Successful advice is lazy and does not prove physical eviction under pressure.
 
 ## HostMemoryRemapper
 
-Compatible guest-memory setup creates this component independently of balloon
-attachment, reporting qualification, and guest EL2. Incompatible external/shared
-providers do not get it. It operates on registered workload RAM only.
+Eligible ordinary guest-memory setup creates this component independently of
+balloon attachment, reporting qualification, and guest EL2. Incompatible
+external/shared providers, capture-tracked RAM and restored file-private RAM do
+not get it. It operates on registered workload RAM only.
 
 The VMM event loop owns scheduling:
 

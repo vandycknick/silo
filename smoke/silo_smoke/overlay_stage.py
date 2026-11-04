@@ -15,7 +15,7 @@ import shutil
 from . import overlay, procs
 from .cli import Silo
 
-ADMITTED_NATIVE_SHA256 = '436de3fb42270d2114030e0cd380f89134e4574f3c6d9d3aabf86a7d670ecc7c'
+ADMITTED_NATIVE_SHA256 = '414aff796db4ad9063daa4f2098dd064cafd9bc3598bce4c34b30d524b7c7a0b'
 
 
 def descriptors(pid: int) -> list[dict]:

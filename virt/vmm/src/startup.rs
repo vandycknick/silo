@@ -905,6 +905,8 @@ fn publish_host_memory_reclaim(machine: &VirtualMachine, store: &Arc<InstanceSto
                     skipped_reports: Some(report.skipped_reports),
                     failed_operations: Some(report.failed_operations),
                     observed_at: Some(prost_types::Timestamp::from(report.observed_at)),
+                    backing: Some(report.backing.to_string()),
+                    reason: Some(report.reason.to_string()),
                 };
                 if let Err(error) = store.set_host_memory_reclaim(proto) {
                     tracing::warn!(error = %error, "failed to record host memory reclaim report");

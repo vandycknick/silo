@@ -123,13 +123,19 @@ impl StartAttempt {
 /// Host memory reclaim state of the running VM as last reported by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostMemoryReclaimReport {
+    /// `boot` or `restored-private`.
+    pub backing: &'static str,
+    /// `none`, `tracked-capture`, or `restored-private-mapping`.
+    pub reason: &'static str,
     pub requested: bool,
     /// `not-run`, `passed`, `failed`, or `inconclusive`.
     pub qualification: &'static str,
     pub effective: bool,
+    /// Process-local successfully advised bytes/ranges, including repeats.
     pub released_bytes: u64,
     pub released_extents: u64,
     pub retried_faults: u64,
+    /// Skipped operations, not a universal count of queue heads or pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
     pub observed_at: SystemTime,

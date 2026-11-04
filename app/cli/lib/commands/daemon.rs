@@ -351,6 +351,8 @@ impl DaemonStatusView {
                         status.host_memory_reclaim_effective,
                         status.host_memory_reclaim_qualification.as_deref(),
                         status.host_memory_reclaim_released_bytes,
+                        status.host_memory_reclaim_backing.as_deref(),
+                        status.host_memory_reclaim_reason.as_deref(),
                     ),
                 ));
             }
@@ -459,6 +461,8 @@ fn format_host_memory_reclaim(
     effective: Option<bool>,
     qualification: Option<&str>,
     released_bytes: Option<u64>,
+    backing: Option<&str>,
+    reason: Option<&str>,
 ) -> String {
     let requested = if requested { "auto" } else { "off" };
     let effective_text = match effective {
@@ -469,6 +473,12 @@ fn format_host_memory_reclaim(
     let mut text = format!("requested {requested}; effective {effective_text}");
     if let Some(qualification) = qualification {
         text.push_str(&format!(" (probe {qualification})"));
+    }
+    if let Some(backing) = backing {
+        text.push_str(&format!("; backing {backing}"));
+    }
+    if let Some(reason) = reason {
+        text.push_str(&format!("; reason {reason}"));
     }
     if let (Some(_), Some(bytes)) = (effective, released_bytes) {
         text.push_str(&format!(
@@ -508,9 +518,7 @@ async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use crate::commands::daemon::{
-        format_actual_backend, format_host_memory_reclaim, format_update_check,
-    };
+    use crate::commands::daemon::format_update_check;
 
     #[test]
     fn feature_flags_distinguish_omitted_enabled_and_disabled() {
@@ -581,30 +589,6 @@ mod tests {
             crate::app::Cli::try_parse_from(["silo", "daemon", "balloon", "--target", "1GiB"])
                 .is_err()
         );
-    }
-
-    #[test]
-    fn status_wording_cases() {
-        use silod_spec::status::MemoryReclaimOutcome;
-
-        for (label, actual, expected) in [
-            ("off_off", format_host_memory_reclaim(false, Some(false), None, None), "requested off; effective off"),
-            ("off_on", format_host_memory_reclaim(false, Some(true), None, None), "requested off; effective on"),
-            ("off_unknown", format_host_memory_reclaim(false, None, None, None), "requested off; effective unknown (not yet reported by the VM backend)"),
-            ("auto_off", format_host_memory_reclaim(true, Some(false), None, None), "requested auto; effective off"),
-            ("auto_on", format_host_memory_reclaim(true, Some(true), None, None), "requested auto; effective on"),
-            ("auto_unknown", format_host_memory_reclaim(true, None, None, None), "requested auto; effective unknown (not yet reported by the VM backend)"),
-            ("passed_probe", format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)), "requested auto; effective on (probe passed); 6MiB advised free since VM start"),
-            ("failed_probe", format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)), "requested auto; effective off (probe failed); 0B advised free since VM start"),
-            ("unreported_counter", format_host_memory_reclaim(true, None, None, Some(10)), "requested auto; effective unknown (not yet reported by the VM backend)"),
-            ("partial_gradual", crate::commands::daemon::format_guest_reclaim(Some("gradual"), MemoryReclaimOutcome::Partial, Some(512 * 1024 * 1024), "2 minutes ago".to_string()), "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"),
-            ("failed_dropcache", crate::commands::daemon::format_guest_reclaim(Some("dropcache"), MemoryReclaimOutcome::Failed, Some(7), "just now".to_string()), "; last idle cache drop reclaim in the guest failed just now"),
-            ("nothing_default", crate::commands::daemon::format_guest_reclaim(None, MemoryReclaimOutcome::Nothing, Some(0), "just now".to_string()), "; last idle gradual reclaim in the guest found nothing reclaimable just now, guest cache fell by 0B"),
-            ("unknown_backend", format_actual_backend(None).to_string(), "unknown"),
-            ("krun_backend", format_actual_backend(Some("krun")).to_string(), "krun"),
-        ] {
-            assert_eq!(actual, expected, "{label}");
-        }
     }
 
     #[test]

@@ -80,10 +80,10 @@ pub(crate) fn main() -> eyre::Result<()> {
                 },
                 vsock_mux: mux,
             },
-            |_control| {
+            |control| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
-                    let shutdown = _control.clone();
+                    let shutdown = control.clone();
                     std::thread::Builder::new()
                         .name("krun-shutdown".to_string())
                         .spawn(move || match shutdown_signals.wait() {
@@ -96,8 +96,7 @@ pub(crate) fn main() -> eyre::Result<()> {
                             Err(error) => eprintln!("krun signal wait failed: {error}"),
                         })?;
                 }
-                #[cfg(target_os = "macos")]
-                start_status_reporter(events.clone(), _control)?;
+                start_status_reporter(events.clone(), control)?;
                 emit(&events, &Event::BackendStarted {})?;
                 stage = StartupStage::Started;
                 Ok(())
@@ -231,7 +230,6 @@ fn emit(events: &Mutex<EventWriter>, event: &Event) -> io::Result<()> {
         .send(event)
 }
 
-#[cfg(target_os = "macos")]
 fn start_status_reporter(
     events: Arc<Mutex<EventWriter>>,
     control: engine::Control,

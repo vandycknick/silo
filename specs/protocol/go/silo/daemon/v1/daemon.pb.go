@@ -11485,6 +11485,8 @@ type SystemStatus struct {
 	Live                                 *LiveMachineReport     `protobuf:"bytes,23,opt,name=live,proto3" json:"live,omitempty"`
 	ProspectiveLive                      *LiveHostReport        `protobuf:"bytes,24,opt,name=prospective_live,json=prospectiveLive,proto3" json:"prospective_live,omitempty"`
 	LiveSchemaVersion                    *uint32                `protobuf:"varint,25,opt,name=live_schema_version,json=liveSchemaVersion,proto3,oneof" json:"live_schema_version,omitempty"`
+	HostMemoryReclaimBacking             *string                `protobuf:"bytes,26,opt,name=host_memory_reclaim_backing,json=hostMemoryReclaimBacking,proto3,oneof" json:"host_memory_reclaim_backing,omitempty"`
+	HostMemoryReclaimReason              *string                `protobuf:"bytes,27,opt,name=host_memory_reclaim_reason,json=hostMemoryReclaimReason,proto3,oneof" json:"host_memory_reclaim_reason,omitempty"`
 	unknownFields                        protoimpl.UnknownFields
 	sizeCache                            protoimpl.SizeCache
 }
@@ -11692,6 +11694,20 @@ func (x *SystemStatus) GetLiveSchemaVersion() uint32 {
 		return *x.LiveSchemaVersion
 	}
 	return 0
+}
+
+func (x *SystemStatus) GetHostMemoryReclaimBacking() string {
+	if x != nil && x.HostMemoryReclaimBacking != nil {
+		return *x.HostMemoryReclaimBacking
+	}
+	return ""
+}
+
+func (x *SystemStatus) GetHostMemoryReclaimReason() string {
+	if x != nil && x.HostMemoryReclaimReason != nil {
+		return *x.HostMemoryReclaimReason
+	}
+	return ""
 }
 
 type LiveMachineRequest struct {
@@ -14087,7 +14103,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\treadiness\x18\x06 \x01(\v2\x1e.silo.daemon.v1.ReadinessStateR\treadiness\x121\n" +
 	"\x05agent\x18\a \x01(\v2\x1b.silo.daemon.v1.AgentStatusR\x05agent\x125\n" +
 	"\x04live\x18\b \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04liveB\t\n" +
-	"\a_run_id\"\xe4\x0e\n" +
+	"\a_run_id\"\xa9\x10\n" +
 	"\fSystemStatus\x121\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x1b.silo.daemon.v1.SystemPhaseR\x05phase\x12\"\n" +
 	"\n" +
@@ -14117,7 +14133,9 @@ const file_daemon_proto_rawDesc = "" +
 	"%host_memory_reclaim_failed_operations\x18\x16 \x01(\x04H\x0fR!hostMemoryReclaimFailedOperations\x88\x01\x01\x125\n" +
 	"\x04live\x18\x17 \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04live\x12I\n" +
 	"\x10prospective_live\x18\x18 \x01(\v2\x1e.silo.daemon.v1.LiveHostReportR\x0fprospectiveLive\x123\n" +
-	"\x13live_schema_version\x18\x19 \x01(\rH\x10R\x11liveSchemaVersion\x88\x01\x01B\r\n" +
+	"\x13live_schema_version\x18\x19 \x01(\rH\x10R\x11liveSchemaVersion\x88\x01\x01\x12B\n" +
+	"\x1bhost_memory_reclaim_backing\x18\x1a \x01(\tH\x11R\x18hostMemoryReclaimBacking\x88\x01\x01\x12@\n" +
+	"\x1ahost_memory_reclaim_reason\x18\x1b \x01(\tH\x12R\x17hostMemoryReclaimReason\x88\x01\x01B\r\n" +
 	"\v_machine_idB\t\n" +
 	"\a_run_idB\x0f\n" +
 	"\r_image_digestB\x13\n" +
@@ -14134,7 +14152,9 @@ const file_daemon_proto_rawDesc = "" +
 	"\"_host_memory_reclaim_qualificationB%\n" +
 	"#_host_memory_reclaim_released_bytesB(\n" +
 	"&_host_memory_reclaim_failed_operationsB\x16\n" +
-	"\x14_live_schema_version\"J\n" +
+	"\x14_live_schema_versionB\x1e\n" +
+	"\x1c_host_memory_reclaim_backingB\x1d\n" +
+	"\x1b_host_memory_reclaim_reason\"J\n" +
 	"\x12LiveMachineRequest\x124\n" +
 	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\"l\n" +
 	"\x12LiveCaptureRequest\x124\n" +

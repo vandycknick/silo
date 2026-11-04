@@ -23,7 +23,6 @@ pub struct Resources<'a> {
 /// Process-local controls, not a reusable VM or a process lifecycle handle.
 #[derive(Clone)]
 pub struct Control {
-    #[cfg(target_os = "macos")]
     handle: std::sync::Arc<libkrun::VmmHandle>,
 }
 
@@ -35,7 +34,6 @@ impl Control {
             .map_err(|source| libkrun_error("request shutdown", source))
     }
 
-    #[cfg(target_os = "macos")]
     pub fn host_memory_reclaim(&self) -> crate::krun::HostMemoryReclaimStatus {
         host_memory_reclaim_status(&self.handle)
     }
@@ -304,12 +302,10 @@ pub fn run_process(
     let vmm = builder
         .build()
         .map_err(|source| libkrun_error("build VMM", source))?;
-    #[cfg(target_os = "macos")]
     let handle = vmm
         .handle()
         .map_err(|source| libkrun_error("obtain VMM control handle", source))?;
     on_built(Control {
-        #[cfg(target_os = "macos")]
         handle: std::sync::Arc::new(handle),
     })
     .map_err(Error::PostBuild)?;
@@ -317,13 +313,24 @@ pub fn run_process(
     Err(Error::EventLoopTerminated)
 }
 
-#[cfg(target_os = "macos")]
 fn host_memory_reclaim_status(handle: &libkrun::VmmHandle) -> crate::krun::HostMemoryReclaimStatus {
-    use crate::krun::HostMemoryReclaimQualification as Q;
-    use libkrun::HostReclaimQualification;
+    use crate::krun::{
+        HostMemoryReclaimBacking as B, HostMemoryReclaimQualification as Q,
+        HostMemoryReclaimReason as R,
+    };
+    use libkrun::{HostReclaimBacking, HostReclaimQualification, HostReclaimReason};
 
     let status = handle.host_reclaim_status();
     crate::krun::HostMemoryReclaimStatus {
+        backing: match status.backing {
+            HostReclaimBacking::Boot => B::Boot,
+            HostReclaimBacking::RestoredPrivate => B::RestoredPrivate,
+        },
+        reason: match status.reason {
+            HostReclaimReason::None => R::None,
+            HostReclaimReason::TrackedCapture => R::TrackedCapture,
+            HostReclaimReason::RestoredPrivateMapping => R::RestoredPrivateMapping,
+        },
         requested: status.requested,
         qualification: match status.qualification {
             HostReclaimQualification::NotRun => Q::NotRun,

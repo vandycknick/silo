@@ -134,20 +134,48 @@ one `stat` invocation, still comparing each fresh post-effect metrics frame
 against both real filesystems. Stopped byte/inode oracles, full logical hashing,
 copy/replay order, fresh boots and exact-boot closure checks are unchanged.
 
+The Phase 9 complete default baseline is
+`.tmp/phase09-corrected-default.xml`, with its command and call-only durations in
+`.tmp/plan/evidence/phase-09/full-smoke-bg618.log`: 87 passed in 988.84 seconds.
+The four two-child fork calls took 49.51 seconds (clean-flat), 48.64
+(dirty-replay-flat), 45.75 (clean-raw) and 44.01 (dirty-replay-raw); the two
+exact-boot snapshot calls took 45.57 and 45.20 seconds. JUnit testcase times also
+include setup/teardown, so compare them separately from pytest's call durations.
+
+Stopped tests now batch each guest-copy proof's same `cat`, absence `test` and
+two `stat` invocations into one fail-fast guest exec. A textual boundary keeps
+the complete `cat` result available for the same host-side exact-byte assertion;
+the original hardlink inode/link-count comparison remains host-side too. Source
+setup invokes the same durable-write probe before the same hardlink/machine-ID
+writes and `sync`, but within their existing shell session. Snapshot children
+read their common file and kernel command line in one exec, still checking exact
+common bytes and the captured argument separately before the Data mutation.
+This removes ten CLI/agent round trips per fork case and three per snapshot
+case, 46 in the default selection, without caching any guest or disk result.
+All logical disk hashes, child/source inode checks, cold boots, run identities,
+dirty replay, lifecycle cleanup and existing deadlines remain in place.
+
 The probe source is `virt/vmm/tests/guest/overlay_probe.rs`. Pytest's session
 fixture compiles it with rustc for Linux musl and embeds that new executable in
 the OCI layer; use a new pytest session after changing it, not a retained image.
 This does not rebuild the production initramfs. Stage the production binaries
-with `make stage` as usual before measuring. With the same baseline environment
-and system-image fixture available, measure the complete unchanged selection:
+with `make stage` as usual before measuring. For the after measurement, retain
+the same kernel/config qualification, fault monitors, system-image fixture,
+host filesystem, resource conditions and environment as the Phase 9 baseline,
+and run the complete unchanged selection:
 
 ```sh
 make stage
-make smoke SMOKE_ARGS='-m "not slow and not sdk and not live" --junitxml=../.tmp/phase08-default-qualified.xml --durations=20'
+make smoke SMOKE_ARGS='-m "not slow and not sdk and not live" --junitxml=../.tmp/phase10-default-qualified.xml --durations=20'
 ```
 
-These changes remove known redundant work, not assertions or default cases.
-No elapsed-time improvement is established until the complete selection runs.
+Compare the full wall time and the six affected call durations against the
+retained Phase 9 baseline, and compare the same testcase identities/counts and
+outcomes in both JUnit reports. Native/runtime changes in the same integration
+are a timing confounder; attribution requires a paired run with the same staged
+native bytes and only the smoke batching changed. These changes remove known
+redundant sessions, not assertions or default cases. No elapsed-time improvement
+is established until the complete selection runs.
 
 
 ## Isolation and evidence

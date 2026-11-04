@@ -263,11 +263,12 @@ def main():
     print(f"  accounting residual       {mib(residual)}   (not a leak or reported-page measurement)")
     print("  Host mappings, guest mappings and backing objects can account for the same pages differently.")
     try:
-        status = json.load(open(silo_home() / "daemon" / "status.json"))
-        if status.get("machine_id", "").startswith(machine["short_id"]):
+        with open(silo_home() / "daemon" / "status.json") as status_file:
+            status = json.load(status_file).get("system")
+        if status and (status.get("machine_id") or "").startswith(machine["short_id"]):
             print()
             print("DAEMON")
-            print(f"  host reclaim: effective={status.get('host_memory_reclaim_effective')} probe={status.get('host_memory_reclaim_qualification')} advised {mib(status.get('host_memory_reclaim_released_bytes') or 0)} failed_ops {status.get('host_memory_reclaim_failed_operations')}")
+            print(f"  host reclaim: backing={status.get('host_memory_reclaim_backing')} reason={status.get('host_memory_reclaim_reason')} requested={status.get('host_memory_reclaim_requested')} effective={status.get('host_memory_reclaim_effective')} probe={status.get('host_memory_reclaim_qualification')} advised free {mib(status.get('host_memory_reclaim_released_bytes') or 0)} failed_ops {status.get('host_memory_reclaim_failed_operations')}")
             print(f"  guest reclaim: runs {status.get('memory_reclaim_runs')} last {status.get('memory_reclaim_at')} outcome {status.get('memory_reclaim_outcome')} cached fell {mib(status.get('memory_reclaim_observed_cache_delta_bytes') or 0)}")
     except (OSError, ValueError):
         pass
