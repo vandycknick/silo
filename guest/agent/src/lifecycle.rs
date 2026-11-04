@@ -312,6 +312,7 @@ pub(crate) struct Lifecycle {
     supervisor: crate::pid1::ProcessSupervisor,
     forwards: crate::forward::listen::GuestForwardServiceImpl,
     network: tokio::sync::Mutex<Option<crate::provision::network::AppliedNetwork>>,
+    status: watch::Sender<v1::AgentStatus>,
     coordinator: Mutex<Coordinator>,
 }
 
@@ -321,6 +322,7 @@ impl Lifecycle {
         controller: crate::freezer::WorkloadController,
         supervisor: crate::pid1::ProcessSupervisor,
         forwards: crate::forward::listen::GuestForwardServiceImpl,
+        status: watch::Sender<v1::AgentStatus>,
     ) -> Arc<Self> {
         runtime.lifecycle.send_modify(|status| {
             status.unsupported_reason = controller.unsupported_reason();
@@ -332,6 +334,7 @@ impl Lifecycle {
             supervisor,
             forwards,
             network: tokio::sync::Mutex::new(None),
+            status,
             coordinator: Mutex::new(Coordinator {
                 freeze: None,
                 thaw: None,
@@ -813,6 +816,10 @@ impl Lifecycle {
             })
         })
         .await;
+        // Activation replaces kernel-owned identity (managed addresses), including partial
+        // destination state left by a failed or cancelled attempt. Observe it once here so
+        // GetStatus/WatchStatus stop serving the cold-boot source addresses.
+        crate::rpc::refresh_system(&self.status);
         // Every terminal path drains hook descendants, including timeout cancellation.
         let cleanup = self
             .controller

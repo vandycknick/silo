@@ -585,17 +585,22 @@ mod tests {
         std::fs::set_permissions(&temp.0, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executable = temp.0.join("loaded-monitor");
         let replacement = temp.0.join("new-monitor");
-        std::fs::copy("/bin/sh", &executable).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::copy("/bin/false", &replacement).unwrap();
-        let output = std::process::Command::new(&executable)
+        // Create executable files in the child: unrelated test-thread forks must
+        // not inherit a writable fixture descriptor and cause ETXTBSY at exec.
+        let output = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("mv -- \"$1\" \"$2\" || exit 92; \"$2\"; test \"$?\" -eq 1 || exit 93; exec \"$3\" -c 'printf loaded-monitor-worker'")
-            .arg("worker-reexec-fixture")
-            .arg(&replacement)
+            .arg(
+                "cp -- /bin/sh \"$1\" && chmod 700 \"$1\" && cp -- /bin/false \"$2\" && \
+                 exec \"$1\" -c 'mv -- \"$1\" \"$2\" || exit 92; \"$2\"; \
+                 test \"$?\" -eq 1 || exit 93; exec \"$3\" -c \"printf loaded-monitor-worker\"' \
+                 worker-reexec-fixture \"$2\" \"$1\" \"$3\"",
+            )
+            .arg("worker-reexec-setup")
             .arg(&executable)
+            .arg(&replacement)
             .arg(crate::virt::backend::krun::owner::WORKER_EXECUTABLE)
-            .output().unwrap();
+            .output()
+            .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, b"loaded-monitor-worker");
     }

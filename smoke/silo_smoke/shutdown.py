@@ -118,7 +118,7 @@ def owned_processes(*processes: Process):
 
 
 def holder(silo: Silo, name: str) -> tuple[dict, Path]:
-    machine_id = silo.machine_id(name)
+    machine_id = procs.machine_id(silo.ws, name)
     run_id = procs.run_id(silo.ws, name)
     path = silo.ws.run_root / "machines" / machine_id / "vm.storage-holder.json"
     raw = path.read_bytes()
@@ -174,20 +174,21 @@ def handles(silo: Silo, pid: int, paths: list[Path]) -> dict[str, list[int]]:
 
 
 def exit_record(silo: Silo, name: str, run_id: str) -> dict:
-    path = silo.ws.silo_home / "logs/machines" / silo.machine_id(name) / "vm.exit.json"
+    machine_id = procs.machine_id(silo.ws, name)
+    path = silo.ws.silo_home / "logs/machines" / machine_id / "vm.exit.json"
     def current():
         if not path.is_file():
             return None
         value = json.loads(path.read_text())
         return value if UUID(value["runId"]) == UUID(run_id) else None
     value = until(current, timeout=90, description="no exact current-run exit record")
-    assert UUID(value["machineId"]) == UUID(silo.machine_id(name))
+    assert UUID(value["machineId"]) == UUID(machine_id)
     silo.ws.record("shutdown-exit", json.dumps(value, sort_keys=True) + "\n")
     return value
 
 
 def outcome(silo: Silo, name: str) -> str:
-    machine_id = silo.machine_id(name)
+    machine_id = procs.machine_id(silo.ws, name)
     rows = procs.query(silo.ws.state_db(), "SELECT json_extract(record_json,'$.stopOutcome') FROM machine_storage WHERE machine_id='" + machine_id + "'")
     assert len(rows) == 1
     return rows[0][0]

@@ -12,7 +12,7 @@ import pytest
 
 from silo_smoke import images, overlay, procs, shutdown
 from silo_smoke.cli import Silo
-from silo_smoke.config import REPO, SmokeConfig, go_ffi_library
+from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
 
@@ -28,19 +28,11 @@ def overlay_large_image(config: SmokeConfig, registry: LoopbackRegistry, overlay
 
 
 @pytest.fixture(scope="session")
-def overlay_capacity_consumer(config: SmokeConfig, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    assert shutil.which("go") is not None, "exact-tail growth requires the existing Go SDK toolchain"
-    bridge = config.bin_dir / go_ffi_library()
-    assert bridge.is_file(), f"build the existing Go FFI bridge first: {bridge}"
-    directory = tmp_path_factory.mktemp("overlay-capacity")
-    binary = directory / "overlay-capacity"
-    caches = subprocess.run(["go", "env", "GOMODCACHE", "GOCACHE"], capture_output=True, text=True, check=True, timeout=30).stdout.split()
-    environment = os.environ.copy()
-    environment.update(GOMODCACHE=caches[0], GOCACHE=caches[1], SILO_GO_FFI_PATH=str(bridge))
-    command = ["go", "-C", str(REPO / "sdk/go"), "build", "-o", str(binary), str(REPO / "smoke/fixtures/overlay-capacity/main.go")]
-    result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=120)
-    (directory / "build.log").write_text(result.stdout + "\n" + result.stderr)
-    assert result.returncode == 0, result.stderr
+def overlay_capacity_consumer(config: SmokeConfig) -> Path:
+    binary = config.bin_dir / "examples/storage_acceptance"
+    if not binary.is_file():
+        binary = REPO / "target/debug/examples/storage_acceptance"
+    assert binary.is_file(), "Main must build cargo build -p libvm --example storage_acceptance"
     return binary
 
 
@@ -323,8 +315,8 @@ def test_overlay_replacement_growth_and_short_tails(silo: Silo, overlay_image: s
     if capacity % (1024**2) == 0:
         silo.run("set", name, f"disk={capacity // (1024**2)}mib")
     else:
-        result = subprocess.run([str(overlay_capacity_consumer), name, str(capacity)], env=silo.ws.env(SILO_GO_FFI_PATH=str(silo.ws.config.bin_dir / go_ffi_library())), capture_output=True, text=True, timeout=250)
-        silo.ws.record("overlay-exact-capacity-sdk", result.stdout + "\n" + result.stderr)
+        result = subprocess.run([str(overlay_capacity_consumer), "set-root-capacity", name, str(capacity)], env=silo.ws.env(), capture_output=True, text=True, timeout=250)
+        silo.ws.record("overlay-exact-capacity-rust", result.stdout + "\n" + result.stderr)
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["capacityBytes"] == capacity
     replacement = overlay.upper(silo, name)
@@ -608,16 +600,17 @@ def test_overlay_capacity_refusal_is_nonmutating(silo: Silo, overlay_image: str,
     current = overlay.upper(silo, name)
     assert silo.run("set", name, "disk=128mib", expect=None).returncode != 0, "hot upper resize accepted"
     silo.stop(name)
-    environment = silo.ws.env(SILO_GO_FFI_PATH=str(silo.ws.config.bin_dir / go_ffi_library()))
-    calibrated = subprocess.run([str(overlay_capacity_consumer), name, str(64 * 1024**2)], env=environment, capture_output=True, text=True, timeout=250)
-    silo.ws.record("overlay-capacity-sdk-control", calibrated.stdout + "\n" + calibrated.stderr)
+    environment = silo.ws.env()
+    calibrated = subprocess.run([str(overlay_capacity_consumer), "set-root-capacity", name, str(64 * 1024**2)], env=environment, capture_output=True, text=True, timeout=250)
+    silo.ws.record("overlay-capacity-rust-control", calibrated.stdout + "\n" + calibrated.stderr)
     assert calibrated.returncode == 0, calibrated.stderr
     assert json.loads(calibrated.stdout)["capacityBytes"] == 64 * 1024**2
+    assert current.stat().st_size == 64 * 1024**2
     before = overlay.digest(current)
     entries = set(current.parent.iterdir())
     for size in [str(64 * 1024**2 - 4096), str(1024**4 + 4096), str(64 * 1024**2 + 1)]:
-        result = subprocess.run([str(overlay_capacity_consumer), name, size], env=environment, capture_output=True, text=True, timeout=250)
-        silo.ws.record("overlay-capacity-sdk-refusal", json.dumps({"requestedBytes": int(size), "returncode": result.returncode}) + "\n" + result.stdout + result.stderr)
+        result = subprocess.run([str(overlay_capacity_consumer), "set-root-capacity", name, size], env=environment, capture_output=True, text=True, timeout=250)
+        silo.ws.record("overlay-capacity-rust-refusal", json.dumps({"requestedBytes": int(size), "returncode": result.returncode}) + "\n" + result.stdout + result.stderr)
         assert result.returncode != 0
         assert overlay.upper(silo, name) == current
         assert current.stat().st_size == 64 * 1024**2

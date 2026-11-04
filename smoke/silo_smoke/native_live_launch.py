@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--ram-layout-fd", type=int)
     parser.add_argument("--generation", choices=("on",))
     parser.add_argument("--generation-proof-mode", type=int, choices=(1, 2, 3, 4), default=0)
+    parser.add_argument("--silo-fixture", type=Path)
     args = parser.parse_args()
     entry = Path(os.environ["SILO_NATIVE_API_EXECUTABLE"]).resolve(strict=True)
     if bool(args.restore) != (args.ram_image_fd is not None and args.ram_layout_fd is not None):
@@ -33,6 +34,12 @@ def main() -> None:
     launch = {"kernel": str(args.kernel), "initramfs": str(args.initramfs),
               "binding": str(args.binding), "restore": str(args.restore) if args.restore else None,
               "echo_port": args.echo_port, "generation_proof_mode": args.generation_proof_mode}
+    if args.silo_fixture is not None:
+        with args.silo_fixture.open("rb") as fixture:
+            fixture_bytes = fixture.read(4097)
+        if len(fixture_bytes) > 4096:
+            raise ValueError("bounded Silo fixture metadata")
+        launch["silo_fixture"] = json.loads(fixture_bytes)
     profile = args.binding / "api-proof-launch.json"
     if profile.exists():
         if args.restore is None or not profile.is_file() or profile.stat().st_size > 4096:

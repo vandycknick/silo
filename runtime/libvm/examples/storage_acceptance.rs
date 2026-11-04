@@ -2,14 +2,14 @@
 //! Never starts a VM and never fabricates an operation result.
 use std::io::Write;
 
-use libvm::{ForkOptions, MachineRef, Runtime};
+use libvm::{ForkOptions, MachineRef, MachineUpdate, Runtime};
 use tokio::io::AsyncBufReadExt;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(
-        "usage: storage_acceptance prune | remove-image REFERENCE | fork-cancellable SOURCE CHILD",
+        "usage: storage_acceptance prune | remove-image REFERENCE | fork-cancellable SOURCE CHILD | set-root-capacity MACHINE BYTES",
     )?;
     let reference = args.next();
     let destination = args.next();
@@ -18,6 +18,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let runtime = Runtime::from_env().await?;
     match (action.as_str(), reference, destination) {
+        ("set-root-capacity", Some(reference), Some(capacity)) => {
+            let capacity = capacity.parse::<u64>()?;
+            let machine = runtime.get_machine(&MachineRef::parse(&reference)?).await?;
+            let updated = machine
+                .update(MachineUpdate::new().root_disk_size(capacity))
+                .await?;
+            if updated.root_disk_size != Some(capacity) {
+                return Err("stopped update did not return the exact published capacity".into());
+            }
+            println!("{}", serde_json::json!({ "capacityBytes": updated.root_disk_size }));
+        }
         ("prune", None, None) => {
             let report = runtime.images().prune().await?;
             println!("{report:?}");
@@ -51,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("expected finish after the actual worker was released".into());
             }
         }
-        _ => return Err("usage: storage_acceptance prune | remove-image REFERENCE | fork-cancellable SOURCE CHILD".into()),
+        _ => return Err("usage: storage_acceptance prune | remove-image REFERENCE | fork-cancellable SOURCE CHILD | set-root-capacity MACHINE BYTES".into()),
     }
     Ok(())
 }

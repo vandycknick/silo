@@ -19,7 +19,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from . import overlay, procs, shutdown
 from .cli import Silo
@@ -59,25 +59,15 @@ def read_bytes(path: Path) -> Bytes:
         os.close(fd)
 
 
-def catalog_machine_id(silo: Silo, name: str) -> str:
-    # Never call info/status while a real monitor is deliberately SIGSTOPped.
-    literal = "'" + name.replace("'", "''") + "'"
-    rows = procs.query(silo.ws.state_db(), f"SELECT id FROM machine_config WHERE name={literal}")
-    assert len(rows) == 1
-    identity = UUID(rows[0][0]).hex
-    assert identity == rows[0][0]
-    return identity
-
-
 def record(silo: Silo, name: str) -> dict:
-    machine_id = catalog_machine_id(silo, name)
+    machine_id = procs.machine_id(silo.ws, name)
     rows = procs.query(silo.ws.state_db(), f"SELECT json(record_json) FROM machine_storage WHERE machine_id='{machine_id}'")
     assert len(rows) == 1
     return json.loads(rows[0][0])
 
 
 def configuration(silo: Silo, name: str) -> dict:
-    machine_id = catalog_machine_id(silo, name)
+    machine_id = procs.machine_id(silo.ws, name)
     rows = procs.query(silo.ws.state_db(), f"SELECT json(config_json) FROM machine_config WHERE id='{machine_id}'")
     assert len(rows) == 1
     result = json.loads(rows[0][0])
@@ -88,7 +78,7 @@ def configuration(silo: Silo, name: str) -> dict:
 def private_path(silo: Silo, name: str, relative: str) -> Path:
     component = Path(relative)
     assert not component.is_absolute() and component.parts and ".." not in component.parts
-    return silo.ws.silo_home / "machines" / catalog_machine_id(silo, name) / component
+    return silo.ws.silo_home / "machines" / procs.machine_id(silo.ws, name) / component
 
 
 def writable_paths(silo: Silo, name: str) -> dict[str, Path]:

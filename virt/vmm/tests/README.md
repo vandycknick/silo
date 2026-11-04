@@ -93,6 +93,10 @@ The tests cover:
 - Manager launch unit tests execute a retained ELF through `/proc/self/fd/N`
   after child cleanup and check that its CLOEXEC executable FD is absent after
   exec. These tests need no guest or hypervisor.
+- The loaded-monitor replacement test creates executable copies in its child,
+  then replaces the pathname and re-execs `/proc/self/exe`. This preserves the
+  real ELF ownership check without letting other test threads' forks inherit
+  writable fixture descriptors and race exec with `ETXTBSY`.
 
 Every launched fixture has a deadline and a separate owned process group for
 failure cleanup. Tests never kill system-wide processes. Tests that use a generic
