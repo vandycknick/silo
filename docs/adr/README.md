@@ -34,9 +34,11 @@ and review standards for new and substantially revised records.
 | 0011 | Package registry endpoint semantics                          | Draft       | 2026-07-16 | `docs/adr/0011-package-registry-endpoint-semantics.md` |
 | 0012 | Cross-platform runtime and SDK packaging                     | Accepted    | 2026-07-22 | `docs/adr/0012-cross-platform-runtime-and-sdk-packaging.md` |
 | 0013 | Image-first machine lifecycle                                | Implemented | 2026-08-07 | `docs/adr/0013-image-first-machine-lifecycle.md` |
+| 0014 | Layered OCI roots and portable VM storage                     | Accepted    | 2026-08-20 | `docs/adr/0014-layered-oci-image-storage.md`     |
 | 0015 | Firecracker-compatible hybrid vsock host surface             | Accepted    | 2026-08-25 | `docs/adr/0015-hybrid-vsock-host-surface.md`     |
 | 0016 | Forwarding: machine- and session-scoped vsock forwards and guest-requested netd publications | Draft | 2026-09-01 | `docs/adr/0016-vsock-forwards-and-netd-publications.md` |
 | 0017 | Single host state root                                        | Accepted    | 2026-09-24 | `docs/adr/0017-single-host-state-root.md`        |
 | 0018 | silo-vmm contract                                           | Accepted    | 2026-09-24 | `docs/adr/0018-silo-vmm-contract.md`           |
 | 0019 | Optional tailnet service through the public Go SDK | Accepted | 2026-10-01 | `docs/adr/0019-optional-tailnet-service.md` |
 | 0020 | Netd owns the VM tailnet node and relays guest SSH | Accepted | 2026-10-01 | `docs/adr/0020-netd-tailnet-identity.md` |
+| 0021 | Live snapshots and forks of running machines | Proposed | 2026-10-25 | `docs/adr/0021-live-snapshots-and-forks.md` |
