@@ -142,6 +142,142 @@ Changing filenames does not break this contract. Adding a second kernel-image
 layer or changing the meaning of an existing format requires a new artifact
 contract rather than a filename heuristic.
 
+## Managed Root Boot Qualification
+
+Workload artifact metadata additionally carries a `rootRuntime` object:
+
+```json
+{
+  "opaqueRaw": true,
+  "managedOverlay": {
+    "eligible": true,
+    "minimumKernelVersion": "6.6",
+    "rootProfile": "linux-flat-overlay-v1",
+    "upperProfile": "silo-upper-ext4-v1",
+    "overlayProfile": "silo-overlay-v1",
+    "renderingAbi": "linux-overlayfs-mountinfo-v1",
+    "attachmentFamily": "krun-virtio-blk-v1",
+    "qualification": "requires-exact-boot-evidence"
+  }
+}
+```
+
+`eligible` is only the numeric Linux >=6.6 prerequisite for workload kernels,
+never a claim that a boot or conformance gate passed. `longterm5` is always
+opaque-raw-only, and `rprobe` is not a workload root candidate. Resolved config
+validation pins built-in ext4, ACL/security support, OverlayFS and its module
+defaults. No EROFS or partition support is added by this contract.
+
+Production flat-overlay admission is owned by libvm's focused
+`boot_qualification` module, not package metadata or runtime discovery. Its
+immutable reviewed tuples bind exact kernel, reusable base-initramfs and native
+monitor/worker executable bytes, the actual resolved Kconfig digest, kernel
+version, guest architecture, host execution lane, root/upper/overlay profiles,
+rendering ABI and attachment family. An arbitrary custom initramfs or a changed
+kernel fails admission before
+machine/storage effects. A source config hash, `uname`, track, successful
+compilation, environment variable, home/database record or staged manifest
+cannot grant admission. There is no public bypass or unsupported fallback.
+Admission checks the actual selected backend and rejects Mock/VZ before opening
+boot assets. Its non-copyable token retains the qualified source descriptors.
+Qualification and launch copying are bounded by each descriptor's initial
+length, check file identity/size/change timestamps before and after, and hash
+the exact copied bytes. Launch stages the kernel and composes the base
+initramfs from these retained descriptors into private temporary files,
+publishing only after validation succeeds. It never hashes a source pathname
+and then reopens that original pathname for use.
+Cooperative atomic restaging can unlink any retained source, including the
+kernel and reusable base. Only link-count decreases and their ctime changes are
+permitted; all other fingerprint fields must remain stable, and copied bytes
+must still match the original qualified digest. This applies before and after
+the bounded copy, without reopening the replacement pathname.
+Linux launches the retained native executable through `/proc/self/fd/N`, with
+the parent descriptor normalized to at least 3 and kept CLOEXEC. The token is
+retained through spawn and its executable fingerprint is rechecked immediately
+beforehand. Atomic restaging may unlink that old inode; link-removal/ctime-only
+changes require a bounded rehash of the retained inode against the admitted
+native digest. No executable pathname fallback or per-start native binary copy
+is used. The worker reexecutes its loaded image rather than a replaced source
+path. Non-Linux managed-overlay launch remains unadmitted. This relies on
+trusted cooperative atomic publication, not protection from malicious same-UID
+in-place executable modification.
+
+The native SHA binds the concrete corrected DISCARD/WRITE_ZEROES implementation.
+An older attachment binary cannot borrow qualification from unchanged
+kernel/init bytes. Retained build evidence also records its signed dependency
+revision and existing capabilities build identity; those provenance strings
+alone never grant admission.
+
+Initial qualification uses a controlled smoke-only fixture with the staged real
+monitor and worker, the real upper formatter, current root bootstrap and actual
+candidate kernel/init bytes. It records sysfs identities/geometry, mountinfo,
+current module parameters and the result of init's effective-option verifier.
+Main reviews the retained evidence and actual build/OCI resolved-config identity
+before an exact tuple can be added. The observed tuple below admits only those
+exact bytes. A candidate probe does not prove normal integration: after
+recording the tuple, the positive gate must create and boot through the normal
+CLI/libvm -> monitor -> worker path. No Cargo test launches a guest, and there
+is no second direct-libkrun harness.
+
+`linux-overlayfs-mountinfo-v1` decodes omitted index, metacopy, redirect and
+nfs_export settings using the current built-in module parameters, not the
+requested mount arguments. Distinct lower/upper filesystems require explicit
+`xino=on`; omission means AUTO/OFF, never ON, even with xino_auto enabled.
+`uuid=null` must also be explicit.
+Unknown or weaker effective semantics fail before workload handoff. The shared
+core-only `rootfs-spec` carries this closed ABI; host workspace checks include
+its codec. Xtask separately tests/lints init's pure library with `--lib
+--no-default-features`, never its no_std/no_main binary harness. The static
+guest init build remains `no_std`.
+
+The flat profile is opt-in and development-only. Opaque raw remains the default.
+Flat roots are not published, transferred or snapshotted; they are removed,
+not migrated, when the final EROFS profile replaces them.
+
+### Observed Linux KVM Candidate
+
+Main observed the controlled real monitor/worker candidate pass on Linux
+x86_64 KVM. The immutable boot-admission entry records exactly:
+
+| Identity | Value |
+| --- | --- |
+| Kernel | Linux `7.2.2`, SHA256 `ec6fee8b1885a71e78306fea384f4ff6687fd151b6f279c23117785027748f33` |
+| Reusable base initramfs | SHA256 `632d14f7ea50ee018a5e7a78f50a27fbdac2bb163589ec56e2e928b36e7015b8` |
+| Actual monitor and worker executable | SHA256 `956e4d613ba0b211e0e7f8da59b7125bb82cb0e4e15e1b5245cfb05638b86024` |
+| Actual resolved Kconfig | SHA256 `f3dab6adffce7cadde5ce693f9403ce88d66ab9f4ec503f7860ce9020cb142e6` |
+| Native source revision | `41d53d7bd86b35885259df600a7324b8a1e55ac5` |
+| Guest / host lane | `amd64` / Linux `x86_64`, KVM |
+| Profiles | `linux-flat-overlay-v1`, `silo-upper-ext4-v1`, `silo-overlay-v1` |
+| Rendering / attachment | `linux-overlayfs-mountinfo-v1` / `krun-virtio-blk-v1` |
+
+Retained candidate evidence:
+`/tmp/silo-smoke-zzwxrmg8/evidence/overlay-candidate-proof.log` and
+`/tmp/silo-smoke-zzwxrmg8/evidence/overlay-candidate-tuple.log`.
+The tuple records native build identity
+`v2:path:clean:41d53d7bd86b35885259df600a7324b8a1e55ac5:content=bc6d8343ff3c8a75fbfb8878a9c763b9f80c745f1dfd3f8f9d950d0b4c829fbf:inputs=ed0ad1756fb2c1ab27c5b1a51eab64a70e2d2be46127b23cd7cf7116ad5cefcf`.
+Main independently extracted the exact tested kernel's embedded IKCONFIG and
+verified byte equality with the supplied resolved `.config`, binding the
+configuration to the executable rather than trusting its pathname. The
+per-launch composite initramfs is not the reusable base identity.
+
+The observed guest validated exact lower/upper serials, a 512 MiB read-only
+lower and 256 MiB writable upper, retained the maintenance mounts and reached
+the workload only after init accepted the effective profile. Mountinfo showed
+explicit `uuid=null,xino=on`; current module parameters were `index=Y`,
+`metacopy=N`, `nfs_export=N`, `redirect_always_follow=N`, `redirect_dir=N`.
+The lower mount was `ro,norecovery`, and the retained observation reported
+256 MiB upper filesystem span with zero excluded tail.
+
+This is controlled-candidate boot evidence only. Main must restage and confirm
+the native executable digest remains unchanged before the normal production
+matrix. Full production-path overlay acceptance, >2 GiB mapping, serial and
+effective-option fault probes, upper lifecycle/growth/capacity/ENOSPC and native
+DISCARD/WRITE_ZEROES gates remain required; this entry does not mark them passed.
+Other native binaries, kernels, base initramfs bytes and host lanes are not
+admitted by this candidate.
+
+
+
 ## Published Payloads
 
 The platform manifests intentionally differ because the architecture boot
@@ -196,18 +332,35 @@ current x86-64 direct-boot contract, the ELF itself is the packaged kernel.
 
 ## Source Patches
 
-Workload kernels apply the ordered patches in `patches/<architecture>/` to the
-pristine source with `patch --fuzz=0 -p1`. The patch set is part of the kernel
-identity (`inputs.patchSet`), so changing, adding or removing a patch produces a
-new kernel reference.
+Stable and longterm workload kernels apply ordered `patches/live/*.patch`
+first, then ordered `patches/<architecture>/*.patch`, to pristine source with
+`patch --fuzz=0 -p1`. Longterm5 retains architecture patches only and remains
+raw-only, never generation-qualified: it has no VM-fork RNG API backport.
+Rprobe selects no patches. The entire selected patch set is part of source,
+build and artifact identity (`inputs.patchSet`), so shared-driver changes
+produce new supported workload artifacts without changing rprobe identity.
 
 | Architecture | Patch | Purpose |
 | --- | --- | --- |
-| x86_64 | `0001-x86-krun-i8042-poweroff.patch` | Adds `arch/x86/kernel/krun_poweroff.c`. When the command line carries `krun.poweroff=i8042`, it registers a lowest-priority poweroff handler that writes `0xfe` to port `0x64`, which libkrun turns into a terminal VMM exit. Without the argument nothing is registered. The krun backend adds the argument on x86_64 only. |
+| x86_64, arm64 (stable/longterm workload only) | `live/0001-virtio-silo-vmgenid.patch` | GPL-attributed built-in `0x5347` virtio-MMIO driver. Waits for CRNG readiness, calls real synchronous `add_vmfork_randomness`, optionally corrects wall time, then commits the exact sequence and ID with the sequence-low word last. Exposes coherent read-only causal sysfs evidence. |
+| x86_64 (all workload tracks) | `x86_64/0001-x86-krun-i8042-poweroff.patch` | Adds `arch/x86/kernel/krun_poweroff.c`. When the command line carries `krun.poweroff=i8042`, it registers a lowest-priority poweroff handler that writes `0xfe` to port `0x64`, which libkrun turns into a terminal VMM exit. Without the argument nothing is registered. The krun backend adds the argument on x86_64 only. |
 
 The x86_64 kernel has neither ACPI nor an i8042 driver, so without this patch a
 guest `poweroff` halts and the VM never exits. arm64 powers off through PSCI and
-carries no patch.
+carries no architecture-specific poweroff patch.
+
+The emitted `.config` must select `CONFIG_VIRTIO_SILO_VMGENID=y`,
+`CONFIG_VMGENID=y`, `CONFIG_VIRT_DRIVERS=y` and the built-in MMIO, initial RNG,
+sysfs and freezer prerequisites. `kernel-config` runs the existing validator
+against that resolved file; packaging retains and hashes that same file as
+`resolvedConfig`. Requested fragments or patch bytes alone do not prove a
+running driver's behavior. See [generation ABI and evidence](README.md#vm-generation-contract-and-evidence).
+
+**Live generation qualification is unverified until the Phase 11 native device
+and real restore smoke gate run.** Retain exact kernel, resolved-config,
+patch/input and native executable identities and correlate guest RNG-return /
+low-word-access evidence with the native accepted exact-tuple commit before its
+deadline. This does not qualify userspace RNG state or grant live capability.
 
 ## Configuration Files
 

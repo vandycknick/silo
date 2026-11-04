@@ -2,16 +2,21 @@
 compile_error!("silo-agent only supports Linux guests");
 
 mod clock;
+mod diagnostics;
 mod filesystem;
 mod forward;
+mod freezer;
 mod guest_process;
 mod handoff;
 mod host;
+mod lifecycle;
 mod memory_reclaim;
 mod metrics;
+mod orderly_shutdown;
 mod pid1;
 mod port;
 mod provision;
+mod root_storage;
 mod rpc;
 mod server;
 mod ssh;
@@ -82,14 +87,17 @@ enum AgentMode {
 fn main() -> eyre::Result<()> {
     let is_pid1 = std::process::id() == 1;
 
-    init_tracing();
+    let diagnostics = init_tracing()?;
 
     let agent_args = parse_agent_args()?;
     let agent_config = load_agent_config(&agent_args.config)?;
     let agent_mode = select_agent_mode(&agent_args, is_pid1)?;
     ensure_default_path();
-    let (boot_mode, early_provisioning) = prepare_agent_process(&agent_mode, &agent_config)?;
-    let process_supervisor = ProcessSupervisor::activate(&boot_mode)?;
+    let (boot_mode, early_provisioning, storage, workloads) =
+        prepare_agent_process(&agent_mode, &agent_config)?;
+    workloads.qualify_profile(&boot_mode);
+    let process_supervisor =
+        ProcessSupervisor::activate(&boot_mode, storage, diagnostics, workloads.clone())?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -100,21 +108,25 @@ fn main() -> eyre::Result<()> {
         process_supervisor,
         agent_config,
         early_provisioning,
+        workloads,
     ))
 }
 
-fn init_tracing() {
+fn init_tracing() -> eyre::Result<crate::diagnostics::Diagnostics> {
     let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
         Err(_) => tracing_subscriber::EnvFilter::new("info"),
     };
 
-    let _ = tracing_subscriber::fmt()
+    let diagnostics = crate::diagnostics::Diagnostics::new(std::io::stdout());
+    tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_level(true)
-        .with_writer(std::io::stdout)
-        .try_init();
+        .with_writer(diagnostics.clone())
+        .try_init()
+        .map_err(|error| eyre::eyre!("install owned agent tracing sink: {error}"))?;
+    Ok(diagnostics)
 }
 
 fn select_agent_mode(agent_args: &AgentArgs, is_pid1: bool) -> eyre::Result<AgentMode> {
@@ -142,21 +154,37 @@ fn select_agent_mode(agent_args: &AgentArgs, is_pid1: bool) -> eyre::Result<Agen
 fn prepare_agent_process(
     agent_mode: &AgentMode,
     agent_config: &AgentConfig,
-) -> eyre::Result<(BootMode, EarlyProvisioning)> {
+) -> eyre::Result<(
+    BootMode,
+    EarlyProvisioning,
+    crate::root_storage::StorageShutdown,
+    crate::freezer::WorkloadController,
+)> {
+    crate::provision::validate_early_mounts(&agent_config.provision)
+        .context("validate complete guest mount plan before effects")?;
+    crate::root_storage::retained_root().context("validate retained root context")?;
+    let mut storage = crate::root_storage::StorageShutdown::capture()
+        .context("retain writeback-error cursors before agent mutations")?;
     if let AgentMode::Init { requested_init } = agent_mode {
         tracing::info!(requested_init = ?requested_init, "agent init mode requested");
         prepare_pid1_environment()?;
     }
+    let workloads = crate::freezer::WorkloadController::discover();
 
-    let early_provisioning = prepare_early_provisioning(&agent_config.provision)
+    storage
+        .register_current(false)
+        .context("retain essential mounts before writes")?;
+    let early_provisioning = prepare_early_provisioning(&agent_config.provision, &mut storage)
         .context("prepare required early guest provisioning")?;
     crate::provision::ssh::prepare(&agent_config.ssh)
         .context("prepare mandatory SSH trust before init handoff")?;
     let boot_mode = match agent_mode {
         AgentMode::Standard => BootMode::Standard,
-        AgentMode::Init { requested_init } => handoff::maybe_handoff_init(requested_init)?,
+        AgentMode::Init { requested_init } => {
+            handoff::maybe_handoff_init(requested_init, &workloads)?
+        }
     };
-    Ok((boot_mode, early_provisioning))
+    Ok((boot_mode, early_provisioning, storage, workloads))
 }
 
 async fn run_agent(
@@ -164,30 +192,101 @@ async fn run_agent(
     process_supervisor: ProcessSupervisor,
     agent_config: AgentConfig,
     early_provisioning: EarlyProvisioning,
+    workloads: crate::freezer::WorkloadController,
+) -> eyre::Result<()> {
+    let runtime = crate::lifecycle::RuntimeContext::new(agent_config.storage_shutdown.clone())?;
+    let orderly = crate::orderly_shutdown::OrderlyShutdown::new(runtime.clone());
+    let memory_reclaim = memory_reclaim::start();
+    let mut result = crate::root_storage::ShutdownResult::default();
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut shutdown_handles = Vec::new();
+    let agent_server = match AgentServer::start(
+        from_kernel_cmdline(),
+        boot_mode.report(),
+        process_supervisor.clone(),
+        memory_reclaim.clone(),
+        orderly.clone(),
+        runtime.clone(),
+        workloads,
+    )
+    .await
+    {
+        Ok(server) => Some(server),
+        Err(error) => {
+            result.record(Err(error));
+            None
+        }
+    };
+    if let Some(agent_server) = &agent_server {
+        result.record(
+            run_agent_services(
+                boot_mode,
+                &process_supervisor,
+                &agent_config,
+                &early_provisioning,
+                agent_server,
+                &mut join_set,
+                &mut shutdown_handles,
+            )
+            .await,
+        );
+        for handle in shutdown_handles {
+            handle.send_replace(true);
+        }
+        // Close mutation admission before awaiting listener/worker completion.
+        agent_server.stop_admissions();
+        result.record(process_supervisor.begin_writer_shutdown());
+        result.record(agent_server.drain_mutations().await);
+    }
+    result.record(
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(task) = join_set.join_next().await {
+                result_from_server(task)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| eyre::eyre!("guest vsock handlers did not drain before shutdown"))
+        .and_then(|result| result),
+    );
+    join_set.abort_all();
+    result.record(memory_reclaim.shutdown().await);
+    result.record(process_supervisor.wait_internal_writers().await);
+    let terminal = process_supervisor.shutdown(result.finish(), orderly).await;
+    drop(agent_server);
+    terminal
+}
+
+fn result_from_server(
+    result: Result<eyre::Result<()>, tokio::task::JoinError>,
+) -> eyre::Result<()> {
+    result.context("guest vsock server task panicked")?
+}
+
+async fn run_agent_services(
+    boot_mode: &BootMode,
+    process_supervisor: &ProcessSupervisor,
+    agent_config: &AgentConfig,
+    early_provisioning: &EarlyProvisioning,
+    agent_server: &AgentServer,
+    join_set: &mut tokio::task::JoinSet<eyre::Result<()>>,
+    shutdown_handles: &mut Vec<tokio::sync::watch::Sender<bool>>,
 ) -> eyre::Result<()> {
     tracing::info!(boot_mode = ?boot_mode, "agent starting");
-
     let boot_report = boot_mode.report();
-    let memory_reclaim = memory_reclaim::start();
-    let agent_server = AgentServer::start(
-        from_kernel_cmdline(),
-        boot_report.clone(),
-        process_supervisor.clone(),
-        memory_reclaim,
-    )
-    .await?;
-    let provision_report = match run_provisioning(
+    let provisioned = match run_provisioning(
         &agent_config.provision,
-        &process_supervisor,
-        &early_provisioning,
+        process_supervisor,
+        early_provisioning,
     ) {
         Ok(report) => report,
         Err(err) => {
             agent_server.fail(format!("provisioning failed: {err}"));
-            agent_server.shutdown().await?;
             return Err(err);
         }
     };
+    let provision_report = provisioned.report;
+    agent_server.set_network(provisioned.network).await;
     agent_server.update(boot_report.clone(), provision_report.clone());
     crate::provision::ssh::verify_trust(&agent_config.ssh).map_err(|error| {
         agent_server.fail(format!("SSH trust verification failed: {error}"));
@@ -196,23 +295,18 @@ async fn run_agent(
 
     if provision_report.status == Some(ProvisionOverallStatus::FailedBoot as i32) {
         agent_server.fail("guest provisioning requested boot failure");
-        if process_supervisor.is_active() {
-            let result = process_supervisor.shutdown().await;
-            agent_server.shutdown().await?;
-            return result;
-        }
-        agent_server.shutdown().await?;
         eyre::bail!("guest provisioning requested boot failure");
     }
 
-    let mut running_servers = Vec::new();
-    let mut server_abort_handles = Vec::new();
-
-    let ssh_service = SshService::new(agent_config.ssh.clone(), process_supervisor.clone())
-        .map_err(|error| {
-            agent_server.fail(format!("SSH startup failed: {error}"));
-            error
-        })?;
+    let ssh_service = SshService::new(
+        agent_config.ssh.clone(),
+        process_supervisor.clone(),
+        agent_server.runtime(),
+    )
+    .map_err(|error| {
+        agent_server.fail(format!("SSH startup failed: {error}"));
+        error
+    })?;
     let ssh_connection_service = ssh_service.clone();
     let owns_ssh_listener = match VsockServer::create(move |stream| {
         let ssh_service = ssh_connection_service.clone();
@@ -224,14 +318,17 @@ async fn run_agent(
     {
         Ok(shell_server) => {
             tracing::info!(port = SSH_VSOCK_PORT, "listening for SSH vsock connections");
-            if let Some(abort_handle) = shell_server.abort_handle() {
-                server_abort_handles.push(abort_handle);
-            }
-            running_servers.push(shell_server);
+            shutdown_handles.push(shell_server.shutdown_handle());
+            join_set.spawn(async move {
+                shell_server
+                    .wait()
+                    .await
+                    .context("guest SSH listener failed")
+            });
             true
         }
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            crate::ssh::constrain_external_listener().map_err(|error| {
+            crate::ssh::constrain_external_listener(process_supervisor).map_err(|error| {
                 agent_server.fail(format!("external SSH listener is not CA-only: {error}"));
                 error
             })?;
@@ -256,31 +353,38 @@ async fn run_agent(
         })?;
     }
 
-    let forward_server = VsockServer::create(crate::forward::dialer::handle)
-        .with_concurrency(1024)
-        .with_tracing(tracing::info_span!(
-            "vsock_server",
-            service = "forward-dialer"
-        ))
-        .listen(forward_spec::FORWARD_VSOCK_PORT)
-        .map_err(|error| {
-            agent_server.fail(format!(
-                "forward dialer startup failed on port {}: {error}",
-                forward_spec::FORWARD_VSOCK_PORT
-            ));
-            eyre::eyre!(
-                "listen for forward dialer vsock connections on port {}: {error}",
-                forward_spec::FORWARD_VSOCK_PORT
-            )
-        })?;
+    let forwards = agent_server.forwards();
+    let forward_server = VsockServer::create(move |stream| {
+        let forwards = forwards.clone();
+        async move { forwards.handle_dialer(stream).await }
+    })
+    .with_concurrency(1024)
+    .with_tracing(tracing::info_span!(
+        "vsock_server",
+        service = "forward-dialer"
+    ))
+    .listen(forward_spec::FORWARD_VSOCK_PORT)
+    .map_err(|error| {
+        agent_server.fail(format!(
+            "forward dialer startup failed on port {}: {error}",
+            forward_spec::FORWARD_VSOCK_PORT
+        ));
+        eyre::eyre!(
+            "listen for forward dialer vsock connections on port {}: {error}",
+            forward_spec::FORWARD_VSOCK_PORT
+        )
+    })?;
     tracing::info!(
         port = forward_spec::FORWARD_VSOCK_PORT,
         "listening for forward dialer vsock connections"
     );
-    if let Some(abort_handle) = forward_server.abort_handle() {
-        server_abort_handles.push(abort_handle);
-    }
-    running_servers.push(forward_server);
+    shutdown_handles.push(forward_server.shutdown_handle());
+    join_set.spawn(async move {
+        forward_server
+            .wait()
+            .await
+            .context("guest forward listener failed")
+    });
 
     agent_server.ready(
         boot_report,
@@ -288,18 +392,7 @@ async fn run_agent(
         ssh_service.descriptor(!owns_ssh_listener)?,
     );
 
-    let mut join_set = tokio::task::JoinSet::new();
-    for server in running_servers {
-        join_set.spawn(async move {
-            server
-                .wait()
-                .await
-                .context("guest vsock server task panicked")
-        });
-    }
-    join_set.spawn(async { std::future::pending::<eyre::Result<()>>().await });
-
-    let result = if let Some(mut shutdown_rx) = process_supervisor.shutdown_receiver() {
+    if let Some(mut shutdown_rx) = process_supervisor.shutdown_receiver() {
         tokio::select! {
             result = join_set.join_next() => agent_task_result(result),
             () = async {
@@ -310,21 +403,12 @@ async fn run_agent(
                 }
             } => {
                 tracing::warn!("PID1 shutdown observed; stopping guest agent listeners");
-                for abort_handle in &server_abort_handles {
-                    abort_handle.abort();
-                }
-                process_supervisor.shutdown().await
+                Ok(())
             }
         }
     } else {
         agent_task_result(join_set.join_next().await)
-    };
-
-    join_set.abort_all();
-    while join_set.join_next().await.is_some() {}
-
-    agent_server.shutdown().await?;
-    result
+    }
 }
 
 fn load_agent_config(path: &Path) -> eyre::Result<AgentConfig> {
@@ -489,6 +573,53 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{parse_agent_args_from, select_agent_mode, AgentArgs, AgentMode};
+
+    #[test]
+    fn guest_config_requires_valid_injected_shutdown_context() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.json");
+        std::fs::write(&config_path, br#"{"provision":{},"ssh":{}}"#).unwrap();
+        assert!(crate::load_agent_config(&config_path).is_err());
+        let mut config = agent_spec::AgentConfig {
+            storage_shutdown: protocol::shutdown::StorageShutdownContext {
+                version: 1,
+                machine_id: uuid::Uuid::new_v4().to_string(),
+                run_id: uuid::Uuid::new_v4().to_string(),
+                manifest: protocol::shutdown::StorageManifest::Unsupported {
+                    reason: "unrepresentable launch storage".into(),
+                },
+            },
+            ..Default::default()
+        };
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(
+            crate::load_agent_config(&config_path)
+                .unwrap()
+                .storage_shutdown,
+            config.storage_shutdown
+        );
+        config.storage_shutdown.run_id = uuid::Uuid::nil().to_string();
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(crate::load_agent_config(&config_path).is_err());
+    }
+
+    #[test]
+    fn invalid_mount_plan_fails_before_handoff_or_provisioning_effects() {
+        let mut config = agent_spec::AgentConfig::default();
+        config.provision.mounts.push(agent_spec::MountConfig {
+            tag: "hide-maintenance".to_string(),
+            path: "/run".to_string(),
+            fstype: "virtiofs".to_string(),
+            options: Vec::new(),
+        });
+        let mode = AgentMode::Init {
+            requested_init: OsStr::new("/sbin/init").to_os_string(),
+        };
+        let error = crate::prepare_agent_process(&mode, &config)
+            .err()
+            .expect("invalid mounts reject before PID1 setup");
+        assert!(error.to_string().contains("complete guest mount plan"));
+    }
 
     #[test]
     fn parses_handoff_equals_argument() {

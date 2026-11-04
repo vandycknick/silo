@@ -4,6 +4,9 @@ use alloc::vec::Vec;
 use crate::applets::{self, install};
 use crate::io;
 
+#[path = "freezer.rs"]
+mod freezer;
+
 const DEFAULT_ROOT: &[u8] = b"/dev/vda";
 pub(crate) const DEFAULT_INIT: &[u8] = b"/sbin/init";
 const MNT_ROOT: &[u8] = b"/mnt/root";
@@ -25,35 +28,79 @@ struct BootConfig {
 }
 
 pub(crate) fn init(_argc: i32, _argv: *const *const u8) -> i32 {
-    if let Err(message) = run_init() {
+    // Until the root contract is decoded, failure is managed/fail-closed.
+    let mut managed = true;
+    if let Err(message) = run_init(&mut managed) {
         io::write(io::STDERR, "init: ");
         io::write(io::STDERR, message);
         io::write(io::STDERR, "\n");
+        if managed {
+            io::write(
+                io::STDERR,
+                "init: overlay: boot failed; workload prohibited\n",
+            );
+            // PID 1 must not return (kernel panic) or expose a rescue shell.
+            loop {
+                io::sleep(3600);
+            }
+        }
         rescue_shell();
     }
     0
 }
 
-fn run_init() -> Result<(), &'static str> {
+fn run_init(managed: &mut bool) -> Result<(), &'static str> {
     if io::getpid() != 1 {
         return Err("refusing to run init outside PID 1");
     }
 
     prepare_directories()?;
     mount_essential_filesystems()?;
+    if let Err(message) = freezer::prepare() {
+        // Cold boot remains usable on kernels without the live profile. The
+        // retained agent controller reports this as unsupported, never frozen.
+        io::write(io::STDERR, "init: live workload containment unavailable: ");
+        io::write(io::STDERR, message);
+        io::write(io::STDERR, "\n");
+    }
     install(b"/bin");
     install(b"/sbin");
 
     let config = read_boot_config();
-    if !config.root.starts_with(b"/") {
-        return Err("root= must be an absolute device path");
-    }
-    if !is_block_device(&config.root) {
-        return Err("root= does not point at a block device");
-    }
-
-    if mount_root(&config) != 0 {
-        return Err("failed to mount root filesystem");
+    let marker = read_cmdline();
+    let overlay_requested =
+        cmdline_value(&marker, b"silo.rootfs=") == Some(b"linux-flat-overlay-v1");
+    match crate::overlay::bootstrap()? {
+        Some(rootfs_spec::Root::FlatOverlay(root)) => {
+            if !overlay_requested {
+                return Err("overlay: missing managed kernel marker");
+            }
+            if cmdline_value(&marker, b"root=").is_some()
+                || cmdline_value(&marker, b"rootfstype=").is_some()
+                || cmdline_value(&marker, b"rootflags=").is_some()
+            {
+                return Err("overlay: conflicting raw root selection");
+            }
+            crate::overlay::assemble(root)?;
+        }
+        root => {
+            if overlay_requested || cmdline_value(&marker, b"silo.rootfs=").is_some() {
+                return Err("overlay: missing managed bootstrap");
+            }
+            if !matches!(root, None | Some(rootfs_spec::Root::Raw)) {
+                return Err("overlay: unsupported root contract");
+            }
+            *managed = false;
+            if !config.root.starts_with(b"/") {
+                return Err("root= must be an absolute device path");
+            }
+            if !is_block_device(&config.root) {
+                return Err("root= does not point at a block device");
+            }
+            if mount_root(&config) != 0 {
+                return Err("failed to mount root filesystem");
+            }
+        }
     }
 
     if prepare_agent_boot()? {
@@ -71,6 +118,15 @@ fn run_init() -> Result<(), &'static str> {
         let init_path = target_init_path(&config.init).ok_or("target init path is too long")?;
         if io::access(&init_path, libc::X_OK) != 0 {
             return Err("target init is not executable");
+        }
+
+        if let Err(message) = freezer::place_image_init() {
+            io::write(
+                io::STDERR,
+                "init: image init cgroup placement unavailable: ",
+            );
+            io::write(io::STDERR, message);
+            io::write(io::STDERR, "\n");
         }
 
         let init_argv = [config.init.as_slice()];
@@ -125,14 +181,7 @@ fn mount_ignore_busy(source: &[u8], target: &[u8], fstype: &[u8]) -> Result<(), 
 }
 
 fn read_boot_config() -> BootConfig {
-    let fd = io::open(b"/proc/cmdline", libc::O_RDONLY, 0);
-    let cmdline = if fd >= 0 {
-        let bytes = io::read_all(fd);
-        io::close(fd);
-        bytes
-    } else {
-        Vec::new()
-    };
+    let cmdline = read_cmdline();
 
     let init = cmdline_value(&cmdline, b"init=");
 
@@ -144,6 +193,16 @@ fn read_boot_config() -> BootConfig {
         init_explicit: init.is_some(),
         rootfstype: cmdline_value(&cmdline, b"rootfstype=").map(|value| value.to_vec()),
     }
+}
+
+fn read_cmdline() -> Vec<u8> {
+    let fd = io::open(b"/proc/cmdline", libc::O_RDONLY, 0);
+    if fd < 0 {
+        return Vec::new();
+    }
+    let bytes = io::read_all(fd);
+    io::close(fd);
+    bytes
 }
 
 fn cmdline_value<'a>(cmdline: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
@@ -287,12 +346,28 @@ fn target_init_path(init: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn do_switch_root(new_root: &[u8], init: &[u8], init_argv: &[&[u8]]) -> i32 {
-    move_mount_if_present(b"/dev", new_root);
-    move_mount_if_present(b"/proc", new_root);
-    move_mount_if_present(b"/sys", new_root);
-    // Match util-linux switch_root behavior for /run. Silo relies on this to
-    // carry the copied /run/agent/silo-agent into the real root.
-    move_mount_if_present(b"/run", new_root);
+    // Validate every destination before the first move. mount(MS_MOVE)
+    // follows a destination symlink, which could otherwise strand /run.
+    let root = io::open(
+        new_root,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    );
+    if root < 0 {
+        return -1;
+    }
+    let prepared = ::init::handoff::prepare_mount_destinations(root);
+    let closed = io::close(root);
+    if prepared.is_err() || closed != 0 {
+        return -1;
+    }
+    for path in [b"/dev".as_slice(), b"/proc", b"/sys", b"/run"] {
+        // /run carries the agent and the managed root maintenance subtree.
+        // Continuing after any required move would hide mounts from PID 1.
+        if move_mount(path, new_root) != 0 {
+            return -1;
+        }
+    }
 
     if io::chdir(new_root) != 0 {
         return -1;
@@ -310,15 +385,11 @@ pub(crate) fn do_switch_root(new_root: &[u8], init: &[u8], init_argv: &[&[u8]]) 
     exec_init(init, init_argv)
 }
 
-fn move_mount_if_present(path: &[u8], new_root: &[u8]) {
-    if io::access(path, libc::F_OK) != 0 {
-        return;
-    }
+fn move_mount(path: &[u8], new_root: &[u8]) -> i32 {
     let Some(target) = join_path(new_root, path) else {
-        return;
+        return -1;
     };
-    applets::files::mkdir_parents(&target, 0o755);
-    applets::system::mount_one(path, &target, None, libc::MS_MOVE, None);
+    applets::system::mount_one(path, &target, None, libc::MS_MOVE, None)
 }
 
 fn join_path(prefix: &[u8], suffix: &[u8]) -> Option<Vec<u8>> {

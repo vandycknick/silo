@@ -125,6 +125,22 @@ jq -n \
         platform: {os: "linux", architecture: $oci_arch},
         kernel: {mediaType: $image_type, format: $format, size: $image_size, digest: ("sha256:" + $image_sha256)},
         resolvedConfig: {size: $config_size, digest: ("sha256:" + $config_sha256)},
+        rootRuntime: {
+            opaqueRaw: ($profile == "workload"),
+            managedOverlay: {
+                eligible: ($profile == "workload" and $track != "longterm5" and
+                    ($version | if test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$") then
+                        split(".") | map(tonumber) | . >= [6, 6, 0]
+                    else error("invalid numeric kernel version") end)),
+                minimumKernelVersion: "6.6",
+                rootProfile: "linux-flat-overlay-v1",
+                upperProfile: "silo-upper-ext4-v1",
+                overlayProfile: "silo-overlay-v1",
+                renderingAbi: "linux-overlayfs-mountinfo-v1",
+                attachmentFamily: "krun-virtio-blk-v1",
+                qualification: "requires-exact-boot-evidence"
+            }
+        },
         source: {url: $source_url, digest: ("sha256:" + $source_sha256), key: $source_key},
         inputs: {patchSet: $patch_key, config: $config_key, build: $build_input_key, toolchain: $toolchain_key},
         build: {

@@ -35,8 +35,8 @@ package_profile() {
     KERNEL_OCI_ROOT="$canonical_root" \
     KERNEL_REPO_ROOT="$temp_dir/repository" \
     KERNEL_PRISTINE_ROOT="$temp_dir/pristine" \
-    KERNEL_TRACK=stable \
-    KERNEL_VERSION=7.2.2 \
+    KERNEL_TRACK="${TRACK_OVERRIDE:-stable}" \
+    KERNEL_VERSION="${VERSION_OVERRIDE:-7.2.2}" \
     KERNEL_SOURCE_URL=https://example.invalid/linux.tar.xz \
     KERNEL_SOURCE_SHA256=7d0e7ce14f98c43efe880cffbf354a59be45928fdf7170d7333c374ae91c0d83 \
     KERNEL_SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-sha256-7d0e7ce14f98c43efe880cffbf354a59be45928fdf7170d7333c374ae91c0d83}" \
@@ -79,6 +79,25 @@ fi
 
 jq -e '.profile == "workload" and .purpose == "workload"' "$temp_dir/workload.json" > /dev/null
 jq -e '.profile == "rprobe" and .purpose == "rosetta-acquisition-probe"' "$temp_dir/rprobe.json" > /dev/null
+jq -e '.rootRuntime.opaqueRaw and .rootRuntime.managedOverlay.eligible and
+    .rootRuntime.managedOverlay.qualification == "requires-exact-boot-evidence" and
+    .rootRuntime.managedOverlay.renderingAbi == "linux-overlayfs-mountinfo-v1"' \
+    "$temp_dir/workload.json" > /dev/null
+jq -e '.rootRuntime.opaqueRaw == false and .rootRuntime.managedOverlay.eligible == false' \
+    "$temp_dir/rprobe.json" > /dev/null
+VERSION_OVERRIDE=6.5.99 LAYOUT_OVERRIDE="$canonical_root/pre-floor" \
+    package_profile workload workload > "$temp_dir/pre-floor.json"
+jq -e '.rootRuntime.managedOverlay.eligible == false' "$temp_dir/pre-floor.json" > /dev/null
+VERSION_OVERRIDE=6.6.0 LAYOUT_OVERRIDE="$canonical_root/floor" \
+    package_profile workload workload > "$temp_dir/floor.json"
+jq -e '.rootRuntime.managedOverlay.eligible == true' "$temp_dir/floor.json" > /dev/null
+TRACK_OVERRIDE=longterm5 VERSION_OVERRIDE=5.15.219 LAYOUT_OVERRIDE="$canonical_root/raw-only" \
+    package_profile workload workload > "$temp_dir/raw-only.json"
+jq -e '.rootRuntime.opaqueRaw and .rootRuntime.managedOverlay.eligible == false' \
+    "$temp_dir/raw-only.json" > /dev/null
+TRACK_OVERRIDE=longterm5 LAYOUT_OVERRIDE="$canonical_root/track-stays-raw" \
+    package_profile workload workload > "$temp_dir/track-stays-raw.json"
+jq -e '.rootRuntime.managedOverlay.eligible == false' "$temp_dir/track-stays-raw.json" > /dev/null
 
 workload_media=$(jq -r '.kernel.mediaType' "$temp_dir/workload.json")
 rprobe_media=$(jq -r '.kernel.mediaType' "$temp_dir/rprobe.json")

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -19,7 +20,7 @@ mod ca;
 mod hostname;
 mod locale;
 mod mounts;
-mod network;
+pub(crate) mod network;
 mod resize;
 mod rosetta;
 pub(crate) mod ssh;
@@ -30,33 +31,55 @@ mod userdata;
 #[derive(Debug, Default)]
 pub(crate) struct EarlyProvisioning {
     rosetta: Option<ProvisionOutcome>,
+    mounts: Option<ProvisionOutcome>,
 }
 
 pub(crate) fn prepare_early_provisioning(
     config: &ProvisionConfig,
+    storage: &mut crate::root_storage::StorageShutdown,
 ) -> eyre::Result<EarlyProvisioning> {
+    let context = ProvisionContext::new(ProcessSupervisor::default());
+    let mounts = Some(mounts::prepare_early(&context, &config.mounts, storage)?);
     let rosetta = rosetta::prepare_early(&config.rosetta)?;
-    Ok(EarlyProvisioning { rosetta })
+    storage
+        .register_current(false)
+        .context("retain required early mounts before handoff")?;
+    Ok(EarlyProvisioning { rosetta, mounts })
 }
 
-pub fn run_provisioning(
+pub(crate) fn validate_early_mounts(config: &ProvisionConfig) -> eyre::Result<()> {
+    mounts::validate_targets(
+        &ProvisionContext::new(ProcessSupervisor::default()),
+        &config.mounts,
+    )
+}
+
+pub(crate) struct Provisioned {
+    pub(crate) report: ProvisionReport,
+    pub(crate) network: Option<network::AppliedNetwork>,
+}
+
+pub(crate) fn run_provisioning(
     config: &ProvisionConfig,
     process_supervisor: &ProcessSupervisor,
     early: &EarlyProvisioning,
-) -> eyre::Result<ProvisionReport> {
+) -> eyre::Result<Provisioned> {
     let started_at = timestamp();
     let started = Instant::now();
 
     if !config.enabled {
         tracing::debug!("guest provisioning disabled");
         let elapsed = started.elapsed();
-        return Ok(ProvisionReport {
-            status: Some(ProvisionOverallStatus::Skipped as i32),
-            started_at: Some(started_at),
-            finished_at: Some(timestamp_after(&started_at, elapsed)),
-            duration: Some(proto_duration(elapsed)),
-            steps: Vec::new(),
-            message: Some(String::from("guest provisioning disabled")),
+        return Ok(Provisioned {
+            report: ProvisionReport {
+                status: Some(ProvisionOverallStatus::Skipped as i32),
+                started_at: Some(started_at),
+                finished_at: Some(timestamp_after(&started_at, elapsed)),
+                duration: Some(proto_duration(elapsed)),
+                steps: Vec::new(),
+                message: Some(String::from("guest provisioning disabled")),
+            },
+            network: None,
         });
     }
 
@@ -85,7 +108,10 @@ pub fn run_provisioning(
         );
     }
 
-    Ok(run.finish(started_at, started))
+    Ok(Provisioned {
+        report: run.finish(started_at, started),
+        network: context.applied_network.into_inner(),
+    })
 }
 
 fn provisioners<'a>(
@@ -103,7 +129,10 @@ fn provisioners<'a>(
             &config.certificate_authority,
         )),
         Box::new(resize::ResizeRootfs::init(&config.resize_rootfs)),
-        Box::new(mounts::Mounts::init(&config.mounts)),
+        Box::new(mounts::Mounts::with_early_outcome(
+            &config.mounts,
+            early.mounts.as_ref(),
+        )),
         Box::new(rosetta::Rosetta::with_early_outcome(
             &config.rosetta,
             early.rosetta.as_ref(),
@@ -570,10 +599,10 @@ fn proto_duration(duration: Duration) -> prost_types::Duration {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct ProvisionContext {
     root: PathBuf,
     process_supervisor: ProcessSupervisor,
+    applied_network: RefCell<Option<network::AppliedNetwork>>,
 }
 
 impl ProvisionContext {
@@ -581,6 +610,7 @@ impl ProvisionContext {
         Self {
             root: PathBuf::from("/"),
             process_supervisor,
+            applied_network: RefCell::new(None),
         }
     }
 
@@ -589,6 +619,7 @@ impl ProvisionContext {
         Self {
             root: root.to_path_buf(),
             process_supervisor: ProcessSupervisor::default(),
+            applied_network: RefCell::new(None),
         }
     }
 
@@ -645,36 +676,6 @@ where
     }
 
     Ok(())
-}
-
-pub(crate) fn command_output<I, S>(
-    process_supervisor: &ProcessSupervisor,
-    program: &str,
-    args: I,
-) -> eyre::Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let args = collect_command_args(args);
-    tracing::debug!(program, args = ?args, "running provisioning command");
-
-    let output = process_supervisor.output(program, &args).with_context(|| {
-        format!(
-            "run provisioning command {}",
-            format_command(program, &args)
-        )
-    })?;
-    if !output.status.success() {
-        return Err(command_failure(program, &args, &output));
-    }
-
-    String::from_utf8(output.stdout).with_context(|| {
-        format!(
-            "decode stdout from provisioning command {} as UTF-8",
-            format_command(program, &args)
-        )
-    })
 }
 
 fn collect_command_args<I, S>(args: I) -> Vec<OsString>

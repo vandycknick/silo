@@ -32,19 +32,41 @@ type DownloadStream = Pin<Box<dyn Stream<Item = Result<ByteChunk, Status>> + Sen
 #[derive(Clone)]
 pub(crate) struct FilesystemService {
     root: PathBuf,
-    instance_id: String,
+    runtime: std::sync::Arc<crate::lifecycle::RuntimeContext>,
     capacity: std::sync::Arc<Semaphore>,
+    stopping: tokio::sync::watch::Sender<bool>,
 }
 
 impl FilesystemService {
-    pub(crate) fn new(root: impl Into<PathBuf>, instance_id: String) -> Self {
+    pub(crate) fn new(
+        root: impl Into<PathBuf>,
+        runtime: std::sync::Arc<crate::lifecycle::RuntimeContext>,
+    ) -> Self {
+        let (stopping, _) = tokio::sync::watch::channel(false);
         Self {
             root: root.into(),
-            instance_id,
+            runtime,
             capacity: std::sync::Arc::new(Semaphore::new(8)),
+            stopping,
         }
     }
 
+    pub(crate) fn stop_admissions(&self) {
+        self.capacity.close();
+        self.stopping.send_replace(true);
+    }
+
+    pub(crate) async fn wait_idle(&self) -> eyre::Result<()> {
+        // Blocking workers own their permits, including after async cancellation.
+        // Never equate aborting the RPC task with completion of its disk writes.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.capacity.available_permits() != 8 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| eyre::eyre!("guest filesystem workers did not drain before shutdown"))
+    }
     fn resolve(&self, value: Option<String>) -> Result<(String, PathBuf), Status> {
         let path = value.ok_or_else(|| invalid("path is required"))?;
         let bytes = path.as_bytes();
@@ -68,16 +90,34 @@ impl FilesystemService {
         Ok((path.clone(), self.root.join(&path[1..])))
     }
 
-    fn admit(&self) -> Result<OwnedSemaphorePermit, Status> {
-        self.capacity.clone().try_acquire_owned().map_err(|_| {
+    fn admit(&self) -> Result<FilesystemPermit, Status> {
+        self.admit_worker(false)
+    }
+
+    fn admit_worker(&self, mutation: bool) -> Result<FilesystemPermit, Status> {
+        let mutation = if mutation {
+            Some(self.runtime.admit_mutation()?)
+        } else {
+            None
+        };
+        let capacity = self.capacity.clone().try_acquire_owned().map_err(|_| {
             protocol::status_with_error(
                 tonic::Code::ResourceExhausted,
                 protocol::v1::ErrorCode::ResourceExhausted,
                 "guest filesystem capacity is exhausted",
                 None,
             )
+        })?;
+        Ok(FilesystemPermit {
+            _capacity: capacity,
+            _mutation: mutation,
         })
     }
+}
+
+struct FilesystemPermit {
+    _capacity: OwnedSemaphorePermit,
+    _mutation: Option<crate::lifecycle::MutationLease>,
 }
 
 #[tonic::async_trait]
@@ -100,7 +140,7 @@ impl GuestFilesystemService for FilesystemService {
         &self,
         request: Request<RemoveEntryRequest>,
     ) -> Result<Response<RemoveEntryResponse>, Status> {
-        let permit = std::sync::Arc::new(self.admit()?);
+        let permit = std::sync::Arc::new(self.admit_worker(true)?);
         let request = request.into_inner();
         let (path, target) = self.resolve(request.path)?;
         reject_root(&path, "remove")?;
@@ -134,7 +174,12 @@ impl GuestFilesystemService for FilesystemService {
         .map_err(join_error)??;
         let (sender, receiver) = tokio::sync::mpsc::channel(RELAY_CAPACITY);
         let delivery_slots = std::sync::Arc::new(Semaphore::new(RELAY_CAPACITY - 1));
+        let mut stopping = self.stopping.subscribe();
         tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = filesystem_stopped(&mut stopping) => {}
+                () = async move {
             let mut file = Some(file);
             let mut total = 0_u64;
             let deadline = tokio::time::Instant::now() + TRANSFER_TOTAL_TIMEOUT;
@@ -226,6 +271,8 @@ impl GuestFilesystemService for FilesystemService {
                     return;
                 }
             }
+                } => {}
+            }
         });
         Ok(Response::new(Box::pin(
             ReceiverStream::new(receiver).map(|(item, _delivery_slot)| item),
@@ -236,11 +283,77 @@ impl GuestFilesystemService for FilesystemService {
         &self,
         request: Request<tonic::Streaming<UploadFileRequest>>,
     ) -> Result<Response<UploadFileResponse>, Status> {
+        self.upload_stream(request.into_inner()).await
+    }
+
+    async fn list_directory(
+        &self,
+        request: Request<ListDirectoryRequest>,
+    ) -> Result<Response<DirectoryPage>, Status> {
         let permit = std::sync::Arc::new(self.admit()?);
-        let mut stream = request.into_inner();
+        let request = request.into_inner();
+        if request
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > protocol::MAX_CURSOR_BYTES)
+        {
+            return Err(invalid("cursor exceeds protocol limit"));
+        }
+        let limit = match request.limit {
+            Some(limit) if limit == 0 || limit > protocol::MAX_DIRECTORY_PAGE_SIZE => {
+                return Err(invalid("directory limit must be 1 through 1024"));
+            }
+            Some(limit) => limit as usize,
+            None => protocol::DEFAULT_DIRECTORY_PAGE_SIZE as usize,
+        };
+        let (path, target) = self.resolve(request.path)?;
+        let cursor = request.cursor.unwrap_or_default();
+        let instance = self.runtime.instance_id();
+        run_blocking(permit, move || {
+            list(&instance, &path, &target, limit, cursor)
+        })
+        .await
+        .map_err(join_error)?
+        .map(Response::new)
+    }
+
+    async fn create_directory(
+        &self,
+        request: Request<CreateDirectoryRequest>,
+    ) -> Result<Response<CreateDirectoryResponse>, Status> {
+        let permit = std::sync::Arc::new(self.admit_worker(true)?);
+        let request = request.into_inner();
+        validate_mode(request.mode)?;
+        let (path, target) = self.resolve(request.path.clone())?;
+        reject_root(&path, "create")?;
+        let root = self.root.clone();
+        let created = run_blocking(permit, move || create_directory(&root, &target, request))
+            .await
+            .map_err(join_error)??;
+        Ok(Response::new(CreateDirectoryResponse {
+            disposition: Some(if created {
+                DirectoryCreateDisposition::Created as i32
+            } else {
+                DirectoryCreateDisposition::AlreadyExists as i32
+            }),
+        }))
+    }
+}
+
+impl FilesystemService {
+    async fn upload_stream(
+        &self,
+        mut stream: impl Stream<Item = Result<UploadFileRequest, Status>> + Unpin + Send,
+    ) -> Result<Response<UploadFileResponse>, Status> {
+        let permit = std::sync::Arc::new(self.admit_worker(true)?);
+        let mut stopping = self.stopping.subscribe();
+        tokio::select! {
+            biased;
+            () = filesystem_stopped(&mut stopping) => Err(Status::unavailable("guest filesystem is stopping")),
+            result = async move {
         let deadline = tokio::time::Instant::now() + TRANSFER_TOTAL_TIMEOUT;
         let mut idle_deadline = tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT;
-        let header = tokio::time::timeout_at(idle_deadline.min(deadline), stream.message())
+        let header = tokio::time::timeout_at(idle_deadline.min(deadline), async { stream.next().await.transpose() })
             .await
             .map_err(|_| {
                 protocol::detailed_status(Status::deadline_exceeded(
@@ -274,7 +387,7 @@ impl GuestFilesystemService for FilesystemService {
         idle_deadline = tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT;
         loop {
             let progress_deadline = idle_deadline.min(deadline);
-            let message = match tokio::time::timeout_at(progress_deadline, stream.message()).await {
+            let message = match tokio::time::timeout_at(progress_deadline, async { stream.next().await.transpose() }).await {
                 Ok(Ok(Some(message))) => message,
                 Ok(Ok(None)) => break,
                 Ok(Err(error)) => return Err(error),
@@ -344,75 +457,37 @@ impl GuestFilesystemService for FilesystemService {
                 FileWriteDisposition::Created as i32
             }),
         }))
-    }
-
-    async fn list_directory(
-        &self,
-        request: Request<ListDirectoryRequest>,
-    ) -> Result<Response<DirectoryPage>, Status> {
-        let permit = std::sync::Arc::new(self.admit()?);
-        let request = request.into_inner();
-        if request
-            .cursor
-            .as_ref()
-            .is_some_and(|cursor| cursor.len() > protocol::MAX_CURSOR_BYTES)
-        {
-            return Err(invalid("cursor exceeds protocol limit"));
+            } => result,
         }
-        let limit = match request.limit {
-            Some(limit) if limit == 0 || limit > protocol::MAX_DIRECTORY_PAGE_SIZE => {
-                return Err(invalid("directory limit must be 1 through 1024"));
-            }
-            Some(limit) => limit as usize,
-            None => protocol::DEFAULT_DIRECTORY_PAGE_SIZE as usize,
-        };
-        let (path, target) = self.resolve(request.path)?;
-        let cursor = request.cursor.unwrap_or_default();
-        let instance = self.instance_id.clone();
-        run_blocking(permit, move || {
-            list(&instance, &path, &target, limit, cursor)
-        })
-        .await
-        .map_err(join_error)?
-        .map(Response::new)
-    }
-
-    async fn create_directory(
-        &self,
-        request: Request<CreateDirectoryRequest>,
-    ) -> Result<Response<CreateDirectoryResponse>, Status> {
-        let permit = std::sync::Arc::new(self.admit()?);
-        let request = request.into_inner();
-        validate_mode(request.mode)?;
-        let (path, target) = self.resolve(request.path.clone())?;
-        reject_root(&path, "create")?;
-        let root = self.root.clone();
-        let created = run_blocking(permit, move || create_directory(&root, &target, request))
-            .await
-            .map_err(join_error)??;
-        Ok(Response::new(CreateDirectoryResponse {
-            disposition: Some(if created {
-                DirectoryCreateDisposition::Created as i32
-            } else {
-                DirectoryCreateDisposition::AlreadyExists as i32
-            }),
-        }))
     }
 }
 
-async fn run_blocking<T, F>(
-    permit: std::sync::Arc<OwnedSemaphorePermit>,
+async fn filesystem_stopped(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*stopping.borrow() {
+        if stopping.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn run_blocking<T, F, P>(
+    permit: std::sync::Arc<P>,
     work: F,
 ) -> Result<T, tokio::task::JoinError>
 where
     T: Send + 'static,
+    P: Send + Sync + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    // Tuple fields drop in declaration order: an abandoned Upload result must
+    // unlink its temporary file before releasing the actual worker's permit.
+    let (output, _permit) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        work()
+        let output = work();
+        (output, _permit)
     })
-    .await
+    .await?;
+    Ok(output)
 }
 
 fn reject_root(path: &str, operation: &str) -> Result<(), Status> {
@@ -1047,6 +1122,9 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use protocol::v1::{ByteChunk, UploadFileRequest};
+    use tokio_stream::wrappers::ReceiverStream;
     use tonic::Code;
 
     use crate::filesystem::{
@@ -1056,7 +1134,39 @@ mod tests {
     };
 
     fn service(root: &std::path::Path) -> FilesystemService {
-        FilesystemService::new(root, "agent-a".to_string())
+        FilesystemService::new(root, crate::lifecycle::RuntimeContext::for_tests())
+    }
+
+    #[tokio::test]
+    async fn activation_rotation_rejects_real_service_cursor() {
+        use protocol::v1::guest_filesystem_service_server::GuestFilesystemService;
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a"), b"a").unwrap();
+        fs::write(root.path().join("b"), b"b").unwrap();
+        let runtime = crate::lifecycle::RuntimeContext::for_tests();
+        let service = FilesystemService::new(root.path(), runtime.clone());
+        let first = service
+            .list_directory(tonic::Request::new(protocol::v1::ListDirectoryRequest {
+                path: Some("/".into()),
+                limit: Some(1),
+                cursor: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut context = runtime.identity().shutdown;
+        context.machine_id = uuid::Uuid::new_v4().to_string();
+        context.run_id = uuid::Uuid::new_v4().to_string();
+        runtime.rotate(context);
+        let stale = service
+            .list_directory(tonic::Request::new(protocol::v1::ListDirectoryRequest {
+                path: Some("/".into()),
+                limit: Some(1),
+                cursor: first.next_cursor,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1093,6 +1203,162 @@ mod tests {
         .await
         .expect("blocking work releases admission permit");
         drop(permit);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_cancelled_actual_filesystem_worker() {
+        let root = tempfile::tempdir().expect("fixture");
+        let service = service(root.path());
+        let permit = Arc::new(service.admit().expect("admitted"));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let target = root.path().join("written");
+        let worker = tokio::spawn(run_blocking(permit, move || {
+            started.send(()).expect("started");
+            released.recv().expect("release");
+            fs::write(target, b"durable worker completed").expect("actual write");
+        }));
+        running.await.expect("running");
+        worker.abort();
+        let _ = worker.await;
+        service.stop_admissions();
+        assert!(service.admit().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), service.wait_idle())
+                .await
+                .is_err()
+        );
+        release.send(()).expect("release worker");
+        service.wait_idle().await.expect("actual worker drained");
+        assert_eq!(
+            fs::read(root.path().join("written")).expect("read write"),
+            b"durable worker completed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_upload_result_keeps_admission_through_actual_temporary_unlink() {
+        struct Cleanup {
+            upload: Option<crate::filesystem::Upload>,
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                drop(self.upload.take());
+            }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("file");
+        let directory = fixture.path().to_path_buf();
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(capacity.clone().try_acquire_owned().unwrap());
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (work_release, work_released) = std::sync::mpsc::channel();
+        let (drop_started, dropping) = std::sync::mpsc::channel();
+        let (drop_release, drop_released) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(run_blocking(permit, move || {
+            let header = protocol::v1::UploadFileHeader {
+                path: Some("/file".to_string()),
+                mode: None,
+                uid: None,
+                gid: None,
+            };
+            let mut upload = prepare_upload(target, header).unwrap();
+            upload
+                .file
+                .as_mut()
+                .unwrap()
+                .write_all(b"actual upload bytes")
+                .unwrap();
+            started.send(directory.join(&upload.temporary)).unwrap();
+            work_released.recv().unwrap();
+            Cleanup {
+                upload: Some(upload),
+                started: drop_started,
+                release: drop_released,
+            }
+        }));
+        let temporary = running.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        work_release.send(()).unwrap();
+        dropping.recv_timeout(Duration::from_secs(1)).unwrap();
+        let retained = capacity.available_permits() == 0 && temporary.is_file();
+        drop_release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(1), capacity.clone().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained);
+        assert!(!temporary.exists());
+        drop(permit);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_idle_upload_before_header_and_after_actual_write() {
+        for write_started in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let service = service(root.path());
+            let (input, stream) = tokio::sync::mpsc::channel(2);
+            let upload = tokio::spawn({
+                let service = service.clone();
+                async move { service.upload_stream(ReceiverStream::new(stream)).await }
+            });
+            if write_started {
+                input
+                    .send(Ok(UploadFileRequest {
+                        payload: Some(protocol::v1::upload_file_request::Payload::Header(
+                            protocol::v1::UploadFileHeader {
+                                path: Some("/target".into()),
+                                mode: None,
+                                uid: None,
+                                gid: None,
+                            },
+                        )),
+                    }))
+                    .await
+                    .unwrap();
+                input
+                    .send(Ok(UploadFileRequest {
+                        payload: Some(protocol::v1::upload_file_request::Payload::Chunk(
+                            ByteChunk {
+                                data: Some(Bytes::from_static(b"actual partial upload")),
+                            },
+                        )),
+                    }))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if std::fs::read_dir(root.path()).unwrap().any(|entry| {
+                            entry
+                                .unwrap()
+                                .metadata()
+                                .is_ok_and(|metadata| metadata.len() != 0)
+                        }) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                tokio::task::yield_now().await;
+            }
+            service.stop_admissions();
+            assert!(tokio::time::timeout(Duration::from_secs(1), upload)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err());
+            service.wait_idle().await.unwrap();
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            drop(input);
+        }
     }
 
     #[test]

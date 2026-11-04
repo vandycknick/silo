@@ -66,6 +66,20 @@ printf '%s\n' "$manifest" | jq -e \
         ($config.resolvedConfig.size | type == "number" and . > 0) and
         $config.resolvedConfig.digest == layers($kconfig_type)[0].digest and
         $config.resolvedConfig.size == layers($kconfig_type)[0].size and
+        $config.rootRuntime.opaqueRaw == ($profile == "workload") and
+        $config.rootRuntime.managedOverlay == {
+            eligible: ($profile == "workload" and $config.track != "longterm5" and
+                ($config.kernelVersion | if test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$") then
+                    split(".") | map(tonumber) | . >= [6, 6, 0]
+                else false end)),
+            minimumKernelVersion: "6.6",
+            rootProfile: "linux-flat-overlay-v1",
+            upperProfile: "silo-upper-ext4-v1",
+            overlayProfile: "silo-overlay-v1",
+            renderingAbi: "linux-overlayfs-mountinfo-v1",
+            attachmentFamily: "krun-virtio-blk-v1",
+            qualification: "requires-exact-boot-evidence"
+        } and
         ($config.source.digest | test("^sha256:[0-9a-f]{64}$")) and
         ($config.source.key | test("^sha256-[0-9a-f]{64}$")) and
         $config.source.key == ("sha256-" + ($config.source.digest | sub("^sha256:"; ""))) and

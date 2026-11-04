@@ -86,6 +86,79 @@ if [ "$rprobe_fragments" != "$expected_fragments" ]; then
     exit 1
 fi
 
+# Exercise the selected patch inputs, not Makefile source text. Mutating an
+# isolated shared patch must affect supported workload identities only.
+mkdir -p "$temp_dir/resources"
+cp -R "$kernel_root" "$temp_dir/resources/kernels"
+isolated_resources="$temp_dir/resources"
+live_patch="$isolated_resources/kernels/patches/live/0001-virtio-silo-vmgenid.patch"
+shared_key=$("$kernel_root/scripts/kernel-input-key.sh" patches "$live_patch")
+empty_key=$("$kernel_root/scripts/kernel-input-key.sh" patches)
+for track in stable longterm longterm5; do
+    identities workload TRACK="$track" RESOURCE_ROOT="$isolated_resources" REPO_ROOT="$repo_root" > "$temp_dir/workload-$track-before"
+    identities rprobe TRACK="$track" RESOURCE_ROOT="$isolated_resources" REPO_ROOT="$repo_root" > "$temp_dir/rprobe-$track-before"
+    expected_key=$shared_key
+    if [ "$track" = longterm5 ]; then expected_key=$empty_key; fi
+    if [ "$(sed -n 's/^patches=//p' "$temp_dir/workload-$track-before")" != "$expected_key" ]; then
+        printf 'unexpected shared workload patch selection on %s\n' "$track" >&2
+        exit 1
+    fi
+done
+x86_patch="$isolated_resources/kernels/patches/x86_64/0001-x86-krun-i8042-poweroff.patch"
+for track in stable longterm longterm5; do
+    make -s -C "$kernel_root" HOST_ARCH=x86_64 TRACK="$track" \
+        RESOURCE_ROOT="$isolated_resources" REPO_ROOT="$repo_root" kernel-identities > "$temp_dir/x86-$track"
+    if [ "$track" = longterm5 ]; then
+        expected_key=$("$kernel_root/scripts/kernel-input-key.sh" patches "$x86_patch")
+    else
+        expected_key=$("$kernel_root/scripts/kernel-input-key.sh" patches "$live_patch" "$x86_patch")
+    fi
+    if [ "$(sed -n 's/^patches=//p' "$temp_dir/x86-$track")" != "$expected_key" ]; then
+        printf 'architecture patch ordering changed on %s\n' "$track" >&2
+        exit 1
+    fi
+done
+printf '\n' >> "$live_patch"
+for track in stable longterm longterm5; do
+    identities workload TRACK="$track" RESOURCE_ROOT="$isolated_resources" REPO_ROOT="$repo_root" > "$temp_dir/workload-$track-after"
+    identities rprobe TRACK="$track" RESOURCE_ROOT="$isolated_resources" REPO_ROOT="$repo_root" > "$temp_dir/rprobe-$track-after"
+    cmp "$temp_dir/rprobe-$track-before" "$temp_dir/rprobe-$track-after"
+    if [ "$track" = longterm5 ]; then
+        cmp "$temp_dir/workload-$track-before" "$temp_dir/workload-$track-after"
+    else
+        for field in patches identity source_dir build_dir canonical_output; do
+            before=$(sed -n "s/^$field=//p" "$temp_dir/workload-$track-before")
+            after=$(sed -n "s/^$field=//p" "$temp_dir/workload-$track-after")
+            if [ "$before" = "$after" ]; then
+                printf 'shared patch mutation did not change %s on %s\n' "$field" "$track" >&2
+                exit 1
+            fi
+        done
+    fi
+done
+
+# Unit boundary for emitted-config validation: a fragment requesting built-in
+# support is not proof when the emitted file omits it, disables it or uses m.
+printf 'CONFIG_VIRTIO_SILO_VMGENID=y\nCONFIG_VMGENID=y\n' > "$temp_dir/required.config"
+cp "$temp_dir/required.config" "$temp_dir/emitted.config"
+"$kernel_root/scripts/validate-config.sh" "$temp_dir/emitted.config" "$temp_dir/required.config"
+for symbol in VIRTIO_SILO_VMGENID VMGENID; do
+    for setting in missing n m; do
+        : > "$temp_dir/emitted.config"
+        for emitted_symbol in VIRTIO_SILO_VMGENID VMGENID; do
+            if [ "$emitted_symbol" != "$symbol" ]; then
+                printf 'CONFIG_%s=y\n' "$emitted_symbol" >> "$temp_dir/emitted.config"
+            elif [ "$setting" != missing ]; then
+                printf 'CONFIG_%s=%s\n' "$symbol" "$setting" >> "$temp_dir/emitted.config"
+            fi
+        done
+        if "$kernel_root/scripts/validate-config.sh" "$temp_dir/emitted.config" "$temp_dir/required.config" > /dev/null 2>&1; then
+            printf 'emitted config accepted non-built-in %s: %s\n' "$symbol" "$setting" >&2
+            exit 1
+        fi
+    done
+done
+
 if make -s -C "$kernel_root" HOST_ARCH=x86_64 KERNEL_PROFILE=rprobe kernel-identities > /dev/null 2>&1; then
     printf 'x86_64 rprobe profile was not rejected\n' >&2
     exit 1

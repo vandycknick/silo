@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use nix::sys::signal::Signal;
 use nix::unistd::{getgrouplist, Gid};
 use protocol::v1::guest_process_event::Event;
@@ -68,8 +68,7 @@ impl Drop for ProcessEventStream {
 
 #[derive(Clone)]
 pub(crate) struct GuestProcessServiceImpl {
-    instance_id: String,
-    boot_id: String,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
     process_supervisor: ProcessSupervisor,
     active_executions: Arc<Mutex<HashSet<Uuid>>>,
     capacity: Arc<Semaphore>,
@@ -77,13 +76,11 @@ pub(crate) struct GuestProcessServiceImpl {
 
 impl GuestProcessServiceImpl {
     pub(crate) fn new(
-        instance_id: String,
-        boot_id: String,
+        runtime: Arc<crate::lifecycle::RuntimeContext>,
         process_supervisor: ProcessSupervisor,
     ) -> Self {
         Self {
-            instance_id,
-            boot_id,
+            runtime,
             process_supervisor,
             active_executions: Arc::new(Mutex::new(HashSet::new())),
             capacity: Arc::new(Semaphore::new(64)),
@@ -99,11 +96,26 @@ impl GuestProcessService for GuestProcessServiceImpl {
         &self,
         request: Request<tonic::Streaming<protocol::v1::GuestProcessInput>>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
+        let mut retirement = self.runtime.retirement();
+        let session = self.runtime.admit_session()?;
+        let session_supervisor = self
+            .process_supervisor
+            .with_session(session, retirement.clone());
+        let worker = session_supervisor
+            .admit_internal_writer()
+            .map_err(|error| {
+                protocol::detailed_status(Status::unavailable(format!(
+                    "guest process I/O admission stopped: {error}"
+                )))
+            })?;
+        let mut shutdown = self.process_supervisor.shutdown_receiver();
         let mut input = request.into_inner();
-        let first = input
-            .message()
-            .await
-            .map_err(protocol::detailed_status)?
+        let first = tokio::select! {
+            biased;
+            () = machine_io_stopped(&mut shutdown) => return Err(protocol::detailed_status(Status::unavailable("guest process admission is stopping"))),
+            _ = retirement.changed() => return Err(Status::failed_precondition("captured execution transport retired")),
+            message = input.message() => message,
+        }.map_err(protocol::detailed_status)?
             .ok_or_else(|| {
                 invalid_request("the first Execute request must be StartGuestProcess")
             })?;
@@ -131,6 +143,13 @@ impl GuestProcessService for GuestProcessServiceImpl {
             ExecutionLease::acquire(Arc::clone(&self.active_executions), execution_id, permit)?;
         let (events, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (cancel, cancel_receiver) = watch::channel(false);
+        let retirement_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = retirement.changed() => { retirement_cancel.send_replace(true); }
+                _ = retirement_cancel.closed() => {}
+            }
+        });
 
         let plan = match ProcessPlan::from_start(start) {
             Ok(plan) => plan,
@@ -138,7 +157,12 @@ impl GuestProcessService for GuestProcessServiceImpl {
                 log_launch_failure(execution_id, &failure);
                 let _ = events.try_send(Ok(failure.event()));
                 drop(execution);
-                tokio::spawn(drain_rejected_input(input, cancel_receiver));
+                tokio::spawn(drain_rejected_input(
+                    input,
+                    cancel_receiver,
+                    shutdown,
+                    worker,
+                ));
                 return Ok(Response::new(Box::pin(ProcessEventStream {
                     receiver: ReceiverStream::new(receiver),
                     cancellation: cancel,
@@ -146,30 +170,24 @@ impl GuestProcessService for GuestProcessServiceImpl {
             }
         };
         let (controls, control_receiver) = mpsc::channel(QUEUE_CAPACITY);
-        let input_cancel = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                match input.message().await {
-                    Ok(Some(control)) => {
-                        if controls.send(control).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(error) => {
-                        tracing::debug!(error = %error, "guest process control stream was lost");
-                        input_cancel.send_replace(true);
-                        return;
-                    }
-                }
-            }
-        });
+        let reader_worker = worker.clone();
+        tokio::spawn(pump_process_input(
+            input,
+            controls,
+            cancel.clone(),
+            cancel_receiver.clone(),
+            shutdown,
+            reader_worker,
+        ));
 
-        let supervisor = self.process_supervisor.clone();
+        let supervisor = session_supervisor;
+        let runtime = self.runtime.clone();
         tokio::spawn(async move {
+            let _worker = worker;
             run_execution(
                 plan,
                 supervisor,
+                runtime,
                 control_receiver,
                 events,
                 cancel_receiver,
@@ -186,18 +204,19 @@ impl GuestProcessService for GuestProcessServiceImpl {
 }
 
 async fn drain_rejected_input(
-    mut input: tonic::Streaming<protocol::v1::GuestProcessInput>,
+    input: impl Stream<Item = Result<protocol::v1::GuestProcessInput, Status>> + Unpin + Send + 'static,
     mut cancellation: watch::Receiver<bool>,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    worker: crate::pid1::InternalWriterGuard,
 ) {
+    let _worker = worker;
+    let mut input = input;
     loop {
         tokio::select! {
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() {
-                    return;
-                }
-            }
-            message = input.message() => {
-                if !matches!(message, Ok(Some(_))) {
+            biased;
+            () = execution_io_stopped(&mut cancellation, &mut shutdown) => return,
+            message = input.next() => {
+                if !matches!(message, Some(Ok(_))) {
                     return;
                 }
             }
@@ -205,14 +224,85 @@ async fn drain_rejected_input(
     }
 }
 
+async fn pump_process_input(
+    input: impl Stream<Item = Result<protocol::v1::GuestProcessInput, Status>> + Unpin + Send + 'static,
+    controls: mpsc::Sender<protocol::v1::GuestProcessInput>,
+    cancel: watch::Sender<bool>,
+    mut cancellation: watch::Receiver<bool>,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    worker: crate::pid1::InternalWriterGuard,
+) {
+    let _worker = worker;
+    let mut input = input;
+    loop {
+        let message = tokio::select! {
+            biased;
+            () = execution_io_stopped(&mut cancellation, &mut shutdown) => {
+                cancel.send_replace(true);
+                return;
+            }
+            () = controls.closed() => return,
+            message = input.next() => message,
+        };
+        match message {
+            Some(Ok(control)) => {
+                tokio::select! {
+                    biased;
+                    () = execution_io_stopped(&mut cancellation, &mut shutdown) => {
+                        cancel.send_replace(true);
+                        return;
+                    }
+                    result = controls.send(control) => if result.is_err() { return; },
+                }
+            }
+            None => return,
+            Some(Err(error)) => {
+                tracing::debug!(error = %error, "guest process control stream was lost");
+                cancel.send_replace(true);
+                return;
+            }
+        }
+    }
+}
+
+async fn execution_io_stopped(
+    cancellation: &mut watch::Receiver<bool>,
+    shutdown: &mut Option<watch::Receiver<bool>>,
+) {
+    loop {
+        if *cancellation.borrow() || shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+            return;
+        }
+        tokio::select! {
+            changed = cancellation.changed() => if changed.is_err() { return; },
+            () = machine_io_stopped(shutdown) => return,
+        }
+    }
+}
+
+async fn machine_io_stopped(shutdown: &mut Option<watch::Receiver<bool>>) {
+    match shutdown {
+        Some(receiver) => {
+            while !*receiver.borrow() {
+                if receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_execution(
     plan: ProcessPlan,
     supervisor: ProcessSupervisor,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
     mut controls: mpsc::Receiver<protocol::v1::GuestProcessInput>,
     events: EventSender,
     mut cancellation: watch::Receiver<bool>,
     execution: ExecutionLease,
 ) {
+    let retirement = supervisor.retirement_receiver();
     let mut spawn = tokio::task::spawn_blocking(move || spawn_process(plan, &supervisor));
     let mut controls_open = true;
     let mut deferred_control = None;
@@ -284,6 +374,10 @@ async fn run_execution(
             events,
             cancellation,
             execution,
+            ExecutionRuntime {
+                context: runtime,
+                retirement,
+            },
         )
     })
     .await;
@@ -329,7 +423,8 @@ impl GuestProcessServiceImpl {
     fn validate_start(&self, start: &StartGuestProcess) -> Result<Uuid, Status> {
         let execution_id = Uuid::parse_str(&start.execution_id)
             .map_err(|_| invalid_request("execution_id must be a UUID"))?;
-        if start.expected_agent_instance_id != self.instance_id {
+        let current = self.runtime.expected();
+        if start.expected_agent_instance_id != current.agent_instance_id {
             return Err(protocol::status_with_error(
                 tonic::Code::FailedPrecondition,
                 protocol::v1::ErrorCode::PreconditionFailed,
@@ -337,7 +432,7 @@ impl GuestProcessServiceImpl {
                 None,
             ));
         }
-        if start.expected_agent_boot_id != self.boot_id {
+        if start.expected_agent_boot_id != current.boot_id {
             return Err(protocol::status_with_error(
                 tonic::Code::FailedPrecondition,
                 protocol::v1::ErrorCode::PreconditionFailed,
@@ -798,6 +893,11 @@ fn child_process_group(child: &Child) -> Result<i32, LaunchFailure> {
         .map_err(|_| LaunchFailure::spawn_failed("child PID does not fit in i32"))
 }
 
+struct ExecutionRuntime {
+    context: Arc<crate::lifecycle::RuntimeContext>,
+    retirement: Option<watch::Receiver<u64>>,
+}
+
 fn drive_process(
     mut process: RunningProcess,
     mut deferred_control: Option<protocol::v1::GuestProcessInput>,
@@ -805,14 +905,31 @@ fn drive_process(
     events: EventSender,
     cancellation: watch::Receiver<bool>,
     _execution: ExecutionLease,
+    runtime: ExecutionRuntime,
 ) {
-    let mut input = start_input_writer(std::mem::replace(&mut process.stdin, ProcessInput::Null));
+    let ExecutionRuntime {
+        context: runtime,
+        retirement,
+    } = runtime;
+    let writer = process.guard.writer();
+    let mut input = start_input_writer(
+        std::mem::replace(&mut process.stdin, ProcessInput::Null),
+        writer.clone(),
+        runtime.clone(),
+        retirement,
+    );
     let disconnected = Arc::new(AtomicBool::new(false));
     let readers = process
         .outputs
         .drain(..)
         .filter_map(|(kind, reader)| {
-            spawn_output_reader(kind, reader, events.clone(), Arc::clone(&disconnected))
+            spawn_output_reader(
+                kind,
+                reader,
+                events.clone(),
+                Arc::clone(&disconnected),
+                writer.clone(),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -826,6 +943,14 @@ fn drive_process(
             .map_or_else(|| controls.try_recv(), Ok);
         match control {
             Ok(control) => {
+                let _mutation = match runtime.admit_mutation() {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        deferred_control = Some(control);
+                        thread::sleep(POLL_INTERVAL);
+                        continue;
+                    }
+                };
                 if let Err(status) = apply_control(&mut process, &mut input, control) {
                     let _ = events.blocking_send(Err(status));
                     terminate_and_reap(&mut process.child, process.process_group);
@@ -862,20 +987,34 @@ fn drive_process(
     }
 }
 
-fn start_input_writer(input: ProcessInput) -> ActiveInput {
+fn start_input_writer(
+    input: ProcessInput,
+    worker: Option<crate::pid1::InternalWriterGuard>,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
+    retirement: Option<watch::Receiver<u64>>,
+) -> ActiveInput {
     match input {
         ProcessInput::Null => ActiveInput::Null,
         ProcessInput::Pipe(writer) => {
             let Some(writer) = writer else {
                 return ActiveInput::Pipe(None);
             };
-            ActiveInput::Pipe(Some(spawn_input_writer(writer)))
+            ActiveInput::Pipe(Some(spawn_input_writer(
+                writer, worker, runtime, retirement,
+            )))
         }
-        ProcessInput::Pty(writer) => ActiveInput::Pty(spawn_input_writer(writer)),
+        ProcessInput::Pty(writer) => {
+            ActiveInput::Pty(spawn_input_writer(writer, worker, runtime, retirement))
+        }
     }
 }
 
-fn spawn_input_writer<W>(mut writer: W) -> std_mpsc::SyncSender<InputCommand>
+fn spawn_input_writer<W>(
+    writer: W,
+    worker: Option<crate::pid1::InternalWriterGuard>,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
+    retirement: Option<watch::Receiver<u64>>,
+) -> std_mpsc::SyncSender<InputCommand>
 where
     W: Write + Send + 'static,
 {
@@ -883,10 +1022,24 @@ where
     let _ = thread::Builder::new()
         .name("silo-guest-process-stdin".to_string())
         .spawn(move || {
+            let _worker = worker;
+            let mut stdin = writer;
             for command in receiver {
                 match command {
                     InputCommand::Data(data) => {
-                        if let Err(error) = writer.write_all(&data) {
+                        let _mutation = loop {
+                            if retirement
+                                .as_ref()
+                                .is_some_and(|receiver| receiver.has_changed().unwrap_or(true))
+                            {
+                                return;
+                            }
+                            match runtime.admit_mutation() {
+                                Ok(lease) => break lease,
+                                Err(_) => thread::sleep(POLL_INTERVAL),
+                            }
+                        };
+                        if let Err(error) = stdin.write_all(&data) {
                             if error.kind() != io::ErrorKind::BrokenPipe {
                                 tracing::debug!(error = %error, "guest process stdin write failed");
                             }
@@ -901,17 +1054,20 @@ where
 
 fn spawn_output_reader(
     kind: OutputKind,
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     events: EventSender,
     disconnected: Arc<AtomicBool>,
+    worker: Option<crate::pid1::InternalWriterGuard>,
 ) -> Option<thread::JoinHandle<()>> {
     let reader_disconnected = Arc::clone(&disconnected);
     match thread::Builder::new()
         .name("silo-guest-process-output".to_string())
         .spawn(move || {
+            let _worker = worker;
+            let mut source = reader;
             let mut buffer = vec![0; protocol::CHUNK_64_KIB];
             loop {
-                let read = match reader.read(&mut buffer) {
+                let read = match source.read(&mut buffer) {
                     Ok(0) => return,
                     Ok(read) => read,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1160,6 +1316,55 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_input_worker_keeps_pre_activation_retirement_observation() {
+        use std::io::Read;
+        let runtime = crate::lifecycle::RuntimeContext::for_tests();
+        let retirement = runtime.retirement();
+        runtime.stop_admissions();
+        runtime.rotate(runtime.identity().shutdown);
+        let (writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let sender =
+            crate::guest_process::spawn_input_writer(writer, None, runtime, Some(retirement));
+        sender
+            .send(crate::guest_process::InputCommand::Data(
+                b"must-not-write".to_vec(),
+            ))
+            .unwrap();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn shared_identity_cutover_rejects_captured_native_execute() {
+        let runtime = crate::lifecycle::RuntimeContext::for_tests();
+        let service = crate::guest_process::GuestProcessServiceImpl::new(
+            runtime.clone(),
+            crate::pid1::ProcessSupervisor::default(),
+        );
+        let before = runtime.identity();
+        let mut start = protocol::v1::StartGuestProcess {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            expected_agent_instance_id: before.expected.agent_instance_id.clone(),
+            expected_agent_boot_id: before.expected.boot_id.clone(),
+            process: None,
+        };
+        assert!(service.validate_start(&start).is_ok());
+        let mut context = before.shutdown;
+        context.machine_id = uuid::Uuid::new_v4().to_string();
+        context.run_id = uuid::Uuid::new_v4().to_string();
+        let after = runtime.rotate(context);
+        assert_eq!(
+            service.validate_start(&start).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        start.expected_agent_instance_id = after.agent_instance_id;
+        assert!(service.validate_start(&start).is_ok());
+    }
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -1177,6 +1382,105 @@ mod tests {
         drive_process, resolve_identity, spawn_process, ExecutionLease, ProcessPlan, QUEUE_CAPACITY,
     };
     use crate::pid1::ProcessSupervisor;
+
+    #[tokio::test]
+    async fn process_control_pump_cancels_idle_and_backpressured_input_before_drain() {
+        for backpressured in [false, true] {
+            let supervisor = ProcessSupervisor::default();
+            let worker = supervisor.admit_internal_writer().unwrap();
+            let (incoming, input) = mpsc::channel(2);
+            let (controls, received) = mpsc::channel(1);
+            let (cancel, cancellation) = watch::channel(false);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(crate::guest_process::pump_process_input(
+                tokio_stream::wrappers::ReceiverStream::new(input),
+                controls,
+                cancel.clone(),
+                cancellation,
+                Some(shutdown_rx),
+                worker,
+            ));
+            if backpressured {
+                incoming
+                    .send(Ok(GuestProcessInput { message: None }))
+                    .await
+                    .unwrap();
+                incoming
+                    .send(Ok(GuestProcessInput { message: None }))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while incoming.capacity() != 2 || received.len() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let pending = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                supervisor.wait_internal_writers(),
+            )
+            .await
+            .is_err();
+            supervisor.begin_writer_shutdown().unwrap();
+            shutdown.send_replace(true);
+            supervisor.wait_internal_writers().await.unwrap();
+            assert!(incoming.is_closed());
+            assert!(*cancel.borrow());
+            task.await.unwrap();
+            assert!(pending);
+            drop(received);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_process_input_cancels_without_waiting_for_peer_fin() {
+        let supervisor = ProcessSupervisor::default();
+        let worker = supervisor.admit_internal_writer().unwrap();
+        let (incoming, input) = mpsc::channel::<Result<GuestProcessInput, tonic::Status>>(1);
+        let (_cancel, cancellation) = watch::channel(false);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(crate::guest_process::drain_rejected_input(
+            tokio_stream::wrappers::ReceiverStream::new(input),
+            cancellation,
+            Some(shutdown_rx),
+            worker,
+        ));
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            supervisor.wait_internal_writers(),
+        )
+        .await
+        .is_err();
+        supervisor.begin_writer_shutdown().unwrap();
+        shutdown.send_replace(true);
+        supervisor.wait_internal_writers().await.unwrap();
+        assert!(incoming.is_closed());
+        task.await.unwrap();
+        assert!(pending);
+    }
+
+    #[tokio::test]
+    async fn completed_execution_closes_its_idle_control_input() {
+        let supervisor = ProcessSupervisor::default();
+        let worker = supervisor.admit_internal_writer().unwrap();
+        let (incoming, input) = mpsc::channel::<Result<GuestProcessInput, tonic::Status>>(1);
+        let (controls, received) = mpsc::channel(1);
+        let (cancel, cancellation) = watch::channel(false);
+        let task = tokio::spawn(crate::guest_process::pump_process_input(
+            tokio_stream::wrappers::ReceiverStream::new(input),
+            controls,
+            cancel,
+            cancellation,
+            None,
+            worker,
+        ));
+        drop(received);
+        supervisor.wait_internal_writers().await.unwrap();
+        assert!(incoming.is_closed());
+        task.await.unwrap();
+    }
 
     fn privileged() -> bool {
         getuid().is_root()
@@ -1237,6 +1541,10 @@ mod tests {
                 events,
                 cancel_receiver,
                 lease,
+                crate::guest_process::ExecutionRuntime {
+                    context: crate::lifecycle::RuntimeContext::for_tests(),
+                    retirement: None,
+                },
             )
         });
         (controls, event_receiver, task)
