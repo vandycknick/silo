@@ -12,6 +12,7 @@ silo_secrets = { package = "secrets", path = "../../common/secrets" }
 oci = { path = "../oci" }
 protocol = { path = "../../specs/protocol" }
 vm-spec = { path = "../../specs/vm-spec" }
+rootfs-spec = { path = "../../specs/rootfs-spec" }
 utils = { path = "../../common/utils" }
 async-trait = "0.1.91"
 base64 = "0.23.0"
@@ -29,12 +30,12 @@ tracing = "0.1.44"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
-nix = { version = "0.31.3", features = ["process", "signal", "fs", "user", "poll", "term", "resource"] }
+nix = { version = "0.31.3", features = ["process", "signal", "fs", "dir", "user", "poll", "term", "resource"] }
 plist = { version = "1.10.0", default-features = false }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid", "json"] }
 ssh-key = { version = "0.7.0-rc.11", default-features = false, features = ["ed25519", "std"] }
 thiserror = "2.0.19"
-tokio = { version = "1.53.1", features = ["time", "fs", "rt", "net", "io-util", "io-std", "sync", "macros", "signal"] }
+tokio = { version = "1.53.1", features = ["time", "fs", "rt", "net", "io-util", "io-std", "sync", "macros", "signal", "process"] }
 tokio-stream = "0.1.19"
 tokio-util = { version = "0.7.19", features = ["io", "rt"] }
 tonic = { version = "0.14.6", features = ["transport"] }
@@ -44,6 +45,9 @@ prost-types = "0.14.4"
 zeroize.workspace = true
 url = "2.5.8"
 x509-parser = "0.18.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", features = ["inotify"] }
 
 [dev-dependencies]
 test-utils = { path = "../test-utils" }

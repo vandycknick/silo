@@ -15,7 +15,7 @@ use crate::network::MachineNetworkConfig;
 use crate::store::models::{MachineConfig, MachineRootfsRecord, MachineRuntimeState, MachineState};
 use crate::ImageSourceKind;
 
-/// Durable pin for the root disk cloned into a machine directory.
+/// Source provenance and the selected private root disk location.
 ///
 /// OCI fields are absent for caller-owned local disks. The launch-time
 /// `Entrypoint` API is intentionally separate from this image metadata.
@@ -32,13 +32,13 @@ pub struct MachineRootfs {
     pub selected_manifest_digest: Option<String>,
     /// OCI configuration digest.
     pub config_digest: Option<String>,
-    /// Materialized rootfs image ID.
+    /// Source image identity, not an identity of the writable private root.
     pub image_id: Option<String>,
     /// Machine-local root disk path.
     pub root_disk_path: PathBuf,
-    /// Size of the machine-local root disk in bytes.
+    /// Selected machine-local virtual disk length in bytes.
     pub root_disk_size_bytes: u64,
-    /// Unix timestamp for when this pin was created.
+    /// Unix timestamp for when this provenance was recorded.
     pub created_at: i64,
 }
 
@@ -159,8 +159,13 @@ pub struct MachineData {
     pub modified_at: i64,
     /// Image reference used to create the machine.
     pub image_ref: String,
-    /// Durable rootfs identity and machine-local disk pin, when available.
+    /// Source provenance and the selected machine-local root path, when available.
     pub rootfs: Option<MachineRootfs>,
+    /// Typed root, boot, storage and ownership meaning.
+    pub storage: Option<crate::MachineStorageRecord>,
+    /// External data disks and host shares, derived from the durable VM specification.
+    /// These mappings are not copied into ownership or represented as self-contained.
+    pub external_resources: Vec<crate::ExternalResource>,
     /// Requested root disk size in bytes, when explicitly configured.
     pub root_disk_size: Option<u64>,
     /// User-defined labels attached to the machine.
@@ -187,6 +192,10 @@ pub struct MachineData {
     /// The current silo-vmm run while the machine is running. Pass it to
     /// `stop_run`/`wait_for_run` to act on exactly this run.
     pub run_id: Option<MachineRunId>,
+    /// Exact run evidence, never relabelled using the current runtime override.
+    pub live: Option<vm_spec::live::LiveMachineReport>,
+    /// Prospective next-start selection, only for an observed stopped machine.
+    pub prospective_live: Option<vm_spec::live::LiveHostReport>,
     /// Latest guest boot report observed by silo-vmm, when the guest registered one.
     pub boot_report: Option<MachineBootReport>,
     /// Latest guest provisioning report observed by silo-vmm, when the guest registered one.
@@ -203,6 +212,7 @@ impl MachineData {
     /// Constructs an owned observation for adapters without opening a machine handle.
     /// Optional observations remain unavailable until the adapter supplies them.
     pub fn new(id: String, name: String, spec: VmSpec) -> Self {
+        let external_resources = crate::ExternalResource::from_spec(&spec);
         Self {
             id,
             name,
@@ -216,6 +226,8 @@ impl MachineData {
             modified_at: 0,
             image_ref: String::new(),
             rootfs: None,
+            storage: None,
+            external_resources,
             root_disk_size: None,
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -226,6 +238,8 @@ impl MachineData {
             observation: MachineObservation::Unavailable,
             issues: Vec::new(),
             run_id: None,
+            live: None,
+            prospective_live: None,
             boot_report: None,
             provision_report: None,
             started_at: None,
@@ -243,6 +257,7 @@ impl MachineData {
         provision_report: Option<MachineProvisionReport>,
         state: MachineState,
     ) -> Self {
+        let external_resources = crate::ExternalResource::from_spec(&config.spec);
         let tailscale = match &config.network {
             crate::store::models::MachineNetworkConfig::Private {
                 policy: Some(policy),
@@ -271,6 +286,8 @@ impl MachineData {
             modified_at: config.modified_at,
             image_ref: config.image_ref,
             rootfs: rootfs.map(Into::into),
+            storage: None,
+            external_resources,
             root_disk_size: config.root_disk_size,
             labels: config.labels,
             metadata: config.metadata,
@@ -281,6 +298,8 @@ impl MachineData {
             observation: MachineObservation::Observed,
             issues: Vec::new(),
             run_id,
+            live: None,
+            prospective_live: None,
             boot_report,
             provision_report,
             started_at: state.started_at,
@@ -769,5 +788,64 @@ mod tests {
 
         assert!(status.ready());
         assert!(!status.guest_ready());
+    }
+
+    #[test]
+    fn external_resource_view_is_derived_from_each_current_specification() {
+        let mut spec = vm_spec::VmSpec::current();
+        spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                vm_spec::Disk {
+                    path: "root.raw".into(),
+                    role: vm_spec::DiskRole::Root,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-root").unwrap(),
+                    read_only: false,
+                },
+                vm_spec::Disk {
+                    path: "/external/data.raw".into(),
+                    role: vm_spec::DiskRole::Data,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                    read_only: true,
+                },
+            ],
+        });
+        spec.mounts.push(vm_spec::Mount {
+            source: "/external/workspace".into(),
+            tag: "/workspace".to_string(),
+            read_only: false,
+        });
+        let first =
+            crate::MachineData::new("machine".to_string(), "first".to_string(), spec.clone());
+        assert_eq!(
+            first.external_resources,
+            vec![
+                crate::ExternalResource::Disk {
+                    role: vm_spec::DiskRole::Data,
+                    order: 1,
+                    path: "/external/data.raw".into(),
+                    read_only: true
+                },
+                crate::ExternalResource::Share {
+                    source: "/external/workspace".into(),
+                    tag: "/workspace".to_string(),
+                    read_only: false
+                },
+            ]
+        );
+        spec.storage.as_mut().unwrap().disks.truncate(1);
+        spec.mounts.clear();
+        let second = crate::MachineData::new("machine".to_string(), "second".to_string(), spec);
+        assert!(second.external_resources.is_empty());
+        assert_eq!(first.external_resources.len(), 2);
     }
 }

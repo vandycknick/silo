@@ -36,11 +36,89 @@ make readiness unavailable without implying that the VM stopped.
 ```sh
 silo ls
 silo ls --format json
-silo show <VM>                  # alias: silo status <VM>
-silo show <VM> --format json
+silo info <VM>
+silo info <VM> --format json
+silo system info --format json
 silo logs <VM>
 silo logs <VM> --stream network
 ```
+
+`silo info` reports exact running-monitor live evidence (`scope: machine`),
+including its backend and lane. A stopped machine reports separately labelled
+prospective next-start host evidence, not a fabricated run report.
+`silo system info` reports prospective manager capabilities and, when enabled,
+the separately configured system appliance host capabilities. Each vector has
+`pause`, `capture`, `restore`, `fork`, and `incremental`, with `native` and
+tagged `supported`/`unsupported` availability and a closed reason code.
+The native implementation bit is diagnostic, not product admission.
+
+The explicit execution-state command grammar is:
+
+```sh
+silo pause <VM>
+silo snapshot create <VM> --live [--name <NAME>]
+silo fork <VM> --name <CHILD> --live
+silo restore <CHECKPOINT> --execution [--name <CHILD>]
+```
+
+These endpoints refuse unsupported operations with typed capability errors.
+They never stop a machine, capture only its disks, or cold boot as a fallback.
+For VZ the ordinary alternative is to use `silo stop`, then the stopped-storage
+snapshot workflow, not an execution checkpoint.
+
+Stopped-storage operations are separate mutations, never a live fallback:
+
+```sh
+silo fork <VM> --name <CHILD>
+silo snapshot create <VM> [--name <NAME>]
+silo snapshot inspect image:<NAME>
+silo snapshot list
+silo restore image:<NAME> --name <CHILD>
+silo snapshot remove image:<NAME>
+silo image remove image:<NAME>
+```
+
+Fork supports admitted stopped opaque raw and development flat-overlay roots.
+Snapshots and stopped restoration support opaque raw only. Both alias and
+immutable `image:sha256:HEX` references resolve through the library artifact
+collection. An unnamed snapshot is still explicitly retained. `snapshot remove`
+releases only that explicit retention; `image remove` removes only an alias.
+Other aliases, machines and in-flight operations continue rooting shared bytes.
+
+Exact copies preserve credentials, guest keys, dirty journals and deleted-data
+remnants. They do not sanitize, repair or replay source storage, nor implicitly
+start or stop a machine. Managed writable disks are included by default.
+External resources default to refusal. `--external-requirements` explicitly
+omits them while recording required destination mappings. Snapshot creation
+accepts only default refusal or required declarations, never destination host
+paths. On fork and restore, `--map-disk ORDER=PATH` and `--map-share TAG=PATH`
+explicitly select absolute destination paths.
+Unresolved requirements block start, and shared external mappings do not imply
+self-contained or independently writable storage.
+
+Admission has two explicit intervals: read-only catalog lookup and monitor
+status observation may happen first; the actual operation consumes that exact
+run-bound observation and refuses before new operational locks, mutation
+permits, leases, budgets, workspace allocation, or lifecycle RPCs. Cold discovery
+does not initialize writable runtime state. A running monitor's backend takes
+precedence over the current prospective backend override.
+Live-refusal commands and `system info` can use an authenticated normal daemon
+whose core is stopping; ordinary management still requires a ready core.
+Stopped fork, snapshot creation, restore and retention/alias removal require
+normal mutation readiness and drain admission, including when live refusal
+would be permitted. Read-only preflight rejects unsupported root, boot,
+resource or artifact kinds before writable initialization where possible;
+the library repeats authoritative checks under its runtime locks.
+The separate shutdown-only service retains its restrictive RPC allowlist.
+Daemon capability reports and typed refusals are validated before encoding.
+Invalid outbound evidence is a protocol failure, never a substitute
+`unsupported` reason or a successful response.
+At durable-machine boundaries, compact stored machine IDs and canonical live
+machine IDs are matched by UUID value. Live reports and monitor outer identities
+retain their strict canonical representation; run and monitor fences remain exact.
+
+The replacement commands do not retain top-level `show`/`status` aliases.
+`silo daemon status` remains the separate daemon lifecycle/status command.
 
 Inventory/partial inspection succeeds with explicit issues. Missing requested
 VMs, global runtime failures, and failed mutations return nonzero. Use `-v` to
@@ -134,6 +212,13 @@ provide stream-style EOF. No watchdog, packet probe, or universal network-health
 policy is part of this design.
 
 ## Verification
+
+The storage-holder reconciliation test waits for a real child process to report
+userspace readiness before dropping the launch lease and asserting a free flock.
+This establishes that inherited close-on-exec descriptors have finished teardown;
+an exec-status notification alone is not the fixture's readiness boundary. The
+same live-holder fence is exercised with clean, missing, and malformed exit
+records, and the child is killed and reaped before terminal reconciliation.
 
 Focused process tests use the real netd binary and actual child processes. The
 real-host smoke tests require built/signed runtime components and disposable VMs:

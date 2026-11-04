@@ -380,7 +380,7 @@ mod tests {
         .await
         .unwrap();
         let disk = dir.path().join("rootfs.img");
-        std::fs::write(&disk, b"disk fixture, never booted").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let MachineNetworkConfig::Private {
             policy: Some(policy),
             ..
@@ -1071,7 +1071,7 @@ mod tests {
             .unwrap()
             .is_empty());
         let disk = dir.path().join("rootfs.img");
-        std::fs::write(&disk, b"disk fixture, never booted").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let MachineNetworkConfig::Private {
             policy: Some(policy),
             ..

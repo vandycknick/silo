@@ -1,0 +1,317 @@
+//! Strict storage-artifact management DTOs, separate from machine observations.
+use crate::{invalid, path_from_wire, path_to_wire, required, ConversionError};
+use libvm::{
+    ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy, SnapshotInfo, SnapshotRef,
+};
+use silod_spec::daemon::v1 as w;
+
+pub fn name(value: Option<String>) -> Result<Option<String>, ConversionError> {
+    if let Some(value) = &value {
+        libvm::validate_new_machine_name(value)
+            .map_err(|_| invalid("name", "invalid machine name"))?;
+    }
+    Ok(value)
+}
+
+pub fn alias(value: &str) -> Result<String, ConversionError> {
+    match format!("image:{value}").parse::<SnapshotRef>() {
+        Ok(SnapshotRef::Image(alias)) if alias == value => Ok(alias),
+        _ => Err(invalid("alias", "invalid image alias")),
+    }
+}
+
+pub fn snapshot_policy(value: &ExternalResourcePolicy) -> Result<(), ConversionError> {
+    if matches!(value, ExternalResourcePolicy::Map { .. }) {
+        return Err(invalid("external_resources", "snapshot creation accepts only reject or required external declarations; destination mappings belong to fork or restore"));
+    }
+    Ok(())
+}
+
+pub fn reference_to_wire(value: &SnapshotRef) -> w::StorageSnapshotRef {
+    use w::storage_snapshot_ref::Reference;
+    w::StorageSnapshotRef {
+        reference: Some(match value {
+            SnapshotRef::Id(id) => Reference::Id(id.to_string()),
+            SnapshotRef::Image(name) => Reference::ImageAlias(name.clone()),
+        }),
+    }
+}
+
+pub fn reference_from_wire(value: w::StorageSnapshotRef) -> Result<SnapshotRef, ConversionError> {
+    use w::storage_snapshot_ref::Reference;
+    match required(value.reference, "snapshot.reference")? {
+        Reference::Id(id) => {
+            Ok(SnapshotRef::Id(id.parse().map_err(|_| {
+                invalid("snapshot.id", "invalid snapshot identity")
+            })?))
+        }
+        Reference::ImageAlias(value) => Ok(SnapshotRef::Image(alias(&value)?)),
+    }
+}
+
+fn key_to_wire(value: &ExternalResourceKey) -> w::ExternalResourceKey {
+    use w::external_resource_key::Resource;
+    w::ExternalResourceKey {
+        resource: Some(match value {
+            ExternalResourceKey::Disk { order } => Resource::DiskOrder(*order),
+            ExternalResourceKey::Share { tag } => Resource::ShareTag(tag.clone()),
+        }),
+    }
+}
+pub fn resource_key(resource: ExternalResourceKey) -> Result<ExternalResourceKey, ConversionError> {
+    let requirement = libvm::ExternalResourceRequirement {
+        resource,
+        read_only: false,
+    };
+    requirement
+        .validate()
+        .map_err(|_| invalid("resource.key", "invalid external resource key"))?;
+    Ok(requirement.resource)
+}
+fn key_from_wire(value: w::ExternalResourceKey) -> Result<ExternalResourceKey, ConversionError> {
+    use w::external_resource_key::Resource;
+    resource_key(match required(value.resource, "resource.key")? {
+        Resource::DiskOrder(order) => ExternalResourceKey::Disk { order },
+        Resource::ShareTag(tag) => ExternalResourceKey::Share { tag },
+    })
+}
+
+pub fn policy_to_wire(value: &ExternalResourcePolicy) -> w::ExternalResourcePolicy {
+    use w::external_resource_policy::Policy;
+    w::ExternalResourcePolicy {
+        policy: Some(match value {
+            ExternalResourcePolicy::Reject => Policy::Reject(()),
+            ExternalResourcePolicy::RequireMappings => Policy::RequireMappings(()),
+            ExternalResourcePolicy::Map { mappings } => {
+                Policy::Mappings(w::ExternalResourceMappings {
+                    values: mappings
+                        .iter()
+                        .map(|mapping| w::ExternalResourceMapping {
+                            resource: Some(key_to_wire(&mapping.resource)),
+                            path: path_to_wire(&mapping.path),
+                        })
+                        .collect(),
+                })
+            }
+        }),
+    }
+}
+
+pub fn policy_from_wire(
+    value: w::ExternalResourcePolicy,
+) -> Result<ExternalResourcePolicy, ConversionError> {
+    use w::external_resource_policy::Policy;
+    match required(value.policy, "external_resources.policy")? {
+        Policy::Reject(()) => Ok(ExternalResourcePolicy::Reject),
+        Policy::RequireMappings(()) => Ok(ExternalResourcePolicy::RequireMappings),
+        Policy::Mappings(value) => {
+            if value.values.is_empty() || value.values.len() > 256 {
+                return Err(invalid(
+                    "external_resources.mappings",
+                    "expected 1..=256 mappings",
+                ));
+            }
+            let mut mappings = Vec::with_capacity(value.values.len());
+            for value in value.values {
+                let resource = key_from_wire(required(value.resource, "mapping.resource")?)?;
+                if mappings
+                    .iter()
+                    .any(|v: &ExternalResourceMapping| v.resource == resource)
+                {
+                    return Err(invalid(
+                        "external_resources.mappings",
+                        "duplicate resource mapping",
+                    ));
+                }
+                let path = path_from_wire(value.path)?;
+                if !path.is_absolute() {
+                    return Err(invalid(
+                        "mapping.path",
+                        "expected absolute destination path",
+                    ));
+                }
+                mappings.push(ExternalResourceMapping { resource, path });
+            }
+            Ok(ExternalResourcePolicy::Map { mappings })
+        }
+    }
+}
+
+pub fn info_to_wire(value: &SnapshotInfo) -> Result<w::StorageSnapshotInfo, ConversionError> {
+    let result = w::StorageSnapshotInfo {
+        id: value.id.to_string(),
+        record_digest: value.record_digest.to_string(),
+        retained: Some(value.retained),
+        aliases: value.aliases.clone(),
+        created_at: Some(value.created_at),
+        capture_kind: w::StorageCaptureKind::StoppedStorage as i32,
+    };
+    info_from_wire(result.clone())?;
+    Ok(result)
+}
+pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, ConversionError> {
+    if value.capture_kind != w::StorageCaptureKind::StoppedStorage as i32 {
+        return Err(invalid("snapshot.capture_kind", "expected stopped-storage"));
+    }
+    if value.aliases.len() > 4096 {
+        return Err(invalid("snapshot.aliases", "too many aliases"));
+    }
+    let mut aliases = std::collections::BTreeSet::new();
+    for value in &value.aliases {
+        if !aliases.insert(alias(value)?) {
+            return Err(invalid("snapshot.aliases", "duplicate alias"));
+        }
+    }
+    let created_at = required(value.created_at, "snapshot.created_at")?;
+    if !(0..=9_007_199_254_740_991).contains(&created_at) {
+        return Err(invalid("snapshot.created_at", "invalid timestamp"));
+    }
+    Ok(SnapshotInfo {
+        id: value
+            .id
+            .parse()
+            .map_err(|_| invalid("snapshot.id", "invalid snapshot identity"))?,
+        record_digest: value
+            .record_digest
+            .parse()
+            .map_err(|_| invalid("snapshot.record_digest", "invalid object digest"))?,
+        retained: required(value.retained, "snapshot.retained")?,
+        aliases: value.aliases,
+        created_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::stopped::{
+        info_from_wire, policy_from_wire, policy_to_wire, reference_from_wire, reference_to_wire,
+    };
+    use libvm::{
+        ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy, SnapshotRef,
+    };
+    use silod_spec::daemon::v1 as w;
+
+    #[test]
+    fn storage_references_are_explicit_and_strict() {
+        assert!(reference_from_wire(w::StorageSnapshotRef::default()).is_err());
+        for value in [
+            "image:checkpoint",
+            "image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let reference: SnapshotRef = value.parse().unwrap();
+            assert_eq!(
+                reference_from_wire(reference_to_wire(&reference))
+                    .unwrap()
+                    .to_string(),
+                value
+            );
+        }
+        for value in ["snapshot:checkpoint", "checkpoint", "image:"] {
+            assert!(value.parse::<SnapshotRef>().is_err());
+        }
+    }
+
+    #[test]
+    fn storage_policy_requires_discriminant_and_unique_absolute_mappings() {
+        assert!(policy_from_wire(w::ExternalResourcePolicy::default()).is_err());
+        let policy = ExternalResourcePolicy::Map {
+            mappings: vec![ExternalResourceMapping {
+                resource: ExternalResourceKey::Disk { order: 1 },
+                path: "/tmp/external.raw".into(),
+            }],
+        };
+        assert!(matches!(
+            policy_from_wire(policy_to_wire(&policy)).unwrap(),
+            ExternalResourcePolicy::Map { .. }
+        ));
+        let mut wire = policy_to_wire(&policy);
+        if let Some(w::external_resource_policy::Policy::Mappings(mappings)) = &mut wire.policy {
+            mappings.values.push(mappings.values[0].clone());
+        }
+        assert!(policy_from_wire(wire).is_err());
+        let relative = ExternalResourcePolicy::Map {
+            mappings: vec![ExternalResourceMapping {
+                resource: ExternalResourceKey::Disk { order: 1 },
+                path: "relative.raw".into(),
+            }],
+        };
+        assert!(policy_from_wire(policy_to_wire(&relative)).is_err());
+        for resource in [
+            ExternalResourceKey::Disk { order: 0 },
+            ExternalResourceKey::Disk { order: 16 },
+            ExternalResourceKey::Share { tag: " ".into() },
+            ExternalResourceKey::Share {
+                tag: "configured\0share".into(),
+            },
+        ] {
+            let policy = ExternalResourcePolicy::Map {
+                mappings: vec![ExternalResourceMapping {
+                    resource,
+                    path: "/tmp/external".into(),
+                }],
+            };
+            assert!(policy_from_wire(policy_to_wire(&policy)).is_err());
+        }
+        let tag = "長い構成済み共有名".repeat(20);
+        let policy = ExternalResourcePolicy::Map {
+            mappings: vec![ExternalResourceMapping {
+                resource: ExternalResourceKey::Share { tag: tag.clone() },
+                path: "/tmp/shared".into(),
+            }],
+        };
+        let ExternalResourcePolicy::Map { mappings } =
+            policy_from_wire(policy_to_wire(&policy)).unwrap()
+        else {
+            panic!("mapping policy was not preserved");
+        };
+        assert_eq!(mappings[0].resource, ExternalResourceKey::Share { tag });
+    }
+
+    #[test]
+    fn storage_info_rejects_observation_or_execution_shaped_success() {
+        let mut wire = w::StorageSnapshotInfo {
+            id: format!("sha256:{}", "a".repeat(64)),
+            record_digest: format!("sha256:{}", "b".repeat(64)),
+            retained: Some(false),
+            aliases: vec!["checkpoint".into()],
+            created_at: Some(1),
+            capture_kind: w::StorageCaptureKind::StoppedStorage as i32,
+        };
+        assert!(info_from_wire(wire.clone()).is_ok());
+        wire.capture_kind = 0;
+        assert!(info_from_wire(wire.clone()).is_err());
+        wire.capture_kind = w::StorageCaptureKind::StoppedStorage as i32;
+        wire.retained = None;
+        assert!(info_from_wire(wire.clone()).is_err());
+        wire.retained = Some(true);
+        wire.aliases.push("checkpoint".into());
+        assert!(info_from_wire(wire).is_err());
+    }
+
+    #[test]
+    fn creation_names_and_snapshot_external_policy_use_exact_native_grammar() {
+        for value in ["child", "child-1", "0"] {
+            assert!(crate::stopped::name(Some(value.into())).is_ok());
+        }
+        for value in [
+            "INVALID",
+            "trailing-",
+            "contains space",
+            "",
+            &"a".repeat(64),
+        ] {
+            assert!(crate::stopped::name(Some(value.into())).is_err());
+        }
+        assert!(crate::stopped::snapshot_policy(&ExternalResourcePolicy::Reject).is_ok());
+        assert!(crate::stopped::snapshot_policy(&ExternalResourcePolicy::RequireMappings).is_ok());
+        assert!(
+            crate::stopped::snapshot_policy(&ExternalResourcePolicy::Map {
+                mappings: vec![ExternalResourceMapping {
+                    resource: ExternalResourceKey::Disk { order: 1 },
+                    path: "/tmp/external.raw".into()
+                }],
+            })
+            .is_err()
+        );
+    }
+}

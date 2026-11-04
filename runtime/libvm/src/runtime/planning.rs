@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{access, AccessFlags};
-use oci::{ImageStore as RootfsImageStore, MaterializeOptions};
+use oci::{MaterializeOptions, OciMaterializer};
 
 use crate::image::{
     local_disk::resolve_local_disk,
-    oci::{cached_resolved_oci_image, image_error, resolve_oci_image_from_registry},
+    oci::{
+        cached_resolved_oci_image, image_error, resolve_oci_image_from_registry,
+        verify_cached_image,
+    },
     ImagePullPolicy, ResolvedOciImage,
 };
 use crate::runtime::RuntimeConfig;
@@ -25,7 +28,8 @@ pub struct ReadOnlyRuntime {
 }
 
 impl ReadOnlyRuntime {
-    /// Opens existing planning state without creating any local state.
+    /// Opens existing planning state without initializing runtime or logical
+    /// catalog state. SQLite may manage its ordinary WAL/SHM coordination files.
     pub async fn open(config: RuntimeConfig) -> Result<Self, LibVmError> {
         let home = config.resolve_home()?;
         let store = ReadOnlyStore::open_if_exists(&home.join("state.db")).await?;
@@ -60,25 +64,61 @@ impl ReadOnlyRuntime {
         reference: String,
         policy: ImagePullPolicy,
     ) -> Result<ResolvedOciImage, LibVmError> {
-        let store = RootfsImageStore::open(self.home.join("images"), self.registry_policy.clone())
-            .map_err(|error| image_error(&reference, error))?;
+        let producer =
+            OciMaterializer::open(self.home.join("images"), self.registry_policy.clone())
+                .map_err(|error| image_error(&reference, error))?;
         let options =
             MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?;
-        match policy {
-            ImagePullPolicy::IfMissing => {
-                if let Some(image) = cached_resolved_oci_image(&store, &reference, options.clone())?
-                {
-                    Ok(image)
-                } else {
-                    resolve_oci_image_from_registry(&store, reference, options, None).await
-                }
+        if policy != ImagePullPolicy::Always {
+            if let Some(image) = self.cached_oci_image(&reference, &options.platform).await? {
+                return Ok(image);
             }
-            ImagePullPolicy::Always => {
-                resolve_oci_image_from_registry(&store, reference, options, None).await
+            if policy == ImagePullPolicy::Never {
+                return Err(LibVmError::ImageNotFound { reference });
             }
-            ImagePullPolicy::Never => cached_resolved_oci_image(&store, &reference, options)?
-                .ok_or(LibVmError::ImageNotFound { reference }),
         }
+        let mut image =
+            resolve_oci_image_from_registry(&producer, reference, options, None).await?;
+        if self
+            .cached_oci_image(&image.selected_reference, &image.platform)
+            .await?
+            .is_some()
+        {
+            image.cache_state = crate::ImageCacheState::Complete;
+        }
+        Ok(image)
+    }
+
+    async fn cached_oci_image(
+        &self,
+        reference: &str,
+        platform: &oci::Platform,
+    ) -> Result<Option<ResolvedOciImage>, LibVmError> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        for candidate in self
+            .registry_policy
+            .candidates(reference)
+            .map_err(|error| image_error(reference, error))?
+        {
+            if let Some(image) = store
+                .cached_oci_image(&candidate.to_string(), platform)
+                .await?
+            {
+                let images = self.home.join("images");
+                return tokio::task::spawn_blocking(move || {
+                    verify_cached_image(&image, &images)?;
+                    Ok(Some(cached_resolved_oci_image(
+                        &image,
+                        candidate.to_string(),
+                    )))
+                })
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
+        }
+        Ok(None)
     }
 
     /// Validates that a disk can be read and that its future machine parent can be created.
@@ -120,15 +160,19 @@ fn validate_create_parent(path: &Path) -> Result<(), LibVmError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
-
-    use crate::{OciImageConfigMetadata, Platform};
-    use oci::{RootfsLayerMetadata, RootfsMetadata};
 
     use crate::store::models::DbConfig;
     use crate::store::{ConfigStore, Store};
     use crate::{ImagePullPolicy, ReadOnlyRuntime, RuntimeConfig};
+
+    mod logical_catalog {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/live_catalog.rs"
+        ));
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct FileSnapshot {
@@ -137,15 +181,16 @@ mod tests {
         modified: i64,
     }
 
-    fn snapshot(root: &Path) -> BTreeMap<PathBuf, FileSnapshot> {
+    fn snapshot(root: &Path, catalog_home: &Path) -> BTreeMap<PathBuf, FileSnapshot> {
         let mut files = BTreeMap::new();
-        snapshot_directory(root, root, &mut files);
+        snapshot_directory(root, root, catalog_home, &mut files);
         files
     }
 
     fn snapshot_directory(
         root: &Path,
         directory: &Path,
+        catalog_home: &Path,
         files: &mut BTreeMap<PathBuf, FileSnapshot>,
     ) {
         let Ok(entries) = std::fs::read_dir(directory) else {
@@ -154,8 +199,18 @@ mod tests {
         for entry in entries {
             let entry = entry.expect("read snapshot entry");
             let path = entry.path();
+            // SQLx snapshots below compare logical catalog contents. These
+            // files are native SQLite read coordination, not runtime artifacts.
+            if directory == catalog_home
+                && matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("state.db" | "state.db-wal" | "state.db-shm")
+                )
+            {
+                continue;
+            }
             if path.is_dir() {
-                snapshot_directory(root, &path, files);
+                snapshot_directory(root, &path, catalog_home, files);
             } else {
                 let metadata = entry.metadata().expect("read snapshot metadata");
                 files.insert(
@@ -194,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_database_is_unchanged_while_checking_name_collisions() {
+    async fn logical_catalog_is_unchanged_while_checking_name_collisions() {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
         let store = Store::open(&data_root.join("state.db"))
@@ -212,7 +267,8 @@ mod tests {
             .await
             .expect("insert machine name");
         store.close().await;
-        let before = snapshot(temp.path());
+        let logical_before = logical_catalog::snapshot(&data_root).await;
+        let before = snapshot(temp.path(), &data_root);
 
         let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
             .await
@@ -222,7 +278,8 @@ mod tests {
             .machine_name_available("taken")
             .await
             .expect("check taken name"));
-        let after = snapshot(temp.path());
+        assert_eq!(logical_catalog::snapshot(&data_root).await, logical_before);
+        let after = snapshot(temp.path(), &data_root);
         assert_eq!(
             before.keys().collect::<Vec<_>>(),
             after.keys().collect::<Vec<_>>()
@@ -246,10 +303,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_rejects_old_migration_history_without_writing() {
+    async fn dry_run_rejects_incompatible_schema_without_logical_changes() {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
         std::fs::create_dir_all(&data_root).expect("create data root");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(data_root.join("catalog.lock"))
+            .unwrap();
         let state_db = data_root.join("state.db");
         std::fs::File::create(&state_db).expect("create state database");
         let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", state_db.display()))
@@ -277,59 +340,48 @@ mod tests {
         .await
         .expect("record old migration");
         pool.close().await;
-        let before = snapshot(temp.path());
+        let logical_before = logical_catalog::snapshot(&data_root).await;
+        let before = snapshot(temp.path(), &data_root);
 
         let error = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
             .await
             .expect_err("dry run must reject an old state database");
 
-        assert!(error.to_string().contains("embedded schema"));
-        assert_eq!(before, snapshot(temp.path()));
+        assert!(error.to_string().contains("reinstall"));
+        assert_eq!(logical_catalog::snapshot(&data_root).await, logical_before);
+        assert_eq!(before, snapshot(temp.path(), &data_root));
     }
 
     #[tokio::test]
-    async fn cached_oci_resolution_preserves_all_local_metadata() {
+    async fn cached_oci_resolution_preserves_logical_catalog_and_cache_metadata() {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
-        let image_root = data_root.join("images");
         let digest = format!("sha256:{}", "a".repeat(64));
         let reference = format!("example.test/demo@{digest}");
-        let platform = Platform::host().expect("host platform");
-        let image_dir = image_root
-            .join(format!("sha256-{}", "a".repeat(64)))
-            .join(format!("{}-{}", platform.os, platform.architecture));
-        std::fs::create_dir_all(&image_dir).expect("create cached image directory");
-        std::fs::write(image_dir.join("rootfs.img"), b"rootfs").expect("write cached rootfs");
-        let metadata = RootfsMetadata {
-            version: 2,
-            image_ref: reference.clone(),
-            image_id: digest.clone(),
-            requested_reference: reference.clone(),
-            selected_reference: reference.clone(),
-            manifest_digest: digest.clone(),
-            config_digest: format!("sha256:{}", "b".repeat(64)),
-            config: OciImageConfigMetadata::default(),
-            layers: Vec::<RootfsLayerMetadata>::new(),
-            platform,
-            filesystem: "ext4".to_string(),
-            rootfs_file: "rootfs.img".to_string(),
-            created_at_unix: 1,
-        };
-        let mut stored_metadata =
-            serde_json::to_value(&metadata).expect("serialize cached metadata");
-        stored_metadata
-            .as_object_mut()
-            .expect("metadata object")
-            .insert(
-                "source".to_string(),
-                serde_json::Value::String("oci-registry".to_string()),
-            );
-        std::fs::write(
-            image_dir.join("metadata.json"),
-            serde_json::to_vec_pretty(&stored_metadata).expect("serialize stored metadata"),
+        let paths = crate::paths::LocalPaths::new(&data_root);
+        let store = Store::new(&paths).await.unwrap();
+        let runtime = crate::Runtime::from_store(
+            paths.clone(),
+            std::sync::Arc::new(store.clone()),
+            crate::RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            crate::runtime::components::test_components(paths.home()),
+            None,
         )
-        .expect("write cached metadata");
-        let before = snapshot(temp.path());
+        .await
+        .unwrap();
+        crate::runtime::core::tests::write_cached_oci_rootfs(
+            &runtime,
+            &paths,
+            &reference,
+            &digest,
+            &format!("sha256:{}", "b".repeat(64)),
+        )
+        .await;
+        drop(runtime);
+        store.close().await;
+        let logical_before = logical_catalog::snapshot(&data_root).await;
+        let before = snapshot(temp.path(), &data_root);
         let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
             .await
             .expect("open read-only runtime");
@@ -340,8 +392,9 @@ mod tests {
             .expect("resolve cached image");
 
         assert_eq!(image.selected_reference, reference);
-        assert_eq!(before, snapshot(temp.path()));
-        assert!(!data_root.join("state.db").exists());
+        assert_eq!(logical_catalog::snapshot(&data_root).await, logical_before);
+        assert_eq!(before, snapshot(temp.path(), &data_root));
+        assert!(data_root.join("state.db").exists());
     }
 
     #[tokio::test]
@@ -359,6 +412,6 @@ mod tests {
             )
             .await
             .is_err());
-        assert!(snapshot(temp.path()).is_empty());
+        assert!(snapshot(temp.path(), &data_root).is_empty());
     }
 }

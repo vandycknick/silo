@@ -28,6 +28,10 @@ impl Machine {
         let runtime = self.runtime();
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
+        let storage = runtime.machine_storage_record(config.id).await?;
+        runtime
+            .preflight_stopped_generation_locked(&config, &storage)
+            .await?;
         let _node_state = crate::node_state::acquire(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
@@ -40,6 +44,7 @@ impl Machine {
                 reference: config.name.clone(),
                 reason: error.to_string(),
             })?;
+        crate::machine::root_storage::validate_spec(&storage, &spec)?;
 
         let previous_spec = config.spec.clone();
         runtime.validate_tailscale_vsock(&config.network, &spec)?;
@@ -69,6 +74,10 @@ impl Machine {
         runtime.validate_machine_network_config(&network).await?;
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
+        let storage = runtime.machine_storage_record(config.id).await?;
+        runtime
+            .preflight_stopped_generation_locked(&config, &storage)
+            .await?;
         let _node_state = crate::node_state::acquire(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
@@ -87,6 +96,16 @@ impl Machine {
 
     /// Applies partial settings updates to a stopped machine.
     pub async fn update(&self, update: MachineUpdate) -> Result<MachineData, LibVmError> {
+        if update.root_disk_size.is_some() || update.temporary_directory.is_some() {
+            let machine = self.clone();
+            // Finish the stopped replacement transaction even if its requester
+            // disappears; otherwise cancellation after COMMIT can erase the new root.
+            return tokio::spawn(async move { machine.update_stopped(update).await }).await?;
+        }
+        self.update_stopped(update).await
+    }
+
+    async fn update_stopped(&self, update: MachineUpdate) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
         if let Err(reason) = update.validate_network() {
             return Err(LibVmError::InvalidMachineUpdate {
@@ -155,6 +174,12 @@ impl Machine {
         };
         let (_lock, mut config) = runtime.lock_machine_config(machine_id).await?;
         runtime.validate_machine_data_dir(&config)?;
+        // Refuse live attachment owners before node-state lock creation or
+        // reconciliation can change the source's durable lifecycle record.
+        let storage = runtime.machine_storage_record(config.id).await?;
+        runtime
+            .preflight_stopped_generation_locked(&config, &storage)
+            .await?;
         let _node_state = crate::node_state::acquire(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
@@ -189,9 +214,35 @@ impl Machine {
             config.labels = labels;
         }
 
+        let mut storage_update =
+            if update.root_disk_size.is_some() || update.temporary_directory.is_some() {
+                Some(runtime.machine_storage_record(config.id).await?)
+            } else {
+                None
+            };
         if let Some(size_bytes) = update.root_disk_size {
-            validate_root_disk_growth(&config, size_bytes)?;
+            if matches!(
+                storage_update.as_ref().map(|storage| &storage.root),
+                Some(crate::MachineRoot::OpaqueRaw { .. })
+            ) {
+                validate_root_disk_growth(&config, size_bytes)?;
+            }
             config.root_disk_size = Some(size_bytes);
+        }
+        if let Some(policy) = update.temporary_directory {
+            policy.validate()?;
+            match storage_update.as_mut().map(|storage| &mut storage.root) {
+                Some(crate::MachineRoot::LinuxOverlay {
+                    temporary_directory,
+                    ..
+                }) => *temporary_directory = policy,
+                _ => {
+                    return Err(LibVmError::InvalidMachineUpdate {
+                        reference: config.name.clone(),
+                        reason: "temporary-directory policy requires flat overlay".into(),
+                    })
+                }
+            }
         }
 
         let previous_spec = config.spec.clone();
@@ -263,6 +314,88 @@ impl Machine {
             runtime.ensure_tailscale_directory(config.id)?;
         }
         config.modified_at = now_unix();
+        let mut replacement = None;
+        let _storage_lifetime = if storage_update.is_some() {
+            // Stop cleanup removes this tree. Recreate it only through the
+            // owned-directory admission path before opening the lifetime lock.
+            runtime.local_paths().ensure_machine_run_dir(config.id)?;
+            Some(
+                crate::lock_manager::MachineLifetimeLock::try_acquire(
+                    &runtime.machine_paths(config.id).vmm_lock_path(),
+                )?
+                .ok_or_else(|| LibVmError::MachineAlreadyRunning {
+                    reference: config.name.clone(),
+                })?,
+            )
+        } else {
+            None
+        };
+        if let Some(storage) = &mut storage_update {
+            match &mut storage.root {
+                crate::MachineRoot::OpaqueRaw { geometry, .. } => {
+                    if let Some(length) = update.root_disk_size {
+                        geometry.length = length;
+                    }
+                }
+                crate::MachineRoot::LinuxOverlay {
+                    upper, capacity, ..
+                } => {
+                    if let Some(length) = update.root_disk_size {
+                        rootfs_spec::upper_geometry::UpperCapacity::new(length).map_err(
+                            |error| LibVmError::InvalidMachineUpdate {
+                                reference: config.name.clone(),
+                                reason: error.to_string(),
+                            },
+                        )?;
+                        if length < *capacity {
+                            return Err(LibVmError::InvalidMachineUpdate {
+                                reference: config.name.clone(),
+                                reason: "overlay upper cannot be shrunk".into(),
+                            });
+                        }
+                        if length > *capacity {
+                            let path = crate::PrivatePath::new(format!(
+                                "upper-{}.raw",
+                                uuid::Uuid::new_v4().simple()
+                            ))?;
+                            replacement =
+                                Some(crate::machine::root_disk::UpperReplacement::prepare(
+                                    &config.machine_dir.join(upper.as_path()),
+                                    &config.machine_dir.join(path.as_path()),
+                                    length,
+                                )?);
+                            let disk = config
+                                .spec
+                                .storage
+                                .as_mut()
+                                .and_then(|storage| {
+                                    storage
+                                        .disks
+                                        .iter_mut()
+                                        .find(|disk| disk.role == vm_spec::DiskRole::RootUpper)
+                                })
+                                .ok_or_else(|| {
+                                    crate::machine::root_storage::invalid(
+                                        "overlay upper disk is missing",
+                                    )
+                                })?;
+                            disk.path = path.as_path().to_path_buf();
+                            disk.geometry.length = length;
+                            *upper = path;
+                            *capacity = length;
+                            storage.storage_generation =
+                                storage.storage_generation.checked_add(1).ok_or_else(|| {
+                                    crate::machine::root_storage::invalid(
+                                        "storage generation overflow",
+                                    )
+                                })?;
+                            spec_changed = true;
+                        }
+                    }
+                }
+            }
+            storage.validate()?;
+        }
         if spec_changed {
             config
                 .spec
@@ -273,11 +406,37 @@ impl Machine {
                 })?;
             write_machine_config(&config.machine_dir, &config.name, &config.spec)?;
         }
-        if let Err(err) = runtime.save_machine_config(&config).await {
+        if let Some(replacement) = replacement.as_mut() {
+            replacement.begin_publication();
+        }
+        let saved = if let Some(storage) = storage_update.as_ref() {
+            runtime
+                .save_machine_config_with_storage(&config, storage)
+                .await
+        } else {
+            runtime.save_machine_config(&config).await
+        };
+        if let Err(err) = saved {
             if spec_changed {
                 let _ = write_machine_config(&config.machine_dir, &config.name, &previous_spec);
             }
+            if let Some(candidate) = replacement.take() {
+                // A returned error can still leave COMMIT's outcome uncertain.
+                // Only a completed semantic reread under our machine/lifetime
+                // locks proves the candidate safe to remove. Cancellation of
+                // this reread deliberately retains both complete generations.
+                if let Ok(storage) = runtime.machine_storage_record(config.id).await {
+                    if matches!(&storage.root, crate::MachineRoot::LinuxOverlay { upper, .. }
+                        if config.machine_dir.join(upper.as_path()) != candidate.path())
+                    {
+                        candidate.discard_unpublished();
+                    }
+                }
+            }
             return Err(err);
+        }
+        if let Some(replacement) = replacement {
+            replacement.commit();
         }
         runtime.machine_inspect_data(config).await
     }
@@ -337,11 +496,91 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    async fn stopped_storage_machine(name: &str) -> (tempfile::TempDir, Runtime, crate::Machine) {
+        let home = tempfile::tempdir().unwrap();
+        let disk = home.path().join("source.raw");
+        std::fs::write(&disk, [0x64; 512]).unwrap();
+        let runtime = Runtime::open(
+            crate::paths::LocalPaths::new(home.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .unwrap();
+        let machine = runtime
+            .machine()
+            .name(name)
+            .image_source(ImageSource::disk(&disk))
+            .create()
+            .await
+            .unwrap();
+        (home, runtime, machine)
+    }
+
+    #[tokio::test]
+    async fn stopped_storage_updates_recreate_only_private_runtime_directories_after_cleanup() {
+        let (_home, runtime, machine) = stopped_storage_machine("private-run-update").await;
+        let id = machine.machine_id();
+        let run = runtime.machine_paths(id).machine_run_dir().to_owned();
+        for length in [1024, 1536] {
+            runtime.local_paths().ensure_machine_run_dir(id).unwrap();
+            runtime.local_paths().remove_machine_run_tree(id).unwrap();
+            assert!(
+                !run.exists(),
+                "exercise the same missing tree left by stop cleanup"
+            );
+            machine
+                .update(MachineUpdate::new().root_disk_size(length))
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(&run).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            // The unmodified admission guard must accept the next lifecycle use.
+            runtime.local_paths().ensure_machine_run_dir(id).unwrap();
+            assert!(matches!(
+                runtime.machine_storage_record(id).await.unwrap().root,
+                crate::MachineRoot::OpaqueRaw { geometry, .. } if geometry.length == length
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_storage_update_refuses_existing_permissive_runtime_directory_without_repair() {
+        let (_home, runtime, machine) = stopped_storage_machine("unsafe-run-update").await;
+        let id = machine.machine_id();
+        runtime.local_paths().ensure_machine_run_dir(id).unwrap();
+        let run = runtime.machine_paths(id).machine_run_dir().to_owned();
+        let marker = run.join("preserve-user-state");
+        std::fs::write(&marker, b"preserve").unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = runtime.machine_config(id).await.unwrap().unwrap();
+        let storage = runtime.machine_storage_record(id).await.unwrap();
+        let root = std::fs::read(before.machine_dir.join("root.raw")).unwrap();
+        let result = machine
+            .update(MachineUpdate::new().root_disk_size(1024))
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::LibVmError::InvalidOwnedPath { .. })
+        ));
+        assert_eq!(
+            std::fs::metadata(&run).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"preserve");
+        assert_eq!(runtime.machine_config(id).await.unwrap().unwrap(), before);
+        assert_eq!(runtime.machine_storage_record(id).await.unwrap(), storage);
+        assert_eq!(
+            std::fs::read(before.machine_dir.join("root.raw")).unwrap(),
+            root
+        );
+    }
     #[tokio::test]
     async fn stopped_tailscale_update_and_exact_atomic_name_contract() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, b"root-disk").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let runtime = Runtime::open(
             crate::paths::LocalPaths::new(home.path().join("silo")),
             RuntimeNetworkingConfig::default(),

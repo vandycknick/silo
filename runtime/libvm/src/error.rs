@@ -5,6 +5,51 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
+    #[error("{operation} unsupported: {reason} (backend={backend}, lane={lane})")]
+    LiveOperationUnsupported {
+        operation: vm_spec::live::LiveOperation,
+        backend: vm_spec::live::LiveBackend,
+        lane: vm_spec::live::LiveLane,
+        reason: vm_spec::live::LiveUnsupportedReason,
+    },
+    #[error("live capability discovery failed: {message}")]
+    LiveDiscovery { message: String },
+    #[error("live capability protocol failed: {message}")]
+    LiveProtocol { message: String },
+    #[error("live observation for {reference} failed: {message}")]
+    LiveObservation { reference: String, message: String },
+
+    #[error(transparent)]
+    Storage(#[from] crate::storage::StorageError),
+    #[error(transparent)]
+    OverlayBootQualification(#[from] crate::boot_qualification::OverlayBootQualificationError),
+    #[error("backend {backend:?} does not support development flat overlay roots")]
+    OverlayBackendUnsupported { backend: vm_spec::live::LiveBackend },
+    #[error("development flat overlay roots cannot be published or snapshotted")]
+    FlatOverlayPublicationUnsupported,
+    #[error("format private overlay upper: {0}")]
+    UpperFormat(#[from] disk_image::ext4::FormatError),
+    #[error(transparent)]
+    Changeset(#[from] oci::changeset::ChangesetError),
+    #[error(transparent)]
+    Namespace(#[from] oci::changeset::namespace::NamespaceError),
+    #[error("blocking storage worker failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+
+    #[error("invalid {record} storage record: {message}")]
+    InvalidStorageRecord {
+        record: &'static str,
+        message: String,
+    },
+
+    #[error("image removal would invalidate machine {machine} dependency {path}")]
+    CacheDependency { machine: String, path: PathBuf },
+
+    #[error("incompatible state database; reinstall Silo and explicitly wipe its state before retrying: {source}")]
+    StateDatabaseIncompatible {
+        #[source]
+        source: sqlx::migrate::MigrateError,
+    },
     #[error("network secret slot {slot:?}, store key {key:?}: {code}")]
     SecretResolution {
         slot: String,
@@ -253,6 +298,8 @@ impl LibVmError {
                 | Self::InvalidOwnedPath { .. }
                 | Self::CorruptState { .. }
                 | Self::StateDecode { .. }
+                | Self::InvalidStorageRecord { .. }
+                | Self::Storage(crate::storage::StorageError::Bound(_))
                 | Self::NetworkRuntime { .. }
                 | Self::MonitorConnection { .. }
                 | Self::MonitorProtocol { .. }
@@ -267,6 +314,21 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::LiveOperationUnsupported { .. } => "LiveOperationUnsupported",
+            Self::LiveDiscovery { .. } => "LiveDiscovery",
+            Self::LiveProtocol { .. } => "LiveProtocol",
+            Self::LiveObservation { .. } => "LiveObservation",
+            Self::Storage(_) => "Storage",
+            Self::OverlayBootQualification(_) => "OverlayBootQualification",
+            Self::OverlayBackendUnsupported { .. } => "OverlayBackendUnsupported",
+            Self::FlatOverlayPublicationUnsupported => "FlatOverlayPublicationUnsupported",
+            Self::UpperFormat(_) => "UpperFormat",
+            Self::Changeset(_) => "Changeset",
+            Self::Namespace(_) => "Namespace",
+            Self::Task(_) => "Task",
+            Self::InvalidStorageRecord { .. } => "InvalidStorageRecord",
+            Self::CacheDependency { .. } => "CacheDependency",
+            Self::StateDatabaseIncompatible { .. } => "StateDatabaseIncompatible",
             Self::SecretResolution { .. } => "SecretResolution",
             Self::MissingNetworkSecrets { .. } => "MissingNetworkSecrets",
             Self::HomeUnavailable => "HomeUnavailable",

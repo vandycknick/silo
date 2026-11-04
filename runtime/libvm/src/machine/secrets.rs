@@ -54,7 +54,7 @@ mod tests {
     async fn scoped_secret_mutations_use_the_runtime_store_and_exclude_removal() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("input.raw");
-        std::fs::write(&disk, b"stopped fixture").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let runtime = Runtime::open(
             crate::paths::LocalPaths::new(home.path().join("home")),
             RuntimeNetworkingConfig::default(),

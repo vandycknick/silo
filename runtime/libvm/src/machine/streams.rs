@@ -182,13 +182,14 @@ impl AsyncRead for MachineFileDownload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMonitorStatus {
     pub machine_id: String,
-    /// Launch generation, never the monitor instance ID. None denotes an older monitor.
+    /// Exact mandatory launch generation, never the monitor instance ID.
     pub run_id: Option<MachineRunId>,
     pub name: String,
     pub monitor: MachineMonitorSnapshot,
     pub vm: MachineVmSnapshot,
     pub readiness: MachineReadinessState,
     pub agent: MachineAgentStatus,
+    pub live: vm_spec::live::LiveMachineReport,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMonitorSnapshot {
@@ -461,6 +462,9 @@ pub struct MachineMetricSnapshot {
     pub block_devices: Vec<MachineBlockDeviceMetrics>,
     /// Last guest page-cache reclaim run by the agent, once it has run.
     pub memory_reclaim: Option<MachineMemoryReclaimReport>,
+    /// Writable upper accounting and actual `/tmp` backing for managed roots.
+    /// Shared lower logical bytes are not host physical allocation.
+    pub root_storage: Option<MachineRootStorageMetrics>,
 }
 /// One guest memory reclaim run, as the agent reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +522,53 @@ pub struct MachineFilesystemMetrics {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub available_bytes: u64,
+}
+/// Managed root identity; opaque raw roots retain ordinary filesystem metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineRootStorageKind {
+    LinuxFlatOverlayV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineTemporaryDirectoryKind {
+    Upper,
+    Tmpfs,
+    Other,
+}
+
+/// One upper's capacity. Never add this to overlay `/` filesystem totals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineRootStorageMetrics {
+    pub kind: MachineRootStorageKind,
+    pub upper_profile: String,
+    pub upper_uuid: String,
+    pub upper_backing_bytes: u64,
+    pub upper_filesystem_bytes: u64,
+    pub unusable_tail_bytes: u64,
+    pub filesystem_overhead_bytes: u64,
+    pub upper_usable_bytes: u64,
+    pub upper_used_bytes: u64,
+    pub upper_free_bytes: u64,
+    pub upper_available_bytes: u64,
+    pub upper_total_inodes: u64,
+    pub upper_free_inodes: u64,
+    pub upper_available_inodes: u64,
+    /// Logical length of the immutable shared lower, not allocated host bytes.
+    pub shared_lower_logical_bytes: u64,
+    pub temporary_directory: MachineTemporaryDirectoryMetrics,
+}
+
+/// Observed `/tmp` state, which image-owned init can change after boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineTemporaryDirectoryMetrics {
+    pub kind: MachineTemporaryDirectoryKind,
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub available_bytes: u64,
+    /// Unknown for an unclassified image-owned mount.
+    pub persistent: Option<bool>,
+    pub memory_charged: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineNetworkInterfaceMetrics {
@@ -1085,6 +1136,8 @@ protocol_enum!(failure_policy, ProvisionFailurePolicy => MachineAgentProvisionFa
 impl TryFrom<v1::HostStatus> for MachineMonitorStatus {
     type Error = String;
     fn try_from(value: v1::HostStatus) -> Result<Self, Self::Error> {
+        let live =
+            crate::machine::live::report_from_status(&value).map_err(|error| error.to_string())?;
         Ok(Self {
             machine_id: canonical_uuid(value.machine_id, "machine_id")?,
             run_id: value
@@ -1100,6 +1153,7 @@ impl TryFrom<v1::HostStatus> for MachineMonitorStatus {
             vm: required(value.vm, "vm")?.try_into()?,
             readiness: required(value.readiness, "readiness")?.try_into()?,
             agent: required(value.agent, "agent")?.try_into()?,
+            live,
         })
     }
 }
@@ -1549,6 +1603,7 @@ impl TryFrom<v1::MetricSnapshot> for MachineMetricSnapshot {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             memory_reclaim: value.memory_reclaim.map(TryInto::try_into).transpose()?,
+            root_storage: value.root_storage.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -1663,6 +1718,104 @@ impl TryFrom<v1::FilesystemMetrics> for MachineFilesystemMetrics {
             total_bytes,
             used_bytes,
             available_bytes,
+        })
+    }
+}
+
+impl TryFrom<v1::RootStorageMetrics> for MachineRootStorageMetrics {
+    type Error = String;
+
+    fn try_from(value: v1::RootStorageMetrics) -> Result<Self, Self::Error> {
+        protocol::validate_root_storage_metrics(&value)?;
+        Ok(Self {
+            kind: MachineRootStorageKind::LinuxFlatOverlayV1,
+            upper_profile: required(value.upper_profile, "metrics.root_storage.upper_profile")?,
+            upper_uuid: required(value.upper_uuid, "metrics.root_storage.upper_uuid")?,
+            upper_backing_bytes: required(
+                value.upper_backing_bytes,
+                "metrics.root_storage.upper_backing_bytes",
+            )?,
+            upper_filesystem_bytes: required(
+                value.upper_filesystem_bytes,
+                "metrics.root_storage.upper_filesystem_bytes",
+            )?,
+            unusable_tail_bytes: required(
+                value.unusable_tail_bytes,
+                "metrics.root_storage.unusable_tail_bytes",
+            )?,
+            filesystem_overhead_bytes: required(
+                value.filesystem_overhead_bytes,
+                "metrics.root_storage.filesystem_overhead_bytes",
+            )?,
+            upper_usable_bytes: required(
+                value.upper_usable_bytes,
+                "metrics.root_storage.upper_usable_bytes",
+            )?,
+            upper_used_bytes: required(
+                value.upper_used_bytes,
+                "metrics.root_storage.upper_used_bytes",
+            )?,
+            upper_free_bytes: required(
+                value.upper_free_bytes,
+                "metrics.root_storage.upper_free_bytes",
+            )?,
+            upper_available_bytes: required(
+                value.upper_available_bytes,
+                "metrics.root_storage.upper_available_bytes",
+            )?,
+            upper_total_inodes: required(
+                value.upper_total_inodes,
+                "metrics.root_storage.upper_total_inodes",
+            )?,
+            upper_free_inodes: required(
+                value.upper_free_inodes,
+                "metrics.root_storage.upper_free_inodes",
+            )?,
+            upper_available_inodes: required(
+                value.upper_available_inodes,
+                "metrics.root_storage.upper_available_inodes",
+            )?,
+            shared_lower_logical_bytes: required(
+                value.shared_lower_logical_bytes,
+                "metrics.root_storage.shared_lower_logical_bytes",
+            )?,
+            temporary_directory: required(
+                value.temporary_directory,
+                "metrics.root_storage.temporary_directory",
+            )?
+            .try_into()?,
+        })
+    }
+}
+
+impl TryFrom<v1::TemporaryDirectoryMetrics> for MachineTemporaryDirectoryMetrics {
+    type Error = String;
+
+    fn try_from(value: v1::TemporaryDirectoryMetrics) -> Result<Self, Self::Error> {
+        protocol::validate_temporary_directory_metrics(&value)?;
+        let kind = match value
+            .kind
+            .and_then(|kind| v1::TemporaryDirectoryKind::try_from(kind).ok())
+        {
+            Some(v1::TemporaryDirectoryKind::Upper) => MachineTemporaryDirectoryKind::Upper,
+            Some(v1::TemporaryDirectoryKind::Tmpfs) => MachineTemporaryDirectoryKind::Tmpfs,
+            Some(v1::TemporaryDirectoryKind::Other) => MachineTemporaryDirectoryKind::Other,
+            _ => return Err("metrics.root_storage.temporary_directory.kind is invalid".to_string()),
+        };
+        Ok(Self {
+            kind,
+            capacity_bytes: required(
+                value.capacity_bytes,
+                "metrics.temporary_directory.capacity_bytes",
+            )?,
+            used_bytes: required(value.used_bytes, "metrics.temporary_directory.used_bytes")?,
+            free_bytes: required(value.free_bytes, "metrics.temporary_directory.free_bytes")?,
+            available_bytes: required(
+                value.available_bytes,
+                "metrics.temporary_directory.available_bytes",
+            )?,
+            persistent: value.persistent,
+            memory_charged: value.memory_charged,
         })
     }
 }
@@ -1826,7 +1979,7 @@ impl TryFrom<v1::WaitReadyResponse> for MachineReadiness {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::machine::streams::*;
 
     struct ErrorAfterChunk(bool);
 
@@ -1854,6 +2007,23 @@ mod tests {
 
     fn status() -> v1::HostStatus {
         v1::HostStatus {
+            live: Some(
+                vm_spec::live::LiveMachineReport {
+                    schema_version: 1,
+                    scope: vm_spec::live::LiveScope::Machine,
+                    machine_id: "00000000-0000-4000-8000-000000000001".into(),
+                    run_id: "00000000-0000-4000-8000-000000000003".into(),
+                    monitor_id: "00000000-0000-4000-8000-000000000002".into(),
+                    backend: vm_spec::live::LiveBackend::Mock,
+                    lane: vm_spec::live::LiveLane::NotApplicable,
+                    topology_revision: 1,
+                    live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                        vm_spec::live::LiveReasonCode::BackendExcluded,
+                    ),
+                }
+                .try_into()
+                .unwrap(),
+            ),
             run_id: Some("00000000-0000-4000-8000-000000000003".into()),
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
@@ -1893,6 +2063,7 @@ mod tests {
                         stale_reason: Some(v1::StaleReason::ReceiptAge as i32),
                         report: Some(v1::AgentStatusReport {
                             ssh: None,
+                            lifecycle: None,
                             observed_at: Some(timestamp()),
                             state: Some(v1::AgentStatusState::Ready as i32),
                             code: Some("ready".to_string()),
@@ -2034,9 +2205,9 @@ mod tests {
     }
     #[test]
     fn status_run_identity_is_validated_without_substituting_monitor_identity() {
-        let mut legacy = status();
-        legacy.run_id = None;
-        assert_eq!(MachineMonitorStatus::try_from(legacy).unwrap().run_id, None);
+        let mut missing = status();
+        missing.run_id = None;
+        assert!(MachineMonitorStatus::try_from(missing).is_err());
         let mut invalid = status();
         invalid.run_id = Some("not-a-run".into());
         assert!(MachineMonitorStatus::try_from(invalid)
@@ -2167,6 +2338,7 @@ mod tests {
                             compacted: Some(true),
                             runs: Some(3),
                         }),
+                        root_storage: Some(root_metrics()),
                     }),
                 }),
                 agent_instance_id: Some("00000000-0000-4000-8000-000000000003".to_string()),
@@ -2203,6 +2375,25 @@ mod tests {
         assert_eq!(snapshot.filesystems.len(), 1);
         assert_eq!(snapshot.network_interfaces.len(), 1);
         assert_eq!(snapshot.block_devices.len(), 1);
+        let root = snapshot.root_storage.expect("root storage");
+        assert_eq!(root.upper_backing_bytes, 134_221_824);
+        assert_eq!(root.upper_filesystem_bytes, 134_217_728);
+        assert_eq!(root.unusable_tail_bytes, 4096);
+        assert_eq!(root.filesystem_overhead_bytes, 8_388_608);
+        assert_eq!(root.upper_usable_bytes, 125_829_120);
+        assert_eq!(root.upper_used_bytes, 83_886_080);
+        assert_eq!(root.upper_free_bytes, 41_943_040);
+        assert_eq!(root.upper_available_bytes, 33_554_432);
+        assert_eq!(root.upper_total_inodes, 8192);
+        assert_eq!(root.upper_free_inodes, 0);
+        assert_eq!(root.upper_available_inodes, 0);
+        assert_eq!(root.shared_lower_logical_bytes, 4_831_838_208);
+        assert_eq!(
+            root.temporary_directory.kind,
+            MachineTemporaryDirectoryKind::Tmpfs
+        );
+        assert_eq!(root.temporary_directory.persistent, Some(false));
+        assert_eq!(root.temporary_directory.memory_charged, Some(true));
     }
 
     #[test]
@@ -2290,5 +2481,95 @@ mod tests {
                 .expect("aborted producer closes request stream")
                 .is_none()
         );
+    }
+    fn root_metrics() -> v1::RootStorageMetrics {
+        v1::RootStorageMetrics {
+            kind: Some(v1::RootStorageKind::LinuxFlatOverlayV1 as i32),
+            upper_profile: Some("silo-upper-ext4-v1".into()),
+            upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
+            upper_backing_bytes: Some(134_221_824),
+            upper_filesystem_bytes: Some(134_217_728),
+            unusable_tail_bytes: Some(4096),
+            filesystem_overhead_bytes: Some(8_388_608),
+            upper_usable_bytes: Some(125_829_120),
+            upper_used_bytes: Some(83_886_080),
+            upper_free_bytes: Some(41_943_040),
+            upper_available_bytes: Some(33_554_432),
+            upper_total_inodes: Some(8192),
+            upper_free_inodes: Some(0),
+            upper_available_inodes: Some(0),
+            shared_lower_logical_bytes: Some(4_831_838_208),
+            temporary_directory: Some(v1::TemporaryDirectoryMetrics {
+                kind: Some(v1::TemporaryDirectoryKind::Tmpfs as i32),
+                capacity_bytes: Some(1_048_576),
+                used_bytes: Some(4096),
+                free_bytes: Some(1_044_480),
+                available_bytes: Some(1_044_480),
+                persistent: Some(false),
+                memory_charged: Some(true),
+            }),
+        }
+    }
+
+    #[test]
+    fn root_metrics_conversion_rejects_incomplete_overflow_and_unknown_kinds() {
+        let mutations: &[fn(&mut v1::RootStorageMetrics)] = &[
+            |value| value.kind = Some(999),
+            |value| value.upper_used_bytes = Some(u64::MAX),
+            |value| value.upper_free_bytes = None,
+            |value| value.unusable_tail_bytes = Some(0),
+            |value| value.temporary_directory = None,
+        ];
+        for mutation in mutations {
+            let mut root = root_metrics();
+            mutation(&mut root);
+            assert!(MachineRootStorageMetrics::try_from(root).is_err());
+        }
+        let mut temporary = root_metrics().temporary_directory.unwrap();
+        temporary.kind = Some(999);
+        assert!(MachineTemporaryDirectoryMetrics::try_from(temporary).is_err());
+    }
+
+    #[test]
+    fn root_metrics_conversion_preserves_existing_freshness_and_identity_frame() {
+        for freshness in [v1::Freshness::Fresh, v1::Freshness::Stale] {
+            let wire = v1::AgentMetricsObservation {
+                agent_instance_id: Some("00000000-0000-4000-8000-000000000003".into()),
+                received_at: Some(timestamp()),
+                stale_at: Some(timestamp()),
+                freshness: Some(freshness as i32),
+                stale_reason: Some(v1::StaleReason::ReceiptAge as i32),
+                report: Some(v1::AgentMetricReport {
+                    observed_at: Some(timestamp()),
+                    snapshot: Some(v1::MetricSnapshot {
+                        root_storage: Some(root_metrics()),
+                        ..Default::default()
+                    }),
+                }),
+            };
+            let converted = MachineAgentMetricsObservation::try_from(wire).unwrap();
+            assert_eq!(
+                converted.agent_instance_id,
+                "00000000-0000-4000-8000-000000000003"
+            );
+            assert_eq!(
+                converted.freshness,
+                if freshness == v1::Freshness::Fresh {
+                    MachineFreshness::Fresh
+                } else {
+                    MachineFreshness::Stale
+                }
+            );
+            assert_eq!(converted.stale_reason, Some(MachineStaleReason::ReceiptAge));
+            assert_eq!(
+                converted
+                    .report
+                    .snapshot
+                    .root_storage
+                    .unwrap()
+                    .unusable_tail_bytes,
+                4096
+            );
+        }
     }
 }

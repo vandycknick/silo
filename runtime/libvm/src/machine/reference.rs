@@ -83,7 +83,7 @@ pub(crate) fn validate_machine_name(name: &str) -> Result<(), LibVmError> {
     })
 }
 
-pub(crate) fn validate_new_machine_name(name: &str) -> Result<(), LibVmError> {
+pub fn validate_new_machine_name(name: &str) -> Result<(), LibVmError> {
     let bytes = name.as_bytes();
     if bytes.len() <= 63
         && bytes

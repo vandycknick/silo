@@ -87,6 +87,505 @@ println!("run {} ended: {:?}", start.run_id, exit.outcome);
 `MachineRetention::Ephemeral` permits a lifecycle owner to attempt removal after
 the run exits. Cleanup is best effort and is not persisted or retried.
 
+Each launch registers one retained storage operation for its exact machine, run
+and storage generation before reading backing contents. Its shared lease follows
+the monitor and attachment-owning worker; cancelling startup does not remove the
+durable pins. Restart, removal and private-disk replacement require every
+registered holder to be terminal, an independently opened exclusive lease, and
+transactional lifecycle/storage reconciliation. A missing monitor or free lease
+alone is not permission to reuse the disks. Missing or malformed admitted holder
+records fail closed; only a provably pre-attachment startup failure can retire
+without one.
+
+Startup failure cleanup also waits for actual registered-holder termination and
+exclusive-lease reconciliation before recording the terminal failure. A bounded
+timeout retains the operation pins and reports incomplete cleanup; it never
+converts a still-owned generation into reusable storage.
+
+Machine-owned directories are derived from the current catalog home and typed
+machine ID, not persisted absolute directory authority. Moving an entire
+current-format stopped home therefore changes the owned path without prefix
+rewrites or data migrations. Explicit external disks and shares remain external
+resources and are not rebased.
+
+`MachineData.storage.stop_outcome` is independent of lifecycle status. Storage
+is `clean` only for the expected run's clean outer exit record with all three
+version-1 shutdown facts: guest protocol completion, host flush completion and
+attachment closure. Valid forced/error exits remain `forced`; missing, stale,
+malformed or incomplete evidence becomes `unknown` after liveness is ruled out.
+Writable external disks/shares retain their existing VM support but do not gain
+all-writer certification merely from a Silo operation lease. The exact launch
+inventory, including read-only generated shares, is injected into the guest and
+sent to the monitor as one trusted context.
+
+Read-only inspect projects terminal lifecycle and storage outcome together from
+the same expected-run exit evidence after registered holders are terminal. This
+does not write lifecycle/storage rows or retire operation pins. Destructive
+operations still require exclusive-lease admission and atomic durable
+reconciliation. Force stop waits within its timeout for that complete
+holder/lease reconciliation after monitor termination, rather than treating the
+monitor's death as completion or reporting a live retained generation as absent.
+
+## Stopped Snapshot Retention And Identity
+
+Stopped-storage snapshots are immutable opaque-raw checkpoints, not execution
+checkpoints. Their current schema-1 record includes complete configured semantics,
+ordered included disk streams and maps, exact pinned next-boot assets, external
+resource requirements, and the actual `clean`, `forced`, or `unknown` stop outcome.
+Capture preserves guest bytes, including credentials, filesystem identities,
+journals and deleted-data remnants; it does not sanitize or repair them. Host
+machine identity, source paths, display names and timestamps are not identity
+inputs. Development flat-overlay roots are eligible for local stopped fork only,
+not snapshot publication.
+
+The snapshot ID is SHA-256 of `silo:snapshot:v1\n` followed by the RFC 8785
+canonical record. The serialized byte-object digest is separate. Canonical
+records reject duplicate or unknown properties, floating point, unsafe integers,
+and malformed Unicode. Property ordering uses UTF-16 code units, including user
+configuration keys, without Unicode normalization.
+
+`SnapshotStore` resolves immutable `image:sha256:HEX` references and shared
+`image:NAME` aliases. An unnamed snapshot has its own persistent retention root.
+`remove_alias(NAME)` removes only a name; `release_retention(reference)` releases
+only explicit retention. Either an alias or explicit retention keeps the artifact
+rooted. Neither operation recursively deletes shared objects. A restore registers
+its complete consumer closure before reading artifact bytes, so removing the last
+public root cannot race away an in-flight restore's disk maps, raw backing, or
+boot objects. After child publication, only its actual boot/read-only dependencies
+remain; its private writable disks do not depend on the source snapshot.
+
+Catalog reads fetch only immutable row/dependency facts inside the read
+transaction. JSON decoding, canonicalization and identity authentication occur
+after it ends; mutation and consumer admission then recheck the same facts under
+short coordination.
+
+Abandoned child recovery binds its exclusivity proof to the acquired operation
+OFD's indexed device/inode, not merely the lease pathname. An uncommitted child
+transitions from `committing` to `cleaning` before an atomic no-replace detach to
+`machines/.retiring-<operation>`. Recursive deletion, parent synchronization and
+fresh destination credential cleanup run outside roots and SQL while retaining
+the exclusive OFD and catalog capability. Recovery recognizes the original or
+quarantine name after interruption, then rechecks durable absence before retiring
+pins. Traversal stays bound to the verified open directory, with no-follow parent
+entry identity checks before traversal and final directory unlink; it never
+reopens a mutable quarantine name to select the tree. Quarantine entries are not
+configurable resources, including a reserved spelling that symlinks outside the
+catalog. Reservation is checked lexically before resource symlink resolution.
+New disks/shares or containing mounts cannot intersect a cleaning candidate; an
+existing external reference instead defers cleanup before detachment.
+
+## Live Capability Admission
+
+`vm_spec::live` defines five fixed operations (`pause`, `capture`, `restore`,
+`fork`, `incremental`) and the closed typed refusal reasons. Host reports describe
+the frozen prospective backend selection; machine reports describe the actual
+backend of a specific machine/run/monitor/topology. Missing fields, unknown
+enums, invalid scopes and malformed typed subjects are errors, not old-monitor
+defaults.
+Tagged JSON alternatives must also reject extra fields: `supported` cannot carry
+a reason, and unit device subjects cannot carry a guest-profile or other payload.
+Durable machine IDs keep their existing compact display; live reports and
+monitor IDs use canonical hyphenated UUIDs. Durable-to-live machine fencing
+compares UUID identity, while monitor outer IDs and live run/monitor fencing
+remain exact.
+
+`LiveCapabilityQuery` performs discovery without opening writable runtime state.
+`LiveObservationReader` performs explicit read-only catalog lookup and run status
+observation. Observation may take read-coordination locks and send `GetStatus`.
+Read-only means unchanged logical database contents and persisted machine/runtime
+state; ordinary SQLite-native WAL/SHM coordination is permitted, so sidecar bytes
+and existence are not the read-only invariant. The SQLx observer uses read-only,
+query-only, no-create-main access with a shared native catalog guard and a close
+barrier. It must not initialize missing state, invoke writable application
+recovery or migrations, mutate logical records, or reserve operation resources.
+Planning uses the same logical read-only SQLite mode but retains an exclusive
+catalog guard to exclude cooperating writers; WAL presence alone is not refusal.
+
+Machine live operations consume an opaque `MachineLiveObservation`; restore
+consumes prospective host evidence. Their first step refuses unsupported
+operations before new operational locks, leases, budget permits, workspace/child
+allocation or lifecycle RPC. This release's endpoints are typed refusals, not
+checkpoint-success placeholders. Positive scenario reports cannot grant a
+successful undelivered manager operation. Production qualification belongs to
+the compiled, actual-revision-bound monitor, never `SILO_HOME`, SQLite or an
+environment grant.
+Observable build-input fingerprints and declared feature fingerprints are not
+gate evidence or actual dependency-feature observations. Until the native
+provider supplies actual compiled build facts, qualification is categorically
+ineligible, even if a record otherwise matches.
+
+## Durable Storage Model
+
+This storage release is a hard break. Reinstall Silo and explicitly wipe all
+previous Silo state before using it. An incompatible database is refused with
+a reinstall/wipe diagnostic; the runtime never deletes user state to make it fit.
+There is no upgrade, root conversion, or old-cache adoption path.
+
+By default new machines own a private `root.raw` disk. SQLite records closed root,
+boot, storage-profile and backend variants, relative private paths, geometry,
+ownership epoch and storage stop outcome. `MachineData::storage` exposes that
+typed meaning. Source manifest/config references are provenance; retained lower
+stream identities, not source tags or descriptor text, are GC dependencies.
+
+Private machine directories are derived from the currently opened catalog home
+and typed machine ID (`<home>/machines/<id>`). Machine configuration does not
+persist an absolute `machineDir`; configuration, inventory, rootfs and read-only
+observation lookups all use that same current-home derivation. Moving a closed
+current-format home therefore requires no catalog rewrite. Absolute external
+resources remain external dependencies, not relocation hints.
+
+`MachineData::external_resources` derives typed external-disk and share mappings
+from the current durable VM specification. They are never promoted to owned
+storage or evidence that a machine is self-contained; active operations retain
+their exclusion constraints independently of the machine row.
+
+Each managed launch durably pins its resolved storage generation before backing
+verification or attachment work. One operation UUID and one shared-flock open
+file description protect the entire closure, including retained streams,
+boot objects, semantic layer dependencies and private/external attachment
+constraints. Parent and child duplicates close independently without explicitly
+unlocking; the stable `images/locks/leases/<operation-id>.lease` inode is never
+removed by cleanup. Cancellation leaves the durable root for recovery rather
+than attempting asynchronous database work from a destructor.
+
+Image and layer producers register their operation before slow work, then add
+each published stream/object dependency while still owning that publication's
+roots guard. A staging operation row alone never retains unregistered published
+outputs. Disposable per-file staging uses publication locks solely to protect
+unpublished temporary directories; these are not generation leases or GC roots.
+
+Local collection discovers at most 256 immutable candidates per batch, then
+rechecks semantic reachability, external-resource constraints and nonblocking
+lease state under roots coordination. Its blocking owner retains the catalog,
+deletion authorization and directory descriptors through unlink, directory sync
+and commit, even if the async caller cancels. Unknown busy leases and missing,
+unsafe or replaced operation lease inodes block destructive recovery. A free
+lease alone never retires a launch: exact-generation holder terminality and
+lifecycle/storage-outcome reconciliation are required first.
+
+### Opt-in development flat overlay
+
+`MachineBuilder::root_profile(RootProfile::LinuxFlatOverlayV1)` explicitly selects
+an immutable OCI-derived ext4 lower and a freshly formatted private `upper.raw`.
+`RootProfile::OpaqueRaw` remains the default. `root_disk_size(bytes)` selects upper
+backing capacity for overlay roots, defaulting to 4 GiB; the admitted envelope is
+64 MiB through 1 TiB, aligned to 4096 bytes. Backing length, achieved ext4 span,
+unusable short-group tail, filesystem overhead and usable bytes are distinct.
+
+Every upper has a new UUID. Creation holds the materialization lease until the
+machine and lower retention root commit together. Pruning image references does
+not remove a machine's retained lower. Start never resolves the image source
+again. It regenerates a bounded read-only `lower.vmdk` for the current home,
+preflights descriptor/record/FD bounds before authenticating lower bytes, and
+retains closure ownership through startup or completed failure cleanup. The
+running machine's semantic root remains the durable retention root. Worker-FD
+lease transfer and certified storage shutdown belong to the later lifecycle gate.
+
+Only the exact qualified kernel/init/native-monitor/profile/architecture/krun
+tuple is admitted. VZ, mock, non-Linux descriptor execution and unqualified
+artifacts fail before materialization or launch effects. Admission retains opened
+boot artifacts. Launch copies and hashes the kernel and base initramfs from those
+same descriptors, never reopening the original paths. On Linux it rechecks and
+executes the retained native ELF through `/proc/self/fd/N`, keeping the descriptor
+CLOEXEC in the parent and owned through startup acknowledgement. Worker reexec
+uses `/proc/self/exe`, so atomic runtime restaging cannot switch the already-loaded
+monitor's worker binary. No native executable copy is made per start. Managed
+staging publishes a complete sibling tree by atomic rename/exchange, rather than
+rewriting the live ELF. These guarantees do not promise protection against hostile
+same-UID in-place writers. Root bootstrap is appended independently of agent injection;
+the overlay root marker and fixed serials cannot be replaced by root arguments.
+There is no automatic raw fallback.
+
+Stopped `MachineUpdate::root_disk_size(bytes)` publishes a replacement private
+upper generation, preserving its old byte prefix, UUID and journal state.
+The host changes no ext4 metadata; init replays and grows upperfs at next boot.
+Shrink and active attachment resize are refused. `/tmp` remains disk-backed;
+`temporary_directory(TemporaryDirectoryPolicy::Tmpfs { capacity_bytes })` selects
+a sized tmpfs at create or stopped update, and `DiskBacked` removes that selection
+on the next boot without deleting previously hidden disk contents.
+
+After stop removes a machine's runtime tree, stopped storage or `/tmp` policy
+updates recreate it through the same owned-directory admission used by start,
+with mode `0700` before opening the lifetime lock. Lock-file opening never creates
+parent directories using ambient umask permissions. An existing unsafe directory
+is refused unchanged; settings updates do not repair its permissions or user data.
+
+Private copies use exclusive destination creation through every reflink/copy
+fallback; an existing destination is never truncated or removed. Before catalog
+publication begins, dropping a replacement removes only its unpublished file.
+Immediately before the asynchronous SQLite write, ownership changes to
+conservative retention: requester cancellation or runtime shutdown may leave the
+COMMIT outcome unknown, so both complete generations remain. A returned failure
+removes the candidate only after a completed semantic reread, under the retained
+machine/lifetime locks, proves that the catalog does not reference it. Confirmed
+success removes the old generation. Creation uses the same preserve-before-write
+boundary for its machine directory. This favors retained unreferenced bytes over
+a catalog root pointing at a deleted file; no uncertain publication is silently
+treated as a confirmed rollback.
+
+### Stopped forks and checkpoints
+
+`Machine::fork_stopped(ForkOptions)` creates a new **stopped** machine from an
+opaque raw root or an admitted development flat-overlay root.
+`Machine::snapshot_stopped(SnapshotOptions)` captures an immutable opaque-raw
+checkpoint; `Runtime::restore_snapshot(SnapshotRef, RestoreOptions)` restores it
+to a new **stopped** machine. None of these APIs stops or starts a source, replays
+a journal, repairs a filesystem, resizes captured bytes, or rewrites guest UUIDs,
+machine IDs or keys. The source's actual reconciled Clean/Forced/Unknown outcome
+is retained; synchronizing files now cannot certify an earlier clean shutdown.
+
+All managed writable Data disks are included and become independent private
+files with fresh host disk IDs. Read-only and pinned boot dependencies remain
+retained. Hardware, process (including unset versus empty commands), guest/user,
+userdata, environment, temporary-directory policy, labels and network intent
+are preserved. Host machine/name/lock, SSH CA, run and network endpoint identities
+are new; source runtime files and external secret scopes are not copied.
+
+External disks and shares are refused by default. `RequireMappings` explicitly
+omits their bytes and records required destination resources; such a child
+cannot start until those resources have explicit mappings. Fork/restore accept
+`Map { mappings }`, keyed by full attachment ordinal or share tag, without
+claiming ownership or self-contained storage for the mapped host resources.
+Snapshot creation accepts omission-as-requirements, not destination mappings.
+No host directory tree is implicitly imported.
+
+Stopped child publication requires catalog-owned secret-scope recovery.
+An explicit `Runtime::with_secret_store` override is refused before fork/restore
+effects because an arbitrary external store has no durable child-scope recovery
+contract. This does **not** reject the existing guest secret-provider feature:
+`with_secret_provider` and configured policy/secret-slot intent remain supported,
+and the normal CLI FileStore/provider path is unchanged. Ordinary create/start
+support for custom stores is unchanged. Snapshot creation allocates no child
+secret scope and is not subject to this child-publication restriction.
+
+Private copies use an operation-local qualified clone when available, otherwise
+fixed-length, sparse streaming with independent destination verification.
+The blocking worker retains source descriptors, writer fences, catalog access,
+operation pins and staging through real completion even if its async waiter is
+cancelled. File and directory durability precede catalog visibility. An uncertain
+SQLite result preserves the owned candidate and its recorded operation identity
+for exact reconciliation, not speculative rollback.
+
+Checkpoints preserve credentials, guest keys, dirty journals and deleted-data
+remnants exactly. They are not automatically generalized or safe public
+templates. Prepare a separate private fork explicitly before publishing prepared
+bytes. Execution operations remain separate: `fork_execution`,
+`restore_execution` and explicit CLI live intent retain the not-delivered refusal.
+
+Flat-overlay roots are development artifacts, not publishable/snapshot images.
+Capture refuses them with `FlatOverlayPublicationUnsupported`; live capability
+bits remain unsupported. This profile is removed rather than migrated when its
+replacement is admitted. Existing state still requires an explicit user wipe.
+
+
+The initial stream hash of a private root describes its creation bytes only.
+It does not certify current contents after writable execution or resizing.
+Cached source streams are separately verified immutable files. Ordinary creation
+still selects installed boot assets. Stopped fork and snapshot capture resolve the
+configured **next** boot once and ingest the exact kernel, base initramfs and optional
+agent into the immutable object pool. Already pinned bundles retain their exact
+closure. Capture does not change source boot selection or claim the assets used by
+an earlier run. Captured children launch from authenticated pinned objects even if
+source-private files or installed defaults are replaced or removed; missing or
+incompatible pins fail rather than selecting new defaults. Authenticated source
+descriptors remain owned through qualification and checked kernel/composite
+generation; launch never reopens a verified pool pathname to read its kernel,
+base initramfs or agent. Each launch regenerates
+the composite bootstrap with the child's fresh machine/run configuration, never
+copies the source composite. Only the admitted same-host Linux krun direct-boot
+profiles are supported; EFI, macOS and cross-lane bundles are refused before
+staging. This does not add global boot-asset updates or enable another backend.
+
+Acknowledged catalog writes use SQLite WAL with synchronous `FULL` and
+`fullfsync` enabled. Database identity checks use path metadata, never a raw
+database/WAL/shared-memory descriptor. Writable pools retain a shared
+`catalog.lock` guard; SQLite also owns it through native connection teardown,
+including cancelled connection setup and asynchronous worker shutdown. A
+reserved collation carries that ownership, and database-touching PRAGMAs run
+only after it is installed. No-write planning retains exclusive catalog access
+and uses ordinary SQLite read-only/query-only/no-create-main connections. SQLite
+may coordinate its WAL/SHM files; their presence alone is not an error. Planning
+does not delete sidecars, invoke writable application recovery, or fall back to
+another reader mode. Native guard ownership survives connection teardown.
+Driver/SQLite upgrades must requalify this ordering.
+Store and detached filesystem workers also own an explicit clone of the writable
+catalog capability. Closing the SQL pool or cancelling the awaiting task does not
+authorize a no-write opener while that worker can still mutate or clean up files.
+
+Writable startup attempts cache recovery. Safely retained work blocked by an
+active lease or explicit external dependency is reported as deferred cleanup;
+those bytes and pending jobs remain intact without stranding private roots.
+Corruption, unsafe publication state and failed durable recovery transactions
+remain typed startup failures. Explicit image pruning reports dependency or
+cleanup failures to its caller.
+
+## Immutable Storage Primitives
+
+`storage::identity::ObjectDigest` identifies exact byte objects;
+`storage::identity::StreamId` identifies decoded logical streams. Both accept
+only `sha256:` plus 64 lowercase hexadecimal characters, but are deliberately
+different Rust types. A raw ext4 image is a stream, not a byte object.
+
+`StreamHasher` reuses one 8 MiB buffer. It hashes every nonzero chunk in full,
+including its zero regions and the shorter final chunk. Only an entirely zero
+chunk becomes `zero`; holes and allocated zeros have the same identity. Stream
+IDs hash `silo:stream:v1\n` followed by the exact RFC 8785 serialization of the
+closed v1 stream schema. The writer emits sorted ASCII keys and validated
+ASCII strings, with bounded exact integers, without a general-purpose JSON
+canonicalization dependency or an intermediate whole-map JSON allocation.
+
+`StoragePool::open` accepts the `images/` directory. Publication copies a
+quiesced regular source into private staging, preserves logical zero tails,
+verifies source metadata stability, synchronizes the read-only bytes, publishes
+under a stable identity lock and synchronizes the containing directories.
+Publication uses an atomic no-replace rename (`RENAME_NOREPLACE` on Linux,
+`RENAME_EXCL` on macOS), with no replacing-rename fallback.
+Existing same-ID content is verified rather than overwritten. Byte objects
+live in `images/objects/sha256/`; streams live in `images/streams/sha256/`.
+Managed directories are `0700`, staging files `0600`, and immutable bytes
+`0400`. Publication does not itself commit a catalog retention root.
+Catalog callers use `publish_stream_for_catalog` or `publish_object_for_catalog`
+and keep the returned root guard through the SQLite retention commit. Copying
+and full content verification happen before root coordination; final publication
+rechecks the verified inode so concurrent pruning cannot create a dangling row.
+
+`open_existing` and `verify_stream` support read-only reuse without creating
+directories or lock files. Verification opens relative to the validated stream
+directory and enforces immutable permissions, ownership, link count and exact
+stream identity, not merely readable bytes at a pathname.
+
+Registered operations hold their one shared generation lease before creating
+`tmp/<operation-uuid>`. Disposable pool and OCI staging instead use
+`tmp/stage-<uuid>` and the close-only publication lock
+`locks/publication/stage-<uuid>.lock`; they never acquire canonical generation
+leases or root published outputs. Recovery recognizes these two current roles
+directly and streams directory entries outside roots coordination.
+`scan_streams` discovers published files, including crash orphans, but never
+deletes them: catalog reachability, external dependencies and the GC journal
+decide deletion. `abandoned_temporary` returns only real directories whose
+corresponding existing lock can be acquired exclusively without waiting. Each
+candidate holds that lock through external-dependency preflight and optional
+`remove`; dropping a candidate without removing it leaves bytes for a retry.
+
+Root coordination and operation leases are explicit capabilities, not global
+state. Lease duplicates retain the open-file-description lock until the final
+descriptor closes; normal cleanup must never remove stable lock files. Database
+file identity uses path metadata only, without opening or closing a SQLite file
+descriptor. These are local storage building blocks, not snapshot or transport
+APIs. See [ADR 0014](../../docs/adr/0014-layered-oci-image-storage.md) for the
+normative identity, ownership and admission limits.
+
+`storage::limits` separates v1 format bounds from host capacity. Its pure
+`check_fd_budget` reserves 256 descriptors in addition to the `FLAT` records and
+reports required, soft and hard limits on failure. It neither queries nor raises
+process limits. The smaller laptop support envelope is not a format rejection;
+actual host reservations and start-time limit adjustment are separate concerns.
+
+## Lossless OCI Layer Artifacts
+
+The Phase2 ingest/compose implementation also supplies every fresh OCI-to-flat
+conversion, for both the default opaque-raw profile and the opt-in flat overlay.
+Acquired blobs pass the same bounded normalized ingestion and ordered namespace
+composition before the final tree is encoded; there is no legacy tar application
+fallback. This does not select a layered guest root, claim an EROFS encoder, or
+qualify a new kernel/init/backend tuple.
+
+Fresh flattening keeps one parsed layer at a time, applies the existing namespace
+kernel incrementally, and retains only live body references and their private
+packs. Zero-copy pack adoption transfers cleanup to the enclosing operation lease
+before releasing each child lease. Reclamation waits for the last hardlink name,
+and wholly unreferenced packs are removed before filesystem encoding.
+
+Flat encoding preserves raw pathname, symlink and xattr bytes, shared-inode
+hardlinks, source ownership/mode/mtime, directory/root metadata and admitted
+special inode/device types. Linux POSIX ACL xattr values are converted to ext4's
+on-disk ACL representation only at the filesystem codec boundary; capability and
+other opaque xattr values remain byte-exact. Sparse payloads stream only stored
+ranges, without reading or allocating their logical holes.
+
+The requested flat size is a minimum, defaulting to 512 MiB. Checked geometry
+accounts for unique live inode data, directory names, xattrs and the formatter's
+inode/extent/GDT/bitmap/journal overhead; a real dense image may therefore produce
+a lower larger than 2 GiB. Logical sparse-file length alone does not enlarge the
+artifact. The complete image remains bounded to 1 TiB. The current conversion
+identity is `flat-ext4-v2:normalized-phase2:minimum-size=536870912`, so an earlier
+lossy development artifact is never reused under this conversion. There is no
+old-state migration, cache repair, compatibility reader or automatic wipe.
+
+`oci::changeset::ingest_layer` returns an owned `StagedChangeset` only after
+independent transport size/digest checks, complete decoded `diff_id` verification,
+bounded tar/PAX/GNU/sparse parsing and structural validation. It never extracts
+onto the host filesystem. Local structural acceptance keeps hardlinks and parent
+symlink traversal unresolved; `namespace::compose` validates them against the
+ordered lower namespace. The same immutable layer can therefore succeed under
+different parents, or fail a particular composition without invalidating the layer.
+
+`storage::LayerStore` owns durable meaning:
+
+* `publish` consumes staged bytes, reuses the existing `StreamHasher`/pool for the
+  pack, and publishes canonical index and identity-record objects.
+* One insert-or-verify catalog transaction retains the recipe, result and exact
+  object dependencies. Different results cannot silently replace one recipe.
+  `retain_occurrences` separately preserves positions and duplicates.
+* `find_recipe` and `load` authenticate retained records, the complete pack stream
+  and index closure without source blobs. They use `open_existing`, never creating
+  missing directories or trusting catalog IDs without byte verification.
+* `compose` consumes authenticated results in occurrence order and returns neutral
+  inode/name/body-origin facts, not a host-extracted tree.
+
+The [normative changeset ABI](../../docs/adr/0014-layered-oci-image-storage.md#changeset-byte-abi)
+fixes exact JCS fields, domain-separated recipe/result IDs and deterministic
+entry/sparse descriptor trees. The index root and regular-body sparse top lists
+have at most 256 descriptors, with indirect nodes for larger valid indexes.
+This is not a 256-page layer limit or a fixed per-file sparse-map cap.
+OCI's `StreamIdentity` wire newtype has no byte-hashing constructor or implicit
+object-digest conversion; libvm remains the stream identity implementation.
+Applicable format limits have one authoritative OCI definition reused by libvm.
+The representation-neutral xattr admission charge is not actual ext4/EROFS size;
+resource preflight/allocation failures remain distinct from hard-format rejection.
+
+Encoding/copying/hashing run outside SQL/root critical sections. After publishing
+complete objects independently, `publish` rechecks every member under shared
+roots before committing its catalog closure. Recovery may remove an uncommitted
+member during the unlocked interval, forcing publication to fail rather than
+register a partial layer. Its blocking worker retains root/lease capabilities
+through registration and filesystem-bearing staged values through cleanup;
+only plain facts cross to async SQL work. Catalog access survives actual cleanup,
+including cancellation. Large composition and durability/removal are offloaded.
+
+Object recovery scans bounded batches with a reverse dependency index. It checks
+all persisted external resources, not just layer foreign keys, under exclusive
+roots and SQL deletion authorization. Those protections survive a cancelled
+caller until deletion finishes. A protected object defers its entire current
+batch and stops the remaining startup recovery pass, including subsequent stream
+cleanup; already completed independent batches may have been reclaimed.
+Startup reports the known-safe dependency deferral; explicit prune reports the
+dependency. Unsafe `0444` bytes fail immutable-path validation rather than being
+treated as valid `0400` content corruption or silently sanitized.
+
+Writable startup initializes empty pool coordination directories under its catalog
+capability before recovery scans immutable objects. A current-schema catalog and
+immutable-pool snapshot therefore need not copy `images/tmp`, `images/locks` or
+private machine/operation state. This does not relax `load`/`find_recipe`:
+read-side authentication never creates missing directories or bytes.
+
+The [changeset conformance guide](../oci/testdata/changesets/README.md) describes
+committed full-byte goldens, independent identities/oracle, real publication tests,
+pinned containerd extraction and producer-original metadata evidence. Synthetic,
+published-corpus and producer-original reports are separate. Pinned provenance for
+six builders is not a claim of admission or equality for all six: rejection,
+unavailable device/metadata extraction, root-policy differences and other
+non-equality remain explicit evidence. These reports do not waive the later
+default gate. The owner-approved source-profile exception admits an effective
+entry named **exactly `/` only when it is a directory**, preserving its root
+metadata and ordinal while storing the same explicit root form as `.`.
+Both spellings in one layer still fail duplicate normalized-path validation.
+The exception is not a broader absolute-path normalizer: non-directory `/`,
+`//`, `/./`, absolute children such as `/nix/...`, and absolute hardlink targets
+remain rejected. Qualification does not strip those paths or silently substitute
+another producer archive. Retained reports from before this source-profile
+correction remain historical evidence, not a current Kaniko admission verdict.
+
 ## Process Configuration
 
 `ProcessConfig` is durable desired process configuration stored with the
@@ -99,6 +598,31 @@ read it from `MachineData::process`.
 The process configuration does not turn an ordinary `start` into a workload
 launch. It lets higher-level callers retain and resolve their intended process
 without reconstructing image metadata.
+
+## Root Capacity Metrics
+
+`Machine::metrics().await` retains the existing agent identity, observation
+timestamps and freshness frame. For a verified managed overlay root,
+`metrics.report.snapshot.root_storage` contains one writable upper's actual
+accounting. `upper_backing_bytes` is the exact private-device length;
+`upper_filesystem_bytes` is the observed ext4 span; their difference is the
+explicit `unusable_tail_bytes`. Filesystem overhead is the span minus statvfs
+usable bytes, not workload usage. Used plus free equals usable; available can
+be lower than free because of reserved blocks. Total, free and available inode
+counts expose inode exhaustion independently of byte exhaustion.
+
+`shared_lower_logical_bytes` is the immutable lower's logical length, not its
+physical host allocation. Neither it nor the maintenance mounts should be
+added to root filesystem capacity. Maintenance lower/upper mounts are omitted
+from the ordinary filesystem array to avoid counting the overlay's upper twice.
+
+The nested `temporary_directory` samples the actual `/tmp` filesystem each time,
+including image-owned changes after boot. Upper-backed `/tmp` shares root
+capacity and persistence. Tmpfs reports separate capacity, non-persistence and
+guest-memory charging. An unclassified image-owned mount reports `Other` with
+unknown persistence/memory charging rather than inferring them from the boot
+request. Malformed retained observations or inconsistent capacity arithmetic
+fail metrics collection/relay instead of publishing invented values.
 
 ## Execution
 
@@ -427,12 +951,30 @@ opening listeners.
 and `agent` once, validates them as absolute paths, and retains that immutable
 set for the runtime lifetime. `SILO_VMM_PATH`, or
 `RuntimeConfig::with_supervisor_path` / `RuntimeBuilder::supervisor_path`,
-replaces only the `silo-vmm` path. Machine starts launch the resolved absolute
-`silo-vmm` path directly. For the krun backend,
+replaces only the `silo-vmm` path. Opaque raw starts launch that absolute path;
+qualified Linux overlay starts use the retained native executable FD described
+above. For the krun backend,
 silo-vmm re-executes itself with `argv[0]` set to `krun` to run libkrun in a
 private worker, so there is no separate krun component to resolve (see
 [silo-vmm architecture](../../docs/architecture/silo-vmm.md)).
 Private networking launches the resolved absolute `netd` path directly.
+
+`make build` and `make stage` package the standalone guest agent with
+`llvm-objcopy --strip-debug` from the Rust toolchain's already-declared `llvm-tools`
+component, resolved through the active compiler rather than PATH. Packaging
+operates on the unpublished assets tree only.
+The original Cargo binary under `target/<guest-target>/<profile>/silo-agent`
+remains unmodified, retaining any DWARF emitted by the selected profile for
+host-side debugging. The guest copy retains executable code, unwind data and its
+symbol table. Both debug and release runtime payloads follow this rule.
+
+This is a guest resource requirement, not a change to the selected RAM or root
+profile. Before early init can free the supplied initrd, the kernel must unpack
+the agent into its initial root. Managed overlay boot uses the kernel's initial
+tmpfs default budget; embedding a large host debug ELF can exhaust it before
+`silo/rootfs.json` is extracted. Removing non-runtime debug sections avoids that
+footprint without weakening fail-closed bootstrap handling. The base initramfs,
+kernel and native monitor bytes are not changed by this agent packaging step.
 
 ## Hybrid Vsock Paths
 

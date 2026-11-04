@@ -90,7 +90,7 @@ mod tests {
     async fn lease_excludes_native_mutations_without_blocking_inspect() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, b"stopped fixture").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let runtime = Runtime::open(
             crate::paths::LocalPaths::new(home.path().join("home")),
             RuntimeNetworkingConfig::default(),
@@ -138,7 +138,7 @@ mod tests {
     async fn recovery_artifacts_fence_mutations_but_not_inspection_or_recovery_leases() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, b"stopped fixture").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let runtime = Runtime::open(
             crate::paths::LocalPaths::new(home.path().join("home")),
             RuntimeNetworkingConfig::default(),

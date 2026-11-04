@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eyre::Context;
-use oci::{
-    ImageStore as RootfsImageStore, MaterializeOptions, OciError, PublishedRootfs, RootfsMetadata,
-};
+use oci::{MaterializeOptions, OciError, OciMaterializer};
 
 use crate::guest_agent::{self, GuestAgentConfigInput};
 use crate::lock_manager::{LockGuard, LockId, LockManager, MachineLifetimeLock, ManagedLock};
@@ -27,8 +25,8 @@ use vm_spec::{Boot, Hardware, Kernel, VmSpec};
 use crate::image::{
     local_disk::resolve_local_disk,
     oci::{
-        cached_resolved_oci_image, ensure_resolved_oci_identity, image_error,
-        resolve_oci_image_from_registry,
+        cached_resolved_oci_image, ensure_resolved_oci_identity, image_error, materialized_image,
+        oci_image_record, resolve_oci_image_from_registry, storage_error, verify_cached_image,
     },
     progress::oci_progress_reporter,
     ImageDetail, ImageHandle, ImageProgress, ImageProgressSender, ImagePruneReport,
@@ -48,17 +46,16 @@ use crate::runtime::RuntimeBuilder;
 use crate::store::models::DbConfig;
 use crate::store::models::MachineId;
 use crate::store::models::{
-    ImageConfigRecord, ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord,
-    ImageRefRecord, ImageRootfsArtifactRecord, MachineConfig,
-    MachineNetworkConfig as ModelMachineNetworkConfig, MachineRootfsRecord, MachineRuntimeState,
-    MachineState, OciImageRecord,
+    MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig, MachineRootfsRecord,
+    MachineRuntimeState, MachineState, OciImageRecord,
 };
 use crate::store::{ConfigStore, DataStore, Store};
-use crate::supervisor::exit_status::{self, VmmExitOutcome, VmmExitStatus};
+use crate::supervisor::exit_status;
 use crate::supervisor::process::{self, ProcessIdentity};
 use crate::supervisor::{self, LaunchSpecInput, VmSupervisor};
 use crate::utils::now_unix;
 use crate::LibVmError;
+use protocol::shutdown::{CurrentExitRecord, ExitOutcome};
 
 /// Live runtime observation for a machine: its reconciled state plus the
 /// start timestamp when running.
@@ -96,6 +93,17 @@ impl RuntimeStatus {
     }
 }
 
+struct ObservedMachineRuntime {
+    state: MachineState,
+    storage_stop_outcome: Option<crate::StorageStopOutcome>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MachineScopeRecovery {
+    CatalogFile,
+    External,
+}
+
 #[derive(Debug, Clone)]
 pub struct Runtime {
     paths: LocalPaths,
@@ -105,10 +113,13 @@ pub struct Runtime {
     registry_policy: RegistryPolicy,
     components: ResolvedRuntimeComponents,
     supervisor: VmSupervisor,
+    live_query: crate::runtime::capabilities::LiveCapabilityQuery,
+    observation_store: Option<Arc<crate::store::observation::ObservationStore>>,
     image_pull_policy: ImagePullPolicy,
     image_progress: Option<ImageProgressSender>,
     secret_store: Arc<dyn silo_secrets::SecretStore>,
     secret_provider: Option<crate::HostCommand>,
+    machine_scope_recovery: MachineScopeRecovery,
 }
 
 /// Identity for one concrete silo-vmm run.
@@ -133,18 +144,28 @@ impl Runtime {
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
         let components = resolve_components(&config)?;
+        let selection = crate::runtime::capabilities::ResolvedBackendSelection::resolve(
+            config.virt_backend.as_ref(),
+        )?;
+        let live_query = crate::runtime::capabilities::LiveCapabilityQuery::resolved(
+            components.supervisor().to_path_buf(),
+            selection,
+        )?;
+        live_query.host_report().await?;
         let roots = config.resolve_roots()?;
         let store = Store::open(&roots.state_db_path()).await?;
         let stored = store.read_or_seed_db_config(&DbConfig::current()).await?;
         crate::runtime::config::validate_db_config(&stored)?;
+        let observation_store = crate::store::observation::ObservationStore::existing(&store);
         let paths = LocalPaths::from_roots(roots);
-        Self::from_store(
+        Self::from_store_resolved(
             paths,
             Arc::new(store),
             config.networking,
             config.registry_policy,
             components,
-            config.virt_backend,
+            live_query,
+            Some(Arc::new(observation_store)),
         )
         .await
     }
@@ -176,6 +197,7 @@ impl Runtime {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn from_store(
         paths: LocalPaths,
         store: Arc<dyn DataStore>,
@@ -184,15 +206,43 @@ impl Runtime {
         components: ResolvedRuntimeComponents,
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Result<Self, LibVmError> {
+        let selection =
+            crate::runtime::capabilities::ResolvedBackendSelection::resolve(virt_backend.as_ref())?;
+        let query = crate::runtime::capabilities::LiveCapabilityQuery::resolved(
+            components.supervisor().to_path_buf(),
+            selection,
+        )?;
+        Self::from_store_resolved(
+            paths,
+            store,
+            networking,
+            registry_policy,
+            components,
+            query,
+            None,
+        )
+        .await
+    }
+
+    async fn from_store_resolved(
+        paths: LocalPaths,
+        store: Arc<dyn DataStore>,
+        networking: RuntimeNetworkingConfig,
+        registry_policy: RegistryPolicy,
+        components: ResolvedRuntimeComponents,
+        live_query: crate::runtime::capabilities::LiveCapabilityQuery,
+        observation_store: Option<Arc<crate::store::observation::ObservationStore>>,
+    ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
         let supervisor = VmSupervisor::new(
             paths.clone(),
             components.supervisor().to_path_buf(),
-            virt_backend,
+            live_query.selection().clone(),
         );
         let runtime = Self {
             secret_store: Arc::new(silo_secrets::FileStore::new(paths.home())),
             secret_provider: None,
+            machine_scope_recovery: MachineScopeRecovery::CatalogFile,
             paths,
             store,
             lock_manager,
@@ -200,6 +250,8 @@ impl Runtime {
             registry_policy,
             components,
             supervisor,
+            live_query,
+            observation_store,
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
         };
@@ -214,8 +266,74 @@ impl Runtime {
         self.paths.home()
     }
 
-    pub(crate) fn image_store(&self) -> oci::OciResult<RootfsImageStore> {
-        RootfsImageStore::open(self.local_images_dir(), self.registry_policy.clone())
+    pub(crate) fn native_store(&self) -> Result<Store, LibVmError> {
+        self.store.native_store().ok_or_else(|| {
+            crate::machine::root_storage::invalid("stopped storage requires a native catalog")
+        })
+    }
+
+    pub(crate) fn captured_boot_context<'a>(
+        &'a self,
+        pool: &'a crate::storage::pool::StoragePool,
+        store: &'a Store,
+        operation_id: uuid::Uuid,
+    ) -> boot_assets::CapturedBootContext<'a> {
+        boot_assets::CapturedBootContext {
+            pool,
+            store,
+            operation_id,
+            default_kernel: self.components.kernel(),
+            default_initramfs: self.components.initramfs(),
+            default_agent: self.components.agent(),
+            native_executable: self.components.supervisor(),
+            backend: self.live_query.selection().backend,
+        }
+    }
+
+    pub(crate) fn preflight_captured_lane(
+        &self,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError> {
+        boot_assets::validate_captured_boot_lane(storage, self.live_query.selection().backend)
+    }
+
+    /// Host-scoped capabilities for this runtime's frozen next-start selection.
+    pub async fn live_capabilities(&self) -> Result<vm_spec::live::LiveHostReport, LibVmError> {
+        self.live_query.host_report().await
+    }
+
+    /// Observe through the initialized pool without reopening/recovering storage.
+    pub async fn observe_live(
+        &self,
+        reference: &MachineRef,
+    ) -> Result<crate::MachineLiveObservation, LibVmError> {
+        let store = self
+            .observation_store
+            .as_ref()
+            .ok_or_else(|| LibVmError::LiveObservation {
+                reference: format!("{reference:?}"),
+                message: "runtime has no native catalog observation adapter".to_string(),
+            })?;
+        let (config, state) = store.lookup(reference).await?;
+        crate::machine::live::observe_run(&self.paths, config, state).await
+    }
+
+    /// Execution restore is not delivered. Refuse before opening the artifact
+    /// or allocating any destination state, even for positive test scenarios.
+    pub async fn restore_execution(
+        &self,
+        report: &vm_spec::live::LiveHostReport,
+        _checkpoint: &Path,
+        _name: Option<&str>,
+    ) -> Result<(), LibVmError> {
+        crate::runtime::capabilities::require_host_live_operation(
+            report,
+            vm_spec::live::LiveOperation::Restore,
+        )
+    }
+
+    pub(crate) fn image_store(&self) -> oci::OciResult<OciMaterializer> {
+        OciMaterializer::open(self.local_images_dir(), self.registry_policy.clone())
     }
 
     /// Read-only readiness using the start resolver. No values or signing material are returned.
@@ -310,6 +428,7 @@ impl Runtime {
     /// Uses this store to resolve policy secrets for future starts.
     pub fn with_secret_store(mut self, store: Arc<dyn silo_secrets::SecretStore>) -> Self {
         self.secret_store = store;
+        self.machine_scope_recovery = MachineScopeRecovery::External;
         self
     }
 
@@ -325,6 +444,15 @@ impl Runtime {
 
     pub(crate) fn secret_store_arc(&self) -> Arc<dyn silo_secrets::SecretStore> {
         Arc::clone(&self.secret_store)
+    }
+
+    pub(crate) fn require_recoverable_child_scopes(&self) -> Result<(), LibVmError> {
+        match self.machine_scope_recovery {
+            MachineScopeRecovery::CatalogFile => Ok(()),
+            MachineScopeRecovery::External => Err(crate::machine::root_storage::invalid(
+                "stopped child publication requires catalog-owned secret scopes; custom SecretStore has no durable recovery contract",
+            )),
+        }
     }
 
     pub(crate) fn resolve_secrets(
@@ -453,6 +581,35 @@ impl Runtime {
             self.components.kernel(),
             self.components.initramfs(),
         )
+    }
+
+    pub(crate) fn qualify_flat_overlay(
+        &self,
+        kernel: Option<&Path>,
+        initramfs: Option<&Path>,
+    ) -> Result<crate::QualifiedOverlayBoot, LibVmError> {
+        let backend = self.live_query.selection().backend;
+        if backend != vm_spec::live::LiveBackend::Krun {
+            return Err(LibVmError::OverlayBackendUnsupported { backend });
+        }
+        let assets = self.resolve_boot_assets(kernel, initramfs)?;
+        let architecture = match std::env::consts::ARCH {
+            "x86_64" => crate::GuestArchitecture::Amd64,
+            "aarch64" => crate::GuestArchitecture::Arm64,
+            arch => {
+                return Err(LibVmError::UnsupportedHostArchitecture {
+                    arch: arch.to_string(),
+                })
+            }
+        };
+        crate::boot_qualification::admit_flat_overlay(
+            &assets.kernel,
+            &assets.initramfs,
+            architecture,
+            backend,
+            self.components.supervisor(),
+        )
+        .map_err(Into::into)
     }
 
     fn complete_launch_boot_assets(&self, spec: &mut VmSpec) -> Result<(), LibVmError> {
@@ -588,70 +745,10 @@ impl Runtime {
         &self,
         reference: &str,
     ) -> Result<MaterializedImage, LibVmError> {
-        let store = self
-            .image_store()
-            .map_err(|err| image_error(reference, err))?;
-        let options = MaterializeOptions::for_host().map_err(|err| image_error(reference, err))?;
-        let progress = self.image_progress.clone();
-
-        let rootfs = match self.image_pull_policy {
-            ImagePullPolicy::IfMissing => {
-                match store
-                    .get_cached(reference, &options)
-                    .map_err(|err| image_error(reference, err))?
-                {
-                    Some(image) => {
-                        emit_cached_image_progress(
-                            progress.as_ref(),
-                            &image.flat_ext4().requested_reference,
-                        );
-                        image
-                    }
-                    None => store
-                        .get_or_create(reference, &options, oci_progress_reporter(progress))
-                        .await
-                        .map_err(|err| image_error(reference, err))?,
-                }
-            }
-            ImagePullPolicy::Always => store
-                .get_or_create(reference, &options, oci_progress_reporter(progress))
-                .await
-                .map_err(|err| image_error(reference, err))?,
-            ImagePullPolicy::Never => store
-                .get_cached(reference, &options)
-                .map_err(|err| image_error(reference, err))?
-                .ok_or_else(|| LibVmError::ImageNotFound {
-                    reference: reference.to_string(),
-                })?,
-        };
-
-        let metadata = store
-            .metadata(&rootfs)
-            .map_err(|err| image_error(&rootfs.flat_ext4().requested_reference, err))?;
-        let size_bytes = fs::metadata(&rootfs.flat_ext4().path)?.len();
-        let source = ImageSource::oci(reference);
-        let identity = materialized_image_identity(&source, &rootfs, Some(&metadata))?;
-        self.persist_materialized_image(
-            &source,
-            &rootfs,
-            Some(&metadata),
-            size_bytes,
-            &identity.requested_reference,
-        )
-        .await?;
-
-        let image = MaterializedImage {
-            rootfs_path: rootfs.flat_ext4().path.clone(),
-            requested_reference: identity.requested_reference,
-            selected_reference: identity.selected_reference,
-            source_kind: ImageSourceKind::Oci,
-            image_id: Some(rootfs.flat_ext4().image_id.clone()),
-            manifest_digest: identity.manifest_digest,
-            config_digest: identity.config_digest,
-            size_bytes,
-        };
-        emit_image_progress_complete(self.image_progress.as_ref());
-        Ok(image)
+        let resolved = self
+            .resolve_oci_image(reference.to_string(), self.image_pull_policy)
+            .await?;
+        self.materialize_resolved_oci_image(&resolved).await
     }
 
     fn materialize_local_disk(&self, path: &Path) -> Result<MaterializedImage, LibVmError> {
@@ -663,6 +760,7 @@ impl Runtime {
         let size_bytes = fs::metadata(&source.canonical_path)?.len();
         let image = MaterializedImage {
             rootfs_path: source.canonical_path,
+            stream: None,
             requested_reference: path.display().to_string(),
             selected_reference: None,
             source_kind: ImageSourceKind::Disk,
@@ -670,6 +768,9 @@ impl Runtime {
             manifest_digest: None,
             config_digest: None,
             size_bytes,
+            platform: oci::Platform::host()
+                .map_err(|error| image_error(&path.display().to_string(), error))?,
+            _lease: None,
         };
         emit_image_progress_complete(self.image_progress.as_ref());
         Ok(image)
@@ -680,47 +781,45 @@ impl Runtime {
         reference: String,
         policy: ImagePullPolicy,
     ) -> Result<ResolvedOciImage, LibVmError> {
-        let store = self
+        let options = MaterializeOptions::for_host().map_err(|err| image_error(&reference, err))?;
+        if policy != ImagePullPolicy::Always {
+            if let Some(image) = self
+                .cached_oci_record(&reference, &options.platform)
+                .await?
+            {
+                return Ok(cached_resolved_oci_image(
+                    &image,
+                    image.reference.requested_reference.clone(),
+                ));
+            }
+            if policy == ImagePullPolicy::Never {
+                return Err(LibVmError::ImageNotFound { reference });
+            }
+        }
+        let producer = self
             .image_store()
             .map_err(|err| image_error(&reference, err))?;
-        let options = MaterializeOptions::for_host().map_err(|err| image_error(&reference, err))?;
-
-        match policy {
-            ImagePullPolicy::IfMissing => {
-                if let Some(image) = cached_resolved_oci_image(&store, &reference, options.clone())?
-                {
-                    return Ok(image);
-                }
-                resolve_oci_image_from_registry(
-                    &store,
-                    reference,
-                    options,
-                    self.image_progress.clone(),
-                )
-                .await
-            }
-            ImagePullPolicy::Always => {
-                resolve_oci_image_from_registry(
-                    &store,
-                    reference,
-                    options,
-                    self.image_progress.clone(),
-                )
-                .await
-            }
-            ImagePullPolicy::Never => cached_resolved_oci_image(&store, &reference, options)?
-                .ok_or(LibVmError::ImageNotFound { reference }),
+        let mut resolved = resolve_oci_image_from_registry(
+            &producer,
+            reference,
+            options,
+            self.image_progress.clone(),
+        )
+        .await?;
+        if self
+            .cached_oci_record(&resolved.selected_reference, &resolved.platform)
+            .await?
+            .is_some()
+        {
+            resolved.cache_state = crate::ImageCacheState::Complete;
         }
+        Ok(resolved)
     }
 
     pub(crate) async fn materialize_resolved_oci_image(
         &self,
         resolved: &ResolvedOciImage,
     ) -> Result<MaterializedImage, LibVmError> {
-        let source = ImageSource::oci(resolved.requested_reference.clone());
-        let store = self
-            .image_store()
-            .map_err(|err| image_error(&resolved.requested_reference, err))?;
         let options = MaterializeOptions::for_host()
             .map_err(|err| image_error(&resolved.requested_reference, err))?;
         if options.platform != resolved.platform {
@@ -733,79 +832,145 @@ impl Runtime {
                 },
             ));
         }
-
-        let rootfs = match &resolved.materialization {
-            ResolvedOciImageMaterialization::Cached => {
-                emit_cached_image_progress(
-                    self.image_progress.as_ref(),
-                    &resolved.requested_reference,
-                );
-                store
-                    .get_cached(&resolved.selected_reference, &options)
-                    .map_err(|err| image_error(&resolved.selected_reference, err))?
-                    .ok_or_else(|| LibVmError::ImageNotFound {
-                        reference: resolved.selected_reference.clone(),
-                    })?
-            }
-            ResolvedOciImageMaterialization::Registry(image) => store
-                .materialize(
-                    image,
-                    &options,
-                    oci_progress_reporter(self.image_progress.clone()),
-                )
-                .await
-                .map_err(|err| image_error(&resolved.requested_reference, err))?,
+        let pool = crate::storage::pool::StoragePool::open(self.local_images_dir())
+            .map_err(storage_error)?;
+        let key_bytes = serde_json::to_vec(&(
+            crate::image::oci::CONVERSION_ABI,
+            &resolved.manifest_digest,
+            &resolved.config_digest,
+            &resolved.platform,
+        ))
+        .map_err(|error| LibVmError::StateDecode {
+            field: "image.conversion-key",
+            message: error.to_string(),
+        })?;
+        let key = crate::storage::identity::ObjectDigest::of_bytes(&key_bytes);
+        let (pool, _conversion) = tokio::task::spawn_blocking(move || {
+            let lock = pool.lock_publication(&key)?;
+            Ok::<_, crate::storage::StorageError>((pool, lock))
+        })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .map_err(storage_error)?;
+        let operation_id = uuid::Uuid::new_v4();
+        let lease = self.store.begin_storage_operation(operation_id).await?;
+        if let Some(image) = self
+            .store
+            .cached_oci_image(&resolved.selected_reference, &resolved.platform)
+            .await?
+        {
+            self.store
+                .retain_storage_stream(&image.artifact.stream_id, operation_id)
+                .await?;
+            let images_dir = self.local_images_dir().to_path_buf();
+            let (mut image, lease) = tokio::task::spawn_blocking(move || {
+                let fingerprint = verify_cached_image(&image, &images_dir)?;
+                if fingerprint
+                    != crate::storage::identity_file::SourceFingerprint::new(&fs::symlink_metadata(
+                        &image.artifact.rootfs_path,
+                    )?)
+                {
+                    return Err(LibVmError::StateDecode {
+                        field: "image.cache",
+                        message: "retained stream changed before use".into(),
+                    });
+                }
+                Ok((image, lease))
+            })
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))??;
+            ensure_resolved_oci_identity(resolved, &image)?;
+            emit_cached_image_progress(self.image_progress.as_ref(), &resolved.requested_reference);
+            image.reference.requested_reference = resolved.requested_reference.clone();
+            image.reference.last_used_at = Some(now_unix());
+            self.store.save_oci_image(&image).await?;
+            emit_image_progress_complete(self.image_progress.as_ref());
+            return Ok(materialized_image(
+                image,
+                &resolved.requested_reference,
+                lease,
+            ));
+        }
+        if let Some(progress) = &self.image_progress {
+            progress.send(ImageProgress::CheckingCache {
+                image_ref: resolved.requested_reference.clone(),
+            });
+            progress.send(ImageProgress::CacheMiss {
+                image_ref: resolved.requested_reference.clone(),
+            });
+        }
+        let ResolvedOciImageMaterialization::Registry(image) = &resolved.materialization else {
+            return Err(LibVmError::ImageNotFound {
+                reference: resolved.selected_reference.clone(),
+            });
         };
-        let metadata = store
-            .metadata(&rootfs)
-            .map_err(|err| image_error(&rootfs.flat_ext4().requested_reference, err))?;
-        ensure_resolved_oci_identity(resolved, &rootfs, &metadata)?;
-        let size_bytes = fs::metadata(&rootfs.flat_ext4().path)?.len();
-        self.persist_materialized_image(
-            &source,
-            &rootfs,
-            Some(&metadata),
-            size_bytes,
+        let producer = self
+            .image_store()
+            .map_err(|err| image_error(&resolved.requested_reference, err))?;
+        let staging_operation = oci::StagingOperation::try_from(operation_id.to_string())
+            .map_err(|error| image_error(&resolved.requested_reference, error))?;
+        let staged = producer
+            .materialize(
+                image,
+                &options,
+                &staging_operation,
+                oci_progress_reporter(self.image_progress.clone()),
+            )
+            .await
+            .map_err(|err| image_error(&resolved.requested_reference, err))?;
+        if let Some(progress) = &self.image_progress {
+            progress.send(ImageProgress::PublishingRootfs);
+        }
+        let published = tokio::task::spawn_blocking(move || {
+            let (published, guard) = pool.publish_stream_for_catalog(&staged.path)?;
+            Ok::<_, crate::storage::StorageError>((published, guard, lease, staged))
+        })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .map_err(storage_error)?;
+        let record = oci_image_record(
+            &published.0,
+            &published.3.metadata,
             &resolved.requested_reference,
-        )
-        .await?;
-
-        let image = MaterializedImage {
-            rootfs_path: rootfs.flat_ext4().path.clone(),
-            requested_reference: resolved.requested_reference.clone(),
-            selected_reference: Some(resolved.selected_reference.clone()),
-            source_kind: ImageSourceKind::Oci,
-            image_id: Some(rootfs.flat_ext4().image_id.clone()),
-            manifest_digest: Some(resolved.manifest_digest.clone()),
-            config_digest: Some(resolved.config_digest.clone()),
-            size_bytes,
-        };
+        )?;
+        ensure_resolved_oci_identity(resolved, &record)?;
+        self.store
+            .retain_storage_stream(&record.artifact.stream_id, operation_id)
+            .await?;
+        self.store.save_oci_image(&record).await?;
         emit_image_progress_complete(self.image_progress.as_ref());
-        Ok(image)
+        Ok(materialized_image(
+            record,
+            &resolved.requested_reference,
+            published.2,
+        ))
     }
 
-    async fn persist_materialized_image(
+    async fn cached_oci_record(
         &self,
-        source: &ImageSource,
-        rootfs: &PublishedRootfs,
-        metadata: Option<&RootfsMetadata>,
-        size_bytes: u64,
-        requested_reference: &str,
-    ) -> Result<(), LibVmError> {
-        match source {
-            ImageSource::Oci(_) => {
-                let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
-                    field: "image.metadata",
-                    message: format!(
-                        "OCI image {} is missing rootfs metadata",
-                        rootfs.flat_ext4().requested_reference
-                    ),
-                })?;
-                let record = oci_image_record(rootfs, metadata, size_bytes, requested_reference)?;
-                self.store.save_oci_image(&record).await
+        reference: &str,
+        platform: &oci::Platform,
+    ) -> Result<Option<OciImageRecord>, LibVmError> {
+        for candidate in self
+            .registry_policy
+            .candidates(reference)
+            .map_err(|error| image_error(reference, error))?
+        {
+            if let Some(image) = self
+                .store
+                .cached_oci_image(&candidate.to_string(), platform)
+                .await?
+            {
+                let images = self.local_images_dir().to_path_buf();
+                return tokio::task::spawn_blocking(move || {
+                    verify_cached_image(&image, &images)?;
+                    Ok(Some(image))
+                })
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
             }
-            ImageSource::Disk(_) => Ok(()),
         }
+        Ok(None)
     }
 
     /// Creates a named network definition.
@@ -850,7 +1015,7 @@ impl Runtime {
         &self,
         machine: &MachineRef,
     ) -> Result<MachineConfig, LibVmError> {
-        match machine.kind() {
+        let config = match machine.kind() {
             MachineRefKind::Id(id) => {
                 self.store
                     .machine_config(*id)
@@ -872,14 +1037,20 @@ impl Runtime {
                     0 => Err(LibVmError::MachineNotFound {
                         reference: prefix.clone(),
                     }),
-                    1 => Ok(matches.into_iter().next().expect("just checked len == 1")),
+                    1 => matches
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| LibVmError::MachineNotFound {
+                            reference: prefix.clone(),
+                        }),
                     count => Err(LibVmError::AmbiguousIdPrefix {
                         prefix: prefix.clone(),
                         count,
                     }),
                 }
             }
-        }
+        }?;
+        Ok(config)
     }
 
     pub(crate) async fn lock_machine_config(
@@ -930,14 +1101,20 @@ impl Runtime {
         let observed = self
             .observe_machine_state(metadata, persisted.as_ref())
             .await?;
-        if machine_state_needs_writeback(persisted.as_ref(), &observed) {
+        if machine_state_needs_writeback(persisted.as_ref(), &observed.state)
+            || !self
+                .store
+                .launch_storage_operations(metadata.id)
+                .await?
+                .is_empty()
+        {
             let Some(_lock) = self.try_acquire_machine_lock(metadata.lock_id)? else {
                 let state = self.machine_state(metadata.id).await?;
                 return Ok(RuntimeStatus::from_machine_state(&state));
             };
             return self.reconcile_machine_runtime_locked(metadata).await;
         }
-        Ok(RuntimeStatus::from_machine_state(&observed))
+        Ok(RuntimeStatus::from_machine_state(&observed.state))
     }
 
     pub(crate) async fn reconcile_machine_runtime_locked(
@@ -948,17 +1125,228 @@ impl Runtime {
         let observed = self
             .observe_machine_state(metadata, persisted.as_ref())
             .await?;
-        if machine_state_needs_writeback(persisted.as_ref(), &observed) {
-            self.store.save_machine_state(&observed).await?;
+        if !self
+            .persist_reconciled_state(metadata, persisted.as_ref(), &observed.state)
+            .await?
+        {
+            return Ok(RuntimeStatus::from_machine_state(&storage_busy_state(
+                metadata.id,
+                persisted.as_ref(),
+            )));
         }
-        Ok(RuntimeStatus::from_machine_state(&observed))
+        Ok(RuntimeStatus::from_machine_state(&observed.state))
     }
 
+    /// Refused live/orphaned generations do not allocate locks or rewrite SQL.
+    pub(crate) async fn preflight_stopped_generation_locked(
+        &self,
+        config: &MachineConfig,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError> {
+        let state = self.store.machine_state(config.id).await?.ok_or_else(|| {
+            crate::machine::root_storage::invalid(
+                "source has no durable lifecycle admission record",
+            )
+        })?;
+        let operations = self.store.launch_storage_operations(config.id).await?;
+        if operations.len() > 1
+            || operations.first().is_some_and(|operation| {
+                operation.storage_generation != storage.storage_generation
+                    || state.run_id.as_deref().is_some_and(|run| {
+                        uuid::Uuid::parse_str(run).ok() != Some(operation.run_id)
+                    })
+            })
+        {
+            return Err(crate::machine::root_storage::invalid(
+                "source launch operation does not uniquely match its exact run and storage generation",
+            ));
+        }
+        let busy = || LibVmError::MachineAlreadyRunning {
+            reference: config.name.clone(),
+        };
+        if let Some(pid) = state.vmm_pid {
+            if let Some(identity) = ProcessIdentity::for_pid(pid)? {
+                if identity.is_alive()? {
+                    return Err(busy());
+                }
+            }
+        }
+        if operations.is_empty() {
+            if matches!(
+                state.status,
+                MachineRuntimeState::Starting
+                    | MachineRuntimeState::Running
+                    | MachineRuntimeState::Stopping
+            ) || state.run_id.is_some()
+                || state.vmm_pid.is_some()
+            {
+                return Err(crate::machine::root_storage::invalid(
+                    "admitted lifecycle generation has no retained launch operation",
+                ));
+            }
+            if let Some(holder) = crate::supervisor::storage_holder::read(
+                &self.machine_paths(config.id).vmm_storage_holder_path(),
+            )? {
+                if holder.machine_id != uuid::Uuid::from(config.id).to_string() {
+                    return Err(crate::machine::root_storage::invalid(
+                        "source holder belongs to another machine",
+                    ));
+                }
+                if !crate::supervisor::storage_holder::all_terminal(&holder)? {
+                    return Err(busy());
+                }
+                let operation = uuid::Uuid::parse_str(&holder.operation_id)
+                    .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
+                let pool =
+                    crate::storage::pool::StoragePool::open_existing(self.local_images_dir())?
+                        .ok_or_else(|| {
+                            crate::machine::root_storage::invalid(
+                                "reconciled holder lease pool is missing",
+                            )
+                        })?;
+                let Some(_old_operation) = pool.try_exclusive_lease(operation)? else {
+                    return Err(busy());
+                };
+            }
+            return Ok(());
+        }
+        let pool = crate::storage::pool::StoragePool::open_existing(self.local_images_dir())?
+            .ok_or_else(|| crate::machine::root_storage::invalid("launch lease pool is missing"))?;
+        for operation in operations {
+            if !self.launch_holders_terminal(config, &operation, Some(&state))? {
+                return Err(busy());
+            }
+            // Probe the old stable inode independently. Never take a shared
+            // old-operation lease before trying to prove it exclusive.
+            let Some(_old_operation) = pool.try_exclusive_lease(operation.operation_id)? else {
+                return Err(busy());
+            };
+        }
+        Ok(())
+    }
+
+    async fn persist_reconciled_state(
+        &self,
+        config: &MachineConfig,
+        expected: Option<&MachineState>,
+        next: &MachineState,
+    ) -> Result<bool, LibVmError> {
+        let operations = self.store.launch_storage_operations(config.id).await?;
+        if operations.len() > 1
+            || operations.first().is_some_and(|operation| {
+                expected
+                    .and_then(|state| state.run_id.as_deref())
+                    .is_some_and(|run| uuid::Uuid::parse_str(run).ok() != Some(operation.run_id))
+            })
+        {
+            return Err(LibVmError::InvalidStorageRecord {
+                record: "storage-operation",
+                message: "launch operation does not uniquely match the expected runtime generation"
+                    .into(),
+            });
+        }
+        if matches!(
+            next.status,
+            MachineRuntimeState::Starting
+                | MachineRuntimeState::Running
+                | MachineRuntimeState::Stopping
+        ) || operations.is_empty()
+        {
+            self.store.save_machine_state(next).await?;
+            return Ok(true);
+        }
+        for operation in operations {
+            if !self.launch_holders_terminal(config, &operation, expected)? {
+                return Ok(false);
+            }
+            let status =
+                read_exit_for_reconciliation(&self.machine_paths(config.id).vmm_exit_status_path());
+            let outcome = status
+                .as_ref()
+                .filter(|status| runtime_exit_matches(status, expected))
+                .map_or(crate::StorageStopOutcome::Unknown, |status| {
+                    exit_status::storage_outcome(
+                        status,
+                        &uuid::Uuid::from(config.id).to_string(),
+                        &operation.run_id.to_string(),
+                    )
+                });
+            if !self
+                .store
+                .try_retire_launch_storage(
+                    operation.operation_id,
+                    operation.run_id,
+                    operation.storage_generation,
+                    next,
+                    outcome,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn launch_holders_terminal(
+        &self,
+        config: &MachineConfig,
+        operation: &crate::store::operation_store::RetainedStorageOperation,
+        expected: Option<&MachineState>,
+    ) -> Result<bool, LibVmError> {
+        let path = self.machine_paths(config.id).vmm_storage_holder_path();
+        let Some(record) = crate::supervisor::storage_holder::read(&path)? else {
+            // The monitor publishes its holder before attachment construction,
+            // and worker config is withheld until the complete holder is durable.
+            // Only an unstarted generation can use the absence as a proof.
+            if !operation.admitted {
+                return Ok(true);
+            }
+            let preattachment = expected.is_some_and(|state| {
+                state.status == MachineRuntimeState::Starting
+                    && state.vmm_pid.is_none()
+                    && state
+                        .run_id
+                        .as_deref()
+                        .and_then(|run| uuid::Uuid::parse_str(run).ok())
+                        == Some(operation.run_id)
+            });
+            let exit = exit_status::read(&self.machine_paths(config.id).vmm_exit_status_path())?;
+            let contradictory = exit.as_ref().is_some_and(|status| {
+                uuid::Uuid::parse_str(&status.run_id).ok() == Some(operation.run_id)
+                    && status
+                        .backend
+                        .as_ref()
+                        .is_some_and(|backend| backend["stage"] == "started")
+            });
+            if preattachment && !contradictory {
+                return Ok(true);
+            }
+            return Err(LibVmError::InvalidStorageRecord {
+                record: "storage-holder",
+                message: format!(
+                    "missing admitted holder evidence for operation {}",
+                    operation.operation_id
+                ),
+            });
+        };
+        record
+            .validate_binding(
+                &uuid::Uuid::from(config.id).to_string(),
+                &operation.run_id.to_string(),
+                &operation.operation_id.to_string(),
+            )
+            .map_err(|message| LibVmError::InvalidStorageRecord {
+                record: "storage-holder",
+                message,
+            })?;
+        Ok(crate::supervisor::storage_holder::all_terminal(&record)?)
+    }
     async fn observe_machine_state(
         &self,
         metadata: &MachineConfig,
         runtime: Option<&MachineState>,
-    ) -> Result<MachineState, LibVmError> {
+    ) -> Result<ObservedMachineRuntime, LibVmError> {
         let pid_path = self.paths.machine(metadata.id).vmm_pid_path();
         let exit_status_path = self.paths.machine(metadata.id).vmm_exit_status_path();
         let pid_from_file = match read_monitor_pid(&pid_path) {
@@ -974,15 +1362,13 @@ impl Runtime {
             .unwrap_or(MachineRuntimeState::Stopped);
         let abandoned_start =
             if current_state == MachineRuntimeState::Starting && live_pid.is_none() {
-                // Persisted starting state can survive a missing runtime tree. Recreate it
-                // securely before lock creation can inherit a permissive umask.
-                self.paths.ensure_machine_run_dir(metadata.id)?;
-                MachineLifetimeLock::try_acquire(&self.paths.machine(metadata.id).vmm_lock_path())?
-                    .is_some()
+                MachineLifetimeLock::available_existing(
+                    &self.paths.machine(metadata.id).vmm_lock_path(),
+                )?
             } else {
                 false
             };
-        let exit_status = exit_status::read(&exit_status_path)?;
+        let exit_status = read_exit_for_reconciliation(&exit_status_path);
         let matching_exit = exit_status
             .as_ref()
             .filter(|status| runtime_exit_matches(status, runtime))
@@ -990,6 +1376,26 @@ impl Runtime {
         let stored_state = runtime
             .cloned()
             .unwrap_or_else(|| stopped_machine_state(metadata.id, None));
+        let mut terminal_storage_observed = runtime.is_some_and(|state| {
+            state.run_id.is_some()
+                && matches!(
+                    state.status,
+                    MachineRuntimeState::Starting
+                        | MachineRuntimeState::Running
+                        | MachineRuntimeState::Stopping
+                )
+        });
+        if live_pid.is_none() {
+            for operation in self.store.launch_storage_operations(metadata.id).await? {
+                terminal_storage_observed = true;
+                if !self.launch_holders_terminal(metadata, &operation, runtime)? {
+                    return Ok(ObservedMachineRuntime {
+                        state: storage_busy_state(metadata.id, runtime),
+                        storage_stop_outcome: None,
+                    });
+                }
+            }
+        }
         let observed_state = match matching_exit {
             Some(status) => {
                 let (clean, error) = exit_observed_event(status);
@@ -1037,9 +1443,26 @@ impl Runtime {
                 }
             },
         };
-        Ok(observed_state)
+        let storage_stop_outcome = if live_pid.is_none() && terminal_storage_observed {
+            Some(
+                matching_exit.map_or(crate::StorageStopOutcome::Unknown, |status| {
+                    exit_status::storage_outcome(
+                        status,
+                        &uuid::Uuid::from(metadata.id).to_string(),
+                        status.run_id.as_str(),
+                    )
+                }),
+            )
+        } else {
+            None
+        };
+        Ok(ObservedMachineRuntime {
+            state: observed_state,
+            storage_stop_outcome,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_machine_state(
         &self,
         machine_id: MachineId,
@@ -1079,6 +1502,184 @@ impl Runtime {
         let next = transitions::reduce(state, event, now_unix()).map_err(transition_error)?;
         self.store.save_machine_state(&next).await?;
         Ok(next)
+    }
+
+    pub(crate) async fn validate_machine_storage_for_launch(
+        &self,
+        config: &MachineConfig,
+    ) -> Result<crate::MachineStorageRecord, LibVmError> {
+        let storage = self
+            .store
+            .machine_storage(config.id)
+            .await?
+            .ok_or_else(|| LibVmError::InvalidStorageRecord {
+                record: "machine-storage",
+                message: format!("machine {} has no durable storage record", config.id),
+            })?;
+        storage.validate()?;
+        if !storage.external_requirements.is_empty() {
+            return Err(crate::machine::root_storage::invalid(
+                "required external resources are unresolved; supply explicit destination mappings",
+            ));
+        }
+        validate_launch_storage(&storage)?;
+        crate::machine::root_storage::validate_spec(&storage, &config.spec)?;
+        crate::store::operation_store::preflight_launch_storage(
+            &storage,
+            &config.spec,
+            self.local_images_dir(),
+        )?;
+        Ok(storage)
+    }
+
+    pub(crate) async fn register_launch_storage(
+        &self,
+        config: &MachineConfig,
+        run_id: uuid::Uuid,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<crate::store::operation_store::LaunchStorageLease, LibVmError> {
+        self.clear_reconciled_storage_holder(config).await?;
+        self.store
+            .register_launch_storage(config.id, run_id, storage, &config.spec)
+            .await
+    }
+
+    pub(crate) async fn mark_launch_storage_admitted(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> Result<(), LibVmError> {
+        self.store.mark_launch_storage_admitted(operation_id).await
+    }
+
+    async fn clear_reconciled_storage_holder(
+        &self,
+        config: &MachineConfig,
+    ) -> Result<(), LibVmError> {
+        if !self
+            .store
+            .launch_storage_operations(config.id)
+            .await?
+            .is_empty()
+        {
+            return Err(LibVmError::MachineAlreadyRunning {
+                reference: config.name.clone(),
+            });
+        }
+        let path = self.machine_paths(config.id).vmm_storage_holder_path();
+        let Some(record) = crate::supervisor::storage_holder::read(&path)? else {
+            return Ok(());
+        };
+        if record.machine_id != uuid::Uuid::from(config.id).to_string() {
+            return Err(LibVmError::InvalidStorageRecord {
+                record: "storage-holder",
+                message: "holder belongs to another machine".into(),
+            });
+        }
+        if !crate::supervisor::storage_holder::all_terminal(&record)? {
+            return Err(LibVmError::MachineAlreadyRunning {
+                reference: config.name.clone(),
+            });
+        }
+        let operation_id = uuid::Uuid::parse_str(&record.operation_id)
+            .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
+        let images_dir = self.local_images_dir().to_path_buf();
+        let store = self.store.clone();
+        let machine_id = config.id;
+        let reference = config.name.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            // This owner retains catalog/roots/lease authority through unlink
+            // and directory durability even if the async waiter is cancelled.
+            let pool = crate::storage::pool::StoragePool::open_existing(&images_dir)?.ok_or_else(
+                || crate::machine::root_storage::invalid("holder lease pool is missing"),
+            )?;
+            let _roots = pool.lock_roots()?;
+            if !handle
+                .block_on(store.launch_storage_operations(machine_id))?
+                .is_empty()
+            {
+                return Err(LibVmError::MachineAlreadyRunning { reference });
+            }
+            if crate::supervisor::storage_holder::read(&path)?.as_ref() != Some(&record) {
+                return Err(LibVmError::InvalidStorageRecord {
+                    record: "storage-holder",
+                    message: "reconciled holder changed before telemetry cleanup".into(),
+                });
+            }
+            let Some(_lease) = pool.try_exclusive_lease(operation_id)? else {
+                return Err(LibVmError::MachineAlreadyRunning { reference });
+            };
+            crate::supervisor::storage_holder::remove_reconciled(&path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("join holder cleanup owner: {error}")))?
+    }
+
+    pub(crate) fn qualify_machine_root(
+        &self,
+        config: &MachineConfig,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<Option<crate::QualifiedOverlayBoot>, LibVmError> {
+        let pool = crate::storage::pool::StoragePool::open_existing(self.local_images_dir())?;
+        let pinned = match &storage.boot {
+            crate::BootProfile::LinuxDirect {
+                binding: crate::BootBinding::Pinned { .. },
+                ..
+            } => Some(
+                boot_assets::resolve_pinned_boot(
+                    storage,
+                    pool.as_ref().ok_or_else(|| {
+                        crate::machine::root_storage::invalid("pinned boot pool is missing")
+                    })?,
+                    self.live_query.selection().backend,
+                    self.components.supervisor(),
+                )?
+                .ok_or_else(|| {
+                    crate::machine::root_storage::invalid("pinned boot selection disappeared")
+                })?,
+            ),
+            _ => None,
+        };
+        if matches!(&storage.root, crate::MachineRoot::LinuxOverlay { .. }) {
+            if let Some(pinned) = pinned {
+                return pinned
+                    .assets
+                    .into_overlay_qualification()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        crate::machine::root_storage::invalid(
+                            "pinned overlay boot has no retained qualification",
+                        )
+                    });
+            }
+            let (kernel, initramfs) = boot_asset_overrides_from_spec(&config.spec);
+            Ok(Some(self.qualify_flat_overlay(kernel, initramfs)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn prepare_machine_root(
+        &self,
+        config: &MachineConfig,
+        storage: &crate::MachineStorageRecord,
+        qualification: Option<crate::QualifiedOverlayBoot>,
+    ) -> Result<crate::machine::root_storage::PreparedRoot, LibVmError> {
+        let data_disks = config.spec.storage.as_ref().map_or(0, |storage| {
+            storage
+                .disks
+                .iter()
+                .filter(|disk| disk.role == vm_spec::DiskRole::Data)
+                .count() as u64
+        });
+        crate::machine::root_storage::prepare(
+            storage,
+            &config.machine_dir,
+            self.local_images_dir(),
+            data_disks,
+            qualification,
+        )
     }
 
     pub(crate) async fn request_machine_start(
@@ -1144,16 +1745,32 @@ impl Runtime {
         failure: StartFailure,
         error: Option<String>,
     ) -> Result<(), LibVmError> {
-        self.transition_current_machine_state(
-            machine_id,
+        let expected = self.store.machine_state(machine_id).await?;
+        let state = expected
+            .clone()
+            .unwrap_or_else(|| stopped_machine_state(machine_id, None));
+        let next = transitions::reduce(
+            state,
             transitions::Event::StartFailed {
                 run_id: run_id.to_string(),
                 failure,
                 error,
             },
+            now_unix(),
         )
-        .await
-        .map(|_| ())
+        .map_err(transition_error)?;
+        let config = self
+            .resolve_machine_config(&MachineRef::id(machine_id))
+            .await?;
+        if !self
+            .persist_reconciled_state(&config, expected.as_ref(), &next)
+            .await?
+        {
+            return Err(LibVmError::MachineAlreadyRunning {
+                reference: config.name,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) async fn mark_machine_stopped(
@@ -1161,15 +1778,20 @@ impl Runtime {
         machine_id: MachineId,
         last_error: Option<String>,
     ) -> Result<(), LibVmError> {
-        self.set_machine_state(
-            machine_id,
-            MachineRuntimeState::Stopped,
-            None,
-            None,
-            None,
-            last_error,
-        )
-        .await
+        let expected = self.store.machine_state(machine_id).await?;
+        let config = self
+            .resolve_machine_config(&MachineRef::id(machine_id))
+            .await?;
+        let next = stopped_machine_state(machine_id, last_error);
+        if !self
+            .persist_reconciled_state(&config, expected.as_ref(), &next)
+            .await?
+        {
+            return Err(LibVmError::MachineAlreadyRunning {
+                reference: config.name,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) async fn request_machine_stop(
@@ -1213,7 +1835,7 @@ impl Runtime {
         }
 
         let next = match transitions::reduce(
-            state,
+            state.clone(),
             transitions::Event::StopCompleted {
                 pid: generation.pid,
                 started_at: generation.started_at,
@@ -1226,7 +1848,12 @@ impl Runtime {
             Err(TransitionError::StaleGeneration) => return Ok(false),
             Err(err) => return Err(transition_error(err)),
         };
-        self.store.save_machine_state(&next).await?;
+        if !self
+            .persist_reconciled_state(config, Some(&state), &next)
+            .await?
+        {
+            return Ok(false);
+        }
         self.cleanup_machine_resources_locked(config).await?;
         Ok(true)
     }
@@ -1235,6 +1862,7 @@ impl Runtime {
         &self,
         config: &MachineConfig,
     ) -> Result<(), LibVmError> {
+        self.ensure_no_live_vmm_generation(config).await?;
         self.validate_machine_data_dir(config)?;
         reconcile_network_runtime(&self.paths, self.store.as_ref(), config, false).await?;
         self.paths.remove_machine_run_tree(config.id)
@@ -1262,6 +1890,25 @@ impl Runtime {
         &self,
         config: &MachineConfig,
     ) -> Result<(), LibVmError> {
+        if !self
+            .store
+            .launch_storage_operations(config.id)
+            .await?
+            .is_empty()
+        {
+            let status = self.reconcile_machine_runtime_locked(config).await?;
+            if status.is_active()
+                || !self
+                    .store
+                    .launch_storage_operations(config.id)
+                    .await?
+                    .is_empty()
+            {
+                return Err(LibVmError::MachineAlreadyRunning {
+                    reference: config.name.clone(),
+                });
+            }
+        }
         let state = self.machine_state(config.id).await?;
         let Some(pid) = state.vmm_pid else {
             return Ok(());
@@ -1354,10 +2001,11 @@ impl Runtime {
     pub(crate) fn prepare_vmm_launch_inputs(
         &self,
         config: &MachineConfig,
+        run_id: &str,
         network: &VmmNetworkAttachment,
         resize_rootfs: bool,
-        ssh_trusted_ca: &str,
-        tls_certificate: Option<&str>,
+        secrets: &crate::secrets::ResolvedSecrets,
+        root: &crate::machine::root_storage::PreparedRoot,
     ) -> Result<crate::supervisor::VmmLaunchInputs, LibVmError> {
         let prepare = || -> eyre::Result<crate::supervisor::VmmLaunchInputs> {
             let rosetta_intent = self
@@ -1368,51 +2016,165 @@ impl Runtime {
                 .context("resolve current directory for relative mount sources")?;
             let machine_paths = self.machine_paths(config.id);
             let mut launch_spec = config.spec.clone();
-            self.complete_launch_boot_assets(&mut launch_spec)?;
+            crate::machine::stopped::project_child_disks(
+                &mut launch_spec,
+                &root.storage,
+                self.local_images_dir(),
+            )?;
+            let data = launch_spec
+                .storage
+                .take()
+                .map(|storage| {
+                    storage
+                        .disks
+                        .into_iter()
+                        .filter(|disk| disk.role == vm_spec::DiskRole::Data)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut data = data;
+            for (offset, disk) in data.iter_mut().enumerate() {
+                let order = root.disks.len() + offset;
+                if root
+                    .storage
+                    .disks
+                    .iter()
+                    .any(|managed| managed.order as usize == order)
+                {
+                    disk.path = config.machine_dir.join(&disk.path);
+                }
+            }
+            launch_spec.storage = Some(vm_spec::Storage {
+                disks: root
+                    .disks
+                    .iter()
+                    .cloned()
+                    .map(|mut disk| {
+                        disk.path = config.machine_dir.join(&disk.path);
+                        disk
+                    })
+                    .chain(data)
+                    .collect(),
+            });
+            let pool = crate::storage::pool::StoragePool::open_existing(self.local_images_dir())?;
+            let pinned = match &root.storage.boot {
+                crate::BootProfile::LinuxDirect {
+                    binding: crate::BootBinding::Pinned { .. },
+                    ..
+                } => boot_assets::resolve_pinned_boot(
+                    &root.storage,
+                    pool.as_ref()
+                        .ok_or_else(|| eyre::eyre!("pinned boot pool is missing"))?,
+                    self.live_query.selection().backend,
+                    self.components.supervisor(),
+                )?,
+                _ => None,
+            };
+            if let Some(pinned) = &pinned {
+                let kernel = launch_spec
+                    .boot
+                    .as_mut()
+                    .and_then(|boot| boot.kernel.as_mut())
+                    .ok_or_else(|| eyre::eyre!("pinned direct boot has no kernel configuration"))?;
+                kernel.path = Some(crate::machine::root_storage::publish_kernel(
+                    &config.machine_dir,
+                    pinned.assets.kernel(),
+                )?);
+                kernel.initramfs = None;
+            }
+            if let Some(descriptor) = &root.descriptor {
+                crate::machine::root_storage::publish_descriptor(&config.machine_dir, descriptor)?;
+            }
+            if let Some(qualification) = root.qualification.as_ref().filter(|_| pinned.is_none()) {
+                let kernel_path = crate::machine::root_storage::publish_kernel(
+                    &config.machine_dir,
+                    qualification.kernel_asset(),
+                )?;
+                let kernel = launch_spec
+                    .boot
+                    .as_mut()
+                    .and_then(|boot| boot.kernel.as_mut())
+                    .ok_or_else(|| eyre::eyre!("qualified overlay has no direct kernel boot"))?;
+                kernel.path = Some(kernel_path);
+            } else if pinned.is_none() {
+                self.complete_launch_boot_assets(&mut launch_spec)?;
+            }
             let mut launch_spec = supervisor::prepare_launch_spec(LaunchSpecInput {
                 relative_mount_base: &relative_mount_base,
                 spec: launch_spec,
             })?;
+            let storage_shutdown = guest_agent::storage_shutdown_context(
+                &uuid::Uuid::from(config.id).to_string(),
+                run_id,
+                &launch_spec,
+            )?;
 
             let agent_enabled = config.guest.agent.enabled();
-            if let Some(agent_path) =
+            let agent_path = if pinned.is_none() {
                 boot_assets::resolve_agent(&config.guest.agent, self.components.agent())?
-            {
+            } else {
+                None
+            };
+            let agent = match &pinned {
+                Some(pinned) => pinned
+                    .agent
+                    .as_ref()
+                    .map(crate::initramfs_overlay::CompositeAgent::Retained),
+                None => agent_path
+                    .as_deref()
+                    .map(crate::initramfs_overlay::CompositeAgent::Path),
+            };
+            let serialized = if agent.is_some() {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
                     machine_name: &config.name,
                     spec: &launch_spec,
                     network,
                     resize_rootfs,
                     user: config.guest.user.as_ref(),
-                    ssh_trusted_ca,
-                    tls_certificate,
+                    ssh_trusted_ca: secrets
+                        .ssh_trusted_ca
+                        .as_deref()
+                        .ok_or_else(|| eyre::eyre!("missing resolved SSH CA"))?,
+                    tls_certificate: secrets.tls_certificate.as_deref(),
+                    storage_shutdown: &storage_shutdown,
                 })?;
                 agent_config.validate().context("validate agent config")?;
-                let serialized =
-                    serde_json::to_vec(&agent_config).context("serialize agent config")?;
-                let base_path = boot_asset_overrides_from_spec(&launch_spec)
-                    .1
-                    .ok_or_else(|| eyre::eyre!("resolved launch spec has no initramfs"))?
-                    .to_path_buf();
-                let composite_path = machine_paths.composite_initramfs_path();
-                crate::initramfs_overlay::write_composite(
-                    &base_path,
-                    &agent_path,
-                    &serialized,
-                    &composite_path,
-                )?;
-                set_launch_initramfs(&mut launch_spec, composite_path);
+                Some(serde_json::to_vec(&agent_config).context("serialize agent config")?)
             } else {
-                remove_file_if_exists(&machine_paths.composite_initramfs_path())?;
-            }
-
-            remove_file_if_exists(&machine_paths.metadata_config_path())?;
+                None
+            };
+            let base_path = boot_asset_overrides_from_spec(&launch_spec)
+                .1
+                .map(Path::to_path_buf);
+            let base = if let Some(pinned) = &pinned {
+                crate::initramfs_overlay::CompositeBase::Retained(pinned.assets.initramfs())
+            } else {
+                match root.qualification.as_ref() {
+                    Some(qualification) => {
+                        crate::initramfs_overlay::CompositeBase::Qualified(qualification)
+                    }
+                    None => crate::initramfs_overlay::CompositeBase::Path(
+                        base_path
+                            .as_deref()
+                            .ok_or_else(|| eyre::eyre!("resolved launch spec has no initramfs"))?,
+                    ),
+                }
+            };
+            let composite_path = machine_paths.composite_initramfs_path();
+            crate::initramfs_overlay::write_composite(
+                base,
+                agent.zip(serialized.as_deref()),
+                Some(&root.bootstrap),
+                &composite_path,
+            )?;
+            set_launch_initramfs(&mut launch_spec, composite_path);
 
             supervisor::write_launch_spec(&machine_paths.vm_spec_path(), &launch_spec)?;
             Ok(crate::supervisor::VmmLaunchInputs {
                 agent_enabled,
                 rosetta_intent,
                 asset_directory: self.components.asset_dir().to_path_buf(),
+                storage_shutdown,
             })
         };
 
@@ -1429,6 +2191,25 @@ impl Runtime {
         self.store.save_machine_config(config).await
     }
 
+    pub(crate) async fn machine_storage_record(
+        &self,
+        id: MachineId,
+    ) -> Result<crate::MachineStorageRecord, LibVmError> {
+        self.store.machine_storage(id).await?.ok_or_else(|| {
+            crate::machine::root_storage::invalid("machine has no semantic storage record")
+        })
+    }
+
+    pub(crate) async fn save_machine_config_with_storage(
+        &self,
+        config: &MachineConfig,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError> {
+        self.store
+            .save_machine_config_with_storage(config, storage)
+            .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn add_machine_record(
         &self,
@@ -1443,9 +2224,10 @@ impl Runtime {
         config: &MachineConfig,
         initial_state: &MachineState,
         rootfs: &MachineRootfsRecord,
+        storage: &crate::MachineStorageRecord,
     ) -> Result<(), LibVmError> {
         self.store
-            .add_machine_with_rootfs(config, initial_state, rootfs)
+            .add_machine_with_rootfs(config, initial_state, rootfs, storage)
             .await
     }
 
@@ -1472,18 +2254,6 @@ impl Runtime {
         reference: &str,
         options: ImageRemoveOptions,
     ) -> Result<(), LibVmError> {
-        let image = self
-            .store
-            .ensure_image_removable(reference, options.clone())
-            .await?;
-        let rootfs_store = self
-            .image_store()
-            .map_err(|err| image_error(&image.requested_reference, err))?;
-        let rootfs_options = MaterializeOptions::for_host()
-            .map_err(|err| image_error(&image.requested_reference, err))?;
-        rootfs_store
-            .remove_reference(&image.requested_reference, &rootfs_options.platform)
-            .map_err(|err| image_error(&image.requested_reference, err))?;
         self.store.remove_image(reference, options).await
     }
 
@@ -1544,9 +2314,9 @@ impl Runtime {
             .observe_machine_state(&config, persisted.as_ref())
             .await
         {
-            Ok(state) if machine_state_needs_writeback(persisted.as_ref(), &state) => {
+            Ok(observed) if machine_state_needs_writeback(persisted.as_ref(), &observed.state) => {
                 match self.try_acquire_machine_lock(config.lock_id) {
-                    Ok(Some(_lock)) => Ok(state),
+                    Ok(Some(_lock)) => Ok(observed),
                     Ok(None) => Err(LibVmError::MonitorConnection {
                         reference: config.name.clone(),
                         message: "machine is being modified; showing last-known state".into(),
@@ -1556,8 +2326,12 @@ impl Runtime {
             }
             result => result,
         };
-        let (state, observation) = match observed {
-            Ok(state) if issues.is_empty() => (state, MachineObservation::Observed),
+        let (state, storage_stop_outcome, observation) = match observed {
+            Ok(observed) if issues.is_empty() => (
+                observed.state,
+                observed.storage_stop_outcome,
+                MachineObservation::Observed,
+            ),
             result => {
                 if let Err(error) = result {
                     if !error.is_machine_observation_error() {
@@ -1572,6 +2346,7 @@ impl Runtime {
                 };
                 (
                     persisted.unwrap_or_else(|| stopped_machine_state(config.id, None)),
+                    None,
                     observation,
                 )
             }
@@ -1585,25 +2360,30 @@ impl Runtime {
             }
             issues.push(MachineIssue::new(MachineIssueComponent::Network, error));
         }
+        let mut live = None;
         let (status, boot_report, provision_report) = if runtime_status.is_running()
             && observation == MachineObservation::Observed
         {
-            let response = self
-                .supervisor
-                .client(config.id)
-                .status()
-                .await
-                .and_then(|response| {
-                    validate_host_status_identity(
-                        &response,
-                        config.id,
-                        runtime_status.run_id.as_deref(),
-                    )
-                    .map(|()| response)
-                    .map_err(crate::supervisor::VmmClientError::from)
-                });
+            let response =
+                self.supervisor
+                    .client(config.id)
+                    .status()
+                    .await
+                    .and_then(|response| {
+                        validate_host_status_identity(
+                            &response,
+                            config.id,
+                            runtime_status.run_id.as_deref(),
+                        )
+                        .map_err(crate::supervisor::VmmClientError::from)?;
+                        let report = crate::machine::live::report_from_status(&response).map_err(
+                            |error| crate::supervisor::VmmClientError::Protocol(error.to_string()),
+                        )?;
+                        Ok((response, report))
+                    });
             match response {
-                Ok(mut response) => {
+                Ok((mut response, report)) => {
+                    live = Some(report);
                     let listener =
                         response
                             .agent
@@ -1694,6 +2474,17 @@ impl Runtime {
             }
             Err(error) => return Err(error),
         };
+        let mut storage = match self.store.machine_storage(config.id).await {
+            Ok(storage) => storage,
+            Err(error) if error.is_machine_observation_error() => {
+                issues.push(MachineIssue::new(MachineIssueComponent::Rootfs, error));
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let (Some(storage), Some(outcome)) = (&mut storage, storage_stop_outcome) {
+            storage.stop_outcome = outcome;
+        }
         let run_id = runtime_status
             .is_running()
             .then(|| {
@@ -1712,6 +2503,16 @@ impl Runtime {
             provision_report,
             state,
         );
+        data.storage = storage;
+        data.live = live;
+        if !runtime_status.is_active() && observation == MachineObservation::Observed {
+            match self.live_capabilities().await {
+                Ok(report) => data.prospective_live = Some(report),
+                Err(error) => {
+                    issues.push(MachineIssue::new(MachineIssueComponent::Telemetry, error))
+                }
+            }
+        }
         data.observation = observation;
         data.issues = issues;
         Ok(data)
@@ -1731,15 +2532,47 @@ fn set_launch_initramfs(spec: &mut VmSpec, path: PathBuf) {
     kernel.initramfs = Some(path);
 }
 
-fn remove_file_if_exists(path: &Path) -> eyre::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("remove stale artifact {}", path.display())),
+fn validate_launch_storage(storage: &crate::MachineStorageRecord) -> Result<(), LibVmError> {
+    use crate::store::models::storage::{
+        BackendRequirement, BootBinding, BootProfile, MachineRoot, RawLayout, RootSelector,
+        StorageProfile, Translation,
+    };
+    let admitted = matches!(
+        (&storage.root, &storage.boot, storage.profile, storage.backend),
+        (MachineRoot::OpaqueRaw { path, layout: RawLayout::WholeDisk, .. },
+         BootProfile::LinuxDirect { binding: BootBinding::RuntimeSelected | BootBinding::Pinned { .. }, root_selector: RootSelector::WholeDisk, translation: Translation::None, .. },
+         StorageProfile::OpaqueRawV1, BackendRequirement::RawBlock)
+        if path.as_path() == crate::paths::root_disk_relative_path().as_path()
+    ) || matches!(
+        (
+            &storage.root,
+            &storage.boot,
+            storage.profile,
+            storage.backend
+        ),
+        (
+            MachineRoot::LinuxOverlay {
+                lower: crate::OverlayLower::FlatExt4 { .. },
+                ..
+            },
+            BootProfile::LinuxDirect {
+                binding: BootBinding::RuntimeSelected | BootBinding::Pinned { .. },
+                root_selector: RootSelector::ManagedOverlay,
+                translation: Translation::None,
+                ..
+            },
+            StorageProfile::LinuxOverlayV1,
+            BackendRequirement::KrunOverlay
+        )
+    );
+    if !admitted || storage.fence.is_some() || storage.relocation_operation.is_some() {
+        return Err(LibVmError::InvalidStorageRecord {
+            record: "machine-storage",
+            message: "storage/boot combination has not passed the launch gate".into(),
+        });
     }
+    Ok(())
 }
-
-const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 fn validate_image_pull_policy(
     source: &ImageSource,
@@ -1772,161 +2605,6 @@ fn emit_image_progress_complete(progress: Option<&ImageProgressSender>) {
     }
 }
 
-fn oci_image_record(
-    rootfs: &PublishedRootfs,
-    metadata: &RootfsMetadata,
-    size_bytes: u64,
-    requested_reference: &str,
-) -> Result<OciImageRecord, LibVmError> {
-    let now = now_unix();
-    let manifest_digest = effective_oci_manifest_digest(rootfs, metadata);
-    let created_at = metadata.created_at_unix;
-    let total_size_bytes = i64_from_u64("image_manifest.total_size_bytes", size_bytes)?;
-    let layer_count =
-        i64::try_from(metadata.layers.len()).map_err(|_| LibVmError::StateDecode {
-            field: "image_manifest.layer_count",
-            message: format!("layer count {} does not fit in i64", metadata.layers.len()),
-        })?;
-
-    let layers = metadata
-        .layers
-        .iter()
-        .map(|layer| ImageLayerRecord {
-            diff_id: layer.diff_id.clone(),
-            blob_digest: layer.blob_digest.clone(),
-            media_type: layer.media_type.clone(),
-            compressed_size_bytes: Some(layer.size_bytes),
-            uncompressed_size_bytes: None,
-            created_at,
-            last_used_at: Some(now),
-        })
-        .collect::<Vec<_>>();
-    let manifest_layers = metadata
-        .layers
-        .iter()
-        .enumerate()
-        .map(|(position, layer)| {
-            let position = i64::try_from(position).map_err(|_| LibVmError::StateDecode {
-                field: "image_manifest_layer.position",
-                message: format!("layer position {position} does not fit in i64"),
-            })?;
-            Ok(ImageManifestLayerRecord {
-                manifest_digest: manifest_digest.clone(),
-                layer_diff_id: layer.diff_id.clone(),
-                position,
-            })
-        })
-        .collect::<Result<Vec<_>, LibVmError>>()?;
-
-    Ok(OciImageRecord {
-        manifest: ImageManifestRecord {
-            digest: manifest_digest.clone(),
-            media_type: OCI_MANIFEST_MEDIA_TYPE.to_string(),
-            image_id: rootfs.flat_ext4().image_id.clone(),
-            platform_os: rootfs.flat_ext4().platform.os.clone(),
-            platform_architecture: rootfs.flat_ext4().platform.architecture.clone(),
-            platform_variant: rootfs.flat_ext4().platform.variant.clone(),
-            config_digest: Some(metadata.config_digest.clone()),
-            layer_count,
-            total_size_bytes,
-            created_at,
-            last_used_at: Some(now),
-        },
-        reference: ImageRefRecord {
-            requested_reference: requested_reference.to_string(),
-            selected_reference: metadata.selected_reference.clone(),
-            manifest_digest: manifest_digest.clone(),
-            image_id: rootfs.flat_ext4().image_id.clone(),
-            platform_os: rootfs.flat_ext4().platform.os.clone(),
-            platform_architecture: rootfs.flat_ext4().platform.architecture.clone(),
-            platform_variant: rootfs.flat_ext4().platform.variant.clone(),
-            size_bytes: Some(size_bytes),
-            created_at,
-            updated_at: now,
-            last_used_at: Some(now),
-        },
-        config: ImageConfigRecord {
-            manifest_digest: manifest_digest.clone(),
-            digest: metadata.config_digest.clone(),
-            metadata: metadata.config.clone(),
-            created_at,
-        },
-        layers,
-        manifest_layers,
-        artifact: image_artifact_record(rootfs, metadata, manifest_digest, size_bytes),
-    })
-}
-
-struct MaterializedImageIdentity {
-    requested_reference: String,
-    selected_reference: Option<String>,
-    manifest_digest: Option<String>,
-    config_digest: Option<String>,
-}
-
-fn materialized_image_identity(
-    source: &ImageSource,
-    rootfs: &PublishedRootfs,
-    metadata: Option<&RootfsMetadata>,
-) -> Result<MaterializedImageIdentity, LibVmError> {
-    match source.kind() {
-        ImageSourceKind::Oci => {
-            let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
-                field: "image.metadata",
-                message: format!(
-                    "OCI image {} is missing rootfs metadata",
-                    rootfs.flat_ext4().requested_reference
-                ),
-            })?;
-            Ok(MaterializedImageIdentity {
-                requested_reference: rootfs.flat_ext4().requested_reference.clone(),
-                selected_reference: Some(metadata.selected_reference.clone()),
-                manifest_digest: Some(effective_oci_manifest_digest(rootfs, metadata)),
-                config_digest: Some(metadata.config_digest.clone()),
-            })
-        }
-        ImageSourceKind::Disk => Ok(MaterializedImageIdentity {
-            requested_reference: source.source_reference(),
-            selected_reference: None,
-            manifest_digest: None,
-            config_digest: None,
-        }),
-    }
-}
-
-fn effective_oci_manifest_digest(_rootfs: &PublishedRootfs, metadata: &RootfsMetadata) -> String {
-    metadata.manifest_digest.clone()
-}
-
-fn image_artifact_record(
-    rootfs: &PublishedRootfs,
-    metadata: &RootfsMetadata,
-    manifest_digest: String,
-    size_bytes: u64,
-) -> ImageRootfsArtifactRecord {
-    let now = now_unix();
-    ImageRootfsArtifactRecord {
-        image_id: rootfs.flat_ext4().image_id.clone(),
-        manifest_digest,
-        config_digest: metadata.config_digest.clone(),
-        platform_os: rootfs.flat_ext4().platform.os.clone(),
-        platform_architecture: rootfs.flat_ext4().platform.architecture.clone(),
-        platform_variant: rootfs.flat_ext4().platform.variant.clone(),
-        filesystem: metadata.filesystem.clone(),
-        rootfs_path: rootfs.flat_ext4().path.clone(),
-        size_bytes,
-        created_at: metadata.created_at_unix,
-        last_used_at: Some(now),
-    }
-}
-
-fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, LibVmError> {
-    i64::try_from(value).map_err(|_| LibVmError::StateDecode {
-        field,
-        message: format!("value {value} does not fit in i64"),
-    })
-}
-
 pub(crate) fn write_machine_config(
     machine_dir: &Path,
     name: &str,
@@ -1954,6 +2632,8 @@ pub(crate) fn validate_root_disk_growth(
     config: &MachineConfig,
     desired_size: u64,
 ) -> Result<(), LibVmError> {
+    crate::storage::limits::validate_disk_length(desired_size)
+        .map_err(crate::storage::StorageError::from)?;
     let root_disk_path = config
         .machine_dir
         .join(crate::paths::root_disk_relative_path());
@@ -1977,6 +2657,8 @@ pub(crate) fn reconcile_root_disk_size(
     let Some(desired_size) = config.root_disk_size else {
         return Ok(crate::machine::root_disk::RootDiskResizeOutcome::GuestRequired);
     };
+    crate::storage::limits::validate_disk_length(desired_size)
+        .map_err(crate::storage::StorageError::from)?;
 
     let root_disk_path = config
         .machine_dir
@@ -2070,14 +2752,34 @@ pub(crate) fn monitor_identity(
     Ok(identity)
 }
 
-fn runtime_exit_matches(status: &VmmExitStatus, state: Option<&MachineState>) -> bool {
+fn runtime_exit_matches(status: &CurrentExitRecord, state: Option<&MachineState>) -> bool {
     let Some(state) = state else {
-        return true;
+        return false;
     };
 
-    status.machine_id == state.machine_id.to_string()
+    uuid::Uuid::parse_str(&status.machine_id).ok() == Some(uuid::Uuid::from(state.machine_id))
         && state.run_id.as_deref() == Some(status.run_id.as_str())
-        && state.vmm_pid == Some(status.pid)
+        && state.vmm_pid.is_none_or(|pid| pid == status.pid)
+}
+
+pub(crate) fn read_exit_for_reconciliation(path: &Path) -> Option<CurrentExitRecord> {
+    match exit_status::read(path) {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "exit record cannot certify current storage");
+            None
+        }
+    }
+}
+
+fn storage_busy_state(machine_id: MachineId, state: Option<&MachineState>) -> MachineState {
+    let mut state = state
+        .cloned()
+        .unwrap_or_else(|| stopped_machine_state(machine_id, None));
+    state.status = MachineRuntimeState::Stopping;
+    state.last_error =
+        Some("storage generation is retained by a live or unreconciled attachment owner".into());
+    state
 }
 
 fn validate_host_status_identity(
@@ -2110,11 +2812,11 @@ fn validate_host_status_identity(
     Ok(())
 }
 
-fn exit_observed_event(status: &VmmExitStatus) -> (bool, Option<String>) {
+fn exit_observed_event(status: &CurrentExitRecord) -> (bool, Option<String>) {
     let _ = status.exited_at;
     match status.outcome {
-        VmmExitOutcome::Clean | VmmExitOutcome::Forced => (true, None),
-        VmmExitOutcome::Error => (false, status.error.clone()),
+        ExitOutcome::Clean | ExitOutcome::Forced => (true, None),
+        ExitOutcome::Error => (false, status.error.clone()),
     }
 }
 
@@ -2229,7 +2931,7 @@ fn apply_resolved_boot_assets(spec: &mut VmSpec, boot_assets: ResolvedBootAssets
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn generic_monitor_status_requires_expected_machine_and_launch_run() {
         let machine = crate::store::models::MachineId::new();
@@ -2266,9 +2968,8 @@ mod tests {
     use crate::lock_manager::LockId;
     use crate::paths::LocalPaths;
     use crate::runtime::core::{
-        effective_oci_manifest_digest, materialized_image_identity, oci_image_record,
-        read_monitor_pid, stopped_machine_state, validate_image_pull_policy, write_machine_config,
-        Runtime,
+        oci_image_record, read_monitor_pid, stopped_machine_state, validate_image_pull_policy,
+        write_machine_config, Runtime,
     };
     use crate::store::models::{
         MachineConfig, MachineId, MachineNetworkConfig, MachineRootfsRecord, MachineRuntimeState,
@@ -2285,7 +2986,7 @@ mod tests {
         MachineKillOptions, MachineRef, MachineRetention, MachineRunId, MachineStatus,
         MachineUpdate, Memory, PublishBind, RuntimeNetworkingConfig,
     };
-    use oci::{FlatExt4Artifact, PublishedRootfs, RootfsMetadata};
+    use oci::RootfsMetadata;
     use silo_policy::NetworkPolicy;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -2384,10 +3085,22 @@ mod tests {
         let error = runtime
             .prepare_vmm_launch_inputs(
                 &config,
+                &uuid::Uuid::new_v4().to_string(),
                 &crate::network::VmmNetworkAttachment::None,
                 false,
-                "",
-                None,
+                &crate::secrets::ResolvedSecrets::default(),
+                &crate::machine::root_storage::PreparedRoot {
+                    disks: vec![],
+                    bootstrap: vec![],
+                    descriptor: None,
+                    qualification: None,
+                    storage: crate::MachineStorageRecord::opaque_raw(
+                        crate::PrivatePath::new("root.raw").unwrap(),
+                        512,
+                        &oci::Platform::host().unwrap(),
+                    )
+                    .unwrap(),
+                },
             )
             .expect_err("reject ineligible durable contract");
         assert!(error.to_string().contains("installed default guest agent"));
@@ -2395,101 +3108,37 @@ mod tests {
         assert!(!runtime.machine_paths(config.id).vm_spec_path().exists());
     }
 
-    fn sample_oci_rootfs_image() -> PublishedRootfs {
-        PublishedRootfs::FlatExt4(FlatExt4Artifact {
-            path: std::path::PathBuf::from("/tmp/rootfs.img"),
-            requested_reference: "ubuntu:latest".to_string(),
-            image_id: "sha256:imageid".to_string(),
-            manifest_digest: "sha256:imageid".to_string(),
-            platform: Platform::linux_arm64(),
-        })
-    }
-
-    fn sample_oci_rootfs_metadata(manifest_digest: &str) -> RootfsMetadata {
-        RootfsMetadata {
-            version: 2,
-            image_ref: "ubuntu:latest".to_string(),
-            image_id: "sha256:imageid".to_string(),
-            requested_reference: "ubuntu:latest".to_string(),
-            selected_reference: format!("ubuntu@{manifest_digest}"),
-            manifest_digest: manifest_digest.to_string(),
-            config_digest: "sha256:config".to_string(),
-            config: OciImageConfigMetadata::default(),
-            layers: Vec::new(),
-            platform: Platform::linux_arm64(),
-            filesystem: "ext4".to_string(),
-            rootfs_file: "rootfs.img".to_string(),
-            created_at_unix: 1,
-        }
-    }
-
-    fn write_cached_oci_rootfs(
+    pub(crate) async fn write_cached_oci_rootfs(
+        runtime: &Runtime,
         paths: &LocalPaths,
         requested_reference: &str,
         manifest_digest: &str,
         config_digest: &str,
     ) -> RootfsMetadata {
-        let platform = Platform::host().expect("host platform");
-        let mut cache_key = format!("{}-{}", platform.os, platform.architecture);
-        if let Some(variant) = &platform.variant {
-            cache_key.push('-');
-            cache_key.push_str(variant);
-        }
-        let image_dir = paths
-            .images_dir()
-            .join(manifest_digest.replace(':', "-"))
-            .join(&cache_key);
-        std::fs::create_dir_all(&image_dir).expect("create cached image directory");
-        std::fs::write(image_dir.join("rootfs.img"), b"cached rootfs").expect("write rootfs");
+        let source = paths.home().join("cache-fixture.raw");
+        std::fs::write(&source, [0x5a_u8; 512]).unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let published = pool.publish_stream(&source).unwrap();
+        std::fs::remove_file(source).unwrap();
+        let repository = requested_reference.split('@').next().unwrap();
+        let repository = repository
+            .rsplit_once(':')
+            .map_or(repository, |(repository, _)| repository);
         let metadata = RootfsMetadata {
-            version: 2,
-            image_ref: requested_reference.to_string(),
-            image_id: manifest_digest.to_string(),
-            requested_reference: requested_reference.to_string(),
-            selected_reference: format!("example.invalid/demo@{manifest_digest}"),
-            manifest_digest: manifest_digest.to_string(),
-            config_digest: config_digest.to_string(),
+            requested_reference: requested_reference.into(),
+            selected_reference: format!("{repository}@{manifest_digest}"),
+            manifest_digest: manifest_digest.into(),
+            config_digest: config_digest.into(),
             config: OciImageConfigMetadata {
-                cmd: Some(vec!["serve".to_string()]),
+                cmd: Some(vec!["serve".into()]),
                 ..OciImageConfigMetadata::default()
             },
             layers: Vec::new(),
-            platform: platform.clone(),
-            filesystem: "ext4".to_string(),
-            rootfs_file: "rootfs.img".to_string(),
+            platform: Platform::host().unwrap(),
             created_at_unix: 7,
         };
-        let mut stored_metadata =
-            serde_json::to_value(&metadata).expect("serialize cache metadata");
-        stored_metadata
-            .as_object_mut()
-            .expect("metadata object")
-            .insert(
-                "source".to_string(),
-                serde_json::Value::String("oci-registry".to_string()),
-            );
-        std::fs::write(
-            image_dir.join("metadata.json"),
-            serde_json::to_vec(&stored_metadata).expect("serialize stored metadata"),
-        )
-        .expect("write cache metadata");
-        let tag_key = format!("{requested_reference}|{cache_key}");
-        std::fs::write(
-            paths.images_dir().join("index.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "tags": {
-                    tag_key: {
-                        "image_ref": requested_reference,
-                        "platform": platform,
-                        "manifest_digest": manifest_digest,
-                        "updated_at_unix": 7
-                    }
-                }
-            }))
-            .expect("serialize cache index"),
-        )
-        .expect("write cache index");
+        let record = oci_image_record(&published, &metadata, requested_reference).unwrap();
+        runtime.store.save_oci_image(&record).await.unwrap();
         metadata
     }
 
@@ -2509,7 +3158,8 @@ mod tests {
         store.expect_list_machine_configs().never();
     }
 
-    async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
+    async fn runtime_with_mock_store(paths: LocalPaths, mut store: MockDataStore) -> Runtime {
+        store.expect_machine_storage().returning(|_| Ok(None));
         let components = crate::runtime::components::test_components(paths.home());
         Runtime::from_store(
             paths,
@@ -2644,36 +3294,104 @@ mod tests {
         );
     }
 
-    #[test]
-    fn effective_oci_manifest_digest_prefers_metadata_digest() {
-        let rootfs = sample_oci_rootfs_image();
-        let metadata = sample_oci_rootfs_metadata("sha256:manifest");
-
-        let digest = effective_oci_manifest_digest(&rootfs, &metadata);
-
-        assert_eq!(digest, "sha256:manifest");
+    #[tokio::test]
+    async fn retained_stream_corruption_is_rejected_for_offline_pull_policies() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        let reference = "example.invalid/demo:latest";
+        write_cached_oci_rootfs(
+            &runtime,
+            &paths,
+            reference,
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+        )
+        .await;
+        let platform = Platform::host().unwrap();
+        let record = runtime
+            .store
+            .cached_oci_image(reference, &platform)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::set_permissions(
+            &record.artifact.rootfs_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(&record.artifact.rootfs_path, b"corrupted").unwrap();
+        std::fs::set_permissions(
+            &record.artifact.rootfs_path,
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
+            let error = runtime
+                .resolve_oci_image(reference.into(), policy)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LibVmError::Storage(crate::storage::StorageError::ContentMismatch(_))
+            ));
+        }
     }
 
-    #[test]
-    fn materialized_oci_manifest_digest_matches_record_metadata() {
-        let source = ImageSource::oci("ubuntu:latest");
-        let rootfs = sample_oci_rootfs_image();
-        let metadata = sample_oci_rootfs_metadata("sha256:manifest");
-
-        let identity = materialized_image_identity(&source, &rootfs, Some(&metadata))
-            .expect("materialized identity should resolve");
-        let record = oci_image_record(&rootfs, &metadata, 4, "ubuntu:latest")
-            .expect("OCI image record should resolve");
-
-        assert_eq!(identity.manifest_digest.as_deref(), Some("sha256:manifest"));
-        assert_eq!(identity.config_digest.as_deref(), Some("sha256:config"));
+    #[tokio::test]
+    async fn warm_cache_requires_readonly_single_link_owned_streams() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        let reference = "example.invalid/demo:latest";
+        write_cached_oci_rootfs(
+            &runtime,
+            &paths,
+            reference,
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+        )
+        .await;
+        let record = runtime
+            .store
+            .cached_oci_image(reference, &Platform::host().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = &record.artifact.rootfs_path;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            runtime
+                .resolve_oci_image(reference.into(), ImagePullPolicy::Never)
+                .await,
+            Err(LibVmError::Storage(
+                crate::storage::StorageError::InvalidPath(_)
+            ))
+        ));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let alias = paths.home().join("unexpected-hardlink");
+        std::fs::hard_link(path, &alias).unwrap();
+        assert!(matches!(
+            runtime
+                .resolve_oci_image(reference.into(), ImagePullPolicy::Never)
+                .await,
+            Err(LibVmError::Storage(
+                crate::storage::StorageError::InvalidPath(_)
+            ))
+        ));
+        std::fs::remove_file(alias).unwrap();
         assert_eq!(
-            identity.selected_reference.as_deref(),
-            Some("ubuntu@sha256:manifest")
+            runtime
+                .resolve_oci_image(reference.into(), ImagePullPolicy::Never)
+                .await
+                .unwrap()
+                .cache_state,
+            ImageCacheState::Complete
         );
-        assert_eq!(record.manifest.digest, "sha256:manifest");
-        assert_eq!(record.reference.manifest_digest, "sha256:manifest");
-        assert_eq!(record.artifact.manifest_digest, "sha256:manifest");
     }
 
     #[test]
@@ -2735,20 +3453,8 @@ mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        let metadata = write_cached_oci_rootfs(&paths, REFERENCE, MANIFEST, CONFIG);
-        let index_before =
-            std::fs::read(paths.images_dir().join("index.json")).expect("read index");
-        let metadata_before = std::fs::read(
-            paths
-                .images_dir()
-                .join(MANIFEST.replace(':', "-"))
-                .join(format!(
-                    "{}-{}",
-                    metadata.platform.os, metadata.platform.architecture
-                ))
-                .join("metadata.json"),
-        )
-        .expect("read metadata");
+        let metadata = write_cached_oci_rootfs(&runtime, &paths, REFERENCE, MANIFEST, CONFIG).await;
+        let before = runtime.images().list().await.unwrap();
 
         for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
             let resolved = runtime
@@ -2768,30 +3474,8 @@ mod tests {
             assert_eq!(resolved.cache_state, ImageCacheState::Complete);
         }
 
-        assert!(runtime
-            .images()
-            .list()
-            .await
-            .expect("list images")
-            .is_empty());
-        assert_eq!(
-            std::fs::read(paths.images_dir().join("index.json")).expect("read index"),
-            index_before
-        );
-        assert_eq!(
-            std::fs::read(
-                paths
-                    .images_dir()
-                    .join(MANIFEST.replace(':', "-"))
-                    .join(format!(
-                        "{}-{}",
-                        metadata.platform.os, metadata.platform.architecture
-                    ))
-                    .join("metadata.json"),
-            )
-            .expect("read metadata"),
-            metadata_before
-        );
+        assert_eq!(runtime.images().list().await.unwrap(), before);
+        assert!(!paths.images_dir().join("index.json").exists());
 
         let error = runtime
             .images()
@@ -2820,27 +3504,8 @@ mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        let metadata = write_cached_oci_rootfs(&paths, FIRST_REFERENCE, MANIFEST, CONFIG);
-        let cache_key = format!(
-            "{}-{}",
-            metadata.platform.os, metadata.platform.architecture
-        );
-        let index_path = paths.images_dir().join("index.json");
-        let mut index: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&index_path).expect("read cache index"))
-                .expect("decode cache index");
-        let first_key = format!("{FIRST_REFERENCE}|{cache_key}");
-        let mut second_tag = index["tags"][&first_key].clone();
-        second_tag["image_ref"] = serde_json::Value::String(SECOND_REFERENCE.to_string());
-        index["tags"]
-            .as_object_mut()
-            .expect("cache tags")
-            .insert(format!("{SECOND_REFERENCE}|{cache_key}"), second_tag);
-        std::fs::write(
-            &index_path,
-            serde_json::to_vec_pretty(&index).expect("encode cache index"),
-        )
-        .expect("write cache index");
+        write_cached_oci_rootfs(&runtime, &paths, FIRST_REFERENCE, MANIFEST, CONFIG).await;
+        write_cached_oci_rootfs(&runtime, &paths, SECOND_REFERENCE, MANIFEST, CONFIG).await;
 
         let handle = runtime
             .images()
@@ -2860,7 +3525,7 @@ mod tests {
             .get(FIRST_REFERENCE)
             .await
             .expect("get first tag")
-            .is_none());
+            .is_some());
         assert!(runtime
             .images()
             .get(SECOND_REFERENCE)
@@ -2882,14 +3547,15 @@ mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        let metadata = write_cached_oci_rootfs(&paths, REFERENCE, MANIFEST, CONFIG);
-        let artifact_dir = paths
-            .images_dir()
-            .join(MANIFEST.replace(':', "-"))
-            .join(format!(
-                "{}-{}",
-                metadata.platform.os, metadata.platform.architecture
-            ));
+        let metadata = write_cached_oci_rootfs(&runtime, &paths, REFERENCE, MANIFEST, CONFIG).await;
+        let artifact_dir = runtime
+            .store
+            .cached_oci_image(REFERENCE, &Platform::host().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .artifact
+            .rootfs_path;
 
         runtime
             .images()
@@ -2906,17 +3572,6 @@ mod tests {
             .remove(REFERENCE)
             .await
             .expect("remove image reference");
-
-        let index: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(paths.images_dir().join("index.json")).expect("read cache index"),
-        )
-        .expect("decode cache index");
-        assert!(
-            index["tags"]
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty),
-            "removal must clear the OCI tag mapping: {index}"
-        );
 
         assert!(runtime
             .images()
@@ -2939,6 +3594,11 @@ mod tests {
             artifact_dir.exists(),
             "removal must retain artifact until prune"
         );
+        let pinned = runtime
+            .resolve_oci_image(metadata.selected_reference, ImagePullPolicy::Never)
+            .await
+            .unwrap();
+        assert_eq!(pinned.manifest_digest, MANIFEST);
 
         let report = runtime
             .images()
@@ -2962,7 +3622,7 @@ mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        let metadata = write_cached_oci_rootfs(&paths, REFERENCE, MANIFEST, CONFIG);
+        let metadata = write_cached_oci_rootfs(&runtime, &paths, REFERENCE, MANIFEST, CONFIG).await;
         let (progress, mut progress_events) = ImageProgressSender::default_channel();
         let progress_runtime = runtime.clone().with_image_progress(progress);
         let resolved = progress_runtime
@@ -3059,7 +3719,7 @@ mod tests {
             write_machine_config(&machine_dir, &self.name, &spec)?;
             std::fs::write(
                 machine_dir.join(crate::paths::root_disk_relative_path()),
-                b"disk",
+                [0_u8; 512],
             )?;
 
             let lock = match runtime.allocate_machine_lock() {
@@ -3169,8 +3829,28 @@ mod tests {
             .expect("read machine config")
             .expect("machine config exists");
         config.guest.agent = crate::machine::MachineAgent::Disabled;
+        let storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![crate::machine::root_storage::disk(
+                "root.raw",
+                vm_spec::DiskRole::Root,
+                512,
+                "silo-root".into(),
+            )
+            .unwrap()],
+        });
+        std::fs::set_permissions(
+            config.machine_dir.join("root.raw"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         runtime
-            .save_machine_config(&config)
+            .save_machine_config_with_storage(&config, &storage)
             .await
             .expect("disable test guest agent");
         (runtime, config, store)
@@ -3203,6 +3883,31 @@ mod tests {
                 .spawn()
                 .expect("spawn sleep process");
             Self { child }
+        }
+
+        fn sleep_ready() -> Self {
+            let child = std::process::Command::new(
+                std::env::current_exe().expect("current test binary path"),
+            )
+            .env("SILO_LIBVM_STORAGE_HOLDER_CHILD", "1")
+            .args([
+                "--exact",
+                "runtime::core::tests::storage_holder_child_process",
+                "--nocapture",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn storage holder process");
+            let mut guard = Self { child };
+            let stdout = guard
+                .child
+                .stdout
+                .take()
+                .expect("child stdout should be piped");
+            // Userspace readiness, unlike an exec-status notification, proves
+            // inherited CLOEXEC descriptors have completed exec-time teardown.
+            wait_for_child_ready(stdout);
+            guard
         }
 
         fn sleep_ignoring_sigint() -> Self {
@@ -3271,6 +3976,16 @@ mod tests {
         unsafe {
             nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &action)
                 .expect("ignore SIGINT");
+        }
+        println!("SILO_READY");
+        std::io::stdout().flush().expect("flush readiness");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn storage_holder_child_process() {
+        if std::env::var_os("SILO_LIBVM_STORAGE_HOLDER_CHILD").is_none() {
+            return;
         }
         println!("SILO_READY");
         std::io::stdout().flush().expect("flush readiness");
@@ -3373,39 +4088,6 @@ mod tests {
         assert_failed_start_network_is_clean(&runtime, config.id).await;
     }
 
-    #[tokio::test]
-    async fn start_rejects_noncanonical_machine_directory_before_creating_runtime_files() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-        let runtime = Runtime::open(paths, RuntimeNetworkingConfig::default())
-            .await
-            .expect("create runtime");
-        let machine = create_pending_sample(&runtime, "devbox")
-            .await
-            .expect("create pending machine")
-            .commit(&runtime)
-            .await
-            .expect("commit machine");
-        let mut config = runtime
-            .machine_config(machine.id)
-            .await
-            .expect("read machine config")
-            .expect("machine config exists");
-        config.machine_dir = temp.path().join("outside-machine-data");
-        runtime
-            .save_machine_config(&config)
-            .await
-            .expect("persist invalid machine directory");
-
-        let error = machine_handle(&runtime, config.id)
-            .start()
-            .await
-            .expect_err("noncanonical machine directory must fail start");
-
-        assert!(matches!(error, LibVmError::InvalidOwnedPath { .. }));
-        assert!(!runtime.paths.machine(config.id).machine_run_dir().exists());
-    }
-
     async fn inspect_machine(
         runtime: &Runtime,
         machine_ref: MachineRef,
@@ -3446,7 +4128,15 @@ mod tests {
         let data = entries[0].data.as_ref().expect("partial details");
         assert!(!data.issues.is_empty());
         assert_ne!(data.observation, crate::MachineObservation::Observed);
-        assert!(entries[1].data.as_ref().expect("healthy").issues.is_empty());
+        let healthy = entries[1].data.as_ref().expect("healthy");
+        assert_eq!(healthy.observation, crate::MachineObservation::Observed);
+        // This storage-only fixture has no monitor executable. Prospective
+        // capability discovery is unavailable, independently of lifecycle.
+        assert!(healthy
+            .issues
+            .iter()
+            .all(|issue| issue.component == crate::MachineIssueComponent::Telemetry));
+        assert!(healthy.prospective_live.is_none());
         assert_eq!(
             std::fs::read_to_string(pid_path).expect("still present"),
             "not a pid"
@@ -3588,50 +4278,103 @@ mod tests {
     async fn replace_config_rolls_back_vm_spec_when_store_save_fails() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let id = MachineId::new();
-        let config = sample_machine_config(&paths, id, "devbox");
-        std::fs::create_dir_all(&config.machine_dir).expect("create machine dir");
-        write_machine_config(&config.machine_dir, &config.name, &config.spec)
-            .expect("write original spec");
-        let state = stopped_state(id);
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        let config_for_lookup = config.clone();
-        store
-            .expect_machine_config()
-            .withf(move |machine_id| *machine_id == id)
-            .times(2)
-            .returning(move |_| Ok(Some(config_for_lookup.clone())));
-        store
-            .expect_machine_state()
-            .withf(move |machine_id| *machine_id == id)
-            .once()
-            .return_once(move |_| Ok(Some(state)));
-        store.expect_save_machine_config().once().returning(|_| {
-            Err(LibVmError::InvalidMachineUpdate {
-                reference: "devbox".to_string(),
-                reason: "forced save failure".to_string(),
-            })
-        });
-        let runtime = runtime_with_mock_store(paths, store).await;
-        let mut replacement = sample_vm_spec();
-        spec_hardware_mut(&mut replacement).cpus = Some(8);
-
-        let err = machine_handle(&runtime, id)
-            .replace_config(replacement)
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
-            .expect_err("store failure should fail replace_config");
+            .expect("open real runtime");
+        let source = temp.path().join("base.raw");
+        std::fs::write(&source, [0x64; 512]).expect("write source disk");
+        let machine = runtime
+            .machine()
+            .name("devbox")
+            .image_source(ImageSource::disk(&source))
+            .create()
+            .await
+            .expect("create current-format machine");
+        let config = runtime
+            .machine_config(machine.machine_id())
+            .await
+            .expect("read config")
+            .expect("published machine");
+        let original_storage = runtime
+            .machine_storage_record(config.id)
+            .await
+            .expect("read semantic storage");
+        original_storage.validate().expect("valid current storage");
+        let path = config.machine_dir.join("config.json");
+        let original_file = std::fs::read(&path).expect("read original spec");
+        let store = Store::open(&paths.state_db_path())
+            .await
+            .expect("open real catalog");
+        store
+            .execute_test_sql(
+                "CREATE TRIGGER reject_spec_publication BEFORE UPDATE ON machine_config
+             BEGIN SELECT RAISE(ABORT, 'reject specification publication'); END",
+            )
+            .await
+            .expect("install real SQLite write failure");
+        let mut replacement = config.spec.clone();
+        spec_hardware_mut(&mut replacement).cpus = Some(8);
+        replacement
+            .validate()
+            .expect("valid replacement specification");
 
-        assert!(matches!(
-            err,
-            LibVmError::InvalidMachineUpdate { ref reason, .. }
-                if reason == "forced save failure"
-        ));
-        let restored: VmSpec = serde_json::from_slice(
-            &std::fs::read(config.machine_dir.join("config.json")).expect("read rolled back spec"),
-        )
-        .expect("parse rolled back spec");
-        assert_eq!(spec_hardware(&restored).cpus, Some(4));
+        let error = machine
+            .replace_config(replacement.clone())
+            .await
+            .expect_err("SQLite trigger must reject publication");
+        assert!(
+            matches!(&error,
+                LibVmError::Database(sqlx::Error::Database(source))
+                    if source.code().as_deref() == Some("1811")
+            ),
+            "expected SQLite SQLITE_CONSTRAINT_TRIGGER: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read rolled back spec"),
+            original_file
+        );
+        assert_eq!(
+            store.machine_config(config.id).await.expect("read catalog"),
+            Some(config.clone())
+        );
+        assert_eq!(
+            store
+                .machine_storage(config.id)
+                .await
+                .expect("read storage"),
+            Some(original_storage)
+        );
+        assert_eq!(
+            std::fs::read(
+                config
+                    .machine_dir
+                    .join(crate::paths::root_disk_relative_path())
+            )
+            .expect("read preserved private root"),
+            [0x64; 512]
+        );
+
+        store
+            .execute_test_sql("DROP TRIGGER reject_spec_publication")
+            .await
+            .expect("remove write failure");
+        machine
+            .replace_config(replacement.clone())
+            .await
+            .expect("same valid replacement succeeds after rollback");
+        let published = store
+            .machine_config(config.id)
+            .await
+            .expect("read published config")
+            .expect("machine remains published");
+        let published_file: VmSpec =
+            serde_json::from_slice(&std::fs::read(path).expect("read published spec"))
+                .expect("decode published spec");
+        assert_eq!(spec_hardware(&published.spec).cpus, Some(8));
+        assert_eq!(
+            serde_json::to_value(&published_file).expect("serialize file spec"),
+            serde_json::to_value(&published.spec).expect("serialize catalog spec")
+        );
     }
 
     #[tokio::test]
@@ -3672,19 +4415,6 @@ mod tests {
         let config = sample_machine_config(&paths, id, "rootfs-inspect");
         std::fs::create_dir_all(&config.machine_dir).expect("create machine directory");
         runtime
-            .store
-            .save_oci_image(
-                &oci_image_record(
-                    &sample_oci_rootfs_image(),
-                    &sample_oci_rootfs_metadata("sha256:manifest"),
-                    4,
-                    "ubuntu:latest",
-                )
-                .expect("build OCI image record"),
-            )
-            .await
-            .expect("persist OCI image");
-        runtime
             .add_machine_record_with_rootfs(
                 &config,
                 &stopped_state(id),
@@ -3696,10 +4426,16 @@ mod tests {
                     manifest_digest: Some("sha256:manifest".to_string()),
                     config_digest: Some("sha256:config".to_string()),
                     image_id: Some("sha256:image-id".to_string()),
-                    root_disk_path: config.machine_dir.join("rootfs.img"),
+                    root_disk_path: config.machine_dir.join("root.raw"),
                     root_disk_size_bytes: 64 * 1024 * 1024,
                     created_at: 7,
                 },
+                &crate::MachineStorageRecord::opaque_raw(
+                    crate::store::models::storage::PrivatePath::new("root.raw").unwrap(),
+                    64 * 1024 * 1024,
+                    &Platform::host().unwrap(),
+                )
+                .unwrap(),
             )
             .await
             .expect("persist machine rootfs pin");
@@ -3836,13 +4572,14 @@ mod tests {
                 format!("{pid}\n"),
             )
             .expect("pidfile");
+            let run_id = uuid::Uuid::new_v4().to_string();
             runtime
                 .set_machine_state(
                     machine.id,
                     MachineRuntimeState::Running,
                     Some(pid),
                     child.started_at(),
-                    Some("run-stop-timeout".to_string()),
+                    Some(run_id.clone()),
                     None,
                 )
                 .await
@@ -3862,10 +4599,8 @@ mod tests {
             });
             let result = tokio::time::timeout(
                 Duration::from_secs(4),
-                machine_handle(&runtime, machine.id).stop_run_with(
-                    MachineRunId::from_raw("run-stop-timeout".to_string()),
-                    options,
-                ),
+                machine_handle(&runtime, machine.id)
+                    .stop_run_with(MachineRunId::from_raw(run_id), options),
             )
             .await
             .expect("bounded stop");
@@ -4150,7 +4885,7 @@ mod tests {
                 MachineRuntimeState::Running,
                 Some(12_345),
                 Some(42),
-                Some("run-1".to_string()),
+                Some("11111111-1111-4111-8111-111111111111".to_string()),
                 None,
             )
             .await
@@ -4160,8 +4895,8 @@ mod tests {
         std::fs::write(
             &exit_status_path,
             format!(
-                r#"{{"machineId":"{}","runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}}"#,
-                machine.id
+                r#"{{"machineId":"{}","runId":"11111111-1111-4111-8111-111111111111","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}}"#,
+                uuid::Uuid::from(machine.id)
             ),
         )
         .expect("write exit status");
@@ -4266,66 +5001,6 @@ mod tests {
             .await
             .expect("inspect removed machine")
             .is_none());
-    }
-
-    #[tokio::test]
-    async fn abandoned_start_recreates_private_runtime_directories() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("silo")),
-            RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .expect("create runtime");
-        let machine = create_pending_sample(&runtime, "devbox")
-            .await
-            .expect("create pending machine")
-            .commit(&runtime)
-            .await
-            .expect("commit machine");
-        let paths = runtime.machine_paths(machine.id);
-        assert!(!paths.machine_run_dir().exists());
-        runtime
-            .set_machine_state(
-                machine.id,
-                MachineRuntimeState::Starting,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("set starting state");
-
-        let status = runtime
-            .reconcile_machine_runtime_locked(&machine)
-            .await
-            .expect("reconcile");
-        assert!(!status.is_active());
-        for path in [
-            paths.machine_run_dir().to_path_buf(),
-            paths
-                .machine_run_dir()
-                .parent()
-                .expect("machines parent")
-                .to_path_buf(),
-        ] {
-            assert_eq!(
-                std::fs::metadata(&path)
-                    .expect("runtime directory")
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700,
-                "{} must stay private",
-                path.display(),
-            );
-        }
-        runtime
-            .local_paths()
-            .remove_machine_run_tree(machine.id)
-            .expect("secure cleanup");
-        assert!(!paths.machine_run_dir().exists());
     }
 
     #[tokio::test]
@@ -4742,7 +5417,7 @@ mod tests {
                 MachineRuntimeState::Running,
                 Some(12_345),
                 Some(42),
-                Some("run-1".to_string()),
+                Some("11111111-1111-4111-8111-111111111111".to_string()),
                 None,
             )
             .await
@@ -4752,8 +5427,8 @@ mod tests {
         std::fs::write(
             &exit_status_path,
             format!(
-                r#"{{"machineId":"{}","runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}}"#,
-                machine.id
+                r#"{{"machineId":"{}","runId":"11111111-1111-4111-8111-111111111111","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}}"#,
+                uuid::Uuid::from(machine.id)
             ),
         )
         .expect("write exit status");
@@ -4817,8 +5492,8 @@ mod tests {
         std::fs::write(
             &exit_status_path,
             format!(
-                r#"{{"machineId":"{}","runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"old runtime exploded"}}"#,
-                machine.id
+                r#"{{"machineId":"{}","runId":"11111111-1111-4111-8111-111111111111","pid":12345,"exitedAt":99,"outcome":"error","error":"old runtime exploded"}}"#,
+                uuid::Uuid::from(machine.id)
             ),
         )
         .expect("write stale exit status");
@@ -5307,7 +5982,7 @@ mod tests {
             .update(MachineUpdate {
                 cpus: Some(6),
                 memory: Some(Memory::mebibytes(2048)),
-                root_disk_size: Some(8),
+                root_disk_size: Some(1024),
                 ..MachineUpdate::default()
             })
             .await
@@ -5315,7 +5990,7 @@ mod tests {
 
         assert_eq!(spec_hardware(&updated.spec).cpus, Some(6));
         assert_eq!(spec_hardware(&updated.spec).memory, Some(2048));
-        assert_eq!(updated.root_disk_size, Some(8));
+        assert_eq!(updated.root_disk_size, Some(1024));
         let persisted = inspect_machine(
             &runtime,
             MachineRef::parse("devbox").expect("parse machine ref"),
@@ -5323,7 +5998,7 @@ mod tests {
         .await
         .expect("inspect persisted update");
         assert_eq!(spec_hardware(&persisted.spec).cpus, Some(6));
-        assert_eq!(persisted.root_disk_size, Some(8));
+        assert_eq!(persisted.root_disk_size, Some(1024));
     }
 
     #[tokio::test]
@@ -5730,5 +6405,1034 @@ mod tests {
             .await
             .expect("persist ephemeral machine");
         config
+    }
+    #[tokio::test]
+    async fn always_policy_rechecks_registry_while_offline_policies_reuse_verified_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let mut runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        let reference = "example.invalid/demo:latest";
+        write_cached_oci_rootfs(
+            &runtime,
+            &paths,
+            reference,
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+        )
+        .await;
+        runtime.registry_policy = crate::RegistryPolicy::new(
+            crate::RegistryAction::Deny,
+            vec!["docker.io".into()],
+            vec![],
+        )
+        .unwrap();
+        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
+            assert_eq!(
+                runtime
+                    .resolve_oci_image(reference.into(), policy)
+                    .await
+                    .unwrap()
+                    .cache_state,
+                ImageCacheState::Complete
+            );
+        }
+        assert!(matches!(
+            runtime
+                .resolve_oci_image(reference.into(), ImagePullPolicy::Always)
+                .await,
+            Err(LibVmError::ImageReferenceRejected { .. })
+        ));
+    }
+
+    #[test]
+    fn launch_admission_rejects_unimplemented_and_noncanonical_root_paths() {
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &Platform::host().unwrap(),
+        )
+        .unwrap();
+        crate::runtime::core::validate_launch_storage(&storage).unwrap();
+        if let crate::MachineRoot::OpaqueRaw { path, .. } = &mut storage.root {
+            *path = crate::PrivatePath::new("different.raw").unwrap();
+        }
+        assert!(matches!(
+            crate::runtime::core::validate_launch_storage(&storage),
+            Err(LibVmError::InvalidStorageRecord { .. })
+        ));
+        if let crate::MachineRoot::OpaqueRaw { path, .. } = &mut storage.root {
+            *path = crate::PrivatePath::new("root.raw").unwrap();
+        }
+        if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
+            *root_selector = crate::RootSelector::ManagedOverlay;
+        }
+        assert!(matches!(
+            crate::runtime::core::validate_launch_storage(&storage),
+            Err(LibVmError::InvalidStorageRecord { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn launch_requires_a_real_durable_storage_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        let config = sample_machine_config(&paths, MachineId::new(), "missing-storage");
+        assert!(matches!(
+            runtime.validate_machine_storage_for_launch(&config).await,
+            Err(LibVmError::InvalidStorageRecord { .. })
+        ));
+    }
+
+    pub(crate) async fn shutdown_storage_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (Runtime, MachineConfig, crate::MachineStorageRecord) {
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths, RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        let mut config = create_pending_sample(&runtime, "shutdown")
+            .await
+            .unwrap()
+            .commit(&runtime)
+            .await
+            .unwrap();
+        let storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![crate::machine::root_storage::disk(
+                "root.raw",
+                vm_spec::DiskRole::Root,
+                512,
+                "silo-root".into(),
+            )
+            .unwrap()],
+        });
+        std::fs::set_permissions(
+            config.machine_dir.join("root.raw"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        runtime
+            .save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        create_machine_runtime_dirs(&runtime, config.id);
+        (runtime, config, storage)
+    }
+
+    fn write_shutdown_holder(
+        runtime: &Runtime,
+        config: &MachineConfig,
+        run: uuid::Uuid,
+        operation: uuid::Uuid,
+        worker: Option<&ChildGuard>,
+    ) {
+        use protocol::shutdown::{StorageHolder, StorageHolderRecord, StorageHolderRole};
+        let mut holders = vec![StorageHolder {
+            role: StorageHolderRole::Monitor,
+            pid: i32::MAX as u32,
+            started_at: 1,
+        }];
+        if let Some(worker) = worker {
+            holders.push(StorageHolder {
+                role: StorageHolderRole::KrunWorker,
+                pid: worker.id(),
+                started_at: u64::try_from(worker.started_at().unwrap()).unwrap(),
+            });
+        }
+        let record = StorageHolderRecord {
+            schema_version: 1,
+            machine_id: uuid::Uuid::from(config.id).to_string(),
+            run_id: run.to_string(),
+            operation_id: operation.to_string(),
+            holders,
+        };
+        let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
+        std::fs::write(&path, record.encode().unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn write_shutdown_exit(
+        runtime: &Runtime,
+        config: &MachineConfig,
+        run: uuid::Uuid,
+        outcome: &str,
+        evidence: Option<serde_json::Value>,
+    ) {
+        let mut value = serde_json::json!({
+            "machineId": uuid::Uuid::from(config.id).to_string(), "runId": run.to_string(),
+            "pid": i32::MAX, "exitedAt": 99, "outcome": outcome,
+        });
+        if let Some(evidence) = evidence {
+            value["storageShutdown"] = evidence;
+        }
+        let path = runtime.machine_paths(config.id).vmm_exit_status_path();
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_reconciliation_requires_exact_run_outer_and_all_three_facts() {
+        use crate::StorageStopOutcome::{Clean, Forced, Unknown};
+        for (outer, evidence, wrong_run, expected) in [
+            (
+                "clean",
+                Some(
+                    serde_json::json!({"version":1,"guestProtocolCompleted":true,"hostFlushCompleted":true,"attachmentsClosed":true}),
+                ),
+                false,
+                Clean,
+            ),
+            ("clean", None, false, Unknown),
+            (
+                "clean",
+                Some(
+                    serde_json::json!({"version":1,"guestProtocolCompleted":true,"hostFlushCompleted":false,"attachmentsClosed":true}),
+                ),
+                false,
+                Unknown,
+            ),
+            (
+                "clean",
+                Some(
+                    serde_json::json!({"version":2,"guestProtocolCompleted":true,"hostFlushCompleted":true,"attachmentsClosed":true}),
+                ),
+                false,
+                Unknown,
+            ),
+            (
+                "clean",
+                Some(
+                    serde_json::json!({"version":1,"guestProtocolCompleted":true,"hostFlushCompleted":true,"attachmentsClosed":true}),
+                ),
+                true,
+                Unknown,
+            ),
+            (
+                "forced",
+                Some(serde_json::json!({"version":"malformed"})),
+                false,
+                Forced,
+            ),
+            (
+                "error",
+                Some(serde_json::json!({"version":"malformed"})),
+                false,
+                Forced,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+            let run = uuid::Uuid::new_v4();
+            let lease = runtime
+                .register_launch_storage(&config, run, &storage)
+                .await
+                .unwrap();
+            runtime
+                .mark_launch_storage_admitted(lease.operation_id())
+                .await
+                .unwrap();
+            runtime
+                .set_machine_state(
+                    config.id,
+                    MachineRuntimeState::Running,
+                    Some(i32::MAX),
+                    Some(1),
+                    Some(run.to_string()),
+                    None,
+                )
+                .await
+                .unwrap();
+            write_shutdown_holder(&runtime, &config, run, lease.operation_id(), None);
+            write_shutdown_exit(
+                &runtime,
+                &config,
+                if wrong_run { uuid::Uuid::new_v4() } else { run },
+                outer,
+                evidence,
+            );
+            drop(lease);
+            let result = runtime
+                .reconcile_machine_runtime_locked(&config)
+                .await
+                .unwrap();
+            assert!(!result.is_active());
+            assert_eq!(
+                runtime
+                    .machine_storage_record(config.id)
+                    .await
+                    .unwrap()
+                    .stop_outcome,
+                expected
+            );
+            assert!(runtime
+                .store
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(runtime.machine_state(config.id).await.unwrap().run_id, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_holders_fence_clean_missing_and_malformed_exits_until_actual_completion() {
+        for record in ["clean", "missing", "malformed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+            let run = uuid::Uuid::new_v4();
+            let lease = runtime
+                .register_launch_storage(&config, run, &storage)
+                .await
+                .unwrap();
+            runtime
+                .mark_launch_storage_admitted(lease.operation_id())
+                .await
+                .unwrap();
+            runtime
+                .set_machine_state(
+                    config.id,
+                    MachineRuntimeState::Running,
+                    Some(i32::MAX),
+                    Some(1),
+                    Some(run.to_string()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut worker = ChildGuard::sleep_ready();
+            write_shutdown_holder(&runtime, &config, run, lease.operation_id(), Some(&worker));
+            if record == "malformed" {
+                let path = runtime.machine_paths(config.id).vmm_exit_status_path();
+                std::fs::write(&path, b"{").unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            if record == "clean" {
+                write_shutdown_exit(
+                    &runtime,
+                    &config,
+                    run,
+                    "clean",
+                    Some(serde_json::json!({
+                        "version":1,"guestProtocolCompleted":true,"hostFlushCompleted":true,"attachmentsClosed":true,
+                    })),
+                );
+            }
+            let operation = lease.operation_id();
+            drop(lease);
+            let pool = crate::storage::pool::StoragePool::open_existing(runtime.local_images_dir())
+                .unwrap()
+                .unwrap();
+            assert!(
+                pool.try_exclusive_lease(operation).unwrap().is_some(),
+                "{record}: holder liveness is independent of a free flock"
+            );
+            assert!(runtime
+                .reconcile_machine_runtime_locked(&config)
+                .await
+                .unwrap()
+                .is_active());
+            assert!(runtime
+                .ensure_no_live_vmm_generation(&config)
+                .await
+                .is_err());
+            assert_eq!(
+                runtime
+                    .store
+                    .launch_storage_operations(config.id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                runtime
+                    .machine_storage_record(config.id)
+                    .await
+                    .unwrap()
+                    .stop_outcome,
+                crate::StorageStopOutcome::Unknown
+            );
+            assert!(config.machine_dir.join("root.raw").exists());
+            worker.kill();
+            assert!(!runtime
+                .reconcile_machine_runtime_locked(&config)
+                .await
+                .unwrap()
+                .is_active());
+            assert_eq!(
+                runtime
+                    .machine_storage_record(config.id)
+                    .await
+                    .unwrap()
+                    .stop_outcome,
+                if record == "clean" {
+                    crate::StorageStopOutcome::Clean
+                } else {
+                    crate::StorageStopOutcome::Unknown
+                }
+            );
+            assert!(runtime
+                .store
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_wrong_run_malformed_or_missing_holders_preserve_operation_and_lifecycle() {
+        for holder in ["missing", "malformed", "wrong-run"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+            let run = uuid::Uuid::new_v4();
+            let lease = runtime
+                .register_launch_storage(&config, run, &storage)
+                .await
+                .unwrap();
+            runtime
+                .mark_launch_storage_admitted(lease.operation_id())
+                .await
+                .unwrap();
+            runtime
+                .set_machine_state(
+                    config.id,
+                    MachineRuntimeState::Running,
+                    Some(i32::MAX),
+                    Some(1),
+                    Some(run.to_string()),
+                    None,
+                )
+                .await
+                .unwrap();
+            if holder == "malformed" {
+                let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
+                std::fs::write(&path, b"{").unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            } else if holder == "wrong-run" {
+                write_shutdown_holder(
+                    &runtime,
+                    &config,
+                    uuid::Uuid::new_v4(),
+                    lease.operation_id(),
+                    None,
+                );
+            }
+            drop(lease);
+            assert!(runtime
+                .reconcile_machine_runtime_locked(&config)
+                .await
+                .is_err());
+            assert_eq!(
+                runtime.machine_state(config.id).await.unwrap().status,
+                MachineRuntimeState::Running
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .launch_storage_operations(config.id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preattachment_startup_failure_reconciles_atomically_without_inventing_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &run.to_string())
+            .await
+            .unwrap();
+        drop(lease);
+        runtime
+            .mark_machine_start_error(
+                config.id,
+                &run.to_string(),
+                Some("pre-attachment failure".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().status,
+            MachineRuntimeState::Error
+        );
+        assert_eq!(
+            runtime
+                .machine_storage_record(config.id)
+                .await
+                .unwrap()
+                .stop_outcome,
+            crate::StorageStopOutcome::Unknown
+        );
+        assert!(runtime
+            .store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_keeps_closure_pins_until_actual_blocking_owner_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &run.to_string())
+            .await
+            .unwrap();
+        let retained = lease.lock().duplicate_inheritable().unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (finished, finishing) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _retained = retained;
+                let _ = entered.send(());
+                let _ = wait.recv();
+                drop(_retained);
+                let _ = finished.send(());
+            })
+            .await
+        });
+        entering.await.unwrap();
+        drop(lease);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .unwrap()
+            .is_active());
+        assert_eq!(
+            runtime
+                .store
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(machine_handle(&runtime, config.id).remove().await.is_err());
+        assert!(config.machine_dir.join("root.raw").exists());
+        release.send(()).unwrap();
+        finishing.await.unwrap();
+        assert!(!runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .unwrap()
+            .is_active());
+        assert!(runtime
+            .store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn exit_record_without_an_expected_run_never_certifies_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        write_shutdown_holder(&runtime, &config, run, lease.operation_id(), None);
+        write_shutdown_exit(
+            &runtime,
+            &config,
+            run,
+            "clean",
+            Some(serde_json::json!({
+                "version":1,"guestProtocolCompleted":true,"hostFlushCompleted":true,"attachmentsClosed":true,
+            })),
+        );
+        drop(lease);
+        assert!(!runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .unwrap()
+            .is_active());
+        assert_eq!(
+            runtime
+                .machine_storage_record(config.id)
+                .await
+                .unwrap()
+                .stop_outcome,
+            crate::StorageStopOutcome::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_preconfig_failure_can_retire_only_without_contradictory_started_evidence() {
+        for started in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+            let run = uuid::Uuid::new_v4();
+            let lease = runtime
+                .register_launch_storage(&config, run, &storage)
+                .await
+                .unwrap();
+            runtime
+                .request_machine_start(&config, &run.to_string())
+                .await
+                .unwrap();
+            runtime
+                .mark_launch_storage_admitted(lease.operation_id())
+                .await
+                .unwrap();
+            let path = runtime.machine_paths(config.id).vmm_exit_status_path();
+            let value = serde_json::json!({
+                "machineId": uuid::Uuid::from(config.id).to_string(), "runId": run.to_string(),
+                "pid": i32::MAX, "exitedAt":99, "outcome":"error",
+                "backend":{"kind":"krun","stage":if started { "started" } else { "prepared" }},
+            });
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            drop(lease);
+            let result = runtime
+                .mark_machine_start_error(
+                    config.id,
+                    &run.to_string(),
+                    Some("startup failed".into()),
+                )
+                .await;
+            if started {
+                assert!(result.is_err());
+                assert_eq!(
+                    runtime.machine_state(config.id).await.unwrap().status,
+                    MachineRuntimeState::Starting
+                );
+                assert_eq!(
+                    runtime
+                        .store
+                        .launch_storage_operations(config.id)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    runtime.machine_state(config.id).await.unwrap().status,
+                    MachineRuntimeState::Error
+                );
+                assert_eq!(
+                    runtime
+                        .machine_storage_record(config.id)
+                        .await
+                        .unwrap()
+                        .stop_outcome,
+                    crate::StorageStopOutcome::Forced
+                );
+                assert!(runtime
+                    .store
+                    .launch_storage_operations(config.id)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_sql_write_rolls_back_storage_outcome_and_operation_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        runtime
+            .set_machine_state(
+                config.id,
+                MachineRuntimeState::Running,
+                Some(i32::MAX),
+                Some(1),
+                Some(run.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        write_shutdown_holder(&runtime, &config, run, lease.operation_id(), None);
+        write_shutdown_exit(
+            &runtime,
+            &config,
+            run,
+            "clean",
+            Some(serde_json::json!({
+                "version":1,"guestProtocolCompleted":true,"hostFlushCompleted":true,"attachmentsClosed":true,
+            })),
+        );
+        drop(lease);
+        let sql = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(runtime.paths.state_db_path()),
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TRIGGER fail_terminal_state BEFORE UPDATE ON machine_state BEGIN SELECT RAISE(ABORT, 'injected terminal SQL failure'); END")
+            .execute(&sql).await.unwrap();
+        assert!(runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .is_err());
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().status,
+            MachineRuntimeState::Running
+        );
+        assert_eq!(
+            runtime
+                .machine_storage_record(config.id)
+                .await
+                .unwrap()
+                .stop_outcome,
+            crate::StorageStopOutcome::Unknown
+        );
+        assert_eq!(
+            runtime
+                .store
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        sqlx::query("DROP TRIGGER fail_terminal_state")
+            .execute(&sql)
+            .await
+            .unwrap();
+        assert!(!runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .unwrap()
+            .is_active());
+        assert_eq!(
+            runtime
+                .machine_storage_record(config.id)
+                .await
+                .unwrap()
+                .stop_outcome,
+            crate::StorageStopOutcome::Clean
+        );
+    }
+
+    #[tokio::test]
+    async fn next_launch_clears_only_terminal_reconciled_holder_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        runtime
+            .set_machine_state(
+                config.id,
+                MachineRuntimeState::Running,
+                Some(i32::MAX),
+                Some(1),
+                Some(run.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        write_shutdown_holder(&runtime, &config, run, lease.operation_id(), None);
+        drop(lease);
+        assert!(!runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .unwrap()
+            .is_active());
+        assert!(runtime
+            .machine_paths(config.id)
+            .vmm_storage_holder_path()
+            .exists());
+        let current = runtime.machine_storage_record(config.id).await.unwrap();
+        let next = runtime
+            .register_launch_storage(&config, uuid::Uuid::new_v4(), &current)
+            .await
+            .unwrap();
+        assert!(!runtime
+            .machine_paths(config.id)
+            .vmm_storage_holder_path()
+            .exists());
+        drop(next);
+        runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readonly_crash_observation_projects_forced_storage_without_retiring_pins_or_writing_state(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        runtime
+            .set_machine_state(
+                config.id,
+                MachineRuntimeState::Running,
+                Some(i32::MAX),
+                Some(1),
+                Some(run.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut worker = ChildGuard::sleep();
+        write_shutdown_holder(&runtime, &config, run, lease.operation_id(), Some(&worker));
+        write_shutdown_exit(
+            &runtime,
+            &config,
+            run,
+            "error",
+            Some(serde_json::json!({
+                "version":1, "guestProtocolCompleted":false, "hostFlushCompleted":false, "attachmentsClosed":true,
+            })),
+        );
+        drop(lease);
+        let before = runtime.machine_state(config.id).await.unwrap();
+        let live = runtime.machine_inspect_data(config.clone()).await.unwrap();
+        assert!(matches!(live.status, MachineStatus::Stopping { .. }));
+        assert_eq!(
+            live.storage.unwrap().stop_outcome,
+            crate::StorageStopOutcome::Unknown
+        );
+        worker.kill();
+        let terminal = runtime.machine_inspect_data(config.clone()).await.unwrap();
+        assert!(matches!(terminal.status, MachineStatus::Error { .. }));
+        assert_eq!(
+            terminal.storage.unwrap().stop_outcome,
+            crate::StorageStopOutcome::Forced
+        );
+        assert_eq!(runtime.machine_state(config.id).await.unwrap(), before);
+        assert_eq!(
+            runtime.machine_storage_record(config.id).await.unwrap(),
+            storage
+        );
+        assert_eq!(
+            runtime
+                .store
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        runtime
+            .reconcile_machine_runtime_locked(&config)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().status,
+            MachineRuntimeState::Error
+        );
+        assert_eq!(
+            runtime
+                .machine_storage_record(config.id)
+                .await
+                .unwrap()
+                .stop_outcome,
+            crate::StorageStopOutcome::Forced
+        );
+        assert!(runtime
+            .store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn force_stop_waits_for_the_actual_attachment_holder_after_monitor_death() {
+        use protocol::shutdown::{StorageHolder, StorageHolderRecord, StorageHolderRole};
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;
+        let run = uuid::Uuid::new_v4();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        let monitor = ChildGuard::sleep_ignoring_sigint();
+        let identity = ProcessIdentity::for_pid(monitor.id() as i32)
+            .unwrap()
+            .unwrap();
+        let lease_descriptor = lease.lock().duplicate_inheritable().unwrap();
+        let backing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(config.machine_dir.join("root.raw"))
+            .unwrap();
+        let inherited = [lease_descriptor.as_raw_fd(), backing.as_raw_fd()];
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        // Actual process/FD lifetime mechanics, not a native-backend simulation.
+        // Parent descriptors remain CLOEXEC; only this child's table changes.
+        unsafe {
+            command.pre_exec(move || {
+                for raw in inherited {
+                    let fd = BorrowedFd::borrow_raw(raw);
+                    nix::fcntl::fcntl(
+                        fd,
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                    )
+                    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+                }
+                Ok(())
+            });
+        }
+        let mut worker = ChildGuard {
+            child: command.spawn().unwrap(),
+        };
+        drop(lease_descriptor);
+        drop(backing);
+        let holder = StorageHolderRecord {
+            schema_version: 1,
+            machine_id: uuid::Uuid::from(config.id).to_string(),
+            run_id: run.to_string(),
+            operation_id: lease.operation_id().to_string(),
+            holders: vec![
+                StorageHolder {
+                    role: StorageHolderRole::Monitor,
+                    pid: monitor.id(),
+                    started_at: u64::try_from(monitor.started_at().unwrap()).unwrap(),
+                },
+                StorageHolder {
+                    role: StorageHolderRole::KrunWorker,
+                    pid: worker.id(),
+                    started_at: u64::try_from(worker.started_at().unwrap()).unwrap(),
+                },
+            ],
+        };
+        let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
+        std::fs::write(&path, holder.encode().unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        runtime
+            .set_machine_state(
+                config.id,
+                MachineRuntimeState::Running,
+                Some(monitor.id() as i32),
+                monitor.started_at(),
+                Some(run.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            runtime.machine_paths(config.id).vmm_pid_path(),
+            format!("{}\n", monitor.id()),
+        )
+        .unwrap();
+        let operation_id = lease.operation_id();
+        drop(lease);
+        let pool = crate::storage::pool::StoragePool::open_existing(runtime.local_images_dir())
+            .unwrap()
+            .unwrap();
+        assert!(
+            pool.try_exclusive_lease(operation_id).unwrap().is_none(),
+            "the actual child retains the lease"
+        );
+        let machine = machine_handle(&runtime, config.id);
+        let stop = tokio::spawn(async move {
+            machine
+                .kill_with(crate::MachineKillOptions::new().timeout(Duration::from_secs(3)))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while identity.is_alive().unwrap() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            worker.child.try_wait().unwrap().is_none(),
+            "monitor-only group kill leaves the independent holder alive"
+        );
+        assert!(
+            !stop.is_finished(),
+            "monitor death alone must not finish force stop"
+        );
+        assert_eq!(
+            runtime
+                .store
+                .launch_storage_operations(config.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        worker.kill();
+        let exit = tokio::time::timeout(Duration::from_secs(2), stop)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit.outcome, MachineExitOutcome::Forced);
+        assert_eq!(exit.machine.status, MachineStatus::Stopped);
+        assert_eq!(
+            exit.machine.storage.unwrap().stop_outcome,
+            crate::StorageStopOutcome::Forced
+        );
+        assert!(runtime
+            .store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pool.try_exclusive_lease(operation_id).unwrap().is_some());
     }
 }

@@ -137,6 +137,12 @@ fn rootfs_from_wire(v: w::Rootfs) -> Result<libvm::MachineRootfs, ConversionErro
     Ok(out)
 }
 pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, ConversionError> {
+    if v.live.is_some() && v.prospective_live.is_some() {
+        return Err(invalid(
+            "machine.live_evidence",
+            "run and prospective evidence are exclusive",
+        ));
+    }
     Ok(w::MachineSnapshot {
         id: v.id.clone(),
         name: v.name.clone(),
@@ -178,9 +184,39 @@ pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, Co
         last_error: v.last_error.clone(),
         updated_at: Some(timestamp(v.updated_at)),
         network_observation: None,
+        live: v
+            .live
+            .as_ref()
+            .map(crate::live::machine_to_wire)
+            .transpose()?,
+        prospective_live: v
+            .prospective_live
+            .as_ref()
+            .map(crate::live::host_to_wire)
+            .transpose()?,
+        live_evidence: Some(if v.live.is_some() {
+            1
+        } else if v.prospective_live.is_some() {
+            2
+        } else {
+            3
+        }),
     })
 }
 pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, ConversionError> {
+    match (
+        required(v.live_evidence, "machine.live_evidence")?,
+        v.live.is_some(),
+        v.prospective_live.is_some(),
+    ) {
+        (1, true, false) | (2, false, true) | (3, false, false) => {}
+        _ => {
+            return Err(invalid(
+                "machine.live_evidence",
+                "invalid evidence discriminator/payload",
+            ))
+        }
+    }
     validate_uuid(&v.id, "machine.id")?;
     let mut out = libvm::MachineData::new(
         v.id,
@@ -241,6 +277,19 @@ pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, C
         .transpose()?;
     out.last_error = v.last_error;
     out.updated_at = timestamp_seconds(v.updated_at, "updated_at")?;
+    out.live = v.live.map(crate::live::machine_from_wire).transpose()?;
+    out.prospective_live = v
+        .prospective_live
+        .map(crate::live::host_from_wire)
+        .transpose()?;
+    if let Some(live) = &out.live {
+        if !crate::live::same_machine_identity(&live.machine_id, &out.id)
+            || Some(live.run_id.as_str())
+                != out.run_id.as_ref().map(|run| run.to_string()).as_deref()
+        {
+            return Err(invalid("machine.live", "report identity mismatch"));
+        }
+    }
     Ok(out)
 }
 pub fn inventory_to_wire(

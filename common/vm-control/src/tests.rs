@@ -116,7 +116,7 @@ fn invalid_required_values_fail_without_echoing_inputs() {
 }
 fn snapshot() -> libvm::MachineData {
     let spec = spec::spec_from_wire(w::VmSpec {
-        spec_version: "1.0.0".into(),
+        spec_version: "0.2.0".into(),
         ..Default::default()
     })
     .unwrap();
@@ -440,10 +440,10 @@ fn readiness_preserves_each_outcome_and_reason() {
                 outcome,
                 status: libvm::MachineMonitorStatus {
                     machine_id: "12345678-1234-4234-8234-123456789abc".into(),
-                    run_id: None,
+                    run_id: Some("22345678-1234-4234-8234-123456789abc".parse().unwrap()),
                     name: "test".into(),
                     monitor: libvm::MachineMonitorSnapshot {
-                        instance_id: "monitor".into(),
+                        instance_id: "32345678-1234-4234-8234-123456789abc".into(),
                         observed_at: now,
                     },
                     vm: libvm::MachineVmSnapshot {
@@ -458,6 +458,19 @@ fn readiness_preserves_each_outcome_and_reason() {
                         reason,
                     },
                     agent: libvm::MachineAgentStatus::Disabled,
+                    live: vm_spec::live::LiveMachineReport {
+                        schema_version: 1,
+                        scope: vm_spec::live::LiveScope::Machine,
+                        machine_id: "12345678-1234-4234-8234-123456789abc".into(),
+                        run_id: "22345678-1234-4234-8234-123456789abc".into(),
+                        monitor_id: "32345678-1234-4234-8234-123456789abc".into(),
+                        backend: vm_spec::live::LiveBackend::Mock,
+                        lane: vm_spec::live::LiveLane::NotApplicable,
+                        topology_revision: 1,
+                        live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                            vm_spec::live::LiveReasonCode::BackendExcluded,
+                        ),
+                    },
                 },
             };
             let decoded =
@@ -466,6 +479,10 @@ fn readiness_preserves_each_outcome_and_reason() {
             assert_eq!(decoded, native);
             assert_eq!(decoded.status.monitor.observed_at, now);
             assert_eq!(decoded.status.readiness.reason, reason);
+            let mut noncanonical_monitor = readiness::readiness_to_wire(&native).unwrap();
+            noncanonical_monitor.status.as_mut().unwrap().machine_id =
+                "12345678123442348234123456789abc".into();
+            assert!(readiness::readiness_from_wire(noncanonical_monitor).is_err());
         }
     }
     assert!(readiness::readiness_from_wire(w::MachineReadiness {
@@ -610,4 +627,181 @@ fn conflicting_rich_status_code_does_not_reconstruct_a_native_error() {
         status.details().to_vec().into(),
     );
     assert!(status_to_native_error(&contradictory).is_err());
+}
+
+#[test]
+fn snapshot_requires_explicit_run_prospective_or_unavailable_evidence() {
+    let input = snapshot();
+    let mut wire = snapshot_to_wire(&input).unwrap();
+    assert_eq!(wire.live_evidence, Some(3));
+    assert!(snapshot_from_wire(wire.clone()).is_ok());
+    wire.live_evidence = None;
+    assert!(snapshot_from_wire(wire.clone()).is_err());
+    wire.live_evidence = Some(1);
+    assert!(snapshot_from_wire(wire.clone()).is_err());
+    wire.live_evidence = Some(99);
+    assert!(snapshot_from_wire(wire).is_err());
+}
+
+#[test]
+fn snapshot_matches_compact_durable_machine_id_to_canonical_live_uuid() {
+    use vm_spec::live::*;
+    let mut data = snapshot();
+    data.id = "12345678123442348234123456789abc".into();
+    data.run_id = Some("22345678-1234-4234-8234-123456789abc".parse().unwrap());
+    data.live = Some(LiveMachineReport {
+        schema_version: 1,
+        scope: LiveScope::Machine,
+        machine_id: "12345678-1234-4234-8234-123456789abc".into(),
+        run_id: "22345678-1234-4234-8234-123456789abc".into(),
+        monitor_id: "32345678-1234-4234-8234-123456789abc".into(),
+        backend: LiveBackend::Mock,
+        lane: LiveLane::NotApplicable,
+        topology_revision: 1,
+        live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+    });
+    let wire = snapshot_to_wire(&data).unwrap();
+    let decoded = snapshot_from_wire(wire.clone()).unwrap();
+    assert_eq!(decoded.id, data.id);
+    assert_eq!(decoded.live, data.live);
+    let mut wrong_machine = wire.clone();
+    wrong_machine.live.as_mut().unwrap().machine_id =
+        Some("42345678-1234-4234-8234-123456789abc".into());
+    assert!(snapshot_from_wire(wrong_machine).is_err());
+    let mut wrong_run = wire.clone();
+    wrong_run.live.as_mut().unwrap().run_id = Some("52345678-1234-4234-8234-123456789abc".into());
+    assert!(snapshot_from_wire(wrong_run).is_err());
+    let mut noncanonical_report = wire;
+    noncanonical_report.live.as_mut().unwrap().machine_id = Some(data.id);
+    assert!(snapshot_from_wire(noncanonical_report).is_err());
+}
+
+#[test]
+fn current_typed_disks_survive_management_wire_without_inference() {
+    let disk = |role, format, serial, read_only| vm_spec::Disk {
+        path: format!("/home with spaces/{serial}.not-an-extension-hint").into(),
+        role,
+        format,
+        geometry: vm_spec::DiskGeometry {
+            length: 64 << 20,
+            logical_sector_size: 512,
+        },
+        block_id: vm_spec::BlockId::new(serial).unwrap(),
+        read_only,
+    };
+    let current = vm_spec::VmSpec {
+        storage: Some(vm_spec::Storage {
+            disks: vec![
+                disk(
+                    vm_spec::DiskRole::RootLower,
+                    vm_spec::DiskFormat::Vmdk,
+                    "silo-root-lower",
+                    true,
+                ),
+                disk(
+                    vm_spec::DiskRole::RootUpper,
+                    vm_spec::DiskFormat::Raw,
+                    "silo-root-upper",
+                    false,
+                ),
+                disk(
+                    vm_spec::DiskRole::Data,
+                    vm_spec::DiskFormat::Raw,
+                    "data-exact",
+                    true,
+                ),
+            ],
+        }),
+        ..vm_spec::VmSpec::current()
+    };
+    let wire = spec::spec_to_wire(&current);
+    assert_eq!(spec::spec_from_wire(wire.clone()).unwrap(), current);
+    for field in ["role", "format", "geometry", "block_id", "read_only"] {
+        let mut invalid = wire.clone();
+        let disk = &mut invalid.storage.as_mut().unwrap().disks[0];
+        match field {
+            "role" => disk.role = None,
+            "format" => disk.format = None,
+            "geometry" => disk.geometry = None,
+            "block_id" => disk.block_id = None,
+            "read_only" => disk.read_only = None,
+            _ => unreachable!(),
+        }
+        assert!(spec::spec_from_wire(invalid).is_err(), "{field}");
+    }
+    let mut old = wire.clone();
+    old.spec_version = "0.1.0".into();
+    assert!(spec::spec_from_wire(old).is_err());
+    let mut invalid = wire.clone();
+    invalid.storage.as_mut().unwrap().disks[0].format = Some(999);
+    assert!(spec::spec_from_wire(invalid).is_err());
+    let mut duplicate = wire;
+    duplicate.storage.as_mut().unwrap().disks[2].block_id = Some("silo-root-lower".into());
+    assert!(spec::spec_from_wire(duplicate).is_err());
+}
+
+#[test]
+fn current_create_selectors_are_explicit_and_closed_on_wire() {
+    let input = w::NormalizedMachineCreate {
+        process: Some(w::ProcessConfig::default()),
+        retention: values::retention_to_wire(libvm::MachineRetention::Persistent),
+        agent: Some(values::agent_to_wire(&libvm::MachineAgent::Default).unwrap()),
+        root_profile: Some(w::RootProfile::LinuxFlatOverlayV1 as i32),
+        temporary_directory: Some(w::TemporaryDirectoryPolicy {
+            backing: Some(w::temporary_directory_policy::Backing::TmpfsCapacityBytes(
+                64 << 20,
+            )),
+        }),
+        ..Default::default()
+    };
+    let native = updates::create_from_wire(input.clone()).unwrap();
+    assert_eq!(native.root_profile, libvm::RootProfile::LinuxFlatOverlayV1);
+    assert_eq!(
+        native.temporary_directory,
+        libvm::TemporaryDirectoryPolicy::Tmpfs {
+            capacity_bytes: 64 << 20
+        }
+    );
+    assert_eq!(updates::create_to_wire(&native).unwrap(), input);
+    let mut missing_profile = input.clone();
+    missing_profile.root_profile = None;
+    assert!(updates::create_from_wire(missing_profile).is_err());
+    let mut unknown_profile = input.clone();
+    unknown_profile.root_profile = Some(999);
+    assert!(updates::create_from_wire(unknown_profile).is_err());
+    let mut missing_policy = input.clone();
+    missing_policy.temporary_directory = None;
+    assert!(updates::create_from_wire(missing_policy).is_err());
+    let mut invalid_policy = input;
+    invalid_policy.temporary_directory.as_mut().unwrap().backing = Some(
+        w::temporary_directory_policy::Backing::TmpfsCapacityBytes(0),
+    );
+    assert!(updates::create_from_wire(invalid_policy).is_err());
+}
+
+#[test]
+fn temporary_policy_updates_preserve_absent_explicit_disk_and_sized_tmpfs() {
+    assert!(updates::update_from_wire(w::MachineUpdate::default())
+        .unwrap()
+        .temporary_directory
+        .is_none());
+    for policy in [
+        libvm::TemporaryDirectoryPolicy::DiskBacked,
+        libvm::TemporaryDirectoryPolicy::Tmpfs {
+            capacity_bytes: 4096,
+        },
+    ] {
+        let native = libvm::MachineUpdate::new().temporary_directory(policy);
+        assert_eq!(
+            updates::update_from_wire(updates::update_to_wire(&native).unwrap())
+                .unwrap()
+                .temporary_directory,
+            Some(policy)
+        );
+    }
+    assert!(updates::update_from_wire(w::MachineUpdate {
+        temporary_directory: Some(w::TemporaryDirectoryPolicy { backing: None }),
+        ..Default::default()
+    })
+    .is_err());
 }
