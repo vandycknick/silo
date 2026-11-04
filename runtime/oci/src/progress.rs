@@ -12,15 +12,6 @@ pub enum ProgressEvent {
         layer_count: usize,
         total_download_bytes: Option<u64>,
     },
-    CheckingCache {
-        image_ref: String,
-    },
-    CacheHit {
-        image_ref: String,
-    },
-    CacheMiss {
-        image_ref: String,
-    },
     LayerDownloadStarted {
         index: usize,
         total: usize,
@@ -55,7 +46,6 @@ pub enum ProgressEvent {
         digest: Option<String>,
     },
     MaterializingRootfs,
-    PublishingRootfs,
 }
 
 #[derive(Clone)]

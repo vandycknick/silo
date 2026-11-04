@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "file": "kaniko/workflow.yaml",
+      "url": "https://raw.githubusercontent.com/int128/kaniko-action/72c12e191799ee153012b3f6d02b2a0bf9d101d0/.github/workflows/ts.yaml",
+      "sha256": "sha256:ca3e97b7ff59a49baf85b151f24061d8153430afb067c083056dc7ae58822867",
+      "length": 2338
+    },
+    {
+      "file": "kaniko/run.ts",
+      "url": "https://raw.githubusercontent.com/int128/kaniko-action/72c12e191799ee153012b3f6d02b2a0bf9d101d0/src/run.ts",
+      "sha256": "sha256:593e2abf7806b208a840f8132e4af6599f5606724b6c975f7d49119dd09d3f4e",
+      "length": 3363
+    },
+    {
+      "file": "kaniko/Dockerfile",
+      "url": "https://raw.githubusercontent.com/int128/kaniko-action/72c12e191799ee153012b3f6d02b2a0bf9d101d0/tests/fixtures/Dockerfile",
+      "sha256": "sha256:e2670a68c09f3c6d1d764721ce2520d19a673a9868ed89c41c8b5da18e9b077f",
+      "length": 147
+    },
+    {
+      "file": "buildah/build-push.sh",
+      "url": "https://raw.githubusercontent.com/containers/image_build/b86020d8c306c4724780adfb6fc492d0a2d9cc48/ci/build-push.sh",
+      "sha256": "sha256:791db38b33411b9441a48ef20b0018edc5f8a7acf6765f386669959933e68c76",
+      "length": 13524
+    },
+    {
+      "file": "nix/docker.nix",
+      "url": "https://raw.githubusercontent.com/NixOS/nix/4d4a91ab8d29cdf986db37d4712dd86fbfdb0fde/docker.nix",
+      "sha256": "sha256:213177964dfe08980159d2897bc785ebc8d95c47a10a3bd815acf114f42d0292",
+      "length": 9434
+    },
+    {
+      "file": "bazel/release.sh",
+      "url": "https://raw.githubusercontent.com/GoogleContainerTools/distroless/e376b9e184a9d3fac863dc9fa5620bf5c562dd71/.cloudbuild/release.sh",
+      "sha256": "sha256:393d1b8d476ed9a4534f233d3e45c6006c5507dc5316984e4176137d7d0c8c19",
+      "length": 1565
+    },
+    {
+      "file": "kaniko/action.yaml",
+      "url": "https://raw.githubusercontent.com/int128/kaniko-action/72c12e191799ee153012b3f6d02b2a0bf9d101d0/action.yaml",
+      "sha256": "sha256:42b447a23813d89ca0fc8abc6ade2a2e2fd4b8f17ba728f1a92a2ea5f6ac0223",
+      "length": 1647
+    }
+  ]
+}

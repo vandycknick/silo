@@ -9,6 +9,13 @@ pub type OciResult<T> = Result<T, OciError>;
 
 #[derive(Debug, Error)]
 pub enum OciError {
+    #[error(transparent)]
+    Changeset(#[from] crate::changeset::ChangesetError),
+    #[error(transparent)]
+    Namespace(#[from] crate::changeset::namespace::NamespaceError),
+    #[error("invalid staging operation ID {value:?}: expected a canonical lowercase UUID")]
+    InvalidOperationId { value: String },
+
     #[error("unsupported host architecture {arch:?}; supported OCI image platforms are linux/amd64 and linux/arm64")]
     UnsupportedHostArchitecture { arch: String },
 
@@ -96,21 +103,16 @@ pub enum OciError {
     #[error("image config for {reference:?} is invalid: {message}")]
     ImageConfig { reference: String, message: String },
 
-    #[error("unsupported OCI layer media type {media_type}")]
-    UnsupportedLayerMediaType { media_type: String },
-
-    #[error("invalid tar entry path {path:?}: {reason}")]
-    InvalidTarPath { path: String, reason: &'static str },
-
-    #[error("invalid symlink target for {path}: {target:?}: {reason}")]
-    InvalidSymlinkTarget {
-        path: String,
-        target: String,
-        reason: &'static str,
+    #[error(
+        "{content} for {reference:?} has {actual} bytes; expected {expected:?}, maximum {limit}"
+    )]
+    MetadataSize {
+        reference: String,
+        content: &'static str,
+        expected: Option<u64>,
+        actual: u64,
+        limit: u64,
     },
-
-    #[error("cache entry at {path} is corrupt: {reason}")]
-    CorruptCacheEntry { path: PathBuf, reason: String },
 
     #[error("ext4 rootfs conversion failed")]
     FlatExt4 {

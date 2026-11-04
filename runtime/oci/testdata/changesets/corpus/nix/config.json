@@ -1,0 +1,527 @@
+{
+    "created": "1970-01-01T00:00:01+00:00",
+    "architecture": "amd64",
+    "os": "linux",
+    "config": {
+        "Cmd": [
+            "/root/.nix-profile/bin/bash"
+        ],
+        "Env": [
+            "USER=root",
+            "PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin",
+            "MANPATH=/root/.nix-profile/share/man:/nix/var/nix/profiles/default/share/man",
+            "SSL_CERT_FILE=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt",
+            "GIT_SSL_CAINFO=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt",
+            "NIX_SSL_CERT_FILE=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt",
+            "NIX_PATH=/nix/var/nix/profiles/per-user/root/channels:/root/.nix-defexpr/channels"
+        ],
+        "User": "0:0"
+    },
+    "rootfs": {
+        "diff_ids": [
+            "sha256:f7d32eb11706647c4651b5bf916900eff6b4c0ffc4d1068c75c83663a2e70585",
+            "sha256:88a5abf1cd55bcaf64553700f9ff497ea0e15024d353cea6b52842f24a8758e8",
+            "sha256:4c25f9f39c45e41d8acda7b35000cf4ba1b6d093dfd772e0c96fe1af10c43a72",
+            "sha256:63d4399694a5038447695789291b8c122d84528e8e8bc5edb75037e31dd2ed00",
+            "sha256:83a78aada9fc0c9d120f7dd4aeb1bea68f441aac702545172999011cd4d54fbf",
+            "sha256:43ebb7e371dfba41498ce9e6ed727c1168614ea736cb7662f21da69f197dd2cf",
+            "sha256:0ad3c0d6a9c5ac6a2280f1392583a4f212fbf35dd031882cb2e03fd8b498931a",
+            "sha256:71f20dae6a48bdc83a98ba9b885d52aaee8fa66f0db207deac3158a1fc901b26",
+            "sha256:bbf957e8754feb55de76a37e4ad53001e6417692d874cd126a0206e81c6107fb",
+            "sha256:94e8d3f03ec03c8fbbc78aecd6f339a42c67ae5c2fd17b4e3b974a9a8063c37c",
+            "sha256:98a1419586485c371e2c2558716d420d9bc1354e2c5d5e5ed9bef9cd86e87184",
+            "sha256:b46d66f0e1adff2ca00da03b5415e43eb82069cb78a57f50f178b0e1e061864f",
+            "sha256:4d8a060200e237a03a0c7f99f1fed17ea4520a2927afec70ae8e8cff776a446f",
+            "sha256:4b9fc870b3346068951e95801106a6e56affc1364d82e01564cf74e4ad606b51",
+            "sha256:4466dc83491dd3677895524b750b69a4e3bca75a2f03fb6457cd2c926250d5c8",
+            "sha256:ba6c4f99f15ebfc1daebd4b5096954bb34846aba26276cc4ff01d975e87de88e",
+            "sha256:f43af1c2309553f8fabe4b8ca083622e692c3acc4b478c2569cc4430b88e4f3b",
+            "sha256:13b45cdf2ae25214bf227b4309664d4c417791aaf45718a712f789dea25f0ea7",
+            "sha256:d717ee1905ab5ac23e96777bf21af5cd6795b1091fd71ba2a64474ddd0bfd1ab",
+            "sha256:63304458a4fdb9c3d9d9ce2ff31e0656a67b83af48eee37711794602d124e9d3",
+            "sha256:be393397331add9f6c491546df828403297ef2dc517926f6e8dbc23188762d8b",
+            "sha256:ea8e5a7f0340f9507b398aa48996ef82539fc77e725ddeb467dbf756791b67a9",
+            "sha256:5c752807299e34b27730fef50048f9bbbd1f5702206c7e71e5dd12224885cbe8",
+            "sha256:9ccdd2ca8e4fdf47c88cce72ef7eddfd207f252b5bf5baabb1c53c1b87f6390e",
+            "sha256:f8ddbcb253bc797d9efddf3132fe19dee417ee2e9ba9d45bef7e7ffe6ba5bdd5",
+            "sha256:ed92e2dc0fc342157240508aeddc26bf8cc1f273c9b4cb5a75db2c1d60b6c5df",
+            "sha256:487e77644f6c13e6b86e81548916d46a3d8f207573552f51ba2bd7c7551ceb76",
+            "sha256:444b1a8623021a9a630a8e4a796a4779f3fbab9c824cbc4dfef08a4b8e2f466e",
+            "sha256:cbc5c0f2e77ac837deb449d80102129b2eafaa29e3dd91526063eccf5b343648",
+            "sha256:ec113515ce0f791e24e56ab92b759234cc878ec9e5192d2c1cb4fb46d6bb5fcc",
+            "sha256:92dd049fd3e6dd2a71e8bef97432e68902092ff02859941ad601bd7762941064",
+            "sha256:22027bdfa579ec81f9202f69c71761c28a0e5f6f527f105a31c7e9220323bb14",
+            "sha256:73df0092b7855d652ab0f7e92b6242ee5ad2d661ac8ab51e17c4130851864175",
+            "sha256:09d58250ebdf6f76d6b954f338737a1771f6b42614503e17ce59c7dd69eb9ff6",
+            "sha256:4e357f5edcc7d6facc6c330e9ab3b9a9e658a40e5dc3aac671ef37df1b0bc4f4",
+            "sha256:8d8e3dc6625fdffcb358bf278d4cef6fbd8f6544e4d7bb19fa938caf33855663",
+            "sha256:545811f02b5d253db48731140c8ece686b77398f697d95c7163b295140fbfb9b",
+            "sha256:f14af150e68648a94bc3018b9de4f272f702711c6bd9ad26d91fcd8b8fba0d96",
+            "sha256:ecf385092e44c95b222bae19d3d802b9bb05e017fecc953b16e3e2e190583351",
+            "sha256:1b28040dfa473c07763a7d590f1a7a01eac4276496d97a1f0d91b53eb6549322",
+            "sha256:a1357b6ed1393aed10370df6d9b606c5b7bc555517e498e2596baa2f6155929d",
+            "sha256:16b2c19bc99a7fe56f95d006115271eda64bea0882327c2155a882a7fb424c46",
+            "sha256:5053568541c6d5ad20da2f7440990aaff224e5bd6e72bcc1ad6a09dc64c5ff7f",
+            "sha256:dd17e565e3ede590307833905a232f6b83c6a1a44e14838dc9c336e4ae7368c2",
+            "sha256:7610f7fb5797778349da6a9e2ce763d2e2d2fb18a4d400b49acfb742ecca7c4c",
+            "sha256:5278caaeba9bf5509769e3994cf8c7a79ab395a0b68ff88a3a42aba24f963261",
+            "sha256:ff6c3c2028700a9b65b1cc043894098227bf9cca65c3b6510f674c7231faff2c",
+            "sha256:be16c6d93863d4cd9e44d9b663ef07b779e3466165c54d6f1a95fb3b66d5be48",
+            "sha256:9b84a254faa8db08e0b334414f388ce50236ec506488fc899a6b2d7122a3a1d3",
+            "sha256:8169668b3cd33d6ebfc0c227a1a472261e4135bfd982ad11210d6b66b96deed3",
+            "sha256:60ea74c48f1c2c1765b0a9eaf33ffb3287f1309fdfa75b120e57e4b8641eb064",
+            "sha256:790cf7a90223c91f59a5494ba13b886447d3722e31313a1bd3ec003ba44a28a9",
+            "sha256:39b8e697c6b199c070d5f893bb62c0b979c1047e62334d23a36ce83586248bb7",
+            "sha256:e39fb7bf61866c728046ea36c51c89ae49ea8d911e05aaea2882e76708b4104a",
+            "sha256:3cd608c9e7cbefe09c26cacc0a34667d289bd49d5e9bbf0a81cc31bf835218cc",
+            "sha256:747ba4dd899b2e9a1868f94a3ef194fb9af2415b8c3caa33d66bc39c31be8db0",
+            "sha256:10f990e6ad70f94418fc141fe362aa371286b0d50ede23e2b3651106d9ca55b2",
+            "sha256:fccc8f8aa50ea435f6548b1954864bcf9ea8aa99795a02d6a0bc8926a5096991",
+            "sha256:462e6263db92198235fe5dea235796268852c3d134b46c2dc6dc6a64b41879f3",
+            "sha256:74f59f4c6b179797cc14778f90c3205dae80d5f3730e41f2f70e677be998d5c6",
+            "sha256:c08991009c2a3225d2cd22fd1feffee1309f92c3e8b7e117c78c6583dd218e23",
+            "sha256:4dafe0c3d0e874110d8abad3a3d8f4713c9103957737580380c866adfc198704",
+            "sha256:7b1b1f53148976b24e7ec5a4bc0a6a38a5ee864c51836cb1d2b9b02f7e680190",
+            "sha256:db9a26bf7779c8140687523841e66dce93b2e686af19327c4eb6bb947d404eac",
+            "sha256:d6398b1f4c098deb3cd1dc0bb9407db3f06697183f8e44eeccfd0ddeb4e429d4",
+            "sha256:af640ab551882f622f12076c52cd4ffb39afbf9060676b0fbc3cdc44fdd84dfb",
+            "sha256:66fdd52f8f8fca67ed6373fecca1b062a40e8b7451c52768868539f7507208f7",
+            "sha256:7cb3fe74aba2fc4353ce7c64c7ae6da52f2caf25a32960dca7edf236a5aed928",
+            "sha256:8b227482e53e764da73e3c59ff95e59f9fe07cbdaf981c101cdae2014f79ae1a",
+            "sha256:3cf1b997350c9bb4ff106e45fc7170813f26577d446fe26dfaf68b8b0533dca5",
+            "sha256:262509079efdc5d6a8314f782ec530856168ea2124ee12026b567abb19d523ed",
+            "sha256:12938de05c8724a333f8548f65c157c2d6570c04e9d48ae3990cfa2efee8f3b4",
+            "sha256:be311488151bd58dad4fb9f3843e5e4f69304e680e2ca437f076a98812767db2",
+            "sha256:16b28daae5cef193c441d4e7615e522a74c4ffa4b82d841a186d78d1ef0e0bae",
+            "sha256:de2bd84c0f731b307a260596f5149ebbd5a687b8941160a7f69324b593935349",
+            "sha256:1cee0bde43f3e09b2a48d6971d7c9cdd57d60c7cec078a8de3d041caa51e1817",
+            "sha256:bfdc856cdaebd706fabf87a415e4a35c3f171ff237215f23ad6fe0e759dbc3c7",
+            "sha256:9e33abf31bfa8f311ac02c17cf8e454b943a7042d6df2ad1068f1d220c3b1efc",
+            "sha256:235431fce6891deab4f98117ae25f27636ba41576b3a49f9c411a1a9cb365a98",
+            "sha256:fb016348e2a7c15993d27c28a9e9dae4feb7d4fc6522523e7088b037c03ad142",
+            "sha256:c1539ec1792d380af7bed866258af5285b37b3cfbd24ddbe0816a804de848b30",
+            "sha256:5e7526e1e44c7ba905338c5cfa3fb56eddcdee9db121d5a34397a5f7a80d261a",
+            "sha256:0f79b5667ac3565ca82b3bc06d9346da4108375b014ca7a0e35f2761e8956a3f",
+            "sha256:d5f3a59049354fe70bac72cc57293748dd367e773590a291ab8bccf0a7075cd2",
+            "sha256:0fc041da3f1977453545b9356f00c2bd46ff312d8aaca3599437964b1fe6ee7b",
+            "sha256:a98554898bc2312f1fe020c42988ec897a7b4d717d7624d574e583a7d06a32f3",
+            "sha256:7118d3cbbc23948c2a3f9105eb451c57974a93fcf2892ce74d0b5c5a0f3b909f",
+            "sha256:5a7e3c31776fb7e3a976410defb27ad0167277180b2e3023fbde2f3d4d6ec507",
+            "sha256:aee23b224a424f61e2be5a8bb6aa2543f2a2d59c9bc954d083a9688f6aad9c57",
+            "sha256:d7a32d74b46ac07d27f1f9cdcab443db32526eea0d570f5fad8f94c3e9128ae4",
+            "sha256:7bb8c1987c4bc27f391290f299d8c8df28c1983c27b40d2c509a9d1bf3e07aa3",
+            "sha256:16ac939b98ed84d04b18ea76a70fd8f7821695d39bd93038515567d0dc9f99bf",
+            "sha256:22a58e76574558443dead90030dd2cba47263673738622f216e059efd32b9a27",
+            "sha256:eede9f278ba01b1144e41160b5dcedf17e47d52b020f927ceceab3c676ac8078",
+            "sha256:2edbbc8c1794dfaaf43fa54f84ecf9ad555d914bb1af37bea6b3049f6f88fcc9",
+            "sha256:29a56eae359949bc7d1a8e1e00fd3579d3c37bd785c2c16c1993d9defead308b",
+            "sha256:8a83adcb6bba08b7d459a8eb0be389dad3374a8151a8d94f14c1dcfd4d972997",
+            "sha256:f0eb9967a1404d06a18a1c3b5f14e5c2ea0d5abd2b513b3b68830aa9f3dc5156",
+            "sha256:2b46ae00f2b5ca617cda90eb15caec25a141bd6f423f9873c565b89648a075ca",
+            "sha256:2de78d90f2bc6b4fec80fade3d9ffafa32537f63c89804852eeadfb98c8b54d1"
+        ],
+        "type": "layers"
+    },
+    "history": [
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/6pqgj71r0850b0cd95yxx0d52zax016i-libunistring-1.2']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/qwjjm4j652ck9izaid7bz63s4hd5bnha-libidn2-2.3.7']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/2d5spnl8j5r4n1s4bj1zmra7mwx0f1n8-xgcc-13.3.0-libgcc']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/wn7v2vhyyyi6clcyn0s9ixvl7d4d87ic-glibc-2.40-36']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/k1dsk0zyq43pvi7f76is2rx6l4aphm5z-openssl-3.3.2']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/1k1bnir265n7jpbmwinj8hiwygnwrw3s-aws-c-common-0.9.27']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/pykh94qqyhllkv2wwfrdn0al6w2fzv52-aws-c-cal-0.6.15']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/x5lxmydkpbkfwah1nyll7bf0fqhlhsg5-s2n-tls-1.5.5']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/b8bl7ks2wfzyy3p7vbbk72jkrwf7c5y3-aws-c-io-0.14.18']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/j8rzqx7farv0w3isp9z943zy437zk02f-gcc-13.3.0-libgcc']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/78mgbp4sp25zz61agaxnwflw6xi3mm3j-aws-c-compression-0.2.19']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/ybjcla5bhj8g1y84998pn4a2drfxybkv-gcc-13.3.0-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/bzk3q2l71qwhycsip23y6rl5n881la4n-zlib-1.3.1']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/nhd2vp53l6m1xy20534yfpr2v1d9jlvm-aws-c-http-0.8.2']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/5ryzwb3h7jp375g30afn8b2gf39f2l1s-aws-c-sdkutils-0.1.16']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/kas89ckkzmp0hczkj30gv19awlki6hwr-aws-checksums-0.1.18']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/8pys6a47askf0g75a1k73p3rx2wim7m6-zstd-1.5.6']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/nmq6s9l9zlym3qjx76zzrqbp05a63y90-attr-2.5.2']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/2vgwd43vqxm66grkgsy7z1d87z31nzph-brotli-1.1.0-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/p6k7xp1lsfmbdd731mlglrdj2d66mr82-bash-5.2p37']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/6aypxg5iayqzb21sp67m429qhji36m3a-aws-c-auth-0.7.26']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/ys6f20b4chzkmfh9ak0hjdp60l0g5abb-keyutils-1.6.3-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/vy8sksf96sfvdnkga0761x2yxyxvbs5f-publicsuffix-list-0-unstable-2024-10-25']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/nrl5m466dwdscvavf1nqzdnqhszjyy9n-acl-2.3.2']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/1n0b29iid3y0w9i91v9zqdiwnx3inak0-libssh2-1.11.1']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/hl3iw85v12gh9mwgvr9yfgjgy0rk81hb-bzip2-1.0.8']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/bdpc1864983kf51r3cznbrvnlkv4d9ff-xz-5.6.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/shg1vgcjxghqxhl0sifwgr0g2zg6bbv7-libxml2-2.13.4']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/g9hgzjcj9g7hw3c2pzgz271b1g1jgc4w-krb5-1.21.3-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/282klmpdw8vibm1k0qachsnzc7zq522z-libpsl-0.21.5']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/aygalfgrn7pvxcqc45jw53b9gc29hwzs-nghttp2-1.64.0-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/vxhnb0j3kbghwr7xd6cmlhmj8wycrs0l-aws-c-event-stream-0.4.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/lzay7jk6yk0h8silizlczd8464rj5ccv-aws-c-mqtt-0.10.5']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/20ky2306yw2ri5ki82bgllr4rwnril21-aws-c-s3-0.6.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/f5zq1g323xw7pbl72vnc9i414zwmqbny-boost-1.81.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/n0gxk0ys2zgqqz6zcsq8qlv6nv5k6fpj-libarchive-3.7.7-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/x94kpcx52cs705iwlzan0y2h9m0mqqfb-libcpuid-0.7.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/ki28jqabr02w1k3p4h2ky230vzh9k4n8-libsodium-1.0.20']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/ixq7chmml361204anwph16ll2njcf19d-curl-8.11.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/k1yk29dy22fjsa1d48kabkyb23gzjshw-aws-crt-cpp-0.26.12']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/319hpn6dffzslywqhvjcwhs8xj822rdl-nix-util-2.28.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/bbd59cqw259149r2ddk4w1q0lr2fch8c-sqlite-3.46.1']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/2r6hkd3p8c0sflhcvd1cy6f3mgy05fmg-aws-sdk-cpp-1.11.336']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/acc43l1xnyl7jmx5m9d0h4h173vxlaab-busybox-static-x86_64-unknown-linux-musl-1.36.1']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/qjfhf5gp6jwh6q0i00cggw0vghqdjww0-libseccomp-2.5.5-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/wc611bs4vm68yfwzl1338abqpiwx8527-perl5.40.0-TimeDate-2.33']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/gkj66hn5cyi3d761nmcdpj35ngv7h8ph-pcre2-10.44']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/0sm8npj7x042zdvalk1zdd5hrrcdkg5k-perl5.40.0-URI-5.21']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/rcjm767qc0mb6qv6inn4vgx8sqwbach1-nix-store-2.28.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/q79g21lgw1rxab9vp63qylhcynrg1r14-perl5.40.0-HTTP-Date-6.06']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/4v0xgzy1346zsjzsirp8bdg0yknnz1nj-perl5.40.0-Clone-0.46']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/44s0c1jm5gn6ldc4yjx0z01h9rbfp5dp-perl5.40.0-Encode-Locale-1.05']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/84qpf5kvkz3f72qqk9ajdl6jwwnazymw-perl5.40.0-IO-HTML-1.004']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/p2khycsvq9qpn0pss8sb3hy4w92szhp5-perl5.40.0-LWP-MediaTypes-6.04']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/27zxnsjglzni889r47i62xbjr9fr9az3-libgit2-1.8.4-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/rlaffalqqdyph1v6m1qnjbqiw39sdmhj-perl5.40.0-HTTP-Message-6.45']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/3j0pj54x5299vfhr8r468ay6mjgi051l-boehm-gc-8.2.8']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/l56kbkxdr3qpy3wnb7flgai4lq3706sw-nix-fetchers-2.28.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/qlk37icqlr9bd7igphgqp95vxs56hm38-perl5.40.0-HTML-Tagset-3.20']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/1p1j0iv3c909kcs4d5300kcsnlwmbwyj-ncurses-6.4.20221231']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/sbc37bmgpzr7wvlbm9lgf4y6q6dyz40q-libxcrypt-4.4.36']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/nxg637az00fnm705pinlrpjac9b4hgsc-gmp-with-cxx-6.3.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/zah6r9m36gxlv1yimkqaskxa9pqain60-perl5.40.0-HTML-Parser-3.81']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/b1wvkjx96i3s7wblz38ya0zr8i93zbc5-coreutils-9.5']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/yikz4aw113sx6nblkzv13clhhsrdwjyw-nix-expr-2.28.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/y2xwjjs72h3qg1j7m0wa1z2qjiqb2p43-perl5.40.0-Net-SSLeay-1.92']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/85kk591kw0wf1wxlf7j1bw8515z369wf-perl5.40.0-Mozilla-CA-20230821']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/85amyk92rg19l4fy0qmy7wr4jmq8p5z0-gnugrep-3.11']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/z1rg61dqcy2fy1z1ad7bsms87zkalhqd-perl5.40.0-Try-Tiny-0.31']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/virb8hapjj9v0gxdinxq4zp1qjba7ha0-audit-4.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/dy0yrgxj4q4dqy5hp2z2ld3ryaaccfyp-db-4.8.30']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/n0q4xhb9z19f0rfd1i8frw7a3ip3rgar-readline-8.2p13']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/a7pimibppfw2m3ryijnwwzx76i780bw2-gzip-1.13']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/6bv7vx01c0zb2gf35mj9dxcd03mh687y-libcap-2.70-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/8sgvk9wjq9vfz5irkl4436yhpfr10njq-expat-2.6.4']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/y6bybcsika2x2718gqzvx1si3zjavjwd-nix-flake-2.28.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/bzk4ygr7zjvkwbnzvsnx2zph9y9apgjk-nix-main-2.28.3']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/6fklzkr5x213h868q31isgy82wpmb1yb-perl-5.40.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/mjlcvgc2vj64bs8sc04zkjx2c070yprb-perl5.40.0-CGI-4.59']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/8s0clnylyka6f31zgr882fbkrziqpdp6-perl5.40.0-Digest-HMAC-1.04']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/j9k8137klihcfypn9d47c0k5z5qaizcc-perl5.40.0-FCGI-0.82']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/ibnb9lh09kbscpxnpdlsq14qfgvmv8v2-perl5.40.0-IO-Socket-SSL-2.083']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/fgdhjn2n5gj6gb4szz20kvkibg9qih1b-linux-pam-1.6.1']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/5kjjyx6zay82qnkzq7i2h89x6brz4gjl-dns-root-data-2024-06-20']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/m9bq0gx3r1vs7h7myyaffkid3qz4m31n-editline-1.17.1']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/hq7m89gp4kafmj8rr0f5sy2qyl7jq479-gdbm-1.24-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/ydzprlbx0fz3qx2yynvg0nf1l96z8xim-libcbor-0.11.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/lw7psn749bfn2nrn943jdh68hh2im8yl-libffi-3.4.6']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/mb8l4bdwb03n1s1zxwxi09x4bqprg6qi-lowdown-1.2.0-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/77yxcw58nmqx2c67a7srpfxxp40j5rbl-mailcap-2.1.54']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/aqga8f06jxy5a6ci4na35v7n09j8i74f-mpdecimal-4.0.0']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/p9lx2xs7kihmwj8pifmbq64gy1qyxrnq-pcsclite-2.3.0-lib']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/q6w4m31q30kq5q16rx5l3wbmpgqhrahx-perl5.40.0-File-Listing-6.16']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/br2b63l3b8403x60fdw65nin47kpc1f0-perl5.40.0-HTTP-CookieJar-0.014']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/q9mfgnjfnx6v6przw13zss5dhasnf1ri-perl5.40.0-HTTP-Cookies-6.10']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/mcwsfj5vw0m6vj72jmr6qknsnbw9p2lv-perl5.40.0-HTTP-Daemon-6.16']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/x09jgjvbji4vp54ha5gm9wib8bdsb44b-perl5.40.0-HTTP-Negotiate-6.01']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/yy2b5j79m1mk0f80bzh68xh4apca6ydg-perl5.40.0-Net-HTTP-6.23']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/y993giax2ncpmyzy9s815zjm1csr2sm9-perl5.40.0-Test-Fatal-0.017', '/nix/store/pwp4csjknhfnxq0y2qd41zsckqagsl2i-perl5.40.0-Test-Needs-0.002010', '/nix/store/qrwrhkcws74famq0vy0wlys47l589d18-perl5.40.0-Test-RequiresInternet-0.05', '/nix/store/ra54gpp2dam6jr51p6ranzq5z3cj3gs9-perl5.40.0-WWW-RobotRules-6.02', '/nix/store/pcdclhaknnwgqjcm8l57y14mj8y0cb77-systemd-minimal-libs-256.8', '/nix/store/dfsiy184c8z6gf5x6cqfyahxv9g16828-tzdata-2024b', '/nix/store/cvk0aq46zfw7s64p33w1ph5jqz9g0b4i-db-5.3.28', '/nix/store/v34vi1nqnkdbk8lydckhcn9zar100pmf-gettext-0.21.1', '/nix/store/g4qfyzlr8gfink7g62kwh7cyan9zv91d-git-2.47.0-doc', '/nix/store/ga9ymzd1mc47z7j5l945j7hld5n4g0a6-gmp-with-cxx-6.3.0', '/nix/store/vmby25zqxnx94awvj0k7zn0rsd0zyrwg-gnused-4.9', '/nix/store/pf3krkihiaqgap8kdwqia4xwxgx8zdzk-groff-1.23.0', '/nix/store/29aklzs2g2n1nyhccac8m6p3ivaiywph-ldns-1.8.4', '/nix/store/x5az3i4df6vh81029r5hpcxf5dzyl0r0-libedit-20240808-3.1', '/nix/store/w9qf9xzv562nhm0wx5lwk3z88x4l6q8z-libfido2-1.15.0', '/nix/store/z152j4xcfydbh4zh5dcf5pzhdksfl6i8-libpipeline-1.5.8', '/nix/store/gbqbaym5rjikap8ri7vr014sacjnkihy-nix-cmd-2.28.3', '/nix/store/jxrd12d8mr6j45mg8gz2pq92byjspixw-pcre-8.45', '/nix/store/dg65ckdmvkzqqiblryk5pk5dpsp1b7a0-perl5.40.0-Authen-SASL-2.1700', '/nix/store/s81rfbb9kygvch1bj49522r5rfsfnblw-perl5.40.0-CGI-Fast-2.16', '/nix/store/vzhbp5dgxxxnjx0jkxlwjnpb20na8k4s-perl5.40.0-FCGI-ProcManager-0.28', '/nix/store/adbl32ayr3k0671p8i6c4pqcblzd5byc-perl5.40.0-HTML-TagCloud-0.38', '/nix/store/2729mybfjazsdz28zsdclpw630lbicrw-perl5.40.0-Net-SMTP-SSL-1.04', '/nix/store/86jrwfmf9b3cdhmj5savjv64hhx9ykkv-perl5.40.0-TermReadKey-2.38', '/nix/store/06axsc4bdxsxlx1y6kg2ihmdrlj7hjx4-perl5.40.0-libnet-3.15', '/nix/store/cdk58cxihryvjszchmih1yv6b29wb45m-perl5.40.0-libwww-perl-6.72', '/nix/store/zv1kaq7f1q20x62kbjv6pfjygw5jmwl6-python3-3.12.7', '/nix/store/gm5g3xyn8iwxkag8gs6rf3ci64bqld80-util-linux-minimal-2.39.4-lib', '/nix/store/asrxwzp3znvrmsar8a3p3hixzabnd132-zstd-1.5.6-bin', '/nix/store/f33kh08pa7pmy4kvsmsibda46sh46s66-bash-interactive-5.2p37', '/nix/store/m7vbrpl1p2xnf0w5wgxwpcsd9hvf2cpm-coreutils-full-9.5', '/nix/store/r686j19q8zcnccpg5h9xlf7bvvs27b8s-curl-8.11.0-bin', '/nix/store/w8pnfazxqwmrqmwkb5zrz1bifsd8abxl-findutils-4.10.0', '/nix/store/1zgzrsbq3b0f06k76pha0r8hmfwvjvc0-git-2.47.0', '/nix/store/zhaypw0znkjnymg0rk1599zn21rr0l50-gnutar-1.35', '/nix/store/0pnclh1az2w4mzf45ghzpgh8n60b4x1b-iana-etc-20240318', '/nix/store/bwmwjz7d7wy0a8a5x8wlihjkxrqpmmrn-less-668', '/nix/store/riql0r65ya6rh8lbhg25hgz3k7nhawrz-man-db-2.13.0', '/nix/store/xlg2s2hdngc2gjb6kfwac1g7b4q2pcg5-nix-2.28.3', '/nix/store/y2zh06pccwcvz43xwgd8mr8pbqflkqww-nss-cacert-3.107', '/nix/store/nfjjkzr25i7qj2r0vslb242jbadb1k4j-openssh-9.9p1', '/nix/store/5lfm8fdlnrr9x6jpv572dcc68bqch97k-wget-1.25.0', '/nix/store/kl3zv2sn1r5ia1z7cg51g6ydcxzldp2y-which-2.21', '/nix/store/3r522862l2lwlbchad0f226ynp41hv89-libmd-1.1.0', '/nix/store/a8xff5gc6wrqqibvqnvslhvp9wx0a3wv-bash-interactive-5.2p37-man', '/nix/store/rlls2vbms86vcrf7z2savrh0x0gbbk8h-curl-8.11.0-man', '/nix/store/zw5haplzbwjgbp3yykhm6iprkpfppzxb-glibc-2.40-36-bin', '/nix/store/ghr1hv8wrk961k3wmh7qdhpylxybgny3-gzip-1.13-man', '/nix/store/c159j32bldpb31ffvkfrfpzjx51dzgs4-less-668-man', '/nix/store/glvk4q4z84qk0bnnaw5hyi3zf33sfqfi-libbsd-0.12.2', '/nix/store/jaanxmkfw5asakn4j4gsrq3g7ksbqshl-manifest.nix', '/nix/store/13cx4lk0k5f0kd12bcg5gw7rqav2c1c8-nk036dp7q03yqkikxlfsapljhgnhxkka-source', '/nix/store/9xhrk86aylscd69342ylwkfby0m1ywax-tcb-1.2', '/nix/store/v1r8fk59wqdmk0axghhzmvz661lln7hh-channel-nixos', '/nix/store/bgmaaz4g83qnn3is8c8z43avp8qacddg-shadow-4.16.0', '/nix/store/4pw26wsikyp4fzbhg292q0i8m9d966lp-user-environment', '/nix/store/wwzb50yira33iwzchhk4y5kgbvcx4irm-base-system']"
+        },
+        {
+            "created": "1970-01-01T00:00:01+00:00",
+            "comment": "store paths: ['/nix/store/d2yvckak6z4brvcv5hiks3xqaa7cp5fq-nix-customisation-layer']"
+        }
+    ]
+}

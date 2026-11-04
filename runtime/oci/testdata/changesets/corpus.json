@@ -1,0 +1,98 @@
+{
+  "schema": 1,
+  "resolvedAt": "2026-11-01",
+  "platform": "linux/amd64",
+  "images": [
+    {
+      "name": "docker",
+      "registry": "registry-1.docker.io",
+      "repository": "library/nginx",
+      "tag": "1.28.0-bookworm",
+      "platform": "linux/amd64",
+      "manifest": "sha256:3b03dfd827515a07ccf4946000f0bbdd2a4fb6aca7499249fcb6b1f9726823d6",
+      "index": "sha256:552e7481ca93ffccd046aa658dbbed22caefbc09c66fa7cd247cbb90b8a5c609",
+      "config": "sha256:34e04bb6b4bb37d45845842374be0cd181723daffb230849b1984aaeaa96faba",
+      "builder": "docker",
+      "provenance": [
+        "OCI config history comment buildkit.dockerfile.v0; NGINX Docker Maintainers label",
+        "https://github.com/nginx/docker-nginx"
+      ]
+    },
+    {
+      "name": "buildah",
+      "registry": "quay.io",
+      "repository": "buildah/stable",
+      "tag": "latest",
+      "platform": "linux/amd64",
+      "manifest": "sha256:77a555756c942f4f0e2916a2a95bace8f109622201b3b70b008a597cf5b7aa69",
+      "index": "sha256:baaa8fe50d0e78687fa39ef90d5afcea07a6bec086dfdef99f792b555f98fbcd",
+      "config": "sha256:35dc24cb8b5faab3b38f68aecd7d4fa54b4ce644fa6a120540eb5d5c614b2b96",
+      "builder": "buildah",
+      "provenance": [
+        "OCI config labels io.buildah.version=1.43.5, built.by.commit=b86020d8c306c4724780adfb6fc492d0a2d9cc48",
+        "https://github.com/podman-container-tools/image_build/blob/b86020d8c306c4724780adfb6fc492d0a2d9cc48/ci/build-push.sh",
+        "https://github.com/podman-container-tools/image_build/actions/runs/40997303375"
+      ]
+    },
+    {
+      "name": "kaniko",
+      "registry": "ghcr.io",
+      "repository": "int128/kaniko-action/example",
+      "tag": "main",
+      "platform": "linux/amd64",
+      "manifest": "sha256:966746ce7ecad73431e51e3b588d88f17b100ebca52d8564c1a6cabbed70dbeb",
+      "index": "sha256:966746ce7ecad73431e51e3b588d88f17b100ebca52d8564c1a6cabbed70dbeb",
+      "config": "sha256:e52f05581db40a21712f4802b8c9cb6f55e95f590cdb12c37db2dcbea2340935",
+      "builder": "kaniko",
+      "provenance": [
+        "OCI config revision=72c12e191799ee153012b3f6d02b2a0bf9d101d0 matches workflow invoking local int128/kaniko-action, not kaniko executor image (built by Docker)",
+        "https://github.com/int128/kaniko-action/blob/72c12e191799ee153012b3f6d02b2a0bf9d101d0/.github/workflows/ts.yaml"
+      ]
+    },
+    {
+      "name": "apko",
+      "registry": "ghcr.io",
+      "repository": "chainguard-images/static",
+      "tag": "latest",
+      "platform": "linux/amd64",
+      "manifest": "sha256:cfcfc99c3e3a23c611610130482c821d44d6f89730c11e58234f6ddf23977609",
+      "index": "sha256:6ee54eb9ffbce221c5ee72f4dab2edad1978dcb023538084dc5fe920b99ae0ca",
+      "config": "sha256:9095165f87012e060853050b1799de3aa73bf14e922c432ed572dc1044d98445",
+      "builder": "apko",
+      "provenance": [
+        "OCI config author github.com/chainguard-dev/apko, history created_by=apko and This is an apko single-layer image",
+        "https://github.com/chainguard-dev/apko"
+      ]
+    },
+    {
+      "name": "nix",
+      "registry": "registry-1.docker.io",
+      "repository": "nixos/nix",
+      "tag": "2.28.3",
+      "platform": "linux/amd64",
+      "manifest": "sha256:d078d7153763895fce17c5fbbdeb86fcfcac414ca0ba875d413c1df57be19931",
+      "index": "sha256:e623d73af9cac82d1b50784c83e0cf2a4b83bfd2cfe8d5b67809a2fc94e043ac",
+      "config": "sha256:4a0fdddc24ba3dc166ffb04481c2a4b6feb0c1782875241c7e3f517316966458",
+      "builder": "nix",
+      "provenance": [
+        "OCI config history store paths; Nix 2.28.3 release source uses pkgs.dockerTools.buildLayeredImageWithNixDb",
+        "https://github.com/NixOS/nix/blob/4d4a91ab8d29cdf986db37d4712dd86fbfdb0fde/docker.nix"
+      ]
+    },
+    {
+      "name": "bazel",
+      "registry": "gcr.io",
+      "repository": "distroless/base-debian12",
+      "tag": "latest",
+      "platform": "linux/amd64",
+      "manifest": "sha256:d2add786f2a5f43d1ab3ae54cd3193de929d0d12c378ff60891921f56f3e47ff",
+      "index": "sha256:fabbf1c0c357a3d42550111351daed089b20a2c954df13ee2fcff60602515e84",
+      "config": "sha256:e65767c737c4e269011a7941c86c28a1dee050aa70ea0cca30299599395d7092",
+      "builder": "bazel",
+      "provenance": [
+        "OCI config history bazel build //common:... and @bookworm//...",
+        "https://github.com/GoogleContainerTools/distroless/blob/e376b9e184a9d3fac863dc9fa5620bf5c562dd71/.cloudbuild/release.sh"
+      ]
+    }
+  ]
+}

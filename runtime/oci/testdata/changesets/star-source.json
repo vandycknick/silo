@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "revision": "e835e64f0d84a614b3c8d619ac646060ea6922a5",
+  "url": "https://codeberg.org/schilytools/schilytools/archive/e835e64f0d84a614b3c8d619ac646060ea6922a5.tar.gz",
+  "sha256": "sha256:fd3db00278caecd94b3802e1f903bf235a7137511ac0a450b31d855e3a52917b",
+  "length": 5898475,
+  "source": "https://codeberg.org/schilytools/schilytools",
+  "build": [
+    "make -f SMakefile RULES CC=gcc COPTX=-std=gnu17 CFLAGS= NOECHO=",
+    "make -C inc all CC=gcc COPTX=-std=gnu17 CFLAGS= NOECHO=",
+    "make -C libschily -f libschily.mk all CC=gcc COPTX=-std=gnu17 CFLAGS= NOECHO=",
+    "make -C libdeflt -f libdeflt.mk all CC=gcc COPTX=-std=gnu17 CFLAGS= NOECHO=",
+    "make -C librmt -f librmt.mk all CC=gcc COPTX=-std=gnu17 CFLAGS= NOECHO=",
+    "make -C libfind -f libfind.mk all CC=gcc COPTX=-std=gnu17 CFLAGS= NOECHO=",
+    "make -C star all CC=gcc COPTX=-std=gnu17 CFLAGS= NOECHO="
+  ],
+  "buildDeadlineSeconds": 600,
+  "buildKillGraceSeconds": 5,
+  "create": [
+    "star",
+    "-c",
+    "H=exustar",
+    "-dump",
+    "-f",
+    "socket.tar",
+    "socket"
+  ],
+  "extract": [
+    "star",
+    "-x",
+    "-f",
+    "socket.tar"
+  ],
+  "proof": "lstat source and independently extracted inode must report S_IFSOCK; no connection state claimed"
+}

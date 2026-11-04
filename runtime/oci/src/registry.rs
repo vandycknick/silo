@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use futures_util::TryStreamExt;
 use oci_client::client::{BlobResponse, SizedStream};
+use oci_client::errors::{OciDistributionError, OciEnvelope};
 use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference, RegistryOperation};
@@ -112,14 +113,11 @@ impl RegistryClient {
         platform: &Platform,
     ) -> OciResult<ResolvedImage> {
         let requested_ref = reference.to_string();
-        let (manifest, digest) = self
-            .client
-            .pull_manifest(reference, &RegistryAuth::Anonymous)
-            .await
-            .map_err(|source| OciError::registry_manifest(requested_ref.clone(), source))?;
-        if let Some(requested_digest) = reference.digest() {
-            verify_manifest_response_digest(&requested_ref, requested_digest, &digest)?;
-        }
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("silo-oci/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| OciError::Io(std::io::Error::other(error)))?;
+        let (manifest, digest) = self.pull_manifest_bounded(&http, reference, None).await?;
 
         let (manifest, manifest_digest) = match manifest {
             OciManifest::Image(manifest) => (manifest, digest),
@@ -127,16 +125,13 @@ impl RegistryClient {
                 let descriptor =
                     select_platform_descriptor(&requested_ref, &index.manifests, platform)?;
                 let manifest_reference = reference.clone_with_digest(descriptor.digest.clone());
+                let size = u64::try_from(descriptor.size).map_err(|_| OciError::ImageConfig {
+                    reference: requested_ref.clone(),
+                    message: "selected manifest descriptor has a negative size".into(),
+                })?;
                 let (selected, selected_digest) = self
-                    .client
-                    .pull_manifest(&manifest_reference, &RegistryAuth::Anonymous)
-                    .await
-                    .map_err(|source| OciError::registry_manifest(requested_ref.clone(), source))?;
-                verify_manifest_response_digest(
-                    &requested_ref,
-                    &descriptor.digest,
-                    &selected_digest,
-                )?;
+                    .pull_manifest_bounded(&http, &manifest_reference, Some(size))
+                    .await?;
                 match selected {
                     OciManifest::Image(manifest) => (manifest, selected_digest),
                     OciManifest::ImageIndex(_) => {
@@ -150,6 +145,7 @@ impl RegistryClient {
                 }
             }
         };
+        Sha256Digest::parse(&manifest.config.digest)?;
         let manifest_reference = reference.clone_with_digest(manifest_digest.clone());
 
         let config_digest = manifest.config.digest.clone();
@@ -194,6 +190,59 @@ impl RegistryClient {
             platform: platform.clone(),
             layers,
         })
+    }
+
+    async fn pull_manifest_bounded(
+        &self,
+        http: &reqwest::Client,
+        reference: &Reference,
+        expected_size: Option<u64>,
+    ) -> OciResult<(OciManifest, String)> {
+        let requested = reference.to_string();
+        if expected_size.is_some_and(|length| length > METADATA_LIMIT) {
+            return Err(OciError::MetadataSize {
+                reference: requested,
+                content: "OCI manifest",
+                expected: expected_size,
+                actual: expected_size.unwrap_or(0),
+                limit: METADATA_LIMIT,
+            });
+        }
+        if let Some(digest) = reference.digest() {
+            Sha256Digest::parse(digest)?;
+        }
+        let mut url = reqwest::Url::parse(&format!(
+            "https://{}/v2/{}/manifests/{}",
+            reference.resolve_registry(),
+            reference.repository(),
+            reference
+                .digest()
+                .or_else(|| reference.tag())
+                .unwrap_or("latest"),
+        ))
+        .map_err(|error| OciError::InvalidReference {
+            reference: requested.clone(),
+            message: error.to_string(),
+        })?;
+        if let Some(namespace) = reference.namespace() {
+            url.query_pairs_mut().append_pair("ns", namespace);
+        }
+        let token = self
+            .client
+            .auth(reference, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+            .await
+            .map_err(|source| OciError::registry_manifest(requested.clone(), source))?;
+        let mut request = http
+            .get(url)
+            .header(reqwest::header::ACCEPT, MANIFEST_ACCEPT);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| OciError::Io(std::io::Error::other(error)))?;
+        read_manifest_response(response, &requested, reference.digest(), expected_size).await
     }
 
     pub(crate) async fn pull_layer_stream(
@@ -242,16 +291,226 @@ impl RegistryClient {
         descriptor: &OciDescriptor,
         requested_ref: &str,
     ) -> OciResult<Vec<u8>> {
+        let expected = u64::try_from(descriptor.size).map_err(|_| OciError::ImageConfig {
+            reference: requested_ref.into(),
+            message: "configuration descriptor has a negative size".into(),
+        })?;
+        let mut body = MetadataBody::new(requested_ref, "image configuration", Some(expected))?;
         let mut stream = self
             .client
             .pull_blob_stream(reference, descriptor)
             .await
             .map_err(|source| OciError::registry(requested_ref.to_string(), source))?;
-        let mut bytes = Vec::new();
         while let Some(chunk) = stream.try_next().await? {
-            bytes.extend_from_slice(&chunk);
+            body.push(&chunk)?;
         }
-        Ok(bytes)
+        body.finish()
+    }
+}
+
+const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json";
+
+async fn read_manifest_response(
+    mut response: reqwest::Response,
+    reference: &str,
+    expected_digest: Option<&str>,
+    expected_size: Option<u64>,
+) -> OciResult<(OciManifest, String)> {
+    let status = response.status();
+    let success = status == reqwest::StatusCode::OK;
+    let expected_size = if success { expected_size } else { None };
+    if let (Some(expected), Some(actual)) = (expected_size, response.content_length()) {
+        if expected != actual {
+            return Err(OciError::MetadataSize {
+                reference: reference.into(),
+                content: "OCI manifest",
+                expected: Some(expected),
+                actual,
+                limit: METADATA_LIMIT,
+            });
+        }
+    }
+    let header_digest = if success {
+        response
+            .headers()
+            .get("docker-content-digest")
+            .map(|header| {
+                let value = header.to_str().map_err(|error| {
+                    OciError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+                })?;
+                Sha256Digest::parse(value)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let mut body = MetadataBody::new(
+        reference,
+        "OCI manifest",
+        expected_size.or(response.content_length()),
+    )?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| OciError::Io(std::io::Error::other(error)))?
+    {
+        body.push(&chunk)?;
+    }
+    let bytes = body.finish()?;
+    if !success {
+        let url = response.url().to_string();
+        let source = if status == reqwest::StatusCode::UNAUTHORIZED {
+            OciDistributionError::UnauthorizedError { url }
+        } else if status.is_success() {
+            OciDistributionError::SpecViolationError(format!(
+                "expected HTTP 200 for manifest, got {status}"
+            ))
+        } else if status.is_client_error() {
+            match serde_json::from_slice::<OciEnvelope>(&bytes) {
+                Ok(envelope) => OciDistributionError::RegistryError { url, envelope },
+                Err(_) => OciDistributionError::ServerError {
+                    code: status.as_u16(),
+                    url,
+                    message: String::from_utf8_lossy(&bytes).into_owned(),
+                },
+            }
+        } else {
+            OciDistributionError::ServerError {
+                code: status.as_u16(),
+                url,
+                message: String::from_utf8_lossy(&bytes).into_owned(),
+            }
+        };
+        return Err(OciError::registry_manifest(reference, source));
+    }
+    let actual = Sha256Digest::from_bytes(&bytes);
+    let digest = actual.to_string();
+    if let Some(header) = header_digest {
+        if header != actual {
+            return Err(OciError::ManifestDigestMismatch {
+                reference: reference.into(),
+                expected: header.to_string(),
+                actual: digest,
+            });
+        }
+    }
+    if let Some(expected) = expected_digest {
+        verify_manifest_response_digest(reference, expected, &digest)?;
+    }
+    let manifest: OciManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        OciError::registry_manifest(
+            reference,
+            OciDistributionError::ManifestParsingError(error.to_string()),
+        )
+    })?;
+    let (schema, media_type, allowed) = match &manifest {
+        OciManifest::Image(image) => (
+            image.schema_version,
+            image.media_type.as_deref(),
+            [
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ],
+        ),
+        OciManifest::ImageIndex(index) => (
+            index.schema_version,
+            index.media_type.as_deref(),
+            [
+                "application/vnd.oci.image.index.v1+json",
+                "application/vnd.docker.distribution.manifest.list.v2+json",
+            ],
+        ),
+    };
+    if schema != 2 {
+        return Err(OciError::registry_manifest(
+            reference,
+            OciDistributionError::UnsupportedSchemaVersionError(i32::from(schema)),
+        ));
+    }
+    if let Some(media_type) = media_type {
+        if !allowed.contains(&media_type) {
+            return Err(OciError::registry_manifest(
+                reference,
+                OciDistributionError::UnsupportedMediaTypeError(media_type.into()),
+            ));
+        }
+    }
+    let count_valid = match &manifest {
+        OciManifest::Image(image) => image.layers.len() <= 1024,
+        OciManifest::ImageIndex(index) => index.manifests.len() <= 4096,
+    };
+    if !count_valid {
+        return Err(OciError::ImageConfig {
+            reference: reference.into(),
+            message: "OCI manifest descriptor count exceeds its bound".into(),
+        });
+    }
+    Ok((manifest, digest))
+}
+
+const METADATA_LIMIT: u64 = 4 * 1024 * 1024;
+
+struct MetadataBody<'a> {
+    reference: &'a str,
+    content: &'static str,
+    expected: Option<u64>,
+    bytes: Vec<u8>,
+}
+
+impl<'a> MetadataBody<'a> {
+    fn new(reference: &'a str, content: &'static str, expected: Option<u64>) -> OciResult<Self> {
+        if expected.is_some_and(|length| length > METADATA_LIMIT) {
+            return Err(OciError::MetadataSize {
+                reference: reference.into(),
+                content,
+                expected,
+                actual: expected.unwrap_or(0),
+                limit: METADATA_LIMIT,
+            });
+        }
+        Ok(Self {
+            reference,
+            content,
+            expected,
+            bytes: Vec::with_capacity(expected.unwrap_or(0) as usize),
+        })
+    }
+
+    fn size_error(&self, actual: u64) -> OciError {
+        OciError::MetadataSize {
+            reference: self.reference.into(),
+            content: self.content,
+            expected: self.expected,
+            actual,
+            limit: METADATA_LIMIT,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> OciResult<()> {
+        let length = (self.bytes.len() as u64).saturating_add(chunk.len() as u64);
+        if length > METADATA_LIMIT || self.expected.is_some_and(|expected| length > expected) {
+            return Err(self.size_error(length));
+        }
+        if self.bytes.capacity() < length as usize {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .clamp(length as usize, METADATA_LIMIT as usize);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> OciResult<Vec<u8>> {
+        if self
+            .expected
+            .is_some_and(|expected| expected != self.bytes.len() as u64)
+        {
+            return Err(self.size_error(self.bytes.len() as u64));
+        }
+        Ok(self.bytes)
     }
 }
 
@@ -292,11 +551,19 @@ fn resolved_layers(
     manifest: &OciImageManifest,
     config: &ImageConfigDocument,
 ) -> OciResult<Vec<ResolvedLayer>> {
+    if manifest.layers.len() > 1024 || manifest.layers.len() != config.rootfs.diff_ids.len() {
+        return Err(OciError::ImageConfig {
+            reference: reference.into(),
+            message: "invalid OCI layer occurrence count".into(),
+        });
+    }
     manifest
         .layers
         .iter()
         .zip(config.rootfs.diff_ids.iter())
         .map(|(layer, diff_id)| {
+            Sha256Digest::parse(&layer.digest)?;
+            Sha256Digest::parse(diff_id)?;
             let size_bytes = u64::try_from(layer.size).map_err(|_| OciError::ImageConfig {
                 reference: reference.to_string(),
                 message: format!("layer {} has negative size {}", layer.digest, layer.size),
@@ -486,5 +753,211 @@ mod tests {
         .expect_err("digest-pinned response must retain the requested digest");
 
         assert!(matches!(err, OciError::ManifestDigestMismatch { .. }));
+    }
+    #[test]
+    fn metadata_bodies_enforce_declared_and_global_limits_before_appending() {
+        use crate::registry::{MetadataBody, METADATA_LIMIT};
+        assert!(MetadataBody::new("test", "config", Some(METADATA_LIMIT + 1)).is_err());
+        let mut exact = MetadataBody::new("test", "config", Some(3)).unwrap();
+        exact.push(b"abc").unwrap();
+        assert!(exact.push(b"d").is_err());
+        assert_eq!(exact.finish().unwrap(), b"abc");
+        let mut short = MetadataBody::new("test", "config", Some(4)).unwrap();
+        short.push(b"abc").unwrap();
+        assert!(short.finish().is_err());
+        let mut unknown = MetadataBody::new("test", "manifest", None).unwrap();
+        assert!(unknown.push(&vec![0; METADATA_LIMIT as usize + 1]).is_err());
+        assert!(unknown.bytes.is_empty());
+    }
+
+    #[test]
+    fn layer_resolution_rejects_invalid_ids_and_excess_occurrences() {
+        let valid = format!("sha256:{}", "a".repeat(64));
+        let mut manifest: oci_client::manifest::OciImageManifest = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType":"application/vnd.oci.image.config.v1+json","digest":valid,"size":2},
+            "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":valid,"size":1024}]
+        })).unwrap();
+        let mut config: ImageConfigDocument = serde_json::from_value(serde_json::json!({
+            "architecture":"amd64","os":"linux","rootfs":{"diff_ids":[valid]}
+        }))
+        .unwrap();
+        for invalid in ["sha512:abc", "sha256:not-hex"] {
+            manifest.layers[0].digest = invalid.into();
+            assert!(crate::registry::resolved_layers("test", &manifest, &config).is_err());
+            manifest.layers[0].digest = valid.clone();
+            config.rootfs.diff_ids[0] = invalid.into();
+            assert!(crate::registry::resolved_layers("test", &manifest, &config).is_err());
+            config.rootfs.diff_ids[0] = valid.clone();
+        }
+        manifest.layers = vec![manifest.layers[0].clone(); 1025];
+        config.rootfs.diff_ids = vec![valid; 1025];
+        assert!(crate::registry::resolved_layers("test", &manifest, &config).is_err());
+    }
+
+    #[test]
+    fn unknown_length_metadata_buffer_growth_stays_within_limit() {
+        let mut body = crate::registry::MetadataBody::new("test", "OCI manifest", None).unwrap();
+        let limit = crate::registry::METADATA_LIMIT as usize;
+        let bytes = vec![0; limit / 3 + 1];
+        for _ in 0..2 {
+            body.push(&bytes).unwrap();
+            assert!(body.bytes.capacity() <= limit);
+        }
+        let remaining = limit - body.bytes.len();
+        body.push(&bytes[..remaining]).unwrap();
+        assert!(body.bytes.capacity() <= limit);
+        assert_eq!(body.finish().unwrap().len(), limit);
+    }
+
+    fn manifest_http_fixture(
+        status: &str,
+        body: Vec<u8>,
+        chunked: bool,
+        header_digest: Option<String>,
+        expected_digest: Option<&str>,
+        expected_size: Option<u64>,
+    ) -> crate::OciResult<(oci_client::manifest::OciManifest, String)> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut headers = format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\n");
+        if chunked {
+            headers.push_str("Transfer-Encoding: chunked\r\n");
+        } else {
+            headers.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        if let Some(digest) = header_digest {
+            headers.push_str(&format!("Docker-Content-Digest: {digest}\r\n"));
+        }
+        headers.push_str("\r\n");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).unwrap();
+                assert!(read > 0 && request.len() + read <= 16384);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            assert!(request.starts_with(b"GET /manifest HTTP/1.1\r\n"));
+            if socket.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            if chunked {
+                for bytes in body.chunks(32768) {
+                    if write!(socket, "{:x}\r\n", bytes.len()).is_err()
+                        || socket.write_all(bytes).is_err()
+                        || socket.write_all(b"\r\n").is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = socket.write_all(b"0\r\n\r\n");
+            } else {
+                let _ = socket.write_all(&body);
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let response = http
+                .get(format!("http://{address}/manifest"))
+                .send()
+                .await
+                .unwrap();
+            crate::registry::read_manifest_response(
+                response,
+                "example.test/demo:latest",
+                expected_digest,
+                expected_size,
+            )
+            .await
+        });
+        server.join().unwrap();
+        result
+    }
+
+    fn manifest_fixture_bytes() -> Vec<u8> {
+        format!(
+            "{{ \"schemaVersion\": 2, \"mediaType\": \"application/vnd.oci.image.manifest.v1+json\", \"config\": {{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{}\",\"size\":2}}, \"layers\": [] }}\n",
+            crate::digest::Sha256Digest::from_bytes(b"{}"),
+        ).into_bytes()
+    }
+
+    #[test]
+    fn bounded_http_manifest_verifies_raw_digest_and_exact_selected_descriptor_size() {
+        let body = manifest_fixture_bytes();
+        let digest = crate::digest::Sha256Digest::from_bytes(&body).to_string();
+        let (_, actual) = manifest_http_fixture(
+            "200 OK",
+            body.clone(),
+            false,
+            Some(digest.clone()),
+            Some(&digest),
+            Some(body.len() as u64),
+        )
+        .unwrap();
+        assert_eq!(actual, digest);
+        assert!(matches!(
+            manifest_http_fixture(
+                "200 OK",
+                body.clone(),
+                true,
+                None,
+                Some(&digest),
+                Some(body.len() as u64 + 1)
+            ),
+            Err(OciError::MetadataSize { .. })
+        ));
+        let wrong = format!("sha256:{}", "b".repeat(64));
+        assert!(matches!(
+            manifest_http_fixture(
+                "200 OK",
+                body.clone(),
+                false,
+                Some(wrong.clone()),
+                None,
+                None
+            ),
+            Err(OciError::ManifestDigestMismatch { .. })
+        ));
+        assert!(matches!(
+            manifest_http_fixture("200 OK", body, true, None, Some(&wrong), None),
+            Err(OciError::ManifestDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_length_http_manifest_cannot_exceed_metadata_bound() {
+        let body = vec![b' '; crate::registry::METADATA_LIMIT as usize + 1];
+        assert!(matches!(
+            manifest_http_fixture("200 OK", body, true, None, None, None),
+            Err(OciError::MetadataSize { actual, limit, .. }) if actual > limit
+        ));
+    }
+
+    #[test]
+    fn bounded_http_manifest_preserves_registry_search_miss_and_denial_errors() {
+        let missing =
+            manifest_http_fixture("404 Not Found", Vec::new(), false, None, None, Some(123))
+                .unwrap_err();
+        assert!(missing.is_search_miss());
+        let denied = manifest_http_fixture("401 Unauthorized", Vec::new(), false, None, None, None)
+            .unwrap_err();
+        assert!(matches!(denied, OciError::RegistryAccessDenied { .. }));
     }
 }

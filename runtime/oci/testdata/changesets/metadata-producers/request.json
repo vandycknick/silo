@@ -1,0 +1,3255 @@
+{
+  "cases": [
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-00.tar",
+          "diffId": "sha256:70ac4e67bc558484532bd555272890520ceee2891ad8f900598e9f849be84490",
+          "digest": "sha256:70ac4e67bc558484532bd555272890520ceee2891ad8f900598e9f849be84490",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-00.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-00",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-01.tar",
+          "diffId": "sha256:bfe77ce9c0ba1708a063bae5b477f3c0d88d3cd3e7676a0dadd5accf83bd2882",
+          "digest": "sha256:bfe77ce9c0ba1708a063bae5b477f3c0d88d3cd3e7676a0dadd5accf83bd2882",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-01.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-01",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-02.tar",
+          "diffId": "sha256:9ed8d90667d4615b2a4e5813905241706aa2f2bb54b131ba4883e8d18d2721db",
+          "digest": "sha256:9ed8d90667d4615b2a4e5813905241706aa2f2bb54b131ba4883e8d18d2721db",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-02.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-02",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-03.tar",
+          "diffId": "sha256:13eba0b9c9485faed024f89ca1bc80c780e3b4c98a49515af191637889b6b4c2",
+          "digest": "sha256:13eba0b9c9485faed024f89ca1bc80c780e3b4c98a49515af191637889b6b4c2",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-03.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-03",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:554b800a259ba43d9add1c9e3237e2f294b30625fc47cc92d3c79b3c53071181",
+          "directory": "silo-artifacts/case-0004/layer-0000",
+          "indexRoot": "sha256:dc971eba62cdbf068260295a266cb996068620981e7b45f672cff769e4d1c925",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:841ce6fafe580330cc6371ebceb320697696dcef1817cad9b26c592cc4b566ee",
+          "result": "sha256:fc70ea998919db89a7b5f13b3cfdd11b6c08a5ca84ea9e419c70ba445e3505b1"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-04.tar",
+          "diffId": "sha256:554b800a259ba43d9add1c9e3237e2f294b30625fc47cc92d3c79b3c53071181",
+          "digest": "sha256:554b800a259ba43d9add1c9e3237e2f294b30625fc47cc92d3c79b3c53071181",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-04.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-04",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:cf9e7153f5e7d140bcd1605c2d68554af38a475e813b4e9bcab1ca785191bdd6",
+          "directory": "silo-artifacts/case-0005/layer-0000",
+          "indexRoot": "sha256:0d7031376ad83b8c63e5ca73bee086d4584bf60fbe01d8a4f17342ce9e00bffa",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:0dd4f775baf5f90c4221088763db17790e615b563be2e92208306f9400830bca",
+          "result": "sha256:ddc71df366dd877e2b1a9bd54f0dcc500a925b637c0894dddc520a513d46fab1"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-05.tar",
+          "diffId": "sha256:cf9e7153f5e7d140bcd1605c2d68554af38a475e813b4e9bcab1ca785191bdd6",
+          "digest": "sha256:cf9e7153f5e7d140bcd1605c2d68554af38a475e813b4e9bcab1ca785191bdd6",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-05.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-05",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:aa1233bb88c85ca1f6626542215f31dc1c31ee17c355da7bf3acdfcd50bcd070",
+          "directory": "silo-artifacts/case-0006/layer-0000",
+          "indexRoot": "sha256:efdc95951f6ece1e0d14ef4e84a0efb54dba600a22b104808860c6c233cf1628",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:b0b216028990fc5dd04c3a1f9ab0f2af05aa1c7ab2eda6dabd9e7af418e0976e",
+          "result": "sha256:a3991c7a04ff2377ec5508d150cf1fade49568a4e8abcd4ff455e9d124ae3689"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-06.tar",
+          "diffId": "sha256:aa1233bb88c85ca1f6626542215f31dc1c31ee17c355da7bf3acdfcd50bcd070",
+          "digest": "sha256:aa1233bb88c85ca1f6626542215f31dc1c31ee17c355da7bf3acdfcd50bcd070",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-06.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-06",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:8786e8045ea344815e09f0e8c36e0758bf1cfd862362dbdefa3cfaf4a44a98f0",
+          "directory": "silo-artifacts/case-0007/layer-0000",
+          "indexRoot": "sha256:059b8fd38adee953957382b374e9701c9eaa0ab6910948e6626a10f845fa64cf",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:1d3d921c18c745a026eb9c63e76a5324d377dd8840f74c5dadbbf747b6f55f6c",
+          "result": "sha256:341626880baedfdfb9e8060d3359964980e8dbb77bae352bc7008fef905ab112"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-07.tar",
+          "diffId": "sha256:8786e8045ea344815e09f0e8c36e0758bf1cfd862362dbdefa3cfaf4a44a98f0",
+          "digest": "sha256:8786e8045ea344815e09f0e8c36e0758bf1cfd862362dbdefa3cfaf4a44a98f0",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-07.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-07",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:05881d5d035f3ec9055fff6ee91e2572c0618f531833ebcf4ca47e3d57173eb6",
+          "directory": "silo-artifacts/case-0008/layer-0000",
+          "indexRoot": "sha256:5419b98b9b6851d939c0538985fc06ed22709864f7b4aeaab14cd100db2b5ca7",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:f300665fdd0d6f43a3e803325ef96c90fd99d6adc7cd045adeb2722555a3d91e",
+          "result": "sha256:77c613110c0c677ecdf1d3f203573bd87d1f353c396065966f93b622a356621f"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-file-08.tar",
+          "diffId": "sha256:05881d5d035f3ec9055fff6ee91e2572c0618f531833ebcf4ca47e3d57173eb6",
+          "digest": "sha256:05881d5d035f3ec9055fff6ee91e2572c0618f531833ebcf4ca47e3d57173eb6",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "gnu-tar-file-08.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-file-08",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "gnu-tar-complete-set.tar",
+          "diffId": "sha256:5dcfc1439c3dd38ec808b85e9fac5b2c646594c89946e826d4a510ffba51db61",
+          "digest": "sha256:5dcfc1439c3dd38ec808b85e9fac5b2c646594c89946e826d4a510ffba51db61",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 30720,
+          "tar": "gnu-tar-complete-set.tar"
+        }
+      ],
+      "name": "producer-original-gnu-tar-complete-set",
+      "producer": "gnu-tar",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:17437b6c69080105edd2a2a837f3fc7325e9412eb0fea4215bbe618dd1764b67",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "Y29tcGxldGUtc2V0",
+          "kind": "regular",
+          "length": 32,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "Y29tcGxldGUtc2V0",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            },
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-00.tar",
+          "diffId": "sha256:5d8f71c55d9a50e0d41cba30c81d50e6a689038e38724dd367a2746e30095151",
+          "digest": "sha256:5d8f71c55d9a50e0d41cba30c81d50e6a689038e38724dd367a2746e30095151",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-00.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-00",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-01.tar",
+          "diffId": "sha256:b2d86ddd33a9efe0f189bffae531221e476458b0407f9aa62ed6b3ce22593bca",
+          "digest": "sha256:b2d86ddd33a9efe0f189bffae531221e476458b0407f9aa62ed6b3ce22593bca",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-01.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-01",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-02.tar",
+          "diffId": "sha256:f83b126206802728a2ff3e04af1cfdb5b5bc1fc69ccfb4424e5389b861f643fb",
+          "digest": "sha256:f83b126206802728a2ff3e04af1cfdb5b5bc1fc69ccfb4424e5389b861f643fb",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-02.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-02",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-03.tar",
+          "diffId": "sha256:b696eeea2f6830b4bf785ef922790f2edc385769ef446699aa575fad10ec6782",
+          "digest": "sha256:b696eeea2f6830b4bf785ef922790f2edc385769ef446699aa575fad10ec6782",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-03.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-03",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-04.tar",
+          "diffId": "sha256:6152803abf2950f6e43c8e4e0a139924c0827d665e9c21bcb0b407bf20687b81",
+          "digest": "sha256:6152803abf2950f6e43c8e4e0a139924c0827d665e9c21bcb0b407bf20687b81",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-04.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-04",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-05.tar",
+          "diffId": "sha256:b14584455d2fe0057ad884f5d01b1dd881dd6d8b14e368dcfef224a0e56ac16a",
+          "digest": "sha256:b14584455d2fe0057ad884f5d01b1dd881dd6d8b14e368dcfef224a0e56ac16a",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-05.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-05",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-06.tar",
+          "diffId": "sha256:f28accf6736bbefd90c200218bffb89f5252e68c43934e6f6c6a0e24d746740c",
+          "digest": "sha256:f28accf6736bbefd90c200218bffb89f5252e68c43934e6f6c6a0e24d746740c",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-06.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-06",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:c5ec1c20607680668a8cd6bae15289c482caa1afdb22e90577776eb72c1dde94",
+          "directory": "silo-artifacts/case-0017/layer-0000",
+          "indexRoot": "sha256:059b8fd38adee953957382b374e9701c9eaa0ab6910948e6626a10f845fa64cf",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:4c7de77d638e62e4e3793096b09a76c504bd2e4af74e0d4ac496b6d81a8bf7d0",
+          "result": "sha256:6c5d1125e9aeade9db0064210c8b8448b3daa678eb54a1b00aa2bfd965e1125c"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-07.tar",
+          "diffId": "sha256:c5ec1c20607680668a8cd6bae15289c482caa1afdb22e90577776eb72c1dde94",
+          "digest": "sha256:c5ec1c20607680668a8cd6bae15289c482caa1afdb22e90577776eb72c1dde94",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-07.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-07",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:4c06d29f7c53e872bb15b90d85df44579ee6883ae4cfa723ab2da9a5b772ab7b",
+          "directory": "silo-artifacts/case-0018/layer-0000",
+          "indexRoot": "sha256:5419b98b9b6851d939c0538985fc06ed22709864f7b4aeaab14cd100db2b5ca7",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:1572ce4a09587c02fcff7d0d492307ae7c8a95d89ece4c21ea40dc20e7920351",
+          "result": "sha256:09530dd4317885d02d867701ade6509fa46228c87d6d5b230297c60e674e76af"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-file-08.tar",
+          "diffId": "sha256:4c06d29f7c53e872bb15b90d85df44579ee6883ae4cfa723ab2da9a5b772ab7b",
+          "digest": "sha256:4c06d29f7c53e872bb15b90d85df44579ee6883ae4cfa723ab2da9a5b772ab7b",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 3072,
+          "tar": "libarchive-file-08.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-file-08",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "libarchive-complete-set.tar",
+          "diffId": "sha256:80ee8fd849267ac993b89214600fbcbb4f9496a5284b865f3d63be6b93713be3",
+          "digest": "sha256:80ee8fd849267ac993b89214600fbcbb4f9496a5284b865f3d63be6b93713be3",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 22016,
+          "tar": "libarchive-complete-set.tar"
+        }
+      ],
+      "name": "producer-original-libarchive-complete-set",
+      "producer": "libarchive",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:17437b6c69080105edd2a2a837f3fc7325e9412eb0fea4215bbe618dd1764b67",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "Y29tcGxldGUtc2V0",
+          "kind": "regular",
+          "length": 32,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "Y29tcGxldGUtc2V0",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            },
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:ef48103f4bd30aa8e697923a582c25a2e9c4cc564af3fec3572a0a1db87a22cf",
+          "directory": "silo-artifacts/case-0020/layer-0000",
+          "indexRoot": "sha256:2243e0d7209051122d92a6b07b50be8a23625ff27d2c1af170ecb8d28cf6924d",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:659dbeb371fe8287217a8aaec22e9a413d430b60607c3eab916464aa683dc1c4",
+          "result": "sha256:e59d21b8df1558b93596dc7c215922782e9cc5a900b1f46af554d23e5728d461"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5h",
+              "value": "Yj0A_wo9"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-00.tar",
+          "diffId": "sha256:ef48103f4bd30aa8e697923a582c25a2e9c4cc564af3fec3572a0a1db87a22cf",
+          "digest": "sha256:ef48103f4bd30aa8e697923a582c25a2e9c4cc564af3fec3572a0a1db87a22cf",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-00.tar"
+        }
+      ],
+      "name": "producer-original-star-file-00",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:a84c42c06b4f7f494ec8186e2d398b18a5ff3021cdae71f61d4fce2bccab702b",
+          "directory": "silo-artifacts/case-0021/layer-0000",
+          "indexRoot": "sha256:55c460db682f305d829ce8894f057b1883767326d36b36f7657780acca05c1b4",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:bad702291b20b22b8dcd383df132c0b5332ae9520b2287df109000160e1e01ea",
+          "result": "sha256:8b9694ece1cef19f328cbef12745be56b1e6d1e6532f1f39f11ff03633816b52"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-01.tar",
+          "diffId": "sha256:a84c42c06b4f7f494ec8186e2d398b18a5ff3021cdae71f61d4fce2bccab702b",
+          "digest": "sha256:a84c42c06b4f7f494ec8186e2d398b18a5ff3021cdae71f61d4fce2bccab702b",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-01.tar"
+        }
+      ],
+      "name": "producer-original-star-file-01",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-02.tar",
+          "diffId": "sha256:45b73e3bd47095760862897a6cf338e76cf21488aabd3847372f72b8164ef776",
+          "digest": "sha256:45b73e3bd47095760862897a6cf338e76cf21488aabd3847372f72b8164ef776",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-02.tar"
+        }
+      ],
+      "name": "producer-original-star-file-02",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-03.tar",
+          "diffId": "sha256:3b87d62428dcf13d9df7b6f7ca29548c396eb40a04d52d959f251cb94099f89d",
+          "digest": "sha256:3b87d62428dcf13d9df7b6f7ca29548c396eb40a04d52d959f251cb94099f89d",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-03.tar"
+        }
+      ],
+      "name": "producer-original-star-file-03",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:1646c142a71a506ae0c834400e1ade98693f7c1bd6d5eaaf57d962a8e76563a2",
+          "directory": "silo-artifacts/case-0024/layer-0000",
+          "indexRoot": "sha256:dc971eba62cdbf068260295a266cb996068620981e7b45f672cff769e4d1c925",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:d832073ba7ba07dcc357d72e92421db5951024527560ca14d88236f311071984",
+          "result": "sha256:8f3b9fcb83f3ef2b1d50b6b706ee9aa85ac49210b62a2cc8b86799803ae85590"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-04.tar",
+          "diffId": "sha256:1646c142a71a506ae0c834400e1ade98693f7c1bd6d5eaaf57d962a8e76563a2",
+          "digest": "sha256:1646c142a71a506ae0c834400e1ade98693f7c1bd6d5eaaf57d962a8e76563a2",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-04.tar"
+        }
+      ],
+      "name": "producer-original-star-file-04",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:185729f336881c9b7c737e3a3f834d3fc73165fde753a4101bea6f88565998eb",
+          "directory": "silo-artifacts/case-0025/layer-0000",
+          "indexRoot": "sha256:0d7031376ad83b8c63e5ca73bee086d4584bf60fbe01d8a4f17342ce9e00bffa",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:6f8a8df3c44d0689ccfda914135ab355cb4c7d80b48f8552f9c62a36a9fca7f1",
+          "result": "sha256:16de6527ea3fec839f4b7edee8f70db1dd22c875499fbd075a77ce139e061e93"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-05.tar",
+          "diffId": "sha256:185729f336881c9b7c737e3a3f834d3fc73165fde753a4101bea6f88565998eb",
+          "digest": "sha256:185729f336881c9b7c737e3a3f834d3fc73165fde753a4101bea6f88565998eb",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-05.tar"
+        }
+      ],
+      "name": "producer-original-star-file-05",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:2403fdaa3fc417b3c8b0bd63a0f777149993a58cad022e9ae14786fc4fa7d38d",
+          "directory": "silo-artifacts/case-0026/layer-0000",
+          "indexRoot": "sha256:efdc95951f6ece1e0d14ef4e84a0efb54dba600a22b104808860c6c233cf1628",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:444639188b6880444067caf7514802d7b4cd7147c7b45a9618cbfae8d606e454",
+          "result": "sha256:8389255c8fe0213882a08eba582c477b7e270ba94fb8156096ec9d41e0f4541a"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-06.tar",
+          "diffId": "sha256:2403fdaa3fc417b3c8b0bd63a0f777149993a58cad022e9ae14786fc4fa7d38d",
+          "digest": "sha256:2403fdaa3fc417b3c8b0bd63a0f777149993a58cad022e9ae14786fc4fa7d38d",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-06.tar"
+        }
+      ],
+      "name": "producer-original-star-file-06",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:d882a235212e539880ef52582eac3ae92eb202852a33a115741690d252e437b3",
+          "directory": "silo-artifacts/case-0027/layer-0000",
+          "indexRoot": "sha256:059b8fd38adee953957382b374e9701c9eaa0ab6910948e6626a10f845fa64cf",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:5bfe09ba350bd3b8032215b8d72690e82d01db9c34da17bc09f7a090f5f43cd8",
+          "result": "sha256:326f83f9bb710e609d1db735f0bb501c9cc78b796037f9b78890ec7a74093ea3"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-07.tar",
+          "diffId": "sha256:d882a235212e539880ef52582eac3ae92eb202852a33a115741690d252e437b3",
+          "digest": "sha256:d882a235212e539880ef52582eac3ae92eb202852a33a115741690d252e437b3",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-07.tar"
+        }
+      ],
+      "name": "producer-original-star-file-07",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [
+        {
+          "diffId": "sha256:bd59e1097d7ecd36e76d99080342773f039966d230e51c009d8aeb79fc2655d1",
+          "directory": "silo-artifacts/case-0028/layer-0000",
+          "indexRoot": "sha256:5419b98b9b6851d939c0538985fc06ed22709864f7b4aeaab14cd100db2b5ca7",
+          "packLength": 4096,
+          "packStream": "sha256:6775a8859b462accca83e437d634fee8a45e48d1c1b5c748f4002d906743d74e",
+          "recipe": "sha256:e3ba84f2ee584a191a6c87f869b1fecddfba214261f35da4cbca4b1135cbde7a",
+          "result": "sha256:58fcab6aec9ab192a847506087f06904ed4133d05fdaed606d73bd50204fe981"
+        }
+      ],
+      "expected": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 0,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 0,
+          "path": "",
+          "target": null,
+          "uid": 0,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-file-08.tar",
+          "diffId": "sha256:bd59e1097d7ecd36e76d99080342773f039966d230e51c009d8aeb79fc2655d1",
+          "digest": "sha256:bd59e1097d7ecd36e76d99080342773f039966d230e51c009d8aeb79fc2655d1",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 10240,
+          "tar": "star-file-08.tar"
+        }
+      ],
+      "name": "producer-original-star-file-08",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "siloRejection": null,
+      "siloRejectionKind": ""
+    },
+    {
+      "artifacts": [],
+      "expected": [],
+      "expectedRejected": false,
+      "layers": [
+        {
+          "blob": "star-complete-set.tar",
+          "diffId": "sha256:b674cf09c2d4863af24b6344f3fb5f96e1c830c0bbbb68396b7b8d73c6d82189",
+          "digest": "sha256:b674cf09c2d4863af24b6344f3fb5f96e1c830c0bbbb68396b7b8d73c6d82189",
+          "mediaType": "application/vnd.oci.image.layer.v1.tar",
+          "packLength": 0,
+          "size": 30720,
+          "tar": "star-complete-set.tar"
+        }
+      ],
+      "name": "producer-original-star-complete-set",
+      "producer": "star",
+      "producerEvidence": "producers.json",
+      "producerOriginal": [
+        {
+          "content": null,
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": null,
+          "kind": "directory",
+          "length": null,
+          "links": null,
+          "mode": 493,
+          "mtimeNanos": 0,
+          "mtimeSeconds": 1,
+          "path": "",
+          "target": null,
+          "uid": 1000,
+          "xattrs": []
+        },
+        {
+          "content": "sha256:17437b6c69080105edd2a2a837f3fc7325e9412eb0fea4215bbe618dd1764b67",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "Y29tcGxldGUtc2V0",
+          "kind": "regular",
+          "length": 32,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "Y29tcGxldGUtc2V0",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            },
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            },
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hPWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJWI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTNEYg",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wMw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wMw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hJTI1Yg",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hIGI",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNQ",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNQ",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7DqQ",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNg",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNg",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci7_",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wNw",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wNw",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5hK2I",
+              "value": "AP8KPQ"
+            }
+          ]
+        },
+        {
+          "content": "sha256:cbb8e824d9c29a0167a61c31fffd9d4c25b8186f56cf8bc3ddbe74665ba2b68d",
+          "deviceMajor": null,
+          "deviceMinor": null,
+          "gid": 1000,
+          "group": "ZmlsZS0wOA",
+          "kind": "regular",
+          "length": 18,
+          "links": 1,
+          "mode": 420,
+          "mtimeNanos": 7,
+          "mtimeSeconds": 1,
+          "path": "ZmlsZS0wOA",
+          "target": null,
+          "uid": 1000,
+          "xattrs": [
+            {
+              "name": "dXNlci5lbXB0eQ",
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "siloRejection": "unsupported changeset feature: ambiguous escaped SCHILY xattr name",
+      "siloRejectionKind": "unsupported"
+    }
+  ],
+  "schema": 1
+}
