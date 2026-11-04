@@ -32,6 +32,50 @@ krun runtime binary. Runtime packages ship it as `bin/silo-vmm` (or
 `Contents/Helpers/silo-vmm` in `Silo.app`). See the
 [silo-vmm architecture and qualification notes](docs/architecture/silo-vmm.md).
 
+## Breaking storage reset
+
+The ADR 0014/0021 storage release requires reinstalling Silo and wiping all
+state from earlier installations. There is no upgrade migration, legacy cache
+import, or compatibility reader. Silo refuses incompatible state with a
+reinstall/reset diagnostic; it does not automatically delete it.
+
+Fresh machines default to private `root.raw` disks. The image cache uses immutable
+content-addressed streams and a SQLite catalog, not mutable JSON metadata.
+The development-only `linux-flat-overlay-v1` profile is explicitly opt-in:
+
+```sh
+silo create ubuntu:24.04 --name overlay-dev \
+  --root-profile linux-flat-overlay-v1 --disk-size 4gib
+silo run ubuntu:24.04 --root-profile linux-flat-overlay-v1 -- uname -a
+```
+
+It retains one shared read-only ext4 lower and creates a fresh private ext4 upper.
+`--disk-size` selects exact upper backing capacity (64 MiB through 1 TiB,
+4096-byte aligned), not usable payload bytes. Filesystem metadata and an explicitly
+reported unusable short-group tail reduce usable capacity. A small growth can
+increase backing length without adding usable space. Resize requires a stopped
+machine; the next boot replays and grows the upper in the guest.
+The profile requires an exactly qualified kernel/init tuple on libkrun, is never
+silently substituted for raw, cannot be published or snapshotted, and will be
+removed rather than migrated when the EROFS profile replaces it.
+
+`/tmp` remains persistent and disk-backed by default. With the overlay profile,
+`--tmpfs-size 64mib` explicitly selects a memory-charged, nonpersistent `/tmp`;
+its capacity is separate from the upper. On a stopped overlay machine,
+`silo set overlay-dev tmpfs-size=off` restores disk-backed `/tmp` at next boot
+without deleting previously hidden disk contents; `tmpfs-size=64mib` selects it
+again. Templates support the same choices:
+
+```yaml
+version: "1"
+image: ubuntu:24.04
+root_profile: linux-flat-overlay-v1
+disk_size: 4gib
+tmpfs_size: 64mib
+```
+
+See [ADR 0014](docs/adr/0014-layered-oci-image-storage.md) for the storage model.
+
 ## Development tests
 
 Run `make test` inside `nix develop` for the host-supported Rust suites and netd
@@ -58,6 +102,11 @@ Build the CLI locally:
 nix develop
 make build
 ```
+
+The Linux development shell includes `pkg-config` and `virglrenderer` for
+compile-checking libkrun's optional GPU code. Compilation does not require a
+physical GPU; accelerated GPU runtime verification requires a suitable device
+and driver. This does not enable GPU live snapshots.
 
 On Apple Silicon macOS, this also downloads and verifies the prebuilt Rosetta
 probe, so no Linux builder is needed for normal development. Use
@@ -152,7 +201,8 @@ Inspect and manage machines:
 
 ```bash
 silo ls
-silo status dev
+silo info dev
+silo system info
 silo stop dev
 silo rm dev
 ```

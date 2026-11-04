@@ -15,6 +15,8 @@ CARGO_TARGET_DIR ?= $(CURDIR)/target
 EXAMPLE ?= basic
 ##? SMOKE_ARGS=...: Extra pytest arguments for make smoke.
 SMOKE_ARGS ?=
+##? CHANGESET_ARGS=...: Extra arguments for explicit OCI fixture/acquisition/qualification commands.
+CHANGESET_ARGS ?=
 ##? BASELINE=path: Select the coverage regression baseline (default: target/coverage-baseline).
 BASELINE ?= $(CARGO_TARGET_DIR)/coverage-baseline
 override CARGO_TARGET_DIR := $(abspath $(CARGO_TARGET_DIR))
@@ -132,7 +134,7 @@ help: ## Show public targets and configurable options.
 build: ## Build the complete adjacent runtime, CLI, daemon, native taild and Go bridge.
 	$(XTASK) build --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
-stage: ## Build and assemble the portable runtime stage.
+stage: ## Build and assemble the portable runtime stage, without desktop or SDK builds.
 	$(XTASK) stage --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
 go-sdk-example: ## Build the runtime and Go bridge, then run EXAMPLE (default: basic).
@@ -203,6 +205,25 @@ smoke: ## Run the real-VM smoke test suite against the staged PROFILE runtime (n
 
 version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check
+
+.PHONY: changeset-fixtures changeset-extractor changeset-acquire changeset-socket changeset-metadata qualify-changesets
+changeset-fixtures: ## Generate independent full-byte OCI changeset fixture goldens (offline Rust).
+	$(XTASK) changeset-fixtures $(CHANGESET_ARGS)
+
+changeset-extractor: ## Build the pinned test-only containerd v2.4.2 extractor (Go >=1.26.6).
+	$(XTASK) changeset-extractor $(CHANGESET_ARGS)
+
+changeset-acquire: ## Acquire one verified published corpus image (explicit --image NAME, network).
+	$(XTASK) changeset-acquire $(CHANGESET_ARGS)
+
+changeset-socket: ## Build pinned test-only star and generate/extract a real Unix socket specimen.
+	$(XTASK) changeset-socket $(CHANGESET_ARGS)
+
+changeset-metadata: ## Capture real GNU tar/libarchive/star xattr producer-original and extraction evidence.
+	$(XTASK) changeset-metadata $(CHANGESET_ARGS)
+
+qualify-changesets: ## Compare against real containerd extraction, retaining JSON and Markdown differences.
+	$(XTASK) qualify-changesets $(CHANGESET_ARGS)
 
 # Internal targets
 .PHONY: cli silo-vmm netd agent portd init initramfs rprobe go-ffi taild kernel

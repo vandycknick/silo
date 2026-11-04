@@ -57,6 +57,10 @@ let
       pkgs.grpcurl
       pkgs.uv
       pkgs.openssl
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.pkg-config
+      pkgs.virglrenderer
     ];
   workspaceHook = ''
     workspace_root="$(pwd -P)"

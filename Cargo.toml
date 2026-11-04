@@ -21,6 +21,7 @@ members = [
     "specs/agent-spec",
     "specs/forward-spec",
     "specs/protocol",
+    "specs/rootfs-spec",
     "specs/silod-spec",
     "specs/vm-spec",
 ]
@@ -34,10 +35,13 @@ zeroize = "1.9.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 thiserror = "2.0.19"
 tempfile = "3.27.0"
-libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "11dbc7863a6ca6176939d48147e67f03d34eeda0", default-features = false, features = ["blk", "net"] }
+libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "58253c00580bda34f5ea9fc4e0fccaf1e09a83d4", default-features = false, features = ["blk", "net"] }
 
 [profile.dev.package.sha2]
 opt-level = 3
 
 [patch.crates-io]
 signal-hook-registry = { path = "vendor/signal-hook-registry" }
+
+[patch."https://github.com/vandycknick/libkrun.git"]
+libkrun = { path = "/home/nickvd/Projects/worktrees/libkrun/silo-production/src/libkrun" }

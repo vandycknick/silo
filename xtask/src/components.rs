@@ -57,13 +57,17 @@ pub enum ComponentError {
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    build_runtime(context)?;
+    build_component(Component::Taild, context)
+}
+
+pub fn build_runtime(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     for component in [
         Component::Cli,
         Component::SiloVmm,
         Component::Netd,
         Component::Agent,
         Component::Init,
-        Component::Taild,
     ] {
         build_component(component, context)?;
     }
@@ -127,16 +131,19 @@ pub fn clippy(
     }
     command::run(cargo)?;
 
-    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
-    rprobe.args([
-        "clippy",
-        "--locked",
-        "-p",
-        "rprobe",
-        "--lib",
-        "--no-default-features",
-    ]);
-    command::run(rprobe)
+    for package in ["rprobe", "init"] {
+        let mut library = standard_cargo_command(workspace_root, target_dir);
+        library.args([
+            "clippy",
+            "--locked",
+            "-p",
+            package,
+            "--lib",
+            "--no-default-features",
+        ]);
+        command::run(library)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -209,7 +216,14 @@ fn run_tests(
     ))?;
 
     if !matches!(suite, TestSuite::Integration) {
-        command::run(rprobe_test_command(workspace_root, target_dir, ci))?;
+        for package in ["rprobe", "init"] {
+            command::run(guest_library_test_command(
+                workspace_root,
+                target_dir,
+                ci,
+                package,
+            ))?;
+        }
     }
     if !matches!(suite, TestSuite::Unit) {
         let mut go = Command::new("go");
@@ -259,9 +273,14 @@ fn workspace_test_command(
     cargo
 }
 
-fn rprobe_test_command(workspace_root: &Path, target_dir: &Path, ci: bool) -> Command {
+fn guest_library_test_command(
+    workspace_root: &Path,
+    target_dir: &Path,
+    ci: bool,
+    package: &str,
+) -> Command {
     let mut cargo = nextest_command(workspace_root, target_dir, ci);
-    cargo.args(["-p", "rprobe", "--lib", "--no-default-features"]);
+    cargo.args(["-p", package, "--lib", "--no-default-features"]);
     cargo
 }
 
@@ -541,7 +560,7 @@ pub(crate) fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -
 #[cfg(test)]
 mod tests {
     use crate::components::{
-        build_rprobe, rprobe_cargo_command, rprobe_test_command, workspace_test_command,
+        build_rprobe, guest_library_test_command, rprobe_cargo_command, workspace_test_command,
         BuildContext, ComponentError, TestSuite,
     };
     use crate::profiles::Profile;
@@ -648,16 +667,22 @@ mod tests {
     }
 
     #[test]
-    fn nextest_ci_profile_applies_to_workspace_and_rprobe() {
+    fn nextest_ci_profile_applies_to_workspace_and_guest_libraries() {
         for ci in [false, true] {
-            let rprobe = rprobe_test_command(Path::new("."), Path::new("target"), ci);
-            let args: Vec<_> = rprobe.get_args().map(|arg| arg.to_str().unwrap()).collect();
-            let mut expected = vec!["nextest", "run", "--locked"];
-            if ci {
-                expected.extend(["--profile", "ci"]);
+            for package in ["rprobe", "init"] {
+                let library =
+                    guest_library_test_command(Path::new("."), Path::new("target"), ci, package);
+                let args: Vec<_> = library
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                let mut expected = vec!["nextest", "run", "--locked"];
+                if ci {
+                    expected.extend(["--profile", "ci"]);
+                }
+                expected.extend(["-p", package, "--lib", "--no-default-features"]);
+                assert_eq!(args, expected);
             }
-            expected.extend(["-p", "rprobe", "--lib", "--no-default-features"]);
-            assert_eq!(args, expected);
 
             for suite in [TestSuite::Unit, TestSuite::Integration, TestSuite::All] {
                 let command = workspace_test_command(
