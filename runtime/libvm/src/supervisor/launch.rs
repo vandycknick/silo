@@ -886,7 +886,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("selected-monitor");
         let replacement = temp.path().join("replacement-monitor");
-        std::fs::copy("/bin/sh", &executable).unwrap();
+        // Parallel test forks must never inherit a writable executable handle.
+        // Keep staging writes in a separate process and wait for it to exit.
+        for (source, destination) in [("/bin/sh", &executable), ("/bin/false", &replacement)] {
+            assert!(Command::new("cp")
+                .arg(source)
+                .arg(destination)
+                .status()
+                .unwrap()
+                .success());
+        }
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let retained = std::fs::File::open(&executable).unwrap();
         let flags = nix::fcntl::fcntl(retained.as_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
@@ -896,7 +905,6 @@ mod tests {
         let mut magic = [0; 4];
         std::os::unix::fs::FileExt::read_exact_at(&retained, &mut magic, 0).unwrap();
         assert_eq!(&magic, b"\x7fELF");
-        std::fs::copy("/bin/false", &replacement).unwrap();
         std::fs::rename(&replacement, &executable).unwrap();
 
         let mut command =

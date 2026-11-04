@@ -417,18 +417,34 @@ pub struct MachineMetrics {
 /// Host memory reclaim state as last reported by the VM backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineHostMemoryReclaim {
-    /// Whether the runtime asked the backend to release guest RAM to the host.
+    pub backing: MachineHostMemoryReclaimBacking,
+    /// Structural inhibition, not an explanation of every ineffective state.
+    pub reason: MachineHostMemoryReclaimReason,
+    /// Finalized runtime policy, false for structurally inhibited mappings.
     pub requested: bool,
-    /// Outcome of the backend's per-VM qualification probe.
+    /// Outcome of the host-specific per-VM probe; Linux does not run one.
     pub qualification: MachineHostMemoryReclaimQualification,
-    /// True only while free-page reports are actually released to the host.
+    /// Actual permission to release reported free pages, not measured savings.
     pub effective: bool,
+    /// Successfully advised bytes, including repeats, not physical memory saved.
     pub released_bytes: u64,
     pub released_extents: u64,
     pub retried_faults: u64,
+    /// Skipped operations, not a universal count of queue heads or pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
     pub observed_at: SystemTime,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineHostMemoryReclaimBacking {
+    Boot,
+    RestoredPrivate,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineHostMemoryReclaimReason {
+    None,
+    TrackedCapture,
+    RestoredPrivateMapping,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineHostMemoryReclaimQualification {
@@ -1509,6 +1525,37 @@ impl TryFrom<v1::HostMetrics> for MachineMetrics {
 impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
     type Error = String;
     fn try_from(value: v1::HostMemoryReclaim) -> Result<Self, Self::Error> {
+        let backing = match required_text(
+            value.backing,
+            "host_memory_reclaim.backing",
+            protocol::MAX_INFO_BYTES,
+        )?
+        .as_str()
+        {
+            "boot" => MachineHostMemoryReclaimBacking::Boot,
+            "restored-private" => MachineHostMemoryReclaimBacking::RestoredPrivate,
+            other => {
+                return Err(format!(
+                    "silo-vmm response has unknown host_memory_reclaim.backing {other:?}"
+                ))
+            }
+        };
+        let reason = match required_text(
+            value.reason,
+            "host_memory_reclaim.reason",
+            protocol::MAX_INFO_BYTES,
+        )?
+        .as_str()
+        {
+            "none" => MachineHostMemoryReclaimReason::None,
+            "tracked-capture" => MachineHostMemoryReclaimReason::TrackedCapture,
+            "restored-private-mapping" => MachineHostMemoryReclaimReason::RestoredPrivateMapping,
+            other => {
+                return Err(format!(
+                    "silo-vmm response has unknown host_memory_reclaim.reason {other:?}"
+                ))
+            }
+        };
         let qualification = match required_text(
             value.qualification,
             "host_memory_reclaim.qualification",
@@ -1526,12 +1573,47 @@ impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
                 ))
             }
         };
+        let requested = required(value.requested, "host_memory_reclaim.requested")?;
+        let effective = required(value.effective, "host_memory_reclaim.effective")?;
+        let released_bytes = value.released_bytes.unwrap_or_default();
+        let released_extents = value.released_extents.unwrap_or_default();
+        let backing_matches_reason = matches!(
+            (backing, reason),
+            (
+                MachineHostMemoryReclaimBacking::Boot,
+                MachineHostMemoryReclaimReason::None
+            ) | (
+                MachineHostMemoryReclaimBacking::Boot,
+                MachineHostMemoryReclaimReason::TrackedCapture
+            ) | (
+                MachineHostMemoryReclaimBacking::RestoredPrivate,
+                MachineHostMemoryReclaimReason::RestoredPrivateMapping
+            )
+        );
+        if !backing_matches_reason {
+            return Err(
+                "silo-vmm response has contradictory host_memory_reclaim backing/reason".into(),
+            );
+        }
+        if reason != MachineHostMemoryReclaimReason::None
+            && (requested
+                || effective
+                || qualification != MachineHostMemoryReclaimQualification::NotRun
+                || released_bytes != 0
+                || released_extents != 0)
+        {
+            return Err(
+                "silo-vmm response has contradictory inhibited host_memory_reclaim state".into(),
+            );
+        }
         Ok(Self {
-            requested: required(value.requested, "host_memory_reclaim.requested")?,
+            backing,
+            reason,
+            requested,
             qualification,
-            effective: required(value.effective, "host_memory_reclaim.effective")?,
-            released_bytes: value.released_bytes.unwrap_or_default(),
-            released_extents: value.released_extents.unwrap_or_default(),
+            effective,
+            released_bytes,
+            released_extents,
             retried_faults: value.retried_faults.unwrap_or_default(),
             skipped_reports: value.skipped_reports.unwrap_or_default(),
             failed_operations: value.failed_operations.unwrap_or_default(),
@@ -2167,6 +2249,105 @@ mod tests {
         })
         .is_err());
     }
+
+    fn host_reclaim_report() -> v1::HostMemoryReclaim {
+        v1::HostMemoryReclaim {
+            backing: Some("restored-private".into()),
+            reason: Some("restored-private-mapping".into()),
+            requested: Some(false),
+            qualification: Some("not-run".into()),
+            effective: Some(false),
+            released_bytes: Some(0),
+            released_extents: Some(0),
+            retried_faults: Some(0),
+            skipped_reports: Some(3),
+            failed_operations: Some(0),
+            observed_at: Some(timestamp()),
+        }
+    }
+
+    #[test]
+    fn host_reclaim_rejects_missing_and_unknown_policy_fields() {
+        for field in ["backing", "reason", "qualification"] {
+            for invalid in [None, Some(""), Some("unknown"), Some("Boot")] {
+                let mut report = host_reclaim_report();
+                let target = match field {
+                    "backing" => &mut report.backing,
+                    "reason" => &mut report.reason,
+                    "qualification" => &mut report.qualification,
+                    _ => unreachable!(),
+                };
+                *target = invalid.map(str::to_owned);
+                let error = MachineHostMemoryReclaim::try_from(report).expect_err(field);
+                assert!(error.contains(field), "{field}: {error}");
+            }
+        }
+        for field in ["requested", "effective", "observed_at"] {
+            let mut report = host_reclaim_report();
+            match field {
+                "requested" => report.requested = None,
+                "effective" => report.effective = None,
+                "observed_at" => report.observed_at = None,
+                _ => unreachable!(),
+            }
+            let error = MachineHostMemoryReclaim::try_from(report).expect_err(field);
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn host_reclaim_rejects_inhibited_policy_and_advice_contradictions() {
+        for (backing, reason) in [
+            ("restored-private", "restored-private-mapping"),
+            ("boot", "tracked-capture"),
+        ] {
+            let mut valid = host_reclaim_report();
+            valid.backing = Some(backing.into());
+            valid.reason = Some(reason.into());
+            assert!(MachineHostMemoryReclaim::try_from(valid.clone()).is_ok());
+            for field in [
+                "requested",
+                "effective",
+                "qualification",
+                "released_bytes",
+                "released_extents",
+            ] {
+                let mut contradictory = valid.clone();
+                match field {
+                    "requested" => contradictory.requested = Some(true),
+                    "effective" => contradictory.effective = Some(true),
+                    "qualification" => contradictory.qualification = Some("passed".into()),
+                    "released_bytes" => contradictory.released_bytes = Some(4096),
+                    "released_extents" => contradictory.released_extents = Some(1),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    MachineHostMemoryReclaim::try_from(contradictory).is_err(),
+                    "{backing}/{reason}: {field}"
+                );
+            }
+        }
+        for (backing, reason) in [
+            ("restored-private", "none"),
+            ("restored-private", "tracked-capture"),
+            ("boot", "restored-private-mapping"),
+        ] {
+            let mut report = host_reclaim_report();
+            report.backing = Some(backing.into());
+            report.reason = Some(reason.into());
+            assert!(MachineHostMemoryReclaim::try_from(report).is_err());
+        }
+
+        // Linux does not run the HVF probe. NotRun must not imply ineffective.
+        let mut ordinary = host_reclaim_report();
+        ordinary.backing = Some("boot".into());
+        ordinary.reason = Some("none".into());
+        ordinary.requested = Some(true);
+        ordinary.effective = Some(true);
+        ordinary.released_bytes = Some(8192);
+        ordinary.released_extents = Some(2);
+        assert!(MachineHostMemoryReclaim::try_from(ordinary).is_ok());
+    }
     #[test]
     fn status_conversion_preserves_nested_agent_observation() {
         let converted = MachineMonitorStatus::try_from(status()).expect("valid status");
@@ -2262,6 +2443,8 @@ mod tests {
             name: Some("machine".to_string()),
             actual_backend: Some("krun".to_string()),
             host_memory_reclaim: Some(v1::HostMemoryReclaim {
+                backing: Some("boot".to_string()),
+                reason: Some("none".to_string()),
                 requested: Some(true),
                 qualification: Some("passed".to_string()),
                 effective: Some(true),

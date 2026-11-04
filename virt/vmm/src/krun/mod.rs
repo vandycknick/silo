@@ -20,6 +20,7 @@ pub(crate) use crate::krun::host::check_host;
 #[cfg(target_os = "macos")]
 pub(crate) use crate::krun::host::{check_host, HvfHostError, HvfHostInfo};
 pub(crate) use crate::krun::rosetta::{RosettaLaunchConfig, RosettaProfileId};
-#[cfg(target_os = "macos")]
-pub(crate) use crate::krun::status::HostMemoryReclaimQualification;
-pub(crate) use crate::krun::status::HostMemoryReclaimStatus;
+pub(crate) use crate::krun::status::{
+    HostMemoryReclaimBacking, HostMemoryReclaimQualification, HostMemoryReclaimReason,
+    HostMemoryReclaimStatus,
+};

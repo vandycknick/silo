@@ -237,6 +237,8 @@ fn system_wire(s: &SystemStatus) -> eyre::Result<w::SystemStatus> {
         host_memory_reclaim_qualification: s.host_memory_reclaim_qualification.clone(),
         host_memory_reclaim_released_bytes: s.host_memory_reclaim_released_bytes,
         host_memory_reclaim_failed_operations: s.host_memory_reclaim_failed_operations,
+        host_memory_reclaim_backing: s.host_memory_reclaim_backing.clone(),
+        host_memory_reclaim_reason: s.host_memory_reclaim_reason.clone(),
     })
 }
 

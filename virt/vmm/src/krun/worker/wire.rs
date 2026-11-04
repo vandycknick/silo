@@ -391,11 +391,46 @@ mod tests {
     }
 
     #[test]
-    fn event_framing_rejects_oversize_and_unknown_fields() {
+    fn event_framing_rejects_oversize_unknown_fields_and_invalid_reclaim_status() {
         assert!(frame_length(u32::MAX.to_be_bytes(), MAX_EVENT).is_err());
         assert!(frame_length([0; 4], MAX_EVENT).is_err());
         assert!(encode(&"large", 2).is_err());
         assert!(decode::<Event>(br#"{"event":"backend_started","unknown":1}"#).is_err());
+
+        let report = serde_json::json!({
+            "event": "host_memory_reclaim",
+            "status": {
+                "backing": "restored-private",
+                "reason": "restored-private-mapping",
+                "requested": false,
+                "qualification": "not_run",
+                "effective": false,
+                "released_bytes": 0,
+                "released_extents": 0,
+                "retried_faults": 0,
+                "skipped_reports": 1,
+                "failed_operations": 0
+            }
+        });
+        decode::<Event>(&serde_json::to_vec(&report).expect("JSON"))
+            .expect("complete inhibited report");
+        for field in ["backing", "reason"] {
+            let mut missing = report.clone();
+            missing["status"]
+                .as_object_mut()
+                .expect("status object")
+                .remove(field);
+            assert!(decode::<Event>(&serde_json::to_vec(&missing).expect("JSON")).is_err());
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!("unknown"),
+                serde_json::json!(false),
+            ] {
+                let mut malformed = report.clone();
+                malformed["status"][field] = invalid;
+                assert!(decode::<Event>(&serde_json::to_vec(&malformed).expect("JSON")).is_err());
+            }
+        }
     }
 
     #[test]

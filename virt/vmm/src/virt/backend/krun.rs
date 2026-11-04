@@ -480,6 +480,8 @@ fn host_memory_reclaim_report(
     status: crate::krun::HostMemoryReclaimStatus,
 ) -> HostMemoryReclaimReport {
     HostMemoryReclaimReport {
+        backing: status.backing.as_str(),
+        reason: status.reason.as_str(),
         requested: status.requested,
         qualification: status.qualification.as_str(),
         effective: status.effective,

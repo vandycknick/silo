@@ -65,9 +65,20 @@ def durable(silo: Silo, name: str, path: str) -> None:
 
 
 def assert_guest_copy(silo: Silo, name: str, *, absent: str) -> None:
-    assert silo.exec(name, "cat", "/stopped-common", user="root").stdout == "committed\n"
-    silo.exec(name, "test", "!", "-e", absent, user="root")
-    assert silo.exec(name, "stat", "-c", "%i %h", "/stopped-hard-a", "/stopped-hard-b", user="root").stdout.splitlines()[0] == silo.exec(name, "stat", "-c", "%i %h", "/stopped-hard-b", user="root").stdout.strip()
+    # Keep the same reads and absence check, but pay for one CLI/agent session.
+    # The marker preserves the exact cat bytes, including its final newline.
+    observed = silo.exec(name, "sh", "-eu", "-c", """
+cat /stopped-common
+printf '%s\\n' SILO_STOPPED_COMMON_END
+test ! -e "$1"
+stat -c '%i %h' /stopped-hard-a /stopped-hard-b
+stat -c '%i %h' /stopped-hard-b
+""", "stopped-copy", absent, user="root").stdout
+    common, links = observed.split("SILO_STOPPED_COMMON_END\n", 1)
+    assert common == "committed\n"
+    identities = links.splitlines()
+    assert len(identities) == 3, identities
+    assert identities[0] == identities[2].strip()
 
 
 @pytest.mark.parametrize("profile", ["raw", "flat"])
@@ -77,8 +88,13 @@ def test_stopped_two_child_fork_independent_replay(stopped_silo: Silo, stopped_i
     source, first, second = "fork-source", "fork-first", "fork-second"
     create(silo, stopped_image, source, profile)
     original_run = boot(silo, source)["run_id"]
-    durable(silo, source, "/stopped-common")
-    silo.exec(source, "sh", "-eu", "-c", "printf hardlink >/stopped-hard-a; ln /stopped-hard-a /stopped-hard-b; printf 'stopped-guest-identity\\n' >/etc/machine-id; sync", user="root")
+    silo.exec(source, "sh", "-eu", "-c", """
+"$1" durable /stopped-common
+printf hardlink >/stopped-hard-a
+ln /stopped-hard-a /stopped-hard-b
+printf 'stopped-guest-identity\\n' >/etc/machine-id
+sync
+""", "stopped-source", overlay.PROBE, user="root")
     lower = overlay.records(overlay.machine_dir(silo, source) / "lower.vmdk")[0].path if profile == "flat" else None
     lower_before = overlay.digest(lower) if lower is not None else None
     if dirty:
@@ -288,8 +304,14 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     first_after = None
     for child in ("snapshot-first", "snapshot-second", "boot-pinned-fork"):
         boot(silo, child)
-        assert silo.exec(child, "cat", "/stopped-common", user="root").stdout == "committed\n"
-        assert "silo.capture_config=exact" in silo.exec(child, "cat", "/proc/cmdline", user="root").stdout
+        observed = silo.exec(child, "sh", "-eu", "-c", """
+cat /stopped-common
+printf '%s\\n' SILO_STOPPED_COMMON_END
+cat /proc/cmdline
+""", user="root").stdout
+        common, cmdline = observed.split("SILO_STOPPED_COMMON_END\n", 1)
+        assert common == "committed\n"
+        assert "silo.capture_config=exact" in cmdline
         # The real worker must own the destination Data inode, never a path
         # retained from the deleted source's VmSpec.
         disk = stopped.writable_paths(silo, child)["data:1"]

@@ -18,8 +18,9 @@ use std::time::Duration;
 use crate::daemon::status::StatusPublisher;
 use eyre::{bail, Context as _};
 use libvm::{
-    MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification, MachineMemoryReclaimReport,
-    MachineReadinessOutcome, MachineStatus,
+    MachineHostMemoryReclaim, MachineHostMemoryReclaimBacking,
+    MachineHostMemoryReclaimQualification, MachineHostMemoryReclaimReason,
+    MachineMemoryReclaimReport, MachineReadinessOutcome, MachineStatus,
 };
 use nix::fcntl::{Flock, FlockArg};
 use silod_spec::status::{MemoryReclaimOutcome, SystemPhase, SystemStatus};
@@ -127,6 +128,8 @@ pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<SystemStatus>
         host_memory_reclaim_qualification: None,
         host_memory_reclaim_released_bytes: None,
         host_memory_reclaim_failed_operations: None,
+        host_memory_reclaim_backing: None,
+        host_memory_reclaim_reason: None,
     })
 }
 
@@ -706,17 +709,32 @@ fn apply_host_memory_reclaim(
     let Some(report) = report else {
         return false;
     };
+    let backing = match report.backing {
+        MachineHostMemoryReclaimBacking::Boot => "boot",
+        MachineHostMemoryReclaimBacking::RestoredPrivate => "restored-private",
+    };
+    let reason = match report.reason {
+        MachineHostMemoryReclaimReason::None => "none",
+        MachineHostMemoryReclaimReason::TrackedCapture => "tracked-capture",
+        MachineHostMemoryReclaimReason::RestoredPrivateMapping => "restored-private-mapping",
+    };
     let qualification = match report.qualification {
         MachineHostMemoryReclaimQualification::NotRun => "not-run",
         MachineHostMemoryReclaimQualification::Passed => "passed",
         MachineHostMemoryReclaimQualification::Failed => "failed",
         MachineHostMemoryReclaimQualification::Inconclusive => "inconclusive",
     };
-    let changed = status.host_memory_reclaim_effective != Some(report.effective)
+    let changed = status.host_memory_reclaim_requested != report.requested
+        || status.host_memory_reclaim_backing.as_deref() != Some(backing)
+        || status.host_memory_reclaim_reason.as_deref() != Some(reason)
+        || status.host_memory_reclaim_effective != Some(report.effective)
         || status.host_memory_reclaim_qualification.as_deref() != Some(qualification)
         || status.host_memory_reclaim_released_bytes != Some(report.released_bytes)
         || status.host_memory_reclaim_failed_operations != Some(report.failed_operations);
     if changed {
+        status.host_memory_reclaim_requested = report.requested;
+        status.host_memory_reclaim_backing = Some(backing.to_string());
+        status.host_memory_reclaim_reason = Some(reason.to_string());
         status.host_memory_reclaim_effective = Some(report.effective);
         status.host_memory_reclaim_qualification = Some(qualification.to_string());
         status.host_memory_reclaim_released_bytes = Some(report.released_bytes);

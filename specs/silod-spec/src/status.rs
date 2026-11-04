@@ -135,7 +135,7 @@ pub struct SystemStatus {
     /// Reclaim runs the agent has completed since it started.
     #[serde(default)]
     pub memory_reclaim_runs: Option<u64>,
-    /// Whether the runtime requested per-VM host memory reclaim qualification.
+    /// Finalized runtime policy once observed; backend intent before the first report.
     #[serde(default)]
     pub host_memory_reclaim_requested: bool,
     /// Effective state as last reported by the VM backend. `None` until it reports.
@@ -144,7 +144,11 @@ pub struct SystemStatus {
     /// Outcome of the backend's qualification probe, when reported.
     #[serde(default)]
     pub host_memory_reclaim_qualification: Option<String>,
-    /// Bytes the backend released to the host during this VM run, when reported.
+    /// Actual RAM backing, absent until the backend reports.
+    pub host_memory_reclaim_backing: Option<String>,
+    /// Structural inhibition reason, absent until the backend reports.
+    pub host_memory_reclaim_reason: Option<String>,
+    /// Successfully advised bytes including repeats, not physical memory saved.
     #[serde(default)]
     pub host_memory_reclaim_released_bytes: Option<u64>,
     /// Release cycles that failed during this VM run, when reported.
@@ -182,6 +186,8 @@ struct RawSystemStatus {
     host_memory_reclaim_qualification: Option<String>,
     host_memory_reclaim_released_bytes: Option<u64>,
     host_memory_reclaim_failed_operations: Option<u64>,
+    host_memory_reclaim_backing: Option<String>,
+    host_memory_reclaim_reason: Option<String>,
 }
 
 impl TryFrom<RawSystemStatus> for SystemStatus {
@@ -215,6 +221,8 @@ impl TryFrom<RawSystemStatus> for SystemStatus {
             host_memory_reclaim_qualification: raw.host_memory_reclaim_qualification,
             host_memory_reclaim_released_bytes: raw.host_memory_reclaim_released_bytes,
             host_memory_reclaim_failed_operations: raw.host_memory_reclaim_failed_operations,
+            host_memory_reclaim_backing: raw.host_memory_reclaim_backing,
+            host_memory_reclaim_reason: raw.host_memory_reclaim_reason,
         };
         status.validate()?;
         Ok(status)
