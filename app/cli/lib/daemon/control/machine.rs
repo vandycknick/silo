@@ -20,6 +20,100 @@ impl w::machine_service_server::MachineService for Service {
     type ListMachinesStream = Stream<w::MachineInventoryEntry>;
     type CreateMachineStream = Stream<w::CreateMachineEvent>;
     type ReadLogsStream = Stream<w::LogChunk>;
+    async fn pause_machine(
+        &self,
+        r: Request<w::LiveMachineRequest>,
+    ) -> Result<Response<()>, Status> {
+        let reference = reference(r.into_inner().machine)?;
+        self.require_machine_live(&reference, vm_spec::live::LiveOperation::Pause)
+            .await?;
+        Ok(Response::new(()))
+    }
+
+    async fn capture_execution(
+        &self,
+        r: Request<w::LiveCaptureRequest>,
+    ) -> Result<Response<()>, Status> {
+        let reference = reference(r.into_inner().machine)?;
+        self.require_machine_live(&reference, vm_spec::live::LiveOperation::Capture)
+            .await?;
+        Ok(Response::new(()))
+    }
+
+    async fn fork_execution(&self, r: Request<w::LiveForkRequest>) -> Result<Response<()>, Status> {
+        let reference = reference(r.into_inner().machine)?;
+        self.require_machine_live(&reference, vm_spec::live::LiveOperation::Fork)
+            .await?;
+        Ok(Response::new(()))
+    }
+
+    async fn fork_stopped(
+        &self,
+        r: Request<w::StoppedForkRequest>,
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let value = r.get_ref().clone();
+        let reference = reference(value.machine)?;
+        let options = libvm::ForkOptions {
+            name: silo_vm_control::stopped::name(value.name).map_err(conversion)?,
+            external_resources: silo_vm_control::stopped::policy_from_wire(required(
+                value.external_resources,
+            )?)
+            .map_err(conversion)?,
+        };
+        libvm::preflight_stopped(&self.config, &reference, false, &options.external_resources)
+            .await
+            .map_err(native)?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let child = state
+                    .machine(&reference)
+                    .await?
+                    .fork_stopped(options)
+                    .await
+                    .map_err(native)?;
+                snapshot(&child.inspect().await.map_err(native)?)
+            })
+            .await?;
+        Ok(Response::new(result))
+    }
+
+    async fn snapshot_stopped(
+        &self,
+        r: Request<w::CreateStorageSnapshotRequest>,
+    ) -> Result<Response<w::StorageSnapshotInfo>, Status> {
+        let value = r.get_ref().clone();
+        let reference = reference(value.machine)?;
+        let options = libvm::SnapshotOptions {
+            name: value
+                .name
+                .map(|name| silo_vm_control::stopped::alias(&name))
+                .transpose()
+                .map_err(conversion)?,
+            external_resources: silo_vm_control::stopped::policy_from_wire(required(
+                value.external_resources,
+            )?)
+            .map_err(conversion)?,
+        };
+        silo_vm_control::stopped::snapshot_policy(&options.external_resources)
+            .map_err(conversion)?;
+        libvm::preflight_stopped(&self.config, &reference, true, &options.external_resources)
+            .await
+            .map_err(native)?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let info = state
+                    .machine(&reference)
+                    .await?
+                    .snapshot_stopped(options)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::stopped::info_to_wire(&info).map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(result))
+    }
     async fn list_machines(
         &self,
         _: Request<()>,

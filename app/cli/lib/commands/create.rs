@@ -49,6 +49,25 @@ impl Pull {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RootProfileArg {
+    #[default]
+    OpaqueRaw,
+    LinuxFlatOverlayV1,
+}
+
+impl RootProfileArg {
+    pub(crate) fn native(self) -> libvm::RootProfile {
+        match self {
+            Self::OpaqueRaw => libvm::RootProfile::OpaqueRaw,
+            Self::LinuxFlatOverlayV1 => libvm::RootProfile::LinuxFlatOverlayV1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args, Default)]
 pub(crate) struct VmOverrideArgs {
     /// Number of virtual CPUs.
@@ -66,9 +85,15 @@ pub(crate) struct VmOverrideArgs {
     /// Append an argument to the Linux kernel command line. May be repeated.
     #[arg(long = "kernel-arg", value_name = "ARG")]
     pub(crate) kernel_args: Vec<String>,
-    /// Resize the image-backed root disk, for example 10gb or 512mb.
+    /// Root disk size, or private upper backing capacity for flat overlay.
     #[arg(long = "disk-size", value_name = "SIZE")]
     pub(crate) disk_size: Option<String>,
+    /// Root storage profile. Flat overlay is development-only and cannot be published.
+    #[arg(long, value_enum)]
+    pub(crate) root_profile: Option<RootProfileArg>,
+    /// Explicit memory-charged, nonpersistent /tmp tmpfs capacity.
+    #[arg(long, value_name = "SIZE")]
+    pub(crate) tmpfs_size: Option<String>,
     /// Enable nested virtualization for supported VZ guests.
     #[arg(long)]
     pub(crate) nested_virtualization: bool,
@@ -165,6 +190,8 @@ impl VmOverrideArgs {
             overrides: MachineOverrides {
                 resources,
                 disk_size: self.disk_size.clone(),
+                root_profile: self.root_profile,
+                tmpfs_size: self.tmpfs_size.clone(),
                 userdata,
                 mounts: self.mounts.clone(),
                 forwards: (!self.forwards.is_empty()).then(|| self.forwards.clone()),
@@ -464,6 +491,8 @@ fn empty_template() -> Template {
         image: None,
         resources: None,
         disk_size: None,
+        root_profile: None,
+        tmpfs_size: None,
         userdata: None,
         mounts: Vec::new(),
         forwards: Vec::new(),
@@ -480,6 +509,20 @@ pub(crate) fn preflight_create(
     policy_config_dir: Option<&Path>,
 ) -> eyre::Result<()> {
     validate_machine_cli_options(options)?;
+    let root_profile = options.overrides.root_profile.or(template.root_profile);
+    crate::template::validate_root_options(
+        root_profile,
+        options
+            .overrides
+            .tmpfs_size
+            .as_deref()
+            .or(template.tmpfs_size.as_deref()),
+    )?;
+    if root_profile == Some(RootProfileArg::LinuxFlatOverlayV1)
+        && selected_image_reference(positional_image, template)?.starts_with("disk:")
+    {
+        eyre::bail!("linux-flat-overlay-v1 requires an OCI image, not disk: input");
+    }
     for (label, path) in [
         ("custom guest agent", options.agent.as_ref()),
         ("kernel", options.kernel.as_ref()),
@@ -727,6 +770,75 @@ mod tests {
         canonical_disk_source, empty_template, preflight_create, validate_process_overrides, Pull,
         VmOverrideArgs,
     };
+
+    #[test]
+    fn overlay_create_and_run_flags_are_explicit() {
+        let cli = Cli::try_parse_from([
+            "silo",
+            "create",
+            "ubuntu:24.04",
+            "--root-profile",
+            "linux-flat-overlay-v1",
+            "--tmpfs-size",
+            "8mib",
+        ])
+        .expect("overlay flags");
+        let Command::Create(create) = cli.command else {
+            panic!("expected create")
+        };
+        assert_eq!(
+            create.overrides.root_profile,
+            Some(crate::commands::create::RootProfileArg::LinuxFlatOverlayV1)
+        );
+        assert_eq!(create.overrides.tmpfs_size.as_deref(), Some("8mib"));
+        Cli::try_parse_from([
+            "silo",
+            "run",
+            "ubuntu:24.04",
+            "--root-profile",
+            "linux-flat-overlay-v1",
+            "--",
+            "true",
+        ])
+        .expect("run shares opt-in");
+        assert!(
+            Cli::try_parse_from(["silo", "create", "ubuntu", "--root-profile", "auto"]).is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_overlay_selection_fails_before_image_resolution() {
+        let options = VmOverrideArgs {
+            tmpfs_size: Some("8mib".into()),
+            ..Default::default()
+        }
+        .resolve()
+        .expect("options");
+        assert!(preflight_create(
+            &empty_template(),
+            &options,
+            Some("registry.invalid/not-pulled"),
+            None
+        )
+        .expect_err("raw tmpfs")
+        .to_string()
+        .contains("requires root_profile"));
+        let options = VmOverrideArgs {
+            root_profile: Some(crate::commands::create::RootProfileArg::LinuxFlatOverlayV1),
+            ..Default::default()
+        }
+        .resolve()
+        .expect("options");
+        assert!(preflight_create(
+            &empty_template(),
+            &options,
+            Some("disk:/never-opened.raw"),
+            None
+        )
+        .expect_err("disk overlay")
+        .to_string()
+        .contains("requires an OCI image"));
+    }
 
     #[test]
     fn create_parses_the_final_image_first_form() {

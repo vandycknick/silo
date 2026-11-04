@@ -127,6 +127,32 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     if let Some(run) = &view.run_id {
         rows.push(("Run".into(), run.clone()));
     }
+    if let Some(outcome) = view.storage_stop_outcome {
+        let label = match outcome {
+            libvm::StorageStopOutcome::Clean => "clean",
+            libvm::StorageStopOutcome::Forced => "forced",
+            libvm::StorageStopOutcome::Unknown => "unknown",
+        };
+        rows.push(("Last storage stop".into(), label.into()));
+    }
+    if let Some(live) = &view.live {
+        crate::commands::system::append_live_rows(
+            &mut rows,
+            "Machine run",
+            live.backend,
+            live.lane,
+            &live.live,
+        );
+    }
+    if let Some(live) = &view.prospective_live {
+        crate::commands::system::append_live_rows(
+            &mut rows,
+            "Next-start prospective host",
+            live.backend,
+            live.lane,
+            &live.live,
+        );
+    }
     append_issues(&mut rows, &view.name, &view.issues);
     ui::print_detail_rows(&rows)
 }

@@ -13,7 +13,7 @@ import (
 )
 
 func validSnapshot() *w.MachineSnapshot {
-	return &w.MachineSnapshot{Id: "12345678-1234-1234-1234-123456789abc", Name: "dev", Spec: &w.VmSpec{}, Process: &w.ProcessConfig{}, Retention: w.Retention_RETENTION_PERSISTENT, Observation: w.Observation_OBSERVATION_OBSERVED, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Status: &w.MachineStatus{Status: &w.MachineStatus_Stopped{Stopped: &emptypb.Empty{}}}}
+	return &w.MachineSnapshot{LiveEvidence: new(w.LiveEvidenceState_LIVE_EVIDENCE_STATE_UNAVAILABLE), Id: "12345678-1234-1234-1234-123456789abc", Name: "dev", Spec: &w.VmSpec{}, Process: &w.ProcessConfig{}, Retention: w.Retention_RETENTION_PERSISTENT, Observation: w.Observation_OBSERVATION_OBSERVED, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Status: &w.MachineStatus{Status: &w.MachineStatus_Stopped{Stopped: &emptypb.Empty{}}}}
 }
 func TestSnapshotPresenceAndPurePolicy(t *testing.T) {
 	v := validSnapshot()
@@ -54,6 +54,10 @@ func TestInvalidSnapshotBoundaries(t *testing.T) {
 		name   string
 		change func(*w.MachineSnapshot)
 	}{
+		{"missing live evidence", func(v *w.MachineSnapshot) { v.LiveEvidence = nil }},
+		{"unknown live evidence", func(v *w.MachineSnapshot) { v.LiveEvidence = new(w.LiveEvidenceState(99)) }},
+		{"missing prospective report", func(v *w.MachineSnapshot) { v.LiveEvidence = new(w.LiveEvidenceState_LIVE_EVIDENCE_STATE_PROSPECTIVE) }},
+		{"missing run report", func(v *w.MachineSnapshot) { v.LiveEvidence = new(w.LiveEvidenceState_LIVE_EVIDENCE_STATE_RUN) }},
 		{"missing spec", func(v *w.MachineSnapshot) { v.Spec = nil }}, {"missing process", func(v *w.MachineSnapshot) { v.Process = nil }}, {"missing status", func(v *w.MachineSnapshot) { v.Status = nil }}, {"empty status", func(v *w.MachineSnapshot) { v.Status = &w.MachineStatus{} }}, {"empty network", func(v *w.MachineSnapshot) { v.Network = &w.ResolvedNetwork{} }}, {"unknown retention", func(v *w.MachineSnapshot) { v.Retention = 99 }}, {"absent retention", func(v *w.MachineSnapshot) { v.Retention = 0 }}, {"unknown observation", func(v *w.MachineSnapshot) { v.Observation = 99 }}, {"cpu overflow", func(v *w.MachineSnapshot) { n := uint32(256); v.Spec.Hardware = &w.Hardware{Cpus: &n} }}, {"bad timestamp", func(v *w.MachineSnapshot) { v.CreatedAt = &timestamppb.Timestamp{Nanos: 1000000000} }}, {"bad UUID", func(v *w.MachineSnapshot) { v.Id = "not-id" }}, {"unknown root source", func(v *w.MachineSnapshot) { v.Rootfs = &w.Rootfs{SourceKind: 99} }}, {"unknown issue", func(v *w.MachineSnapshot) { v.Issues = []*w.MachineIssue{{Component: 99}} }}, {"unknown agent", func(v *w.MachineSnapshot) { v.AgentMode = &w.Agent{} }}, {"unknown boot", func(v *w.MachineSnapshot) { v.BootReport = &w.BootReport{Mode: 99} }}, {"unknown provision", func(v *w.MachineSnapshot) { v.ProvisionReport = &w.ProvisionReport{Status: 99} }}, {"duration overflow", func(v *w.MachineSnapshot) {
 			v.ProvisionReport = &w.ProvisionReport{Duration: &durationpb.Duration{Seconds: math.MaxInt64 / int64(time.Second), Nanos: 999999999}}
 		}}, {"unknown live", func(v *w.MachineSnapshot) {

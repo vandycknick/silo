@@ -1268,6 +1268,7 @@ mod tests {
             "updated_at": chrono::Utc::now().to_rfc3339(),
             "last_error": null,
             "system": null,
+            "manager_live": null, "appliance_live": null,
             "tailscale": {
                 "enabled": false, "state": "disabled", "diagnostic": null,
                 "approval_url": null, "dns_name": null, "restart_count": 0,
@@ -1754,7 +1755,7 @@ mod tests {
             std::fs::write(
                 paths.status(),
                 format!(
-                    r#"{{"schema":2,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"process_start":"test","core":"{phase}","home":"/tmp","control_endpoint":"/tmp/control.sock","configuration_identity":"test","system":null,"tailscale":{{"enabled":false,"state":"disabled","diagnostic":null,"approval_url":null,"dns_name":null,"restart_count":0,"shutdown_protection":"unsupported"}},"updated_at":"{updated_at}","last_error":"boom"}}"#
+                    r#"{{"schema":2,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"process_start":"test","core":"{phase}","home":"/tmp","control_endpoint":"/tmp/control.sock","configuration_identity":"test","system":null,"manager_live":null,"appliance_live":null,"tailscale":{{"enabled":false,"state":"disabled","diagnostic":null,"approval_url":null,"dns_name":null,"restart_count":0,"shutdown_protection":"unsupported"}},"updated_at":"{updated_at}","last_error":"boom"}}"#
                 ),
             )
             .expect("status");

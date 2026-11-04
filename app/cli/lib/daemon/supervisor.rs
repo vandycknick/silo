@@ -109,6 +109,8 @@ pub(crate) fn initial_status(docker_socket: &Path) -> eyre::Result<SystemStatus>
         configured_image: None,
         memory_bytes: None,
         actual_backend: None,
+        live: None,
+        prospective_live: None,
         docker_socket: docker_socket.display().to_string(),
         updated_at: now(),
         last_error: None,
@@ -536,6 +538,21 @@ fn connected(runtime: &mut Option<SystemRuntime>) -> eyre::Result<&mut SystemRun
         .ok_or_else(|| eyre::eyre!("the libvm runtime is not connected"))
 }
 
+fn live_report_for_run(
+    report: Option<vm_spec::live::LiveMachineReport>,
+    machine_id: &str,
+    run_id: &str,
+) -> eyre::Result<vm_spec::live::LiveMachineReport> {
+    let report =
+        report.ok_or_else(|| eyre::eyre!("system monitor live observation unavailable"))?;
+    if !silo_vm_control::live::same_machine_identity(&report.machine_id, machine_id)
+        || report.run_id != run_id
+    {
+        bail!("system monitor live observation belongs to a different machine/run");
+    }
+    Ok(report)
+}
+
 /// One startup attempt: recover an interrupted upgrade, ensure the VM exists, boot or
 /// adopt it, and activate the engine.
 async fn attempt(
@@ -546,6 +563,15 @@ async fn attempt(
     status: &mut SystemStatus,
     publisher: &StatusPublisher,
 ) -> eyre::Result<Active> {
+    status.live = None;
+    status.prospective_live = None;
+    publish(publisher, status)?;
+    status.prospective_live = Some(
+        libvm::LiveCapabilityQuery::open(runtime_config)?
+            .host_report()
+            .await?,
+    );
+    publish(publisher, status)?;
     if runtime.is_none() {
         *runtime = Some(SystemRuntime::connect(runtime_config.clone()).await?);
     }
@@ -581,8 +607,11 @@ async fn attempt(
             machine.start_with_options(options).await?.run_id
         }
     };
-    status.run_id = Some(run_id.to_string());
-    status.actual_backend = machine.metrics().await?.actual_backend;
+    let run_id = run_id.to_string();
+    let live = live_report_for_run(machine.inspect().await?.live, &machine_data.id, &run_id)?;
+    status.run_id = Some(run_id);
+    status.actual_backend = Some(live.backend.to_string());
+    status.live = Some(live);
     status.phase = SystemPhase::WaitingGuest;
     publish(publisher, status)?;
     let readiness = machine.wait_ready(READY_TIMEOUT).await?;
@@ -870,6 +899,7 @@ mod tests {
             "docker_socket": "/tmp/silo.sock",
             "updated_at": "2026-09-14T00:00:00Z",
             "last_error": null,
+            "live": null, "prospective_live": null,
             "restart_count": 0
         }))
         .expect("status");
@@ -937,5 +967,116 @@ mod tests {
         drop(first);
         assert!(path.exists());
         LifetimeLock::acquire(&path).expect("released");
+    }
+
+    #[test]
+    fn appliance_live_report_must_match_selected_machine_and_run() {
+        use vm_spec::live::*;
+        let report = LiveMachineReport {
+            schema_version: 1,
+            scope: LiveScope::Machine,
+            machine_id: "12345678-1234-4234-8234-123456789abc".into(),
+            run_id: "22345678-1234-4234-8234-123456789abc".into(),
+            monitor_id: "32345678-1234-4234-8234-123456789abc".into(),
+            backend: LiveBackend::Mock,
+            lane: LiveLane::NotApplicable,
+            topology_revision: 1,
+            live: LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded),
+        };
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            None,
+            &report.machine_id,
+            &report.run_id
+        )
+        .is_err());
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            Some(report.clone()),
+            "other-machine",
+            &report.run_id
+        )
+        .is_err());
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            Some(report.clone()),
+            &report.machine_id,
+            "other-run"
+        )
+        .is_err());
+        assert!(crate::daemon::supervisor::live_report_for_run(
+            Some(report.clone()),
+            "42345678123442348234123456789abc",
+            &report.run_id
+        )
+        .is_err());
+        assert_eq!(
+            crate::daemon::supervisor::live_report_for_run(
+                Some(report.clone()),
+                "12345678123442348234123456789abc",
+                &report.run_id
+            )
+            .unwrap(),
+            report
+        );
+        assert_eq!(
+            crate::daemon::supervisor::live_report_for_run(
+                Some(report.clone()),
+                &report.machine_id,
+                &report.run_id
+            )
+            .unwrap(),
+            report
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_appliance_discovery_clears_previously_published_prospective_report() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = silod_spec::paths::DaemonPaths::new(root.path().join("home"));
+        let host = libvm::HostPaths::new(paths.home(), root.path().join("config"));
+        let query = libvm::LiveCapabilityQuery::open(
+            &libvm::RuntimeConfig::local(paths.home())
+                .with_supervisor_path(test_utils::mock_vmm_binary())
+                .with_virt_backend(libvm::VirtBackendOverride::Vz),
+        )
+        .unwrap();
+        let mut status = crate::daemon::supervisor::initial_status(&paths.docker_socket()).unwrap();
+        status.prospective_live = Some(query.host_report().await.unwrap());
+        let publisher = crate::daemon::status::StatusPublisher::new(
+            &host,
+            uuid::Uuid::new_v4(),
+            crate::config::FeatureSelection {
+                system: true,
+                tailscale: false,
+            },
+            "test".into(),
+            Some(status.clone()),
+        )
+        .unwrap();
+        publisher.set_system(status.clone()).unwrap();
+        assert!(publisher.wire().unwrap().appliance_live.is_some());
+        let desired = crate::daemon::system_config::resolve(
+            &silod_spec::arguments::SystemOverrides::default(),
+            root.path(),
+            &paths.docker_socket(),
+            None,
+        )
+        .unwrap();
+        let config = libvm::RuntimeConfig::local(paths.home())
+            .with_supervisor_path(root.path().join("missing-monitor"));
+        let mut runtime = None;
+        assert!(crate::daemon::supervisor::attempt(
+            &mut runtime,
+            &config,
+            &paths,
+            &desired,
+            &mut status,
+            &publisher,
+        )
+        .await
+        .is_err());
+        assert!(runtime.is_none());
+        assert!(status.prospective_live.is_none());
+        let wire = publisher.wire().unwrap();
+        assert!(wire.appliance_live.is_none());
+        assert!(wire.system.unwrap().prospective_live.is_none());
     }
 }

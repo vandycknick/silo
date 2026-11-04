@@ -31,6 +31,10 @@ pub(crate) struct Template {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) disk_size: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) root_profile: Option<crate::commands::create::RootProfileArg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tmpfs_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) userdata: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) mounts: Vec<MachineMount>,
@@ -204,6 +208,7 @@ pub(crate) fn validate_template(template: &Template) -> eyre::Result<()> {
     {
         bail!("template image cannot be empty");
     }
+    validate_root_options(template.root_profile, template.tmpfs_size.as_deref())?;
     validate_machine_defaults(
         template.resources.as_ref(),
         template.disk_size.as_deref(),
@@ -212,6 +217,23 @@ pub(crate) fn validate_template(template: &Template) -> eyre::Result<()> {
         template.network.as_ref(),
     )
     .map_err(|error| eyre::eyre!("template {error}"))
+}
+
+pub(crate) fn validate_root_options(
+    profile: Option<crate::commands::create::RootProfileArg>,
+    tmpfs_size: Option<&str>,
+) -> eyre::Result<()> {
+    if let Some(size) = tmpfs_size {
+        if profile.unwrap_or_default()
+            != crate::commands::create::RootProfileArg::LinuxFlatOverlayV1
+        {
+            bail!("tmpfs_size requires root_profile: linux-flat-overlay-v1");
+        }
+        if let Some(capacity_bytes) = crate::machine_defaults::disk_size_bytes(Some(size))? {
+            libvm::TemporaryDirectoryPolicy::Tmpfs { capacity_bytes }.validate()?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_template_name(name: &str) -> eyre::Result<()> {
@@ -268,6 +290,8 @@ mod tests {
                 memory: Some("4gb".to_string()),
             }),
             disk_size: Some("40gb".to_string()),
+            root_profile: None,
+            tmpfs_size: None,
             userdata: Some("#!/bin/sh\nset -eu\n".to_string()),
             mounts: vec![MachineMount {
                 source: "/tmp/workspace".into(),
@@ -451,5 +475,22 @@ labels:
             .expect_err("existing yaml must not be replaced");
 
         assert!(error.to_string().contains("template `dev` already exists"));
+    }
+    #[test]
+    fn overlay_template_requires_explicit_profile_and_sized_tmpfs() {
+        let template = parse_template("version: \"1\"\nroot_profile: linux-flat-overlay-v1\ndisk_size: 64mib\ntmpfs_size: 8mib\n")
+            .expect("explicit overlay template");
+        assert_eq!(
+            template.root_profile,
+            Some(crate::commands::create::RootProfileArg::LinuxFlatOverlayV1)
+        );
+        assert_eq!(template.tmpfs_size.as_deref(), Some("8mib"));
+        for invalid in [
+            "version: \"1\"\ntmpfs_size: 8mib\n",
+            "version: \"1\"\nroot_profile: linux-flat-overlay-v1\ntmpfs_size: 0\n",
+            "version: \"1\"\nroot_profile: auto\n",
+        ] {
+            assert!(parse_template(invalid).is_err(), "accepted {invalid}");
+        }
     }
 }

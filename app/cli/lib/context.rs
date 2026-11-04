@@ -8,14 +8,16 @@ use crate::config::GlobalConfig;
 #[derive(Debug)]
 pub struct Context {
     verbose: u8,
+    admission: silo_vm_control::transport::Admission,
     config: Option<GlobalConfig>,
     api: Option<AppApi>,
 }
 
 impl Context {
-    pub fn new(verbose: u8) -> Self {
+    pub fn new(verbose: u8, admission: silo_vm_control::transport::Admission) -> Self {
         Self {
             verbose,
+            admission,
             config: None,
             api: None,
         }
@@ -45,7 +47,7 @@ impl Context {
                 .with_networking(networking)
                 .with_registry_policy(images);
             let host = libvm::HostPaths::from_env().context("resolve daemon identity paths")?;
-            self.api = Some(AppApi::select(runtime_config, &host).await?);
+            self.api = Some(AppApi::select(runtime_config, &host, self.admission).await?);
         }
         self.api
             .as_mut()

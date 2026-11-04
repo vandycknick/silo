@@ -441,6 +441,7 @@ mod tests {
         let helper = uuid::Uuid::new_v4();
         let identity = w::DaemonStatus {
             protocol_major: 1,
+            live_schema_version: Some(1),
             product_version: env!("CARGO_PKG_VERSION").into(),
             generation: daemon.to_string(),
             home: silo_vm_control::path_to_wire(&home.canonicalize().unwrap()),

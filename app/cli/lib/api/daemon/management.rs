@@ -32,6 +32,196 @@ fn run_ref(id: &str, run: MachineRunId) -> Result<w::MachineRunRef, LibVmError> 
 }
 
 impl DaemonVmService {
+    pub(crate) async fn live_capabilities(&self) -> eyre::Result<vm_spec::live::LiveHostReport> {
+        Ok(silo_vm_control::live::host_from_wire(
+            self.daemon
+                .clone()
+                .get_live_capabilities(())
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn appliance_live_capabilities(
+        &self,
+    ) -> eyre::Result<Option<vm_spec::live::LiveHostReport>> {
+        let status = self
+            .daemon
+            .clone()
+            .get_status(())
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        silo_vm_control::live::validate_daemon_status(&status)?;
+        Ok(status
+            .appliance_live
+            .map(silo_vm_control::live::host_from_wire)
+            .transpose()?)
+    }
+
+    pub(crate) async fn pause_machine(&self, value: &str) -> eyre::Result<()> {
+        self.machines
+            .clone()
+            .pause_machine(w::LiveMachineRequest {
+                machine: Some(reference(value)?),
+            })
+            .await
+            .map_err(native_status)?;
+        Ok(())
+    }
+
+    pub(crate) async fn capture_execution(
+        &self,
+        value: &str,
+        name: Option<&str>,
+    ) -> eyre::Result<()> {
+        self.machines
+            .clone()
+            .capture_execution(w::LiveCaptureRequest {
+                machine: Some(reference(value)?),
+                name: name.map(str::to_owned),
+            })
+            .await
+            .map_err(native_status)?;
+        Ok(())
+    }
+
+    pub(crate) async fn fork_execution(&self, value: &str, name: &str) -> eyre::Result<()> {
+        self.machines
+            .clone()
+            .fork_execution(w::LiveForkRequest {
+                machine: Some(reference(value)?),
+                name: Some(name.into()),
+            })
+            .await
+            .map_err(native_status)?;
+        Ok(())
+    }
+
+    pub(crate) async fn restore_execution(
+        &self,
+        checkpoint: &str,
+        name: Option<&str>,
+    ) -> eyre::Result<()> {
+        self.runtime
+            .clone()
+            .restore_execution(w::LiveRestoreRequest {
+                checkpoint: checkpoint.as_bytes().to_vec(),
+                name: name.map(str::to_owned),
+            })
+            .await
+            .map_err(native_status)?;
+        Ok(())
+    }
+
+    pub(crate) async fn fork_stopped(
+        &self,
+        value: &str,
+        options: libvm::ForkOptions,
+    ) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.machines
+                .clone()
+                .fork_stopped(w::StoppedForkRequest {
+                    machine: Some(reference(value)?),
+                    name: options.name,
+                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+                        &options.external_resources,
+                    )),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn snapshot_stopped(
+        &self,
+        value: &str,
+        options: libvm::SnapshotOptions,
+    ) -> eyre::Result<libvm::SnapshotInfo> {
+        Ok(silo_vm_control::stopped::info_from_wire(
+            self.machines
+                .clone()
+                .snapshot_stopped(w::CreateStorageSnapshotRequest {
+                    machine: Some(reference(value)?),
+                    name: options.name,
+                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+                        &options.external_resources,
+                    )),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn restore_snapshot(
+        &self,
+        reference: libvm::SnapshotRef,
+        options: libvm::RestoreOptions,
+    ) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.runtime
+                .clone()
+                .restore_snapshot(w::RestoreStorageSnapshotRequest {
+                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(&reference)),
+                    name: options.name,
+                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+                        &options.external_resources,
+                    )),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn inspect_snapshot(
+        &self,
+        reference: libvm::SnapshotRef,
+    ) -> eyre::Result<libvm::SnapshotInfo> {
+        Ok(silo_vm_control::stopped::info_from_wire(
+            self.runtime
+                .clone()
+                .inspect_storage_snapshot(silo_vm_control::stopped::reference_to_wire(&reference))
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn list_snapshots(&self) -> eyre::Result<Vec<libvm::SnapshotInfo>> {
+        self.runtime
+            .clone()
+            .list_storage_snapshots(())
+            .await
+            .map_err(native_status)?
+            .into_inner()
+            .snapshots
+            .into_iter()
+            .map(|value| silo_vm_control::stopped::info_from_wire(value).map_err(Into::into))
+            .collect()
+    }
+
+    pub(crate) async fn release_snapshot(&self, reference: libvm::SnapshotRef) -> eyre::Result<()> {
+        self.runtime
+            .clone()
+            .release_snapshot_retention(silo_vm_control::stopped::reference_to_wire(&reference))
+            .await
+            .map_err(native_status)?;
+        Ok(())
+    }
+
+    pub(crate) async fn remove_image_alias(&self, alias: String) -> eyre::Result<()> {
+        self.runtime
+            .clone()
+            .remove_image_alias(w::Name { name: alias })
+            .await
+            .map_err(native_status)?;
+        Ok(())
+    }
     pub(crate) async fn list_machines(&self) -> eyre::Result<Vec<MachineInventoryEntry>> {
         let mut stream = self
             .machines

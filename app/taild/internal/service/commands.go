@@ -572,7 +572,7 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 			labels[GuestPortsLabel] = string(b)
 		}
 		cpus, memory, disk, vsock := uint32(q.CPUs), q.Memory, q.Disk, true
-		spec := &w.NormalizedMachineCreate{Name: &q.Name, Labels: labels, Cpus: &cpus, MemoryBytes: &memory, RootDiskSizeBytes: &disk, Vsock: &vsock}
+		spec := &w.NormalizedMachineCreate{Name: &q.Name, Labels: labels, Cpus: &cpus, MemoryBytes: &memory, RootDiskSizeBytes: &disk, Vsock: &vsock, RootProfile: w.RootProfile_ROOT_PROFILE_OPAQUE_RAW.Enum(), TemporaryDirectory: &w.TemporaryDirectoryPolicy{Backing: &w.TemporaryDirectoryPolicy_DiskBacked{DiskBacked: &emptypb.Empty{}}}}
 		spec.Process = &w.ProcessConfig{}
 		spec.Retention = w.Retention_RETENTION_PERSISTENT
 		spec.Agent = &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}

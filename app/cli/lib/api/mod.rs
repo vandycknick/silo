@@ -40,10 +40,150 @@ impl AppApi {
     pub(crate) async fn select(
         config: RuntimeConfig,
         host: &libvm::HostPaths,
+        admission: silo_vm_control::transport::Admission,
     ) -> eyre::Result<Self> {
-        match daemon::DaemonVmService::probe(&config, host).await? {
+        match daemon::DaemonVmService::probe(&config, host, admission).await? {
             Some(service) => Ok(Self::Daemon(service)),
             None => Ok(Self::local(config)),
+        }
+    }
+
+    pub(crate) async fn live_capabilities(
+        &mut self,
+    ) -> eyre::Result<vm_spec::live::LiveHostReport> {
+        match self {
+            Self::Local(service) => service.live_capabilities().await,
+            Self::Daemon(service) => service.live_capabilities().await,
+        }
+    }
+
+    pub(crate) async fn appliance_live_capabilities(
+        &mut self,
+    ) -> eyre::Result<Option<vm_spec::live::LiveHostReport>> {
+        match self {
+            Self::Local(_) => Ok(None),
+            Self::Daemon(service) => service.appliance_live_capabilities().await,
+        }
+    }
+
+    pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<()> {
+        match self {
+            Self::Local(service) => {
+                service
+                    .require_machine_live(reference, vm_spec::live::LiveOperation::Pause)
+                    .await
+            }
+            Self::Daemon(service) => service.pause_machine(reference).await,
+        }
+    }
+
+    pub(crate) async fn capture_execution(
+        &mut self,
+        reference: &str,
+        name: Option<&str>,
+    ) -> eyre::Result<()> {
+        match self {
+            Self::Local(service) => {
+                service
+                    .require_machine_live(reference, vm_spec::live::LiveOperation::Capture)
+                    .await
+            }
+            Self::Daemon(service) => service.capture_execution(reference, name).await,
+        }
+    }
+
+    pub(crate) async fn fork_execution(&mut self, reference: &str, name: &str) -> eyre::Result<()> {
+        match self {
+            Self::Local(service) => {
+                service
+                    .require_machine_live(reference, vm_spec::live::LiveOperation::Fork)
+                    .await
+            }
+            Self::Daemon(service) => service.fork_execution(reference, name).await,
+        }
+    }
+
+    pub(crate) async fn restore_execution(
+        &mut self,
+        checkpoint: &str,
+        name: Option<&str>,
+    ) -> eyre::Result<()> {
+        match self {
+            Self::Local(service) => service.restore_execution(checkpoint, name).await,
+            Self::Daemon(service) => service.restore_execution(checkpoint, name).await,
+        }
+    }
+
+    pub(crate) async fn fork_stopped(
+        &mut self,
+        reference: &str,
+        options: libvm::ForkOptions,
+    ) -> eyre::Result<MachineData> {
+        match self {
+            Self::Local(service) => service.fork_stopped(reference, options).await,
+            Self::Daemon(service) => service.fork_stopped(reference, options).await,
+        }
+    }
+
+    pub(crate) async fn snapshot_stopped(
+        &mut self,
+        reference: &str,
+        options: libvm::SnapshotOptions,
+    ) -> eyre::Result<libvm::SnapshotInfo> {
+        match self {
+            Self::Local(service) => service.snapshot_stopped(reference, options).await,
+            Self::Daemon(service) => service.snapshot_stopped(reference, options).await,
+        }
+    }
+
+    pub(crate) async fn restore_snapshot(
+        &mut self,
+        reference: &str,
+        options: libvm::RestoreOptions,
+    ) -> eyre::Result<MachineData> {
+        let reference: libvm::SnapshotRef = reference.parse()?;
+        match self {
+            Self::Local(service) => service.restore_snapshot(reference, options).await,
+            Self::Daemon(service) => service.restore_snapshot(reference, options).await,
+        }
+    }
+
+    pub(crate) async fn inspect_snapshot(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::SnapshotInfo> {
+        let reference: libvm::SnapshotRef = reference.parse()?;
+        match self {
+            Self::Local(service) => service.inspect_snapshot(reference).await,
+            Self::Daemon(service) => service.inspect_snapshot(reference).await,
+        }
+    }
+
+    pub(crate) async fn list_snapshots(&mut self) -> eyre::Result<Vec<libvm::SnapshotInfo>> {
+        match self {
+            Self::Local(service) => service.list_snapshots().await,
+            Self::Daemon(service) => service.list_snapshots().await,
+        }
+    }
+
+    pub(crate) async fn release_snapshot(&mut self, reference: &str) -> eyre::Result<()> {
+        let reference: libvm::SnapshotRef = reference.parse()?;
+        match self {
+            Self::Local(service) => service.release_snapshot(reference).await,
+            Self::Daemon(service) => service.release_snapshot(reference).await,
+        }
+    }
+
+    pub(crate) async fn remove_image_alias(&mut self, reference: &str) -> eyre::Result<()> {
+        let alias = match reference.parse::<libvm::SnapshotRef>()? {
+            libvm::SnapshotRef::Image(alias) => alias,
+            libvm::SnapshotRef::Id(_) => {
+                eyre::bail!("image remove requires an image:NAME alias, not an immutable identity")
+            }
+        };
+        match self {
+            Self::Local(service) => service.remove_image_alias(alias).await,
+            Self::Daemon(service) => service.remove_image_alias(alias).await,
         }
     }
 
@@ -323,7 +463,7 @@ mod tests {
             &temp.path().join("home"),
         ));
         let disk = temp.path().join("rootfs.img");
-        std::fs::write(&disk, b"caller-owned disk").expect("write local disk");
+        std::fs::write(&disk, [0x64; 512]).expect("write local disk");
         let reference = format!("disk:{}", disk.display());
         let template: Template =
             serde_json::from_str(r#"{"version":"1"}"#).expect("parse minimal template");
@@ -387,14 +527,19 @@ mod tests {
         let assets = components.join("assets");
         std::fs::create_dir_all(&bin).expect("create binary component fixtures");
         std::fs::create_dir(&assets).expect("create asset component fixtures");
-        for name in ["silo-vmm", "netd", "krun"] {
+        let supervisor = bin.join("silo-vmm");
+        std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
+            .expect("install real scenario-capable monitor");
+        for name in ["netd", "krun"] {
             executable_fixture(&bin, name);
         }
         for name in ["kernel-default", "initramfs"] {
             std::fs::write(assets.join(name), b"fixture").expect("write asset fixture");
         }
         executable_fixture(&assets, "agent");
-        RuntimeConfig::local(home).with_runtime_root(&components)
+        RuntimeConfig::local(home)
+            .with_runtime_root(&components)
+            .with_virt_backend(libvm::VirtBackendOverride::Mock { scenario: None })
     }
 
     #[tokio::test]
@@ -403,7 +548,7 @@ mod tests {
         let home = temp.path().join("home");
         let mut api = AppApi::local(isolated_runtime_config(temp.path(), &home));
         let disk = temp.path().join("disk.img");
-        std::fs::write(&disk, b"never-booted disk fixture").unwrap();
+        std::fs::write(&disk, [0x64; 512]).unwrap();
         let policy = libvm::NetworkPolicy::from_json_str(r#"{"version":1,"endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],"credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"}]}"#).unwrap();
         let AppApi::Local(service) = &mut api else {
             unreachable!("explicit local fixture")

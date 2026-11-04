@@ -34,6 +34,8 @@ impl StatusPublisher {
                 last_error: None,
                 system,
                 configuration_identity,
+                manager_live: None,
+                appliance_live: None,
                 tailscale: ComponentStatus {
                     enabled: features.tailscale,
                     state: if features.tailscale {
@@ -75,8 +77,17 @@ impl StatusPublisher {
             s.last_error = error;
         })
     }
+    pub(crate) fn set_manager_live(
+        &self,
+        report: vm_spec::live::LiveHostReport,
+    ) -> eyre::Result<()> {
+        self.update(|s| s.manager_live = Some(report))
+    }
     pub(crate) fn set_system(&self, system: SystemStatus) -> eyre::Result<()> {
-        self.update(|s| s.system = Some(system))
+        self.update(|s| {
+            s.appliance_live = system.prospective_live.clone();
+            s.system = Some(system);
+        })
     }
     pub(crate) fn fail_system(&self, error: String) -> eyre::Result<()> {
         self.update(|s| {
@@ -109,6 +120,7 @@ impl StatusPublisher {
             .lock()
             .map_err(|_| eyre::eyre!("status publisher poisoned"))?;
         Ok(w::DaemonStatus {
+            live_schema_version: Some(1),
             product_version: env!("CARGO_PKG_VERSION").into(),
             protocol_major: 1,
             generation: s.generation.to_string(),
@@ -127,7 +139,17 @@ impl StatusPublisher {
             control_endpoint: silo_vm_control::path_to_wire(&s.control_endpoint),
             updated_at: timestamp(&s.updated_at),
             last_error: s.last_error.clone(),
-            system: s.system.as_ref().map(system_wire),
+            manager_live: s
+                .manager_live
+                .as_ref()
+                .map(silo_vm_control::live::host_to_wire)
+                .transpose()?,
+            appliance_live: s
+                .appliance_live
+                .as_ref()
+                .map(silo_vm_control::live::host_to_wire)
+                .transpose()?,
+            system: s.system.as_ref().map(system_wire).transpose()?,
             tailscale: Some(component_wire(&s.tailscale)),
         })
     }
@@ -162,8 +184,9 @@ fn component_wire(s: &ComponentStatus) -> w::ComponentStatus {
         } as i32,
     }
 }
-fn system_wire(s: &SystemStatus) -> w::SystemStatus {
-    w::SystemStatus {
+fn system_wire(s: &SystemStatus) -> eyre::Result<w::SystemStatus> {
+    Ok(w::SystemStatus {
+        live_schema_version: Some(1),
         phase: match s.phase {
             SystemPhase::PreparingStorage => w::SystemPhase::PreparingStorage,
             SystemPhase::Creating => w::SystemPhase::Creating,
@@ -184,6 +207,16 @@ fn system_wire(s: &SystemStatus) -> w::SystemStatus {
         configured_image: s.configured_image.clone(),
         memory_bytes: s.memory_bytes,
         actual_backend: s.actual_backend.clone(),
+        live: s
+            .live
+            .as_ref()
+            .map(silo_vm_control::live::machine_to_wire)
+            .transpose()?,
+        prospective_live: s
+            .prospective_live
+            .as_ref()
+            .map(silo_vm_control::live::host_to_wire)
+            .transpose()?,
         docker_socket: silo_vm_control::path_to_wire(std::path::Path::new(&s.docker_socket)),
         last_error: s.last_error.clone(),
         restart_count: s.restart_count.into(),
@@ -204,7 +237,7 @@ fn system_wire(s: &SystemStatus) -> w::SystemStatus {
         host_memory_reclaim_qualification: s.host_memory_reclaim_qualification.clone(),
         host_memory_reclaim_released_bytes: s.host_memory_reclaim_released_bytes,
         host_memory_reclaim_failed_operations: s.host_memory_reclaim_failed_operations,
-    }
+    })
 }
 
 #[cfg(test)]

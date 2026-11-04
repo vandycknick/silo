@@ -30,7 +30,7 @@ impl SystemRuntime {
             match machine.data {
                 Some(snapshot) => data.push(snapshot),
                 None => eprintln!(
-                    "machine {} ({}) configuration unavailable: {:?}; inspect with silo show",
+                    "machine {} ({}) configuration unavailable: {:?}; inspect with silo info",
                     machine.name, machine.id, machine.issues
                 ),
             }

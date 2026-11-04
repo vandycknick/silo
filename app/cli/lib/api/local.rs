@@ -21,17 +21,23 @@ use crate::template::Template;
 
 #[derive(Debug)]
 pub(crate) enum LocalVmService {
-    Uninitialized(Option<RuntimeConfig>),
+    Uninitialized {
+        config: Option<RuntimeConfig>,
+        query: tokio::sync::OnceCell<libvm::LiveCapabilityQuery>,
+    },
     Ready(Runtime),
 }
 
 impl LocalVmService {
     pub(crate) fn new(config: RuntimeConfig) -> Self {
-        Self::Uninitialized(Some(config))
+        Self::Uninitialized {
+            config: Some(config),
+            query: tokio::sync::OnceCell::new(),
+        }
     }
 
     pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
-        if let Self::Uninitialized(config) = self {
+        if let Self::Uninitialized { config, .. } = self {
             let config = config
                 .take()
                 .ok_or_else(|| eyre::eyre!("local runtime configuration was not initialized"))?;
@@ -50,8 +56,187 @@ impl LocalVmService {
 
         match self {
             Self::Ready(runtime) => Ok(runtime),
-            Self::Uninitialized(_) => Err(eyre::eyre!("local runtime was not initialized")),
+            Self::Uninitialized { .. } => Err(eyre::eyre!("local runtime was not initialized")),
         }
+    }
+
+    pub(crate) async fn live_capabilities(&self) -> eyre::Result<vm_spec::live::LiveHostReport> {
+        match self {
+            Self::Ready(runtime) => Ok(runtime.live_capabilities().await?),
+            Self::Uninitialized {
+                config: Some(config),
+                query,
+            } => {
+                let query = query
+                    .get_or_try_init(|| async { libvm::LiveCapabilityQuery::open(config) })
+                    .await?;
+                Ok(query.host_report().await?)
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable")
+            }
+        }
+    }
+
+    pub(crate) async fn require_machine_live(
+        &self,
+        reference: &str,
+        operation: vm_spec::live::LiveOperation,
+    ) -> eyre::Result<()> {
+        let reference = MachineRef::parse(reference)?;
+        let observation = match self {
+            Self::Ready(runtime) => runtime.observe_live(&reference).await?,
+            Self::Uninitialized {
+                config: Some(config),
+                ..
+            } => {
+                let reader = libvm::LiveObservationReader::open(config)?;
+                if !reader.catalog_exists()? {
+                    // No machine evidence exists. Refuse using explicitly host-scoped evidence.
+                    libvm::require_host_live_operation(
+                        &self.live_capabilities().await?,
+                        operation,
+                    )?;
+                }
+                reader.observe(&reference).await?
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable")
+            }
+        };
+        libvm::require_live_operation(&observation, operation)?;
+        Ok(())
+    }
+
+    pub(crate) async fn restore_execution(
+        &self,
+        _checkpoint: &str,
+        _name: Option<&str>,
+    ) -> eyre::Result<()> {
+        let report = self.live_capabilities().await?;
+        libvm::require_host_live_operation(&report, vm_spec::live::LiveOperation::Restore)?;
+        Ok(())
+    }
+
+    async fn preflight_stopped(
+        &self,
+        reference: &MachineRef,
+        snapshot: bool,
+        policy: &libvm::ExternalResourcePolicy,
+    ) -> eyre::Result<()> {
+        match self {
+            Self::Uninitialized {
+                config: Some(config),
+                ..
+            } => {
+                libvm::preflight_stopped(config, reference, snapshot, policy).await?;
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable")
+            }
+            // Already initialized ownership is not new admission; the native API
+            // repeats authoritative checks under the source lifecycle locks.
+            Self::Ready(_) => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn fork_stopped(
+        &mut self,
+        reference: &str,
+        mut options: libvm::ForkOptions,
+    ) -> eyre::Result<MachineData> {
+        options.name = silo_vm_control::stopped::name(options.name)?;
+        let reference = MachineRef::parse(reference)?;
+        self.preflight_stopped(&reference, false, &options.external_resources)
+            .await?;
+        let machine = self.runtime().await?.get_machine(&reference).await?;
+        Ok(machine.fork_stopped(options).await?.inspect().await?)
+    }
+
+    pub(crate) async fn snapshot_stopped(
+        &mut self,
+        reference: &str,
+        mut options: libvm::SnapshotOptions,
+    ) -> eyre::Result<libvm::SnapshotInfo> {
+        options.name = options
+            .name
+            .map(|name| silo_vm_control::stopped::alias(&name))
+            .transpose()?;
+        silo_vm_control::stopped::snapshot_policy(&options.external_resources)?;
+        let reference = MachineRef::parse(reference)?;
+        self.preflight_stopped(&reference, true, &options.external_resources)
+            .await?;
+        Ok(self
+            .runtime()
+            .await?
+            .get_machine(&reference)
+            .await?
+            .snapshot_stopped(options)
+            .await?)
+    }
+
+    pub(crate) async fn restore_snapshot(
+        &mut self,
+        reference: libvm::SnapshotRef,
+        mut options: libvm::RestoreOptions,
+    ) -> eyre::Result<MachineData> {
+        options.name = silo_vm_control::stopped::name(options.name)?;
+        if let Self::Uninitialized {
+            config: Some(config),
+            ..
+        } = self
+        {
+            libvm::preflight_restore_snapshot(config, &reference, &options.external_resources)
+                .await?;
+        }
+        Ok(self
+            .runtime()
+            .await?
+            .restore_snapshot(reference, options)
+            .await?
+            .inspect()
+            .await?)
+    }
+
+    pub(crate) async fn inspect_snapshot(
+        &mut self,
+        reference: libvm::SnapshotRef,
+    ) -> eyre::Result<libvm::SnapshotInfo> {
+        Ok(
+            libvm::SnapshotStore::open(self.runtime().await?.local_home())
+                .await?
+                .inspect(&reference)
+                .await?,
+        )
+    }
+
+    pub(crate) async fn list_snapshots(&mut self) -> eyre::Result<Vec<libvm::SnapshotInfo>> {
+        Ok(
+            libvm::SnapshotStore::open(self.runtime().await?.local_home())
+                .await?
+                .list()
+                .await?,
+        )
+    }
+
+    pub(crate) async fn release_snapshot(
+        &mut self,
+        reference: libvm::SnapshotRef,
+    ) -> eyre::Result<()> {
+        libvm::SnapshotStore::open(self.runtime().await?.local_home())
+            .await?
+            .release_retention(&reference)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn remove_image_alias(&mut self, alias: String) -> eyre::Result<()> {
+        libvm::SnapshotStore::open(self.runtime().await?.local_home())
+            .await?
+            .remove_alias(&alias)
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn list_machines(
@@ -84,7 +269,11 @@ impl LocalVmService {
         let machine = self.machine(reference).await?;
         let data = machine.inspect().await?;
         if !data.is_running() {
-            return Ok(data);
+            // Observation is read-only. The lifecycle API must still reconcile
+            // terminal owners, storage outcome and durable operation pins.
+            return Ok(machine
+                .stop_with(MachineStopOptions::new().timeout(timeout))
+                .await?);
         }
         if force {
             machine
@@ -414,6 +603,13 @@ pub(crate) fn normalize_plan(
             .and_then(|resources| resources.cpus),
         memory_bytes,
         root_disk_size_bytes,
+        root_profile: plan.machine.root_profile.native(),
+        temporary_directory: match crate::machine_defaults::disk_size_bytes(
+            plan.machine.tmpfs_size.as_deref(),
+        )? {
+            Some(capacity_bytes) => libvm::TemporaryDirectoryPolicy::Tmpfs { capacity_bytes },
+            None => libvm::TemporaryDirectoryPolicy::DiskBacked,
+        },
         userdata: plan.machine.userdata.clone(),
         network,
         agent,
@@ -566,6 +762,8 @@ mod tests {
             machine: MachinePlan {
                 resources: None,
                 disk_size: None,
+                root_profile: Default::default(),
+                tmpfs_size: None,
                 userdata: None,
                 mounts: Vec::new(),
                 forwards: Vec::new(),
@@ -714,5 +912,111 @@ mod tests {
             user: None,
         });
         assert!(crate::api::local::normalize_update(&mut missing).is_err());
+    }
+
+    #[tokio::test]
+    async fn stopped_option_validation_precedes_cold_runtime_initialization() {
+        use crate::api::local::LocalVmService;
+        use libvm::{
+            ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy, ForkOptions,
+            RestoreOptions, RuntimeConfig, SnapshotOptions,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("absent-home");
+        let run = temp.path().join("absent-run");
+        let mut service = LocalVmService::new(RuntimeConfig::local(&home).with_run_root(&run));
+        for name in [
+            "INVALID",
+            "trailing-",
+            "contains space",
+            "",
+            &"a".repeat(64),
+        ] {
+            let error = service
+                .fork_stopped(
+                    "absent",
+                    ForkOptions {
+                        name: Some(name.into()),
+                        external_resources: ExternalResourcePolicy::Reject,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<silo_vm_control::ConversionError>()
+                    .is_some(),
+                "{error}"
+            );
+            let error = service
+                .restore_snapshot(
+                    "image:absent".parse().unwrap(),
+                    RestoreOptions {
+                        name: Some(name.into()),
+                        external_resources: ExternalResourcePolicy::Reject,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<silo_vm_control::ConversionError>()
+                    .is_some(),
+                "{error}"
+            );
+            assert!(!home.exists());
+            assert!(!run.exists());
+        }
+        for name in ["invalid alias", "sha256:invalid", "", &"a".repeat(129)] {
+            let error = service
+                .snapshot_stopped(
+                    "absent",
+                    SnapshotOptions {
+                        name: Some(name.into()),
+                        external_resources: ExternalResourcePolicy::Reject,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<silo_vm_control::ConversionError>()
+                    .is_some(),
+                "{error}"
+            );
+            assert!(!home.exists());
+            assert!(!run.exists());
+        }
+        let error = service
+            .snapshot_stopped(
+                "absent",
+                SnapshotOptions {
+                    name: None,
+                    external_resources: ExternalResourcePolicy::Map {
+                        mappings: vec![ExternalResourceMapping {
+                            resource: ExternalResourceKey::Disk { order: 1 },
+                            path: "/must/not/open.raw".into(),
+                        }],
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<silo_vm_control::ConversionError>()
+                .is_some(),
+            "{error}"
+        );
+        assert!(matches!(
+            service,
+            LocalVmService::Uninitialized {
+                config: Some(_),
+                ..
+            }
+        ));
+        assert!(!home.exists());
+        assert!(!run.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

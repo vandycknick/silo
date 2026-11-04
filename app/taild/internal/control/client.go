@@ -107,6 +107,9 @@ func (c *Client) Admit(ctx context.Context, productVersion, generation, home, co
 	if err != nil {
 		return nil, fmt.Errorf("inspect daemon identity: %w", err)
 	}
+	if !validLiveDaemon(status) {
+		return nil, invalidResponse()
+	}
 	if status.ProtocolMajor != 1 || status.ProductVersion != productVersion {
 		return nil, fmt.Errorf("%w: product/protocol", ErrIdentityMismatch)
 	}

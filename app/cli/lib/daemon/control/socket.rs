@@ -162,6 +162,7 @@ fn shutdown_allowed(path: &str) -> bool {
     matches!(
         path,
         "/silo.daemon.v1.DaemonService/GetStatus"
+            | "/silo.daemon.v1.DaemonService/GetLiveCapabilities"
             | "/silo.daemon.v1.DaemonService/DrainMutations"
             | "/silo.daemon.v1.MachineService/ListMachines"
             | "/silo.daemon.v1.MachineService/InspectInventory"

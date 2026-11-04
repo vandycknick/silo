@@ -279,12 +279,39 @@ impl DaemonStatusView {
             if let Some(error) = &daemon.last_error {
                 rows.push(("Core error".to_string(), error.clone()));
             }
+            if let Some(live) = &daemon.manager_live {
+                crate::commands::system::append_live_rows(
+                    &mut rows,
+                    "Manager prospective host",
+                    live.backend,
+                    live.lane,
+                    &live.live,
+                );
+            }
+            if let Some(live) = &daemon.appliance_live {
+                crate::commands::system::append_live_rows(
+                    &mut rows,
+                    "Appliance prospective host",
+                    live.backend,
+                    live.lane,
+                    &live.live,
+                );
+            }
         }
         if let Some(status) = self
             .daemon
             .as_ref()
             .and_then(|daemon| daemon.system.as_ref())
         {
+            if let Some(live) = &status.live {
+                crate::commands::system::append_live_rows(
+                    &mut rows,
+                    "Appliance machine run",
+                    live.backend,
+                    live.lane,
+                    &live.live,
+                );
+            }
             if let Some(machine_id) = &status.machine_id {
                 rows.push(("Machine".to_string(), machine_id.clone()));
             }
@@ -587,6 +614,7 @@ mod tests {
                 "phase": "ready", "machine_id": null, "run_id": null,
                 "image_digest": null, "docker_socket": "/tmp/test.sock",
                 "updated_at": "2026-01-01T00:00:00Z", "last_error": null, "restart_count": 0,
+                "live": null, "prospective_live": null,
             }))
             .expect("status");
         assert_eq!(format_update_check(&status), "not checked yet");
