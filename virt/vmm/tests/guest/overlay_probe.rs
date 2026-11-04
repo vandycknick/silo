@@ -127,14 +127,7 @@ fn persist_check() -> io::Result<()> {
     println!("{{\"persistent\":true}}"); Ok(())
 }
 fn fill(kind: &str) -> io::Result<()> {
-    // Stderr is carried by the real exec stream; stdout remains the errno oracle.
-    // Bound diagnostics to the first MiB rather than logging each fill iteration.
-    let stage = |value: &str| {
-        if kind == "host" { eprintln!("SILO_HOST_ENOSPC stage={value}"); }
-    };
-    stage("mkdir");
     fs::create_dir_all("/fill")?;
-    stage("mkdir-complete");
     let mut count = 0u64;
     let failure = loop {
         let path = format!("/fill/{count}");
@@ -144,13 +137,9 @@ fn fill(kind: &str) -> io::Result<()> {
             // once below before the host observes exhaustion.
             "inodes" => File::create(path).map(drop),
             "blocks" | "host" => (|| {
-                if count == 0 { stage("create"); }
                 let mut f = File::create(path)?;
-                if count == 0 { stage("write"); }
                 for _ in 0..16 { f.write_all(&[0x5a; 65536])?; }
-                if count == 0 { stage("fsync"); }
                 f.sync_all()?;
-                if count == 0 { stage("fsync-complete"); }
                 Ok::<(), io::Error>(())
             })(),
             "copyup" => OpenOptions::new().write(true).open("/overlay-fixture/large").and_then(|f| { f.write_all_at(b"x",0)?; f.sync_all() }),
