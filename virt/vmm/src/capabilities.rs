@@ -1140,7 +1140,9 @@ mod tests {
         for operation in LiveOperation::ALL {
             assert_eq!(
                 native_primitive(operation, &operations),
-                operation == LiveOperation::Pause && lane != native::NativeLane::Unsupported
+                lane == native::NativeLane::KvmX86_64
+                    || (operation == LiveOperation::Pause
+                        && lane != native::NativeLane::Unsupported)
             );
             assert!(!qualification_matches(
                 &compiled,
@@ -1234,7 +1236,9 @@ mod tests {
             for operation in LiveOperation::ALL {
                 assert_eq!(
                     native_primitive(operation, &operations),
-                    operation == LiveOperation::Pause && lane != native::NativeLane::Unsupported
+                    lane == native::NativeLane::KvmX86_64
+                        || (operation == LiveOperation::Pause
+                            && lane != native::NativeLane::Unsupported)
                 );
             }
         }
@@ -1259,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_native_pause_does_not_grant_public_admission() {
+    fn capabilities_native_primitives_do_not_grant_public_admission() {
         let compiled = compiled_build();
         for lane in [
             native::NativeLane::KvmX86_64,
@@ -1267,46 +1271,50 @@ mod tests {
             native::NativeLane::HvfArm64GicV3,
         ] {
             let operations = native::NativeLiveOperations::for_lane(lane);
-            let native = native_primitive(LiveOperation::Pause, &operations);
-            assert!(native);
-            let qualified = qualification_matches(
-                &compiled,
-                native_lane(lane).expect("recognized native lane"),
-                LiveOperation::Pause,
-                QUALIFICATIONS,
-            );
-            assert!(!qualified);
-            for host in [admitted(), HostAdmission::not_evaluated()] {
-                let capability = evaluate(EvaluationFacts {
-                    backend_allowed: true,
-                    native,
-                    delivered: DELIVERED.contains(&LiveOperation::Pause),
-                    qualified,
-                    host,
-                })
-                .expect("delivery refusal precedes host admission");
-                assert!(capability.native);
+            for operation in LiveOperation::ALL {
+                let native = native_primitive(operation, &operations);
+                if !native {
+                    continue;
+                }
+                let qualified = qualification_matches(
+                    &compiled,
+                    native_lane(lane).expect("recognized native lane"),
+                    operation,
+                    QUALIFICATIONS,
+                );
+                assert!(!qualified);
+                for host in [admitted(), HostAdmission::not_evaluated()] {
+                    let capability = evaluate(EvaluationFacts {
+                        backend_allowed: true,
+                        native,
+                        delivered: DELIVERED.contains(&operation),
+                        qualified,
+                        host,
+                    })
+                    .expect("delivery refusal precedes host admission");
+                    assert!(capability.native);
+                    assert_eq!(
+                        capability.availability,
+                        LiveAvailability::Unsupported {
+                            reason: LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
+                        }
+                    );
+                }
                 assert_eq!(
-                    capability.availability,
+                    evaluate(EvaluationFacts {
+                        backend_allowed: true,
+                        native,
+                        delivered: true,
+                        qualified,
+                        host: admitted(),
+                    })
+                    .expect("known host is still unqualified")
+                    .availability,
                     LiveAvailability::Unsupported {
-                        reason: LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
+                        reason: LiveUnsupportedReason::new(LiveReasonCode::LaneNotQualified),
                     }
                 );
             }
-            assert_eq!(
-                evaluate(EvaluationFacts {
-                    backend_allowed: true,
-                    native,
-                    delivered: true,
-                    qualified,
-                    host: admitted(),
-                })
-                .expect("known host is still unqualified")
-                .availability,
-                LiveAvailability::Unsupported {
-                    reason: LiveUnsupportedReason::new(LiveReasonCode::LaneNotQualified),
-                }
-            );
         }
     }
 

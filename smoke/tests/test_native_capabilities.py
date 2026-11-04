@@ -47,9 +47,10 @@ def test_native_capabilities_machine_less_binding_and_no_mutable_grants(config: 
     report = json.loads(result.stdout)
     assert report["schemaVersion"] == 1 and report["scope"] == "host" and report["backend"] == "krun"
     assert report["scenarioDigest"] is None
+    assert report["lane"] in ("kvm-x86_64", "kvm-arm64-gicv3", "hvf-arm64")
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         capability = report["live"][operation]
-        assert capability["native"] is (operation == "pause")
+        assert capability["native"] is (report["lane"] == "kvm-x86_64" or operation == "pause")
         assert capability["availability"] == {"status": "unsupported", "reason": {"code": "not-delivered", "subject": None}}
     identity = native_source_identity(report)
     assert identity.kind == "path"

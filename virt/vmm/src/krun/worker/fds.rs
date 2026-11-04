@@ -13,6 +13,10 @@
 //!
 //! | 8  | generation lease: shared-flock regular file       |
 //! | 9+ | Raw backing handles, in manifest order (max 16)   |
+//! | 25 | restore RAM, read-only regular file (standalone only) |
+//! | 26 | restore layout, read-only regular file              |
+//! | 27 | restore execution, read-only regular file           |
+//! | 28 | restore devices, read-only regular file             |
 //!
 //! The optional mux hole stays closed; no other descriptor may be open.
 
@@ -32,7 +36,25 @@ pub(crate) const MUX_FD: RawFd = 7;
 pub(crate) const STORAGE_LEASE_FD: RawFd = 8;
 pub(crate) const FIRST_RAW_FD: RawFd = 9;
 const MAX_RAW_HANDLES: usize = 16;
-const MAX_INHERITED_FDS: usize = 6 + MAX_RAW_HANDLES;
+const MAX_INHERITED_FDS: usize = 13 + MAX_RAW_HANDLES;
+pub(crate) const RESTORE_STATE_FDS: [RawFd; 4] = [25, 26, 27, 28];
+pub(crate) const STANDALONE_ENDPOINT_FDS: [RawFd; 3] = [29, 30, 31];
+
+#[allow(dead_code)] // Consumed only by the explicit standalone API entry.
+pub(crate) struct StandaloneEndpoints {
+    pub(crate) network: OwnedFd,
+    pub(crate) console_input: OwnedFd,
+    pub(crate) console_output: OwnedFd,
+}
+
+/// State objects are not disk attachments and never enter `raw_handles`.
+#[allow(dead_code)] // Normal worker launch never adopts state roles.
+pub(crate) struct RestoreStateFiles {
+    pub(crate) ram: std::fs::File,
+    pub(crate) layout: std::fs::File,
+    pub(crate) execution: std::fs::File,
+    pub(crate) devices: std::fs::File,
+}
 
 pub(crate) struct Bootstrap {
     pub(crate) config: OwnedFd,
@@ -42,6 +64,10 @@ pub(crate) struct Bootstrap {
     pub(crate) mux: Option<OwnedFd>,
     pub(crate) storage_lease: OwnedFd,
     pub(crate) raw_handles: Vec<OwnedFd>,
+    #[allow(dead_code)] // Only the explicit standalone entry consumes these roles.
+    pub(crate) state_files: Option<RestoreStateFiles>,
+    #[allow(dead_code)]
+    pub(crate) standalone: Option<StandaloneEndpoints>,
 }
 
 #[derive(Clone, Copy)]
@@ -53,12 +79,24 @@ enum Role {
     Mux,
     StorageLease,
     Raw,
+    State { maximum: u64 },
+    Network,
 }
 
 impl Bootstrap {
     /// Adopt the fixed descriptor table. The mux is optional; whether it must be
     /// present is decided by the config, which is read afterwards.
     pub(crate) fn adopt_fixed() -> io::Result<Self> {
+        Self::adopt_fixed_mode(false, false)
+    }
+
+    /// Explicit proof entry only; normal worker launch never admits these roles.
+    #[allow(dead_code)] // Not an extension of the normal worker wire.
+    pub(crate) fn adopt_standalone_fixed(restore: bool) -> io::Result<Self> {
+        Self::adopt_fixed_mode(restore, true)
+    }
+
+    fn adopt_fixed_mode(restore: bool, standalone: bool) -> io::Result<Self> {
         let mux = descriptor_open(MUX_FD)?.then_some(MUX_FD);
         let mut raw_handles = [0; MAX_RAW_HANDLES];
         let mut raw_count = 0;
@@ -87,12 +125,18 @@ impl Bootstrap {
         .into_iter()
         .chain(mux)
         .chain(raw_handles.iter().copied())
-        {
+        .chain(restore.then_some(RESTORE_STATE_FDS).into_iter().flatten())
+        .chain(
+            standalone
+                .then_some(STANDALONE_ENDPOINT_FDS)
+                .into_iter()
+                .flatten(),
+        ) {
             allowed[count] = raw;
             count += 1;
         }
         ensure_exact_descriptors(&allowed[..count])?;
-        Self::adopt(
+        Self::adopt_with_state(
             CONFIG_FD,
             EVENTS_FD,
             WATCHDOG_FD,
@@ -100,10 +144,13 @@ impl Bootstrap {
             mux,
             STORAGE_LEASE_FD,
             raw_handles,
+            restore.then_some(RESTORE_STATE_FDS),
+            standalone.then_some(STANDALONE_ENDPOINT_FDS),
         )
     }
 
     /// Adopt descriptors only after validating all roles, access and aliases.
+    #[cfg(test)]
     fn adopt(
         config: RawFd,
         events: RawFd,
@@ -112,6 +159,31 @@ impl Bootstrap {
         mux: Option<RawFd>,
         storage_lease: RawFd,
         raw_handles: &[RawFd],
+    ) -> io::Result<Self> {
+        Self::adopt_with_state(
+            config,
+            events,
+            watchdog,
+            console,
+            mux,
+            storage_lease,
+            raw_handles,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_with_state(
+        config: RawFd,
+        events: RawFd,
+        watchdog: RawFd,
+        console: RawFd,
+        mux: Option<RawFd>,
+        storage_lease: RawFd,
+        raw_handles: &[RawFd],
+        state: Option<[RawFd; 4]>,
+        standalone: Option<[RawFd; 3]>,
     ) -> io::Result<Self> {
         if raw_handles.len() > MAX_RAW_HANDLES {
             return Err(invalid("too many inherited Raw backing handles"));
@@ -132,6 +204,25 @@ impl Bootstrap {
             .chain(mux.map(|raw| (raw, Role::Mux)))
             .chain(std::iter::once((storage_lease, Role::StorageLease)))
             .chain(raw_handles.iter().map(|&raw| (raw, Role::Raw)))
+            .chain(state.into_iter().flat_map(|fds| {
+                fds.into_iter().zip([
+                    Role::State { maximum: 1 << 40 },
+                    Role::State { maximum: 64 * 1024 },
+                    Role::State {
+                        maximum: 16 * 1024 * 1024,
+                    },
+                    Role::State {
+                        maximum: 32 * 1024 * 1024,
+                    },
+                ])
+            }))
+            .chain(standalone.into_iter().flat_map(|[network, input, output]| {
+                [
+                    (network, Role::Network),
+                    (input, Role::Mux),
+                    (output, Role::Mux),
+                ]
+            }))
         {
             if raw < 3 || numbers[..count].contains(&raw) {
                 return Err(invalid("invalid or duplicated bootstrap descriptor"));
@@ -165,6 +256,12 @@ impl Bootstrap {
             }
             let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
             let access = flags & OFlag::O_ACCMODE;
+            #[cfg(target_os = "linux")]
+            if matches!(role, Role::State { .. })
+                && flags.intersects(OFlag::O_PATH | OFlag::O_DIRECT)
+            {
+                return Err(invalid("state roles require readable buffered descriptors"));
+            }
             match role {
                 Role::Config | Role::Watchdog
                     if kind == SFlag::S_IFIFO && access == OFlag::O_RDONLY => {}
@@ -177,10 +274,23 @@ impl Bootstrap {
                     }
                     getpeername::<UnixAddr>(raw)?;
                 }
+                Role::Network if kind == SFlag::S_IFSOCK => {
+                    use nix::sys::socket::{getpeername, getsockopt, sockopt, SockType, UnixAddr};
+                    if getsockopt(&fd, sockopt::SockType)? != SockType::Datagram {
+                        return Err(invalid("managed network must be a datagram socket"));
+                    }
+                    getpeername::<UnixAddr>(raw)?;
+                }
                 Role::StorageLease => validate_lease_metadata(fd)?,
                 Role::Raw
                     if matches!(kind, SFlag::S_IFREG | SFlag::S_IFBLK | SFlag::S_IFCHR)
                         && matches!(access, OFlag::O_RDONLY | OFlag::O_RDWR) => {}
+                Role::State { maximum }
+                    if kind == SFlag::S_IFREG
+                        && access == OFlag::O_RDONLY
+                        && !flags.contains(OFlag::O_APPEND)
+                        && stat.st_size > 0
+                        && (stat.st_size as u64) <= maximum => {}
                 _ => return Err(invalid("bootstrap descriptor has wrong type or access")),
             }
             numbers[count] = raw;
@@ -207,6 +317,17 @@ impl Bootstrap {
                     .iter()
                     .map(|&raw| OwnedFd::from_raw_fd(raw))
                     .collect(),
+                state_files: state.map(|[ram, layout, execution, devices]| RestoreStateFiles {
+                    ram: std::fs::File::from_raw_fd(ram),
+                    layout: std::fs::File::from_raw_fd(layout),
+                    execution: std::fs::File::from_raw_fd(execution),
+                    devices: std::fs::File::from_raw_fd(devices),
+                }),
+                standalone: standalone.map(|[network, input, output]| StandaloneEndpoints {
+                    network: OwnedFd::from_raw_fd(network),
+                    console_input: OwnedFd::from_raw_fd(input),
+                    console_output: OwnedFd::from_raw_fd(output),
+                }),
             }
         })
     }
@@ -476,6 +597,141 @@ mod tests {
         validate(lease.as_fd()).unwrap();
         nix::fcntl::fcntl(&lease, nix::fcntl::FcntlArg::F_GETFD).unwrap();
         drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_roles_validate_before_any_descriptor_is_adopted() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("worker-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let (config, _config_writer) = nix::unistd::pipe().unwrap();
+        let (_events_reader, events) = nix::unistd::pipe().unwrap();
+        let (watchdog, _watchdog_writer) = nix::unistd::pipe().unwrap();
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join("lease"))
+            .unwrap();
+        let mut files = Vec::new();
+        for index in 0..4 {
+            let path = root.join(index.to_string());
+            std::fs::write(&path, [1_u8; 8]).unwrap();
+            files.push(std::fs::File::open(path).unwrap());
+        }
+        let raw = std::array::from_fn(|index| files[index].as_raw_fd());
+        let refuse = |state, disks: &[std::os::fd::RawFd]| {
+            assert!(Bootstrap::adopt_with_state(
+                config.as_raw_fd(),
+                events.as_raw_fd(),
+                watchdog.as_raw_fd(),
+                pty.slave.as_raw_fd(),
+                None,
+                lease.as_raw_fd(),
+                disks,
+                Some(state),
+                None,
+            )
+            .is_err());
+            for file in &files {
+                nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+            }
+            nix::fcntl::fcntl(&config, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        };
+        let writable = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("0"))
+            .unwrap();
+        refuse([writable.as_raw_fd(), raw[1], raw[2], raw[3]], &[]);
+        #[cfg(target_os = "linux")]
+        {
+            let path_only = nix::fcntl::open(
+                &root.join("0"),
+                nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            )
+            .unwrap();
+            refuse([path_only.as_raw_fd(), raw[1], raw[2], raw[3]], &[]);
+        }
+        let alias = files[0].try_clone().unwrap();
+        refuse([raw[0], alias.as_raw_fd(), raw[2], raw[3]], &[]);
+        refuse([raw[0], raw[0], raw[2], raw[3]], &[]);
+        refuse([-1, raw[1], raw[2], raw[3]], &[]);
+        refuse([config.as_raw_fd(), raw[1], raw[2], raw[3]], &[]);
+        refuse(raw, &[alias.as_raw_fd()]);
+        files[3]
+            .set_len(0)
+            .expect_err("read-only file cannot truncate");
+        std::fs::write(root.join("3"), []).unwrap();
+        refuse(raw, &[]);
+        drop(files);
+        drop(alias);
+        drop(writable);
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_state_adoption_restores_cloexec_and_keeps_state_out_of_disks() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use std::os::fd::{AsFd, IntoRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+        let root =
+            std::env::temp_dir().join(format!("worker-state-adopt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let (config, _config_writer) = nix::unistd::pipe().unwrap();
+        let (_events_reader, events) = nix::unistd::pipe().unwrap();
+        let (watchdog, _watchdog_writer) = nix::unistd::pipe().unwrap();
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join("lease"))
+            .unwrap();
+        let files: [std::fs::File; 4] = std::array::from_fn(|index| {
+            let path = root.join(index.to_string());
+            std::fs::write(&path, [1_u8; 8]).unwrap();
+            let file = std::fs::File::open(path).unwrap();
+            fcntl(&file, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+            file
+        });
+        let adopted = Bootstrap::adopt_with_state(
+            config.into_raw_fd(),
+            events.into_raw_fd(),
+            watchdog.into_raw_fd(),
+            pty.slave.into_raw_fd(),
+            None,
+            lease.into_raw_fd(),
+            &[],
+            Some(files.map(IntoRawFd::into_raw_fd)),
+            None,
+        )
+        .unwrap();
+        assert!(adopted.raw_handles.is_empty());
+        let state = adopted.state_files.as_ref().unwrap();
+        for fd in [
+            adopted.config.as_fd(),
+            adopted.events.as_fd(),
+            adopted.watchdog.as_fd(),
+            adopted.console.as_fd(),
+            adopted.storage_lease.as_fd(),
+            state.ram.as_fd(),
+            state.layout.as_fd(),
+            state.execution.as_fd(),
+            state.devices.as_fd(),
+        ] {
+            assert!(
+                FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD).unwrap())
+                    .contains(FdFlag::FD_CLOEXEC)
+            );
+        }
+        drop(adopted);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
