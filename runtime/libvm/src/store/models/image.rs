@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::image::{ImageSourceKind, OciImageConfigMetadata};
 
-use super::MachineId;
+use crate::store::models::MachineId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageManifestRecord {
@@ -46,7 +46,6 @@ pub(crate) struct ImageConfigRecord {
 pub(crate) struct ImageLayerRecord {
     pub diff_id: String,
     pub blob_digest: String,
-    pub media_type: String,
     pub compressed_size_bytes: Option<u64>,
     pub uncompressed_size_bytes: Option<u64>,
     pub created_at: i64,
@@ -57,6 +56,8 @@ pub(crate) struct ImageLayerRecord {
 pub(crate) struct ImageManifestLayerRecord {
     pub manifest_digest: String,
     pub layer_diff_id: String,
+    pub layer_blob_digest: String,
+    pub media_type: String,
     pub position: i64,
 }
 
@@ -73,6 +74,8 @@ pub(crate) struct ImageRootfsArtifactRecord {
     pub size_bytes: u64,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    pub stream_id: crate::storage::identity::StreamId,
+    pub conversion_abi: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,4 +100,17 @@ pub(crate) struct OciImageRecord {
     pub layers: Vec<ImageLayerRecord>,
     pub manifest_layers: Vec<ImageManifestLayerRecord>,
     pub artifact: ImageRootfsArtifactRecord,
+}
+
+/// Only outcomes whose bytes and durable deletion jobs remain safely retained
+/// belong here. Corruption, unsafe ownership and failed transactions are errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheCleanupDeferral {
+    ExternalDependency { machine: String, path: PathBuf },
+    ActiveLease { operation_id: uuid::Uuid },
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct CacheRecoveryReport {
+    pub deferred: Vec<CacheCleanupDeferral>,
 }

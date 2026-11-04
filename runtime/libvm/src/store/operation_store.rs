@@ -1,0 +1,1066 @@
+//! Durable closure pins are independent of machine rows and close-only OFD leases.
+//! Registration is short; slow readers retain the returned lease outside roots.
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
+use uuid::Uuid;
+
+use crate::storage::identity::StreamId;
+use crate::storage::locks::StorageLock;
+use crate::storage::pool::StoragePool;
+use crate::store::models::{MachineId, MachineState};
+use crate::store::Store;
+use crate::{LibVmError, MachineStorageRecord, StorageStopOutcome};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RetainedStorageOperation {
+    pub operation_id: Uuid,
+    pub machine_id: MachineId,
+    pub run_id: Uuid,
+    pub storage_generation: u64,
+    pub admitted: bool,
+    pub storage: MachineStorageRecord,
+    pub disks: Vec<vm_spec::Disk>,
+    pub external_resources: Vec<crate::ExternalResource>,
+}
+
+pub(crate) struct LaunchStorageLease {
+    record: RetainedStorageOperation,
+    lease: StorageLock,
+}
+impl std::fmt::Debug for LaunchStorageLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchStorageLease")
+            .field("operation_id", &self.record.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+impl LaunchStorageLease {
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.record.operation_id
+    }
+    pub(crate) fn storage_record(&self) -> &MachineStorageRecord {
+        &self.record.storage
+    }
+    pub(crate) fn lock(&self) -> &StorageLock {
+        &self.lease
+    }
+    pub(crate) fn file_identity(&self) -> std::io::Result<(u64, u64)> {
+        self.lease.file_identity()
+    }
+}
+
+fn invalid(message: impl std::fmt::Display) -> LibVmError {
+    LibVmError::InvalidStorageRecord {
+        record: "storage-operation",
+        message: message.to_string(),
+    }
+}
+fn validate_record(record: &RetainedStorageOperation) -> Result<(), LibVmError> {
+    record
+        .storage
+        .validate_for_machine(record.machine_id.into())?;
+    vm_spec::Storage::validate_disks(&record.disks).map_err(invalid)?;
+    if record.operation_id.is_nil()
+        || record.run_id.is_nil()
+        || Uuid::from(record.machine_id).is_nil()
+        || record.storage_generation != record.storage.storage_generation
+    {
+        return Err(invalid("invalid exact generation identity"));
+    }
+    for resource in &record.external_resources {
+        let path = match resource {
+            crate::ExternalResource::Disk { path, .. } => path,
+            crate::ExternalResource::Share { source, .. } => source,
+        };
+        if !path.is_absolute() {
+            return Err(invalid("retained external resource is not absolute"));
+        }
+    }
+    Ok(())
+}
+fn encode(record: &RetainedStorageOperation) -> Result<String, LibVmError> {
+    validate_record(record)?;
+    let json = serde_json::to_string(record).map_err(|error| invalid(error.to_string()))?;
+    crate::storage::limits::Resource::MetadataPageBytes
+        .check(json.len() as u64)
+        .map_err(crate::storage::StorageError::from)?;
+    Ok(json)
+}
+fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<RetainedStorageOperation, LibVmError> {
+    let json: String = row.try_get("record_json")?;
+    crate::storage::limits::Resource::MetadataPageBytes
+        .check(json.len() as u64)
+        .map_err(crate::storage::StorageError::from)?;
+    let record: RetainedStorageOperation =
+        serde_json::from_str(&json).map_err(|error| invalid(error.to_string()))?;
+    validate_record(&record)?;
+    let id: String = row.try_get("operation_id")?;
+    let machine: String = row.try_get("machine_id")?;
+    let run: String = row.try_get("run_id")?;
+    let generation: i64 = row.try_get("storage_generation")?;
+    let schema: i64 = row.try_get("schema")?;
+    let kind: String = row.try_get("kind")?;
+    let state: String = row.try_get("state")?;
+    if schema != 1
+        || kind != "launch"
+        || state != "prepared"
+        || id != record.operation_id.to_string()
+        || machine != record.machine_id.to_string()
+        || run != record.run_id.to_string()
+        || u64::try_from(generation).ok() != Some(record.storage_generation)
+    {
+        return Err(invalid("indexed operation identity contradicts its record"));
+    }
+    Ok(record)
+}
+const SELECT_LAUNCH_BY_OPERATION: &str = "SELECT operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,CASE WHEN json_valid(record_json,8) THEN json(record_json) ELSE '{}' END AS record_json FROM storage_operation WHERE kind='launch' AND operation_id=?1";
+const SELECT_LAUNCH_BY_MACHINE: &str = "SELECT operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,CASE WHEN json_valid(record_json,8) THEN json(record_json) ELSE '{}' END AS record_json FROM storage_operation WHERE kind='launch' AND machine_id=?1 ORDER BY operation_id";
+
+fn validate_lease_identity(
+    row: &sqlx::sqlite::SqliteRow,
+    lease: &StorageLock,
+) -> Result<(), LibVmError> {
+    validate_lease_metadata(row, lease.file_identity()?)
+}
+
+fn validate_lease_metadata(
+    row: &sqlx::sqlite::SqliteRow,
+    (device, inode): (u64, u64),
+) -> Result<(), LibVmError> {
+    let expected_device: String = row.try_get("file_device")?;
+    let expected_inode: String = row.try_get("file_inode")?;
+    if expected_device != device.to_string() || expected_inode != inode.to_string() {
+        return Err(invalid("stable operation lease inode was replaced"));
+    }
+    Ok(())
+}
+
+pub(crate) fn preflight_launch_storage(
+    storage: &MachineStorageRecord,
+    spec: &vm_spec::VmSpec,
+    images_dir: &std::path::Path,
+) -> Result<(), LibVmError> {
+    storage.validate()?;
+    if let Some(disks) = &spec.storage {
+        disks.validate().map_err(invalid)?;
+    }
+    if let crate::MachineRoot::LinuxOverlay {
+        lower: crate::OverlayLower::FlatExt4 {
+            stream, geometry, ..
+        },
+        ..
+    } = &storage.root
+    {
+        let occurrences = [crate::storage::vmdk::LowerOccurrence::resolved(
+            *stream,
+            images_dir.join("streams/sha256").join(stream.hex()),
+            geometry.length,
+        )];
+        let data_disks = spec
+            .storage
+            .as_ref()
+            .map(|storage| {
+                storage
+                    .disks
+                    .iter()
+                    .filter(|disk| disk.role == vm_spec::DiskRole::Data)
+                    .count()
+            })
+            .unwrap_or(0);
+        crate::storage::vmdk::FlatLowerPlan::new(&occurrences)?.preflight(data_disks as u64)?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoppedCommitCandidate {
+    candidate_machine_id: Option<MachineId>,
+    candidate_snapshot_id: Option<crate::storage::identity::SnapshotId>,
+    directory: Option<CandidateDirectory>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateDirectory {
+    device: String,
+    inode: String,
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn directory_identity(directory: &crate::paths::OwnedDirectory) -> Result<(u64, u64), LibVmError> {
+    let stat = nix::sys::stat::fstat(directory.fd()).map_err(std::io::Error::from)?;
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
+}
+
+fn commit_candidate(json: &str) -> Result<StoppedCommitCandidate, LibVmError> {
+    let candidate: StoppedCommitCandidate = serde_json::from_str(json).map_err(invalid)?;
+    if let Some(directory) = &candidate.directory {
+        for value in [&directory.device, &directory.inode] {
+            if value.parse::<u64>().map_err(invalid)?.to_string() != *value {
+                return Err(invalid(
+                    "candidate directory identity is not canonical decimal",
+                ));
+            }
+        }
+    }
+    match (
+        &candidate.candidate_machine_id,
+        &candidate.candidate_snapshot_id,
+        &candidate.directory,
+    ) {
+        (Some(machine), None, Some(_)) if !Uuid::from(*machine).is_nil() => Ok(candidate),
+        (None, Some(_), None) => Ok(candidate),
+        _ => Err(invalid("committing operation must name exactly one result")),
+    }
+}
+
+/// A cleanup namespace is operation-owned, not a mutable machine slot. The
+/// cleaning catalog root fences new external references until durable removal.
+struct MachineCleanup {
+    parent: Option<crate::paths::OwnedDirectory>,
+    source_name: String,
+    quarantine_name: String,
+    expected: (u64, u64),
+    #[cfg(test)]
+    hook: Option<std::sync::Arc<crate::store::layer_store::tests::WorkerHook>>,
+}
+
+impl MachineCleanup {
+    /// Called with roots held, after the cleaning transition has committed.
+    /// This is one atomic detach, never recursive work or directory fsync.
+    fn detach(&self) -> Result<(), LibVmError> {
+        let Some(parent) = &self.parent else {
+            return Ok(());
+        };
+        let source = parent.open_dir(&self.source_name)?;
+        let quarantine = parent.open_dir(&self.quarantine_name)?;
+        if source.is_some() && quarantine.is_some() {
+            return Err(invalid("both source and cleanup quarantine are occupied"));
+        }
+        if let Some(directory) = source {
+            if directory_identity(&directory)? != self.expected {
+                return Err(invalid("stopped destination directory was replaced"));
+            }
+            crate::storage::pool::rename_component_no_replace(
+                parent,
+                &self.source_name,
+                parent,
+                &self.quarantine_name,
+            )?;
+        } else if let Some(directory) = quarantine {
+            if directory_identity(&directory)? != self.expected {
+                return Err(invalid("cleanup quarantine directory was replaced"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The blocking worker retains the exclusive operation OFD and catalog.
+    /// No root lock or SQL transaction survives into recursive removal/sync.
+    fn remove(&self, home: &std::path::Path) -> Result<(), LibVmError> {
+        if let Some(parent) = &self.parent {
+            if let Some(directory) = parent.open_dir(&self.quarantine_name)? {
+                if directory_identity(&directory)? != self.expected {
+                    return Err(invalid("cleanup quarantine directory was replaced"));
+                }
+                #[cfg(test)]
+                if let Some(hook) = &self.hook {
+                    hook.hit(
+                        crate::store::layer_store::tests::WorkerPoint::CandidateDirectoryVerified,
+                    )?;
+                }
+                parent.remove_open_tree(&self.quarantine_name, &directory)?;
+                drop(directory);
+            }
+            parent.sync()?;
+        } else {
+            crate::paths::OwnedDirectory::open_existing_root(home)?
+                .ok_or_else(|| invalid("candidate catalog home disappeared"))?
+                .sync()?;
+        }
+        Ok(())
+    }
+
+    fn recheck_absence(&self) -> Result<(), LibVmError> {
+        if let Some(parent) = &self.parent {
+            let current = crate::paths::OwnedDirectory::open_existing_root(parent.path())?
+                .ok_or_else(|| invalid("candidate parent disappeared during cleanup"))?;
+            if directory_identity(&current)? != directory_identity(parent)? {
+                return Err(invalid("candidate parent was replaced during cleanup"));
+            }
+            if parent.open_dir(&self.source_name)?.is_some()
+                || parent.open_dir(&self.quarantine_name)?.is_some()
+            {
+                return Err(invalid("candidate namespace changed during cleanup"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Store {
+    pub(crate) async fn check_cleaning_dependencies(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        paths: &crate::store::cache_paths::ConfigurationPaths,
+    ) -> Result<(), LibVmError> {
+        let rows = sqlx::query("SELECT operation_id,json(record_json) AS record_json FROM storage_operation WHERE state='cleaning'")
+            .fetch_all(connection).await?;
+        for row in rows {
+            let operation: Uuid = row
+                .try_get::<String, _>("operation_id")?
+                .parse()
+                .map_err(invalid)?;
+            let candidate = commit_candidate(&row.try_get::<String, _>("record_json")?)?;
+            let machine = candidate
+                .candidate_machine_id
+                .ok_or_else(|| invalid("cleanup root has no machine candidate"))?;
+            let source = paths.machines.join(machine.to_string());
+            let quarantine = paths.machines.join(format!(".retiring-{operation}"));
+            for (resource, directory) in &paths.resources {
+                if [&source, &quarantine].iter().any(|candidate| {
+                    resource.starts_with(candidate)
+                        || (*directory && candidate.starts_with(resource))
+                }) {
+                    return Err(LibVmError::CacheDependency {
+                        machine: format!("cleanup operation {operation}"),
+                        path: resource.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Register the complete consumed closure before any artifact byte is read.
+    /// The original close-only shared OFD moves into the real blocking owner.
+    pub(crate) async fn begin_stopped_operation(
+        &self,
+        kind: &str,
+        streams: &[StreamId],
+        objects: &[crate::storage::identity::ObjectDigest],
+    ) -> Result<(Uuid, StorageLock), LibVmError> {
+        if !matches!(kind, "snapshot" | "fork" | "import") {
+            return Err(invalid("unsupported stopped operation kind"));
+        }
+        let id = Uuid::new_v4();
+        let pool = StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let lease = pool.lease(id)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::insert_stopped_operation(&mut tx, id, kind, &lease, streams, objects).await?;
+        tx.commit().await?;
+        Ok((id, lease))
+    }
+
+    pub(crate) async fn insert_stopped_operation(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: Uuid,
+        kind: &str,
+        lease: &StorageLock,
+        streams: &[StreamId],
+        objects: &[crate::storage::identity::ObjectDigest],
+    ) -> Result<(), LibVmError> {
+        if id.is_nil() || !matches!(kind, "snapshot" | "fork" | "import") {
+            return Err(invalid("invalid stopped operation"));
+        }
+        let (device, inode) = lease.file_identity()?;
+        sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,file_device,file_inode,record_json) VALUES(?1,1,?2,'staging',?3,?4,jsonb('{}'))")
+            .bind(id.to_string()).bind(kind).bind(device.to_string()).bind(inode.to_string()).execute(&mut **tx).await?;
+        for stream in streams {
+            insert_stream(tx, id, stream).await?;
+        }
+        for object in objects {
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) VALUES(?1,?2)")
+                .bind(id.to_string()).bind(object.to_string()).execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Record destination authority before a possibly uncertain machine commit.
+    pub(crate) async fn preserve_stopped_operation(
+        &self,
+        id: Uuid,
+        destination: MachineId,
+    ) -> Result<(), LibVmError> {
+        if Uuid::from(destination).is_nil() {
+            return Err(invalid("nil stopped destination"));
+        }
+        let path = crate::paths::machine_data_dir_in(&self.home, destination);
+        let directory = crate::paths::OwnedDirectory::open_existing_root(&path)?
+            .ok_or_else(|| invalid("stopped destination directory is absent"))?;
+        let (device, inode) = directory_identity(&directory)?;
+        self.preserve_stopped_candidate(
+            id,
+            &serde_json::json!({
+                "candidateMachineId": destination,
+                "directory": {"device": device.to_string(), "inode": inode.to_string()},
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    pub(crate) async fn preserve_snapshot_operation(
+        &self,
+        id: Uuid,
+        destination: crate::storage::identity::SnapshotId,
+    ) -> Result<(), LibVmError> {
+        self.preserve_stopped_candidate(
+            id,
+            &serde_json::json!({"candidateSnapshotId": destination}).to_string(),
+        )
+        .await
+    }
+
+    async fn preserve_stopped_candidate(&self, id: Uuid, json: &str) -> Result<(), LibVmError> {
+        let snapshot = commit_candidate(json)?.candidate_snapshot_id.is_some();
+        let pool = StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let result = sqlx::query("UPDATE storage_operation SET state='committing',record_json=jsonb(?2) WHERE operation_id=?1 AND ((?3 AND kind='snapshot') OR (NOT ?3 AND kind IN ('fork','import'))) AND state='staging'")
+            .bind(id.to_string()).bind(json).bind(snapshot).execute(&self.pool).await?;
+        if result.rows_affected() != 1 {
+            return Err(invalid("stopped operation is not staging"));
+        }
+        Ok(())
+    }
+
+    async fn prepare_stopped_machine_cleanup(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        operation: Uuid,
+        state: &str,
+        machine: MachineId,
+        candidate: &CandidateDirectory,
+    ) -> Result<Option<MachineCleanup>, LibVmError> {
+        let path = crate::paths::machine_data_dir_in(&self.home, machine);
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| invalid("candidate has no parent"))?;
+        let parent = crate::paths::OwnedDirectory::open_existing_root(parent_path)?;
+        let source_name = machine.to_string();
+        let quarantine_name = format!(".retiring-{operation}");
+        let directory = match &parent {
+            Some(parent) => parent.open_dir(&source_name)?,
+            None => None,
+        };
+        let quarantine = match &parent {
+            Some(parent) => parent.open_dir(&quarantine_name)?,
+            None => None,
+        };
+        let expected = (
+            candidate.device.parse::<u64>().map_err(invalid)?,
+            candidate.inode.parse::<u64>().map_err(invalid)?,
+        );
+        for directory in directory.iter().chain(quarantine.iter()) {
+            if directory_identity(directory)? != expected {
+                return Err(invalid(
+                    "stopped candidate or cleanup quarantine was replaced",
+                ));
+            }
+        }
+        if directory.is_some() && quarantine.is_some() {
+            return Err(invalid("both stopped candidate names are occupied"));
+        }
+        if state == "committing" && quarantine.is_some() {
+            return Err(invalid("unowned cleanup quarantine collision"));
+        }
+        let committed = sqlx::query(
+            "SELECT id,name,json(config_json) AS config_json FROM machine_config WHERE id=?1",
+        )
+        .bind(machine.to_string())
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(row) = committed {
+            if state == "cleaning" {
+                return Err(invalid(
+                    "cleanup candidate acquired a committed machine root",
+                ));
+            }
+            let crate::store::row::DbMachineConfig(config) =
+                crate::store::row::DbMachineConfig::from_row_in(&row, &self.home)?;
+            if config.id != machine || directory.is_none() {
+                return Err(invalid(
+                    "committed stopped destination identity is inconsistent",
+                ));
+            }
+            let json = sqlx::query_scalar::<_, String>(
+                "SELECT json(record_json) FROM machine_storage WHERE machine_id=?1",
+            )
+            .bind(machine.to_string())
+            .fetch_one(&mut **tx)
+            .await?;
+            MachineStorageRecord::decode(&json)?.validate_for_machine(machine.into())?;
+            return Ok(None);
+        }
+        let quarantine_path = parent_path.join(&quarantine_name);
+        crate::store::ensure_cache_paths_unreferenced(tx, &[path, quarantine_path], &self.home)
+            .await?;
+        sqlx::query("UPDATE storage_operation SET state='cleaning' WHERE operation_id=?1 AND state IN ('committing','cleaning')")
+            .bind(operation.to_string()).execute(&mut **tx).await?;
+        Ok(Some(MachineCleanup {
+            parent,
+            source_name,
+            quarantine_name,
+            expected,
+            #[cfg(test)]
+            hook: self.layer_hook.clone(),
+        }))
+    }
+
+    /// Completion is metadata only. Dependencies are retired by the existing
+    /// collector after the original OFD and every inherited duplicate close.
+    pub(crate) async fn finish_stopped_operation(&self, id: Uuid) -> Result<(), LibVmError> {
+        let pool = StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let result = sqlx::query("UPDATE storage_operation SET state='committed',record_json=jsonb('{}') WHERE operation_id=?1 AND kind IN ('snapshot','fork','import') AND state IN ('staging','committing','committed')")
+            .bind(id.to_string()).execute(&self.pool).await?;
+        if result.rows_affected() != 1 {
+            return Err(invalid("stopped operation is not active"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn begin_storage_operation_inner(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<StorageLock, LibVmError> {
+        if operation_id.is_nil() {
+            return Err(invalid("storage operation ID is nil"));
+        }
+        let pool = StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let lease = pool.lease(operation_id)?;
+        let (device, inode) = lease.file_identity()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,file_device,file_inode,record_json) VALUES(?1,1,'convert','staging',?2,?3,jsonb('{}'))")
+            .bind(operation_id.to_string()).bind(device.to_string()).bind(inode.to_string()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(lease)
+    }
+
+    /// The producer owns the returned publication roots guard through this
+    /// transaction. A staging row alone never roots unregistered outputs.
+    pub(crate) async fn pin_published_storage_dependencies(
+        &self,
+        operation_id: Uuid,
+        streams: &[StreamId],
+        objects: &[crate::storage::identity::ObjectDigest],
+    ) -> Result<(), LibVmError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','fork','import') AND state='staging')")
+            .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
+        if !active {
+            return Err(invalid(
+                "published dependency has no active registered operation",
+            ));
+        }
+        for stream in streams {
+            insert_stream(&mut tx, operation_id, stream).await?;
+        }
+        for object in objects {
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) VALUES(?1,?2)")
+                .bind(operation_id.to_string()).bind(object.to_string()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Called only by the existing blocking GC owners, before either collector
+    /// walks bytes. Retire pins of abandoned non-launch producers first.
+    pub(crate) async fn retire_abandoned_storage_operations(
+        &self,
+        pool: &StoragePool,
+    ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
+        self.check_operation_recovery(pool).await?;
+        let mut report = crate::store::models::CacheRecoveryReport::default();
+        let mut cursor = String::new();
+        loop {
+            let ids = sqlx::query_scalar::<_,String>("SELECT operation_id FROM storage_operation WHERE operation_id>?1 ORDER BY operation_id LIMIT 256").bind(&cursor).fetch_all(&self.pool).await?;
+            if ids.is_empty() {
+                break;
+            }
+            for operation in ids {
+                cursor = operation;
+                let id = Uuid::parse_str(&cursor).map_err(|error| invalid(error.to_string()))?;
+                let _roots = pool.lock_roots()?;
+                let Some(_lease) = pool.try_exclusive_lease(id)? else {
+                    report
+                        .deferred
+                        .push(crate::store::models::CacheCleanupDeferral::ActiveLease {
+                            operation_id: id,
+                        });
+                    continue;
+                };
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                let row = sqlx::query("SELECT kind,state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1").bind(&cursor).fetch_optional(&mut *tx).await?;
+                if let Some(row) = row {
+                    validate_lease_identity(&row, &_lease)?;
+                    let kind: String = row.try_get("kind")?;
+                    let state: String = row.try_get("state")?;
+                    let mut removed_machine = None;
+                    if matches!(state.as_str(), "committing" | "cleaning") {
+                        let candidate =
+                            commit_candidate(&row.try_get::<String, _>("record_json")?)?;
+                        if let (Some(machine), Some(directory)) =
+                            (candidate.candidate_machine_id, candidate.directory.as_ref())
+                        {
+                            if let Some(cleanup) = self
+                                .prepare_stopped_machine_cleanup(
+                                    &mut tx, id, &state, machine, directory,
+                                )
+                                .await?
+                            {
+                                removed_machine = Some((machine, cleanup));
+                            }
+                        }
+                        // Snapshot candidates contain only immutable pool output.
+                        // Presence and absence both reconcile safely; there is no
+                        // private destination requiring uncommitted cleanup.
+                    }
+                    if let Some((machine, cleanup)) = removed_machine {
+                        let candidate_json: String = row.try_get("record_json")?;
+                        tx.commit().await?;
+                        #[cfg(test)]
+                        if let Some(hook) = &self.layer_hook {
+                            hook.hit(
+                                crate::store::layer_store::tests::WorkerPoint::CandidateAuthorized,
+                            )?;
+                        }
+                        // Commit cleaning authority before the atomic detach.
+                        // A crash rediscovers either canonical or quarantine name.
+                        cleanup.detach()?;
+                        drop(_roots);
+                        #[cfg(test)]
+                        if let Some(hook) = &self.layer_hook {
+                            hook.hit(
+                                crate::store::layer_store::tests::WorkerPoint::CandidateDetached,
+                            )?;
+                        }
+                        cleanup.remove(&self.home)?;
+                        #[cfg(test)]
+                        if let Some(hook) = &self.layer_hook {
+                            hook.hit(
+                                crate::store::layer_store::tests::WorkerPoint::CandidateRemoved,
+                            )?;
+                        }
+                        // FileStore owns a separate blocking lock; the exclusive
+                        // operation OFD and catalog remain ours outside roots.
+                        crate::ssh_ca::delete_scope(
+                            &silo_secrets::FileStore::new(&self.home),
+                            machine,
+                        )
+                        .map_err(std::io::Error::other)?;
+                        let _roots = pool.lock_roots()?;
+                        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                        let current = sqlx::query("SELECT state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1")
+                            .bind(id.to_string()).fetch_one(&mut *tx).await?;
+                        validate_lease_identity(&current, &_lease)?;
+                        if current.try_get::<String, _>("state")? != "cleaning"
+                            || current.try_get::<String, _>("record_json")? != candidate_json
+                        {
+                            return Err(invalid(
+                                "candidate changed during scoped credential cleanup",
+                            ));
+                        }
+                        let appeared: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM machine_config WHERE id=?1)",
+                        )
+                        .bind(machine.to_string())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        if appeared {
+                            return Err(invalid(
+                                "uncommitted candidate acquired a machine root during cleanup",
+                            ));
+                        }
+                        cleanup.recheck_absence()?;
+                        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+                            .bind(id.to_string())
+                            .execute(&mut *tx)
+                            .await?;
+                        tx.commit().await?;
+                        continue;
+                    }
+                    // An exclusive lease alone never reconciles a launch.
+                    if kind != "launch" {
+                        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+                            .bind(&cursor)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+                tx.commit().await?;
+            }
+        }
+        Ok(report)
+    }
+
+    pub(crate) async fn register_launch_storage_inner(
+        &self,
+        machine_id: MachineId,
+        run_id: Uuid,
+        storage: &MachineStorageRecord,
+        spec: &vm_spec::VmSpec,
+    ) -> Result<LaunchStorageLease, LibVmError> {
+        storage.validate_for_machine(machine_id.into())?;
+        preflight_launch_storage(storage, spec, &self.images_dir)?;
+        let machine_directory = crate::paths::machine_data_dir_in(&self.home, machine_id);
+        if !machine_directory.is_absolute() {
+            return Err(invalid("machine directory is not absolute"));
+        }
+        let mut external_resources = crate::ExternalResource::from_spec(spec);
+        for resource in &mut external_resources {
+            let path = match resource {
+                crate::ExternalResource::Disk { path, .. } => path,
+                crate::ExternalResource::Share { source, .. } => source,
+            };
+            if !path.is_absolute() {
+                *path = machine_directory.join(&*path);
+            }
+        }
+        let record = RetainedStorageOperation {
+            operation_id: Uuid::new_v4(),
+            machine_id,
+            run_id,
+            storage_generation: storage.storage_generation,
+            admitted: false,
+            storage: storage.clone(),
+            disks: spec
+                .storage
+                .as_ref()
+                .map(|storage| storage.disks.clone())
+                .unwrap_or_default(),
+            external_resources,
+        };
+        let json = encode(&record)?;
+        let generation = i64::try_from(record.storage_generation)
+            .map_err(|_| invalid("storage generation exceeds SQL range"))?;
+        let pool = StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let lease = pool.lease(record.operation_id)?;
+        let (device, inode) = lease.file_identity()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(machine_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if current
+            .as_deref()
+            .map(MachineStorageRecord::decode)
+            .transpose()?
+            .as_ref()
+            != Some(storage)
+        {
+            return Err(invalid(
+                "machine storage changed before operation registration",
+            ));
+        }
+        let row = sqlx::query(
+            "SELECT id,name,json(config_json) AS config_json FROM machine_config WHERE id=?1",
+        )
+        .bind(machine_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        let crate::store::row::DbMachineConfig(current_config) =
+            crate::store::row::DbMachineConfig::from_row_in(&row, &self.home)?;
+        if &current_config.spec != spec {
+            return Err(invalid(
+                "machine attachments changed before operation registration",
+            ));
+        }
+        sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,record_json) VALUES(?1,1,'launch','prepared',?2,?3,?4,?5,?6,jsonb(?7))")
+            .bind(record.operation_id.to_string()).bind(machine_id.to_string()).bind(run_id.to_string()).bind(generation).bind(device.to_string()).bind(inode.to_string()).bind(json).execute(&mut *tx).await?;
+        let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(storage);
+        for stream in streams {
+            insert_stream(&mut tx, record.operation_id, &stream).await?;
+            // Reuse semantic layer dependencies. No parsing of generated VMDK paths.
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,id FROM layer_result WHERE pack_stream=?2")
+                .bind(record.operation_id.to_string()).bind(stream.to_string()).execute(&mut *tx).await?;
+        }
+        for object in objects {
+            sqlx::query(
+                "INSERT INTO storage_operation_object(operation_id,object_digest) VALUES(?1,?2)",
+            )
+            .bind(record.operation_id.to_string())
+            .bind(object.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(LaunchStorageLease { record, lease })
+    }
+
+    pub(crate) async fn mark_launch_storage_admitted_inner(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<(), LibVmError> {
+        let pool = StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(SELECT_LAUNCH_BY_OPERATION)
+            .bind(operation_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| invalid("launch operation disappeared"))?;
+        let mut record = decode(&row)?;
+        record.admitted = true;
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb(?2) WHERE operation_id=?1")
+            .bind(operation_id.to_string())
+            .bind(encode(&record)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn launch_storage_operations_inner(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Vec<RetainedStorageOperation>, LibVmError> {
+        sqlx::query(SELECT_LAUNCH_BY_MACHINE)
+            .bind(machine_id.to_string())
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(decode)
+            .collect()
+    }
+
+    /// Holder terminality is a lifecycle prerequisite, not inferred from flock.
+    pub(crate) async fn try_retire_launch_storage_inner(
+        &self,
+        operation_id: Uuid,
+        run_id: Uuid,
+        generation: u64,
+        next_state: &MachineState,
+        outcome: StorageStopOutcome,
+    ) -> Result<bool, LibVmError> {
+        if !matches!(
+            next_state.status,
+            crate::store::models::MachineRuntimeState::Stopped
+                | crate::store::models::MachineRuntimeState::Error
+        ) {
+            return Err(invalid(
+                "operation retirement requires a terminal lifecycle state",
+            ));
+        }
+        let pool = StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let Some(_lease) = pool.try_exclusive_lease(operation_id)? else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(SELECT_LAUNCH_BY_OPERATION)
+            .bind(operation_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| invalid("launch operation disappeared before reconciliation"))?;
+        validate_lease_identity(&row, &_lease)?;
+        let record = decode(&row)?;
+        if record.machine_id != next_state.machine_id
+            || record.run_id != run_id
+            || record.storage_generation != generation
+        {
+            return Err(invalid(
+                "reconciliation does not match exact launch generation",
+            ));
+        }
+        let current_state = sqlx::query_as::<_,crate::store::row::DbMachineState>("SELECT machine_id,status,json(state_json) AS state_json FROM machine_state WHERE machine_id=?1")
+            .bind(next_state.machine_id.to_string()).fetch_optional(&mut *tx).await?;
+        if current_state.is_some_and(|crate::store::row::DbMachineState(state)| {
+            state
+                .run_id
+                .as_deref()
+                .is_some_and(|current| Uuid::parse_str(current).ok() != Some(run_id))
+        }) {
+            return Err(invalid("another runtime generation owns the machine state"));
+        }
+        let json: String =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(next_state.machine_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        let mut storage = MachineStorageRecord::decode(&json)?;
+        if storage.storage_generation != generation {
+            return Err(invalid("machine generation changed before reconciliation"));
+        }
+        storage.stop_outcome = outcome;
+        Self::write_machine_storage(&mut tx, next_state.machine_id, &storage).await?;
+        sqlx::query("INSERT INTO machine_state(machine_id,status,state_json) VALUES(?1,?2,jsonb(?3)) ON CONFLICT(machine_id) DO UPDATE SET status=excluded.status,state_json=excluded.state_json")
+            .bind(next_state.machine_id.to_string()).bind(next_state.status.as_str()).bind(Self::serialize("machine_state.state_json",next_state)?).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+            .bind(operation_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Inventory discovery is outside roots; each coordinated metadata batch is
+    /// bounded and performs only nonblocking lease probes.
+    pub(crate) async fn check_operation_recovery(
+        &self,
+        pool: &StoragePool,
+    ) -> Result<(), LibVmError> {
+        let mut ids = pool.scan_leases()?;
+        loop {
+            let batch = ids.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
+            if batch.is_empty() {
+                break;
+            }
+            let _roots = pool.lock_roots()?;
+            for id in batch {
+                let known: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)",
+                )
+                .bind(id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+                if !known && pool.try_exclusive_lease(id)?.is_none() {
+                    return Err(invalid(format!(
+                        "busy lease {id} has no understood operation root"
+                    )));
+                }
+            }
+        }
+        let mut cursor = String::new();
+        loop {
+            let operations = sqlx::query_scalar::<_,String>("SELECT operation_id FROM storage_operation WHERE operation_id>?1 ORDER BY operation_id LIMIT 256")
+                .bind(&cursor).fetch_all(&self.pool).await?;
+            if operations.is_empty() {
+                break;
+            }
+            let _roots = pool.lock_roots()?;
+            for operation in operations {
+                cursor = operation;
+                let row = sqlx::query("SELECT operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,CASE WHEN json_valid(record_json,8) THEN json(record_json) ELSE '{}' END AS record_json FROM storage_operation WHERE operation_id=?1")
+                    .bind(&cursor).fetch_optional(&self.pool).await?;
+                let Some(row) = row else { continue };
+                let id = Uuid::parse_str(&cursor).map_err(|error| invalid(error.to_string()))?;
+                let schema: i64 = row.try_get("schema")?;
+                let kind: String = row.try_get("kind")?;
+                let state: String = row.try_get("state")?;
+                if schema != 1 {
+                    return Err(invalid("unsupported operation schema"));
+                }
+                match kind.as_str() {
+                    "launch" => {
+                        decode(&row)?;
+                    }
+                    "convert" | "snapshot" | "fork" | "import"
+                        if matches!(state.as_str(), "staging" | "committed") =>
+                    {
+                        let json: String = row.try_get("record_json")?;
+                        if json != "{}" {
+                            return Err(invalid("malformed staging operation"));
+                        }
+                    }
+                    "snapshot" | "fork" | "import"
+                        if matches!(state.as_str(), "committing" | "cleaning") =>
+                    {
+                        let candidate =
+                            commit_candidate(&row.try_get::<String, _>("record_json")?)?;
+                        if candidate.candidate_snapshot_id.is_some() != (kind == "snapshot") {
+                            return Err(invalid(
+                                "operation kind contradicts its snapshot candidate",
+                            ));
+                        }
+                        if state == "cleaning" && candidate.candidate_machine_id.is_none() {
+                            return Err(invalid("only a machine candidate can enter cleanup"));
+                        }
+                    }
+                    _ => return Err(invalid("unsupported operation root")),
+                }
+                validate_lease_metadata(&row, pool.operation_lease_identity(id)?)?;
+                if let Some(probe) = pool.try_exclusive_lease(id)? {
+                    validate_lease_identity(&row, &probe)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn insert_stream(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    operation_id: Uuid,
+    stream: &StreamId,
+) -> Result<(), LibVmError> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) VALUES(?1,?2)",
+    )
+    .bind(operation_id.to_string())
+    .bind(stream.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::paths::LocalPaths;
+    use crate::storage::pool::StoragePool;
+    use crate::store::operation_store::{validate_lease_identity, validate_lease_metadata};
+    use crate::store::Store;
+
+    #[tokio::test]
+    async fn stopped_retirement_rejects_exclusive_replacement_ofd_after_pathname_aba() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temp.path().join("home")))
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let (operation, original) = store
+            .begin_stopped_operation("fork", &[], &[])
+            .await
+            .unwrap();
+        let input = temp.path().join("object");
+        std::fs::write(&input, b"retained while the original worker owns its OFD").unwrap();
+        let (object, roots) = pool.publish_object_for_catalog(&input).unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[object.digest])
+            .await
+            .unwrap();
+        drop(roots);
+        let canonical = store
+            .images_dir
+            .join("locks/leases")
+            .join(format!("{operation}.lease"));
+        let saved_original = canonical.with_extension("original");
+        let saved_replacement = canonical.with_extension("replacement");
+        std::fs::rename(&canonical, &saved_original).unwrap();
+        drop(pool.lease(operation).unwrap());
+        let replacement_exclusive = pool.try_exclusive_lease(operation).unwrap().unwrap();
+        assert_ne!(
+            original.file_identity().unwrap(),
+            replacement_exclusive.file_identity().unwrap()
+        );
+        std::fs::rename(&canonical, &saved_replacement).unwrap();
+        std::fs::rename(&saved_original, &canonical).unwrap();
+        let row = sqlx::query(
+            "SELECT file_device,file_inode FROM storage_operation WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        // The restored pathname looks correct, but it is not the acquired EX OFD.
+        validate_lease_metadata(&row, pool.operation_lease_identity(operation).unwrap()).unwrap();
+        assert!(validate_lease_identity(&row, &replacement_exclusive).is_err());
+        validate_lease_identity(&row, &original).unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_object WHERE operation_id=?1 AND object_digest=?2)")
+            .bind(operation.to_string()).bind(object.digest.to_string()).fetch_one(&store.pool).await.unwrap();
+        assert!(pinned);
+        assert!(pool.verify_object(&object.digest).is_ok());
+        drop((replacement_exclusive, original));
+    }
+}

@@ -11,7 +11,7 @@ use crate::store::models::{MachineId, MachineNetworkConfig};
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Persisted machine configuration.
 ///
 /// This is the durable create/update-time record. It is private to the crate and
@@ -27,7 +27,8 @@ pub(crate) struct MachineConfig {
     pub agent_mode: Option<MachineAgent>,
     #[serde(default, skip_serializing_if = "MachineGuestConfig::is_default")]
     pub guest: MachineGuestConfig,
-    #[serde(alias = "instanceDir")]
+    /// Derived from the currently opened catalog home, never persisted authority.
+    #[serde(skip)]
     pub machine_dir: PathBuf,
     pub created_at: i64,
     pub modified_at: i64,

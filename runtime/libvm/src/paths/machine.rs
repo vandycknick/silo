@@ -2,21 +2,20 @@ use std::path::{Path, PathBuf};
 
 use crate::store::models::MachineId;
 
-pub(super) const MACHINES_DIR_NAME: &str = "machines";
-pub(super) const LOGS_DIR_NAME: &str = "logs";
-pub(super) const NETWORK_DIR_NAME: &str = "network";
+pub(crate) const MACHINES_DIR_NAME: &str = "machines";
+pub(crate) const LOGS_DIR_NAME: &str = "logs";
+pub(crate) const NETWORK_DIR_NAME: &str = "network";
 const VM_SPEC_FILE_NAME: &str = "config.json";
 const VMM_PID_FILE_NAME: &str = "vm.pid";
 const VMM_SOCKET_FILE_NAME: &str = "vm.sock";
 const VMM_LOCK_FILE_NAME: &str = "vm.lock";
-pub(super) const VMM_TRACE_LOG_FILE_NAME: &str = "vm.trace.log";
+pub(crate) const VMM_TRACE_LOG_FILE_NAME: &str = "vm.trace.log";
 const VMM_EXIT_STATUS_FILE_NAME: &str = "vm.exit.json";
-pub(super) const SERIAL_LOG_FILE_NAME: &str = "serial.log";
-pub(super) const EXEC_LOG_FILE_NAME: &str = "exec.log";
+pub(crate) const SERIAL_LOG_FILE_NAME: &str = "serial.log";
+pub(crate) const EXEC_LOG_FILE_NAME: &str = "exec.log";
 pub(crate) const NETWORK_SERVICE_LOG_FILE_NAME: &str = "netd.log";
 pub(crate) const NETWORK_AUDIT_LOG_FILE_NAME: &str = "audit.jsonl";
-const ROOT_DISK_FILE_NAME: &str = "rootfs.img";
-const LEGACY_METADATA_CONFIG_FILE_NAME: &str = "metadata.json";
+const ROOT_DISK_FILE_NAME: &str = "root.raw";
 const COMPOSITE_INITRAMFS_FILE_NAME: &str = "initramfs";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +23,10 @@ pub(crate) struct MachinePaths {
     data_dir: PathBuf,
     run_dir: PathBuf,
     logs_dir: PathBuf,
+}
+
+pub(crate) fn machine_data_dir_in(home: &Path, machine_id: MachineId) -> PathBuf {
+    home.join(MACHINES_DIR_NAME).join(machine_id.to_string())
 }
 
 impl MachinePaths {
@@ -57,10 +60,6 @@ impl MachinePaths {
         vm_spec_path_in(&self.data_dir)
     }
 
-    pub(crate) fn metadata_config_path(&self) -> PathBuf {
-        self.data_dir.join(LEGACY_METADATA_CONFIG_FILE_NAME)
-    }
-
     pub(crate) fn composite_initramfs_path(&self) -> PathBuf {
         self.data_dir.join(COMPOSITE_INITRAMFS_FILE_NAME)
     }
@@ -75,6 +74,10 @@ impl MachinePaths {
 
     pub(crate) fn vmm_lock_path(&self) -> PathBuf {
         self.run_dir.join(VMM_LOCK_FILE_NAME)
+    }
+
+    pub(crate) fn vmm_storage_holder_path(&self) -> PathBuf {
+        self.run_dir.join("vm.storage-holder.json")
     }
 
     pub(crate) fn vsock_mux_path(&self, filename: &Path) -> PathBuf {
@@ -159,12 +162,6 @@ mod tests {
                 .join("config.json")
         );
         assert_eq!(
-            paths.metadata_config_path(),
-            PathBuf::from("/tmp/silo/machines")
-                .join(&id)
-                .join("metadata.json")
-        );
-        assert_eq!(
             paths.composite_initramfs_path(),
             PathBuf::from("/tmp/silo/machines")
                 .join(&id)
@@ -242,6 +239,6 @@ mod tests {
                 .join(&id)
                 .join("network/audit.jsonl")
         );
-        assert_eq!(root_disk_relative_path(), PathBuf::from("rootfs.img"));
+        assert_eq!(root_disk_relative_path(), PathBuf::from("root.raw"));
     }
 }

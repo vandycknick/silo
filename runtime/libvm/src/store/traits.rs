@@ -27,6 +27,34 @@ pub(crate) trait ConfigStore: std::fmt::Debug + Send + Sync {
 /// require an existing machine unless a method explicitly says otherwise.
 #[async_trait]
 pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
+    /// Native stopped operations retain the same writable catalog capability.
+    fn native_store(&self) -> Option<crate::store::Store> {
+        None
+    }
+    async fn register_launch_storage(
+        &self,
+        machine_id: MachineId,
+        run_id: uuid::Uuid,
+        storage: &crate::MachineStorageRecord,
+        spec: &vm_spec::VmSpec,
+    ) -> Result<crate::store::operation_store::LaunchStorageLease, LibVmError>;
+    async fn mark_launch_storage_admitted(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> Result<(), LibVmError>;
+    async fn launch_storage_operations(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Vec<crate::store::operation_store::RetainedStorageOperation>, LibVmError>;
+    /// The caller must establish terminality of all exact-run durable holders.
+    async fn try_retire_launch_storage(
+        &self,
+        operation_id: uuid::Uuid,
+        run_id: uuid::Uuid,
+        generation: u64,
+        next_state: &MachineState,
+        outcome: crate::StorageStopOutcome,
+    ) -> Result<bool, LibVmError>;
     /// Atomically inserts a machine config and its initial runtime state.
     ///
     /// Returns `MachineAlreadyExists` when the machine name is already reserved.
@@ -43,6 +71,7 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
         config: &MachineConfig,
         initial_state: &MachineState,
         rootfs: &MachineRootfsRecord,
+        storage: &crate::MachineStorageRecord,
     ) -> Result<(), LibVmError>;
 
     /// Reads runtime state for an existing machine, if a row is present.
@@ -57,6 +86,12 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
         machine_id: MachineId,
     ) -> Result<Option<MachineRootfsRecord>, LibVmError>;
 
+    /// Reads the semantic root, boot, ownership and stop record.
+    async fn machine_storage(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<crate::MachineStorageRecord>, LibVmError>;
+
     /// Upserts runtime state for an existing machine.
     ///
     /// The machine config row must already exist; SQLite enforces that through a
@@ -68,6 +103,13 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
     /// Missing machine IDs return `MachineNotFound`; duplicate names are rejected
     /// by the store's unique constraint.
     async fn save_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError>;
+
+    /// Atomically replaces desired configuration and its semantic storage root.
+    async fn save_machine_config_with_storage(
+        &self,
+        config: &MachineConfig,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<(), LibVmError>;
 
     /// Looks up a machine config by full machine ID.
     async fn machine_config(&self, id: MachineId) -> Result<Option<MachineConfig>, LibVmError>;
@@ -113,8 +155,26 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
 /// Durable image metadata and machine rootfs pin storage.
 #[async_trait]
 pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
+    /// Registers a fresh durable operation before any protected slow work.
+    async fn begin_storage_operation(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> Result<crate::storage::locks::StorageLock, LibVmError>;
     /// Upserts OCI manifest metadata, its mutable reference, layers, and rootfs artifact.
     async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
+
+    /// Retains a verified stream while an operation holds its filesystem lease.
+    async fn retain_storage_stream(
+        &self,
+        stream_id: &crate::storage::identity::StreamId,
+        operation_id: uuid::Uuid,
+    ) -> Result<(), LibVmError>;
+
+    async fn cached_oci_image(
+        &self,
+        reference: &str,
+        platform: &oci::Platform,
+    ) -> Result<Option<OciImageRecord>, LibVmError>;
 
     /// Reads a lightweight image reference by exact reference.
     async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;

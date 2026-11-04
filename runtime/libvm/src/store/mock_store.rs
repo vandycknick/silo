@@ -21,6 +21,10 @@ mock! {
 
     #[async_trait]
     impl MachineStore for DataStore {
+        async fn register_launch_storage(&self, machine_id: MachineId, run_id: uuid::Uuid, storage: &crate::MachineStorageRecord, spec: &vm_spec::VmSpec) -> Result<crate::store::operation_store::LaunchStorageLease, LibVmError>;
+        async fn mark_launch_storage_admitted(&self, operation_id: uuid::Uuid) -> Result<(), LibVmError>;
+        async fn launch_storage_operations(&self, machine_id: MachineId) -> Result<Vec<crate::store::operation_store::RetainedStorageOperation>, LibVmError>;
+        async fn try_retire_launch_storage(&self, operation_id: uuid::Uuid, run_id: uuid::Uuid, generation: u64, next_state: &MachineState, outcome: crate::StorageStopOutcome) -> Result<bool, LibVmError>;
         #[cfg(test)]
         async fn add_machine(
             &self,
@@ -33,6 +37,7 @@ mock! {
             config: &MachineConfig,
             initial_state: &MachineState,
             rootfs: &MachineRootfsRecord,
+            storage: &crate::MachineStorageRecord,
         ) -> Result<(), LibVmError>;
 
         async fn machine_state(
@@ -45,9 +50,20 @@ mock! {
             machine_id: MachineId,
         ) -> Result<Option<MachineRootfsRecord>, LibVmError>;
 
+        async fn machine_storage(
+            &self,
+            machine_id: MachineId,
+        ) -> Result<Option<crate::MachineStorageRecord>, LibVmError>;
+
         async fn save_machine_state(&self, state: &MachineState) -> Result<(), LibVmError>;
 
         async fn save_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError>;
+
+        async fn save_machine_config_with_storage(
+            &self,
+            config: &MachineConfig,
+            storage: &crate::MachineStorageRecord,
+        ) -> Result<(), LibVmError>;
 
         async fn machine_config(
             &self,
@@ -72,7 +88,20 @@ mock! {
 
     #[async_trait]
     impl ImageStore for DataStore {
+        async fn begin_storage_operation(&self, operation_id: uuid::Uuid) -> Result<crate::storage::locks::StorageLock, LibVmError>;
         async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
+
+        async fn retain_storage_stream(
+            &self,
+            stream_id: &crate::storage::identity::StreamId,
+            operation_id: uuid::Uuid,
+        ) -> Result<(), LibVmError>;
+
+        async fn cached_oci_image(
+            &self,
+            reference: &str,
+            platform: &oci::Platform,
+        ) -> Result<Option<OciImageRecord>, LibVmError>;
 
         async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;
 

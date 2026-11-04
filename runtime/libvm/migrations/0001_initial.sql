@@ -5,6 +5,8 @@ CREATE TABLE db_config (
     modified_at         INTEGER NOT NULL
 );
 
+-- Current machine_config JSON has no machineDir field. Private machine paths
+-- are derived from this catalog's current home and its indexed machine ID.
 CREATE TABLE machine_config (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL UNIQUE,
@@ -110,21 +112,24 @@ CREATE TABLE image_config (
 );
 
 CREATE TABLE image_layer (
-    diff_id                 TEXT PRIMARY KEY,
+    diff_id                 TEXT NOT NULL,
     blob_digest             TEXT NOT NULL,
-    media_type              TEXT NOT NULL,
     compressed_size_bytes   INTEGER,
     uncompressed_size_bytes INTEGER,
     created_at              INTEGER NOT NULL,
-    last_used_at            INTEGER
+    last_used_at            INTEGER,
+    PRIMARY KEY (diff_id, blob_digest)
 );
 
 CREATE TABLE image_manifest_layer (
     manifest_digest         TEXT NOT NULL REFERENCES image_manifest(digest) ON DELETE CASCADE,
-    layer_diff_id           TEXT NOT NULL REFERENCES image_layer(diff_id) ON DELETE RESTRICT,
+    layer_diff_id           TEXT NOT NULL,
+    layer_blob_digest       TEXT NOT NULL,
+    media_type              TEXT NOT NULL,
     position                INTEGER NOT NULL,
-    PRIMARY KEY (manifest_digest, layer_diff_id),
-    UNIQUE (manifest_digest, position)
+    PRIMARY KEY (manifest_digest, position),
+    FOREIGN KEY (layer_diff_id, layer_blob_digest) REFERENCES image_layer(diff_id, blob_digest) ON DELETE RESTRICT,
+    CHECK (position >= 0)
 );
 
 CREATE TABLE image_rootfs_artifact (
@@ -138,7 +143,9 @@ CREATE TABLE image_rootfs_artifact (
     rootfs_path             TEXT NOT NULL,
     size_bytes              INTEGER NOT NULL,
     created_at              INTEGER NOT NULL,
-    last_used_at            INTEGER
+    last_used_at            INTEGER,
+    stream_id               TEXT NOT NULL,
+    conversion_abi          TEXT NOT NULL
 );
 
 CREATE TABLE machine_rootfs (
@@ -146,11 +153,9 @@ CREATE TABLE machine_rootfs (
     source_kind             TEXT NOT NULL CHECK (source_kind IN ('oci', 'disk')),
     requested_reference     TEXT NOT NULL,
     selected_reference      TEXT,
-    manifest_digest         TEXT REFERENCES image_manifest(digest) ON DELETE RESTRICT,
+    manifest_digest         TEXT,
     config_digest           TEXT,
     image_id                TEXT,
-    root_disk_path          TEXT NOT NULL,
-    root_disk_size_bytes    INTEGER NOT NULL,
     created_at              INTEGER NOT NULL
 );
 
@@ -201,3 +206,124 @@ BEFORE UPDATE OF created_at ON machine_rootfs
 BEGIN
     SELECT RAISE(ABORT, 'machine_rootfs.created_at is immutable');
 END;
+
+CREATE TABLE machine_storage (
+    machine_id TEXT PRIMARY KEY NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
+    record_json BLOB NOT NULL
+);
+
+
+CREATE TABLE storage_operation (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    schema INTEGER NOT NULL CHECK (schema = 1),
+    kind TEXT NOT NULL CHECK (kind IN ('import', 'convert', 'snapshot', 'fork', 'relocate', 'update-boot-assets', 'launch')),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'staging', 'committing', 'cleaning', 'committed', 'aborted')),
+    machine_id TEXT,
+    run_id TEXT,
+    storage_generation INTEGER,
+    file_device TEXT NOT NULL,
+    file_inode TEXT NOT NULL,
+    record_json BLOB NOT NULL,
+    CHECK (kind != 'launch' OR (machine_id IS NOT NULL AND run_id IS NOT NULL AND storage_generation IS NOT NULL AND storage_generation >= 0))
+);
+CREATE INDEX storage_operation_machine_idx ON storage_operation(machine_id);
+CREATE TABLE storage_operation_stream (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    stream_id TEXT NOT NULL,
+    PRIMARY KEY (operation_id, stream_id)
+);
+CREATE INDEX storage_operation_stream_reverse_idx ON storage_operation_stream(stream_id, operation_id);
+CREATE TABLE storage_operation_object (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    object_digest TEXT NOT NULL,
+    PRIMARY KEY (operation_id, object_digest)
+);
+CREATE INDEX storage_operation_object_reverse_idx ON storage_operation_object(object_digest, operation_id);
+
+CREATE TABLE image_stream_gc (
+    stream_id TEXT PRIMARY KEY NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0)
+);
+
+CREATE TABLE layer_recipe (
+    id TEXT PRIMARY KEY NOT NULL,
+    diff_id TEXT NOT NULL,
+    record_digest TEXT NOT NULL,
+    record_bytes BLOB NOT NULL
+);
+CREATE TABLE layer_result (
+    id TEXT PRIMARY KEY NOT NULL,
+    recipe_id TEXT NOT NULL UNIQUE REFERENCES layer_recipe(id) ON DELETE RESTRICT,
+    pack_stream TEXT NOT NULL,
+    pack_length INTEGER NOT NULL CHECK (pack_length >= 0),
+    index_root TEXT NOT NULL,
+    record_digest TEXT NOT NULL,
+    record_bytes BLOB NOT NULL
+);
+CREATE TABLE layer_object_dependency (
+    result_id TEXT NOT NULL REFERENCES layer_result(id) ON DELETE CASCADE,
+    object_digest TEXT NOT NULL,
+    PRIMARY KEY (result_id, object_digest)
+);
+CREATE INDEX layer_object_dependency_digest_idx
+ON layer_object_dependency(object_digest, result_id);
+CREATE TABLE layer_occurrence_set (
+    owner_digest TEXT PRIMARY KEY NOT NULL,
+    layer_count INTEGER NOT NULL CHECK (layer_count >= 0 AND layer_count <= 1024)
+);
+CREATE TABLE layer_occurrence (
+    owner_digest TEXT NOT NULL REFERENCES layer_occurrence_set(owner_digest) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0 AND position < 1024),
+    result_id TEXT NOT NULL REFERENCES layer_result(id) ON DELETE RESTRICT,
+    PRIMARY KEY (owner_digest, position)
+);
+CREATE TABLE storage_operation_layer (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    result_id TEXT NOT NULL REFERENCES layer_result(id) ON DELETE RESTRICT,
+    PRIMARY KEY (operation_id, result_id)
+);
+CREATE INDEX storage_operation_layer_reverse_idx ON storage_operation_layer(result_id, operation_id);
+CREATE TRIGGER layer_recipe_immutable BEFORE UPDATE ON layer_recipe
+BEGIN SELECT RAISE(ABORT, 'layer recipe is immutable'); END;
+CREATE TRIGGER layer_result_immutable BEFORE UPDATE ON layer_result
+BEGIN SELECT RAISE(ABORT, 'layer result is immutable'); END;
+CREATE TRIGGER layer_dependency_immutable BEFORE UPDATE ON layer_object_dependency
+BEGIN SELECT RAISE(ABORT, 'layer dependency is immutable'); END;
+CREATE TRIGGER layer_occurrence_set_immutable BEFORE UPDATE ON layer_occurrence_set
+BEGIN SELECT RAISE(ABORT, 'layer occurrence set is immutable'); END;
+CREATE TRIGGER layer_occurrence_immutable BEFORE UPDATE ON layer_occurrence
+BEGIN SELECT RAISE(ABORT, 'layer occurrence is immutable'); END;
+
+-- Current immutable stopped-storage artifacts. Names are image: aliases;
+-- explicit retention is independent of every alias.
+CREATE TABLE storage_snapshot (
+    id TEXT PRIMARY KEY NOT NULL,
+    record_digest TEXT NOT NULL,
+    record_bytes BLOB NOT NULL,
+    retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE image_alias (
+    name TEXT PRIMARY KEY NOT NULL,
+    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE RESTRICT
+);
+CREATE INDEX image_alias_snapshot_idx ON image_alias(snapshot_id);
+CREATE TABLE snapshot_stream_dependency (
+    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
+    stream_id TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, stream_id)
+);
+CREATE INDEX snapshot_stream_reverse_idx ON snapshot_stream_dependency(stream_id, snapshot_id);
+CREATE TABLE snapshot_object_dependency (
+    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
+    object_digest TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, object_digest)
+);
+CREATE INDEX snapshot_object_reverse_idx ON snapshot_object_dependency(object_digest, snapshot_id);
+CREATE TRIGGER storage_snapshot_identity_immutable
+BEFORE UPDATE OF id, record_digest, record_bytes, created_at ON storage_snapshot
+BEGIN SELECT RAISE(ABORT, 'snapshot identity is immutable'); END;
+CREATE TRIGGER snapshot_stream_dependency_immutable BEFORE UPDATE ON snapshot_stream_dependency
+BEGIN SELECT RAISE(ABORT, 'snapshot stream dependency is immutable'); END;
+CREATE TRIGGER snapshot_object_dependency_immutable BEFORE UPDATE ON snapshot_object_dependency
+BEGIN SELECT RAISE(ABORT, 'snapshot object dependency is immutable'); END;

@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 #[cfg(test)]
 use crate::paths::LocalPaths;
+use crate::store::catalog_guard::CatalogGuard;
 #[cfg(test)]
 use crate::store::models::DbConfig;
 #[cfg(test)]
@@ -17,11 +18,20 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     pub(super) pool: SqlitePool,
-    /// `<home>/images`, where cached rootfs artifacts live; `state.db` is `<home>/state.db`.
+    pub(super) home: PathBuf,
+    /// `<home>/images`, the immutable pool; `state.db` is `<home>/state.db`.
     pub(super) images_dir: PathBuf,
+    /// Explicit capability for detached filesystem workers, independent of
+    /// SqlitePool::close; native connections retain their own clone as well.
+    pub(super) catalog: std::sync::Arc<CatalogGuard>,
+    #[cfg(test)]
+    pub(super) layer_hook: Option<std::sync::Arc<crate::store::layer_store::tests::WorkerHook>>,
 }
 
 impl Store {
+    pub(crate) fn home_path(&self) -> &Path {
+        &self.home
+    }
     #[cfg(test)]
     pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
         let store = Self::open(&paths.state_db_path()).await?;
@@ -33,6 +43,13 @@ impl Store {
     pub(crate) async fn execute_test_sql(&self, statement: &'static str) -> Result<(), LibVmError> {
         sqlx::raw_sql(statement).execute(&self.pool).await?;
         Ok(())
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn storage_operation_count(&self) -> Result<i64, LibVmError> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     #[cfg(test)]
@@ -48,28 +65,90 @@ impl Store {
             ))
         })?;
         std::fs::create_dir_all(home)?;
-        let pool = Self::connect(state_db_path).await?;
-        MIGRATOR.run(&pool).await?;
-        Ok(Self {
+        let guard = CatalogGuard::writable(home).await?;
+        let pool = Self::connect_guarded(state_db_path, guard.clone()).await?;
+        if let Err(error) = MIGRATOR.run(&pool).await {
+            pool.close().await;
+            return Err(match error {
+                sqlx::migrate::MigrateError::VersionMismatch(_)
+                | sqlx::migrate::MigrateError::VersionMissing(_) => {
+                    LibVmError::StateDatabaseIncompatible { source: error }
+                }
+                other => other.into(),
+            });
+        }
+        let store = Self {
             pool,
+            home: home.to_path_buf(),
             images_dir: home.join("images"),
-        })
+            catalog: guard,
+            #[cfg(test)]
+            layer_hook: None,
+        };
+        match store.recover_image_cache().await {
+            Ok(report) => {
+                for deferred in report.deferred {
+                    tracing::warn!(
+                        ?deferred,
+                        "image cache cleanup deferred; bytes and pending jobs retained"
+                    );
+                }
+            }
+            Err(error) => {
+                store.pool.close().await;
+                return Err(error);
+            }
+        }
+        Ok(store)
     }
 
+    #[cfg(test)]
     async fn connect(path: &Path) -> Result<SqlitePool, LibVmError> {
-        let options = Self::sqlite_options(path);
-        Ok(SqlitePoolOptions::new()
+        let home = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("state database has no parent"))?;
+        let guard = CatalogGuard::writable(home).await?;
+        Self::connect_guarded(path, guard).await
+    }
+
+    async fn connect_guarded(
+        path: &Path,
+        guard: std::sync::Arc<CatalogGuard>,
+    ) -> Result<SqlitePool, LibVmError> {
+        let expected = match crate::storage::identity_file::FileIdentity::from_path(path) {
+            Ok(identity) => Some(identity),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let options = CatalogGuard::attach_sqlite(guard, Self::sqlite_options(path));
+        let pool = SqlitePoolOptions::new()
             .acquire_timeout(Duration::from_secs(30))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    // Native SQLite ownership of catalog.lock is installed
+                    // before these database-touching PRAGMAs can run.
+                    sqlx::raw_sql("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
+                        .execute(connection).await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
-            .await?)
+            .await?;
+        if let Some(expected) = expected {
+            if expected != crate::storage::identity_file::FileIdentity::from_path(path)? {
+                pool.close().await;
+                return Err(
+                    std::io::Error::other("state database changed identity while opening").into(),
+                );
+            }
+        }
+        Ok(pool)
     }
 
     fn sqlite_options(path: &Path) -> SqliteConnectOptions {
         SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5))
     }
@@ -77,51 +156,69 @@ impl Store {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReadOnlyStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl ReadOnlyStore {
     pub(crate) async fn open_if_exists(state_db_path: &Path) -> Result<Option<Self>, LibVmError> {
-        match std::fs::metadata(state_db_path) {
-            Ok(metadata) if metadata.is_file() => {}
+        let metadata = match std::fs::symlink_metadata(state_db_path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() >= 100 => metadata,
             Ok(_) => {
-                return Err(std::io::Error::other("state database is not a regular file").into())
+                return Err(std::io::Error::other(
+                    "state database is not a regular initialized SQLite file",
+                )
+                .into())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
-        }
-        let mut wal_name = state_db_path.as_os_str().to_os_string();
-        wal_name.push("-wal");
-        if std::fs::exists(std::path::Path::new(&wal_name))? {
-            return Err(std::io::Error::other(format!(
-                "state database {} has an active WAL and cannot be planned without local writes",
-                state_db_path.display()
-            ))
-            .into());
-        }
-
-        let options = SqliteConnectOptions::new()
-            .filename(state_db_path)
-            .read_only(true)
-            .immutable(true)
-            .create_if_missing(false)
-            .busy_timeout(Duration::from_secs(5));
+        };
+        let identity = crate::storage::identity_file::FileIdentity::from_metadata(&metadata);
+        let home = state_db_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("state database has no parent"))?;
+        let guard = CatalogGuard::readonly(home)?;
+        let options = CatalogGuard::attach_sqlite(
+            guard,
+            SqliteConnectOptions::new()
+                .filename(state_db_path)
+                .read_only(true)
+                .create_if_missing(false)
+                .shared_cache(false)
+                .busy_timeout(Duration::from_secs(5)),
+        );
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(30))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA query_only = ON")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await?;
-        validate_embedded_migration_history(&pool).await?;
+        if identity != crate::storage::identity_file::FileIdentity::from_path(state_db_path)? {
+            pool.close().await;
+            return Err(
+                std::io::Error::other("state database changed identity while opening").into(),
+            );
+        }
+        if let Err(error) = validate_embedded_migration_history(&pool).await {
+            pool.close().await;
+            return Err(error);
+        }
         Ok(Some(Self { pool }))
     }
 
     pub(crate) async fn db_config(
         &self,
     ) -> Result<Option<crate::store::models::DbConfig>, LibVmError> {
-        let row = sqlx::query("SELECT os FROM db_config WHERE id = 1")
+        let os = sqlx::query_scalar::<_, String>("SELECT os FROM db_config WHERE id = 1")
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|row| crate::store::models::DbConfig { os: row.get("os") }))
+        Ok(os.map(|os| crate::store::models::DbConfig { os }))
     }
 
     pub(crate) async fn machine_name_exists(&self, name: &str) -> Result<bool, LibVmError> {
@@ -135,7 +232,9 @@ impl ReadOnlyStore {
     }
 }
 
-async fn validate_embedded_migration_history(pool: &SqlitePool) -> Result<(), LibVmError> {
+pub(crate) async fn validate_embedded_migration_history(
+    pool: &SqlitePool,
+) -> Result<(), LibVmError> {
     let rows = sqlx::query(
         "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version",
     )
@@ -146,25 +245,24 @@ async fn validate_embedded_migration_history(pool: &SqlitePool) -> Result<(), Li
         return Err(LibVmError::StateDecode {
             field: "state_db.migrations",
             message: format!(
-                "applied migration count {} does not match embedded migration count {}",
+                "incompatible state: applied migration count {} does not match embedded migration count {}; reinstall Silo and explicitly wipe state",
                 rows.len(),
                 expected.len()
             ),
         });
     }
     for (row, migration) in rows.iter().zip(expected) {
-        let version: i64 = row.get("version");
-        let description: String = row.get("description");
-        let success: bool = row.get("success");
-        let checksum: Vec<u8> = row.get("checksum");
+        let version: i64 = row.try_get("version")?;
+        let description: String = row.try_get("description")?;
+        let success: bool = row.try_get("success")?;
+        let checksum: Vec<u8> = row.try_get("checksum")?;
         if version != migration.version
             || description != migration.description
             || !success
             || migration.checksum != checksum
         {
-            return Err(LibVmError::StateDecode {
-                field: "state_db.migrations",
-                message: format!("migration {version} does not match the embedded schema"),
+            return Err(LibVmError::StateDatabaseIncompatible {
+                source: sqlx::migrate::MigrateError::VersionMismatch(version),
             });
         }
     }
@@ -189,6 +287,13 @@ mod tests {
     };
     use crate::store::{MachineStore, NetworkStore, Store};
     use crate::LibVmError;
+
+    mod logical_catalog {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/live_catalog.rs"
+        ));
+    }
 
     fn temp_paths() -> (tempfile::TempDir, LocalPaths) {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -401,7 +506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_migration_history_is_rejected() {
+    async fn incompatible_schema_refusal_preserves_existing_state() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let state_db = dir.path().join("state.db");
         std::fs::File::create(&state_db).expect("create old state database");
@@ -429,15 +534,38 @@ mod tests {
         .execute(&pool)
         .await
         .expect("record old migration");
+        sqlx::query("CREATE TABLE owner_data (value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO owner_data VALUES ('must survive refusal')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retained_file = dir.path().join("owner-root.raw");
+        std::fs::write(&retained_file, b"owner bytes").unwrap();
         pool.close().await;
 
         let error = Store::open(&state_db)
             .await
             .expect_err("old state database must not be adopted");
-        assert!(
-            error.to_string().contains("migration") || error.to_string().contains("checksum"),
-            "unexpected migration rejection: {error}"
-        );
+        assert!(matches!(
+            error,
+            LibVmError::StateDatabaseIncompatible { .. }
+        ));
+        assert!(error.to_string().contains("reinstall"));
+        assert!(error.to_string().contains("wipe"));
+        let retained = sqlx::SqlitePool::connect(&format!("sqlite://{}", state_db.display()))
+            .await
+            .unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM owner_data")
+            .fetch_one(&retained)
+            .await
+            .unwrap();
+        assert_eq!(value, "must survive refusal");
+        retained.close().await;
+        assert_eq!(std::fs::read(retained_file).unwrap(), b"owner bytes");
+        assert!(state_db.is_file());
     }
 
     #[tokio::test]
@@ -486,7 +614,7 @@ mod tests {
             manifest_digest: Some("sha256:manifest".to_string()),
             config_digest: Some("sha256:config".to_string()),
             image_id: Some("sha256:image-id".to_string()),
-            root_disk_path: paths.machine(id).dir().join("rootfs.img"),
+            root_disk_path: paths.machine(id).dir().join("root.raw"),
             root_disk_size_bytes: 64 * 1024 * 1024,
             created_at: 7,
         };
@@ -495,6 +623,12 @@ mod tests {
             &machine,
             &machine_state(id, MachineRuntimeState::Stopped),
             &rootfs,
+            &crate::MachineStorageRecord::opaque_raw(
+                crate::PrivatePath::new("root.raw").unwrap(),
+                rootfs.root_disk_size_bytes,
+                &oci::Platform::host().unwrap(),
+            )
+            .unwrap(),
         )
         .await
         .expect("insert machine rootfs pin");
@@ -1352,5 +1486,1358 @@ mod tests {
             .expect("should find machine from other connection");
 
         assert_eq!(found.id, id);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_connections_use_wal_full_and_fullfsync() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let mut first = db.pool.acquire().await.unwrap();
+        let mut second = db.pool.acquire().await.unwrap();
+        for connection in [&mut first, &mut second] {
+            let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            let fullfsync: i64 = sqlx::query_scalar("PRAGMA fullfsync")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            assert_eq!(journal, "wal");
+            assert_eq!(sync, 2);
+            assert_eq!(fullfsync, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_planning_excludes_writers_and_outliving_pool_clones() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = db.pool.clone();
+        drop(db);
+        assert!(
+            crate::store::ReadOnlyStore::open_if_exists(&paths.state_db_path())
+                .await
+                .is_err()
+        );
+        pool.close().await;
+        drop(pool);
+        let readonly = crate::store::ReadOnlyStore::open_if_exists(&paths.state_db_path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(readonly.db_config().await.unwrap().is_some());
+        // Writers cannot acquire even their first connection during read-only planning.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Store::open(&paths.state_db_path())
+        )
+        .await
+        .is_err());
+        let readonly_pool = readonly.pool.clone();
+        drop(readonly);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Store::open(&paths.state_db_path())
+        )
+        .await
+        .is_err());
+        readonly_pool.close().await;
+        drop(readonly_pool);
+        Store::open(&paths.state_db_path())
+            .await
+            .unwrap()
+            .close()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_history_dry_run_preserves_logical_catalog_and_noncatalog_state() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET version = 999")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.close().await;
+        let identity =
+            crate::storage::identity_file::FileIdentity::from_path(&paths.state_db_path()).unwrap();
+        let entries = || {
+            std::fs::read_dir(paths.home())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| !matches!(name.to_str(), Some("state.db-wal" | "state.db-shm")))
+                .collect::<BTreeSet<_>>()
+        };
+        let before = entries();
+        let logical_before = logical_catalog::snapshot(paths.home()).await;
+        let error = crate::store::ReadOnlyStore::open_if_exists(&paths.state_db_path())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LibVmError::StateDatabaseIncompatible { .. }
+        ));
+        assert_eq!(entries(), before);
+        assert_eq!(
+            logical_catalog::snapshot(paths.home()).await,
+            logical_before
+        );
+        assert_eq!(
+            crate::storage::identity_file::FileIdentity::from_path(&paths.state_db_path()).unwrap(),
+            identity
+        );
+        let pool = Store::connect(&paths.state_db_path()).await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 999);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM db_config")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn storage_insert_failure_rolls_back_machine_state_and_provenance() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        db.execute_test_sql("CREATE TRIGGER reject_storage BEFORE INSERT ON machine_storage BEGIN SELECT RAISE(ABORT, 'reject storage'); END;").await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "atomic".to_string(), paths.machine(id).dir());
+        let rootfs = MachineRootfsRecord {
+            machine_id: id,
+            source_kind: crate::ImageSourceKind::Disk,
+            requested_reference: "/input.raw".to_string(),
+            selected_reference: None,
+            manifest_digest: None,
+            config_digest: None,
+            image_id: None,
+            root_disk_path: config.machine_dir.join("root.raw"),
+            root_disk_size_bytes: 512,
+            created_at: 1,
+        };
+        let storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        assert!(db
+            .add_machine_with_rootfs(
+                &config,
+                &machine_state(id, MachineRuntimeState::Stopped),
+                &rootfs,
+                &storage
+            )
+            .await
+            .is_err());
+        for (table, query) in [
+            ("machine_config", "SELECT count(*) FROM machine_config"),
+            ("machine_state", "SELECT count(*) FROM machine_state"),
+            ("machine_rootfs", "SELECT count(*) FROM machine_rootfs"),
+            ("machine_storage", "SELECT count(*) FROM machine_storage"),
+        ] {
+            let count: i64 = sqlx::query_scalar(query).fetch_one(&db.pool).await.unwrap();
+            assert_eq!(count, 0, "partial row in {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_operation_fence_round_trip_and_invalid_update_are_atomic() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        seed_machine(
+            &db,
+            &machine_from_path(id, "fenced".to_string(), paths.machine(id).dir()),
+        )
+        .await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        let operation = uuid::Uuid::new_v4();
+        storage.operation = Some(crate::StorageOperationRecord {
+            id: operation,
+            kind: crate::StorageOperationKind::Relocate,
+            state: crate::StorageOperationState::Prepared,
+            machine_id: Some(id.into()),
+            ownership_epoch: 0,
+        });
+        storage.relocation_operation = Some(operation);
+        storage.fence = Some(crate::FenceRecord {
+            operation,
+            ownership_epoch: 0,
+            state: crate::FenceState::Prepared,
+        });
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(db.machine_storage(id).await.unwrap(), Some(storage.clone()));
+        let mut invalid = storage.clone();
+        invalid.fence.as_mut().unwrap().ownership_epoch = 1;
+        let mut tx = db.pool.begin().await.unwrap();
+        assert!(matches!(
+            Store::write_machine_storage(&mut tx, id, &invalid).await,
+            Err(LibVmError::InvalidStorageRecord { .. })
+        ));
+        tx.rollback().await.unwrap();
+        assert_eq!(db.machine_storage(id).await.unwrap(), Some(storage));
+    }
+
+    #[tokio::test]
+    async fn cache_dependency_preflight_covers_relative_disks_boot_symlinks_and_shares() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "dependencies".to_string(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let candidate = paths.images_dir().join("streams/sha256/retained");
+        std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        std::fs::write(&candidate, [0x64; 512]).unwrap();
+        // A source string is provenance only and cannot retain evictable bytes.
+        config.image_ref = candidate.display().to_string();
+        seed_machine(&db, &config).await;
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        crate::store::ensure_cache_paths_unreferenced(
+            &mut tx,
+            std::slice::from_ref(&candidate),
+            &db.home,
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                crate::machine::root_storage::disk(
+                    "root.raw",
+                    vm_spec::DiskRole::Root,
+                    512,
+                    "silo-root".into(),
+                )
+                .unwrap(),
+                vm_spec::Disk {
+                    path: "../../images/streams/sha256/retained".into(),
+                    role: vm_spec::DiskRole::Data,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                    read_only: false,
+                },
+            ],
+        });
+        db.save_machine_config(&config).await.unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(matches!(
+            crate::store::ensure_cache_paths_unreferenced(
+                &mut tx,
+                std::slice::from_ref(&candidate),
+                &db.home,
+            )
+            .await,
+            Err(LibVmError::CacheDependency { .. })
+        ));
+        tx.rollback().await.unwrap();
+        config.spec.storage = None;
+        let alias = paths.home().join("kernel-alias");
+        std::os::unix::fs::symlink(&candidate, &alias).unwrap();
+        config.spec.boot = Some(vm_spec::Boot {
+            kernel: Some(vm_spec::Kernel {
+                path: Some(alias),
+                initramfs: None,
+                cmdline: Vec::new(),
+            }),
+            userdata: None,
+        });
+        db.save_machine_config(&config).await.unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(crate::store::ensure_cache_paths_unreferenced(
+            &mut tx,
+            std::slice::from_ref(&candidate),
+            &db.home,
+        )
+        .await
+        .is_err());
+        tx.rollback().await.unwrap();
+        config.spec.boot = None;
+        config.spec.mounts.push(vm_spec::Mount {
+            source: paths.images_dir().to_path_buf(),
+            tag: "/images".into(),
+            read_only: true,
+        });
+        db.save_machine_config(&config).await.unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(crate::store::ensure_cache_paths_unreferenced(
+            &mut tx,
+            std::slice::from_ref(&candidate),
+            &db.home,
+        )
+        .await
+        .is_err());
+        tx.rollback().await.unwrap();
+        assert_eq!(std::fs::metadata(candidate).unwrap().len(), 512);
+    }
+
+    #[tokio::test]
+    async fn path_identity_preserves_sqlite_writer_locks_across_processes() {
+        const PROBE: &str = "SILO_STORE_IDENTITY_LOCK_PROBE";
+        if let Some(path) = std::env::var_os(PROBE) {
+            let pool = Store::connect(Path::new(&path)).await.unwrap();
+            let mut connection = pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA busy_timeout = 50")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            let result = sqlx::query("UPDATE lock_probe SET value = value + 1")
+                .execute(&mut *connection)
+                .await;
+            let blocked = std::env::var_os("SILO_STORE_EXPECT_BLOCKED").is_some();
+            if blocked {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(&error, sqlx::Error::Database(error) if error.code().is_some_and(|code| code == "5" || code == "SQLITE_BUSY"))
+                );
+            } else {
+                result.unwrap();
+            }
+            drop(connection);
+            pool.close().await;
+            return;
+        }
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        db.execute_test_sql(
+            "CREATE TABLE lock_probe(value INTEGER NOT NULL); INSERT INTO lock_probe VALUES (0);",
+        )
+        .await
+        .unwrap();
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE lock_probe SET value = 10")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            crate::storage::identity_file::FileIdentity::from_path(&paths.state_db_path()).unwrap();
+        }
+        let test = concat!(
+            module_path!(),
+            "::path_identity_preserves_sqlite_writer_locks_across_processes"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env(PROBE, paths.state_db_path())
+            .env("SILO_STORE_EXPECT_BLOCKED", "1");
+        let child = command.output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        tx.commit().await.unwrap();
+        let child = command
+            .env_remove("SILO_STORE_EXPECT_BLOCKED")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        let value: i64 = sqlx::query_scalar("SELECT value FROM lock_probe")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 11);
+    }
+
+    #[tokio::test]
+    async fn selected_geometry_and_config_update_commit_or_rollback_together() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "resized".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        config.root_disk_size = Some(1024);
+        db.save_machine_config(&config).await.unwrap();
+        let selected = db.machine_storage(id).await.unwrap().unwrap();
+        assert!(matches!(
+            selected.root,
+            crate::MachineRoot::OpaqueRaw {
+                geometry: vm_spec::DiskGeometry { length: 1024, .. },
+                ..
+            }
+        ));
+        let mut invalid = config.clone();
+        invalid.name = "must-not-commit".to_string();
+        invalid.root_disk_size = Some(513);
+        assert!(matches!(
+            db.save_machine_config(&invalid).await,
+            Err(LibVmError::Storage(crate::storage::StorageError::Bound(_)))
+        ));
+        assert_eq!(db.machine_config(id).await.unwrap(), Some(config));
+        assert_eq!(db.machine_storage(id).await.unwrap(), Some(selected));
+    }
+
+    #[tokio::test]
+    async fn malformed_or_missing_new_format_storage_is_a_typed_observation_error() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        seed_machine(
+            &db,
+            &machine_from_path(id, "corrupt-storage".to_string(), paths.machine(id).dir()),
+        )
+        .await;
+        sqlx::query("UPDATE machine_storage SET record_json = x'ff' WHERE machine_id = ?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let error = db.machine_storage(id).await.unwrap_err();
+        assert!(matches!(error, LibVmError::InvalidStorageRecord { .. }));
+        assert!(error.is_machine_observation_error());
+        sqlx::query("DELETE FROM machine_storage WHERE machine_id = ?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let error = db.machine_storage(id).await.unwrap_err();
+        assert!(matches!(error, LibVmError::InvalidStorageRecord { .. }));
+        assert!(error.is_machine_observation_error());
+        assert!(db
+            .machine_storage(MachineId::new())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn deferred_cache_recovery_does_not_strand_private_roots() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let source = paths.home().join("source.raw");
+        std::fs::write(&source, [0x64; 512]).unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        let id = MachineId::new();
+        let mut config =
+            machine_from_path(id, "independent-root".to_string(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let private_root = config.machine_dir.join("root.raw");
+        std::fs::write(&private_root, [0x65; 512]).unwrap();
+        std::fs::set_permissions(&private_root, std::fs::Permissions::from_mode(0o600)).unwrap();
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                vm_spec::Disk {
+                    path: "root.raw".into(),
+                    role: vm_spec::DiskRole::Root,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-root").unwrap(),
+                    read_only: false,
+                },
+                vm_spec::Disk {
+                    path: stream.path.clone(),
+                    role: vm_spec::DiskRole::Data,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                    read_only: true,
+                },
+            ],
+        });
+        seed_machine(&db, &config).await;
+        sqlx::query("INSERT INTO image_stream_gc (stream_id, size_bytes) VALUES (?1, 512)")
+            .bind(stream.id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(roots);
+        db.close().await;
+        let reopened = Store::open(&paths.state_db_path()).await.unwrap();
+        assert_eq!(reopened.machine_config(id).await.unwrap(), Some(config));
+        assert!(reopened.machine_storage(id).await.unwrap().is_some());
+        assert_eq!(std::fs::read(private_root).unwrap(), [0x65; 512]);
+        assert!(stream.path.is_file());
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM image_stream_gc")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
+        assert!(matches!(
+            crate::store::ImageStore::prune_images(&reopened).await,
+            Err(LibVmError::CacheDependency { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn corrupt_recovery_metadata_remains_a_fatal_startup_error() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let id = MachineId::new();
+        let config =
+            machine_from_path(id, "retained-on-error".to_string(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let private = config.machine_dir.join("root.raw");
+        std::fs::write(&private, [0x65; 512]).unwrap();
+        seed_machine(&db, &config).await;
+        sqlx::query("INSERT INTO image_stream_gc (stream_id, size_bytes) VALUES ('invalid-stream-identity', 512)")
+            .execute(&db.pool).await.unwrap();
+        db.close().await;
+        Store::open(&paths.state_db_path())
+            .await
+            .expect_err("corrupt recovery metadata must not be downgraded to a deferral");
+        let inspected = Store::connect(&paths.state_db_path()).await.unwrap();
+        let job: String = sqlx::query_scalar("SELECT stream_id FROM image_stream_gc")
+            .fetch_one(&inspected)
+            .await
+            .unwrap();
+        assert_eq!(job, "invalid-stream-identity");
+        let machines: i64 = sqlx::query_scalar("SELECT count(*) FROM machine_config")
+            .fetch_one(&inspected)
+            .await
+            .unwrap();
+        assert_eq!(machines, 1);
+        assert_eq!(std::fs::read(private).unwrap(), [0x65; 512]);
+        inspected.close().await;
+        drop(pool);
+    }
+
+    #[tokio::test]
+    async fn object_recovery_defers_persisted_disk_kernel_and_directory_mount_dependencies() {
+        for dependency in ["disk", "kernel", "mount"] {
+            let (_dir, paths) = temp_paths();
+            let db = Store::new(&paths).await.unwrap();
+            let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+            let source = paths.home().join("object-source");
+            std::fs::write(&source, [0x21; 512]).unwrap();
+            let protected = pool.publish_object(&source).unwrap();
+            std::fs::write(&source, [0x22; 512]).unwrap();
+            let orphan = pool.publish_object(&source).unwrap();
+            let unrelated_stream = pool.publish_stream(&source).unwrap();
+            let id = MachineId::new();
+            let mut config =
+                machine_from_path(id, format!("object-{dependency}"), paths.machine(id).dir());
+            std::fs::create_dir_all(&config.machine_dir).unwrap();
+            let private = config.machine_dir.join("root.raw");
+            std::fs::write(&private, [0x23; 512]).unwrap();
+            config.spec.storage = Some(vm_spec::Storage {
+                disks: vec![vm_spec::Disk {
+                    path: private.clone(),
+                    role: vm_spec::DiskRole::Root,
+                    format: vm_spec::DiskFormat::Raw,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: vm_spec::BlockId::new("silo-root").unwrap(),
+                    read_only: false,
+                }],
+            });
+            match dependency {
+                "disk" => config
+                    .spec
+                    .storage
+                    .as_mut()
+                    .unwrap()
+                    .disks
+                    .push(vm_spec::Disk {
+                        path: protected.path.clone(),
+                        role: vm_spec::DiskRole::Data,
+                        format: vm_spec::DiskFormat::Raw,
+                        geometry: vm_spec::DiskGeometry {
+                            length: 512,
+                            logical_sector_size: 512,
+                        },
+                        block_id: vm_spec::BlockId::new("silo-data-0").unwrap(),
+                        read_only: true,
+                    }),
+                "kernel" => {
+                    config.spec.boot = Some(vm_spec::Boot {
+                        kernel: Some(vm_spec::Kernel {
+                            path: Some(protected.path.clone()),
+                            initramfs: None,
+                            cmdline: vec![],
+                        }),
+                        userdata: None,
+                    })
+                }
+                _ => config.spec.mounts.push(vm_spec::Mount {
+                    source: protected.path.parent().unwrap().to_path_buf(),
+                    tag: "/retained-objects".into(),
+                    read_only: true,
+                }),
+            }
+            seed_machine(&db, &config).await;
+            let report = db.recover_image_cache().await.unwrap();
+            assert!(
+                matches!(report.deferred.as_slice(),[crate::store::models::CacheCleanupDeferral::ExternalDependency{machine,..}] if machine==&id.to_string())
+            );
+            assert_eq!(std::fs::read(&protected.path).unwrap(), [0x21; 512]);
+            // Recovery preflights a complete bounded batch before deleting any
+            // member; a protected member conservatively defers its batch peers.
+            assert!(orphan.path.exists());
+            db.close().await;
+            let reopened = Store::open(&paths.state_db_path()).await.unwrap();
+            assert_eq!(reopened.machine_config(id).await.unwrap(), Some(config));
+            assert!(reopened.machine_storage(id).await.unwrap().is_some());
+            assert_eq!(std::fs::read(private).unwrap(), [0x23; 512]);
+            assert_eq!(std::fs::read(protected.path).unwrap(), [0x21; 512]);
+            assert!(orphan.path.exists());
+            assert!(unrelated_stream.path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn vmdk_semantic_machine_roots_survive_prune_recovery_and_release_last_reference() {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("source");
+        std::fs::write(&source, [0x42; 512]).unwrap();
+        let lower = pool.publish_stream(&source).unwrap();
+        let mut configs = Vec::new();
+        sqlx::query("INSERT INTO image_manifest(digest,media_type,image_id,platform_os,platform_architecture,config_digest,layer_count,total_size_bytes,created_at) VALUES('sha256:flat-manifest','application/vnd.oci.image.manifest.v1+json','sha256:flat-image','linux','amd64','sha256:flat-config',0,512,1)")
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO image_ref(requested_reference,selected_reference,manifest_digest,created_at,updated_at) VALUES('example.test/flat:latest','example.test/flat@sha256:flat-manifest','sha256:flat-manifest',1,1)")
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO image_rootfs_artifact(image_id,manifest_digest,config_digest,platform_os,platform_architecture,filesystem,rootfs_path,size_bytes,created_at,stream_id,conversion_abi) VALUES('sha256:flat-image','sha256:flat-manifest','sha256:flat-config','linux','amd64','ext4',?1,512,1,?2,?3)")
+            .bind(lower.path.to_str().unwrap()).bind(lower.id.to_string()).bind(crate::image::oci::CONVERSION_ABI)
+            .execute(&db.pool).await.unwrap();
+        let mut uuids = std::collections::HashSet::new();
+        let lower_uuid = uuid::Uuid::new_v4();
+        for index in 0..2 {
+            let id = MachineId::new();
+            let mut config =
+                machine_from_path(id, format!("overlay-{index}"), paths.machine(id).dir());
+            std::fs::create_dir_all(&config.machine_dir).unwrap();
+            let capacity = 64 * 1024 * 1024;
+            let upper = disk_image::ext4::upper::format_upper(
+                &config.machine_dir.join("upper.raw"),
+                rootfs_spec::upper_geometry::UpperCapacity::new(capacity).unwrap(),
+            )
+            .unwrap();
+            assert!(uuids.insert(upper.uuid));
+            config.root_disk_size = Some(capacity);
+            config.spec.storage = Some(vm_spec::Storage {
+                disks: vec![
+                    crate::machine::root_storage::disk(
+                        "lower.vmdk",
+                        vm_spec::DiskRole::RootLower,
+                        512,
+                        "silo-root-lower".into(),
+                    )
+                    .unwrap(),
+                    crate::machine::root_storage::disk(
+                        "upper.raw",
+                        vm_spec::DiskRole::RootUpper,
+                        capacity,
+                        "silo-root-upper".into(),
+                    )
+                    .unwrap(),
+                ],
+            });
+            seed_machine(&db, &config).await;
+            let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+            storage.root = crate::MachineRoot::LinuxOverlay {
+                lower: crate::OverlayLower::FlatExt4 {
+                    stream: lower.id,
+                    geometry: vm_spec::DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    filesystem_uuid: lower_uuid,
+                },
+                upper: crate::PrivatePath::new("upper.raw").unwrap(),
+                upper_uuid: upper.uuid,
+                capacity,
+                ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
+                overlay_profile: crate::OverlayProfile::SiloOverlayV1,
+                temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
+            };
+            storage.profile = crate::StorageProfile::LinuxOverlayV1;
+            storage.backend = crate::BackendRequirement::KrunOverlay;
+            if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
+                *root_selector = crate::RootSelector::ManagedOverlay;
+            }
+            db.save_machine_config_with_storage(&config, &storage)
+                .await
+                .unwrap();
+            configs.push(config);
+        }
+        db.remove_image(
+            "example.test/flat:latest",
+            crate::ImageRemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+        // No image alias, descriptor or operation lease retains this stream.
+        // Even an already queued collection must obey the semantic machine roots.
+        sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) VALUES(?1,512)")
+            .bind(lower.id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.prune_images().await.unwrap();
+        assert_eq!(std::fs::read(&lower.path).unwrap(), [0x42; 512]);
+        db.close().await;
+        let db = Store::open(&paths.state_db_path()).await.unwrap();
+        assert!(lower.path.exists());
+        db.remove_machine(&configs[0]).await.unwrap();
+        db.prune_images().await.unwrap();
+        assert!(lower.path.exists());
+        db.remove_machine(&configs[1]).await.unwrap();
+        db.prune_images().await.unwrap();
+        assert!(!lower.path.exists());
+    }
+
+    #[tokio::test]
+    async fn launch_operation_survives_cancellation_and_retires_exact_generation_atomically() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "retained-launch".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let run = uuid::Uuid::new_v4();
+        let owner = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        let duplicate = owner.lock().duplicate_inheritable().unwrap();
+        let identity = owner.file_identity().unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        drop(owner);
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        drop(duplicate);
+        let operations = db.launch_storage_operations(id).await.unwrap();
+        assert_eq!(operations.len(), 1);
+        assert!(!operations[0].admitted);
+        db.mark_launch_storage_admitted(operation).await.unwrap();
+        assert!(db.launch_storage_operations(id).await.unwrap()[0].admitted);
+        let mut next = machine_state(id, MachineRuntimeState::Stopped);
+        next.updated_at = 7;
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                uuid::Uuid::new_v4(),
+                storage.storage_generation,
+                &next,
+                crate::StorageStopOutcome::Forced
+            )
+            .await
+            .is_err());
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        sqlx::query("CREATE TRIGGER reject_retirement BEFORE UPDATE ON machine_state BEGIN SELECT RAISE(ABORT,'retirement interrupted'); END")
+            .execute(&db.pool).await.unwrap();
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &next,
+                crate::StorageStopOutcome::Forced
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+            storage.stop_outcome
+        );
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        sqlx::query("DROP TRIGGER reject_retirement")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .try_retire_launch_storage(
+                operation,
+                run,
+                storage.storage_generation,
+                &next,
+                crate::StorageStopOutcome::Forced
+            )
+            .await
+            .unwrap());
+        assert!(db.launch_storage_operations(id).await.unwrap().is_empty());
+        assert_eq!(db.machine_state(id).await.unwrap().unwrap(), next);
+        assert_eq!(
+            db.machine_storage(id).await.unwrap().unwrap().stop_outcome,
+            crate::StorageStopOutcome::Forced
+        );
+        assert_eq!(
+            pool.try_exclusive_lease(operation)
+                .unwrap()
+                .unwrap()
+                .file_identity()
+                .unwrap(),
+            identity
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_pins_and_external_constraints_survive_machine_row_deletion() {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("stream-source");
+        std::fs::write(&source, [9; 512]).unwrap();
+        let stream = pool.publish_stream(&source).unwrap();
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "operation-only".into(), paths.machine(id).dir());
+        config.spec.mounts.push(vm_spec::Mount {
+            source: paths.images_dir().join("streams"),
+            tag: "foreign-share".into(),
+            read_only: true,
+        });
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let owner = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        sqlx::query("DELETE FROM machine_config WHERE id=?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        assert!(matches!(
+            db.prune_images().await,
+            Err(LibVmError::CacheDependency { .. })
+        ));
+        assert_eq!(std::fs::read(&stream.path).unwrap(), [9; 512]);
+        drop(owner);
+        // Free lease is not permission to forget a launch's durable resources.
+        assert!(db.prune_images().await.is_err());
+        assert_eq!(db.launch_storage_operations(id).await.unwrap().len(), 1);
+        let _exclusive = pool.try_exclusive_lease(operation).unwrap().unwrap();
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+            .bind(operation.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(_exclusive);
+        db.prune_images().await.unwrap();
+        assert!(!stream.path.exists());
+    }
+
+    #[tokio::test]
+    async fn unknown_busy_or_missing_operation_lease_fails_recovery_closed() {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("source");
+        std::fs::write(&source, [3; 512]).unwrap();
+        let stream = pool.publish_stream(&source).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        let lease = pool.lease(operation).unwrap();
+        assert!(db.prune_images().await.is_err());
+        assert!(stream.path.exists());
+        assert!(db
+            .retain_storage_stream(&stream.id, operation)
+            .await
+            .is_err());
+        drop(lease);
+        let operation = uuid::Uuid::new_v4();
+        let lease = db.begin_storage_operation(operation).await.unwrap();
+        db.retain_storage_stream(&stream.id, operation)
+            .await
+            .unwrap();
+        drop(lease);
+        let path = paths
+            .images_dir()
+            .join("locks/leases")
+            .join(format!("{operation}.lease"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(db.prune_images().await.is_err());
+        assert!(!path.exists());
+        assert!(stream.path.exists());
+    }
+
+    #[tokio::test]
+    async fn launch_snapshot_pins_managed_data_and_boot_objects_without_machine_roots() {
+        use crate::store::ImageStore;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("source");
+        std::fs::write(&source, [7; 512]).unwrap();
+        let stream = pool.publish_stream(&source).unwrap();
+        let object = pool.publish_object(&source).unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "closure-pins".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        storage.disks.push(crate::IncludedDisk {
+            id: uuid::Uuid::new_v4(),
+            role: vm_spec::DiskRole::Data,
+            order: 1,
+            storage: crate::DiskStorage::ManagedReadOnly {
+                stream: stream.id,
+                geometry: vm_spec::DiskGeometry {
+                    length: 512,
+                    logical_sector_size: 512,
+                },
+            },
+        });
+        if let crate::BootProfile::LinuxDirect {
+            binding,
+            kernel_architecture,
+            ..
+        } = &mut storage.boot
+        {
+            *binding = crate::BootBinding::Pinned {
+                kernel: object.digest,
+                base_initramfs: object.digest,
+                agent: Some(object.digest),
+                architecture: *kernel_architecture,
+                abi: "unit-bundle-v1".into(),
+            };
+        } else {
+            panic!("fixture must use LinuxDirect");
+        }
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        // Committed semantic roots protect the same projection before launch.
+        db.prune_images().await.unwrap();
+        assert!(object.path.exists());
+        assert!(stream.path.exists());
+        let owner = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        let op = owner.operation_id();
+        let duplicate = owner.lock().duplicate_inheritable().unwrap();
+        sqlx::query("DELETE FROM machine_config WHERE id=?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(owner);
+        db.prune_images().await.unwrap();
+        assert_eq!(std::fs::read(&stream.path).unwrap(), [7; 512]);
+        assert_eq!(std::fs::read(&object.path).unwrap(), [7; 512]);
+        let links: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage_operation_object WHERE operation_id=?1",
+        )
+        .bind(op.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(links, 1);
+        drop(duplicate);
+        // Launch roots remain until explicit terminal reconciliation, not EX alone.
+        db.prune_images().await.unwrap();
+        assert!(stream.path.exists());
+        assert!(object.path.exists());
+        let _terminal = pool.try_exclusive_lease(op).unwrap().unwrap();
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+            .bind(op.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(_terminal);
+        db.prune_images().await.unwrap();
+        assert!(!stream.path.exists());
+        assert!(!object.path.exists());
+    }
+
+    #[tokio::test]
+    async fn replaced_lease_inode_and_malformed_launch_closure_never_authorize_gc() {
+        use crate::store::ImageStore;
+        use std::os::unix::fs::OpenOptionsExt;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("source");
+        std::fs::write(&source, [4; 512]).unwrap();
+        let stream = pool.publish_stream(&source).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        let lease = db.begin_storage_operation(operation).await.unwrap();
+        db.retain_storage_stream(&stream.id, operation)
+            .await
+            .unwrap();
+        let path = paths
+            .images_dir()
+            .join("locks/leases")
+            .join(format!("{operation}.lease"));
+        let displaced = paths.home().join("displaced-lease");
+        std::fs::rename(&path, &displaced).unwrap();
+        let replacement = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(db.prune_images().await.is_err());
+        assert!(stream.path.exists());
+        drop(replacement);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&displaced, &path).unwrap();
+        drop(lease);
+        let id = MachineId::new();
+        let config = machine_from_path(id, "malformed-closure".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let owner = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        let json: String = sqlx::query_scalar(
+            "SELECT json(record_json) FROM storage_operation WHERE operation_id=?1",
+        )
+        .bind(owner.operation_id().to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let mut malformed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        malformed["storageGeneration"] = serde_json::json!(storage.storage_generation + 1);
+        sqlx::query("UPDATE storage_operation SET record_json=jsonb(?2) WHERE operation_id=?1")
+            .bind(owner.operation_id().to_string())
+            .bind(malformed.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.prune_images().await.is_err());
+        assert!(stream.path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roots_waiters_keep_current_thread_executor_available_for_sql_owners() {
+        use crate::store::ImageStore;
+        use std::time::Duration;
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "concurrent-roots".into(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let run = uuid::Uuid::new_v4();
+        let owner = db
+            .register_launch_storage(id, run, &storage, &config.spec)
+            .await
+            .unwrap();
+        let operation = owner.operation_id();
+        drop(owner);
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let source = paths.home().join("concurrent-source");
+        std::fs::write(&source, [8; 512]).unwrap();
+        let stream = pool.publish_stream(&source).unwrap();
+        let stream_operation = uuid::Uuid::new_v4();
+        let _stream_lease = db.begin_storage_operation(stream_operation).await.unwrap();
+        for phase in ["register", "admit", "retain", "retire"] {
+            let images = paths.images_dir().to_path_buf();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, resume) = std::sync::mpsc::channel();
+            // A real OS deadline releases roots even in the regressed code,
+            // where synchronous flock would prevent Tokio timers from firing.
+            let holder = std::thread::spawn(move || {
+                let pool = crate::storage::pool::StoragePool::open(&images).unwrap();
+                let roots = pool.lock_roots().unwrap();
+                entered.send(()).unwrap();
+                let executor_responsive = resume.recv_timeout(Duration::from_secs(3)).is_ok();
+                drop(roots);
+                executor_responsive
+            });
+            ready.await.unwrap();
+            let worker = db.clone();
+            let storage = storage.clone();
+            let spec = config.spec.clone();
+            let stream_id = stream.id;
+            let task = tokio::spawn(async move {
+                match phase {
+                    "register" => worker
+                        .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &spec)
+                        .await
+                        .map(drop),
+                    "admit" => worker.mark_launch_storage_admitted(operation).await,
+                    "retain" => {
+                        worker
+                            .retain_storage_stream(&stream_id, stream_operation)
+                            .await
+                    }
+                    "retire" => worker
+                        .try_retire_launch_storage(
+                            operation,
+                            run,
+                            storage.storage_generation,
+                            &machine_state(id, MachineRuntimeState::Stopped),
+                            crate::StorageStopOutcome::Unknown,
+                        )
+                        .await
+                        .map(|retired| assert!(retired)),
+                    _ => unreachable!("closed test phase"),
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let sent_while_coordinated = release.send(()).is_ok();
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                holder.join().unwrap(),
+                "{phase} blocked the SQL executor on flock"
+            );
+            assert!(sent_while_coordinated);
+            result.unwrap();
+        }
+    }
+
+    async fn add_catalog_relative_raw_fixture(
+        store: &Store,
+        paths: &LocalPaths,
+        name: &str,
+    ) -> MachineConfig {
+        use std::os::unix::fs::PermissionsExt;
+        let id = MachineId::new();
+        let config = machine_from_path(id, name.into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let disk = config.machine_dir.join("root.raw");
+        std::fs::write(&disk, [0x51; 512]).unwrap();
+        std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let rootfs = MachineRootfsRecord {
+            machine_id: id,
+            source_kind: crate::ImageSourceKind::Disk,
+            requested_reference: "source-provenance.raw".into(),
+            selected_reference: None,
+            manifest_digest: None,
+            config_digest: None,
+            image_id: None,
+            root_disk_path: disk,
+            root_disk_size_bytes: 512,
+            created_at: 1,
+        };
+        store
+            .add_machine_with_rootfs(
+                &config,
+                &machine_state(id, MachineRuntimeState::Stopped),
+                &rootfs,
+                &storage,
+            )
+            .await
+            .unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn whole_home_rename_derives_all_machine_read_paths_from_current_catalog() {
+        use crate::store::observation::ObservationStore;
+        let temporary = tempfile::tempdir().unwrap();
+        let old_home = temporary.path().join("old catalog home");
+        let new_home = temporary.path().join("moved catalog home");
+        let original_paths = LocalPaths::new(&old_home);
+        let store = Store::new(&original_paths).await.unwrap();
+        let original =
+            add_catalog_relative_raw_fixture(&store, &original_paths, "relocated-machine").await;
+        let id = original.id;
+        let before = logical_catalog::snapshot(&old_home).await;
+        store.close().await;
+        std::fs::rename(&old_home, &new_home).unwrap();
+        // A different real inode at the former spelling must never become
+        // private-machine authority after opening the relocated catalog.
+        std::fs::create_dir_all(&original.machine_dir).unwrap();
+        std::fs::write(original.machine_dir.join("root.raw"), [0x72; 512]).unwrap();
+        let expected = crate::paths::machine_data_dir_in(&new_home, id);
+        let references = [
+            id.to_string(),
+            original.name.clone(),
+            id.to_string()[..8].to_string(),
+        ];
+        let observer = ObservationStore::open(&new_home.join("state.db"))
+            .await
+            .unwrap();
+        for reference in &references {
+            let (config, state) = observer
+                .lookup(&crate::machine::MachineRef::parse(reference.clone()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(config.machine_dir, expected);
+            assert_eq!(state.machine_id, id);
+            assert_eq!(
+                std::fs::read(config.machine_dir.join("root.raw")).unwrap(),
+                [0x51; 512]
+            );
+        }
+        observer.close().await.unwrap();
+        assert_eq!(logical_catalog::snapshot(&new_home).await, before);
+        let store = Store::open(&new_home.join("state.db")).await.unwrap();
+        let mut decoded = vec![
+            store.machine_config(id).await.unwrap().unwrap(),
+            store
+                .machine_config_by_name(&original.name)
+                .await
+                .unwrap()
+                .unwrap(),
+        ];
+        decoded.extend(
+            store
+                .machine_configs_by_id_prefix(&id.to_string()[..8])
+                .await
+                .unwrap(),
+        );
+        decoded.extend(store.list_machine_configs().await.unwrap());
+        decoded.extend(
+            store
+                .machine_inventory()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.config.unwrap()),
+        );
+        for config in decoded {
+            assert_eq!(config.machine_dir, expected);
+        }
+        let rootfs = store.machine_rootfs(id).await.unwrap().unwrap();
+        assert_eq!(rootfs.root_disk_path, expected.join("root.raw"));
+        assert_eq!(std::fs::read(&rootfs.root_disk_path).unwrap(), [0x51; 512]);
+        assert_eq!(
+            std::fs::read(original.machine_dir.join("root.raw")).unwrap(),
+            [0x72; 512]
+        );
+        let observer = ObservationStore::existing(&store);
+        assert_eq!(
+            observer
+                .lookup(&crate::machine::MachineRef::parse(original.name.clone()).unwrap())
+                .await
+                .unwrap()
+                .0
+                .machine_dir,
+            expected
+        );
+        observer.close().await.unwrap();
+        assert_eq!(logical_catalog::snapshot(&new_home).await, before);
+        let config = store.machine_config(id).await.unwrap().unwrap();
+        let storage = store.machine_storage(id).await.unwrap().unwrap();
+        let owner = store
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn foreign_machine_directory_is_never_persisted_or_accepted_as_json_authority() {
+        use crate::store::observation::ObservationStore;
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temporary.path().join("catalog home"));
+        let store = Store::new(&paths).await.unwrap();
+        let mut config = add_catalog_relative_raw_fixture(&store, &paths, "foreign-dir").await;
+        let expected = config.machine_dir.clone();
+        let foreign = temporary.path().join("foreign machine dir");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("root.raw"), [0x73; 512]).unwrap();
+        config.machine_dir = foreign.clone();
+        store.save_machine_config(&config).await.unwrap();
+        let json: String =
+            sqlx::query_scalar("SELECT json(config_json) FROM machine_config WHERE id=?1")
+                .bind(config.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("machineDir").is_none());
+        assert_eq!(
+            store
+                .machine_config(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .machine_dir,
+            expected
+        );
+        assert_eq!(
+            store
+                .machine_rootfs(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .root_disk_path,
+            expected.join("root.raw")
+        );
+        // A persisted absolute spelling is not an old-shape reader or a
+        // relocation hint: it is invalid in the current closed schema.
+        value["machineDir"] = serde_json::json!(foreign);
+        sqlx::query("UPDATE machine_config SET config_json=jsonb(?2) WHERE id=?1")
+            .bind(config.id.to_string())
+            .bind(value.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.machine_config(config.id).await.is_err());
+        assert!(store.machine_config_by_name(&config.name).await.is_err());
+        assert!(store
+            .machine_configs_by_id_prefix(&config.id.to_string()[..8])
+            .await
+            .is_err());
+        assert!(store.list_machine_configs().await.is_err());
+        assert!(store
+            .machine_inventory()
+            .await
+            .unwrap()
+            .remove(0)
+            .config
+            .is_err());
+        let before = logical_catalog::snapshot(paths.home()).await;
+        let observer = ObservationStore::open(&paths.state_db_path())
+            .await
+            .unwrap();
+        for reference in [
+            config.id.to_string(),
+            config.name.clone(),
+            config.id.to_string()[..8].to_string(),
+        ] {
+            assert!(observer
+                .lookup(&crate::machine::MachineRef::parse(reference).unwrap())
+                .await
+                .is_err());
+        }
+        observer.close().await.unwrap();
+        assert_eq!(logical_catalog::snapshot(paths.home()).await, before);
+        assert_eq!(
+            std::fs::read(foreign.join("root.raw")).unwrap(),
+            [0x73; 512]
+        );
+        assert_eq!(
+            std::fs::read(expected.join("root.raw")).unwrap(),
+            [0x51; 512]
+        );
     }
 }

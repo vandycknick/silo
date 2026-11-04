@@ -16,12 +16,12 @@ pub(crate) struct DbNetworkAttachment(pub(crate) NetworkAttachment);
 pub(crate) struct DbNetworkInstance(pub(crate) NetworkInstance);
 pub(crate) struct DbNetworkDefinition(pub(crate) NetworkDefinition);
 
-impl<'row> FromRow<'row, SqliteRow> for DbMachineConfig {
-    fn from_row(row: &'row SqliteRow) -> sqlx::Result<Self> {
+impl DbMachineConfig {
+    pub(crate) fn from_row_in(row: &SqliteRow, home: &std::path::Path) -> sqlx::Result<Self> {
         let id_str: String = row.try_get("id")?;
         let id = parse_machine_id(&id_str, "machine_config.id")?;
         let name: String = row.try_get("name")?;
-        let config: MachineConfig =
+        let mut config: MachineConfig =
             deserialize_json(row.try_get("config_json")?, "machine_config.config_json")?;
         if config.id != id {
             return Err(column_decode_error(
@@ -41,6 +41,7 @@ impl<'row> FromRow<'row, SqliteRow> for DbMachineConfig {
                 )),
             ));
         }
+        config.machine_dir = crate::paths::machine_data_dir_in(home, id);
         Ok(Self(config))
     }
 }
