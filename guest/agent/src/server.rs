@@ -3,18 +3,19 @@ use std::io;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use tokio::sync::Semaphore;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY, VMADDR_CID_HOST};
 use tracing::{Instrument, Span};
 
 pub struct RunningServer {
     task: Option<JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl RunningServer {
-    pub fn abort_handle(&self) -> Option<AbortHandle> {
-        self.task.as_ref().map(JoinHandle::abort_handle)
+    pub fn shutdown_handle(&self) -> watch::Sender<bool> {
+        self.shutdown.clone()
     }
 
     pub async fn wait(mut self) -> Result<(), tokio::task::JoinError> {
@@ -22,6 +23,15 @@ impl RunningServer {
             task.await
         } else {
             Ok(())
+        }
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        self.shutdown.send_replace(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -63,25 +73,37 @@ where
         let handler = self.handler;
         let concurrency = self.concurrency;
         let span = self.span;
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
 
         let task = tokio::spawn(
             async move {
                 let mut incoming = listener.incoming();
                 let semaphore = Arc::new(Semaphore::new(concurrency));
+                let mut handlers = tokio::task::JoinSet::new();
 
                 loop {
-                    match incoming.next().await {
+                    let connection = tokio::select! {
+                        connection = incoming.next() => connection,
+                        _ = shutdown_rx.changed() => break,
+                        Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "vsock handler stopped");
+                            }
+                            continue;
+                        }
+                    };
+                    match connection {
                         Some(Ok(stream)) if stream.peer_addr().is_ok_and(|peer| peer.cid() == VMADDR_CID_HOST) => {
-                            let permit = match Arc::clone(&semaphore).acquire_owned().await {
-                                Ok(permit) => permit,
-                                Err(err) => {
-                                    tracing::warn!(error = %err, "semaphore closed while accepting connection");
-                                    break;
-                                }
+                            let permit = tokio::select! {
+                                permit = Arc::clone(&semaphore).acquire_owned() => match permit {
+                                    Ok(permit) => permit,
+                                    Err(_) => break,
+                                },
+                                _ = shutdown_rx.changed() => break,
                             };
 
                             let handler = handler.clone();
-                            tokio::spawn(async move {
+                            handlers.spawn(async move {
                                 let _permit = permit;
                                 if let Err(err) = handler(stream).await {
                                     tracing::error!(error = %err, "connection handler failed");
@@ -97,10 +119,15 @@ where
                         None => break,
                     }
                 }
+                handlers.abort_all();
+                while handlers.join_next().await.is_some() {}
             }
             .instrument(span),
         );
 
-        Ok(RunningServer { task: Some(task) })
+        Ok(RunningServer {
+            task: Some(task),
+            shutdown,
+        })
     }
 }

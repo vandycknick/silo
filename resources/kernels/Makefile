@@ -63,8 +63,10 @@ WORKLOAD_CONFIG_FRAGMENTS := \
 RPROBE_CONFIG_FRAGMENTS := \
 	$(REPO_ROOT)/guest/rprobe/kernel/common.config \
 	$(REPO_ROOT)/guest/rprobe/kernel/arm64.config
-# Ordered, architecture-specific workload patches (part of the kernel identity).
-WORKLOAD_PATCHES ?= $(sort $(wildcard $(RESOURCE_ROOT)/kernels/patches/$(KERNEL_ARCH)/*.patch))
+# Shared live driver precedes architecture patches on supported workload tracks.
+# longterm5 lacks the real VM-fork RNG API and stays raw-only, without a shim.
+WORKLOAD_LIVE_PATCHES := $(if $(filter stable longterm,$(TRACK)),$(sort $(wildcard $(RESOURCE_ROOT)/kernels/patches/live/*.patch)))
+WORKLOAD_PATCHES ?= $(WORKLOAD_LIVE_PATCHES) $(sort $(wildcard $(RESOURCE_ROOT)/kernels/patches/$(KERNEL_ARCH)/*.patch))
 RPROBE_PATCHES ?=
 CONFIG_FRAGMENTS := $($(shell printf '%s' "$(KERNEL_PROFILE)" | tr '[:lower:]' '[:upper:]')_CONFIG_FRAGMENTS)
 PATCHES := $($(shell printf '%s' "$(KERNEL_PROFILE)" | tr '[:lower:]' '[:upper:]')_PATCHES)
@@ -154,8 +156,8 @@ kernel-config:
 		ARCH="$(KERNEL_ARCH)" \
 		KCONFIG_ALLCONFIG="$(MINICONFIG)" alldefconfig
 	@if ! "$(CONFIG_VALIDATOR)" "$(KERNEL_BUILD_DIR)/.config" $(CONFIG_FRAGMENTS) $(if $(KERNEL_INITRAMFS),"$(KERNEL_BUILD_DIR)/embedded.config"); then \
-		if [ "$(TRACK)" = stable ] || [ "$(KERNEL_PROFILE)" = rprobe ]; then exit 1; fi; \
-		printf 'warning: %s/%s config differs from the stable miniconfig contract (best effort)\n' "$(TRACK)" "$(KERNEL_ARCH)" >&2; \
+		if [ "$(TRACK)" != longterm5 ] || [ "$(KERNEL_PROFILE)" = rprobe ]; then exit 1; fi; \
+		printf 'warning: longterm5/%s differs from workload config; raw-only, never a managed-overlay candidate\n' "$(KERNEL_ARCH)" >&2; \
 	fi
 
 .PHONY: kernel-image

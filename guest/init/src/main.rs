@@ -14,6 +14,7 @@ extern crate alloc;
 mod applets;
 mod init;
 mod io;
+mod overlay;
 mod sys;
 
 use crate::applets::{get_arg, run_applet};

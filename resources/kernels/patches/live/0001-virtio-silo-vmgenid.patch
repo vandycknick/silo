@@ -1,0 +1,474 @@
+From: Microsandbox <development@superrad.company>
+Subject: [PATCH] virtio: add acknowledged Silo VM generation driver
+
+Port the Microsandbox GPL VM generation driver to Silo's private device ID
+and pristine upstream sources. Preserve the 68-byte word ABI. Require an
+initialized CRNG and synchronous fork notification before committing the
+exact request, validate immutable requests before duplicate handling, and
+expose coherent read-only causal evidence.
+
+Derived from superradcompany/libkrunfw commit
+70ff1e821a7b513adb391aef6ad538f6ce148c17, patch 0034,
+by Microsandbox <development@superrad.company> (GPL-2.0-only).
+
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -33,6 +33,18 @@
+ 
+ if VIRTIO_MENU
+ 
++config VIRTIO_SILO_VMGENID
++	bool "Silo acknowledged VM generation driver"
++	depends on VIRTIO=y && VIRTIO_MMIO=y && SYSFS
++	select VIRT_DRIVERS
++	select VMGENID
++	help
++	  Reseed the initialized kernel CRNG after a Silo VM clone or rollback
++	  and acknowledge the exact sequence and identity through device config.
++	  Ordinary resident resume may request clock correction without reseeding.
++	  This built-in driver uses modern virtio-MMIO and exposes read-only
++	  generation processing evidence in sysfs.
++
+ config VIRTIO_HARDEN_NOTIFICATION
+         bool "Harden virtio notification"
+         depends on BROKEN
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_VIRTIO) += virtio.o virtio_ring.o
+ obj-$(CONFIG_VIRTIO_ANCHOR) += virtio_anchor.o
++obj-$(CONFIG_VIRTIO_SILO_VMGENID) += virtio_silo_vmgenid.o
+ obj-$(CONFIG_VIRTIO_PCI_LIB) += virtio_pci_modern_dev.o
+ obj-$(CONFIG_VIRTIO_PCI_LIB_LEGACY) += virtio_pci_legacy_dev.o
+ obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@ -69,6 +69,7 @@
+ #define VIRTIO_ID_BT			40 /* virtio bluetooth */
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
+ #define VIRTIO_ID_SPI			45 /* virtio spi */
++#define VIRTIO_ID_SILO_VMGENID		0x5347 /* Silo VM generation (MMIO only) */
+ 
+ /*
+  * Virtio Transitional IDs
+--- /dev/null
++++ b/drivers/virtio/virtio_silo_vmgenid.c
+@@ -0,0 +1,417 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Silo acknowledged VM generation driver.
++ * Derived from Microsandbox's VM generation driver:
++ * Copyright (c) 2026 Microsandbox <development@superrad.company>
++ *
++ * All config accesses are aligned little-endian words. The host publishes
++ * immutable requests while vCPUs are stopped; each new request advances the
++ * sequence without wrap. Separate MMIO reads are not an atomic transaction.
++ */
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/random.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/timekeeping.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#define SILO_VERSION 1
++#define SILO_READY BIT(0)
++#define SILO_ERROR BIT(1)
++#define SILO_CLOCK BIT(2)
++#define SILO_CLOCK_ONLY_CAP BIT(3)
++#define SILO_SYNC_CLOCK BIT(0)
++#define SILO_CLOCK_ONLY BIT(1)
++#define SILO_CAPS (SILO_READY | SILO_CLOCK | SILO_CLOCK_ONLY_CAP)
++
++struct silo_config {
++	__le32 version;
++	__le32 driver_status;
++	__le32 request_sequence_low;
++	__le32 request_sequence_high;
++	__le32 generation_id[4];
++	__le32 processed_sequence_low;
++	__le32 processed_sequence_high;
++	__le32 processed_id[4];
++	__le32 request_flags;
++	__le32 clock_low;
++	__le32 clock_high;
++};
++
++static_assert(sizeof(struct silo_config) == 68);
++static_assert(offsetof(struct silo_config, processed_sequence_low) == 32);
++static_assert(offsetof(struct silo_config, processed_id) == 40);
++static_assert(offsetof(struct silo_config, request_flags) == 56);
++
++struct silo_request {
++	u64 sequence;
++	u8 id[16];
++	u32 flags;
++};
++
++struct silo_evidence {
++	struct silo_request request;
++	struct silo_request completed;
++	struct silo_request reseed;
++	struct silo_request ack;
++	u64 event_order;
++	u64 reseed_count;
++	u64 reseed_return_order;
++	u64 clock_complete_order;
++	u64 ack_write_count;
++	u64 ack_write_order;
++	u64 ack_return_order;
++	bool rng_ready_before_call;
++	bool ack_accessor_returned;
++	int error;
++};
++
++struct silo_vmgenid {
++	struct virtio_device *vdev;
++	/* No queue data or entropy: find_vqs installs the MMIO config IRQ. */
++	struct virtqueue *vq;
++	struct work_struct work;
++	wait_queue_head_t stop_wait;
++	bool stopping;
++	struct silo_request observed;
++	struct silo_request completed;
++	struct silo_request reseeded;
++	/* Never held across RNG waits, notifier callbacks or device accesses. */
++	spinlock_t evidence_lock;
++	struct silo_evidence evidence;
++};
++
++static u32 silo_read(struct silo_vmgenid *g, unsigned int offset)
++{
++	__le32 value = 0;
++
++	g->vdev->config->get(g->vdev, offset, &value, sizeof(value));
++	return le32_to_cpu(value);
++}
++
++static void silo_write(struct silo_vmgenid *g, unsigned int offset, u32 value)
++{
++	__le32 encoded = cpu_to_le32(value);
++
++	g->vdev->config->set(g->vdev, offset, &encoded, sizeof(encoded));
++}
++
++static u64 silo_sequence(struct silo_vmgenid *g)
++{
++	u32 low = silo_read(g, offsetof(struct silo_config, request_sequence_low));
++	u32 high = silo_read(g, offsetof(struct silo_config, request_sequence_high));
++
++	return (u64)low | ((u64)high << 32);
++}
++
++static bool silo_same(const struct silo_request *a, const struct silo_request *b)
++{
++	return a->sequence == b->sequence && a->flags == b->flags &&
++	       !memcmp(a->id, b->id, sizeof(a->id));
++}
++
++static int silo_request_read(struct silo_vmgenid *g, struct silo_request *r)
++{
++	u64 before;
++	unsigned int i, attempt;
++
++	/* Bound malformed/changing-host input rather than spinning forever. */
++	for (attempt = 0; attempt < 8; attempt++) {
++		before = silo_sequence(g);
++		if (silo_read(g, offsetof(struct silo_config, version)) != SILO_VERSION)
++			return -EPROTO;
++		for (i = 0; i < 4; i++) {
++			__le32 word = cpu_to_le32(silo_read(g,
++				offsetof(struct silo_config, generation_id) + i * 4));
++
++			memcpy(r->id + i * 4, &word, sizeof(word));
++		}
++		r->flags = silo_read(g, offsetof(struct silo_config, request_flags));
++		r->sequence = silo_sequence(g);
++		if (before == r->sequence)
++			return 0;
++		cond_resched();
++	}
++	return -EAGAIN;
++}
++
++static void silo_error(struct silo_vmgenid *g, int error)
++{
++	spin_lock(&g->evidence_lock);
++	g->evidence.error = error;
++	g->evidence.event_order++;
++	spin_unlock(&g->evidence_lock);
++	silo_write(g, offsetof(struct silo_config, driver_status),
++		   SILO_CAPS | (error ? SILO_ERROR : 0));
++}
++
++static int silo_validate(struct silo_vmgenid *g, const struct silo_request *r)
++{
++	if (r->flags & ~(SILO_SYNC_CLOCK | SILO_CLOCK_ONLY))
++		return -EINVAL;
++	if (!r->sequence)
++		return r->flags || g->observed.sequence ? -EINVAL : 0;
++	if (r->sequence < g->observed.sequence)
++		return -ESTALE;
++	if (r->sequence == g->observed.sequence && !silo_same(r, &g->observed))
++		return -EPROTO;
++	if ((r->flags & SILO_CLOCK_ONLY) &&
++	    (!(r->flags & SILO_SYNC_CLOCK) ||
++	     memcmp(r->id, g->completed.id, sizeof(r->id))))
++		return -EINVAL;
++	return 0;
++}
++
++static int silo_sync_clock(struct silo_vmgenid *g)
++{
++	struct timespec64 target;
++	u64 before, after, sample;
++	u32 low, high;
++
++	before = ktime_get_raw_ns();
++	/* Reading low latches a fresh host sample; high belongs to that sample. */
++	low = silo_read(g, offsetof(struct silo_config, clock_low));
++	high = silo_read(g, offsetof(struct silo_config, clock_high));
++	after = ktime_get_raw_ns();
++	sample = (u64)low | ((u64)high << 32);
++	if (!sample || sample > S64_MAX || after < before ||
++	    (after - before) / 2 > S64_MAX - sample)
++		return -ERANGE;
++	sample += (after - before) / 2;
++	/* Only forward wall-time correction. Never inject MONOTONIC/BOOTTIME. */
++	if (sample <= ktime_get_real_ns())
++		return 0;
++	target = ns_to_timespec64(sample);
++	return do_settimeofday64(&target);
++}
++
++static void silo_publish(struct silo_vmgenid *g, const struct silo_request *r)
++{
++	unsigned int i;
++
++	for (i = 0; i < 4; i++) {
++		__le32 word;
++
++		memcpy(&word, r->id + i * 4, sizeof(word));
++		silo_write(g, offsetof(struct silo_config, processed_id) + i * 4,
++			   le32_to_cpu(word));
++	}
++	silo_write(g, offsetof(struct silo_config, processed_sequence_high),
++		   upper_32_bits(r->sequence));
++	spin_lock(&g->evidence_lock);
++	g->evidence.ack = *r;
++	g->evidence.ack_write_count++;
++	g->evidence.ack_accessor_returned = false;
++	g->evidence.ack_write_order = ++g->evidence.event_order;
++	spin_unlock(&g->evidence_lock);
++	/* Commit event, not equality assembled after any staging write. Modern
++	 * MMIO config->set uses ordered writel, preserving ID/high/low ordering.
++	 */
++	silo_write(g, offsetof(struct silo_config, processed_sequence_low),
++		   lower_32_bits(r->sequence));
++	spin_lock(&g->evidence_lock);
++	g->evidence.ack_accessor_returned = true;
++	g->evidence.ack_return_order = ++g->evidence.event_order;
++	spin_unlock(&g->evidence_lock);
++}
++
++static void silo_process(struct work_struct *work)
++{
++	struct silo_vmgenid *g = container_of(work, struct silo_vmgenid, work);
++	struct silo_request r, latest;
++	int ret;
++
++	while (!READ_ONCE(g->stopping)) {
++		ret = silo_request_read(g, &r);
++		if (ret)
++			goto error;
++		spin_lock(&g->evidence_lock);
++		g->evidence.request = r;
++		g->evidence.event_order++;
++		spin_unlock(&g->evidence_lock);
++		ret = silo_validate(g, &r);
++		if (ret)
++			goto error;
++		if (!r.sequence)
++			return;
++		g->observed = r;
++		/* Validate every field before this duplicate shortcut. */
++		if (silo_same(&r, &g->completed))
++			goto publish;
++		if (!(r.flags & SILO_CLOCK_ONLY) && !silo_same(&r, &g->reseeded)) {
++			/* Readiness never regresses. Poll only to make removal cancellable
++			 * before entering the public readiness API, not to supply entropy.
++			 */
++			while (!rng_is_initialized()) {
++				wait_event_timeout(g->stop_wait, READ_ONCE(g->stopping),
++						   msecs_to_jiffies(100));
++				if (READ_ONCE(g->stopping))
++					return;
++			}
++			ret = wait_for_random_bytes();
++			if (ret)
++				goto error;
++			/* A restore can supersede captured work during the wait. */
++			ret = silo_request_read(g, &latest);
++			if (ret)
++				goto error;
++			if (!silo_same(&r, &latest))
++				continue;
++			add_vmfork_randomness(r.id, sizeof(r.id));
++			/* This evidence exists only after the real blocking API returns. */
++			g->reseeded = r;
++			spin_lock(&g->evidence_lock);
++			g->evidence.reseed = r;
++			g->evidence.rng_ready_before_call = true;
++			g->evidence.reseed_count++;
++			g->evidence.reseed_return_order = ++g->evidence.event_order;
++			spin_unlock(&g->evidence_lock);
++		}
++		ret = silo_request_read(g, &latest);
++		if (ret)
++			goto error;
++		if (!silo_same(&r, &latest))
++			continue;
++		if (r.flags & SILO_SYNC_CLOCK) {
++			ret = silo_sync_clock(g);
++			if (ret)
++				goto error;
++			spin_lock(&g->evidence_lock);
++			g->evidence.clock_complete_order = ++g->evidence.event_order;
++			spin_unlock(&g->evidence_lock);
++		}
++		ret = silo_request_read(g, &latest);
++		if (ret)
++			goto error;
++		if (!silo_same(&r, &latest))
++			continue;
++		g->completed = r;
++		spin_lock(&g->evidence_lock);
++		g->evidence.completed = r;
++		g->evidence.event_order++;
++		spin_unlock(&g->evidence_lock);
++publish:
++		silo_error(g, 0);
++		silo_publish(g, &r);
++		/* Drain a config notification coalesced with this work item. */
++		ret = silo_request_read(g, &latest);
++		if (ret)
++			goto error;
++		if (silo_same(&r, &latest))
++			return;
++		cond_resched();
++	}
++	return;
++error:
++	silo_error(g, ret);
++}
++
++static ssize_t generation_state_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct silo_vmgenid *g = dev_to_virtio(dev)->priv;
++	struct silo_evidence e;
++
++	spin_lock(&g->evidence_lock);
++	e = g->evidence;
++	spin_unlock(&g->evidence_lock);
++	return sysfs_emit(buf,
++		"version=1 request_sequence=%llu request_id=%16phN request_flags=%u "
++		"completed_sequence=%llu completed_id=%16phN completed_flags=%u "
++		"rng_ready_before_call=%u reseed_count=%llu reseed_sequence=%llu "
++		"reseed_id=%16phN reseed_return_order=%llu clock_complete_order=%llu "
++		"ack_sequence=%llu ack_id=%16phN ack_write_count=%llu "
++		"ack_write_order=%llu ack_accessor_returned=%u ack_return_order=%llu "
++		"error=%d event_order=%llu\n",
++		e.request.sequence, e.request.id, e.request.flags,
++		e.completed.sequence, e.completed.id, e.completed.flags,
++		e.rng_ready_before_call, e.reseed_count, e.reseed.sequence,
++		e.reseed.id, e.reseed_return_order, e.clock_complete_order,
++		e.ack.sequence, e.ack.id, e.ack_write_count, e.ack_write_order,
++		e.ack_accessor_returned, e.ack_return_order, e.error, e.event_order);
++}
++static DEVICE_ATTR_RO(generation_state);
++
++static void silo_config_changed(struct virtio_device *vdev)
++{
++	struct silo_vmgenid *g = vdev->priv;
++
++	if (!READ_ONCE(g->stopping))
++		schedule_work(&g->work);
++}
++
++static int silo_probe(struct virtio_device *vdev)
++{
++	struct silo_vmgenid *g;
++	int ret;
++
++	if (!virtio_has_feature(vdev, VIRTIO_F_VERSION_1))
++		return -ENODEV;
++	g = kzalloc(sizeof(*g), GFP_KERNEL);
++	if (!g)
++		return -ENOMEM;
++	g->vdev = vdev;
++	spin_lock_init(&g->evidence_lock);
++	init_waitqueue_head(&g->stop_wait);
++	INIT_WORK(&g->work, silo_process);
++	vdev->priv = g;
++	g->vq = virtio_find_single_vq(vdev, NULL, "unused");
++	if (IS_ERR(g->vq)) {
++		ret = PTR_ERR(g->vq);
++		goto free;
++	}
++	ret = device_create_file(&vdev->dev, &dev_attr_generation_state);
++	if (ret)
++		goto queues;
++	virtio_device_ready(vdev);
++	silo_error(g, 0);
++	schedule_work(&g->work);
++	return 0;
++queues:
++	vdev->config->del_vqs(vdev);
++free:
++	vdev->priv = NULL;
++	kfree(g);
++	return ret;
++}
++
++static void silo_remove(struct virtio_device *vdev)
++{
++	struct silo_vmgenid *g = vdev->priv;
++
++	WRITE_ONCE(g->stopping, true);
++	wake_up(&g->stop_wait);
++	cancel_work_sync(&g->work);
++	silo_write(g, offsetof(struct silo_config, driver_status), 0);
++	virtio_reset_device(vdev);
++	device_remove_file(&vdev->dev, &dev_attr_generation_state);
++	vdev->config->del_vqs(vdev);
++	vdev->priv = NULL;
++	kfree(g);
++}
++
++static const struct virtio_device_id silo_id_table[] = {
++	{ VIRTIO_ID_SILO_VMGENID, VIRTIO_DEV_ANY_ID },
++	{ 0 },
++};
++
++static struct virtio_driver silo_driver = {
++	.driver.name = KBUILD_MODNAME,
++	.driver.owner = THIS_MODULE,
++	.id_table = silo_id_table,
++	.probe = silo_probe,
++	.remove = silo_remove,
++	.config_changed = silo_config_changed,
++};
++module_virtio_driver(silo_driver);
++MODULE_DEVICE_TABLE(virtio, silo_id_table);
++MODULE_AUTHOR("Microsandbox <development@superrad.company>");
++MODULE_DESCRIPTION("Silo acknowledged VM generation driver");
++MODULE_LICENSE("GPL");

@@ -10,6 +10,8 @@ use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow, Signal};
 use nix::unistd::{execv, fork, setsid, ForkResult};
 use protocol::v1::{GuestBootMode, GuestBootReport};
 
+use crate::freezer::WorkloadController;
+
 const HANDOFF_AUTO: &str = "auto";
 pub(crate) const HANDOFF_AUTO_CANDIDATES: &[&str] = &[
     "/sbin/init",
@@ -98,7 +100,10 @@ fn os_to_string(value: &OsStr) -> String {
     value.to_string_lossy().into_owned()
 }
 
-pub(crate) fn maybe_handoff_init(requested_init: &OsStr) -> eyre::Result<BootMode> {
+pub(crate) fn maybe_handoff_init(
+    requested_init: &OsStr,
+    workloads: &WorkloadController,
+) -> eyre::Result<BootMode> {
     let Some(target) = resolve_handoff_target(requested_init)? else {
         tracing::info!(
             requested_init = ?requested_init,
@@ -109,7 +114,7 @@ pub(crate) fn maybe_handoff_init(requested_init: &OsStr) -> eyre::Result<BootMod
         });
     };
 
-    fork_handoff_init(requested_init, &target)
+    fork_handoff_init(requested_init, &target, workloads)
 }
 
 fn resolve_handoff_target(requested_init: &OsStr) -> eyre::Result<Option<PathBuf>> {
@@ -169,7 +174,11 @@ fn is_agent_binary(path: &Path, agent_path: &Path) -> bool {
     }
 }
 
-fn fork_handoff_init(requested_init: &OsStr, target: &Path) -> eyre::Result<BootMode> {
+fn fork_handoff_init(
+    requested_init: &OsStr,
+    target: &Path,
+    workloads: &WorkloadController,
+) -> eyre::Result<BootMode> {
     let init = CString::new(target.as_os_str().as_bytes())
         .with_context(|| format!("prepare init path {}", target.display()))?;
 
@@ -177,7 +186,12 @@ fn fork_handoff_init(requested_init: &OsStr, target: &Path) -> eyre::Result<Boot
     // async runtime internals. PID 1 becomes the guest init; the child remains
     // the Silo agent.
     match unsafe { fork() }.context("fork init handoff")? {
-        ForkResult::Parent { .. } => exec_handoff_parent(&init, target),
+        ForkResult::Parent { .. } => {
+            workloads
+                .place_handoff_parent()
+                .context("place image PID1 in workload cgroup before exec")?;
+            exec_handoff_parent(&init, target)
+        }
         ForkResult::Child => {
             if let Err(err) = setsid() {
                 tracing::warn!(error = %err, "failed to isolate agent child session");
@@ -200,7 +214,7 @@ fn exec_handoff_parent(init: &std::ffi::CStr, target: &Path) -> eyre::Result<Boo
 
     let argv = [init];
     match execv(init, &argv) {
-        Ok(_) => unreachable!("execv returned after replacing the process"),
+        Ok(never) => match never {},
         Err(err) => {
             tracing::error!(init = %target.display(), error = %err, "failed to exec handoff init");
             std::process::exit(127);

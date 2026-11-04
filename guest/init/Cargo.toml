@@ -13,4 +13,5 @@ alloc = []
 sh = ["alloc"]
 
 [dependencies]
+rootfs-spec = { path = "../../specs/rootfs-spec" }
 libc = { version = "0.2.189", default-features = false }

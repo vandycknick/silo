@@ -13,12 +13,13 @@ use std::time::Duration;
 use eyre::Context;
 use nix::sys::signal::{self, SigSet, SigmaskHow, Signal as NixSignal};
 use rustix::io::Errno;
-use rustix::mount::{mount_remount, MountFlags};
 use rustix::process::{self, Pid, Signal as RustixSignal, WaitOptions, WaitStatus};
 use rustix::system::{reboot, RebootCommand};
 use tokio::sync::watch;
 
+use crate::freezer::{SpawnRole, WorkloadController};
 use crate::handoff::BootMode;
+use crate::root_storage::{ShutdownResult, StorageShutdown};
 
 const PROC_DIR: &str = "/proc";
 const DEV_INPUT_DIR: &str = "/dev/input";
@@ -36,15 +37,42 @@ const EV_KEY: u16 = 0x01;
 const KEY_POWER: u16 = 116;
 const KEY_RESTART: u16 = 408;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ProcessSupervisor {
     inner: Option<Arc<Pid1Supervisor>>,
+    writers: Arc<Mutex<InternalWriters>>,
+    writer_shutdown: watch::Sender<bool>,
+    workloads: WorkloadController,
+    session: Option<crate::lifecycle::SessionLease>,
+    retirement: Option<watch::Receiver<u64>>,
+}
+
+impl Default for ProcessSupervisor {
+    fn default() -> Self {
+        let (writer_shutdown, _) = watch::channel(false);
+        Self {
+            inner: None,
+            writers: Arc::default(),
+            writer_shutdown,
+            workloads: WorkloadController::discover(),
+            session: None,
+            retirement: None,
+        }
+    }
 }
 
 impl ProcessSupervisor {
-    pub(crate) fn activate(boot_mode: &BootMode) -> eyre::Result<Self> {
+    pub(crate) fn activate(
+        boot_mode: &BootMode,
+        storage: StorageShutdown,
+        diagnostics: crate::diagnostics::Diagnostics,
+        workloads: WorkloadController,
+    ) -> eyre::Result<Self> {
         if !matches!(boot_mode, BootMode::AgentPid1 { .. }) {
-            return Ok(Self::default());
+            return Ok(Self {
+                workloads,
+                ..Self::default()
+            });
         }
 
         let signals = pid1_signal_set();
@@ -58,13 +86,38 @@ impl ProcessSupervisor {
             shutdown_tx,
             shutting_down: AtomicBool::new(false),
             shutdown_worker_started: AtomicBool::new(false),
+            storage: Mutex::new(Some(storage)),
+            diagnostics,
         });
 
         spawn_signal_thread(Arc::clone(&inner), signals)?;
         spawn_power_button_monitor(Arc::clone(&inner))?;
         tracing::info!("PID1 process supervisor active");
 
-        Ok(Self { inner: Some(inner) })
+        Ok(Self {
+            inner: Some(Arc::clone(&inner)),
+            writers: Arc::default(),
+            writer_shutdown: inner.shutdown_tx.clone(),
+            workloads,
+            session: None,
+            retirement: None,
+        })
+    }
+
+    pub(crate) fn with_session(
+        &self,
+        session: crate::lifecycle::SessionLease,
+        retirement: watch::Receiver<u64>,
+    ) -> Self {
+        Self {
+            session: Some(session),
+            retirement: Some(retirement),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn retirement_receiver(&self) -> Option<watch::Receiver<u64>> {
+        self.retirement.clone()
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -72,18 +125,85 @@ impl ProcessSupervisor {
     }
 
     pub(crate) fn shutdown_receiver(&self) -> Option<watch::Receiver<bool>> {
-        self.inner
-            .as_ref()
-            .map(|inner| inner.shutdown_tx.subscribe())
+        Some(self.writer_shutdown.subscribe())
     }
 
-    pub(crate) async fn shutdown(&self) -> eyre::Result<()> {
+    /// Close mutation admissions and send initial TERM before real worker drains.
+    /// The final PID1 phase applies the remaining grace/KILL sequence and storage cleanup.
+    pub(crate) fn begin_writer_shutdown(&self) -> eyre::Result<()> {
+        lock_or_recover(&self.writers).closed = true;
+        self.writer_shutdown.send_replace(true);
         let Some(inner) = &self.inner else {
             return Ok(());
         };
+        // Serialize against the final admitted spawn, not only the atomic flag.
+        let _spawn = lock_or_recover(&inner.spawn_lock);
+        inner.request_shutdown("agent draining writers".to_string());
+        let mut result = ShutdownResult::default();
+        inner.signal_tracked_process_groups(RustixSignal::TERM, &mut result);
+        inner.kill_all(RustixSignal::TERM, &mut result);
+        result.finish()
+    }
+
+    pub(crate) fn admit_internal_writer(&self) -> io::Result<InternalWriterGuard> {
+        let mut writers = lock_or_recover(&self.writers);
+        if writers.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "agent internal writers are stopping",
+            ));
+        }
+        writers.active = writers
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("internal writer count overflow"))?;
+        Ok(InternalWriterGuard {
+            _lease: Arc::new(InternalWriterLease {
+                writers: Arc::clone(&self.writers),
+                _session: self.session.clone(),
+            }),
+        })
+    }
+
+    pub(crate) async fn wait_internal_writers(&self) -> eyre::Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if lock_or_recover(&self.writers).active == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            eyre::eyre!("actual agent internal writer workers did not drain before shutdown")
+        })
+    }
+
+    pub(crate) async fn shutdown(
+        &self,
+        quiescence: eyre::Result<()>,
+        orderly: Arc<crate::orderly_shutdown::OrderlyShutdown>,
+    ) -> eyre::Result<()> {
+        let Some(inner) = &self.inner else {
+            return quiescence;
+        };
 
         inner.request_shutdown("agent shutdown".to_string());
+        let mut result = ShutdownResult::default();
+        result.record(quiescence);
+        inner.start_shutdown_worker(result, orderly);
         std::future::pending::<eyre::Result<()>>().await
+    }
+
+    pub(crate) fn request_orderly_shutdown(&self) -> eyre::Result<()> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("agent does not own PID1"))?;
+        let _spawn = lock_or_recover(&inner.spawn_lock);
+        inner.request_shutdown("run-bound orderly shutdown".to_owned());
+        Ok(())
     }
 
     pub(crate) fn spawn_child(
@@ -91,7 +211,12 @@ impl ProcessSupervisor {
         command: &mut Command,
         label: impl Into<String>,
     ) -> io::Result<(Child, ChildGuard)> {
-        self.spawn_child_with(command, label, ChildSpawnMode::NewProcessGroup)
+        self.spawn_child_with(
+            command,
+            label,
+            ChildSpawnMode::NewProcessGroup,
+            SpawnRole::Workload,
+        )
     }
 
     pub(crate) fn spawn_session_child(
@@ -99,7 +224,44 @@ impl ProcessSupervisor {
         command: &mut Command,
         label: impl Into<String>,
     ) -> io::Result<(Child, ChildGuard)> {
-        self.spawn_child_with(command, label, ChildSpawnMode::SessionLeader)
+        self.spawn_child_with(
+            command,
+            label,
+            ChildSpawnMode::SessionLeader,
+            SpawnRole::Workload,
+        )
+    }
+
+    pub(crate) fn spawn_activation_child(
+        &self,
+        command: &mut Command,
+        label: impl Into<String>,
+    ) -> io::Result<(Child, ChildGuard)> {
+        self.spawn_child_with(
+            command,
+            label,
+            ChildSpawnMode::NewProcessGroup,
+            SpawnRole::ActivationHook,
+        )
+    }
+
+    /// The non-PID1 SSH path retains Tokio's cancellation/kill-on-drop behavior,
+    /// but uses the same admission and pre-exec placement as supervised spawns.
+    pub(crate) fn spawn_tokio_workload(
+        &self,
+        command: &mut tokio::process::Command,
+    ) -> io::Result<(tokio::process::Child, ChildGuard)> {
+        if self.is_active() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PID1 children must use the supervised spawn path",
+            ));
+        }
+        let writer = self.admit_internal_writer()?;
+        let child = self.workloads.spawn_tokio_workload(command)?;
+        let mut guard = ChildGuard::inactive();
+        guard.writer = Some(writer);
+        Ok((child, guard))
     }
 
     fn spawn_child_with(
@@ -107,13 +269,22 @@ impl ProcessSupervisor {
         command: &mut Command,
         label: impl Into<String>,
         mode: ChildSpawnMode,
+        role: SpawnRole,
     ) -> io::Result<(Child, ChildGuard)> {
-        let Some(inner) = &self.inner else {
-            let child = command.spawn()?;
-            return Ok((child, ChildGuard::inactive()));
-        };
-
-        inner.spawn_child(command, label.into(), mode)
+        let writer = self.admit_internal_writer()?;
+        let (child, mut guard) = self
+            .workloads
+            .with_spawn(command, role, |command| match &self.inner {
+                Some(inner) => inner.spawn_child(command, label.into(), mode),
+                None => {
+                    if matches!(mode, ChildSpawnMode::NewProcessGroup) {
+                        command.process_group(0);
+                    }
+                    command.spawn().map(|child| (child, ChildGuard::inactive()))
+                }
+            })?;
+        guard.writer = Some(writer);
+        Ok((child, guard))
     }
 
     pub(crate) fn output<I, S>(&self, program: &str, args: I) -> io::Result<Output>
@@ -134,12 +305,67 @@ impl ProcessSupervisor {
     }
 }
 
+/// Retired captured sessions must kill, not TERM and wait on frozen tasks.
+/// The direct child remains owned and reaped before its session lease drains.
+pub(crate) fn wait_retiring_child(
+    child: &mut Child,
+    retirement: Option<watch::Receiver<u64>>,
+) -> io::Result<std::process::ExitStatus> {
+    let Some(retirement) = retirement else {
+        return child.wait();
+    };
+    loop {
+        if retirement.has_changed().unwrap_or(true) {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let _ = signal::kill(nix::unistd::Pid::from_raw(-pid), NixSignal::SIGKILL);
+            }
+            let killed = child.kill();
+            let status = child.wait();
+            if let Err(error) = killed {
+                if error.raw_os_error() != Some(nix::errno::Errno::ESRCH as i32) {
+                    return Err(error);
+                }
+            }
+            return status;
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Default)]
+struct InternalWriters {
+    closed: bool,
+    active: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct InternalWriterGuard {
+    _lease: Arc<InternalWriterLease>,
+}
+
+struct InternalWriterLease {
+    writers: Arc<Mutex<InternalWriters>>,
+    _session: Option<crate::lifecycle::SessionLease>,
+}
+
+impl Drop for InternalWriterLease {
+    fn drop(&mut self) {
+        let mut writers = lock_or_recover(&self.writers);
+        writers.active = writers.active.saturating_sub(1);
+    }
+}
+
 struct Pid1Supervisor {
     registry: Mutex<ChildRegistry>,
     spawn_lock: Mutex<()>,
     shutdown_tx: watch::Sender<bool>,
     shutting_down: AtomicBool,
     shutdown_worker_started: AtomicBool,
+    storage: Mutex<Option<StorageShutdown>>,
+    diagnostics: crate::diagnostics::Diagnostics,
 }
 
 impl Pid1Supervisor {
@@ -177,6 +403,7 @@ impl Pid1Supervisor {
             ChildGuard {
                 inner: Some(Arc::clone(self)),
                 pid: Some(pid),
+                writer: None,
             },
         ))
     }
@@ -189,12 +416,15 @@ impl Pid1Supervisor {
         let first = !self.shutting_down.swap(true, Ordering::SeqCst);
         if first {
             tracing::warn!(reason, "PID1 shutdown requested");
-            let _ = self.shutdown_tx.send(true);
+            self.shutdown_tx.send_replace(true);
         }
-        self.start_shutdown_worker();
     }
 
-    fn start_shutdown_worker(self: &Arc<Self>) {
+    fn start_shutdown_worker(
+        self: &Arc<Self>,
+        result: ShutdownResult,
+        orderly: Arc<crate::orderly_shutdown::OrderlyShutdown>,
+    ) {
         if self.shutdown_worker_started.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -202,16 +432,20 @@ impl Pid1Supervisor {
         let supervisor = Arc::clone(self);
         if let Err(err) = thread::Builder::new()
             .name("silo-pid1-shutdown".to_string())
-            .spawn(move || supervisor.run_shutdown())
+            .spawn(move || supervisor.run_shutdown(result, orderly))
         {
             tracing::error!(error = %err, "failed to spawn PID1 shutdown thread");
             poweroff_guest();
         }
     }
 
-    fn run_shutdown(self: Arc<Self>) {
-        tracing::warn!("PID1 shutdown sequence starting");
-        self.signal_tracked_process_groups(RustixSignal::TERM);
+    fn run_shutdown(
+        self: Arc<Self>,
+        mut result: ShutdownResult,
+        orderly: Arc<crate::orderly_shutdown::OrderlyShutdown>,
+    ) {
+        tracing::warn!("PID1 shutdown sequence starting after agent writer drain");
+        self.signal_tracked_process_groups(RustixSignal::TERM, &mut result);
 
         for _ in 0..shutdown_grace_ticks() {
             self.reap_adopted_children();
@@ -222,18 +456,40 @@ impl Pid1Supervisor {
         }
 
         if self.has_tracked_children() {
-            self.signal_tracked_process_groups(RustixSignal::KILL);
+            self.signal_tracked_process_groups(RustixSignal::KILL, &mut result);
             thread::sleep(SHUTDOWN_POLL);
             self.reap_adopted_children();
         }
 
-        self.kill_all(RustixSignal::TERM);
+        self.kill_all(RustixSignal::TERM, &mut result);
         thread::sleep(KILL_ALL_GRACE);
         self.reap_adopted_children();
-        self.kill_all(RustixSignal::KILL);
+        self.kill_all(RustixSignal::KILL, &mut result);
         thread::sleep(SHUTDOWN_POLL);
         self.reap_adopted_children();
-
+        result.record(verify_no_workload_writers());
+        result.record(
+            self.diagnostics
+                .close()
+                .context("drain and close agent diagnostic writer"),
+        );
+        let coverage = match lock_or_recover(&self.storage).take() {
+            Some(storage) => {
+                let coverage = storage
+                    .coverage(&orderly.manifest())
+                    .err()
+                    .map(|error| error.to_string());
+                storage.shutdown(&mut result);
+                coverage
+            }
+            None => {
+                result.record(Err(eyre::eyre!("shutdown storage context missing")));
+                None
+            }
+        };
+        // No success file or filesystem-backed diagnostic is emitted after
+        // this point. Only the retained RPC carries the sticky terminal result.
+        orderly.complete_and_wait(result.finish(), coverage);
         poweroff_guest();
     }
 
@@ -275,7 +531,7 @@ impl Pid1Supervisor {
             .collect()
     }
 
-    fn signal_tracked_process_groups(&self, signal: RustixSignal) {
+    fn signal_tracked_process_groups(&self, signal: RustixSignal, result: &mut ShutdownResult) {
         for child in self.tracked_process_groups() {
             if let Err(err) = kill_process_group(child.process_group, signal) {
                 tracing::debug!(
@@ -286,13 +542,18 @@ impl Pid1Supervisor {
                     error = %err,
                     "failed to signal tracked process group"
                 );
+                result.record(Err(eyre::eyre!(
+                    "signal tracked process group {}: {err}",
+                    child.process_group
+                )));
             }
         }
     }
 
-    fn kill_all(&self, signal: RustixSignal) {
+    fn kill_all(&self, signal: RustixSignal, result: &mut ShutdownResult) {
         if let Err(err) = kill_process_group(Pid::INIT, signal) {
             tracing::debug!(signal = signal.as_raw(), error = %err, "kill(-1) backstop failed");
+            result.record(Err(eyre::eyre!("kill(-1) with {signal:?}: {err}")));
         }
     }
 
@@ -341,6 +602,7 @@ struct TrackedProcessGroup {
 pub(crate) struct ChildGuard {
     inner: Option<Arc<Pid1Supervisor>>,
     pid: Option<Pid>,
+    writer: Option<InternalWriterGuard>,
 }
 
 impl ChildGuard {
@@ -348,7 +610,12 @@ impl ChildGuard {
         Self {
             inner: None,
             pid: None,
+            writer: None,
         }
+    }
+
+    pub(crate) fn writer(&self) -> Option<InternalWriterGuard> {
+        self.writer.clone()
     }
 }
 
@@ -648,13 +915,6 @@ fn shutdown_grace_ticks() -> u32 {
 }
 
 fn poweroff_guest() -> ! {
-    tracing::warn!("syncing filesystems before poweroff");
-    rustix::fs::sync();
-    if let Err(err) = mount_remount("/", MountFlags::RDONLY, "") {
-        tracing::warn!(error = %err, "failed to remount root read-only before poweroff");
-    }
-    rustix::fs::sync();
-
     match reboot(RebootCommand::PowerOff) {
         Ok(()) => loop {
             thread::park();
@@ -664,6 +924,56 @@ fn poweroff_guest() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+fn verify_no_workload_writers() -> eyre::Result<()> {
+    for entry in fs::read_dir(PROC_DIR)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 1 {
+            continue;
+        }
+        let status = match fs::read_to_string(entry.path().join("status")) {
+            Ok(status) => status,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("inspect remaining workload writer"),
+        };
+        if !status.lines().any(|line| {
+            line.starts_with("State:") && (line.contains("Z (zombie)") || line.contains("X (dead)"))
+        }) {
+            let stat = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("inspect remaining task flags"),
+            };
+            if is_kernel_task(&stat)? {
+                continue;
+            }
+            eyre::bail!("workload process {pid} remains alive after shutdown");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_kernel_task(stat: &str) -> eyre::Result<bool> {
+    // /proc/pid/stat field 9 is Linux task flags. PF_KTHREAD distinguishes
+    // kernel workers (which syncfs must finish) from remaining guest workloads.
+    // Parse after the final ')' because comm may contain spaces and parentheses.
+    let (_, fields) = stat
+        .rsplit_once(')')
+        .ok_or_else(|| eyre::eyre!("malformed process stat"))?;
+    let flags = fields
+        .split_whitespace()
+        .nth(6)
+        .ok_or_else(|| eyre::eyre!("process task flags missing"))?
+        .parse::<u64>()?;
+    Ok(flags & 0x0020_0000 != 0)
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -685,6 +995,100 @@ mod tests {
         EV_KEY, INPUT_EVENT_CODE_OFFSET, INPUT_EVENT_SIZE, INPUT_EVENT_TYPE_OFFSET,
         INPUT_EVENT_VALUE_OFFSET, KEY_POWER, KEY_RESTART,
     };
+
+    #[test]
+    fn retired_session_kills_and_reaps_a_real_stopped_child() {
+        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        use nix::unistd::Pid;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+        nix::sys::signal::kill(pid, Signal::SIGSTOP).unwrap();
+        assert!(matches!(
+            waitpid(pid, Some(WaitPidFlag::WUNTRACED)).unwrap(),
+            WaitStatus::Stopped(_, Signal::SIGSTOP),
+        ));
+        let (retire, retirement) = tokio::sync::watch::channel(0_u64);
+        retire.send_replace(1);
+        let status = crate::pid1::wait_retiring_child(&mut child, Some(retirement)).unwrap();
+        assert_eq!(status.signal(), Some(Signal::SIGKILL as i32));
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_tracks_actual_blocking_workers_and_their_reader_clones() {
+        let supervisor = crate::pid1::ProcessSupervisor::default();
+        let writer = supervisor.admit_internal_writer().unwrap();
+        let reader = writer.clone();
+        drop(writer);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _reader = reader;
+                started.send(()).unwrap();
+                released.recv().unwrap();
+            })
+            .await
+        });
+        running.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        supervisor.begin_writer_shutdown().unwrap();
+        assert!(supervisor.admit_internal_writer().is_err());
+        let incomplete = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            supervisor.wait_internal_writers(),
+        )
+        .await
+        .is_err();
+        release.send(()).unwrap();
+        supervisor.wait_internal_writers().await.unwrap();
+        assert!(incomplete);
+    }
+
+    #[test]
+    fn remaining_writer_check_distinguishes_kernel_tasks_from_workloads() {
+        assert!(crate::pid1::is_kernel_task("2 (kthreadd) S 0 0 0 0 -1 2097152").unwrap());
+        assert!(
+            !crate::pid1::is_kernel_task("42 (work (with spaces)) S 1 42 42 0 -1 4194304").unwrap()
+        );
+        assert!(crate::pid1::is_kernel_task("malformed").is_err());
+    }
+
+    #[test]
+    fn shutdown_request_before_subscription_is_sticky_without_starting_cleanup() {
+        use std::sync::{atomic::AtomicBool, Arc, Mutex};
+        let (shutdown_tx, receiver) = tokio::sync::watch::channel(false);
+        drop(receiver);
+        let supervisor = Arc::new(crate::pid1::Pid1Supervisor {
+            registry: Mutex::new(crate::pid1::ChildRegistry::default()),
+            spawn_lock: Mutex::new(()),
+            shutdown_tx,
+            shutting_down: AtomicBool::new(false),
+            shutdown_worker_started: AtomicBool::new(false),
+            storage: Mutex::new(None),
+            diagnostics: crate::diagnostics::Diagnostics::new(std::io::stdout()),
+        });
+        supervisor.request_shutdown("unit shutdown request".to_string());
+        assert!(*supervisor.shutdown_tx.subscribe().borrow());
+        assert!(!supervisor
+            .shutdown_worker_started
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let mut command = std::process::Command::new("/must-not-run");
+        assert!(supervisor
+            .spawn_child(
+                &mut command,
+                "rejected".to_string(),
+                crate::pid1::ChildSpawnMode::NewProcessGroup
+            )
+            .is_err());
+    }
 
     #[test]
     fn pid1_signal_list_contains_shutdown_and_child_signals() {

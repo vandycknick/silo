@@ -6,14 +6,16 @@ use prost_types::Timestamp;
 use protocol::v1::{
     AgentMetricReport, AgentMetrics, BlockDeviceMetrics, CpuMetrics, FilesystemMetrics,
     LoadAverageMetrics, MemoryMetrics, MemoryReclaimReport, MetricSnapshot,
-    NetworkInterfaceMetrics,
+    NetworkInterfaceMetrics, RootStorageKind, RootStorageMetrics, TemporaryDirectoryKind,
+    TemporaryDirectoryMetrics,
 };
 
 pub(crate) fn collect(
     instance_id: String,
     memory_reclaim: Option<MemoryReclaimReport>,
-) -> AgentMetrics {
-    AgentMetrics {
+) -> Result<AgentMetrics, String> {
+    let root_storage = root_storage()?;
+    Ok(AgentMetrics {
         agent_instance_id: Some(instance_id),
         report: Some(AgentMetricReport {
             observed_at: Some(now()),
@@ -34,9 +36,10 @@ pub(crate) fn collect(
                 network_interfaces: network(),
                 block_devices: block_devices(),
                 memory_reclaim,
+                root_storage,
             }),
         }),
-    }
+    })
 }
 
 fn now() -> Timestamp {
@@ -145,21 +148,20 @@ fn parse_filesystems(text: &str) -> Vec<FilesystemMetrics> {
         let Some(mount) = fields.next().and_then(decode_mount_field) else {
             continue;
         };
+        // `/` already reports the upper-backed overlay. Maintenance mounts are
+        // accounted for explicitly in root_storage, never as additional disks.
+        if is_root_maintenance_mount(&mount) {
+            continue;
+        }
         let Some(filesystem_type) = fields.next().and_then(decode_mount_field) else {
             continue;
         };
         let Ok(stat) = rustix::fs::statvfs(&mount) else {
             continue;
         };
-        let block_size = stat.f_frsize;
-        let blocks = stat.f_blocks;
-        let free_blocks = stat.f_bfree;
-        let available_blocks = stat.f_bavail;
-        let (Some(total_bytes), Some(free_bytes), Some(available_bytes)) = (
-            blocks.checked_mul(block_size),
-            free_blocks.checked_mul(block_size),
-            available_blocks.checked_mul(block_size),
-        ) else {
+        let Some(capacity) =
+            Capacity::from_counts(stat.f_frsize, stat.f_blocks, stat.f_bfree, stat.f_bavail)
+        else {
             continue;
         };
         filesystems
@@ -167,15 +169,164 @@ fn parse_filesystems(text: &str) -> Vec<FilesystemMetrics> {
             .or_insert(FilesystemMetrics {
                 mount_point: Some(mount),
                 filesystem_type: Some(filesystem_type),
-                total_bytes: Some(total_bytes),
-                used_bytes: Some(total_bytes.saturating_sub(free_bytes)),
-                available_bytes: Some(available_bytes),
+                total_bytes: Some(capacity.usable),
+                used_bytes: Some(capacity.used),
+                available_bytes: Some(capacity.available),
             });
     }
     filesystems
         .into_values()
         .take(protocol::MAX_METRIC_ARRAY_ENTRIES)
         .collect()
+}
+
+fn is_root_maintenance_mount(mount: &str) -> bool {
+    Path::new(mount).starts_with("/run/silo/rootfs")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Capacity {
+    usable: u64,
+    used: u64,
+    free: u64,
+    available: u64,
+}
+
+impl Capacity {
+    fn from_counts(fragment: u64, blocks: u64, free: u64, available: u64) -> Option<Self> {
+        if fragment == 0 || available > free {
+            return None;
+        }
+        Some(Self {
+            usable: blocks.checked_mul(fragment)?,
+            used: blocks.checked_sub(free)?.checked_mul(fragment)?,
+            free: free.checked_mul(fragment)?,
+            available: available.checked_mul(fragment)?,
+        })
+    }
+}
+
+fn root_storage() -> Result<Option<RootStorageMetrics>, String> {
+    let Some(observation) =
+        crate::root_storage::retained_root().map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    use std::os::unix::fs::MetadataExt;
+    let upper_device = fs::metadata(rootfs_spec::UPPER_MOUNT)
+        .map_err(|error| format!("inspect managed upper mount: {error}"))?
+        .dev();
+    if nix::sys::stat::major(upper_device) != u64::from(observation.upper_device.major)
+        || nix::sys::stat::minor(upper_device) != u64::from(observation.upper_device.minor)
+    {
+        return Err(
+            "managed upper maintenance mount device differs from retained observation".to_string(),
+        );
+    }
+    let stat = rustix::fs::statvfs(rootfs_spec::UPPER_MOUNT)
+        .map_err(|error| format!("inspect managed upper capacity: {error}"))?;
+    let capacity = Capacity::from_counts(stat.f_frsize, stat.f_blocks, stat.f_bfree, stat.f_bavail)
+        .ok_or_else(|| "managed upper capacity arithmetic is inconsistent".to_string())?;
+    let temporary_directory = temporary_directory()?;
+    root_storage_from_observation(
+        &observation,
+        capacity,
+        stat.f_files,
+        stat.f_ffree,
+        stat.f_favail,
+        temporary_directory,
+    )
+    .map(Some)
+}
+
+fn root_storage_from_observation(
+    observation: &rootfs_spec::Observation,
+    capacity: Capacity,
+    total_inodes: u64,
+    free_inodes: u64,
+    available_inodes: u64,
+    temporary_directory: TemporaryDirectoryMetrics,
+) -> Result<RootStorageMetrics, String> {
+    observation.validate().map_err(|error| error.to_string())?;
+    let overhead = observation
+        .upper_filesystem_bytes
+        .checked_sub(capacity.usable)
+        .ok_or_else(|| "managed upper usable bytes exceed its filesystem span".to_string())?;
+    let metrics = RootStorageMetrics {
+        kind: Some(RootStorageKind::LinuxFlatOverlayV1 as i32),
+        upper_profile: Some(observation.root.upper_profile.as_str().to_string()),
+        upper_uuid: Some(observation.root.upper.filesystem_uuid.to_string()),
+        upper_backing_bytes: Some(observation.root.upper.length_bytes),
+        upper_filesystem_bytes: Some(observation.upper_filesystem_bytes),
+        unusable_tail_bytes: Some(observation.unusable_tail_bytes),
+        filesystem_overhead_bytes: Some(overhead),
+        upper_usable_bytes: Some(capacity.usable),
+        upper_used_bytes: Some(capacity.used),
+        upper_free_bytes: Some(capacity.free),
+        upper_available_bytes: Some(capacity.available),
+        upper_total_inodes: Some(total_inodes),
+        upper_free_inodes: Some(free_inodes),
+        upper_available_inodes: Some(available_inodes),
+        shared_lower_logical_bytes: Some(observation.root.lower.length_bytes),
+        temporary_directory: Some(temporary_directory),
+    };
+    protocol::validate_root_storage_metrics(&metrics)?;
+    Ok(metrics)
+}
+
+fn temporary_directory() -> Result<TemporaryDirectoryMetrics, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let stat =
+        rustix::fs::statvfs("/tmp").map_err(|error| format!("inspect /tmp capacity: {error}"))?;
+    let capacity = Capacity::from_counts(stat.f_frsize, stat.f_blocks, stat.f_bfree, stat.f_bavail)
+        .ok_or_else(|| "/tmp capacity arithmetic is inconsistent".to_string())?;
+    let filesystem = nix::sys::statfs::statfs("/tmp")
+        .map_err(|error| format!("inspect /tmp filesystem: {error}"))?;
+    let tmp_device = fs::metadata("/tmp")
+        .map_err(|error| format!("inspect /tmp device: {error}"))?
+        .dev();
+    let root_device = fs::metadata("/")
+        .map_err(|error| format!("inspect root device: {error}"))?
+        .dev();
+    let upper_device = fs::metadata(rootfs_spec::UPPER_MOUNT)
+        .map_err(|error| format!("inspect upper device: {error}"))?
+        .dev();
+    let kind = temporary_directory_kind(
+        filesystem.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC,
+        tmp_device == root_device || tmp_device == upper_device,
+    );
+    Ok(temporary_directory_metrics(kind, capacity))
+}
+
+fn temporary_directory_kind(tmpfs: bool, shares_upper: bool) -> TemporaryDirectoryKind {
+    if tmpfs {
+        TemporaryDirectoryKind::Tmpfs
+    } else if shares_upper {
+        TemporaryDirectoryKind::Upper
+    } else {
+        TemporaryDirectoryKind::Other
+    }
+}
+
+fn temporary_directory_metrics(
+    kind: TemporaryDirectoryKind,
+    capacity: Capacity,
+) -> TemporaryDirectoryMetrics {
+    let (persistent, memory_charged) = match kind {
+        TemporaryDirectoryKind::Upper => (Some(true), Some(false)),
+        TemporaryDirectoryKind::Tmpfs => (Some(false), Some(true)),
+        _ => (None, None),
+    };
+    TemporaryDirectoryMetrics {
+        kind: Some(kind as i32),
+        capacity_bytes: Some(capacity.usable),
+        used_bytes: Some(capacity.used),
+        free_bytes: Some(capacity.free),
+        available_bytes: Some(capacity.available),
+        persistent,
+        memory_charged,
+    }
 }
 
 fn decode_mount_field(value: &str) -> Option<String> {
@@ -375,5 +526,99 @@ mod tests {
             vec![Some("a"), Some("z")]
         );
         assert_eq!(metrics[0].read_bytes, Some(1024));
+    }
+    #[test]
+    fn capacity_checks_reserved_blocks_exhaustion_and_overflow() {
+        use crate::metrics::Capacity;
+        assert_eq!(
+            Capacity::from_counts(4096, 10, 3, 2),
+            Some(Capacity {
+                usable: 40960,
+                used: 28672,
+                free: 12288,
+                available: 8192,
+            })
+        );
+        assert_eq!(Capacity::from_counts(4096, 10, 0, 0).unwrap().used, 40960);
+        assert!(Capacity::from_counts(0, 10, 3, 2).is_none());
+        assert!(Capacity::from_counts(4096, 10, 11, 0).is_none());
+        assert!(Capacity::from_counts(4096, 10, 3, 4).is_none());
+        assert!(Capacity::from_counts(4096, u64::MAX, 0, 0).is_none());
+        assert!(Capacity::from_counts(1, u64::MAX, 0, 0).is_some());
+    }
+
+    #[test]
+    fn actual_temporary_backing_overrides_boot_policy_and_unknown_is_not_persistent() {
+        use crate::metrics::{temporary_directory_kind, temporary_directory_metrics, Capacity};
+        use protocol::v1::TemporaryDirectoryKind;
+        let capacity = Capacity::from_counts(4096, 256, 255, 254).unwrap();
+        let disk = temporary_directory_metrics(temporary_directory_kind(false, true), capacity);
+        assert_eq!(disk.kind, Some(TemporaryDirectoryKind::Upper as i32));
+        assert_eq!(
+            (disk.persistent, disk.memory_charged),
+            (Some(true), Some(false))
+        );
+        let tmpfs = temporary_directory_metrics(temporary_directory_kind(true, true), capacity);
+        assert_eq!(tmpfs.kind, Some(TemporaryDirectoryKind::Tmpfs as i32));
+        assert_eq!(
+            (tmpfs.persistent, tmpfs.memory_charged),
+            (Some(false), Some(true))
+        );
+        let other = temporary_directory_metrics(temporary_directory_kind(false, false), capacity);
+        assert_eq!(other.kind, Some(TemporaryDirectoryKind::Other as i32));
+        assert_eq!((other.persistent, other.memory_charged), (None, None));
+        protocol::validate_temporary_directory_metrics(&disk).unwrap();
+        protocol::validate_temporary_directory_metrics(&tmpfs).unwrap();
+        protocol::validate_temporary_directory_metrics(&other).unwrap();
+    }
+
+    #[test]
+    fn maintenance_mounts_do_not_duplicate_overlay_capacity() {
+        assert!(crate::metrics::is_root_maintenance_mount(
+            "/run/silo/rootfs/upperfs"
+        ));
+        assert!(crate::metrics::is_root_maintenance_mount(
+            "/run/silo/rootfs/lower"
+        ));
+        assert!(!crate::metrics::is_root_maintenance_mount("/"));
+        assert!(!crate::metrics::is_root_maintenance_mount(
+            "/run/silo/rootfs-other"
+        ));
+    }
+    #[test]
+    fn retained_observation_reports_upper_not_lower_or_overlay_and_preserves_tail() {
+        use crate::metrics::{
+            root_storage_from_observation, temporary_directory_metrics, Capacity,
+        };
+        use protocol::v1::TemporaryDirectoryKind;
+        let mut observation = rootfs_spec::decode_observation(include_bytes!(
+            "../../../specs/rootfs-spec/fixtures/observation.json"
+        ))
+        .unwrap();
+        observation.root.upper.length_bytes += 4096;
+        observation.unusable_tail_bytes = 4096;
+        let capacity = Capacity::from_counts(4096, 15_000, 2_000, 1_000).unwrap();
+        let temporary = temporary_directory_metrics(TemporaryDirectoryKind::Upper, capacity);
+        let report =
+            root_storage_from_observation(&observation, capacity, 8192, 0, 0, temporary).unwrap();
+        assert_eq!(report.upper_backing_bytes, Some(67_112_960));
+        assert_eq!(report.upper_filesystem_bytes, Some(67_108_864));
+        assert_eq!(report.unusable_tail_bytes, Some(4096));
+        assert_eq!(report.filesystem_overhead_bytes, Some(5_668_864));
+        assert_eq!(report.upper_usable_bytes, Some(61_440_000));
+        assert_eq!(report.upper_used_bytes, Some(53_248_000));
+        assert_eq!(report.upper_free_bytes, Some(8_192_000));
+        assert_eq!(report.upper_available_bytes, Some(4_096_000));
+        assert_eq!(report.upper_free_inodes, Some(0));
+        assert_eq!(report.shared_lower_logical_bytes, Some(268_435_456));
+        assert_eq!(
+            report.upper_uuid.as_deref(),
+            Some("87654321-4321-4321-8321-cba987654321")
+        );
+        let too_large = Capacity::from_counts(4096, 20_000, 0, 0).unwrap();
+        let temporary = temporary_directory_metrics(TemporaryDirectoryKind::Upper, too_large);
+        assert!(
+            root_storage_from_observation(&observation, too_large, 8192, 0, 0, temporary,).is_err()
+        );
     }
 }

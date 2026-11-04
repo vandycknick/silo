@@ -16,7 +16,7 @@ pub fn write_buf(fd: i32, buf: &[u8]) -> isize {
                 buf.len() - written,
             )
         };
-        if ret < 0 {
+        if ret <= 0 {
             return ret;
         }
         written += ret as usize;

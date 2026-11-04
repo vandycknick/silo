@@ -5,6 +5,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eyre::Context;
@@ -130,9 +131,9 @@ pub(crate) async fn wait_ready(process_supervisor: &ProcessSupervisor) -> eyre::
     let started = Instant::now();
 
     loop {
-        let process_supervisor = process_supervisor.clone();
+        let checker = process_supervisor.clone();
         let output = tokio::task::spawn_blocking(move || {
-            process_supervisor.output(
+            checker.output(
                 OPENSSH_SERVER_PATH,
                 ["-t", "-f", crate::provision::ssh::CONFIG],
             )
@@ -143,6 +144,7 @@ pub(crate) async fn wait_ready(process_supervisor: &ProcessSupervisor) -> eyre::
         match output {
             Ok(output) if output.status.success() => {
                 verify_effective_config(
+                    process_supervisor,
                     Path::new(OPENSSH_SERVER_PATH),
                     Path::new(crate::provision::ssh::CONFIG),
                 )?;
@@ -182,12 +184,22 @@ pub(crate) async fn wait_ready(process_supervisor: &ProcessSupervisor) -> eyre::
     }
 }
 
-pub(crate) fn verify_effective_config(sshd: &Path, config: &Path) -> eyre::Result<()> {
-    let output = StdCommand::new(sshd)
+pub(crate) fn verify_effective_config(
+    process_supervisor: &ProcessSupervisor,
+    sshd: &Path,
+    config: &Path,
+) -> eyre::Result<()> {
+    let mut command = StdCommand::new(sshd);
+    command
         .arg("-T")
         .arg("-f")
         .arg(config)
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (child, guard) =
+        process_supervisor.spawn_child(&mut command, "sshd configuration check")?;
+    let output = child.wait_with_output()?;
+    drop(guard);
     if !output.status.success() {
         eyre::bail!(
             "sshd effective configuration check failed: {}",
@@ -278,42 +290,83 @@ fn command_stream_for_log(value: &[u8]) -> String {
 pub(crate) async fn handle_connection(
     process_supervisor: ProcessSupervisor,
     stream: VsockStream,
+    runtime: Arc<crate::lifecycle::RuntimeContext>,
 ) -> io::Result<()> {
+    let retirement = runtime.retirement();
+    let process_supervisor = process_supervisor.with_session(
+        runtime
+            .admit_session()
+            .map_err(|error| io::Error::other(error.to_string()))?,
+        retirement,
+    );
     if process_supervisor.is_active() {
+        let writer = process_supervisor.admit_internal_writer()?;
         return tokio::task::spawn_blocking(move || {
+            let _writer = writer;
             handle_connection_blocking(process_supervisor, stream)
         })
         .await
         .map_err(io::Error::other)?;
     }
 
-    handle_connection_async(stream).await
+    handle_connection_async(process_supervisor, stream).await
 }
 
-async fn handle_connection_async(stream: VsockStream) -> io::Result<()> {
+async fn handle_connection_async(
+    process_supervisor: ProcessSupervisor,
+    stream: VsockStream,
+) -> io::Result<()> {
     clear_nonblocking(stream.as_fd())?;
 
     let sshd_stdin = stream.as_fd().try_clone_to_owned()?;
     let sshd_stdout = stream.as_fd().try_clone_to_owned()?;
 
-    let mut child = TokioCommand::from(inetd_command(
+    let mut command = TokioCommand::from(inetd_command(
         Path::new(OPENSSH_SERVER_PATH),
         Path::new(crate::provision::ssh::CONFIG),
-    ))
-    .stdin(Stdio::from(sshd_stdin))
-    .stdout(Stdio::from(sshd_stdout))
-    .stderr(Stdio::piped())
-    .kill_on_drop(true)
-    .spawn()?;
+    ));
+    command.process_group(0);
+    command
+        .stdin(Stdio::from(sshd_stdin))
+        .stdout(Stdio::from(sshd_stdout))
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let logger_worker = process_supervisor.admit_internal_writer()?;
+    let (mut child, _guard) = process_supervisor.spawn_tokio_workload(&mut command)?;
 
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("failed to capture sshd stderr"))?;
-    let stderr_task = tokio::spawn(log_stderr_async(stderr));
+    let Some(stderr) = child.stderr.take() else {
+        let killed = child.start_kill();
+        let reaped = child.wait().await;
+        killed?;
+        reaped?;
+        return Err(io::Error::other("failed to capture sshd stderr"));
+    };
+    let stderr_task = tokio::spawn(async move {
+        let _worker = logger_worker;
+        log_stderr_async(stderr).await
+    });
 
-    let status = child.wait().await?;
-    stderr_task.await.map_err(io::Error::other)??;
+    let mut retirement = process_supervisor.retirement_receiver();
+    let status = tokio::select! {
+        status = child.wait() => status,
+        _ = async {
+            match &mut retirement {
+                Some(retirement) => { let _ = retirement.changed().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
+            if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+                crate::ssh::agent::signal_process_group(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            let killed = child.start_kill();
+            let status = child.wait().await;
+            killed?;
+            status
+        }
+    };
+    let logger = stderr_task.await.map_err(io::Error::other)?;
+    let status = status?;
+    logger?;
 
     report_connection_exit(status);
 
@@ -339,17 +392,33 @@ fn handle_connection_blocking(
         .stderr(Stdio::piped());
 
     let (mut child, guard) = process_supervisor.spawn_child(&mut command, "sshd")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("failed to capture sshd stderr"))?;
-    let stderr_thread = std::thread::spawn(move || log_stderr_blocking(stderr));
+    let Some(stderr) = child.stderr.take() else {
+        let killed = child.kill();
+        let reaped = child.wait();
+        killed?;
+        reaped?;
+        return Err(io::Error::other("failed to capture sshd stderr"));
+    };
+    let stderr_thread = match std::thread::Builder::new()
+        .name("silo-sshd-stderr".to_string())
+        .spawn(move || log_stderr_blocking(stderr))
+    {
+        Ok(logger) => logger,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
 
-    let status = child.wait()?;
-    drop(guard);
-    stderr_thread
+    let status =
+        crate::pid1::wait_retiring_child(&mut child, process_supervisor.retirement_receiver());
+    let logger = stderr_thread
         .join()
-        .map_err(|_| io::Error::other("sshd stderr logger panicked"))??;
+        .map_err(|_| io::Error::other("sshd stderr logger panicked"));
+    drop(guard);
+    let status = status?;
+    logger??;
 
     report_connection_exit(status);
 
@@ -605,7 +674,12 @@ mod tests {
             crate::provision::ssh::policy(&ca_path, &host_path).replace("UsePAM yes", "UsePAM no"),
         )
         .unwrap();
-        crate::ssh::openssh::verify_effective_config(&sshd, &config).unwrap();
+        crate::ssh::openssh::verify_effective_config(
+            &crate::pid1::ProcessSupervisor::default(),
+            &sshd,
+            &config,
+        )
+        .unwrap();
 
         // Use the production command builder: no -e, so OpenSSH's protocol
         // diagnostics keep their configured syslog destination.
@@ -786,7 +860,12 @@ mod tests {
             crate::provision::ssh::policy(&ca_path, &host_path).replace("UsePAM yes", "UsePAM no"),
         )
         .unwrap();
-        crate::ssh::openssh::verify_effective_config(&sshd, &config).unwrap();
+        crate::ssh::openssh::verify_effective_config(
+            &crate::pid1::ProcessSupervisor::default(),
+            &sshd,
+            &config,
+        )
+        .unwrap();
         let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
             .unwrap()
             .unwrap()

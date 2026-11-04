@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,8 @@ const COMPACT_MEMORY: &str = "/proc/sys/vm/compact_memory";
 #[derive(Clone, Default)]
 pub(crate) struct MemoryReclaimStatus {
     last: Arc<Mutex<Option<MemoryReclaimReport>>>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 impl MemoryReclaimStatus {
@@ -35,19 +37,50 @@ impl MemoryReclaimStatus {
             *last = Some(report);
         }
     }
+
+    pub(crate) async fn shutdown(&self) -> eyre::Result<()> {
+        {
+            let (stopped, wake) = &*self.stop;
+            *stopped
+                .lock()
+                .map_err(|_| eyre::eyre!("reclaimer stop lock poisoned"))? = true;
+            wake.notify_all();
+        }
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| eyre::eyre!("reclaimer worker lock poisoned"))?
+            .take();
+        if let Some(worker) = worker {
+            let join = tokio::task::spawn_blocking(move || {
+                worker
+                    .join()
+                    .map_err(|_| eyre::eyre!("memory reclaimer panicked"))
+            });
+            tokio::time::timeout(Duration::from_secs(3), join)
+                .await
+                .map_err(|_| eyre::eyre!("memory reclaimer did not stop before shutdown"))?
+                .map_err(|error| eyre::eyre!("memory reclaimer join failed: {error}"))??;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn start() -> MemoryReclaimStatus {
     let status = MemoryReclaimStatus::default();
     let thread_status = status.clone();
-    if let Err(error) = thread::Builder::new()
+    match thread::Builder::new()
         .name("guest-cache-reclaimer".to_string())
         .spawn(move || {
             lower_to_idle_priority();
             GuestCacheReclaimer::new().run(&thread_status);
-        })
-    {
-        tracing::warn!(%error, "failed to start GuestCacheReclaimer");
+        }) {
+        Ok(worker) => {
+            if let Ok(mut slot) = status.worker.lock() {
+                *slot = Some(worker);
+            }
+        }
+        Err(error) => tracing::warn!(%error, "failed to start GuestCacheReclaimer"),
     }
     status
 }
@@ -180,7 +213,19 @@ impl GuestCacheReclaimer {
     fn run(mut self, status: &MemoryReclaimStatus) {
         let mut last_availability = None;
         loop {
-            thread::sleep(POLL_INTERVAL);
+            let (stopped, wake) = &*status.stop;
+            let Ok(stopped) = stopped.lock() else {
+                return;
+            };
+            let Ok((stopped, _)) =
+                wake.wait_timeout_while(stopped, POLL_INTERVAL, |stopped| !*stopped)
+            else {
+                return;
+            };
+            if *stopped {
+                return;
+            }
+            drop(stopped);
             let reporter = free_page_reporter_available(Path::new("/sys/bus/virtio/devices"));
             let targets = if reporter {
                 reclaim_targets(Path::new("/sys/fs/cgroup"))
@@ -394,6 +439,16 @@ fn is_idle(busy: u64, total: u64) -> bool {
 mod tests {
     use crate::memory_reclaim::*;
     const MEMINFO_FIXTURE: &str = "MemTotal:        8388608 kB\nMemFree:         6291456 kB\nCached:          1048576 kB\nActive(file):     524288 kB\nInactive(file):   393216 kB\nShmem:            262144 kB\nSReclaimable:      65536 kB\n";
+
+    #[tokio::test]
+    async fn shutdown_joins_reclaimer_without_waiting_for_poll_interval() {
+        let status = crate::memory_reclaim::start();
+        tokio::time::timeout(std::time::Duration::from_secs(2), status.shutdown())
+            .await
+            .expect("shutdown wakes sleeping reclaimer")
+            .expect("reclaimer joined");
+        assert!(status.worker.lock().expect("worker lock").is_none());
+    }
 
     #[test]
     fn reporter_requires_negotiation_and_ready_driver_status() {
