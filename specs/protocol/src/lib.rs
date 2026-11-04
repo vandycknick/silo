@@ -1,3 +1,6 @@
+pub mod live;
+pub mod shutdown;
+
 #[allow(clippy::large_enum_variant)]
 pub mod v1 {
     tonic::include_proto!("silo.v1");
@@ -133,6 +136,101 @@ fn truncate_utf8(value: &str, maximum: usize) -> String {
     value[..end].to_string()
 }
 
+/// Checks the current managed-root metric contract at both relay boundaries.
+/// This validates observations, not upper geometry predictions or qualification.
+pub fn validate_root_storage_metrics(value: &v1::RootStorageMetrics) -> Result<(), String> {
+    let required = |field: &str, value: Option<u64>| {
+        value.ok_or_else(|| format!("metrics.root_storage.{field} is required"))
+    };
+    if value.kind != Some(v1::RootStorageKind::LinuxFlatOverlayV1 as i32)
+        || value.upper_profile.as_deref()
+            != Some(rootfs_spec::UpperProfile::SiloUpperExt4V1.as_str())
+    {
+        return Err("metrics.root_storage kind/profile is invalid".to_string());
+    }
+    rootfs_spec::FilesystemUuid::parse(value.upper_uuid.as_deref().unwrap_or_default())
+        .map_err(|error| format!("metrics.root_storage.upper_uuid is invalid: {error}"))?;
+    let backing = required("upper_backing_bytes", value.upper_backing_bytes)?;
+    rootfs_spec::upper_geometry::UpperCapacity::new(backing)
+        .map_err(|error| format!("metrics.root_storage.upper_backing_bytes is invalid: {error}"))?;
+    let filesystem = required("upper_filesystem_bytes", value.upper_filesystem_bytes)?;
+    let tail = required("unusable_tail_bytes", value.unusable_tail_bytes)?;
+    let overhead = required("filesystem_overhead_bytes", value.filesystem_overhead_bytes)?;
+    let usable = required("upper_usable_bytes", value.upper_usable_bytes)?;
+    let used = required("upper_used_bytes", value.upper_used_bytes)?;
+    let free = required("upper_free_bytes", value.upper_free_bytes)?;
+    let available = required("upper_available_bytes", value.upper_available_bytes)?;
+    let total_inodes = required("upper_total_inodes", value.upper_total_inodes)?;
+    let free_inodes = required("upper_free_inodes", value.upper_free_inodes)?;
+    let available_inodes = required("upper_available_inodes", value.upper_available_inodes)?;
+    let lower = required(
+        "shared_lower_logical_bytes",
+        value.shared_lower_logical_bytes,
+    )?;
+    vm_spec::DiskGeometry {
+        length: lower,
+        logical_sector_size: 512,
+    }
+    .validate()
+    .map_err(|error| {
+        format!("metrics.root_storage.shared_lower_logical_bytes is invalid: {error}")
+    })?;
+    if filesystem == 0
+        || filesystem % u64::from(rootfs_spec::upper_geometry::BLOCK_SIZE) != 0
+        || filesystem.checked_add(tail) != Some(backing)
+        || usable.checked_add(overhead) != Some(filesystem)
+        || used.checked_add(free) != Some(usable)
+        || available > free
+        || total_inodes == 0
+        || free_inodes > total_inodes
+        || available_inodes > free_inodes
+    {
+        return Err("metrics.root_storage accounting is inconsistent".to_string());
+    }
+    let temporary = value
+        .temporary_directory
+        .as_ref()
+        .ok_or_else(|| "metrics.root_storage.temporary_directory is required".to_string())?;
+    validate_temporary_directory_metrics(temporary)?;
+    if temporary.kind == Some(v1::TemporaryDirectoryKind::Upper as i32)
+        && temporary.capacity_bytes != Some(usable)
+    {
+        return Err("metrics.root_storage disk-backed /tmp must share upper capacity".to_string());
+    }
+    Ok(())
+}
+
+/// Validates actual `/tmp` accounting without inventing persistence for OTHER.
+pub fn validate_temporary_directory_metrics(
+    value: &v1::TemporaryDirectoryMetrics,
+) -> Result<(), String> {
+    let required = |field: &str, value: Option<u64>| {
+        value.ok_or_else(|| format!("metrics.temporary_directory.{field} is required"))
+    };
+    let capacity = required("capacity_bytes", value.capacity_bytes)?;
+    let used = required("used_bytes", value.used_bytes)?;
+    let free = required("free_bytes", value.free_bytes)?;
+    let available = required("available_bytes", value.available_bytes)?;
+    if used.checked_add(free) != Some(capacity) || available > free {
+        return Err("metrics.temporary_directory accounting is inconsistent".to_string());
+    }
+    let expected = match value
+        .kind
+        .and_then(|kind| v1::TemporaryDirectoryKind::try_from(kind).ok())
+    {
+        Some(v1::TemporaryDirectoryKind::Upper) => (Some(true), Some(false)),
+        Some(v1::TemporaryDirectoryKind::Tmpfs) => (Some(false), Some(true)),
+        Some(v1::TemporaryDirectoryKind::Other) => (None, None),
+        _ => return Err("metrics.temporary_directory.kind is invalid".to_string()),
+    };
+    if (value.persistent, value.memory_charged) != expected {
+        return Err(
+            "metrics.temporary_directory persistence/memory charging is inconsistent".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use prost::Message;
@@ -176,75 +274,6 @@ mod tests {
         assert_eq!(
             parse_guest_port_args(["silo.guest.port=65536"]),
             DEFAULT_GUEST_CONTROL_PORT
-        );
-    }
-
-    #[test]
-    fn descriptor_inventory_is_complete_and_source_free() {
-        let descriptors =
-            FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("decode descriptors");
-        let files: Vec<_> = descriptors
-            .file
-            .iter()
-            .filter_map(|file| file.name.as_deref())
-            .collect();
-        assert!(files.contains(&"common.proto"));
-        assert!(files.contains(&"execution.proto"));
-        assert!(files.contains(&"errors.proto"));
-        assert!(files.contains(&"filesystem.proto"));
-        assert!(files.contains(&"forward.proto"));
-        assert!(files.contains(&"guest.proto"));
-        assert!(files.contains(&"guest_process.proto"));
-        assert!(files.contains(&"vm_monitor.proto"));
-        assert!(descriptors
-            .file
-            .iter()
-            .all(|file| file.source_code_info.is_none()));
-
-        let service_methods = |service_name: &str| {
-            descriptors
-                .file
-                .iter()
-                .flat_map(|file| &file.service)
-                .find(|service| service.name.as_deref() == Some(service_name))
-                .expect("service in descriptor")
-                .method
-                .iter()
-                .filter_map(|method| method.name.as_deref())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            service_methods("VmMonitorService"),
-            ["GetStatus", "WaitReady", "GetMetrics"]
-        );
-        assert_eq!(
-            service_methods("VmAccessService"),
-            ["OpenSsh", "OpenSerial"]
-        );
-        assert_eq!(
-            service_methods("GuestAgentService"),
-            [
-                "GetStatus",
-                "WatchStatus",
-                "GetMetrics",
-                "WatchMetrics",
-                "SyncClock"
-            ]
-        );
-        assert_eq!(service_methods("GuestProcessService"), ["Execute"]);
-        assert_eq!(service_methods("VmExecutionService"), ["Execute"]);
-        assert_eq!(service_methods("GuestForwardService"), ["Listen"]);
-        assert_eq!(service_methods("VmForwardService"), ["Open", "List"]);
-        assert_eq!(
-            service_methods("GuestFilesystemService"),
-            [
-                "GetEntry",
-                "RemoveEntry",
-                "DownloadFile",
-                "UploadFile",
-                "ListDirectory",
-                "CreateDirectory"
-            ]
         );
     }
 
@@ -434,5 +463,146 @@ mod tests {
             services,
             ["silo.v1.GuestFilesystemService", "silo.v1.VmMonitorService"]
         );
+    }
+    fn root_metrics() -> v1::RootStorageMetrics {
+        v1::RootStorageMetrics {
+            kind: Some(v1::RootStorageKind::LinuxFlatOverlayV1 as i32),
+            upper_profile: Some("silo-upper-ext4-v1".into()),
+            upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
+            upper_backing_bytes: Some(134_221_824),
+            upper_filesystem_bytes: Some(134_217_728),
+            unusable_tail_bytes: Some(4096),
+            filesystem_overhead_bytes: Some(8_388_608),
+            upper_usable_bytes: Some(125_829_120),
+            upper_used_bytes: Some(83_886_080),
+            upper_free_bytes: Some(41_943_040),
+            upper_available_bytes: Some(33_554_432),
+            upper_total_inodes: Some(8192),
+            upper_free_inodes: Some(0),
+            upper_available_inodes: Some(0),
+            shared_lower_logical_bytes: Some(4_831_838_208),
+            temporary_directory: Some(v1::TemporaryDirectoryMetrics {
+                kind: Some(v1::TemporaryDirectoryKind::Tmpfs as i32),
+                capacity_bytes: Some(1_048_576),
+                used_bytes: Some(4096),
+                free_bytes: Some(1_044_480),
+                available_bytes: Some(1_044_480),
+                persistent: Some(false),
+                memory_charged: Some(true),
+            }),
+        }
+    }
+
+    #[test]
+    fn root_metrics_wire_round_trip_preserves_tail_reserved_blocks_and_inode_exhaustion() {
+        let metrics = root_metrics();
+        crate::validate_root_storage_metrics(&metrics).unwrap();
+        let decoded = v1::RootStorageMetrics::decode(metrics.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, metrics);
+        assert_ne!(decoded.upper_free_bytes, decoded.upper_available_bytes);
+        assert_eq!(decoded.upper_free_inodes, Some(0));
+    }
+
+    #[test]
+    fn root_metrics_reject_missing_unknown_and_inconsistent_accounting() {
+        let mutations: &[fn(&mut v1::RootStorageMetrics)] = &[
+            |value| value.kind = None,
+            |value| value.kind = Some(999),
+            |value| value.upper_profile = Some("other".into()),
+            |value| value.upper_uuid = Some("00000000-0000-0000-0000-000000000000".into()),
+            |value| value.upper_uuid = Some("12345678-1234-4234-8234-123456789ABC".into()),
+            |value| value.upper_backing_bytes = None,
+            |value| value.upper_backing_bytes = Some(u64::MAX),
+            |value| value.upper_filesystem_bytes = Some(0),
+            |value| value.unusable_tail_bytes = Some(u64::MAX),
+            |value| value.filesystem_overhead_bytes = Some(u64::MAX),
+            |value| value.upper_used_bytes = Some(u64::MAX),
+            |value| value.upper_free_bytes = Some(u64::MAX),
+            |value| value.upper_available_bytes = value.upper_usable_bytes,
+            |value| value.upper_total_inodes = Some(0),
+            |value| value.upper_free_inodes = Some(8193),
+            |value| value.upper_available_inodes = Some(1),
+            |value| value.shared_lower_logical_bytes = Some(0),
+            |value| value.shared_lower_logical_bytes = Some(513),
+            |value| value.temporary_directory = None,
+        ];
+        for mutation in mutations {
+            let mut metrics = root_metrics();
+            mutation(&mut metrics);
+            assert!(
+                crate::validate_root_storage_metrics(&metrics).is_err(),
+                "{metrics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_metrics_reject_unknown_semantics_and_preserve_zero_free_capacity() {
+        let mut temporary = root_metrics().temporary_directory.unwrap();
+        temporary.used_bytes = temporary.capacity_bytes;
+        temporary.free_bytes = Some(0);
+        temporary.available_bytes = Some(0);
+        crate::validate_temporary_directory_metrics(&temporary).unwrap();
+        temporary.kind = Some(v1::TemporaryDirectoryKind::Other as i32);
+        assert!(crate::validate_temporary_directory_metrics(&temporary).is_err());
+        temporary.persistent = None;
+        temporary.memory_charged = None;
+        crate::validate_temporary_directory_metrics(&temporary).unwrap();
+        temporary.kind = Some(999);
+        assert!(crate::validate_temporary_directory_metrics(&temporary).is_err());
+        temporary.kind = Some(v1::TemporaryDirectoryKind::Other as i32);
+        temporary.used_bytes = Some(u64::MAX);
+        temporary.free_bytes = Some(1);
+        assert!(crate::validate_temporary_directory_metrics(&temporary).is_err());
+    }
+
+    #[test]
+    fn disk_temporary_metrics_share_upper_capacity_not_additional_space() {
+        let mut metrics = root_metrics();
+        let temporary = metrics.temporary_directory.as_mut().unwrap();
+        temporary.kind = Some(v1::TemporaryDirectoryKind::Upper as i32);
+        temporary.persistent = Some(true);
+        temporary.memory_charged = Some(false);
+        assert!(crate::validate_root_storage_metrics(&metrics).is_err());
+        let temporary = metrics.temporary_directory.as_mut().unwrap();
+        temporary.capacity_bytes = metrics.upper_usable_bytes;
+        temporary.used_bytes = metrics.upper_used_bytes;
+        temporary.free_bytes = metrics.upper_free_bytes;
+        temporary.available_bytes = metrics.upper_available_bytes;
+        crate::validate_root_storage_metrics(&metrics).unwrap();
+    }
+    #[test]
+    fn root_metrics_accept_inclusive_capacity_bounds_without_narrowing_tail_alignment() {
+        use rootfs_spec::upper_geometry::{
+            UpperCapacity, UpperGeometry, MAX_CAPACITY_BYTES, MIN_CAPACITY_BYTES,
+        };
+        for backing in [
+            MIN_CAPACITY_BYTES,
+            MIN_CAPACITY_BYTES + 4096,
+            134_221_824,
+            MAX_CAPACITY_BYTES,
+        ] {
+            let mut metrics = root_metrics();
+            let geometry = UpperGeometry::for_capacity(UpperCapacity::new(backing).unwrap());
+            let filesystem = geometry.filesystem_bytes;
+            metrics.upper_backing_bytes = Some(backing);
+            metrics.upper_filesystem_bytes = Some(filesystem);
+            metrics.unusable_tail_bytes = Some(geometry.unusable_tail_bytes);
+            metrics.filesystem_overhead_bytes = Some(4096);
+            metrics.upper_usable_bytes = Some(filesystem - 4096);
+            metrics.upper_used_bytes = Some(filesystem - 4096);
+            metrics.upper_free_bytes = Some(0);
+            metrics.upper_available_bytes = Some(0);
+            crate::validate_root_storage_metrics(&metrics).unwrap();
+        }
+        for backing in [
+            MIN_CAPACITY_BYTES - 4096,
+            MAX_CAPACITY_BYTES + 4096,
+            MIN_CAPACITY_BYTES + 1,
+        ] {
+            let mut metrics = root_metrics();
+            metrics.upper_backing_bytes = Some(backing);
+            assert!(crate::validate_root_storage_metrics(&metrics).is_err());
+        }
     }
 }

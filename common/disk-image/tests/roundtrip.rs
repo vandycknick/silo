@@ -41,9 +41,10 @@ fn test_create_and_read_file() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut &content[..]),
+        Some(disk_image::ext4::FileData::Dense(&mut &content[..])),
         Some(1000),
         Some(1000),
+        None,
         None,
     )
     .unwrap();
@@ -84,6 +85,7 @@ fn test_nested_directories() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -92,7 +94,8 @@ fn test_nested_directories() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "deep".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "deep".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -123,7 +126,10 @@ fn test_symlinks() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "target content".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "target content".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -134,7 +140,8 @@ fn test_symlinks() {
     fmt.create(
         "/short_link",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("/target.txt"),
+        Some("/target.txt".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -154,6 +161,7 @@ fn test_symlinks() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     fmt.create(
@@ -161,7 +169,10 @@ fn test_symlinks() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "long target".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "long target".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -170,7 +181,8 @@ fn test_symlinks() {
     fmt.create(
         "/long_link",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some(long_target),
+        Some(long_target.as_bytes()),
+        None,
         None,
         None,
         None,
@@ -205,7 +217,8 @@ fn test_unicode_paths_and_symlinks() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut b"hello".as_slice()),
+        Some(disk_image::ext4::FileData::Dense(&mut b"hello".as_slice())),
+        None,
         None,
         None,
         None,
@@ -214,7 +227,8 @@ fn test_unicode_paths_and_symlinks() {
     fmt.create(
         "/data/\u{94fe}\u{63a5}",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("\u{65e5}\u{672c}\u{8a9e}.txt"),
+        Some("\u{65e5}\u{672c}\u{8a9e}.txt".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -253,7 +267,8 @@ fn test_remove_operations() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut b"first".as_slice()),
+        Some(disk_image::ext4::FileData::Dense(&mut b"first".as_slice())),
+        None,
         None,
         None,
         None,
@@ -264,7 +279,8 @@ fn test_remove_operations() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut b"second".as_slice()),
+        Some(disk_image::ext4::FileData::Dense(&mut b"second".as_slice())),
+        None,
         None,
         None,
         None,
@@ -276,7 +292,8 @@ fn test_remove_operations() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut b"gone".as_slice()),
+        Some(disk_image::ext4::FileData::Dense(&mut b"gone".as_slice())),
+        None,
         None,
         None,
         None,
@@ -304,6 +321,7 @@ fn test_list_directory() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     fmt.create(
@@ -311,7 +329,8 @@ fn test_list_directory() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "a".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "a".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -322,7 +341,8 @@ fn test_list_directory() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "b".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "b".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -333,7 +353,8 @@ fn test_list_directory() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "g".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "g".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -346,7 +367,10 @@ fn test_list_directory() {
     let entries = reader.list_dir("/dir").unwrap();
 
     // Should contain exactly our 3 files, sorted.
-    assert_eq!(entries, vec!["alpha", "beta", "gamma"]);
+    assert_eq!(
+        entries,
+        vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+    );
 }
 
 #[test]
@@ -358,7 +382,10 @@ fn test_hard_links_roundtrip() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "shared content".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "shared content".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -389,6 +416,7 @@ fn test_empty_file() {
     fmt.create(
         "/empty.bin",
         make_mode(file_mode::S_IFREG, 0o644),
+        None,
         None,
         None,
         None,
@@ -429,7 +457,8 @@ fn test_zero_byte_read() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut &content[..]),
+        Some(disk_image::ext4::FileData::Dense(&mut &content[..])),
+        None,
         None,
         None,
         None,
@@ -472,7 +501,8 @@ fn test_partial_read() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut &content[..]),
+        Some(disk_image::ext4::FileData::Dense(&mut &content[..])),
+        None,
         None,
         None,
         None,
@@ -533,7 +563,8 @@ fn test_large_file_multi_block() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut pattern.as_slice()),
+        Some(disk_image::ext4::FileData::Dense(&mut pattern.as_slice())),
+        None,
         None,
         None,
         None,
@@ -584,7 +615,8 @@ fn test_read_nonexistent_path() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "data".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "data".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -638,6 +670,7 @@ fn test_read_file_on_directory() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -666,7 +699,8 @@ fn test_list_dir_on_file() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "content".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(&mut "content".as_bytes())),
+        None,
         None,
         None,
         None,
@@ -731,7 +765,8 @@ fn test_symlink_loop_detection() {
     fmt.create(
         "/link_a",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("/link_b"),
+        Some("/link_b".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -743,7 +778,8 @@ fn test_symlink_loop_detection() {
     fmt.create(
         "/link_b",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("/link_a"),
+        Some("/link_a".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -784,7 +820,10 @@ fn test_symlink_chain() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "chained content".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "chained content".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -794,7 +833,8 @@ fn test_symlink_chain() {
     fmt.create(
         "/c",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("/real_file"),
+        Some("/real_file".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -806,7 +846,8 @@ fn test_symlink_chain() {
     fmt.create(
         "/b",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("/c"),
+        Some("/c".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -818,7 +859,8 @@ fn test_symlink_chain() {
     fmt.create(
         "/a",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("/b"),
+        Some("/b".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -862,7 +904,10 @@ fn test_relative_symlinks() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut "relative target".as_bytes()),
+        Some(disk_image::ext4::FileData::Dense(
+            &mut "relative target".as_bytes(),
+        )),
+        None,
         None,
         None,
         None,
@@ -873,7 +918,8 @@ fn test_relative_symlinks() {
     fmt.create(
         "/dir/rel_link",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("file.txt"),
+        Some("file.txt".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -886,7 +932,8 @@ fn test_relative_symlinks() {
     fmt.create(
         "/other_link",
         make_mode(file_mode::S_IFLNK, 0o777),
-        Some("dir/file.txt"),
+        Some("dir/file.txt".as_bytes()),
+        None,
         None,
         None,
         None,
@@ -942,10 +989,16 @@ fn test_xattr_end_to_end() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut &content[..]),
+        Some(disk_image::ext4::FileData::Dense(&mut &content[..])),
         Some(1000),
         Some(1000),
-        Some(&xattrs),
+        Some(
+            &xattrs
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_slice()))
+                .collect::<Vec<_>>(),
+        ),
+        None,
     )
     .unwrap();
 
@@ -957,8 +1010,11 @@ fn test_xattr_end_to_end() {
     let data = reader.read_file("/xattr_file.txt", 0, None).unwrap();
     assert_eq!(&data, content);
 
-    // The Reader does not (yet) expose a high-level xattr API, so we verify
-    // at the inode level that the inline_xattrs area has been populated.
+    let actual_xattrs = reader.xattrs("/xattr_file.txt").unwrap();
+    assert_eq!(actual_xattrs.len(), xattrs.len());
+    for (name, value) in &xattrs {
+        assert_eq!(actual_xattrs.get(name.as_bytes()).unwrap(), value);
+    }
     let (_, inode) = reader.stat("/xattr_file.txt").unwrap();
 
     // The first 4 bytes of inline_xattrs should be the xattr header magic
@@ -1002,7 +1058,8 @@ fn test_multi_block_group() {
             make_mode(file_mode::S_IFREG, 0o644),
             None,
             None,
-            Some(&mut content.as_bytes()),
+            Some(disk_image::ext4::FileData::Dense(&mut content.as_bytes())),
+            None,
             None,
             None,
             None,
@@ -1056,6 +1113,7 @@ fn test_large_directory() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -1068,7 +1126,8 @@ fn test_large_directory() {
             make_mode(file_mode::S_IFREG, 0o644),
             None,
             None,
-            Some(&mut content.as_bytes()),
+            Some(disk_image::ext4::FileData::Dense(&mut content.as_bytes())),
+            None,
             None,
             None,
             None,
@@ -1112,7 +1171,8 @@ fn test_read_file_into() {
         make_mode(file_mode::S_IFREG, 0o644),
         None,
         None,
-        Some(&mut &content[..]),
+        Some(disk_image::ext4::FileData::Dense(&mut &content[..])),
+        None,
         None,
         None,
         None,

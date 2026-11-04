@@ -31,7 +31,7 @@ pub const XATTR_BLOCK_HEADER_SIZE: u32 = 32;
 pub const MAX_LINKS: u32 = 65000;
 pub const EXT4_NAME_LEN: usize = 255;
 pub const MAX_BLOCKS_PER_EXTENT: u32 = 0x8000;
-pub const MAX_FILE_SIZE: u64 = 128 * 1024 * 1024 * 1024; // 128 GiB
+pub const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 pub const SUPERBLOCK_OFFSET: u64 = 1024;
 
 // ── Inode block field size ──

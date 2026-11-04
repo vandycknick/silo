@@ -24,6 +24,7 @@ const (
 	DaemonService_GetRuntimeInfo_FullMethodName        = "/silo.daemon.v1.DaemonService/GetRuntimeInfo"
 	DaemonService_ReportTailscaleStatus_FullMethodName = "/silo.daemon.v1.DaemonService/ReportTailscaleStatus"
 	DaemonService_DrainMutations_FullMethodName        = "/silo.daemon.v1.DaemonService/DrainMutations"
+	DaemonService_GetLiveCapabilities_FullMethodName   = "/silo.daemon.v1.DaemonService/GetLiveCapabilities"
 )
 
 // DaemonServiceClient is the client API for DaemonService service.
@@ -34,6 +35,7 @@ type DaemonServiceClient interface {
 	GetRuntimeInfo(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RuntimeInfo, error)
 	ReportTailscaleStatus(ctx context.Context, in *TailscaleStatusReport, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	DrainMutations(ctx context.Context, in *DrainMutationsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	GetLiveCapabilities(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LiveHostReport, error)
 }
 
 type daemonServiceClient struct {
@@ -84,6 +86,16 @@ func (c *daemonServiceClient) DrainMutations(ctx context.Context, in *DrainMutat
 	return out, nil
 }
 
+func (c *daemonServiceClient) GetLiveCapabilities(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LiveHostReport, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LiveHostReport)
+	err := c.cc.Invoke(ctx, DaemonService_GetLiveCapabilities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DaemonServiceServer is the server API for DaemonService service.
 // All implementations must embed UnimplementedDaemonServiceServer
 // for forward compatibility.
@@ -92,6 +104,7 @@ type DaemonServiceServer interface {
 	GetRuntimeInfo(context.Context, *emptypb.Empty) (*RuntimeInfo, error)
 	ReportTailscaleStatus(context.Context, *TailscaleStatusReport) (*emptypb.Empty, error)
 	DrainMutations(context.Context, *DrainMutationsRequest) (*emptypb.Empty, error)
+	GetLiveCapabilities(context.Context, *emptypb.Empty) (*LiveHostReport, error)
 	mustEmbedUnimplementedDaemonServiceServer()
 }
 
@@ -113,6 +126,9 @@ func (UnimplementedDaemonServiceServer) ReportTailscaleStatus(context.Context, *
 }
 func (UnimplementedDaemonServiceServer) DrainMutations(context.Context, *DrainMutationsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method DrainMutations not implemented")
+}
+func (UnimplementedDaemonServiceServer) GetLiveCapabilities(context.Context, *emptypb.Empty) (*LiveHostReport, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLiveCapabilities not implemented")
 }
 func (UnimplementedDaemonServiceServer) mustEmbedUnimplementedDaemonServiceServer() {}
 func (UnimplementedDaemonServiceServer) testEmbeddedByValue()                       {}
@@ -207,6 +223,24 @@ func _DaemonService_DrainMutations_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DaemonService_GetLiveCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DaemonServiceServer).GetLiveCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DaemonService_GetLiveCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DaemonServiceServer).GetLiveCapabilities(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DaemonService_ServiceDesc is the grpc.ServiceDesc for DaemonService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -230,6 +264,10 @@ var DaemonService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "DrainMutations",
 			Handler:    _DaemonService_DrainMutations_Handler,
 		},
+		{
+			MethodName: "GetLiveCapabilities",
+			Handler:    _DaemonService_GetLiveCapabilities_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "daemon.proto",
@@ -252,6 +290,11 @@ const (
 	MachineService_RemoveAfterRun_FullMethodName      = "/silo.daemon.v1.MachineService/RemoveAfterRun"
 	MachineService_ReadLogs_FullMethodName            = "/silo.daemon.v1.MachineService/ReadLogs"
 	MachineService_SetMachineSecret_FullMethodName    = "/silo.daemon.v1.MachineService/SetMachineSecret"
+	MachineService_PauseMachine_FullMethodName        = "/silo.daemon.v1.MachineService/PauseMachine"
+	MachineService_CaptureExecution_FullMethodName    = "/silo.daemon.v1.MachineService/CaptureExecution"
+	MachineService_ForkExecution_FullMethodName       = "/silo.daemon.v1.MachineService/ForkExecution"
+	MachineService_ForkStopped_FullMethodName         = "/silo.daemon.v1.MachineService/ForkStopped"
+	MachineService_SnapshotStopped_FullMethodName     = "/silo.daemon.v1.MachineService/SnapshotStopped"
 )
 
 // MachineServiceClient is the client API for MachineService service.
@@ -274,6 +317,11 @@ type MachineServiceClient interface {
 	RemoveAfterRun(ctx context.Context, in *MachineRunRef, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ReadLogs(ctx context.Context, in *ReadLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogChunk], error)
 	SetMachineSecret(ctx context.Context, in *SetMachineSecretRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ForkStopped(ctx context.Context, in *StoppedForkRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
+	SnapshotStopped(ctx context.Context, in *CreateStorageSnapshotRequest, opts ...grpc.CallOption) (*StorageSnapshotInfo, error)
 }
 
 type machineServiceClient struct {
@@ -471,6 +519,56 @@ func (c *machineServiceClient) SetMachineSecret(ctx context.Context, in *SetMach
 	return out, nil
 }
 
+func (c *machineServiceClient) PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, MachineService_PauseMachine_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *machineServiceClient) CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, MachineService_CaptureExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *machineServiceClient) ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, MachineService_ForkExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *machineServiceClient) ForkStopped(ctx context.Context, in *StoppedForkRequest, opts ...grpc.CallOption) (*MachineSnapshot, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSnapshot)
+	err := c.cc.Invoke(ctx, MachineService_ForkStopped_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *machineServiceClient) SnapshotStopped(ctx context.Context, in *CreateStorageSnapshotRequest, opts ...grpc.CallOption) (*StorageSnapshotInfo, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StorageSnapshotInfo)
+	err := c.cc.Invoke(ctx, MachineService_SnapshotStopped_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MachineServiceServer is the server API for MachineService service.
 // All implementations must embed UnimplementedMachineServiceServer
 // for forward compatibility.
@@ -491,6 +589,11 @@ type MachineServiceServer interface {
 	RemoveAfterRun(context.Context, *MachineRunRef) (*emptypb.Empty, error)
 	ReadLogs(*ReadLogsRequest, grpc.ServerStreamingServer[LogChunk]) error
 	SetMachineSecret(context.Context, *SetMachineSecretRequest) (*emptypb.Empty, error)
+	PauseMachine(context.Context, *LiveMachineRequest) (*emptypb.Empty, error)
+	CaptureExecution(context.Context, *LiveCaptureRequest) (*emptypb.Empty, error)
+	ForkExecution(context.Context, *LiveForkRequest) (*emptypb.Empty, error)
+	ForkStopped(context.Context, *StoppedForkRequest) (*MachineSnapshot, error)
+	SnapshotStopped(context.Context, *CreateStorageSnapshotRequest) (*StorageSnapshotInfo, error)
 	mustEmbedUnimplementedMachineServiceServer()
 }
 
@@ -548,6 +651,21 @@ func (UnimplementedMachineServiceServer) ReadLogs(*ReadLogsRequest, grpc.ServerS
 }
 func (UnimplementedMachineServiceServer) SetMachineSecret(context.Context, *SetMachineSecretRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetMachineSecret not implemented")
+}
+func (UnimplementedMachineServiceServer) PauseMachine(context.Context, *LiveMachineRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method PauseMachine not implemented")
+}
+func (UnimplementedMachineServiceServer) CaptureExecution(context.Context, *LiveCaptureRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method CaptureExecution not implemented")
+}
+func (UnimplementedMachineServiceServer) ForkExecution(context.Context, *LiveForkRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForkExecution not implemented")
+}
+func (UnimplementedMachineServiceServer) ForkStopped(context.Context, *StoppedForkRequest) (*MachineSnapshot, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForkStopped not implemented")
+}
+func (UnimplementedMachineServiceServer) SnapshotStopped(context.Context, *CreateStorageSnapshotRequest) (*StorageSnapshotInfo, error) {
+	return nil, status.Error(codes.Unimplemented, "method SnapshotStopped not implemented")
 }
 func (UnimplementedMachineServiceServer) mustEmbedUnimplementedMachineServiceServer() {}
 func (UnimplementedMachineServiceServer) testEmbeddedByValue()                        {}
@@ -837,6 +955,96 @@ func _MachineService_SetMachineSecret_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MachineService_PauseMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LiveMachineRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).PauseMachine(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_PauseMachine_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).PauseMachine(ctx, req.(*LiveMachineRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MachineService_CaptureExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LiveCaptureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).CaptureExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_CaptureExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).CaptureExecution(ctx, req.(*LiveCaptureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MachineService_ForkExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LiveForkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).ForkExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_ForkExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).ForkExecution(ctx, req.(*LiveForkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MachineService_ForkStopped_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StoppedForkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).ForkStopped(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_ForkStopped_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).ForkStopped(ctx, req.(*StoppedForkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MachineService_SnapshotStopped_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateStorageSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).SnapshotStopped(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_SnapshotStopped_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).SnapshotStopped(ctx, req.(*CreateStorageSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MachineService_ServiceDesc is the grpc.ServiceDesc for MachineService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -895,6 +1103,26 @@ var MachineService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetMachineSecret",
 			Handler:    _MachineService_SetMachineSecret_Handler,
+		},
+		{
+			MethodName: "PauseMachine",
+			Handler:    _MachineService_PauseMachine_Handler,
+		},
+		{
+			MethodName: "CaptureExecution",
+			Handler:    _MachineService_CaptureExecution_Handler,
+		},
+		{
+			MethodName: "ForkExecution",
+			Handler:    _MachineService_ForkExecution_Handler,
+		},
+		{
+			MethodName: "ForkStopped",
+			Handler:    _MachineService_ForkStopped_Handler,
+		},
+		{
+			MethodName: "SnapshotStopped",
+			Handler:    _MachineService_SnapshotStopped_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -1176,12 +1404,18 @@ var NetworkService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	RuntimeService_ResolveImage_FullMethodName       = "/silo.daemon.v1.RuntimeService/ResolveImage"
-	RuntimeService_PullImage_FullMethodName          = "/silo.daemon.v1.RuntimeService/PullImage"
-	RuntimeService_ProposeMachineName_FullMethodName = "/silo.daemon.v1.RuntimeService/ProposeMachineName"
-	RuntimeService_ParseResource_FullMethodName      = "/silo.daemon.v1.RuntimeService/ParseResource"
-	RuntimeService_NormalizePolicy_FullMethodName    = "/silo.daemon.v1.RuntimeService/NormalizePolicy"
-	RuntimeService_CheckPolicySecrets_FullMethodName = "/silo.daemon.v1.RuntimeService/CheckPolicySecrets"
+	RuntimeService_ResolveImage_FullMethodName             = "/silo.daemon.v1.RuntimeService/ResolveImage"
+	RuntimeService_PullImage_FullMethodName                = "/silo.daemon.v1.RuntimeService/PullImage"
+	RuntimeService_ProposeMachineName_FullMethodName       = "/silo.daemon.v1.RuntimeService/ProposeMachineName"
+	RuntimeService_ParseResource_FullMethodName            = "/silo.daemon.v1.RuntimeService/ParseResource"
+	RuntimeService_NormalizePolicy_FullMethodName          = "/silo.daemon.v1.RuntimeService/NormalizePolicy"
+	RuntimeService_CheckPolicySecrets_FullMethodName       = "/silo.daemon.v1.RuntimeService/CheckPolicySecrets"
+	RuntimeService_RestoreExecution_FullMethodName         = "/silo.daemon.v1.RuntimeService/RestoreExecution"
+	RuntimeService_RestoreSnapshot_FullMethodName          = "/silo.daemon.v1.RuntimeService/RestoreSnapshot"
+	RuntimeService_InspectStorageSnapshot_FullMethodName   = "/silo.daemon.v1.RuntimeService/InspectStorageSnapshot"
+	RuntimeService_ListStorageSnapshots_FullMethodName     = "/silo.daemon.v1.RuntimeService/ListStorageSnapshots"
+	RuntimeService_ReleaseSnapshotRetention_FullMethodName = "/silo.daemon.v1.RuntimeService/ReleaseSnapshotRetention"
+	RuntimeService_RemoveImageAlias_FullMethodName         = "/silo.daemon.v1.RuntimeService/RemoveImageAlias"
 )
 
 // RuntimeServiceClient is the client API for RuntimeService service.
@@ -1194,6 +1428,12 @@ type RuntimeServiceClient interface {
 	ParseResource(ctx context.Context, in *ParseResourceRequest, opts ...grpc.CallOption) (*Size, error)
 	NormalizePolicy(ctx context.Context, in *NormalizePolicyRequest, opts ...grpc.CallOption) (*PolicyDocument, error)
 	CheckPolicySecrets(ctx context.Context, in *CheckPolicySecretsRequest, opts ...grpc.CallOption) (*PolicySecretsResult, error)
+	RestoreExecution(ctx context.Context, in *LiveRestoreRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	RestoreSnapshot(ctx context.Context, in *RestoreStorageSnapshotRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
+	InspectStorageSnapshot(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*StorageSnapshotInfo, error)
+	ListStorageSnapshots(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StorageSnapshotList, error)
+	ReleaseSnapshotRetention(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	RemoveImageAlias(ctx context.Context, in *Name, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type runtimeServiceClient struct {
@@ -1282,6 +1522,66 @@ func (c *runtimeServiceClient) CheckPolicySecrets(ctx context.Context, in *Check
 	return out, nil
 }
 
+func (c *runtimeServiceClient) RestoreExecution(ctx context.Context, in *LiveRestoreRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, RuntimeService_RestoreExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) RestoreSnapshot(ctx context.Context, in *RestoreStorageSnapshotRequest, opts ...grpc.CallOption) (*MachineSnapshot, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSnapshot)
+	err := c.cc.Invoke(ctx, RuntimeService_RestoreSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) InspectStorageSnapshot(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*StorageSnapshotInfo, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StorageSnapshotInfo)
+	err := c.cc.Invoke(ctx, RuntimeService_InspectStorageSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) ListStorageSnapshots(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StorageSnapshotList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StorageSnapshotList)
+	err := c.cc.Invoke(ctx, RuntimeService_ListStorageSnapshots_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) ReleaseSnapshotRetention(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, RuntimeService_ReleaseSnapshotRetention_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) RemoveImageAlias(ctx context.Context, in *Name, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, RuntimeService_RemoveImageAlias_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RuntimeServiceServer is the server API for RuntimeService service.
 // All implementations must embed UnimplementedRuntimeServiceServer
 // for forward compatibility.
@@ -1292,6 +1592,12 @@ type RuntimeServiceServer interface {
 	ParseResource(context.Context, *ParseResourceRequest) (*Size, error)
 	NormalizePolicy(context.Context, *NormalizePolicyRequest) (*PolicyDocument, error)
 	CheckPolicySecrets(context.Context, *CheckPolicySecretsRequest) (*PolicySecretsResult, error)
+	RestoreExecution(context.Context, *LiveRestoreRequest) (*emptypb.Empty, error)
+	RestoreSnapshot(context.Context, *RestoreStorageSnapshotRequest) (*MachineSnapshot, error)
+	InspectStorageSnapshot(context.Context, *StorageSnapshotRef) (*StorageSnapshotInfo, error)
+	ListStorageSnapshots(context.Context, *emptypb.Empty) (*StorageSnapshotList, error)
+	ReleaseSnapshotRetention(context.Context, *StorageSnapshotRef) (*emptypb.Empty, error)
+	RemoveImageAlias(context.Context, *Name) (*emptypb.Empty, error)
 	mustEmbedUnimplementedRuntimeServiceServer()
 }
 
@@ -1319,6 +1625,24 @@ func (UnimplementedRuntimeServiceServer) NormalizePolicy(context.Context, *Norma
 }
 func (UnimplementedRuntimeServiceServer) CheckPolicySecrets(context.Context, *CheckPolicySecretsRequest) (*PolicySecretsResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckPolicySecrets not implemented")
+}
+func (UnimplementedRuntimeServiceServer) RestoreExecution(context.Context, *LiveRestoreRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreExecution not implemented")
+}
+func (UnimplementedRuntimeServiceServer) RestoreSnapshot(context.Context, *RestoreStorageSnapshotRequest) (*MachineSnapshot, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
+}
+func (UnimplementedRuntimeServiceServer) InspectStorageSnapshot(context.Context, *StorageSnapshotRef) (*StorageSnapshotInfo, error) {
+	return nil, status.Error(codes.Unimplemented, "method InspectStorageSnapshot not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ListStorageSnapshots(context.Context, *emptypb.Empty) (*StorageSnapshotList, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListStorageSnapshots not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ReleaseSnapshotRetention(context.Context, *StorageSnapshotRef) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseSnapshotRetention not implemented")
+}
+func (UnimplementedRuntimeServiceServer) RemoveImageAlias(context.Context, *Name) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveImageAlias not implemented")
 }
 func (UnimplementedRuntimeServiceServer) mustEmbedUnimplementedRuntimeServiceServer() {}
 func (UnimplementedRuntimeServiceServer) testEmbeddedByValue()                        {}
@@ -1435,6 +1759,114 @@ func _RuntimeService_CheckPolicySecrets_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimeService_RestoreExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LiveRestoreRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).RestoreExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_RestoreExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).RestoreExecution(ctx, req.(*LiveRestoreRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_RestoreSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreStorageSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).RestoreSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_RestoreSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).RestoreSnapshot(ctx, req.(*RestoreStorageSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_InspectStorageSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StorageSnapshotRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).InspectStorageSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_InspectStorageSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).InspectStorageSnapshot(ctx, req.(*StorageSnapshotRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_ListStorageSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).ListStorageSnapshots(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_ListStorageSnapshots_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).ListStorageSnapshots(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_ReleaseSnapshotRetention_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StorageSnapshotRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).ReleaseSnapshotRetention(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_ReleaseSnapshotRetention_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).ReleaseSnapshotRetention(ctx, req.(*StorageSnapshotRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_RemoveImageAlias_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Name)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).RemoveImageAlias(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_RemoveImageAlias_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).RemoveImageAlias(ctx, req.(*Name))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RuntimeService_ServiceDesc is the grpc.ServiceDesc for RuntimeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1457,6 +1889,30 @@ var RuntimeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckPolicySecrets",
 			Handler:    _RuntimeService_CheckPolicySecrets_Handler,
+		},
+		{
+			MethodName: "RestoreExecution",
+			Handler:    _RuntimeService_RestoreExecution_Handler,
+		},
+		{
+			MethodName: "RestoreSnapshot",
+			Handler:    _RuntimeService_RestoreSnapshot_Handler,
+		},
+		{
+			MethodName: "InspectStorageSnapshot",
+			Handler:    _RuntimeService_InspectStorageSnapshot_Handler,
+		},
+		{
+			MethodName: "ListStorageSnapshots",
+			Handler:    _RuntimeService_ListStorageSnapshots_Handler,
+		},
+		{
+			MethodName: "ReleaseSnapshotRetention",
+			Handler:    _RuntimeService_ReleaseSnapshotRetention_Handler,
+		},
+		{
+			MethodName: "RemoveImageAlias",
+			Handler:    _RuntimeService_RemoveImageAlias_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

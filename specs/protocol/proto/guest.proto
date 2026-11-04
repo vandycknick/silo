@@ -3,6 +3,7 @@ syntax = "proto3";
 package silo.v1;
 
 import "common.proto";
+import "forward.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -12,6 +13,14 @@ service GuestAgentService {
   rpc GetMetrics(GetAgentMetricsRequest) returns (AgentMetrics);
   rpc WatchMetrics(WatchAgentMetricsRequest) returns (stream AgentMetrics);
   rpc SyncClock(SyncClockRequest) returns (SyncClockResponse);
+  rpc FreezeWorkloads(FreezeWorkloadsRequest) returns (FreezeWorkloadsResponse);
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+  rpc Thaw(ThawRequest) returns (ThawResponse);
+  // Version 1, <=65536 encoded bytes per frame. Required exact launch/run,
+  // attempt, agent-instance and boot identities bind the complete exchange:
+  // BEGIN -> ACCEPTED/AGENT_PID1 -> COMPLETED -> ALLOW_POWEROFF -> poweroff.
+  // This stream survives mutation/workload drains; ACCEPTED is not evidence.
+  rpc OrderlyShutdown(stream ShutdownHostFrame) returns (stream ShutdownGuestFrame);
 }
 
 message GetAgentStatusRequest {}
@@ -37,4 +46,145 @@ message SyncClockResponse {
   google.protobuf.Duration offset = 1;
   // True when the guest stepped CLOCK_REALTIME to host_time.
   bool stepped = 2;
+}
+
+// Required-presence fields are validated against trusted per-launch context.
+// Every identity is a canonical lowercase, hyphenated, nonnil UUID.
+// version must be present and exactly 1. Missing/unknown oneofs are rejected.
+message ShutdownFrameIdentity {
+  optional uint32 version = 1;
+  optional string machine_id = 2;
+  optional string run_id = 3;
+  optional string shutdown_id = 4;
+  optional string agent_instance_id = 5;
+  optional string boot_id = 6;
+}
+
+message ShutdownHostFrame {
+  ShutdownFrameIdentity identity = 1;
+  oneof payload {
+    ShutdownBegin begin = 2;
+    ShutdownAllowPoweroff allow_poweroff = 3;
+  }
+}
+
+message ShutdownBegin {
+  // Strict protocol::shutdown::StorageManifest JSON, no host paths.
+  // Includes every block/share, <=64 combined and <=16 disks. Unrepresentable
+  // coverage uses explicit unsupported, never a truncated certifying manifest.
+  bytes manifest_json = 1;
+}
+
+// Acknowledges host receipt of COMPLETED, not host storage flush completion.
+message ShutdownAllowPoweroff {}
+
+message ShutdownGuestFrame {
+  ShutdownFrameIdentity identity = 1;
+  oneof payload {
+    ShutdownAccepted accepted = 2;
+    ShutdownCompleted completed = 3;
+  }
+}
+
+enum ShutdownAuthority {
+  SHUTDOWN_AUTHORITY_UNSPECIFIED = 0;
+  SHUTDOWN_AUTHORITY_AGENT_PID1 = 1;
+}
+
+message ShutdownAccepted {
+  optional ShutdownAuthority authority = 1;
+}
+
+enum ShutdownCompletionResult {
+  SHUTDOWN_COMPLETION_RESULT_UNSPECIFIED = 0;
+  SHUTDOWN_COMPLETION_RESULT_SUCCEEDED = 1;
+  SHUTDOWN_COMPLETION_RESULT_FAILED = 2;
+  SHUTDOWN_COMPLETION_RESULT_UNSUPPORTED = 3;
+}
+
+message ShutdownCompleted {
+  optional ShutdownCompletionResult result = 1;
+  // SUCCEEDED has no diagnostic. FAILED/UNSUPPORTED require a nonempty
+  // UTF-8 diagnostic of at most 4096 bytes. Completion is sticky; after sending
+  // it the guest performs no filesystem logging or persistent result writes.
+  optional string diagnostic = 2;
+}
+
+// All UUIDs are required canonical lowercase, hyphenated and nonnil.
+message ExpectedGuestIdentity {
+  string machine_id = 1;
+  string run_id = 2;
+  string agent_instance_id = 3;
+  string boot_id = 4;
+}
+
+message FreezeWorkloadsRequest {
+  ExpectedGuestIdentity expected = 1;
+  FreezeRef freeze_ref = 2;
+  optional uint32 deadline_ms = 3;
+}
+
+message FreezeWorkloadsResponse { GuestLifecycleStatus status = 1; }
+
+message ThawRequest {
+  ExpectedGuestIdentity expected = 1;
+  FreezeRef freeze_ref = 2;
+  // Reconciles an incomplete/failed freeze, never a failed activation.
+  bool rollback = 3;
+  optional uint32 deadline_ms = 4;
+}
+message ThawResponse { GuestLifecycleStatus status = 1; }
+
+message ActivationNetwork {
+  string mac = 1;
+  string ipv4 = 2;
+  uint32 prefix_length = 3;
+  string gateway = 4;
+  repeated string dns_servers = 5;
+  repeated string dns_search = 6;
+}
+
+message ActivationListener {
+  string name = 1;
+  ListenRequest registration = 2;
+}
+message ActivationListenerBound {
+  string name = 1;
+  ListenerBound bound = 2;
+}
+
+message ActivationHook {
+  repeated string argv = 1;
+  repeated EnvironmentVariable environment = 2;
+  string working_directory = 3;
+  optional uint32 timeout_ms = 4;
+}
+
+message ActivationShutdownContext {
+  // Existing strict protocol::shutdown::StorageManifest encoding and bounds.
+  // No host paths. Binding is destination_machine_id/destination_run_id.
+  bytes manifest_json = 1;
+}
+
+// The trusted monitor sends this only after the exact kernel-generation ack.
+// Replays compare the entire original request, including source identity.
+message ActivateRequest {
+  string activation_id = 1;
+  ExpectedGuestIdentity expected = 2;
+  FreezeRef freeze_ref = 3;
+  string destination_machine_id = 4;
+  string destination_run_id = 5;
+  ActivationNetwork network = 6;
+  repeated ActivationListener listeners = 7;
+  ActivationHook hook = 8;
+  google.protobuf.Timestamp host_time = 9;
+  ActivationShutdownContext shutdown = 10;
+  optional uint32 deadline_ms = 11;
+}
+
+message ActivateResponse {
+  ExpectedGuestIdentity identity = 1;
+  FreezeRef freeze_ref = 2;
+  repeated ActivationListenerBound listeners = 3;
+  GuestLifecycleStatus status = 4;
 }

@@ -8,12 +8,12 @@
 //!
 //! ```no_run
 //! use std::path::Path;
-//! use disk_image::ext4::Formatter;
+//! use disk_image::ext4::{FileData, Formatter};
 //!
 //! // Create a new ext4 image.
 //! let mut fmt = Formatter::new(Path::new("rootfs.ext4"), 4096, 256 * 1024).unwrap();
 //! fmt.create("/hello.txt", 0x8000 | 0o644, None, None,
-//!     Some(&mut "hello world".as_bytes()), None, None, None).unwrap();
+//!     Some(FileData::Dense(&mut "hello world".as_bytes())), None, None, None, None).unwrap();
 //! fmt.close().unwrap();
 //!
 //! // Read it back.
@@ -28,6 +28,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod acl;
 pub mod checksum;
 pub mod constants;
 pub mod dir;
@@ -35,19 +36,24 @@ pub mod error;
 pub mod extent;
 pub mod file_tree;
 pub mod formatter;
+mod input;
 mod journal;
 mod layout;
 pub mod reader;
 pub mod reader_io;
 pub mod resizer;
+mod sizing;
 pub mod types;
+pub mod upper;
 pub mod xattr;
 
 // Re-export the primary public types at the crate root.
 pub use error::{FormatError, FormatResult, ReadError, ReadResult, ResizeError, ResizeResult};
 pub use formatter::{FileTimestamps, FormatOptions, Formatter};
+pub use input::{DeviceId, FileData, FileRange, SparseData};
 pub use reader::Reader;
 pub use resizer::{GrowOutcome, grow_image};
+pub use sizing::FormatSizing;
 
 /// The result of checking an image for the ext4 superblock magic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

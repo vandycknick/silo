@@ -1,3 +1,5 @@
+pub mod live;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -55,7 +57,7 @@ impl VmSpec {
     /// Create a minimal spec at the current schema version.
     pub fn current() -> Self {
         Self {
-            spec_version: Version::new(0, 1, 0),
+            spec_version: Version::new(0, 2, 0),
             guest: None,
             boot: None,
             hardware: None,
@@ -72,6 +74,12 @@ impl VmSpec {
     /// Call this before persisting a programmatically constructed or modified
     /// specification. Deserialization performs the same validation.
     pub fn validate(&self) -> Result<(), String> {
+        if self.spec_version != Version::new(0, 2, 0) {
+            return Err("only VM spec 0.2.0 is supported; reinstall and wipe old state".into());
+        }
+        if let Some(storage) = &self.storage {
+            storage.validate()?;
+        }
         if let Some(vsock) = &self.vsock {
             vsock.validate().map_err(str::to_owned)?;
         }
@@ -204,7 +212,7 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
             .and_then(Path::to_str);
         forward_spec::validate_forwards(&forwards, mux_filename).map_err(A::Error::custom)?;
 
-        Ok(VmSpec {
+        let spec = VmSpec {
             spec_version: spec_version.ok_or_else(|| A::Error::missing_field("specVersion"))?,
             guest: guest.flatten(),
             boot: boot.flatten(),
@@ -214,7 +222,9 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
             forwards,
             vsock: vsock.map(|parsed| parsed.value),
             annotations: annotations.unwrap_or_default(),
-        })
+        };
+        spec.validate().map_err(A::Error::custom)?;
+        Ok(spec)
     }
 }
 
@@ -282,22 +292,208 @@ pub struct Hardware {
 
 /// Ordered disk attachments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Storage {
     /// Disk images attached to the VM in device order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<Disk>,
 }
 
-/// Disk image attachment.
+/// Semantic attachment role, shared by persistence and launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskRole {
+    Root,
+    RootLower,
+    RootUpper,
+    Data,
+}
+
+/// Explicit launch encoding. No filename or content probing is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskFormat {
+    Raw,
+    Vmdk,
+}
+
+/// Exact virtual geometry, not descriptor-file length or allocated host bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskGeometry {
+    pub length: u64,
+    pub logical_sector_size: u32,
+}
+
+impl DiskGeometry {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.logical_sector_size != 512
+            || self.length == 0
+            || self.length > 1 << 40
+            || !self.length.is_multiple_of(512)
+        {
+            return Err(
+                "disk geometry requires positive 512-aligned length <=1 TiB and 512-byte sectors"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A virtio block identity that cannot be truncated or silently synthesized.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct BlockId(String);
+
+impl BlockId {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 20
+            || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
+        {
+            return Err("block ID must be 1..=20 printable ASCII bytes without whitespace".into());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for BlockId {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for BlockId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Fully resolved disk attachment. Every field is required in the current schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Disk {
-    /// Path to the disk image on the host.
     pub path: PathBuf,
-    /// Mount the disk read-only when supported by the backend.
-    #[serde(default)]
+    pub role: DiskRole,
+    pub format: DiskFormat,
+    pub geometry: DiskGeometry,
+    pub block_id: BlockId,
     pub read_only: bool,
+}
+
+impl Disk {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.path.as_os_str().is_empty() || self.path.as_os_str().as_encoded_bytes().contains(&0)
+        {
+            return Err("disk path must be nonempty and contain no NUL".into());
+        }
+        Self::validate_attachment(
+            self.role,
+            self.format,
+            self.geometry,
+            &self.block_id,
+            self.read_only,
+        )
+    }
+
+    /// Validate the path-free attachment identity used by the shutdown manifest.
+    pub fn validate_attachment(
+        role: DiskRole,
+        format: DiskFormat,
+        geometry: DiskGeometry,
+        block_id: &BlockId,
+        read_only: bool,
+    ) -> Result<(), String> {
+        geometry.validate()?;
+        let valid = match role {
+            DiskRole::Root => {
+                format == DiskFormat::Raw
+                    && !read_only
+                    && !matches!(block_id.as_str(), "silo-root-lower" | "silo-root-upper")
+            }
+            DiskRole::RootLower => {
+                format == DiskFormat::Vmdk && read_only && block_id.as_str() == "silo-root-lower"
+            }
+            DiskRole::RootUpper => {
+                format == DiskFormat::Raw
+                    && !read_only
+                    && block_id.as_str() == "silo-root-upper"
+                    && (64 << 20..=1 << 40).contains(&geometry.length)
+                    && geometry.length.is_multiple_of(4096)
+            }
+            DiskRole::Data => {
+                format == DiskFormat::Raw
+                    && !matches!(block_id.as_str(), "silo-root-lower" | "silo-root-upper")
+            }
+        };
+        if !valid {
+            return Err(format!(
+                "invalid {:?} disk format, access, geometry or block identity",
+                role
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Storage {
+    /// Validate the complete list at both public and private launch boundaries.
+    pub fn validate(&self) -> Result<(), String> {
+        Self::validate_disks(&self.disks)
+    }
+
+    pub fn validate_disks(disks: &[Disk]) -> Result<(), String> {
+        if disks.len() > 16 {
+            return Err("at most 16 total disk attachments are supported".into());
+        }
+        for disk in disks {
+            disk.validate()?;
+        }
+        Self::validate_attachment_sequence(disks.iter().map(|disk| (disk.role, &disk.block_id)))
+    }
+
+    /// Check complete root ordering, identities and the shared sixteen-disk bound.
+    pub fn validate_attachment_sequence<'a>(
+        attachments: impl IntoIterator<Item = (DiskRole, &'a BlockId)>,
+    ) -> Result<(), String> {
+        let mut ids: [Option<&BlockId>; 16] = [None; 16];
+        let mut count = 0;
+        let mut roots = 0u8;
+        let mut saw_data = false;
+        for (role, block_id) in attachments {
+            if count == ids.len() {
+                return Err("at most 16 total disk attachments are supported".into());
+            }
+            if ids[..count].contains(&Some(block_id)) {
+                return Err(format!("duplicate block ID {}", block_id.as_str()));
+            }
+            ids[count] = Some(block_id);
+            count += 1;
+            match role {
+                DiskRole::Data => saw_data = true,
+                DiskRole::Root if roots == 0 && !saw_data => roots = 1,
+                DiskRole::RootLower if roots == 0 && !saw_data => roots = 2,
+                DiskRole::RootUpper if roots == 2 && !saw_data => roots = 3,
+                _ => {
+                    return Err(
+                        "roots must be one raw Root or ordered RootLower/RootUpper, before Data"
+                            .into(),
+                    )
+                }
+            }
+        }
+        if count != 0 && !matches!(roots, 1 | 3) {
+            return Err("storage requires one raw Root or a RootLower/RootUpper pair".into());
+        }
+        Ok(())
+    }
 }
 
 /// Host directory mount exposed to the guest.
@@ -628,9 +824,10 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        effective_vsock_enabled, effective_vsock_filename, project_mounts, Boot, Disk, Guest,
-        GuestOs, Hardware, Kernel, Mount, MountProjectionError, Storage, VmSpec, Vsock,
-        DEFAULT_VSOCK_MUX_FILENAME, GENERATED_MOUNT_TAG_PREFIX, VIRTIOFS_TAG_MAX_BYTES,
+        effective_vsock_enabled, effective_vsock_filename, project_mounts, BlockId, Boot, Disk,
+        DiskFormat, DiskGeometry, DiskRole, Guest, GuestOs, Hardware, Kernel, Mount,
+        MountProjectionError, Storage, VmSpec, Vsock, DEFAULT_VSOCK_MUX_FILENAME,
+        GENERATED_MOUNT_TAG_PREFIX, VIRTIOFS_TAG_MAX_BYTES,
     };
 
     fn forward(listen: &str, connect: &str) -> forward_spec::Forward {
@@ -646,13 +843,13 @@ mod tests {
 
         let value = serde_json::to_value(&spec).expect("serialize vm spec");
 
-        assert_eq!(value, json!({ "specVersion": "0.1.0" }));
+        assert_eq!(value, json!({ "specVersion": "0.2.0" }));
     }
 
     #[test]
     fn minimal_spec_deserializes_from_version_only() {
         let spec: VmSpec = serde_json::from_value(json!({
-            "specVersion": "0.1.0"
+            "specVersion": "0.2.0"
         }))
         .expect("deserialize vm spec");
 
@@ -681,8 +878,15 @@ mod tests {
             }),
             storage: Some(Storage {
                 disks: vec![Disk {
-                    path: PathBuf::from("/data.img"),
-                    read_only: true,
+                    path: PathBuf::from("/root.raw"),
+                    role: DiskRole::Root,
+                    format: DiskFormat::Raw,
+                    geometry: DiskGeometry {
+                        length: 512,
+                        logical_sector_size: 512,
+                    },
+                    block_id: BlockId::new("silo-root").unwrap(),
+                    read_only: false,
                 }],
             }),
             mounts: vec![Mount {
@@ -707,7 +911,7 @@ mod tests {
         assert_eq!(
             value,
             json!({
-                "specVersion": "0.1.0",
+                "specVersion": "0.2.0",
                 "guest": { "os": "linux" },
                 "boot": {
                     "kernel": {
@@ -725,7 +929,7 @@ mod tests {
                 },
                 "storage": {
                     "disks": [
-                        { "path": "/data.img", "readOnly": true }
+                        { "path": "/root.raw", "role": "root", "format": "raw", "geometry": { "length": 512, "logicalSectorSize": 512 }, "blockId": "silo-root", "readOnly": false }
                     ]
                 },
                 "mounts": [
@@ -943,7 +1147,7 @@ mod tests {
             .contains("mount tag \"workspace\" is repeated"));
 
         let error = serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
+            "specVersion": "0.2.0",
             "mounts": [
                 { "source": "/one", "tag": "workspace" },
                 { "source": "/two", "tag": "workspace" }
@@ -980,7 +1184,7 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&encoded).expect("decode json"),
             json!({
-                "specVersion": "0.1.0",
+                "specVersion": "0.2.0",
                 "boot": { "kernel": { "path": "/kernel" } },
                 "storage": {}
             })
@@ -1057,7 +1261,7 @@ mod tests {
 
     #[test]
     fn new_vsock_shape_and_validation_work_through_yaml() {
-        let yaml = "specVersion: 0.1.0\nfutureTopLevel:\n  nested: true\nvsock:\n  enabled: true\n  uds: custom.sock\n  futureVsockField: 42\n";
+        let yaml = "specVersion: 0.2.0\nfutureTopLevel:\n  nested: true\nvsock:\n  enabled: true\n  uds: custom.sock\n  futureVsockField: 42\n";
         let spec = serde_yaml_ng::from_str::<VmSpec>(yaml).expect("deserialize YAML VM spec");
         assert_eq!(
             spec.vsock,
@@ -1078,7 +1282,7 @@ mod tests {
         );
 
         let error = serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nvsock:\n  enabled: false\n  uds: ignored.sock\n",
+            "specVersion: 0.2.0\nvsock:\n  enabled: false\n  uds: ignored.sock\n",
         )
         .expect_err("invalid YAML vsock must fail validation");
         assert!(error.to_string().contains("enabled is false"));
@@ -1086,7 +1290,7 @@ mod tests {
 
     #[test]
     fn all_four_forward_shapes_round_trip_through_yaml() {
-        let yaml = r#"specVersion: 0.1.0
+        let yaml = r#"specVersion: 0.2.0
 forwards:
   - name: inbound-agent
     listen: host:unix:docker.sock
@@ -1115,7 +1319,7 @@ forwards:
     #[test]
     fn forwards_cannot_conflict_with_default_or_custom_mux_sockets() {
         let default_error = serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nforwards:\n  - listen: host:unix:vsock.sock\n    connect: guest:tcp:80\nvsock:\n  enabled: true\n",
+            "specVersion: 0.2.0\nforwards:\n  - listen: host:unix:vsock.sock\n    connect: guest:tcp:80\nvsock:\n  enabled: true\n",
         )
         .expect_err("default mux conflict must fail");
         assert!(default_error
@@ -1123,13 +1327,13 @@ forwards:
             .contains("conflicts with vsock mux"));
 
         let custom_error = serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nforwards:\n  - listen: host:unix:custom.sock_5000\n    connect: guest:tcp:80\nvsock:\n  enabled: true\n  uds: custom.sock\n",
+            "specVersion: 0.2.0\nforwards:\n  - listen: host:unix:custom.sock_5000\n    connect: guest:tcp:80\nvsock:\n  enabled: true\n  uds: custom.sock\n",
         )
         .expect_err("custom mux listener conflict must fail");
         assert!(custom_error.to_string().contains("custom.sock"));
 
         let disabled = serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nforwards:\n  - listen: host:unix:vsock.sock\n    connect: guest:tcp:80\nvsock:\n  enabled: false\n",
+            "specVersion: 0.2.0\nforwards:\n  - listen: host:unix:vsock.sock\n    connect: guest:tcp:80\nvsock:\n  enabled: false\n",
         )
         .expect("disabled mux has no filename conflict");
         assert_eq!(disabled.forwards.len(), 1);
@@ -1139,19 +1343,19 @@ forwards:
     fn invalid_spec_parse_cases() {
         for (label, message, required, forbidden) in [
             ("duplicate_forward_names_and_vsock_listen_ports_are_rejected_duplicate_name", serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nforwards:\n  - name: api\n    listen: host:tcp:80\n    connect: guest:tcp:80\n  - name: api\n    listen: host:tcp:81\n    connect: guest:tcp:81\n",
+            "specVersion: 0.2.0\nforwards:\n  - name: api\n    listen: host:tcp:80\n    connect: guest:tcp:80\n  - name: api\n    listen: host:tcp:81\n    connect: guest:tcp:81\n",
         )
         .expect_err("duplicate name must fail").to_string(), &["forward name \"api\" is repeated"][..], &[][..]),
             ("duplicate_forward_names_and_vsock_listen_ports_are_rejected_duplicate_port", serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nforwards:\n  - listen: vsock:5000\n    connect: host:tcp:80\n  - listen: vsock:5000\n    connect: host:tcp:81\n",
+            "specVersion: 0.2.0\nforwards:\n  - listen: vsock:5000\n    connect: host:tcp:80\n  - listen: vsock:5000\n    connect: host:tcp:81\n",
         )
         .expect_err("duplicate vsock listen port must fail").to_string(), &["vsock listen port 5000 is repeated"][..], &[][..]),
             ("removed_fields_are_reported_before_invalid_forwards_error", serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nvsockEndpoints:\n  - plugin:\n      command: /bin/old\nforwards:\n  - listen: host:tcp:80\n    connect: host:tcp:81\n",
+            "specVersion: 0.2.0\nvsockEndpoints:\n  - plugin:\n      command: /bin/old\nforwards:\n  - listen: host:tcp:80\n    connect: host:tcp:81\n",
         )
         .expect_err("removed field and invalid forward must fail").to_string(), &["removed ADR 0005 fields", "vsockEndpoints[0].plugin.command"][..], &["invalid forward sides"][..]),
             ("duplicate_unix_listeners_are_rejected_when_loading_a_spec_error", serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
+            "specVersion": "0.2.0",
             "forwards": [
                 {"listen": "host:unix:service.sock", "connect": "guest:tcp:80"},
                 {"listen": "host:unix:service.sock", "connect": "guest:tcp:81"}
@@ -1159,7 +1363,7 @@ forwards:
         }))
         .unwrap_err().to_string(), &["Unix listen endpoint"][..], &[][..]),
             ("removed_endpoint_fields_are_reported_comprehensively_error", serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
+            "specVersion": "0.2.0",
             "vsock": {
                 "endpoints": [
                     {
@@ -1185,7 +1389,7 @@ forwards:
         }))
         .expect_err("removed endpoint fields must fail").to_string(), &["vsock.endpoints", "vsock.endpoints[0].name", "vsock.endpoints[0].plugin", "vsock.endpoints[0].plugin.command", "vsock.endpoints[0].plugin.config.kind", "vsock.endpoints[0].lifecycle.restart", "vsock.endpoints[0].lifecycle.backoffMs.initial", "vsock.endpoints[0].lifecycle.backoffMs.max", "vsock.endpoints[1].name", "vsock.endpoints[1].plugin.command", "vsock.endpoints[1].lifecycle.autostart", "vsock.plugin.command", "vsock.lifecycle.restart"][..], &[][..]),
             ("mixed_legacy_forms_are_aggregated_into_one_error_error", serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
+            "specVersion": "0.2.0",
             "vsock_endpoints": [{
                 "plugin": { "command": "/bin/snake" },
                 "lifecycle": { "restart": "always" }
@@ -1222,13 +1426,13 @@ forwards:
     #[test]
     fn forward_entries_reject_unknown_fields_but_top_level_remains_permissive() {
         let error = serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nfutureTopLevel: true\nforwards:\n  - listen: host:tcp:80\n    connect: guest:tcp:80\n    nam: typo\n",
+            "specVersion: 0.2.0\nfutureTopLevel: true\nforwards:\n  - listen: host:tcp:80\n    connect: guest:tcp:80\n    nam: typo\n",
         )
         .expect_err("unknown forward field must fail");
         assert!(error.to_string().contains("nam"));
 
         let spec = serde_yaml_ng::from_str::<VmSpec>(
-            "specVersion: 0.1.0\nfutureTopLevel: true\nforwards:\n  - listen: host:tcp:80\n    connect: guest:tcp:80\n",
+            "specVersion: 0.2.0\nfutureTopLevel: true\nforwards:\n  - listen: host:tcp:80\n    connect: guest:tcp:80\n",
         )
         .expect("unknown top-level field remains permitted");
         assert_eq!(spec.forwards.len(), 1);
@@ -1371,7 +1575,7 @@ forwards:
         for field in ["vsock_endpoints", "vsockEndpoints"] {
             let input = format!(
                 r#"{{
-                    "specVersion": "0.1.0",
+                    "specVersion": "0.2.0",
                     "{field}": [
                         {{
                             "name": "first",
@@ -1415,7 +1619,7 @@ forwards:
     #[test]
     fn duplicate_vsock_cannot_hide_legacy_json_or_yaml_data() {
         let json = r#"{
-            "specVersion": "0.1.0",
+            "specVersion": "0.2.0",
             "vsock": { "endpoints": [{ "plugin": { "command": "/bin/old" } }] },
             "vsock": { "enabled": true }
         }"#;
@@ -1423,7 +1627,7 @@ forwards:
             .expect_err("duplicate JSON vsock must not hide old data");
         assert!(json_error.to_string().contains("duplicate field `vsock`"));
 
-        let yaml = "specVersion: 0.1.0\nvsock:\n  endpoints:\n    - plugin:\n        command: /bin/old\nvsock:\n  enabled: true\n";
+        let yaml = "specVersion: 0.2.0\nvsock:\n  endpoints:\n    - plugin:\n        command: /bin/old\nvsock:\n  enabled: true\n";
         let yaml_error = serde_yaml_ng::from_str::<VmSpec>(yaml)
             .expect_err("duplicate YAML vsock must not hide old data");
         assert!(yaml_error.to_string().contains("duplicate field `vsock`"));
@@ -1454,7 +1658,7 @@ forwards:
     fn top_level_legacy_endpoint_forms_are_rejected_comprehensively_in_yaml() {
         for field in ["vsock_endpoints", "vsockEndpoints"] {
             let input = format!(
-                "specVersion: 0.1.0\n{field}:\n{}",
+                "specVersion: 0.2.0\n{field}:\n{}",
                 [
                     "  - name: first",
                     "    plugin:",
@@ -1503,7 +1707,7 @@ forwards:
     #[test]
     fn unrelated_unknown_fields_remain_permissive() {
         let spec = serde_json::from_value::<VmSpec>(json!({
-            "specVersion": "0.1.0",
+            "specVersion": "0.2.0",
             "futureTopLevel": { "nested": true },
             "vsock": { "enabled": true, "futureVsockField": 42 }
         }))
@@ -1521,7 +1725,7 @@ forwards:
     #[test]
     fn non_vsock_sections_still_round_trip() {
         let value = json!({
-            "specVersion": "0.1.0",
+            "specVersion": "0.2.0",
             "guest": { "os": "linux" },
             "hardware": { "cpus": 2, "memory": 1024 },
             "annotations": { "owner": "test" }
@@ -1532,5 +1736,160 @@ forwards:
             serde_json::to_value(spec).expect("serialize vm spec"),
             value
         );
+    }
+    fn raw_disk() -> Disk {
+        Disk {
+            path: "root.raw".into(),
+            role: DiskRole::Root,
+            format: DiskFormat::Raw,
+            geometry: DiskGeometry {
+                length: 64 << 20,
+                logical_sector_size: 512,
+            },
+            block_id: BlockId::new("silo-root").unwrap(),
+            read_only: false,
+        }
+    }
+
+    fn overlay_disks() -> Vec<Disk> {
+        let mut lower = raw_disk();
+        lower.role = DiskRole::RootLower;
+        lower.format = DiskFormat::Vmdk;
+        lower.read_only = true;
+        lower.block_id = BlockId::new("silo-root-lower").unwrap();
+        let mut upper = raw_disk();
+        upper.role = DiskRole::RootUpper;
+        upper.block_id = BlockId::new("silo-root-upper").unwrap();
+        vec![lower, upper]
+    }
+
+    #[test]
+    fn current_disks_require_every_field_and_reject_old_versions() {
+        let value = json!({
+            "specVersion": "0.2.0",
+            "storage": { "disks": [serde_json::to_value(raw_disk()).unwrap()] }
+        });
+        let parsed = serde_json::from_value::<VmSpec>(value.clone()).unwrap();
+        parsed.validate().unwrap();
+        for field in ["path", "role", "format", "geometry", "blockId", "readOnly"] {
+            let mut invalid = value.clone();
+            invalid["storage"]["disks"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<VmSpec>(invalid).is_err(),
+                "missing {field}"
+            );
+        }
+        for version in ["0.1.0", "0.2.0-alpha", "0.2.0+old", "1.0.0"] {
+            let mut invalid = value.clone();
+            invalid["specVersion"] = json!(version);
+            assert!(
+                serde_json::from_value::<VmSpec>(invalid).is_err(),
+                "{version}"
+            );
+        }
+        let mut invalid = value;
+        invalid["storage"]["disks"][0]["format"] = json!("qcow2");
+        assert!(serde_json::from_value::<VmSpec>(invalid).is_err());
+    }
+
+    #[test]
+    fn block_id_rejects_truncation_controls_whitespace_and_unicode() {
+        for id in [
+            "",
+            "a b",
+            " leading",
+            "trailing ",
+            "a\tb",
+            "a\nb",
+            "a\0b",
+            "a\u{7f}b",
+            "é",
+            "123456789012345678901",
+        ] {
+            assert!(BlockId::new(id).is_err(), "{id:?}");
+            assert!(serde_json::from_value::<BlockId>(json!(id)).is_err());
+        }
+        assert!(BlockId::new("12345678901234567890").is_ok());
+        assert!(BlockId::new("!#$%&'()*+,-./:;<=>?").is_ok());
+    }
+
+    #[test]
+    fn semantic_root_combinations_are_closed_at_public_boundary() {
+        let valid = overlay_disks();
+        Storage::validate_disks(&valid).unwrap();
+        for index in 0..2 {
+            let mut invalid = valid.clone();
+            invalid[index].read_only = !invalid[index].read_only;
+            assert!(Storage::validate_disks(&invalid).is_err());
+            let mut invalid = valid.clone();
+            invalid[index].format = if invalid[index].format == DiskFormat::Raw {
+                DiskFormat::Vmdk
+            } else {
+                DiskFormat::Raw
+            };
+            assert!(Storage::validate_disks(&invalid).is_err());
+            let mut invalid = valid.clone();
+            invalid[index].block_id = BlockId::new("wrong-serial").unwrap();
+            assert!(Storage::validate_disks(&invalid).is_err());
+        }
+        assert!(Storage::validate_disks(&valid[..1]).is_err());
+        assert!(Storage::validate_disks(&valid[1..]).is_err());
+        let mut reversed = valid.clone();
+        reversed.reverse();
+        assert!(Storage::validate_disks(&reversed).is_err());
+        let mut mixed = valid;
+        mixed.push(raw_disk());
+        assert!(Storage::validate_disks(&mixed).is_err());
+        let mut duplicate = vec![raw_disk(), raw_disk()];
+        duplicate[1].role = DiskRole::Data;
+        assert!(Storage::validate_disks(&duplicate).is_err());
+        duplicate[1].block_id = BlockId::new("data").unwrap();
+        Storage::validate_disks(&duplicate).unwrap();
+        duplicate.reverse();
+        assert!(Storage::validate_disks(&duplicate).is_err());
+    }
+
+    #[test]
+    fn disk_geometry_and_attachment_count_bounds_are_inclusive() {
+        for length in [0, 1, 511, 513, (1 << 40) + 512, u64::MAX] {
+            let mut disk = raw_disk();
+            disk.geometry.length = length;
+            assert!(disk.validate().is_err());
+        }
+        for length in [512, 64 << 20, 1 << 40] {
+            let mut disk = raw_disk();
+            disk.geometry.length = length;
+            disk.validate().unwrap();
+        }
+        for sector in [0, 4096] {
+            let mut disk = raw_disk();
+            disk.geometry.logical_sector_size = sector;
+            assert!(disk.validate().is_err());
+        }
+        for path in ["", "a\0b"] {
+            let mut disk = raw_disk();
+            disk.path = path.into();
+            assert!(disk.validate().is_err());
+        }
+        let mut disks = overlay_disks();
+        disks[1].geometry.length = (64 << 20) - 4096;
+        assert!(Storage::validate_disks(&disks).is_err());
+        disks[1].geometry.length = (64 << 20) + 4096;
+        Storage::validate_disks(&disks).unwrap();
+        for index in 0..14 {
+            let mut data = raw_disk();
+            data.role = DiskRole::Data;
+            data.block_id = BlockId::new(format!("data-{index}")).unwrap();
+            disks.push(data);
+        }
+        Storage::validate_disks(&disks).unwrap();
+        let mut extra = raw_disk();
+        extra.role = DiskRole::Data;
+        extra.block_id = BlockId::new("extra").unwrap();
+        disks.push(extra);
+        assert!(Storage::validate_disks(&disks).is_err());
     }
 }

@@ -73,6 +73,110 @@ func (Retention) EnumDescriptor() ([]byte, []int) {
 	return file_daemon_proto_rawDescGZIP(), []int{0}
 }
 
+type DiskRole int32
+
+const (
+	DiskRole_DISK_ROLE_UNSPECIFIED DiskRole = 0
+	DiskRole_DISK_ROLE_ROOT        DiskRole = 1
+	DiskRole_DISK_ROLE_ROOT_LOWER  DiskRole = 2
+	DiskRole_DISK_ROLE_ROOT_UPPER  DiskRole = 3
+	DiskRole_DISK_ROLE_DATA        DiskRole = 4
+)
+
+// Enum value maps for DiskRole.
+var (
+	DiskRole_name = map[int32]string{
+		0: "DISK_ROLE_UNSPECIFIED",
+		1: "DISK_ROLE_ROOT",
+		2: "DISK_ROLE_ROOT_LOWER",
+		3: "DISK_ROLE_ROOT_UPPER",
+		4: "DISK_ROLE_DATA",
+	}
+	DiskRole_value = map[string]int32{
+		"DISK_ROLE_UNSPECIFIED": 0,
+		"DISK_ROLE_ROOT":        1,
+		"DISK_ROLE_ROOT_LOWER":  2,
+		"DISK_ROLE_ROOT_UPPER":  3,
+		"DISK_ROLE_DATA":        4,
+	}
+)
+
+func (x DiskRole) Enum() *DiskRole {
+	p := new(DiskRole)
+	*p = x
+	return p
+}
+
+func (x DiskRole) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DiskRole) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[1].Descriptor()
+}
+
+func (DiskRole) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[1]
+}
+
+func (x DiskRole) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DiskRole.Descriptor instead.
+func (DiskRole) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{1}
+}
+
+type DiskFormat int32
+
+const (
+	DiskFormat_DISK_FORMAT_UNSPECIFIED DiskFormat = 0
+	DiskFormat_DISK_FORMAT_RAW         DiskFormat = 1
+	DiskFormat_DISK_FORMAT_VMDK        DiskFormat = 2
+)
+
+// Enum value maps for DiskFormat.
+var (
+	DiskFormat_name = map[int32]string{
+		0: "DISK_FORMAT_UNSPECIFIED",
+		1: "DISK_FORMAT_RAW",
+		2: "DISK_FORMAT_VMDK",
+	}
+	DiskFormat_value = map[string]int32{
+		"DISK_FORMAT_UNSPECIFIED": 0,
+		"DISK_FORMAT_RAW":         1,
+		"DISK_FORMAT_VMDK":        2,
+	}
+)
+
+func (x DiskFormat) Enum() *DiskFormat {
+	p := new(DiskFormat)
+	*p = x
+	return p
+}
+
+func (x DiskFormat) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DiskFormat) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[2].Descriptor()
+}
+
+func (DiskFormat) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[2]
+}
+
+func (x DiskFormat) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DiskFormat.Descriptor instead.
+func (DiskFormat) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{2}
+}
+
 type GuestOs int32
 
 const (
@@ -103,11 +207,11 @@ func (x GuestOs) String() string {
 }
 
 func (GuestOs) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[1].Descriptor()
+	return file_daemon_proto_enumTypes[3].Descriptor()
 }
 
 func (GuestOs) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[1]
+	return &file_daemon_proto_enumTypes[3]
 }
 
 func (x GuestOs) Number() protoreflect.EnumNumber {
@@ -116,7 +220,7 @@ func (x GuestOs) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use GuestOs.Descriptor instead.
 func (GuestOs) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{1}
+	return file_daemon_proto_rawDescGZIP(), []int{3}
 }
 
 type PublishBind int32
@@ -152,11 +256,11 @@ func (x PublishBind) String() string {
 }
 
 func (PublishBind) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[2].Descriptor()
+	return file_daemon_proto_enumTypes[4].Descriptor()
 }
 
 func (PublishBind) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[2]
+	return &file_daemon_proto_enumTypes[4]
 }
 
 func (x PublishBind) Number() protoreflect.EnumNumber {
@@ -165,7 +269,7 @@ func (x PublishBind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PublishBind.Descriptor instead.
 func (PublishBind) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{2}
+	return file_daemon_proto_rawDescGZIP(), []int{4}
 }
 
 type NetworkTopology int32
@@ -204,11 +308,11 @@ func (x NetworkTopology) String() string {
 }
 
 func (NetworkTopology) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[3].Descriptor()
+	return file_daemon_proto_enumTypes[5].Descriptor()
 }
 
 func (NetworkTopology) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[3]
+	return &file_daemon_proto_enumTypes[5]
 }
 
 func (x NetworkTopology) Number() protoreflect.EnumNumber {
@@ -217,7 +321,7 @@ func (x NetworkTopology) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use NetworkTopology.Descriptor instead.
 func (NetworkTopology) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{3}
+	return file_daemon_proto_rawDescGZIP(), []int{5}
 }
 
 type NetworkDriver int32
@@ -253,11 +357,11 @@ func (x NetworkDriver) String() string {
 }
 
 func (NetworkDriver) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[4].Descriptor()
+	return file_daemon_proto_enumTypes[6].Descriptor()
 }
 
 func (NetworkDriver) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[4]
+	return &file_daemon_proto_enumTypes[6]
 }
 
 func (x NetworkDriver) Number() protoreflect.EnumNumber {
@@ -266,7 +370,56 @@ func (x NetworkDriver) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use NetworkDriver.Descriptor instead.
 func (NetworkDriver) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{4}
+	return file_daemon_proto_rawDescGZIP(), []int{6}
+}
+
+type RootProfile int32
+
+const (
+	RootProfile_ROOT_PROFILE_UNSPECIFIED           RootProfile = 0
+	RootProfile_ROOT_PROFILE_OPAQUE_RAW            RootProfile = 1
+	RootProfile_ROOT_PROFILE_LINUX_FLAT_OVERLAY_V1 RootProfile = 2
+)
+
+// Enum value maps for RootProfile.
+var (
+	RootProfile_name = map[int32]string{
+		0: "ROOT_PROFILE_UNSPECIFIED",
+		1: "ROOT_PROFILE_OPAQUE_RAW",
+		2: "ROOT_PROFILE_LINUX_FLAT_OVERLAY_V1",
+	}
+	RootProfile_value = map[string]int32{
+		"ROOT_PROFILE_UNSPECIFIED":           0,
+		"ROOT_PROFILE_OPAQUE_RAW":            1,
+		"ROOT_PROFILE_LINUX_FLAT_OVERLAY_V1": 2,
+	}
+)
+
+func (x RootProfile) Enum() *RootProfile {
+	p := new(RootProfile)
+	*p = x
+	return p
+}
+
+func (x RootProfile) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RootProfile) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[7].Descriptor()
+}
+
+func (RootProfile) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[7]
+}
+
+func (x RootProfile) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RootProfile.Descriptor instead.
+func (RootProfile) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{7}
 }
 
 type PullPolicy int32
@@ -305,11 +458,11 @@ func (x PullPolicy) String() string {
 }
 
 func (PullPolicy) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[5].Descriptor()
+	return file_daemon_proto_enumTypes[8].Descriptor()
 }
 
 func (PullPolicy) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[5]
+	return &file_daemon_proto_enumTypes[8]
 }
 
 func (x PullPolicy) Number() protoreflect.EnumNumber {
@@ -318,7 +471,7 @@ func (x PullPolicy) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PullPolicy.Descriptor instead.
 func (PullPolicy) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{5}
+	return file_daemon_proto_rawDescGZIP(), []int{8}
 }
 
 type CacheState int32
@@ -354,11 +507,11 @@ func (x CacheState) String() string {
 }
 
 func (CacheState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[6].Descriptor()
+	return file_daemon_proto_enumTypes[9].Descriptor()
 }
 
 func (CacheState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[6]
+	return &file_daemon_proto_enumTypes[9]
 }
 
 func (x CacheState) Number() protoreflect.EnumNumber {
@@ -367,7 +520,7 @@ func (x CacheState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use CacheState.Descriptor instead.
 func (CacheState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{6}
+	return file_daemon_proto_rawDescGZIP(), []int{9}
 }
 
 type Observation int32
@@ -406,11 +559,11 @@ func (x Observation) String() string {
 }
 
 func (Observation) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[7].Descriptor()
+	return file_daemon_proto_enumTypes[10].Descriptor()
 }
 
 func (Observation) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[7]
+	return &file_daemon_proto_enumTypes[10]
 }
 
 func (x Observation) Number() protoreflect.EnumNumber {
@@ -419,7 +572,7 @@ func (x Observation) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Observation.Descriptor instead.
 func (Observation) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{7}
+	return file_daemon_proto_rawDescGZIP(), []int{10}
 }
 
 type IssueComponent int32
@@ -464,11 +617,11 @@ func (x IssueComponent) String() string {
 }
 
 func (IssueComponent) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[8].Descriptor()
+	return file_daemon_proto_enumTypes[11].Descriptor()
 }
 
 func (IssueComponent) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[8]
+	return &file_daemon_proto_enumTypes[11]
 }
 
 func (x IssueComponent) Number() protoreflect.EnumNumber {
@@ -477,7 +630,7 @@ func (x IssueComponent) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use IssueComponent.Descriptor instead.
 func (IssueComponent) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{8}
+	return file_daemon_proto_rawDescGZIP(), []int{11}
 }
 
 type ImageSourceKind int32
@@ -513,11 +666,11 @@ func (x ImageSourceKind) String() string {
 }
 
 func (ImageSourceKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[9].Descriptor()
+	return file_daemon_proto_enumTypes[12].Descriptor()
 }
 
 func (ImageSourceKind) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[9]
+	return &file_daemon_proto_enumTypes[12]
 }
 
 func (x ImageSourceKind) Number() protoreflect.EnumNumber {
@@ -526,7 +679,7 @@ func (x ImageSourceKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ImageSourceKind.Descriptor instead.
 func (ImageSourceKind) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{9}
+	return file_daemon_proto_rawDescGZIP(), []int{12}
 }
 
 type BootMode int32
@@ -565,11 +718,11 @@ func (x BootMode) String() string {
 }
 
 func (BootMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[10].Descriptor()
+	return file_daemon_proto_enumTypes[13].Descriptor()
 }
 
 func (BootMode) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[10]
+	return &file_daemon_proto_enumTypes[13]
 }
 
 func (x BootMode) Number() protoreflect.EnumNumber {
@@ -578,7 +731,7 @@ func (x BootMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use BootMode.Descriptor instead.
 func (BootMode) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{10}
+	return file_daemon_proto_rawDescGZIP(), []int{13}
 }
 
 type ProvisionStatus int32
@@ -620,11 +773,11 @@ func (x ProvisionStatus) String() string {
 }
 
 func (ProvisionStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[11].Descriptor()
+	return file_daemon_proto_enumTypes[14].Descriptor()
 }
 
 func (ProvisionStatus) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[11]
+	return &file_daemon_proto_enumTypes[14]
 }
 
 func (x ProvisionStatus) Number() protoreflect.EnumNumber {
@@ -633,7 +786,7 @@ func (x ProvisionStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ProvisionStatus.Descriptor instead.
 func (ProvisionStatus) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{11}
+	return file_daemon_proto_rawDescGZIP(), []int{14}
 }
 
 type ProvisionStepStatus int32
@@ -675,11 +828,11 @@ func (x ProvisionStepStatus) String() string {
 }
 
 func (ProvisionStepStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[12].Descriptor()
+	return file_daemon_proto_enumTypes[15].Descriptor()
 }
 
 func (ProvisionStepStatus) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[12]
+	return &file_daemon_proto_enumTypes[15]
 }
 
 func (x ProvisionStepStatus) Number() protoreflect.EnumNumber {
@@ -688,7 +841,7 @@ func (x ProvisionStepStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ProvisionStepStatus.Descriptor instead.
 func (ProvisionStepStatus) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{12}
+	return file_daemon_proto_rawDescGZIP(), []int{15}
 }
 
 type ProvisionFailurePolicy int32
@@ -724,11 +877,11 @@ func (x ProvisionFailurePolicy) String() string {
 }
 
 func (ProvisionFailurePolicy) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[13].Descriptor()
+	return file_daemon_proto_enumTypes[16].Descriptor()
 }
 
 func (ProvisionFailurePolicy) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[13]
+	return &file_daemon_proto_enumTypes[16]
 }
 
 func (x ProvisionFailurePolicy) Number() protoreflect.EnumNumber {
@@ -737,7 +890,7 @@ func (x ProvisionFailurePolicy) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ProvisionFailurePolicy.Descriptor instead.
 func (ProvisionFailurePolicy) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{13}
+	return file_daemon_proto_rawDescGZIP(), []int{16}
 }
 
 type ReadinessOutcome int32
@@ -776,11 +929,11 @@ func (x ReadinessOutcome) String() string {
 }
 
 func (ReadinessOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[14].Descriptor()
+	return file_daemon_proto_enumTypes[17].Descriptor()
 }
 
 func (ReadinessOutcome) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[14]
+	return &file_daemon_proto_enumTypes[17]
 }
 
 func (x ReadinessOutcome) Number() protoreflect.EnumNumber {
@@ -789,7 +942,7 @@ func (x ReadinessOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ReadinessOutcome.Descriptor instead.
 func (ReadinessOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{14}
+	return file_daemon_proto_rawDescGZIP(), []int{17}
 }
 
 type ExitOutcome int32
@@ -834,11 +987,11 @@ func (x ExitOutcome) String() string {
 }
 
 func (ExitOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[15].Descriptor()
+	return file_daemon_proto_enumTypes[18].Descriptor()
 }
 
 func (ExitOutcome) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[15]
+	return &file_daemon_proto_enumTypes[18]
 }
 
 func (x ExitOutcome) Number() protoreflect.EnumNumber {
@@ -847,7 +1000,7 @@ func (x ExitOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ExitOutcome.Descriptor instead.
 func (ExitOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{15}
+	return file_daemon_proto_rawDescGZIP(), []int{18}
 }
 
 type LogSource int32
@@ -895,11 +1048,11 @@ func (x LogSource) String() string {
 }
 
 func (LogSource) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[16].Descriptor()
+	return file_daemon_proto_enumTypes[19].Descriptor()
 }
 
 func (LogSource) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[16]
+	return &file_daemon_proto_enumTypes[19]
 }
 
 func (x LogSource) Number() protoreflect.EnumNumber {
@@ -908,7 +1061,7 @@ func (x LogSource) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LogSource.Descriptor instead.
 func (LogSource) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{16}
+	return file_daemon_proto_rawDescGZIP(), []int{19}
 }
 
 type LogOutput int32
@@ -947,11 +1100,11 @@ func (x LogOutput) String() string {
 }
 
 func (LogOutput) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[17].Descriptor()
+	return file_daemon_proto_enumTypes[20].Descriptor()
 }
 
 func (LogOutput) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[17]
+	return &file_daemon_proto_enumTypes[20]
 }
 
 func (x LogOutput) Number() protoreflect.EnumNumber {
@@ -960,7 +1113,7 @@ func (x LogOutput) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LogOutput.Descriptor instead.
 func (LogOutput) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{17}
+	return file_daemon_proto_rawDescGZIP(), []int{20}
 }
 
 type ResourceKind int32
@@ -996,11 +1149,11 @@ func (x ResourceKind) String() string {
 }
 
 func (ResourceKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[18].Descriptor()
+	return file_daemon_proto_enumTypes[21].Descriptor()
 }
 
 func (ResourceKind) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[18]
+	return &file_daemon_proto_enumTypes[21]
 }
 
 func (x ResourceKind) Number() protoreflect.EnumNumber {
@@ -1009,7 +1162,7 @@ func (x ResourceKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ResourceKind.Descriptor instead.
 func (ResourceKind) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{18}
+	return file_daemon_proto_rawDescGZIP(), []int{21}
 }
 
 type SecretKind int32
@@ -1045,11 +1198,11 @@ func (x SecretKind) String() string {
 }
 
 func (SecretKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[19].Descriptor()
+	return file_daemon_proto_enumTypes[22].Descriptor()
 }
 
 func (SecretKind) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[19]
+	return &file_daemon_proto_enumTypes[22]
 }
 
 func (x SecretKind) Number() protoreflect.EnumNumber {
@@ -1058,7 +1211,7 @@ func (x SecretKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SecretKind.Descriptor instead.
 func (SecretKind) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{19}
+	return file_daemon_proto_rawDescGZIP(), []int{22}
 }
 
 type SecretField int32
@@ -1100,11 +1253,11 @@ func (x SecretField) String() string {
 }
 
 func (SecretField) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[20].Descriptor()
+	return file_daemon_proto_enumTypes[23].Descriptor()
 }
 
 func (SecretField) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[20]
+	return &file_daemon_proto_enumTypes[23]
 }
 
 func (x SecretField) Number() protoreflect.EnumNumber {
@@ -1113,7 +1266,7 @@ func (x SecretField) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SecretField.Descriptor instead.
 func (SecretField) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{20}
+	return file_daemon_proto_rawDescGZIP(), []int{23}
 }
 
 type PolicySecretsState int32
@@ -1152,11 +1305,11 @@ func (x PolicySecretsState) String() string {
 }
 
 func (PolicySecretsState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[21].Descriptor()
+	return file_daemon_proto_enumTypes[24].Descriptor()
 }
 
 func (PolicySecretsState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[21]
+	return &file_daemon_proto_enumTypes[24]
 }
 
 func (x PolicySecretsState) Number() protoreflect.EnumNumber {
@@ -1165,7 +1318,7 @@ func (x PolicySecretsState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PolicySecretsState.Descriptor instead.
 func (PolicySecretsState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{21}
+	return file_daemon_proto_rawDescGZIP(), []int{24}
 }
 
 type ErrorKind int32
@@ -1219,11 +1372,11 @@ func (x ErrorKind) String() string {
 }
 
 func (ErrorKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[22].Descriptor()
+	return file_daemon_proto_enumTypes[25].Descriptor()
 }
 
 func (ErrorKind) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[22]
+	return &file_daemon_proto_enumTypes[25]
 }
 
 func (x ErrorKind) Number() protoreflect.EnumNumber {
@@ -1232,20 +1385,21 @@ func (x ErrorKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ErrorKind.Descriptor instead.
 func (ErrorKind) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{22}
+	return file_daemon_proto_rawDescGZIP(), []int{25}
 }
 
 type ErrorCode int32
 
 const (
-	ErrorCode_ERROR_CODE_UNSPECIFIED              ErrorCode = 0
-	ErrorCode_ERROR_CODE_ALREADY_RUNNING          ErrorCode = 1
-	ErrorCode_ERROR_CODE_NOT_RUNNING              ErrorCode = 2
-	ErrorCode_ERROR_CODE_STALE_GENERATION         ErrorCode = 3
-	ErrorCode_ERROR_CODE_MONITOR_CONNECTION       ErrorCode = 4
-	ErrorCode_ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED ErrorCode = 5
-	ErrorCode_ERROR_CODE_COMMAND_NOT_FOUND        ErrorCode = 6
-	ErrorCode_ERROR_CODE_NATIVE                   ErrorCode = 7
+	ErrorCode_ERROR_CODE_UNSPECIFIED                ErrorCode = 0
+	ErrorCode_ERROR_CODE_ALREADY_RUNNING            ErrorCode = 1
+	ErrorCode_ERROR_CODE_NOT_RUNNING                ErrorCode = 2
+	ErrorCode_ERROR_CODE_STALE_GENERATION           ErrorCode = 3
+	ErrorCode_ERROR_CODE_MONITOR_CONNECTION         ErrorCode = 4
+	ErrorCode_ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED   ErrorCode = 5
+	ErrorCode_ERROR_CODE_COMMAND_NOT_FOUND          ErrorCode = 6
+	ErrorCode_ERROR_CODE_NATIVE                     ErrorCode = 7
+	ErrorCode_ERROR_CODE_LIVE_OPERATION_UNSUPPORTED ErrorCode = 8
 )
 
 // Enum value maps for ErrorCode.
@@ -1259,16 +1413,18 @@ var (
 		5: "ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED",
 		6: "ERROR_CODE_COMMAND_NOT_FOUND",
 		7: "ERROR_CODE_NATIVE",
+		8: "ERROR_CODE_LIVE_OPERATION_UNSUPPORTED",
 	}
 	ErrorCode_value = map[string]int32{
-		"ERROR_CODE_UNSPECIFIED":              0,
-		"ERROR_CODE_ALREADY_RUNNING":          1,
-		"ERROR_CODE_NOT_RUNNING":              2,
-		"ERROR_CODE_STALE_GENERATION":         3,
-		"ERROR_CODE_MONITOR_CONNECTION":       4,
-		"ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED": 5,
-		"ERROR_CODE_COMMAND_NOT_FOUND":        6,
-		"ERROR_CODE_NATIVE":                   7,
+		"ERROR_CODE_UNSPECIFIED":                0,
+		"ERROR_CODE_ALREADY_RUNNING":            1,
+		"ERROR_CODE_NOT_RUNNING":                2,
+		"ERROR_CODE_STALE_GENERATION":           3,
+		"ERROR_CODE_MONITOR_CONNECTION":         4,
+		"ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED":   5,
+		"ERROR_CODE_COMMAND_NOT_FOUND":          6,
+		"ERROR_CODE_NATIVE":                     7,
+		"ERROR_CODE_LIVE_OPERATION_UNSUPPORTED": 8,
 	}
 )
 
@@ -1283,11 +1439,11 @@ func (x ErrorCode) String() string {
 }
 
 func (ErrorCode) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[23].Descriptor()
+	return file_daemon_proto_enumTypes[26].Descriptor()
 }
 
 func (ErrorCode) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[23]
+	return &file_daemon_proto_enumTypes[26]
 }
 
 func (x ErrorCode) Number() protoreflect.EnumNumber {
@@ -1296,7 +1452,7 @@ func (x ErrorCode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ErrorCode.Descriptor instead.
 func (ErrorCode) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{23}
+	return file_daemon_proto_rawDescGZIP(), []int{26}
 }
 
 type LaunchFailureReason int32
@@ -1353,11 +1509,11 @@ func (x LaunchFailureReason) String() string {
 }
 
 func (LaunchFailureReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[24].Descriptor()
+	return file_daemon_proto_enumTypes[27].Descriptor()
 }
 
 func (LaunchFailureReason) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[24]
+	return &file_daemon_proto_enumTypes[27]
 }
 
 func (x LaunchFailureReason) Number() protoreflect.EnumNumber {
@@ -1366,7 +1522,7 @@ func (x LaunchFailureReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LaunchFailureReason.Descriptor instead.
 func (LaunchFailureReason) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{24}
+	return file_daemon_proto_rawDescGZIP(), []int{27}
 }
 
 type NodeState int32
@@ -1414,11 +1570,11 @@ func (x NodeState) String() string {
 }
 
 func (NodeState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[25].Descriptor()
+	return file_daemon_proto_enumTypes[28].Descriptor()
 }
 
 func (NodeState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[25]
+	return &file_daemon_proto_enumTypes[28]
 }
 
 func (x NodeState) Number() protoreflect.EnumNumber {
@@ -1427,7 +1583,7 @@ func (x NodeState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use NodeState.Descriptor instead.
 func (NodeState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{25}
+	return file_daemon_proto_rawDescGZIP(), []int{28}
 }
 
 type NetworkObservationIssue int32
@@ -1475,11 +1631,11 @@ func (x NetworkObservationIssue) String() string {
 }
 
 func (NetworkObservationIssue) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[26].Descriptor()
+	return file_daemon_proto_enumTypes[29].Descriptor()
 }
 
 func (NetworkObservationIssue) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[26]
+	return &file_daemon_proto_enumTypes[29]
 }
 
 func (x NetworkObservationIssue) Number() protoreflect.EnumNumber {
@@ -1488,7 +1644,7 @@ func (x NetworkObservationIssue) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use NetworkObservationIssue.Descriptor instead.
 func (NetworkObservationIssue) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{26}
+	return file_daemon_proto_rawDescGZIP(), []int{29}
 }
 
 type CorePhase int32
@@ -1533,11 +1689,11 @@ func (x CorePhase) String() string {
 }
 
 func (CorePhase) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[27].Descriptor()
+	return file_daemon_proto_enumTypes[30].Descriptor()
 }
 
 func (CorePhase) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[27]
+	return &file_daemon_proto_enumTypes[30]
 }
 
 func (x CorePhase) Number() protoreflect.EnumNumber {
@@ -1546,7 +1702,7 @@ func (x CorePhase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use CorePhase.Descriptor instead.
 func (CorePhase) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{27}
+	return file_daemon_proto_rawDescGZIP(), []int{30}
 }
 
 type ComponentState int32
@@ -1594,11 +1750,11 @@ func (x ComponentState) String() string {
 }
 
 func (ComponentState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[28].Descriptor()
+	return file_daemon_proto_enumTypes[31].Descriptor()
 }
 
 func (ComponentState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[28]
+	return &file_daemon_proto_enumTypes[31]
 }
 
 func (x ComponentState) Number() protoreflect.EnumNumber {
@@ -1607,7 +1763,7 @@ func (x ComponentState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ComponentState.Descriptor instead.
 func (ComponentState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{28}
+	return file_daemon_proto_rawDescGZIP(), []int{31}
 }
 
 type ShutdownProtection int32
@@ -1646,11 +1802,11 @@ func (x ShutdownProtection) String() string {
 }
 
 func (ShutdownProtection) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[29].Descriptor()
+	return file_daemon_proto_enumTypes[32].Descriptor()
 }
 
 func (ShutdownProtection) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[29]
+	return &file_daemon_proto_enumTypes[32]
 }
 
 func (x ShutdownProtection) Number() protoreflect.EnumNumber {
@@ -1659,7 +1815,7 @@ func (x ShutdownProtection) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ShutdownProtection.Descriptor instead.
 func (ShutdownProtection) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{29}
+	return file_daemon_proto_rawDescGZIP(), []int{32}
 }
 
 type EnrollmentMode int32
@@ -1698,11 +1854,11 @@ func (x EnrollmentMode) String() string {
 }
 
 func (EnrollmentMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[30].Descriptor()
+	return file_daemon_proto_enumTypes[33].Descriptor()
 }
 
 func (EnrollmentMode) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[30]
+	return &file_daemon_proto_enumTypes[33]
 }
 
 func (x EnrollmentMode) Number() protoreflect.EnumNumber {
@@ -1711,7 +1867,7 @@ func (x EnrollmentMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use EnrollmentMode.Descriptor instead.
 func (EnrollmentMode) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{30}
+	return file_daemon_proto_rawDescGZIP(), []int{33}
 }
 
 type VmState int32
@@ -1756,11 +1912,11 @@ func (x VmState) String() string {
 }
 
 func (VmState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[31].Descriptor()
+	return file_daemon_proto_enumTypes[34].Descriptor()
 }
 
 func (VmState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[31]
+	return &file_daemon_proto_enumTypes[34]
 }
 
 func (x VmState) Number() protoreflect.EnumNumber {
@@ -1769,7 +1925,7 @@ func (x VmState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use VmState.Descriptor instead.
 func (VmState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{31}
+	return file_daemon_proto_rawDescGZIP(), []int{34}
 }
 
 type ReadinessReason int32
@@ -1829,11 +1985,11 @@ func (x ReadinessReason) String() string {
 }
 
 func (ReadinessReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[32].Descriptor()
+	return file_daemon_proto_enumTypes[35].Descriptor()
 }
 
 func (ReadinessReason) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[32]
+	return &file_daemon_proto_enumTypes[35]
 }
 
 func (x ReadinessReason) Number() protoreflect.EnumNumber {
@@ -1842,7 +1998,7 @@ func (x ReadinessReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ReadinessReason.Descriptor instead.
 func (ReadinessReason) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{32}
+	return file_daemon_proto_rawDescGZIP(), []int{35}
 }
 
 type AgentConnectionState int32
@@ -1881,11 +2037,11 @@ func (x AgentConnectionState) String() string {
 }
 
 func (AgentConnectionState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[33].Descriptor()
+	return file_daemon_proto_enumTypes[36].Descriptor()
 }
 
 func (AgentConnectionState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[33]
+	return &file_daemon_proto_enumTypes[36]
 }
 
 func (x AgentConnectionState) Number() protoreflect.EnumNumber {
@@ -1894,7 +2050,7 @@ func (x AgentConnectionState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use AgentConnectionState.Descriptor instead.
 func (AgentConnectionState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{33}
+	return file_daemon_proto_rawDescGZIP(), []int{36}
 }
 
 type Freshness int32
@@ -1930,11 +2086,11 @@ func (x Freshness) String() string {
 }
 
 func (Freshness) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[34].Descriptor()
+	return file_daemon_proto_enumTypes[37].Descriptor()
 }
 
 func (Freshness) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[34]
+	return &file_daemon_proto_enumTypes[37]
 }
 
 func (x Freshness) Number() protoreflect.EnumNumber {
@@ -1943,7 +2099,7 @@ func (x Freshness) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Freshness.Descriptor instead.
 func (Freshness) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{34}
+	return file_daemon_proto_rawDescGZIP(), []int{37}
 }
 
 type StaleReason int32
@@ -1979,11 +2135,11 @@ func (x StaleReason) String() string {
 }
 
 func (StaleReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[35].Descriptor()
+	return file_daemon_proto_enumTypes[38].Descriptor()
 }
 
 func (StaleReason) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[35]
+	return &file_daemon_proto_enumTypes[38]
 }
 
 func (x StaleReason) Number() protoreflect.EnumNumber {
@@ -1992,7 +2148,7 @@ func (x StaleReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use StaleReason.Descriptor instead.
 func (StaleReason) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{35}
+	return file_daemon_proto_rawDescGZIP(), []int{38}
 }
 
 type AgentStatusState int32
@@ -2031,11 +2187,11 @@ func (x AgentStatusState) String() string {
 }
 
 func (AgentStatusState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[36].Descriptor()
+	return file_daemon_proto_enumTypes[39].Descriptor()
 }
 
 func (AgentStatusState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[36]
+	return &file_daemon_proto_enumTypes[39]
 }
 
 func (x AgentStatusState) Number() protoreflect.EnumNumber {
@@ -2044,7 +2200,7 @@ func (x AgentStatusState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use AgentStatusState.Descriptor instead.
 func (AgentStatusState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{36}
+	return file_daemon_proto_rawDescGZIP(), []int{39}
 }
 
 type SshBackend int32
@@ -2083,11 +2239,11 @@ func (x SshBackend) String() string {
 }
 
 func (SshBackend) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[37].Descriptor()
+	return file_daemon_proto_enumTypes[40].Descriptor()
 }
 
 func (SshBackend) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[37]
+	return &file_daemon_proto_enumTypes[40]
 }
 
 func (x SshBackend) Number() protoreflect.EnumNumber {
@@ -2096,7 +2252,7 @@ func (x SshBackend) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SshBackend.Descriptor instead.
 func (SshBackend) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{37}
+	return file_daemon_proto_rawDescGZIP(), []int{40}
 }
 
 type SystemPhase int32
@@ -2162,11 +2318,11 @@ func (x SystemPhase) String() string {
 }
 
 func (SystemPhase) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[38].Descriptor()
+	return file_daemon_proto_enumTypes[41].Descriptor()
 }
 
 func (SystemPhase) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[38]
+	return &file_daemon_proto_enumTypes[41]
 }
 
 func (x SystemPhase) Number() protoreflect.EnumNumber {
@@ -2175,7 +2331,7 @@ func (x SystemPhase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SystemPhase.Descriptor instead.
 func (SystemPhase) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{38}
+	return file_daemon_proto_rawDescGZIP(), []int{41}
 }
 
 type MemoryReclaimOutcome int32
@@ -2217,11 +2373,11 @@ func (x MemoryReclaimOutcome) String() string {
 }
 
 func (MemoryReclaimOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[39].Descriptor()
+	return file_daemon_proto_enumTypes[42].Descriptor()
 }
 
 func (MemoryReclaimOutcome) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[39]
+	return &file_daemon_proto_enumTypes[42]
 }
 
 func (x MemoryReclaimOutcome) Number() protoreflect.EnumNumber {
@@ -2230,7 +2386,383 @@ func (x MemoryReclaimOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MemoryReclaimOutcome.Descriptor instead.
 func (MemoryReclaimOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{39}
+	return file_daemon_proto_rawDescGZIP(), []int{42}
+}
+
+type StorageCaptureKind int32
+
+const (
+	StorageCaptureKind_STORAGE_CAPTURE_KIND_UNSPECIFIED     StorageCaptureKind = 0
+	StorageCaptureKind_STORAGE_CAPTURE_KIND_STOPPED_STORAGE StorageCaptureKind = 1
+)
+
+// Enum value maps for StorageCaptureKind.
+var (
+	StorageCaptureKind_name = map[int32]string{
+		0: "STORAGE_CAPTURE_KIND_UNSPECIFIED",
+		1: "STORAGE_CAPTURE_KIND_STOPPED_STORAGE",
+	}
+	StorageCaptureKind_value = map[string]int32{
+		"STORAGE_CAPTURE_KIND_UNSPECIFIED":     0,
+		"STORAGE_CAPTURE_KIND_STOPPED_STORAGE": 1,
+	}
+)
+
+func (x StorageCaptureKind) Enum() *StorageCaptureKind {
+	p := new(StorageCaptureKind)
+	*p = x
+	return p
+}
+
+func (x StorageCaptureKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (StorageCaptureKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[43].Descriptor()
+}
+
+func (StorageCaptureKind) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[43]
+}
+
+func (x StorageCaptureKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use StorageCaptureKind.Descriptor instead.
+func (StorageCaptureKind) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{43}
+}
+
+type LiveOperation int32
+
+const (
+	LiveOperation_LIVE_OPERATION_UNSPECIFIED LiveOperation = 0
+	LiveOperation_LIVE_OPERATION_PAUSE       LiveOperation = 1
+	LiveOperation_LIVE_OPERATION_CAPTURE     LiveOperation = 2
+	LiveOperation_LIVE_OPERATION_RESTORE     LiveOperation = 3
+	LiveOperation_LIVE_OPERATION_FORK        LiveOperation = 4
+	LiveOperation_LIVE_OPERATION_INCREMENTAL LiveOperation = 5
+)
+
+// Enum value maps for LiveOperation.
+var (
+	LiveOperation_name = map[int32]string{
+		0: "LIVE_OPERATION_UNSPECIFIED",
+		1: "LIVE_OPERATION_PAUSE",
+		2: "LIVE_OPERATION_CAPTURE",
+		3: "LIVE_OPERATION_RESTORE",
+		4: "LIVE_OPERATION_FORK",
+		5: "LIVE_OPERATION_INCREMENTAL",
+	}
+	LiveOperation_value = map[string]int32{
+		"LIVE_OPERATION_UNSPECIFIED": 0,
+		"LIVE_OPERATION_PAUSE":       1,
+		"LIVE_OPERATION_CAPTURE":     2,
+		"LIVE_OPERATION_RESTORE":     3,
+		"LIVE_OPERATION_FORK":        4,
+		"LIVE_OPERATION_INCREMENTAL": 5,
+	}
+)
+
+func (x LiveOperation) Enum() *LiveOperation {
+	p := new(LiveOperation)
+	*p = x
+	return p
+}
+
+func (x LiveOperation) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveOperation) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[44].Descriptor()
+}
+
+func (LiveOperation) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[44]
+}
+
+func (x LiveOperation) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveOperation.Descriptor instead.
+func (LiveOperation) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{44}
+}
+
+type LiveBackend int32
+
+const (
+	LiveBackend_LIVE_BACKEND_UNSPECIFIED LiveBackend = 0
+	LiveBackend_LIVE_BACKEND_KRUN        LiveBackend = 1
+	LiveBackend_LIVE_BACKEND_VZ          LiveBackend = 2
+	LiveBackend_LIVE_BACKEND_MOCK        LiveBackend = 3
+)
+
+// Enum value maps for LiveBackend.
+var (
+	LiveBackend_name = map[int32]string{
+		0: "LIVE_BACKEND_UNSPECIFIED",
+		1: "LIVE_BACKEND_KRUN",
+		2: "LIVE_BACKEND_VZ",
+		3: "LIVE_BACKEND_MOCK",
+	}
+	LiveBackend_value = map[string]int32{
+		"LIVE_BACKEND_UNSPECIFIED": 0,
+		"LIVE_BACKEND_KRUN":        1,
+		"LIVE_BACKEND_VZ":          2,
+		"LIVE_BACKEND_MOCK":        3,
+	}
+)
+
+func (x LiveBackend) Enum() *LiveBackend {
+	p := new(LiveBackend)
+	*p = x
+	return p
+}
+
+func (x LiveBackend) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveBackend) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[45].Descriptor()
+}
+
+func (LiveBackend) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[45]
+}
+
+func (x LiveBackend) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveBackend.Descriptor instead.
+func (LiveBackend) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{45}
+}
+
+type LiveLane int32
+
+const (
+	LiveLane_LIVE_LANE_UNSPECIFIED      LiveLane = 0
+	LiveLane_LIVE_LANE_KVM_X86_64       LiveLane = 1
+	LiveLane_LIVE_LANE_KVM_ARM64_GIC_V3 LiveLane = 2
+	LiveLane_LIVE_LANE_HVF_ARM64        LiveLane = 3
+	LiveLane_LIVE_LANE_NOT_APPLICABLE   LiveLane = 4
+)
+
+// Enum value maps for LiveLane.
+var (
+	LiveLane_name = map[int32]string{
+		0: "LIVE_LANE_UNSPECIFIED",
+		1: "LIVE_LANE_KVM_X86_64",
+		2: "LIVE_LANE_KVM_ARM64_GIC_V3",
+		3: "LIVE_LANE_HVF_ARM64",
+		4: "LIVE_LANE_NOT_APPLICABLE",
+	}
+	LiveLane_value = map[string]int32{
+		"LIVE_LANE_UNSPECIFIED":      0,
+		"LIVE_LANE_KVM_X86_64":       1,
+		"LIVE_LANE_KVM_ARM64_GIC_V3": 2,
+		"LIVE_LANE_HVF_ARM64":        3,
+		"LIVE_LANE_NOT_APPLICABLE":   4,
+	}
+)
+
+func (x LiveLane) Enum() *LiveLane {
+	p := new(LiveLane)
+	*p = x
+	return p
+}
+
+func (x LiveLane) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveLane) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[46].Descriptor()
+}
+
+func (LiveLane) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[46]
+}
+
+func (x LiveLane) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveLane.Descriptor instead.
+func (LiveLane) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{46}
+}
+
+type LiveScope int32
+
+const (
+	LiveScope_LIVE_SCOPE_UNSPECIFIED LiveScope = 0
+	LiveScope_LIVE_SCOPE_HOST        LiveScope = 1
+	LiveScope_LIVE_SCOPE_MACHINE     LiveScope = 2
+)
+
+// Enum value maps for LiveScope.
+var (
+	LiveScope_name = map[int32]string{
+		0: "LIVE_SCOPE_UNSPECIFIED",
+		1: "LIVE_SCOPE_HOST",
+		2: "LIVE_SCOPE_MACHINE",
+	}
+	LiveScope_value = map[string]int32{
+		"LIVE_SCOPE_UNSPECIFIED": 0,
+		"LIVE_SCOPE_HOST":        1,
+		"LIVE_SCOPE_MACHINE":     2,
+	}
+)
+
+func (x LiveScope) Enum() *LiveScope {
+	p := new(LiveScope)
+	*p = x
+	return p
+}
+
+func (x LiveScope) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveScope) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[47].Descriptor()
+}
+
+func (LiveScope) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[47]
+}
+
+func (x LiveScope) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveScope.Descriptor instead.
+func (LiveScope) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{47}
+}
+
+type LiveReasonCode int32
+
+const (
+	LiveReasonCode_LIVE_REASON_CODE_UNSPECIFIED             LiveReasonCode = 0
+	LiveReasonCode_LIVE_REASON_CODE_BACKEND_EXCLUDED        LiveReasonCode = 1
+	LiveReasonCode_LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR     LiveReasonCode = 2
+	LiveReasonCode_LIVE_REASON_CODE_LANE_NOT_QUALIFIED      LiveReasonCode = 3
+	LiveReasonCode_LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE  LiveReasonCode = 4
+	LiveReasonCode_LIVE_REASON_CODE_BUILD_EXCLUDED          LiveReasonCode = 5
+	LiveReasonCode_LIVE_REASON_CODE_NOT_DELIVERED           LiveReasonCode = 6
+	LiveReasonCode_LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED LiveReasonCode = 7
+)
+
+// Enum value maps for LiveReasonCode.
+var (
+	LiveReasonCode_name = map[int32]string{
+		0: "LIVE_REASON_CODE_UNSPECIFIED",
+		1: "LIVE_REASON_CODE_BACKEND_EXCLUDED",
+		2: "LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR",
+		3: "LIVE_REASON_CODE_LANE_NOT_QUALIFIED",
+		4: "LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE",
+		5: "LIVE_REASON_CODE_BUILD_EXCLUDED",
+		6: "LIVE_REASON_CODE_NOT_DELIVERED",
+		7: "LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED",
+	}
+	LiveReasonCode_value = map[string]int32{
+		"LIVE_REASON_CODE_UNSPECIFIED":             0,
+		"LIVE_REASON_CODE_BACKEND_EXCLUDED":        1,
+		"LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR":     2,
+		"LIVE_REASON_CODE_LANE_NOT_QUALIFIED":      3,
+		"LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE":  4,
+		"LIVE_REASON_CODE_BUILD_EXCLUDED":          5,
+		"LIVE_REASON_CODE_NOT_DELIVERED":           6,
+		"LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED": 7,
+	}
+)
+
+func (x LiveReasonCode) Enum() *LiveReasonCode {
+	p := new(LiveReasonCode)
+	*p = x
+	return p
+}
+
+func (x LiveReasonCode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveReasonCode) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[48].Descriptor()
+}
+
+func (LiveReasonCode) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[48]
+}
+
+func (x LiveReasonCode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveReasonCode.Descriptor instead.
+func (LiveReasonCode) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{48}
+}
+
+type LiveEvidenceState int32
+
+const (
+	LiveEvidenceState_LIVE_EVIDENCE_STATE_UNSPECIFIED LiveEvidenceState = 0
+	LiveEvidenceState_LIVE_EVIDENCE_STATE_RUN         LiveEvidenceState = 1
+	LiveEvidenceState_LIVE_EVIDENCE_STATE_PROSPECTIVE LiveEvidenceState = 2
+	LiveEvidenceState_LIVE_EVIDENCE_STATE_UNAVAILABLE LiveEvidenceState = 3
+)
+
+// Enum value maps for LiveEvidenceState.
+var (
+	LiveEvidenceState_name = map[int32]string{
+		0: "LIVE_EVIDENCE_STATE_UNSPECIFIED",
+		1: "LIVE_EVIDENCE_STATE_RUN",
+		2: "LIVE_EVIDENCE_STATE_PROSPECTIVE",
+		3: "LIVE_EVIDENCE_STATE_UNAVAILABLE",
+	}
+	LiveEvidenceState_value = map[string]int32{
+		"LIVE_EVIDENCE_STATE_UNSPECIFIED": 0,
+		"LIVE_EVIDENCE_STATE_RUN":         1,
+		"LIVE_EVIDENCE_STATE_PROSPECTIVE": 2,
+		"LIVE_EVIDENCE_STATE_UNAVAILABLE": 3,
+	}
+)
+
+func (x LiveEvidenceState) Enum() *LiveEvidenceState {
+	p := new(LiveEvidenceState)
+	*p = x
+	return p
+}
+
+func (x LiveEvidenceState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveEvidenceState) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[49].Descriptor()
+}
+
+func (LiveEvidenceState) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[49]
+}
+
+func (x LiveEvidenceState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveEvidenceState.Descriptor instead.
+func (LiveEvidenceState) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{49}
 }
 
 type Name struct {
@@ -2921,17 +3453,73 @@ func (x *Mount) GetReadOnly() bool {
 	return false
 }
 
+type DiskGeometry struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Length            uint64                 `protobuf:"varint,1,opt,name=length,proto3" json:"length,omitempty"`
+	LogicalSectorSize uint32                 `protobuf:"varint,2,opt,name=logical_sector_size,json=logicalSectorSize,proto3" json:"logical_sector_size,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *DiskGeometry) Reset() {
+	*x = DiskGeometry{}
+	mi := &file_daemon_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiskGeometry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiskGeometry) ProtoMessage() {}
+
+func (x *DiskGeometry) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiskGeometry.ProtoReflect.Descriptor instead.
+func (*DiskGeometry) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *DiskGeometry) GetLength() uint64 {
+	if x != nil {
+		return x.Length
+	}
+	return 0
+}
+
+func (x *DiskGeometry) GetLogicalSectorSize() uint32 {
+	if x != nil {
+		return x.LogicalSectorSize
+	}
+	return 0
+}
+
 type Disk struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          []byte                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	ReadOnly      bool                   `protobuf:"varint,2,opt,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
+	ReadOnly      *bool                  `protobuf:"varint,2,opt,name=read_only,json=readOnly,proto3,oneof" json:"read_only,omitempty"`
+	Role          *DiskRole              `protobuf:"varint,3,opt,name=role,proto3,enum=silo.daemon.v1.DiskRole,oneof" json:"role,omitempty"`
+	Format        *DiskFormat            `protobuf:"varint,4,opt,name=format,proto3,enum=silo.daemon.v1.DiskFormat,oneof" json:"format,omitempty"`
+	Geometry      *DiskGeometry          `protobuf:"bytes,5,opt,name=geometry,proto3" json:"geometry,omitempty"`
+	BlockId       *string                `protobuf:"bytes,6,opt,name=block_id,json=blockId,proto3,oneof" json:"block_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Disk) Reset() {
 	*x = Disk{}
-	mi := &file_daemon_proto_msgTypes[11]
+	mi := &file_daemon_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2943,7 +3531,7 @@ func (x *Disk) String() string {
 func (*Disk) ProtoMessage() {}
 
 func (x *Disk) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[11]
+	mi := &file_daemon_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2956,7 +3544,7 @@ func (x *Disk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Disk.ProtoReflect.Descriptor instead.
 func (*Disk) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{11}
+	return file_daemon_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Disk) GetPath() []byte {
@@ -2967,10 +3555,38 @@ func (x *Disk) GetPath() []byte {
 }
 
 func (x *Disk) GetReadOnly() bool {
-	if x != nil {
-		return x.ReadOnly
+	if x != nil && x.ReadOnly != nil {
+		return *x.ReadOnly
 	}
 	return false
+}
+
+func (x *Disk) GetRole() DiskRole {
+	if x != nil && x.Role != nil {
+		return *x.Role
+	}
+	return DiskRole_DISK_ROLE_UNSPECIFIED
+}
+
+func (x *Disk) GetFormat() DiskFormat {
+	if x != nil && x.Format != nil {
+		return *x.Format
+	}
+	return DiskFormat_DISK_FORMAT_UNSPECIFIED
+}
+
+func (x *Disk) GetGeometry() *DiskGeometry {
+	if x != nil {
+		return x.Geometry
+	}
+	return nil
+}
+
+func (x *Disk) GetBlockId() string {
+	if x != nil && x.BlockId != nil {
+		return *x.BlockId
+	}
+	return ""
 }
 
 type Address struct {
@@ -2986,7 +3602,7 @@ type Address struct {
 
 func (x *Address) Reset() {
 	*x = Address{}
-	mi := &file_daemon_proto_msgTypes[12]
+	mi := &file_daemon_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2998,7 +3614,7 @@ func (x *Address) String() string {
 func (*Address) ProtoMessage() {}
 
 func (x *Address) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[12]
+	mi := &file_daemon_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3011,7 +3627,7 @@ func (x *Address) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Address.ProtoReflect.Descriptor instead.
 func (*Address) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{12}
+	return file_daemon_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *Address) GetAddress() isAddress_Address {
@@ -3069,7 +3685,7 @@ type Endpoint struct {
 
 func (x *Endpoint) Reset() {
 	*x = Endpoint{}
-	mi := &file_daemon_proto_msgTypes[13]
+	mi := &file_daemon_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3081,7 +3697,7 @@ func (x *Endpoint) String() string {
 func (*Endpoint) ProtoMessage() {}
 
 func (x *Endpoint) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[13]
+	mi := &file_daemon_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3094,7 +3710,7 @@ func (x *Endpoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Endpoint.ProtoReflect.Descriptor instead.
 func (*Endpoint) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{13}
+	return file_daemon_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Endpoint) GetEndpoint() isEndpoint_Endpoint {
@@ -3165,7 +3781,7 @@ type Forward struct {
 
 func (x *Forward) Reset() {
 	*x = Forward{}
-	mi := &file_daemon_proto_msgTypes[14]
+	mi := &file_daemon_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3177,7 +3793,7 @@ func (x *Forward) String() string {
 func (*Forward) ProtoMessage() {}
 
 func (x *Forward) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[14]
+	mi := &file_daemon_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3190,7 +3806,7 @@ func (x *Forward) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Forward.ProtoReflect.Descriptor instead.
 func (*Forward) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{14}
+	return file_daemon_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Forward) GetListen() *Endpoint {
@@ -3230,7 +3846,7 @@ type ForwardList struct {
 
 func (x *ForwardList) Reset() {
 	*x = ForwardList{}
-	mi := &file_daemon_proto_msgTypes[15]
+	mi := &file_daemon_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3242,7 +3858,7 @@ func (x *ForwardList) String() string {
 func (*ForwardList) ProtoMessage() {}
 
 func (x *ForwardList) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[15]
+	mi := &file_daemon_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3255,7 +3871,7 @@ func (x *ForwardList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardList.ProtoReflect.Descriptor instead.
 func (*ForwardList) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{15}
+	return file_daemon_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ForwardList) GetValues() []*Forward {
@@ -3275,7 +3891,7 @@ type Vsock struct {
 
 func (x *Vsock) Reset() {
 	*x = Vsock{}
-	mi := &file_daemon_proto_msgTypes[16]
+	mi := &file_daemon_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3287,7 +3903,7 @@ func (x *Vsock) String() string {
 func (*Vsock) ProtoMessage() {}
 
 func (x *Vsock) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[16]
+	mi := &file_daemon_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3300,7 +3916,7 @@ func (x *Vsock) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Vsock.ProtoReflect.Descriptor instead.
 func (*Vsock) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{16}
+	return file_daemon_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Vsock) GetEnabled() bool {
@@ -3328,7 +3944,7 @@ type Kernel struct {
 
 func (x *Kernel) Reset() {
 	*x = Kernel{}
-	mi := &file_daemon_proto_msgTypes[17]
+	mi := &file_daemon_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3340,7 +3956,7 @@ func (x *Kernel) String() string {
 func (*Kernel) ProtoMessage() {}
 
 func (x *Kernel) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[17]
+	mi := &file_daemon_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3353,7 +3969,7 @@ func (x *Kernel) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Kernel.ProtoReflect.Descriptor instead.
 func (*Kernel) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{17}
+	return file_daemon_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *Kernel) GetPath() []byte {
@@ -3387,7 +4003,7 @@ type Boot struct {
 
 func (x *Boot) Reset() {
 	*x = Boot{}
-	mi := &file_daemon_proto_msgTypes[18]
+	mi := &file_daemon_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3399,7 +4015,7 @@ func (x *Boot) String() string {
 func (*Boot) ProtoMessage() {}
 
 func (x *Boot) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[18]
+	mi := &file_daemon_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3412,7 +4028,7 @@ func (x *Boot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Boot.ProtoReflect.Descriptor instead.
 func (*Boot) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{18}
+	return file_daemon_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Boot) GetKernel() *Kernel {
@@ -3441,7 +4057,7 @@ type Hardware struct {
 
 func (x *Hardware) Reset() {
 	*x = Hardware{}
-	mi := &file_daemon_proto_msgTypes[19]
+	mi := &file_daemon_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3453,7 +4069,7 @@ func (x *Hardware) String() string {
 func (*Hardware) ProtoMessage() {}
 
 func (x *Hardware) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[19]
+	mi := &file_daemon_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3466,7 +4082,7 @@ func (x *Hardware) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hardware.ProtoReflect.Descriptor instead.
 func (*Hardware) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{19}
+	return file_daemon_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Hardware) GetCpus() uint32 {
@@ -3506,7 +4122,7 @@ type Storage struct {
 
 func (x *Storage) Reset() {
 	*x = Storage{}
-	mi := &file_daemon_proto_msgTypes[20]
+	mi := &file_daemon_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3518,7 +4134,7 @@ func (x *Storage) String() string {
 func (*Storage) ProtoMessage() {}
 
 func (x *Storage) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[20]
+	mi := &file_daemon_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3531,7 +4147,7 @@ func (x *Storage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Storage.ProtoReflect.Descriptor instead.
 func (*Storage) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{20}
+	return file_daemon_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Storage) GetDisks() []*Disk {
@@ -3550,7 +4166,7 @@ type VmGuest struct {
 
 func (x *VmGuest) Reset() {
 	*x = VmGuest{}
-	mi := &file_daemon_proto_msgTypes[21]
+	mi := &file_daemon_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3562,7 +4178,7 @@ func (x *VmGuest) String() string {
 func (*VmGuest) ProtoMessage() {}
 
 func (x *VmGuest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[21]
+	mi := &file_daemon_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3575,7 +4191,7 @@ func (x *VmGuest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VmGuest.ProtoReflect.Descriptor instead.
 func (*VmGuest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{21}
+	return file_daemon_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *VmGuest) GetOs() GuestOs {
@@ -3602,7 +4218,7 @@ type VmSpec struct {
 
 func (x *VmSpec) Reset() {
 	*x = VmSpec{}
-	mi := &file_daemon_proto_msgTypes[22]
+	mi := &file_daemon_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3614,7 +4230,7 @@ func (x *VmSpec) String() string {
 func (*VmSpec) ProtoMessage() {}
 
 func (x *VmSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[22]
+	mi := &file_daemon_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3627,7 +4243,7 @@ func (x *VmSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VmSpec.ProtoReflect.Descriptor instead.
 func (*VmSpec) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{22}
+	return file_daemon_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *VmSpec) GetSpecVersion() string {
@@ -3703,7 +4319,7 @@ type PrivateNetwork struct {
 
 func (x *PrivateNetwork) Reset() {
 	*x = PrivateNetwork{}
-	mi := &file_daemon_proto_msgTypes[23]
+	mi := &file_daemon_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3715,7 +4331,7 @@ func (x *PrivateNetwork) String() string {
 func (*PrivateNetwork) ProtoMessage() {}
 
 func (x *PrivateNetwork) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[23]
+	mi := &file_daemon_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3728,7 +4344,7 @@ func (x *PrivateNetwork) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrivateNetwork.ProtoReflect.Descriptor instead.
 func (*PrivateNetwork) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{23}
+	return file_daemon_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PrivateNetwork) GetPolicyJson() string {
@@ -3759,7 +4375,7 @@ type ResolvedNetwork struct {
 
 func (x *ResolvedNetwork) Reset() {
 	*x = ResolvedNetwork{}
-	mi := &file_daemon_proto_msgTypes[24]
+	mi := &file_daemon_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3771,7 +4387,7 @@ func (x *ResolvedNetwork) String() string {
 func (*ResolvedNetwork) ProtoMessage() {}
 
 func (x *ResolvedNetwork) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[24]
+	mi := &file_daemon_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3784,7 +4400,7 @@ func (x *ResolvedNetwork) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolvedNetwork.ProtoReflect.Descriptor instead.
 func (*ResolvedNetwork) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{24}
+	return file_daemon_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ResolvedNetwork) GetAttachment() isResolvedNetwork_Attachment {
@@ -3854,7 +4470,7 @@ type NetworkDefinition struct {
 
 func (x *NetworkDefinition) Reset() {
 	*x = NetworkDefinition{}
-	mi := &file_daemon_proto_msgTypes[25]
+	mi := &file_daemon_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3866,7 +4482,7 @@ func (x *NetworkDefinition) String() string {
 func (*NetworkDefinition) ProtoMessage() {}
 
 func (x *NetworkDefinition) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[25]
+	mi := &file_daemon_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3879,7 +4495,7 @@ func (x *NetworkDefinition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkDefinition.ProtoReflect.Descriptor instead.
 func (*NetworkDefinition) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{25}
+	return file_daemon_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *NetworkDefinition) GetName() string {
@@ -3912,7 +4528,7 @@ type OptionalNetworkDefinition struct {
 
 func (x *OptionalNetworkDefinition) Reset() {
 	*x = OptionalNetworkDefinition{}
-	mi := &file_daemon_proto_msgTypes[26]
+	mi := &file_daemon_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3924,7 +4540,7 @@ func (x *OptionalNetworkDefinition) String() string {
 func (*OptionalNetworkDefinition) ProtoMessage() {}
 
 func (x *OptionalNetworkDefinition) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[26]
+	mi := &file_daemon_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3937,7 +4553,7 @@ func (x *OptionalNetworkDefinition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OptionalNetworkDefinition.ProtoReflect.Descriptor instead.
 func (*OptionalNetworkDefinition) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{26}
+	return file_daemon_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *OptionalNetworkDefinition) GetDefinition() *NetworkDefinition {
@@ -3956,7 +4572,7 @@ type CreateNetworkDefinitionRequest struct {
 
 func (x *CreateNetworkDefinitionRequest) Reset() {
 	*x = CreateNetworkDefinitionRequest{}
-	mi := &file_daemon_proto_msgTypes[27]
+	mi := &file_daemon_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3968,7 +4584,7 @@ func (x *CreateNetworkDefinitionRequest) String() string {
 func (*CreateNetworkDefinitionRequest) ProtoMessage() {}
 
 func (x *CreateNetworkDefinitionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[27]
+	mi := &file_daemon_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3981,7 +4597,7 @@ func (x *CreateNetworkDefinitionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateNetworkDefinitionRequest.ProtoReflect.Descriptor instead.
 func (*CreateNetworkDefinitionRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{27}
+	return file_daemon_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *CreateNetworkDefinitionRequest) GetDefinition() *NetworkDefinition {
@@ -4001,7 +4617,7 @@ type SetMachineNetworkRequest struct {
 
 func (x *SetMachineNetworkRequest) Reset() {
 	*x = SetMachineNetworkRequest{}
-	mi := &file_daemon_proto_msgTypes[28]
+	mi := &file_daemon_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4013,7 +4629,7 @@ func (x *SetMachineNetworkRequest) String() string {
 func (*SetMachineNetworkRequest) ProtoMessage() {}
 
 func (x *SetMachineNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[28]
+	mi := &file_daemon_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4026,7 +4642,7 @@ func (x *SetMachineNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetMachineNetworkRequest.ProtoReflect.Descriptor instead.
 func (*SetMachineNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{28}
+	return file_daemon_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *SetMachineNetworkRequest) GetMachine() *MachineRef {
@@ -4043,36 +4659,120 @@ func (x *SetMachineNetworkRequest) GetNetwork() *ResolvedNetwork {
 	return nil
 }
 
+type TemporaryDirectoryPolicy struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Backing:
+	//
+	//	*TemporaryDirectoryPolicy_DiskBacked
+	//	*TemporaryDirectoryPolicy_TmpfsCapacityBytes
+	Backing       isTemporaryDirectoryPolicy_Backing `protobuf_oneof:"backing"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TemporaryDirectoryPolicy) Reset() {
+	*x = TemporaryDirectoryPolicy{}
+	mi := &file_daemon_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TemporaryDirectoryPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TemporaryDirectoryPolicy) ProtoMessage() {}
+
+func (x *TemporaryDirectoryPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TemporaryDirectoryPolicy.ProtoReflect.Descriptor instead.
+func (*TemporaryDirectoryPolicy) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *TemporaryDirectoryPolicy) GetBacking() isTemporaryDirectoryPolicy_Backing {
+	if x != nil {
+		return x.Backing
+	}
+	return nil
+}
+
+func (x *TemporaryDirectoryPolicy) GetDiskBacked() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Backing.(*TemporaryDirectoryPolicy_DiskBacked); ok {
+			return x.DiskBacked
+		}
+	}
+	return nil
+}
+
+func (x *TemporaryDirectoryPolicy) GetTmpfsCapacityBytes() uint64 {
+	if x != nil {
+		if x, ok := x.Backing.(*TemporaryDirectoryPolicy_TmpfsCapacityBytes); ok {
+			return x.TmpfsCapacityBytes
+		}
+	}
+	return 0
+}
+
+type isTemporaryDirectoryPolicy_Backing interface {
+	isTemporaryDirectoryPolicy_Backing()
+}
+
+type TemporaryDirectoryPolicy_DiskBacked struct {
+	DiskBacked *emptypb.Empty `protobuf:"bytes,1,opt,name=disk_backed,json=diskBacked,proto3,oneof"`
+}
+
+type TemporaryDirectoryPolicy_TmpfsCapacityBytes struct {
+	TmpfsCapacityBytes uint64 `protobuf:"varint,2,opt,name=tmpfs_capacity_bytes,json=tmpfsCapacityBytes,proto3,oneof"`
+}
+
+func (*TemporaryDirectoryPolicy_DiskBacked) isTemporaryDirectoryPolicy_Backing() {}
+
+func (*TemporaryDirectoryPolicy_TmpfsCapacityBytes) isTemporaryDirectoryPolicy_Backing() {}
+
 type NormalizedMachineCreate struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	Name                 *string                `protobuf:"bytes,1,opt,name=name,proto3,oneof" json:"name,omitempty"`
-	TemplateName         *string                `protobuf:"bytes,2,opt,name=template_name,json=templateName,proto3,oneof" json:"template_name,omitempty"`
-	Labels               map[string]string      `protobuf:"bytes,3,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Process              *ProcessConfig         `protobuf:"bytes,4,opt,name=process,proto3" json:"process,omitempty"`
-	Retention            Retention              `protobuf:"varint,5,opt,name=retention,proto3,enum=silo.daemon.v1.Retention" json:"retention,omitempty"`
-	Kernel               []byte                 `protobuf:"bytes,6,opt,name=kernel,proto3,oneof" json:"kernel,omitempty"`
-	Initramfs            []byte                 `protobuf:"bytes,7,opt,name=initramfs,proto3,oneof" json:"initramfs,omitempty"`
-	KernelArgs           []string               `protobuf:"bytes,8,rep,name=kernel_args,json=kernelArgs,proto3" json:"kernel_args,omitempty"`
-	NestedVirtualization bool                   `protobuf:"varint,9,opt,name=nested_virtualization,json=nestedVirtualization,proto3" json:"nested_virtualization,omitempty"`
-	Rosetta              bool                   `protobuf:"varint,10,opt,name=rosetta,proto3" json:"rosetta,omitempty"`
-	Disks                [][]byte               `protobuf:"bytes,11,rep,name=disks,proto3" json:"disks,omitempty"`
-	Mounts               []*Mount               `protobuf:"bytes,12,rep,name=mounts,proto3" json:"mounts,omitempty"`
-	Forwards             []*Forward             `protobuf:"bytes,13,rep,name=forwards,proto3" json:"forwards,omitempty"`
-	Vsock                *bool                  `protobuf:"varint,14,opt,name=vsock,proto3,oneof" json:"vsock,omitempty"`
-	Cpus                 *uint32                `protobuf:"varint,15,opt,name=cpus,proto3,oneof" json:"cpus,omitempty"`
-	MemoryBytes          *uint64                `protobuf:"varint,16,opt,name=memory_bytes,json=memoryBytes,proto3,oneof" json:"memory_bytes,omitempty"`
-	RootDiskSizeBytes    *uint64                `protobuf:"varint,17,opt,name=root_disk_size_bytes,json=rootDiskSizeBytes,proto3,oneof" json:"root_disk_size_bytes,omitempty"`
-	Userdata             *string                `protobuf:"bytes,18,opt,name=userdata,proto3,oneof" json:"userdata,omitempty"`
-	Network              *ResolvedNetwork       `protobuf:"bytes,19,opt,name=network,proto3" json:"network,omitempty"`
-	Agent                *Agent                 `protobuf:"bytes,20,opt,name=agent,proto3" json:"agent,omitempty"`
-	ProvisionUser        *User                  `protobuf:"bytes,21,opt,name=provision_user,json=provisionUser,proto3" json:"provision_user,omitempty"`
+	state                protoimpl.MessageState    `protogen:"open.v1"`
+	Name                 *string                   `protobuf:"bytes,1,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	TemplateName         *string                   `protobuf:"bytes,2,opt,name=template_name,json=templateName,proto3,oneof" json:"template_name,omitempty"`
+	Labels               map[string]string         `protobuf:"bytes,3,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Process              *ProcessConfig            `protobuf:"bytes,4,opt,name=process,proto3" json:"process,omitempty"`
+	Retention            Retention                 `protobuf:"varint,5,opt,name=retention,proto3,enum=silo.daemon.v1.Retention" json:"retention,omitempty"`
+	Kernel               []byte                    `protobuf:"bytes,6,opt,name=kernel,proto3,oneof" json:"kernel,omitempty"`
+	Initramfs            []byte                    `protobuf:"bytes,7,opt,name=initramfs,proto3,oneof" json:"initramfs,omitempty"`
+	KernelArgs           []string                  `protobuf:"bytes,8,rep,name=kernel_args,json=kernelArgs,proto3" json:"kernel_args,omitempty"`
+	NestedVirtualization bool                      `protobuf:"varint,9,opt,name=nested_virtualization,json=nestedVirtualization,proto3" json:"nested_virtualization,omitempty"`
+	Rosetta              bool                      `protobuf:"varint,10,opt,name=rosetta,proto3" json:"rosetta,omitempty"`
+	Disks                [][]byte                  `protobuf:"bytes,11,rep,name=disks,proto3" json:"disks,omitempty"`
+	Mounts               []*Mount                  `protobuf:"bytes,12,rep,name=mounts,proto3" json:"mounts,omitempty"`
+	Forwards             []*Forward                `protobuf:"bytes,13,rep,name=forwards,proto3" json:"forwards,omitempty"`
+	Vsock                *bool                     `protobuf:"varint,14,opt,name=vsock,proto3,oneof" json:"vsock,omitempty"`
+	Cpus                 *uint32                   `protobuf:"varint,15,opt,name=cpus,proto3,oneof" json:"cpus,omitempty"`
+	MemoryBytes          *uint64                   `protobuf:"varint,16,opt,name=memory_bytes,json=memoryBytes,proto3,oneof" json:"memory_bytes,omitempty"`
+	RootDiskSizeBytes    *uint64                   `protobuf:"varint,17,opt,name=root_disk_size_bytes,json=rootDiskSizeBytes,proto3,oneof" json:"root_disk_size_bytes,omitempty"`
+	Userdata             *string                   `protobuf:"bytes,18,opt,name=userdata,proto3,oneof" json:"userdata,omitempty"`
+	Network              *ResolvedNetwork          `protobuf:"bytes,19,opt,name=network,proto3" json:"network,omitempty"`
+	Agent                *Agent                    `protobuf:"bytes,20,opt,name=agent,proto3" json:"agent,omitempty"`
+	ProvisionUser        *User                     `protobuf:"bytes,21,opt,name=provision_user,json=provisionUser,proto3" json:"provision_user,omitempty"`
+	RootProfile          *RootProfile              `protobuf:"varint,22,opt,name=root_profile,json=rootProfile,proto3,enum=silo.daemon.v1.RootProfile,oneof" json:"root_profile,omitempty"`
+	TemporaryDirectory   *TemporaryDirectoryPolicy `protobuf:"bytes,23,opt,name=temporary_directory,json=temporaryDirectory,proto3" json:"temporary_directory,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
 
 func (x *NormalizedMachineCreate) Reset() {
 	*x = NormalizedMachineCreate{}
-	mi := &file_daemon_proto_msgTypes[29]
+	mi := &file_daemon_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4084,7 +4784,7 @@ func (x *NormalizedMachineCreate) String() string {
 func (*NormalizedMachineCreate) ProtoMessage() {}
 
 func (x *NormalizedMachineCreate) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[29]
+	mi := &file_daemon_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4097,7 +4797,7 @@ func (x *NormalizedMachineCreate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NormalizedMachineCreate.ProtoReflect.Descriptor instead.
 func (*NormalizedMachineCreate) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{29}
+	return file_daemon_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *NormalizedMachineCreate) GetName() string {
@@ -4247,6 +4947,20 @@ func (x *NormalizedMachineCreate) GetProvisionUser() *User {
 	return nil
 }
 
+func (x *NormalizedMachineCreate) GetRootProfile() RootProfile {
+	if x != nil && x.RootProfile != nil {
+		return *x.RootProfile
+	}
+	return RootProfile_ROOT_PROFILE_UNSPECIFIED
+}
+
+func (x *NormalizedMachineCreate) GetTemporaryDirectory() *TemporaryDirectoryPolicy {
+	if x != nil {
+		return x.TemporaryDirectory
+	}
+	return nil
+}
+
 type OciIdentity struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	RequestedReference string                 `protobuf:"bytes,1,opt,name=requested_reference,json=requestedReference,proto3" json:"requested_reference,omitempty"`
@@ -4261,7 +4975,7 @@ type OciIdentity struct {
 
 func (x *OciIdentity) Reset() {
 	*x = OciIdentity{}
-	mi := &file_daemon_proto_msgTypes[30]
+	mi := &file_daemon_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4273,7 +4987,7 @@ func (x *OciIdentity) String() string {
 func (*OciIdentity) ProtoMessage() {}
 
 func (x *OciIdentity) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[30]
+	mi := &file_daemon_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4286,7 +5000,7 @@ func (x *OciIdentity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OciIdentity.ProtoReflect.Descriptor instead.
 func (*OciIdentity) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{30}
+	return file_daemon_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *OciIdentity) GetRequestedReference() string {
@@ -4342,7 +5056,7 @@ type ResolvedImage struct {
 
 func (x *ResolvedImage) Reset() {
 	*x = ResolvedImage{}
-	mi := &file_daemon_proto_msgTypes[31]
+	mi := &file_daemon_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4354,7 +5068,7 @@ func (x *ResolvedImage) String() string {
 func (*ResolvedImage) ProtoMessage() {}
 
 func (x *ResolvedImage) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[31]
+	mi := &file_daemon_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4367,7 +5081,7 @@ func (x *ResolvedImage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolvedImage.ProtoReflect.Descriptor instead.
 func (*ResolvedImage) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{31}
+	return file_daemon_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ResolvedImage) GetIdentity() *OciIdentity {
@@ -4405,7 +5119,7 @@ type CreateMachineRequest struct {
 
 func (x *CreateMachineRequest) Reset() {
 	*x = CreateMachineRequest{}
-	mi := &file_daemon_proto_msgTypes[32]
+	mi := &file_daemon_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4417,7 +5131,7 @@ func (x *CreateMachineRequest) String() string {
 func (*CreateMachineRequest) ProtoMessage() {}
 
 func (x *CreateMachineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[32]
+	mi := &file_daemon_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4430,7 +5144,7 @@ func (x *CreateMachineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateMachineRequest.ProtoReflect.Descriptor instead.
 func (*CreateMachineRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{32}
+	return file_daemon_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *CreateMachineRequest) GetConfiguration() *NormalizedMachineCreate {
@@ -4490,7 +5204,7 @@ type ImageReferenceProgress struct {
 
 func (x *ImageReferenceProgress) Reset() {
 	*x = ImageReferenceProgress{}
-	mi := &file_daemon_proto_msgTypes[33]
+	mi := &file_daemon_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4502,7 +5216,7 @@ func (x *ImageReferenceProgress) String() string {
 func (*ImageReferenceProgress) ProtoMessage() {}
 
 func (x *ImageReferenceProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[33]
+	mi := &file_daemon_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4515,7 +5229,7 @@ func (x *ImageReferenceProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImageReferenceProgress.ProtoReflect.Descriptor instead.
 func (*ImageReferenceProgress) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{33}
+	return file_daemon_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ImageReferenceProgress) GetImageRef() string {
@@ -4537,7 +5251,7 @@ type ManifestProgress struct {
 
 func (x *ManifestProgress) Reset() {
 	*x = ManifestProgress{}
-	mi := &file_daemon_proto_msgTypes[34]
+	mi := &file_daemon_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4549,7 +5263,7 @@ func (x *ManifestProgress) String() string {
 func (*ManifestProgress) ProtoMessage() {}
 
 func (x *ManifestProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[34]
+	mi := &file_daemon_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4562,7 +5276,7 @@ func (x *ManifestProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ManifestProgress.ProtoReflect.Descriptor instead.
 func (*ManifestProgress) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{34}
+	return file_daemon_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *ManifestProgress) GetImageRef() string {
@@ -4606,7 +5320,7 @@ type LayerProgress struct {
 
 func (x *LayerProgress) Reset() {
 	*x = LayerProgress{}
-	mi := &file_daemon_proto_msgTypes[35]
+	mi := &file_daemon_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4618,7 +5332,7 @@ func (x *LayerProgress) String() string {
 func (*LayerProgress) ProtoMessage() {}
 
 func (x *LayerProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[35]
+	mi := &file_daemon_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4631,7 +5345,7 @@ func (x *LayerProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LayerProgress.ProtoReflect.Descriptor instead.
 func (*LayerProgress) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{35}
+	return file_daemon_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *LayerProgress) GetIndex() uint64 {
@@ -4680,7 +5394,7 @@ type ApplyingLayerProgress struct {
 
 func (x *ApplyingLayerProgress) Reset() {
 	*x = ApplyingLayerProgress{}
-	mi := &file_daemon_proto_msgTypes[36]
+	mi := &file_daemon_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4692,7 +5406,7 @@ func (x *ApplyingLayerProgress) String() string {
 func (*ApplyingLayerProgress) ProtoMessage() {}
 
 func (x *ApplyingLayerProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[36]
+	mi := &file_daemon_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4705,7 +5419,7 @@ func (x *ApplyingLayerProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyingLayerProgress.ProtoReflect.Descriptor instead.
 func (*ApplyingLayerProgress) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{36}
+	return file_daemon_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *ApplyingLayerProgress) GetIndex() uint64 {
@@ -4755,7 +5469,7 @@ type ImageProgress struct {
 
 func (x *ImageProgress) Reset() {
 	*x = ImageProgress{}
-	mi := &file_daemon_proto_msgTypes[37]
+	mi := &file_daemon_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4767,7 +5481,7 @@ func (x *ImageProgress) String() string {
 func (*ImageProgress) ProtoMessage() {}
 
 func (x *ImageProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[37]
+	mi := &file_daemon_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4780,7 +5494,7 @@ func (x *ImageProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImageProgress.ProtoReflect.Descriptor instead.
 func (*ImageProgress) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{37}
+	return file_daemon_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *ImageProgress) GetEvent() isImageProgress_Event {
@@ -5032,7 +5746,7 @@ type CreateMachineEvent struct {
 
 func (x *CreateMachineEvent) Reset() {
 	*x = CreateMachineEvent{}
-	mi := &file_daemon_proto_msgTypes[38]
+	mi := &file_daemon_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5044,7 +5758,7 @@ func (x *CreateMachineEvent) String() string {
 func (*CreateMachineEvent) ProtoMessage() {}
 
 func (x *CreateMachineEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[38]
+	mi := &file_daemon_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5057,7 +5771,7 @@ func (x *CreateMachineEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateMachineEvent.ProtoReflect.Descriptor instead.
 func (*CreateMachineEvent) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{38}
+	return file_daemon_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *CreateMachineEvent) GetEvent() isCreateMachineEvent_Event {
@@ -5111,7 +5825,7 @@ type ResolveImageRequest struct {
 
 func (x *ResolveImageRequest) Reset() {
 	*x = ResolveImageRequest{}
-	mi := &file_daemon_proto_msgTypes[39]
+	mi := &file_daemon_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5123,7 +5837,7 @@ func (x *ResolveImageRequest) String() string {
 func (*ResolveImageRequest) ProtoMessage() {}
 
 func (x *ResolveImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[39]
+	mi := &file_daemon_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5136,7 +5850,7 @@ func (x *ResolveImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveImageRequest.ProtoReflect.Descriptor instead.
 func (*ResolveImageRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{39}
+	return file_daemon_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *ResolveImageRequest) GetReference() string {
@@ -5166,7 +5880,7 @@ type ResolveImageEvent struct {
 
 func (x *ResolveImageEvent) Reset() {
 	*x = ResolveImageEvent{}
-	mi := &file_daemon_proto_msgTypes[40]
+	mi := &file_daemon_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5178,7 +5892,7 @@ func (x *ResolveImageEvent) String() string {
 func (*ResolveImageEvent) ProtoMessage() {}
 
 func (x *ResolveImageEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[40]
+	mi := &file_daemon_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5191,7 +5905,7 @@ func (x *ResolveImageEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveImageEvent.ProtoReflect.Descriptor instead.
 func (*ResolveImageEvent) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{40}
+	return file_daemon_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *ResolveImageEvent) GetEvent() isResolveImageEvent_Event {
@@ -5244,7 +5958,7 @@ type PullImageRequest struct {
 
 func (x *PullImageRequest) Reset() {
 	*x = PullImageRequest{}
-	mi := &file_daemon_proto_msgTypes[41]
+	mi := &file_daemon_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5256,7 +5970,7 @@ func (x *PullImageRequest) String() string {
 func (*PullImageRequest) ProtoMessage() {}
 
 func (x *PullImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[41]
+	mi := &file_daemon_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5269,7 +5983,7 @@ func (x *PullImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullImageRequest.ProtoReflect.Descriptor instead.
 func (*PullImageRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{41}
+	return file_daemon_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *PullImageRequest) GetReference() string {
@@ -5289,7 +6003,7 @@ type EgressSecret struct {
 
 func (x *EgressSecret) Reset() {
 	*x = EgressSecret{}
-	mi := &file_daemon_proto_msgTypes[42]
+	mi := &file_daemon_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5301,7 +6015,7 @@ func (x *EgressSecret) String() string {
 func (*EgressSecret) ProtoMessage() {}
 
 func (x *EgressSecret) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[42]
+	mi := &file_daemon_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5314,7 +6028,7 @@ func (x *EgressSecret) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EgressSecret.ProtoReflect.Descriptor instead.
 func (*EgressSecret) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{42}
+	return file_daemon_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *EgressSecret) GetSlot() string {
@@ -5344,7 +6058,7 @@ type Entrypoint struct {
 
 func (x *Entrypoint) Reset() {
 	*x = Entrypoint{}
-	mi := &file_daemon_proto_msgTypes[43]
+	mi := &file_daemon_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5356,7 +6070,7 @@ func (x *Entrypoint) String() string {
 func (*Entrypoint) ProtoMessage() {}
 
 func (x *Entrypoint) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[43]
+	mi := &file_daemon_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5369,7 +6083,7 @@ func (x *Entrypoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Entrypoint.ProtoReflect.Descriptor instead.
 func (*Entrypoint) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{43}
+	return file_daemon_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *Entrypoint) GetProgram() string {
@@ -5418,7 +6132,7 @@ type StartOptions struct {
 
 func (x *StartOptions) Reset() {
 	*x = StartOptions{}
-	mi := &file_daemon_proto_msgTypes[44]
+	mi := &file_daemon_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5430,7 +6144,7 @@ func (x *StartOptions) String() string {
 func (*StartOptions) ProtoMessage() {}
 
 func (x *StartOptions) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[44]
+	mi := &file_daemon_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5443,7 +6157,7 @@ func (x *StartOptions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartOptions.ProtoReflect.Descriptor instead.
 func (*StartOptions) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{44}
+	return file_daemon_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *StartOptions) GetCleanupOnExit() bool {
@@ -5477,7 +6191,7 @@ type StartMachineRequest struct {
 
 func (x *StartMachineRequest) Reset() {
 	*x = StartMachineRequest{}
-	mi := &file_daemon_proto_msgTypes[45]
+	mi := &file_daemon_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5489,7 +6203,7 @@ func (x *StartMachineRequest) String() string {
 func (*StartMachineRequest) ProtoMessage() {}
 
 func (x *StartMachineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[45]
+	mi := &file_daemon_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5502,7 +6216,7 @@ func (x *StartMachineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartMachineRequest.ProtoReflect.Descriptor instead.
 func (*StartMachineRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{45}
+	return file_daemon_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *StartMachineRequest) GetMachine() *MachineRef {
@@ -5531,7 +6245,7 @@ type StopMachineRequest struct {
 
 func (x *StopMachineRequest) Reset() {
 	*x = StopMachineRequest{}
-	mi := &file_daemon_proto_msgTypes[46]
+	mi := &file_daemon_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5543,7 +6257,7 @@ func (x *StopMachineRequest) String() string {
 func (*StopMachineRequest) ProtoMessage() {}
 
 func (x *StopMachineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[46]
+	mi := &file_daemon_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5556,7 +6270,7 @@ func (x *StopMachineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopMachineRequest.ProtoReflect.Descriptor instead.
 func (*StopMachineRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{46}
+	return file_daemon_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *StopMachineRequest) GetMachine() *MachineRef {
@@ -5596,7 +6310,7 @@ type RemoveMachineRequest struct {
 
 func (x *RemoveMachineRequest) Reset() {
 	*x = RemoveMachineRequest{}
-	mi := &file_daemon_proto_msgTypes[47]
+	mi := &file_daemon_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5608,7 +6322,7 @@ func (x *RemoveMachineRequest) String() string {
 func (*RemoveMachineRequest) ProtoMessage() {}
 
 func (x *RemoveMachineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[47]
+	mi := &file_daemon_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5621,7 +6335,7 @@ func (x *RemoveMachineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveMachineRequest.ProtoReflect.Descriptor instead.
 func (*RemoveMachineRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{47}
+	return file_daemon_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *RemoveMachineRequest) GetMachine() *MachineRef {
@@ -5644,7 +6358,7 @@ type PolicyUpdate struct {
 
 func (x *PolicyUpdate) Reset() {
 	*x = PolicyUpdate{}
-	mi := &file_daemon_proto_msgTypes[48]
+	mi := &file_daemon_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5656,7 +6370,7 @@ func (x *PolicyUpdate) String() string {
 func (*PolicyUpdate) ProtoMessage() {}
 
 func (x *PolicyUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[48]
+	mi := &file_daemon_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5669,7 +6383,7 @@ func (x *PolicyUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PolicyUpdate.ProtoReflect.Descriptor instead.
 func (*PolicyUpdate) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{48}
+	return file_daemon_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *PolicyUpdate) GetUpdate() isPolicyUpdate_Update {
@@ -5726,7 +6440,7 @@ type PublicationUpdate struct {
 
 func (x *PublicationUpdate) Reset() {
 	*x = PublicationUpdate{}
-	mi := &file_daemon_proto_msgTypes[49]
+	mi := &file_daemon_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5738,7 +6452,7 @@ func (x *PublicationUpdate) String() string {
 func (*PublicationUpdate) ProtoMessage() {}
 
 func (x *PublicationUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[49]
+	mi := &file_daemon_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5751,7 +6465,7 @@ func (x *PublicationUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublicationUpdate.ProtoReflect.Descriptor instead.
 func (*PublicationUpdate) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{49}
+	return file_daemon_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *PublicationUpdate) GetUpdate() isPublicationUpdate_Update {
@@ -5808,7 +6522,7 @@ type UserUpdate struct {
 
 func (x *UserUpdate) Reset() {
 	*x = UserUpdate{}
-	mi := &file_daemon_proto_msgTypes[50]
+	mi := &file_daemon_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5820,7 +6534,7 @@ func (x *UserUpdate) String() string {
 func (*UserUpdate) ProtoMessage() {}
 
 func (x *UserUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[50]
+	mi := &file_daemon_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5833,7 +6547,7 @@ func (x *UserUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UserUpdate.ProtoReflect.Descriptor instead.
 func (*UserUpdate) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{50}
+	return file_daemon_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *UserUpdate) GetUpdate() isUserUpdate_Update {
@@ -5878,28 +6592,29 @@ func (*UserUpdate_Set) isUserUpdate_Update() {}
 func (*UserUpdate_Clear) isUserUpdate_Update() {}
 
 type MachineUpdate struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	Name                 *string                `protobuf:"bytes,1,opt,name=name,proto3,oneof" json:"name,omitempty"`
-	Labels               *StringMap             `protobuf:"bytes,2,opt,name=labels,proto3" json:"labels,omitempty"`
-	Cpus                 *uint32                `protobuf:"varint,3,opt,name=cpus,proto3,oneof" json:"cpus,omitempty"`
-	MemoryBytes          *uint64                `protobuf:"varint,4,opt,name=memory_bytes,json=memoryBytes,proto3,oneof" json:"memory_bytes,omitempty"`
-	RootDiskSizeBytes    *uint64                `protobuf:"varint,5,opt,name=root_disk_size_bytes,json=rootDiskSizeBytes,proto3,oneof" json:"root_disk_size_bytes,omitempty"`
-	NestedVirtualization *bool                  `protobuf:"varint,6,opt,name=nested_virtualization,json=nestedVirtualization,proto3,oneof" json:"nested_virtualization,omitempty"`
-	Rosetta              *bool                  `protobuf:"varint,7,opt,name=rosetta,proto3,oneof" json:"rosetta,omitempty"`
-	Forwards             *ForwardList           `protobuf:"bytes,8,opt,name=forwards,proto3" json:"forwards,omitempty"`
-	Vsock                *Vsock                 `protobuf:"bytes,9,opt,name=vsock,proto3" json:"vsock,omitempty"`
-	Network              *ResolvedNetwork       `protobuf:"bytes,10,opt,name=network,proto3" json:"network,omitempty"`
-	Policy               *PolicyUpdate          `protobuf:"bytes,11,opt,name=policy,proto3" json:"policy,omitempty"`
-	Publication          *PublicationUpdate     `protobuf:"bytes,12,opt,name=publication,proto3" json:"publication,omitempty"`
-	Guest                *GuestConfig           `protobuf:"bytes,13,opt,name=guest,proto3" json:"guest,omitempty"`
-	User                 *UserUpdate            `protobuf:"bytes,14,opt,name=user,proto3" json:"user,omitempty"`
+	state                protoimpl.MessageState    `protogen:"open.v1"`
+	Name                 *string                   `protobuf:"bytes,1,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	Labels               *StringMap                `protobuf:"bytes,2,opt,name=labels,proto3" json:"labels,omitempty"`
+	Cpus                 *uint32                   `protobuf:"varint,3,opt,name=cpus,proto3,oneof" json:"cpus,omitempty"`
+	MemoryBytes          *uint64                   `protobuf:"varint,4,opt,name=memory_bytes,json=memoryBytes,proto3,oneof" json:"memory_bytes,omitempty"`
+	RootDiskSizeBytes    *uint64                   `protobuf:"varint,5,opt,name=root_disk_size_bytes,json=rootDiskSizeBytes,proto3,oneof" json:"root_disk_size_bytes,omitempty"`
+	NestedVirtualization *bool                     `protobuf:"varint,6,opt,name=nested_virtualization,json=nestedVirtualization,proto3,oneof" json:"nested_virtualization,omitempty"`
+	Rosetta              *bool                     `protobuf:"varint,7,opt,name=rosetta,proto3,oneof" json:"rosetta,omitempty"`
+	Forwards             *ForwardList              `protobuf:"bytes,8,opt,name=forwards,proto3" json:"forwards,omitempty"`
+	Vsock                *Vsock                    `protobuf:"bytes,9,opt,name=vsock,proto3" json:"vsock,omitempty"`
+	Network              *ResolvedNetwork          `protobuf:"bytes,10,opt,name=network,proto3" json:"network,omitempty"`
+	Policy               *PolicyUpdate             `protobuf:"bytes,11,opt,name=policy,proto3" json:"policy,omitempty"`
+	Publication          *PublicationUpdate        `protobuf:"bytes,12,opt,name=publication,proto3" json:"publication,omitempty"`
+	Guest                *GuestConfig              `protobuf:"bytes,13,opt,name=guest,proto3" json:"guest,omitempty"`
+	User                 *UserUpdate               `protobuf:"bytes,14,opt,name=user,proto3" json:"user,omitempty"`
+	TemporaryDirectory   *TemporaryDirectoryPolicy `protobuf:"bytes,15,opt,name=temporary_directory,json=temporaryDirectory,proto3" json:"temporary_directory,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
 
 func (x *MachineUpdate) Reset() {
 	*x = MachineUpdate{}
-	mi := &file_daemon_proto_msgTypes[51]
+	mi := &file_daemon_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5911,7 +6626,7 @@ func (x *MachineUpdate) String() string {
 func (*MachineUpdate) ProtoMessage() {}
 
 func (x *MachineUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[51]
+	mi := &file_daemon_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5924,7 +6639,7 @@ func (x *MachineUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineUpdate.ProtoReflect.Descriptor instead.
 func (*MachineUpdate) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{51}
+	return file_daemon_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *MachineUpdate) GetName() string {
@@ -6025,6 +6740,13 @@ func (x *MachineUpdate) GetUser() *UserUpdate {
 	return nil
 }
 
+func (x *MachineUpdate) GetTemporaryDirectory() *TemporaryDirectoryPolicy {
+	if x != nil {
+		return x.TemporaryDirectory
+	}
+	return nil
+}
+
 type UpdateMachineRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Machine       *MachineRef            `protobuf:"bytes,1,opt,name=machine,proto3" json:"machine,omitempty"`
@@ -6035,7 +6757,7 @@ type UpdateMachineRequest struct {
 
 func (x *UpdateMachineRequest) Reset() {
 	*x = UpdateMachineRequest{}
-	mi := &file_daemon_proto_msgTypes[52]
+	mi := &file_daemon_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6047,7 +6769,7 @@ func (x *UpdateMachineRequest) String() string {
 func (*UpdateMachineRequest) ProtoMessage() {}
 
 func (x *UpdateMachineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[52]
+	mi := &file_daemon_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6060,7 +6782,7 @@ func (x *UpdateMachineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateMachineRequest.ProtoReflect.Descriptor instead.
 func (*UpdateMachineRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{52}
+	return file_daemon_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *UpdateMachineRequest) GetMachine() *MachineRef {
@@ -6088,7 +6810,7 @@ type WaitReadyRequest struct {
 
 func (x *WaitReadyRequest) Reset() {
 	*x = WaitReadyRequest{}
-	mi := &file_daemon_proto_msgTypes[53]
+	mi := &file_daemon_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6100,7 +6822,7 @@ func (x *WaitReadyRequest) String() string {
 func (*WaitReadyRequest) ProtoMessage() {}
 
 func (x *WaitReadyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[53]
+	mi := &file_daemon_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6113,7 +6835,7 @@ func (x *WaitReadyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitReadyRequest.ProtoReflect.Descriptor instead.
 func (*WaitReadyRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{53}
+	return file_daemon_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *WaitReadyRequest) GetId() string {
@@ -6148,7 +6870,7 @@ type StopRunRequest struct {
 
 func (x *StopRunRequest) Reset() {
 	*x = StopRunRequest{}
-	mi := &file_daemon_proto_msgTypes[54]
+	mi := &file_daemon_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6160,7 +6882,7 @@ func (x *StopRunRequest) String() string {
 func (*StopRunRequest) ProtoMessage() {}
 
 func (x *StopRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[54]
+	mi := &file_daemon_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6173,7 +6895,7 @@ func (x *StopRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopRunRequest.ProtoReflect.Descriptor instead.
 func (*StopRunRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{54}
+	return file_daemon_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *StopRunRequest) GetMachine() *MachineRunRef {
@@ -6207,7 +6929,7 @@ type KillRunRequest struct {
 
 func (x *KillRunRequest) Reset() {
 	*x = KillRunRequest{}
-	mi := &file_daemon_proto_msgTypes[55]
+	mi := &file_daemon_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6219,7 +6941,7 @@ func (x *KillRunRequest) String() string {
 func (*KillRunRequest) ProtoMessage() {}
 
 func (x *KillRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[55]
+	mi := &file_daemon_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6232,7 +6954,7 @@ func (x *KillRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KillRunRequest.ProtoReflect.Descriptor instead.
 func (*KillRunRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{55}
+	return file_daemon_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *KillRunRequest) GetMachine() *MachineRunRef {
@@ -6259,7 +6981,7 @@ type WaitForRunRequest struct {
 
 func (x *WaitForRunRequest) Reset() {
 	*x = WaitForRunRequest{}
-	mi := &file_daemon_proto_msgTypes[56]
+	mi := &file_daemon_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6271,7 +6993,7 @@ func (x *WaitForRunRequest) String() string {
 func (*WaitForRunRequest) ProtoMessage() {}
 
 func (x *WaitForRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[56]
+	mi := &file_daemon_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6284,7 +7006,7 @@ func (x *WaitForRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitForRunRequest.ProtoReflect.Descriptor instead.
 func (*WaitForRunRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{56}
+	return file_daemon_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *WaitForRunRequest) GetMachine() *MachineRunRef {
@@ -6311,7 +7033,7 @@ type MachineIssue struct {
 
 func (x *MachineIssue) Reset() {
 	*x = MachineIssue{}
-	mi := &file_daemon_proto_msgTypes[57]
+	mi := &file_daemon_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6323,7 +7045,7 @@ func (x *MachineIssue) String() string {
 func (*MachineIssue) ProtoMessage() {}
 
 func (x *MachineIssue) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[57]
+	mi := &file_daemon_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6336,7 +7058,7 @@ func (x *MachineIssue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineIssue.ProtoReflect.Descriptor instead.
 func (*MachineIssue) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{57}
+	return file_daemon_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *MachineIssue) GetComponent() IssueComponent {
@@ -6362,7 +7084,7 @@ type LifecycleDetail struct {
 
 func (x *LifecycleDetail) Reset() {
 	*x = LifecycleDetail{}
-	mi := &file_daemon_proto_msgTypes[58]
+	mi := &file_daemon_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6374,7 +7096,7 @@ func (x *LifecycleDetail) String() string {
 func (*LifecycleDetail) ProtoMessage() {}
 
 func (x *LifecycleDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[58]
+	mi := &file_daemon_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6387,7 +7109,7 @@ func (x *LifecycleDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LifecycleDetail.ProtoReflect.Descriptor instead.
 func (*LifecycleDetail) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{58}
+	return file_daemon_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *LifecycleDetail) GetMessage() string {
@@ -6408,7 +7130,7 @@ type RunningStatus struct {
 
 func (x *RunningStatus) Reset() {
 	*x = RunningStatus{}
-	mi := &file_daemon_proto_msgTypes[59]
+	mi := &file_daemon_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6420,7 +7142,7 @@ func (x *RunningStatus) String() string {
 func (*RunningStatus) ProtoMessage() {}
 
 func (x *RunningStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[59]
+	mi := &file_daemon_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6433,7 +7155,7 @@ func (x *RunningStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunningStatus.ProtoReflect.Descriptor instead.
 func (*RunningStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{59}
+	return file_daemon_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *RunningStatus) GetReady() bool {
@@ -6473,7 +7195,7 @@ type MachineStatus struct {
 
 func (x *MachineStatus) Reset() {
 	*x = MachineStatus{}
-	mi := &file_daemon_proto_msgTypes[60]
+	mi := &file_daemon_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6485,7 +7207,7 @@ func (x *MachineStatus) String() string {
 func (*MachineStatus) ProtoMessage() {}
 
 func (x *MachineStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[60]
+	mi := &file_daemon_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6498,7 +7220,7 @@ func (x *MachineStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineStatus.ProtoReflect.Descriptor instead.
 func (*MachineStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{60}
+	return file_daemon_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *MachineStatus) GetStatus() isMachineStatus_Status {
@@ -6604,7 +7326,7 @@ type Rootfs struct {
 
 func (x *Rootfs) Reset() {
 	*x = Rootfs{}
-	mi := &file_daemon_proto_msgTypes[61]
+	mi := &file_daemon_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6616,7 +7338,7 @@ func (x *Rootfs) String() string {
 func (*Rootfs) ProtoMessage() {}
 
 func (x *Rootfs) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[61]
+	mi := &file_daemon_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6629,7 +7351,7 @@ func (x *Rootfs) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Rootfs.ProtoReflect.Descriptor instead.
 func (*Rootfs) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{61}
+	return file_daemon_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *Rootfs) GetSourceKind() ImageSourceKind {
@@ -6706,7 +7428,7 @@ type MachineTailscale struct {
 
 func (x *MachineTailscale) Reset() {
 	*x = MachineTailscale{}
-	mi := &file_daemon_proto_msgTypes[62]
+	mi := &file_daemon_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6718,7 +7440,7 @@ func (x *MachineTailscale) String() string {
 func (*MachineTailscale) ProtoMessage() {}
 
 func (x *MachineTailscale) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[62]
+	mi := &file_daemon_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6731,7 +7453,7 @@ func (x *MachineTailscale) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineTailscale.ProtoReflect.Descriptor instead.
 func (*MachineTailscale) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{62}
+	return file_daemon_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *MachineTailscale) GetStateDir() []byte {
@@ -6771,7 +7493,7 @@ type BootReport struct {
 
 func (x *BootReport) Reset() {
 	*x = BootReport{}
-	mi := &file_daemon_proto_msgTypes[63]
+	mi := &file_daemon_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6783,7 +7505,7 @@ func (x *BootReport) String() string {
 func (*BootReport) ProtoMessage() {}
 
 func (x *BootReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[63]
+	mi := &file_daemon_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6796,7 +7518,7 @@ func (x *BootReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BootReport.ProtoReflect.Descriptor instead.
 func (*BootReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{63}
+	return file_daemon_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *BootReport) GetMode() BootMode {
@@ -6871,7 +7593,7 @@ type ProvisionStepReport struct {
 
 func (x *ProvisionStepReport) Reset() {
 	*x = ProvisionStepReport{}
-	mi := &file_daemon_proto_msgTypes[64]
+	mi := &file_daemon_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6883,7 +7605,7 @@ func (x *ProvisionStepReport) String() string {
 func (*ProvisionStepReport) ProtoMessage() {}
 
 func (x *ProvisionStepReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[64]
+	mi := &file_daemon_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6896,7 +7618,7 @@ func (x *ProvisionStepReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProvisionStepReport.ProtoReflect.Descriptor instead.
 func (*ProvisionStepReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{64}
+	return file_daemon_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *ProvisionStepReport) GetId() string {
@@ -6969,7 +7691,7 @@ type ProvisionReport struct {
 
 func (x *ProvisionReport) Reset() {
 	*x = ProvisionReport{}
-	mi := &file_daemon_proto_msgTypes[65]
+	mi := &file_daemon_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6981,7 +7703,7 @@ func (x *ProvisionReport) String() string {
 func (*ProvisionReport) ProtoMessage() {}
 
 func (x *ProvisionReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[65]
+	mi := &file_daemon_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6994,7 +7716,7 @@ func (x *ProvisionReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProvisionReport.ProtoReflect.Descriptor instead.
 func (*ProvisionReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{65}
+	return file_daemon_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *ProvisionReport) GetStatus() ProvisionStatus {
@@ -7069,13 +7791,16 @@ type MachineSnapshot struct {
 	LastError          *string                `protobuf:"bytes,26,opt,name=last_error,json=lastError,proto3,oneof" json:"last_error,omitempty"`
 	UpdatedAt          *timestamppb.Timestamp `protobuf:"bytes,27,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	NetworkObservation *NetworkObservation    `protobuf:"bytes,28,opt,name=network_observation,json=networkObservation,proto3" json:"network_observation,omitempty"`
+	Live               *LiveMachineReport     `protobuf:"bytes,29,opt,name=live,proto3" json:"live,omitempty"`
+	ProspectiveLive    *LiveHostReport        `protobuf:"bytes,30,opt,name=prospective_live,json=prospectiveLive,proto3" json:"prospective_live,omitempty"`
+	LiveEvidence       *LiveEvidenceState     `protobuf:"varint,31,opt,name=live_evidence,json=liveEvidence,proto3,enum=silo.daemon.v1.LiveEvidenceState,oneof" json:"live_evidence,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
 
 func (x *MachineSnapshot) Reset() {
 	*x = MachineSnapshot{}
-	mi := &file_daemon_proto_msgTypes[66]
+	mi := &file_daemon_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7087,7 +7812,7 @@ func (x *MachineSnapshot) String() string {
 func (*MachineSnapshot) ProtoMessage() {}
 
 func (x *MachineSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[66]
+	mi := &file_daemon_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7100,7 +7825,7 @@ func (x *MachineSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineSnapshot.ProtoReflect.Descriptor instead.
 func (*MachineSnapshot) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{66}
+	return file_daemon_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *MachineSnapshot) GetId() string {
@@ -7299,6 +8024,27 @@ func (x *MachineSnapshot) GetNetworkObservation() *NetworkObservation {
 	return nil
 }
 
+func (x *MachineSnapshot) GetLive() *LiveMachineReport {
+	if x != nil {
+		return x.Live
+	}
+	return nil
+}
+
+func (x *MachineSnapshot) GetProspectiveLive() *LiveHostReport {
+	if x != nil {
+		return x.ProspectiveLive
+	}
+	return nil
+}
+
+func (x *MachineSnapshot) GetLiveEvidence() LiveEvidenceState {
+	if x != nil && x.LiveEvidence != nil {
+		return *x.LiveEvidence
+	}
+	return LiveEvidenceState_LIVE_EVIDENCE_STATE_UNSPECIFIED
+}
+
 type MachineInventoryEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -7311,7 +8057,7 @@ type MachineInventoryEntry struct {
 
 func (x *MachineInventoryEntry) Reset() {
 	*x = MachineInventoryEntry{}
-	mi := &file_daemon_proto_msgTypes[67]
+	mi := &file_daemon_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7323,7 +8069,7 @@ func (x *MachineInventoryEntry) String() string {
 func (*MachineInventoryEntry) ProtoMessage() {}
 
 func (x *MachineInventoryEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[67]
+	mi := &file_daemon_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7336,7 +8082,7 @@ func (x *MachineInventoryEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineInventoryEntry.ProtoReflect.Descriptor instead.
 func (*MachineInventoryEntry) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{67}
+	return file_daemon_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *MachineInventoryEntry) GetId() string {
@@ -7377,7 +8123,7 @@ type MachineStart struct {
 
 func (x *MachineStart) Reset() {
 	*x = MachineStart{}
-	mi := &file_daemon_proto_msgTypes[68]
+	mi := &file_daemon_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7389,7 +8135,7 @@ func (x *MachineStart) String() string {
 func (*MachineStart) ProtoMessage() {}
 
 func (x *MachineStart) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[68]
+	mi := &file_daemon_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7402,7 +8148,7 @@ func (x *MachineStart) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineStart.ProtoReflect.Descriptor instead.
 func (*MachineStart) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{68}
+	return file_daemon_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *MachineStart) GetRunId() string {
@@ -7430,7 +8176,7 @@ type MachineReadiness struct {
 
 func (x *MachineReadiness) Reset() {
 	*x = MachineReadiness{}
-	mi := &file_daemon_proto_msgTypes[69]
+	mi := &file_daemon_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7442,7 +8188,7 @@ func (x *MachineReadiness) String() string {
 func (*MachineReadiness) ProtoMessage() {}
 
 func (x *MachineReadiness) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[69]
+	mi := &file_daemon_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7455,7 +8201,7 @@ func (x *MachineReadiness) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineReadiness.ProtoReflect.Descriptor instead.
 func (*MachineReadiness) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{69}
+	return file_daemon_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *MachineReadiness) GetOutcome() ReadinessOutcome {
@@ -7492,7 +8238,7 @@ type MachineExit struct {
 
 func (x *MachineExit) Reset() {
 	*x = MachineExit{}
-	mi := &file_daemon_proto_msgTypes[70]
+	mi := &file_daemon_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7504,7 +8250,7 @@ func (x *MachineExit) String() string {
 func (*MachineExit) ProtoMessage() {}
 
 func (x *MachineExit) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[70]
+	mi := &file_daemon_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7517,7 +8263,7 @@ func (x *MachineExit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MachineExit.ProtoReflect.Descriptor instead.
 func (*MachineExit) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{70}
+	return file_daemon_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *MachineExit) GetRunId() string {
@@ -7568,7 +8314,7 @@ type ReadLogsRequest struct {
 
 func (x *ReadLogsRequest) Reset() {
 	*x = ReadLogsRequest{}
-	mi := &file_daemon_proto_msgTypes[71]
+	mi := &file_daemon_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7580,7 +8326,7 @@ func (x *ReadLogsRequest) String() string {
 func (*ReadLogsRequest) ProtoMessage() {}
 
 func (x *ReadLogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[71]
+	mi := &file_daemon_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7593,7 +8339,7 @@ func (x *ReadLogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadLogsRequest.ProtoReflect.Descriptor instead.
 func (*ReadLogsRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{71}
+	return file_daemon_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *ReadLogsRequest) GetId() string {
@@ -7642,7 +8388,7 @@ type LogChunk struct {
 
 func (x *LogChunk) Reset() {
 	*x = LogChunk{}
-	mi := &file_daemon_proto_msgTypes[72]
+	mi := &file_daemon_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7654,7 +8400,7 @@ func (x *LogChunk) String() string {
 func (*LogChunk) ProtoMessage() {}
 
 func (x *LogChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[72]
+	mi := &file_daemon_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7667,7 +8413,7 @@ func (x *LogChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogChunk.ProtoReflect.Descriptor instead.
 func (*LogChunk) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{72}
+	return file_daemon_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *LogChunk) GetData() []byte {
@@ -7702,7 +8448,7 @@ type SetMachineSecretRequest struct {
 
 func (x *SetMachineSecretRequest) Reset() {
 	*x = SetMachineSecretRequest{}
-	mi := &file_daemon_proto_msgTypes[73]
+	mi := &file_daemon_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7714,7 +8460,7 @@ func (x *SetMachineSecretRequest) String() string {
 func (*SetMachineSecretRequest) ProtoMessage() {}
 
 func (x *SetMachineSecretRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[73]
+	mi := &file_daemon_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7727,7 +8473,7 @@ func (x *SetMachineSecretRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetMachineSecretRequest.ProtoReflect.Descriptor instead.
 func (*SetMachineSecretRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{73}
+	return file_daemon_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *SetMachineSecretRequest) GetId() string {
@@ -7761,7 +8507,7 @@ type ParseResourceRequest struct {
 
 func (x *ParseResourceRequest) Reset() {
 	*x = ParseResourceRequest{}
-	mi := &file_daemon_proto_msgTypes[74]
+	mi := &file_daemon_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7773,7 +8519,7 @@ func (x *ParseResourceRequest) String() string {
 func (*ParseResourceRequest) ProtoMessage() {}
 
 func (x *ParseResourceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[74]
+	mi := &file_daemon_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7786,7 +8532,7 @@ func (x *ParseResourceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ParseResourceRequest.ProtoReflect.Descriptor instead.
 func (*ParseResourceRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{74}
+	return file_daemon_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *ParseResourceRequest) GetKind() ResourceKind {
@@ -7812,7 +8558,7 @@ type Size struct {
 
 func (x *Size) Reset() {
 	*x = Size{}
-	mi := &file_daemon_proto_msgTypes[75]
+	mi := &file_daemon_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7824,7 +8570,7 @@ func (x *Size) String() string {
 func (*Size) ProtoMessage() {}
 
 func (x *Size) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[75]
+	mi := &file_daemon_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7837,7 +8583,7 @@ func (x *Size) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Size.ProtoReflect.Descriptor instead.
 func (*Size) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{75}
+	return file_daemon_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *Size) GetBytes() uint64 {
@@ -7861,7 +8607,7 @@ type NormalizePolicyRequest struct {
 
 func (x *NormalizePolicyRequest) Reset() {
 	*x = NormalizePolicyRequest{}
-	mi := &file_daemon_proto_msgTypes[76]
+	mi := &file_daemon_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7873,7 +8619,7 @@ func (x *NormalizePolicyRequest) String() string {
 func (*NormalizePolicyRequest) ProtoMessage() {}
 
 func (x *NormalizePolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[76]
+	mi := &file_daemon_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7886,7 +8632,7 @@ func (x *NormalizePolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NormalizePolicyRequest.ProtoReflect.Descriptor instead.
 func (*NormalizePolicyRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{76}
+	return file_daemon_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *NormalizePolicyRequest) GetInput() isNormalizePolicyRequest_Input {
@@ -7954,7 +8700,7 @@ type SecretAlternative struct {
 
 func (x *SecretAlternative) Reset() {
 	*x = SecretAlternative{}
-	mi := &file_daemon_proto_msgTypes[77]
+	mi := &file_daemon_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7966,7 +8712,7 @@ func (x *SecretAlternative) String() string {
 func (*SecretAlternative) ProtoMessage() {}
 
 func (x *SecretAlternative) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[77]
+	mi := &file_daemon_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7979,7 +8725,7 @@ func (x *SecretAlternative) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretAlternative.ProtoReflect.Descriptor instead.
 func (*SecretAlternative) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{77}
+	return file_daemon_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *SecretAlternative) GetSlots() []string {
@@ -7999,7 +8745,7 @@ type SecretRequirement struct {
 
 func (x *SecretRequirement) Reset() {
 	*x = SecretRequirement{}
-	mi := &file_daemon_proto_msgTypes[78]
+	mi := &file_daemon_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8011,7 +8757,7 @@ func (x *SecretRequirement) String() string {
 func (*SecretRequirement) ProtoMessage() {}
 
 func (x *SecretRequirement) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[78]
+	mi := &file_daemon_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8024,7 +8770,7 @@ func (x *SecretRequirement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretRequirement.ProtoReflect.Descriptor instead.
 func (*SecretRequirement) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{78}
+	return file_daemon_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *SecretRequirement) GetOwner() string {
@@ -8054,7 +8800,7 @@ type SecretSlot struct {
 
 func (x *SecretSlot) Reset() {
 	*x = SecretSlot{}
-	mi := &file_daemon_proto_msgTypes[79]
+	mi := &file_daemon_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8066,7 +8812,7 @@ func (x *SecretSlot) String() string {
 func (*SecretSlot) ProtoMessage() {}
 
 func (x *SecretSlot) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[79]
+	mi := &file_daemon_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8079,7 +8825,7 @@ func (x *SecretSlot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretSlot.ProtoReflect.Descriptor instead.
 func (*SecretSlot) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{79}
+	return file_daemon_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *SecretSlot) GetName() string {
@@ -8129,7 +8875,7 @@ type PolicyDocument struct {
 
 func (x *PolicyDocument) Reset() {
 	*x = PolicyDocument{}
-	mi := &file_daemon_proto_msgTypes[80]
+	mi := &file_daemon_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8141,7 +8887,7 @@ func (x *PolicyDocument) String() string {
 func (*PolicyDocument) ProtoMessage() {}
 
 func (x *PolicyDocument) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[80]
+	mi := &file_daemon_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8154,7 +8900,7 @@ func (x *PolicyDocument) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PolicyDocument.ProtoReflect.Descriptor instead.
 func (*PolicyDocument) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{80}
+	return file_daemon_proto_rawDescGZIP(), []int{82}
 }
 
 func (x *PolicyDocument) GetCanonicalJson() string {
@@ -8195,7 +8941,7 @@ type CheckPolicySecretsRequest struct {
 
 func (x *CheckPolicySecretsRequest) Reset() {
 	*x = CheckPolicySecretsRequest{}
-	mi := &file_daemon_proto_msgTypes[81]
+	mi := &file_daemon_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8207,7 +8953,7 @@ func (x *CheckPolicySecretsRequest) String() string {
 func (*CheckPolicySecretsRequest) ProtoMessage() {}
 
 func (x *CheckPolicySecretsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[81]
+	mi := &file_daemon_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8220,7 +8966,7 @@ func (x *CheckPolicySecretsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckPolicySecretsRequest.ProtoReflect.Descriptor instead.
 func (*CheckPolicySecretsRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{81}
+	return file_daemon_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *CheckPolicySecretsRequest) GetPolicyJson() string {
@@ -8248,7 +8994,7 @@ type SecretDiagnostic struct {
 
 func (x *SecretDiagnostic) Reset() {
 	*x = SecretDiagnostic{}
-	mi := &file_daemon_proto_msgTypes[82]
+	mi := &file_daemon_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8260,7 +9006,7 @@ func (x *SecretDiagnostic) String() string {
 func (*SecretDiagnostic) ProtoMessage() {}
 
 func (x *SecretDiagnostic) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[82]
+	mi := &file_daemon_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8273,7 +9019,7 @@ func (x *SecretDiagnostic) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretDiagnostic.ProtoReflect.Descriptor instead.
 func (*SecretDiagnostic) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{82}
+	return file_daemon_proto_rawDescGZIP(), []int{84}
 }
 
 func (x *SecretDiagnostic) GetSlot() string {
@@ -8309,7 +9055,7 @@ type PolicySecretsResult struct {
 
 func (x *PolicySecretsResult) Reset() {
 	*x = PolicySecretsResult{}
-	mi := &file_daemon_proto_msgTypes[83]
+	mi := &file_daemon_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8321,7 +9067,7 @@ func (x *PolicySecretsResult) String() string {
 func (*PolicySecretsResult) ProtoMessage() {}
 
 func (x *PolicySecretsResult) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[83]
+	mi := &file_daemon_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8334,7 +9080,7 @@ func (x *PolicySecretsResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PolicySecretsResult.ProtoReflect.Descriptor instead.
 func (*PolicySecretsResult) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{83}
+	return file_daemon_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *PolicySecretsResult) GetState() PolicySecretsState {
@@ -8366,23 +9112,24 @@ func (x *PolicySecretsResult) GetSlots() []*SecretSlot {
 }
 
 type ErrorDetail struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	Kind                ErrorKind              `protobuf:"varint,1,opt,name=kind,proto3,enum=silo.daemon.v1.ErrorKind" json:"kind,omitempty"`
-	Code                ErrorCode              `protobuf:"varint,2,opt,name=code,proto3,enum=silo.daemon.v1.ErrorCode" json:"code,omitempty"`
-	SafeMessage         string                 `protobuf:"bytes,3,opt,name=safe_message,json=safeMessage,proto3" json:"safe_message,omitempty"`
-	Reference           *string                `protobuf:"bytes,4,opt,name=reference,proto3,oneof" json:"reference,omitempty"`
-	ExpectedRun         *string                `protobuf:"bytes,5,opt,name=expected_run,json=expectedRun,proto3,oneof" json:"expected_run,omitempty"`
-	CurrentRun          *string                `protobuf:"bytes,6,opt,name=current_run,json=currentRun,proto3,oneof" json:"current_run,omitempty"`
-	Program             *string                `protobuf:"bytes,7,opt,name=program,proto3,oneof" json:"program,omitempty"`
-	NativeVariant       *string                `protobuf:"bytes,8,opt,name=native_variant,json=nativeVariant,proto3,oneof" json:"native_variant,omitempty"`
-	LaunchFailureReason *LaunchFailureReason   `protobuf:"varint,9,opt,name=launch_failure_reason,json=launchFailureReason,proto3,enum=silo.daemon.v1.LaunchFailureReason,oneof" json:"launch_failure_reason,omitempty"`
+	state               protoimpl.MessageState    `protogen:"open.v1"`
+	Kind                ErrorKind                 `protobuf:"varint,1,opt,name=kind,proto3,enum=silo.daemon.v1.ErrorKind" json:"kind,omitempty"`
+	Code                ErrorCode                 `protobuf:"varint,2,opt,name=code,proto3,enum=silo.daemon.v1.ErrorCode" json:"code,omitempty"`
+	SafeMessage         string                    `protobuf:"bytes,3,opt,name=safe_message,json=safeMessage,proto3" json:"safe_message,omitempty"`
+	Reference           *string                   `protobuf:"bytes,4,opt,name=reference,proto3,oneof" json:"reference,omitempty"`
+	ExpectedRun         *string                   `protobuf:"bytes,5,opt,name=expected_run,json=expectedRun,proto3,oneof" json:"expected_run,omitempty"`
+	CurrentRun          *string                   `protobuf:"bytes,6,opt,name=current_run,json=currentRun,proto3,oneof" json:"current_run,omitempty"`
+	Program             *string                   `protobuf:"bytes,7,opt,name=program,proto3,oneof" json:"program,omitempty"`
+	NativeVariant       *string                   `protobuf:"bytes,8,opt,name=native_variant,json=nativeVariant,proto3,oneof" json:"native_variant,omitempty"`
+	LaunchFailureReason *LaunchFailureReason      `protobuf:"varint,9,opt,name=launch_failure_reason,json=launchFailureReason,proto3,enum=silo.daemon.v1.LaunchFailureReason,oneof" json:"launch_failure_reason,omitempty"`
+	LiveUnsupported     *LiveOperationUnsupported `protobuf:"bytes,10,opt,name=live_unsupported,json=liveUnsupported,proto3" json:"live_unsupported,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ErrorDetail) Reset() {
 	*x = ErrorDetail{}
-	mi := &file_daemon_proto_msgTypes[84]
+	mi := &file_daemon_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8394,7 +9141,7 @@ func (x *ErrorDetail) String() string {
 func (*ErrorDetail) ProtoMessage() {}
 
 func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[84]
+	mi := &file_daemon_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8407,7 +9154,7 @@ func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorDetail.ProtoReflect.Descriptor instead.
 func (*ErrorDetail) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{84}
+	return file_daemon_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *ErrorDetail) GetKind() ErrorKind {
@@ -8473,6 +9220,13 @@ func (x *ErrorDetail) GetLaunchFailureReason() LaunchFailureReason {
 	return LaunchFailureReason_LAUNCH_FAILURE_REASON_UNSPECIFIED
 }
 
+func (x *ErrorDetail) GetLiveUnsupported() *LiveOperationUnsupported {
+	if x != nil {
+		return x.LiveUnsupported
+	}
+	return nil
+}
+
 type NodeStatus struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	MachineId      string                 `protobuf:"bytes,1,opt,name=machine_id,json=machineId,proto3" json:"machine_id,omitempty"`
@@ -8494,7 +9248,7 @@ type NodeStatus struct {
 
 func (x *NodeStatus) Reset() {
 	*x = NodeStatus{}
-	mi := &file_daemon_proto_msgTypes[85]
+	mi := &file_daemon_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8506,7 +9260,7 @@ func (x *NodeStatus) String() string {
 func (*NodeStatus) ProtoMessage() {}
 
 func (x *NodeStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[85]
+	mi := &file_daemon_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8519,7 +9273,7 @@ func (x *NodeStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatus.ProtoReflect.Descriptor instead.
 func (*NodeStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{85}
+	return file_daemon_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *NodeStatus) GetMachineId() string {
@@ -8630,7 +9384,7 @@ type NodeObservation struct {
 
 func (x *NodeObservation) Reset() {
 	*x = NodeObservation{}
-	mi := &file_daemon_proto_msgTypes[86]
+	mi := &file_daemon_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8642,7 +9396,7 @@ func (x *NodeObservation) String() string {
 func (*NodeObservation) ProtoMessage() {}
 
 func (x *NodeObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[86]
+	mi := &file_daemon_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8655,7 +9409,7 @@ func (x *NodeObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeObservation.ProtoReflect.Descriptor instead.
 func (*NodeObservation) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{86}
+	return file_daemon_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *NodeObservation) GetMachineId() string {
@@ -8732,7 +9486,7 @@ type NetworkObservation struct {
 
 func (x *NetworkObservation) Reset() {
 	*x = NetworkObservation{}
-	mi := &file_daemon_proto_msgTypes[87]
+	mi := &file_daemon_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8744,7 +9498,7 @@ func (x *NetworkObservation) String() string {
 func (*NetworkObservation) ProtoMessage() {}
 
 func (x *NetworkObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[87]
+	mi := &file_daemon_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8757,7 +9511,7 @@ func (x *NetworkObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkObservation.ProtoReflect.Descriptor instead.
 func (*NetworkObservation) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{87}
+	return file_daemon_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *NetworkObservation) GetLive() *NodeStatus {
@@ -8796,7 +9550,7 @@ type ComponentStatus struct {
 
 func (x *ComponentStatus) Reset() {
 	*x = ComponentStatus{}
-	mi := &file_daemon_proto_msgTypes[88]
+	mi := &file_daemon_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8808,7 +9562,7 @@ func (x *ComponentStatus) String() string {
 func (*ComponentStatus) ProtoMessage() {}
 
 func (x *ComponentStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[88]
+	mi := &file_daemon_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8821,7 +9575,7 @@ func (x *ComponentStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ComponentStatus.ProtoReflect.Descriptor instead.
 func (*ComponentStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{88}
+	return file_daemon_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *ComponentStatus) GetEnabled() bool {
@@ -8874,28 +9628,31 @@ func (x *ComponentStatus) GetShutdownProtection() ShutdownProtection {
 }
 
 type DaemonStatus struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	ProductVersion  string                 `protobuf:"bytes,1,opt,name=product_version,json=productVersion,proto3" json:"product_version,omitempty"`
-	ProtocolMajor   uint32                 `protobuf:"varint,2,opt,name=protocol_major,json=protocolMajor,proto3" json:"protocol_major,omitempty"`
-	Generation      string                 `protobuf:"bytes,3,opt,name=generation,proto3" json:"generation,omitempty"`
-	Home            []byte                 `protobuf:"bytes,4,opt,name=home,proto3" json:"home,omitempty"`
-	ConfigDir       []byte                 `protobuf:"bytes,5,opt,name=config_dir,json=configDir,proto3" json:"config_dir,omitempty"`
-	Core            CorePhase              `protobuf:"varint,6,opt,name=core,proto3,enum=silo.daemon.v1.CorePhase" json:"core,omitempty"`
-	System          *SystemStatus          `protobuf:"bytes,7,opt,name=system,proto3" json:"system,omitempty"`
-	Tailscale       *ComponentStatus       `protobuf:"bytes,8,opt,name=tailscale,proto3" json:"tailscale,omitempty"`
-	Schema          uint32                 `protobuf:"varint,9,opt,name=schema,proto3" json:"schema,omitempty"`
-	Pid             uint32                 `protobuf:"varint,10,opt,name=pid,proto3" json:"pid,omitempty"`
-	ProcessStart    string                 `protobuf:"bytes,11,opt,name=process_start,json=processStart,proto3" json:"process_start,omitempty"`
-	ControlEndpoint []byte                 `protobuf:"bytes,12,opt,name=control_endpoint,json=controlEndpoint,proto3" json:"control_endpoint,omitempty"`
-	UpdatedAt       *timestamppb.Timestamp `protobuf:"bytes,13,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	LastError       *string                `protobuf:"bytes,14,opt,name=last_error,json=lastError,proto3,oneof" json:"last_error,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	ProductVersion    string                 `protobuf:"bytes,1,opt,name=product_version,json=productVersion,proto3" json:"product_version,omitempty"`
+	ProtocolMajor     uint32                 `protobuf:"varint,2,opt,name=protocol_major,json=protocolMajor,proto3" json:"protocol_major,omitempty"`
+	Generation        string                 `protobuf:"bytes,3,opt,name=generation,proto3" json:"generation,omitempty"`
+	Home              []byte                 `protobuf:"bytes,4,opt,name=home,proto3" json:"home,omitempty"`
+	ConfigDir         []byte                 `protobuf:"bytes,5,opt,name=config_dir,json=configDir,proto3" json:"config_dir,omitempty"`
+	Core              CorePhase              `protobuf:"varint,6,opt,name=core,proto3,enum=silo.daemon.v1.CorePhase" json:"core,omitempty"`
+	System            *SystemStatus          `protobuf:"bytes,7,opt,name=system,proto3" json:"system,omitempty"`
+	Tailscale         *ComponentStatus       `protobuf:"bytes,8,opt,name=tailscale,proto3" json:"tailscale,omitempty"`
+	Schema            uint32                 `protobuf:"varint,9,opt,name=schema,proto3" json:"schema,omitempty"`
+	Pid               uint32                 `protobuf:"varint,10,opt,name=pid,proto3" json:"pid,omitempty"`
+	ProcessStart      string                 `protobuf:"bytes,11,opt,name=process_start,json=processStart,proto3" json:"process_start,omitempty"`
+	ControlEndpoint   []byte                 `protobuf:"bytes,12,opt,name=control_endpoint,json=controlEndpoint,proto3" json:"control_endpoint,omitempty"`
+	UpdatedAt         *timestamppb.Timestamp `protobuf:"bytes,13,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	LastError         *string                `protobuf:"bytes,14,opt,name=last_error,json=lastError,proto3,oneof" json:"last_error,omitempty"`
+	ManagerLive       *LiveHostReport        `protobuf:"bytes,15,opt,name=manager_live,json=managerLive,proto3" json:"manager_live,omitempty"`
+	ApplianceLive     *LiveHostReport        `protobuf:"bytes,16,opt,name=appliance_live,json=applianceLive,proto3" json:"appliance_live,omitempty"`
+	LiveSchemaVersion *uint32                `protobuf:"varint,17,opt,name=live_schema_version,json=liveSchemaVersion,proto3,oneof" json:"live_schema_version,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DaemonStatus) Reset() {
 	*x = DaemonStatus{}
-	mi := &file_daemon_proto_msgTypes[89]
+	mi := &file_daemon_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8907,7 +9664,7 @@ func (x *DaemonStatus) String() string {
 func (*DaemonStatus) ProtoMessage() {}
 
 func (x *DaemonStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[89]
+	mi := &file_daemon_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8920,7 +9677,7 @@ func (x *DaemonStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DaemonStatus.ProtoReflect.Descriptor instead.
 func (*DaemonStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{89}
+	return file_daemon_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *DaemonStatus) GetProductVersion() string {
@@ -9021,6 +9778,27 @@ func (x *DaemonStatus) GetLastError() string {
 	return ""
 }
 
+func (x *DaemonStatus) GetManagerLive() *LiveHostReport {
+	if x != nil {
+		return x.ManagerLive
+	}
+	return nil
+}
+
+func (x *DaemonStatus) GetApplianceLive() *LiveHostReport {
+	if x != nil {
+		return x.ApplianceLive
+	}
+	return nil
+}
+
+func (x *DaemonStatus) GetLiveSchemaVersion() uint32 {
+	if x != nil && x.LiveSchemaVersion != nil {
+		return *x.LiveSchemaVersion
+	}
+	return 0
+}
+
 type RuntimeComponents struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	SupervisorPath []byte                 `protobuf:"bytes,1,opt,name=supervisor_path,json=supervisorPath,proto3" json:"supervisor_path,omitempty"`
@@ -9035,7 +9813,7 @@ type RuntimeComponents struct {
 
 func (x *RuntimeComponents) Reset() {
 	*x = RuntimeComponents{}
-	mi := &file_daemon_proto_msgTypes[90]
+	mi := &file_daemon_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9047,7 +9825,7 @@ func (x *RuntimeComponents) String() string {
 func (*RuntimeComponents) ProtoMessage() {}
 
 func (x *RuntimeComponents) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[90]
+	mi := &file_daemon_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9060,7 +9838,7 @@ func (x *RuntimeComponents) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeComponents.ProtoReflect.Descriptor instead.
 func (*RuntimeComponents) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{90}
+	return file_daemon_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *RuntimeComponents) GetSupervisorPath() []byte {
@@ -9116,7 +9894,7 @@ type RuntimeInfo struct {
 
 func (x *RuntimeInfo) Reset() {
 	*x = RuntimeInfo{}
-	mi := &file_daemon_proto_msgTypes[91]
+	mi := &file_daemon_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9128,7 +9906,7 @@ func (x *RuntimeInfo) String() string {
 func (*RuntimeInfo) ProtoMessage() {}
 
 func (x *RuntimeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[91]
+	mi := &file_daemon_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9141,7 +9919,7 @@ func (x *RuntimeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeInfo.ProtoReflect.Descriptor instead.
 func (*RuntimeInfo) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{91}
+	return file_daemon_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *RuntimeInfo) GetGeneration() string {
@@ -9176,7 +9954,7 @@ type TailscaleStatusReport struct {
 
 func (x *TailscaleStatusReport) Reset() {
 	*x = TailscaleStatusReport{}
-	mi := &file_daemon_proto_msgTypes[92]
+	mi := &file_daemon_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9188,7 +9966,7 @@ func (x *TailscaleStatusReport) String() string {
 func (*TailscaleStatusReport) ProtoMessage() {}
 
 func (x *TailscaleStatusReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[92]
+	mi := &file_daemon_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9201,7 +9979,7 @@ func (x *TailscaleStatusReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TailscaleStatusReport.ProtoReflect.Descriptor instead.
 func (*TailscaleStatusReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{92}
+	return file_daemon_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *TailscaleStatusReport) GetHelperGeneration() string {
@@ -9234,7 +10012,7 @@ type DrainMutationsRequest struct {
 
 func (x *DrainMutationsRequest) Reset() {
 	*x = DrainMutationsRequest{}
-	mi := &file_daemon_proto_msgTypes[93]
+	mi := &file_daemon_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9246,7 +10024,7 @@ func (x *DrainMutationsRequest) String() string {
 func (*DrainMutationsRequest) ProtoMessage() {}
 
 func (x *DrainMutationsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[93]
+	mi := &file_daemon_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9259,7 +10037,7 @@ func (x *DrainMutationsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrainMutationsRequest.ProtoReflect.Descriptor instead.
 func (*DrainMutationsRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{93}
+	return file_daemon_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *DrainMutationsRequest) GetExpectedGeneration() string {
@@ -9280,7 +10058,7 @@ type ResourceDefaults struct {
 
 func (x *ResourceDefaults) Reset() {
 	*x = ResourceDefaults{}
-	mi := &file_daemon_proto_msgTypes[94]
+	mi := &file_daemon_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9292,7 +10070,7 @@ func (x *ResourceDefaults) String() string {
 func (*ResourceDefaults) ProtoMessage() {}
 
 func (x *ResourceDefaults) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[94]
+	mi := &file_daemon_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9305,7 +10083,7 @@ func (x *ResourceDefaults) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceDefaults.ProtoReflect.Descriptor instead.
 func (*ResourceDefaults) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{94}
+	return file_daemon_proto_rawDescGZIP(), []int{96}
 }
 
 func (x *ResourceDefaults) GetCpus() uint32 {
@@ -9341,7 +10119,7 @@ type ResourceCeilings struct {
 
 func (x *ResourceCeilings) Reset() {
 	*x = ResourceCeilings{}
-	mi := &file_daemon_proto_msgTypes[95]
+	mi := &file_daemon_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9353,7 +10131,7 @@ func (x *ResourceCeilings) String() string {
 func (*ResourceCeilings) ProtoMessage() {}
 
 func (x *ResourceCeilings) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[95]
+	mi := &file_daemon_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9366,7 +10144,7 @@ func (x *ResourceCeilings) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceCeilings.ProtoReflect.Descriptor instead.
 func (*ResourceCeilings) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{95}
+	return file_daemon_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *ResourceCeilings) GetCpus() uint32 {
@@ -9418,7 +10196,7 @@ type TailscaleSettings struct {
 
 func (x *TailscaleSettings) Reset() {
 	*x = TailscaleSettings{}
-	mi := &file_daemon_proto_msgTypes[96]
+	mi := &file_daemon_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9430,7 +10208,7 @@ func (x *TailscaleSettings) String() string {
 func (*TailscaleSettings) ProtoMessage() {}
 
 func (x *TailscaleSettings) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[96]
+	mi := &file_daemon_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9443,7 +10221,7 @@ func (x *TailscaleSettings) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TailscaleSettings.ProtoReflect.Descriptor instead.
 func (*TailscaleSettings) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{96}
+	return file_daemon_proto_rawDescGZIP(), []int{98}
 }
 
 func (x *TailscaleSettings) GetHostname() string {
@@ -9561,7 +10339,7 @@ type HelperBootstrap struct {
 
 func (x *HelperBootstrap) Reset() {
 	*x = HelperBootstrap{}
-	mi := &file_daemon_proto_msgTypes[97]
+	mi := &file_daemon_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9573,7 +10351,7 @@ func (x *HelperBootstrap) String() string {
 func (*HelperBootstrap) ProtoMessage() {}
 
 func (x *HelperBootstrap) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[97]
+	mi := &file_daemon_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9586,7 +10364,7 @@ func (x *HelperBootstrap) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HelperBootstrap.ProtoReflect.Descriptor instead.
 func (*HelperBootstrap) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{97}
+	return file_daemon_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *HelperBootstrap) GetProtocolMajor() uint32 {
@@ -9704,7 +10482,7 @@ type MonitorSnapshot struct {
 
 func (x *MonitorSnapshot) Reset() {
 	*x = MonitorSnapshot{}
-	mi := &file_daemon_proto_msgTypes[98]
+	mi := &file_daemon_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9716,7 +10494,7 @@ func (x *MonitorSnapshot) String() string {
 func (*MonitorSnapshot) ProtoMessage() {}
 
 func (x *MonitorSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[98]
+	mi := &file_daemon_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9729,7 +10507,7 @@ func (x *MonitorSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MonitorSnapshot.ProtoReflect.Descriptor instead.
 func (*MonitorSnapshot) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{98}
+	return file_daemon_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *MonitorSnapshot) GetInstanceId() string {
@@ -9759,7 +10537,7 @@ type VmSnapshot struct {
 
 func (x *VmSnapshot) Reset() {
 	*x = VmSnapshot{}
-	mi := &file_daemon_proto_msgTypes[99]
+	mi := &file_daemon_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9771,7 +10549,7 @@ func (x *VmSnapshot) String() string {
 func (*VmSnapshot) ProtoMessage() {}
 
 func (x *VmSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[99]
+	mi := &file_daemon_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9784,7 +10562,7 @@ func (x *VmSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VmSnapshot.ProtoReflect.Descriptor instead.
 func (*VmSnapshot) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{99}
+	return file_daemon_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *VmSnapshot) GetState() VmState {
@@ -9832,7 +10610,7 @@ type ReadinessState struct {
 
 func (x *ReadinessState) Reset() {
 	*x = ReadinessState{}
-	mi := &file_daemon_proto_msgTypes[100]
+	mi := &file_daemon_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9844,7 +10622,7 @@ func (x *ReadinessState) String() string {
 func (*ReadinessState) ProtoMessage() {}
 
 func (x *ReadinessState) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[100]
+	mi := &file_daemon_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9857,7 +10635,7 @@ func (x *ReadinessState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadinessState.ProtoReflect.Descriptor instead.
 func (*ReadinessState) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{100}
+	return file_daemon_proto_rawDescGZIP(), []int{102}
 }
 
 func (x *ReadinessState) GetReady() bool {
@@ -9887,7 +10665,7 @@ type AgentConnection struct {
 
 func (x *AgentConnection) Reset() {
 	*x = AgentConnection{}
-	mi := &file_daemon_proto_msgTypes[101]
+	mi := &file_daemon_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9899,7 +10677,7 @@ func (x *AgentConnection) String() string {
 func (*AgentConnection) ProtoMessage() {}
 
 func (x *AgentConnection) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[101]
+	mi := &file_daemon_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9912,7 +10690,7 @@ func (x *AgentConnection) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentConnection.ProtoReflect.Descriptor instead.
 func (*AgentConnection) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{101}
+	return file_daemon_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *AgentConnection) GetState() AgentConnectionState {
@@ -9961,7 +10739,7 @@ type AgentIdentity struct {
 
 func (x *AgentIdentity) Reset() {
 	*x = AgentIdentity{}
-	mi := &file_daemon_proto_msgTypes[102]
+	mi := &file_daemon_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9973,7 +10751,7 @@ func (x *AgentIdentity) String() string {
 func (*AgentIdentity) ProtoMessage() {}
 
 func (x *AgentIdentity) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[102]
+	mi := &file_daemon_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9986,7 +10764,7 @@ func (x *AgentIdentity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentIdentity.ProtoReflect.Descriptor instead.
 func (*AgentIdentity) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{102}
+	return file_daemon_proto_rawDescGZIP(), []int{104}
 }
 
 func (x *AgentIdentity) GetInstanceId() string {
@@ -10024,7 +10802,7 @@ type SystemInfo struct {
 
 func (x *SystemInfo) Reset() {
 	*x = SystemInfo{}
-	mi := &file_daemon_proto_msgTypes[103]
+	mi := &file_daemon_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10036,7 +10814,7 @@ func (x *SystemInfo) String() string {
 func (*SystemInfo) ProtoMessage() {}
 
 func (x *SystemInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[103]
+	mi := &file_daemon_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10049,7 +10827,7 @@ func (x *SystemInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SystemInfo.ProtoReflect.Descriptor instead.
 func (*SystemInfo) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{103}
+	return file_daemon_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *SystemInfo) GetKernelVersion() string {
@@ -10107,7 +10885,7 @@ type SshListenerReport struct {
 
 func (x *SshListenerReport) Reset() {
 	*x = SshListenerReport{}
-	mi := &file_daemon_proto_msgTypes[104]
+	mi := &file_daemon_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10119,7 +10897,7 @@ func (x *SshListenerReport) String() string {
 func (*SshListenerReport) ProtoMessage() {}
 
 func (x *SshListenerReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[104]
+	mi := &file_daemon_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10132,7 +10910,7 @@ func (x *SshListenerReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SshListenerReport.ProtoReflect.Descriptor instead.
 func (*SshListenerReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{104}
+	return file_daemon_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *SshListenerReport) GetBackend() SshBackend {
@@ -10184,7 +10962,7 @@ type GuestProvisionReport struct {
 
 func (x *GuestProvisionReport) Reset() {
 	*x = GuestProvisionReport{}
-	mi := &file_daemon_proto_msgTypes[105]
+	mi := &file_daemon_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10196,7 +10974,7 @@ func (x *GuestProvisionReport) String() string {
 func (*GuestProvisionReport) ProtoMessage() {}
 
 func (x *GuestProvisionReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[105]
+	mi := &file_daemon_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10209,7 +10987,7 @@ func (x *GuestProvisionReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GuestProvisionReport.ProtoReflect.Descriptor instead.
 func (*GuestProvisionReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{105}
+	return file_daemon_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *GuestProvisionReport) GetStatus() ProvisionStatus {
@@ -10270,7 +11048,7 @@ type AgentStatusReport struct {
 
 func (x *AgentStatusReport) Reset() {
 	*x = AgentStatusReport{}
-	mi := &file_daemon_proto_msgTypes[106]
+	mi := &file_daemon_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10282,7 +11060,7 @@ func (x *AgentStatusReport) String() string {
 func (*AgentStatusReport) ProtoMessage() {}
 
 func (x *AgentStatusReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[106]
+	mi := &file_daemon_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10295,7 +11073,7 @@ func (x *AgentStatusReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentStatusReport.ProtoReflect.Descriptor instead.
 func (*AgentStatusReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{106}
+	return file_daemon_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *AgentStatusReport) GetObservedAt() *timestamppb.Timestamp {
@@ -10367,7 +11145,7 @@ type AgentStatusObservation struct {
 
 func (x *AgentStatusObservation) Reset() {
 	*x = AgentStatusObservation{}
-	mi := &file_daemon_proto_msgTypes[107]
+	mi := &file_daemon_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10379,7 +11157,7 @@ func (x *AgentStatusObservation) String() string {
 func (*AgentStatusObservation) ProtoMessage() {}
 
 func (x *AgentStatusObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[107]
+	mi := &file_daemon_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10392,7 +11170,7 @@ func (x *AgentStatusObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentStatusObservation.ProtoReflect.Descriptor instead.
 func (*AgentStatusObservation) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{107}
+	return file_daemon_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *AgentStatusObservation) GetReceivedAt() *timestamppb.Timestamp {
@@ -10442,7 +11220,7 @@ type EnabledAgent struct {
 
 func (x *EnabledAgent) Reset() {
 	*x = EnabledAgent{}
-	mi := &file_daemon_proto_msgTypes[108]
+	mi := &file_daemon_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10454,7 +11232,7 @@ func (x *EnabledAgent) String() string {
 func (*EnabledAgent) ProtoMessage() {}
 
 func (x *EnabledAgent) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[108]
+	mi := &file_daemon_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10467,7 +11245,7 @@ func (x *EnabledAgent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnabledAgent.ProtoReflect.Descriptor instead.
 func (*EnabledAgent) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{108}
+	return file_daemon_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *EnabledAgent) GetConnection() *AgentConnection {
@@ -10511,7 +11289,7 @@ type AgentStatus struct {
 
 func (x *AgentStatus) Reset() {
 	*x = AgentStatus{}
-	mi := &file_daemon_proto_msgTypes[109]
+	mi := &file_daemon_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10523,7 +11301,7 @@ func (x *AgentStatus) String() string {
 func (*AgentStatus) ProtoMessage() {}
 
 func (x *AgentStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[109]
+	mi := &file_daemon_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10536,7 +11314,7 @@ func (x *AgentStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentStatus.ProtoReflect.Descriptor instead.
 func (*AgentStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{109}
+	return file_daemon_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *AgentStatus) GetStatus() isAgentStatus_Status {
@@ -10589,13 +11367,14 @@ type MonitorStatus struct {
 	Vm            *VmSnapshot            `protobuf:"bytes,5,opt,name=vm,proto3" json:"vm,omitempty"`
 	Readiness     *ReadinessState        `protobuf:"bytes,6,opt,name=readiness,proto3" json:"readiness,omitempty"`
 	Agent         *AgentStatus           `protobuf:"bytes,7,opt,name=agent,proto3" json:"agent,omitempty"`
+	Live          *LiveMachineReport     `protobuf:"bytes,8,opt,name=live,proto3" json:"live,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MonitorStatus) Reset() {
 	*x = MonitorStatus{}
-	mi := &file_daemon_proto_msgTypes[110]
+	mi := &file_daemon_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10607,7 +11386,7 @@ func (x *MonitorStatus) String() string {
 func (*MonitorStatus) ProtoMessage() {}
 
 func (x *MonitorStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[110]
+	mi := &file_daemon_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10620,7 +11399,7 @@ func (x *MonitorStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MonitorStatus.ProtoReflect.Descriptor instead.
 func (*MonitorStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{110}
+	return file_daemon_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *MonitorStatus) GetMachineId() string {
@@ -10672,6 +11451,13 @@ func (x *MonitorStatus) GetAgent() *AgentStatus {
 	return nil
 }
 
+func (x *MonitorStatus) GetLive() *LiveMachineReport {
+	if x != nil {
+		return x.Live
+	}
+	return nil
+}
+
 type SystemStatus struct {
 	state                                protoimpl.MessageState `protogen:"open.v1"`
 	Phase                                SystemPhase            `protobuf:"varint,1,opt,name=phase,proto3,enum=silo.daemon.v1.SystemPhase" json:"phase,omitempty"`
@@ -10696,13 +11482,16 @@ type SystemStatus struct {
 	HostMemoryReclaimQualification       *string                `protobuf:"bytes,20,opt,name=host_memory_reclaim_qualification,json=hostMemoryReclaimQualification,proto3,oneof" json:"host_memory_reclaim_qualification,omitempty"`
 	HostMemoryReclaimReleasedBytes       *uint64                `protobuf:"varint,21,opt,name=host_memory_reclaim_released_bytes,json=hostMemoryReclaimReleasedBytes,proto3,oneof" json:"host_memory_reclaim_released_bytes,omitempty"`
 	HostMemoryReclaimFailedOperations    *uint64                `protobuf:"varint,22,opt,name=host_memory_reclaim_failed_operations,json=hostMemoryReclaimFailedOperations,proto3,oneof" json:"host_memory_reclaim_failed_operations,omitempty"`
+	Live                                 *LiveMachineReport     `protobuf:"bytes,23,opt,name=live,proto3" json:"live,omitempty"`
+	ProspectiveLive                      *LiveHostReport        `protobuf:"bytes,24,opt,name=prospective_live,json=prospectiveLive,proto3" json:"prospective_live,omitempty"`
+	LiveSchemaVersion                    *uint32                `protobuf:"varint,25,opt,name=live_schema_version,json=liveSchemaVersion,proto3,oneof" json:"live_schema_version,omitempty"`
 	unknownFields                        protoimpl.UnknownFields
 	sizeCache                            protoimpl.SizeCache
 }
 
 func (x *SystemStatus) Reset() {
 	*x = SystemStatus{}
-	mi := &file_daemon_proto_msgTypes[111]
+	mi := &file_daemon_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10714,7 +11503,7 @@ func (x *SystemStatus) String() string {
 func (*SystemStatus) ProtoMessage() {}
 
 func (x *SystemStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[111]
+	mi := &file_daemon_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10727,7 +11516,7 @@ func (x *SystemStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SystemStatus.ProtoReflect.Descriptor instead.
 func (*SystemStatus) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{111}
+	return file_daemon_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *SystemStatus) GetPhase() SystemPhase {
@@ -10884,6 +11673,1552 @@ func (x *SystemStatus) GetHostMemoryReclaimFailedOperations() uint64 {
 	return 0
 }
 
+func (x *SystemStatus) GetLive() *LiveMachineReport {
+	if x != nil {
+		return x.Live
+	}
+	return nil
+}
+
+func (x *SystemStatus) GetProspectiveLive() *LiveHostReport {
+	if x != nil {
+		return x.ProspectiveLive
+	}
+	return nil
+}
+
+func (x *SystemStatus) GetLiveSchemaVersion() uint32 {
+	if x != nil && x.LiveSchemaVersion != nil {
+		return *x.LiveSchemaVersion
+	}
+	return 0
+}
+
+type LiveMachineRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Machine       *MachineRef            `protobuf:"bytes,1,opt,name=machine,proto3" json:"machine,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveMachineRequest) Reset() {
+	*x = LiveMachineRequest{}
+	mi := &file_daemon_proto_msgTypes[114]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveMachineRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveMachineRequest) ProtoMessage() {}
+
+func (x *LiveMachineRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[114]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveMachineRequest.ProtoReflect.Descriptor instead.
+func (*LiveMachineRequest) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{114}
+}
+
+func (x *LiveMachineRequest) GetMachine() *MachineRef {
+	if x != nil {
+		return x.Machine
+	}
+	return nil
+}
+
+type LiveCaptureRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Machine       *MachineRef            `protobuf:"bytes,1,opt,name=machine,proto3" json:"machine,omitempty"`
+	Name          *string                `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveCaptureRequest) Reset() {
+	*x = LiveCaptureRequest{}
+	mi := &file_daemon_proto_msgTypes[115]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveCaptureRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveCaptureRequest) ProtoMessage() {}
+
+func (x *LiveCaptureRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[115]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveCaptureRequest.ProtoReflect.Descriptor instead.
+func (*LiveCaptureRequest) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{115}
+}
+
+func (x *LiveCaptureRequest) GetMachine() *MachineRef {
+	if x != nil {
+		return x.Machine
+	}
+	return nil
+}
+
+func (x *LiveCaptureRequest) GetName() string {
+	if x != nil && x.Name != nil {
+		return *x.Name
+	}
+	return ""
+}
+
+type LiveForkRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Machine       *MachineRef            `protobuf:"bytes,1,opt,name=machine,proto3" json:"machine,omitempty"`
+	Name          *string                `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveForkRequest) Reset() {
+	*x = LiveForkRequest{}
+	mi := &file_daemon_proto_msgTypes[116]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveForkRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveForkRequest) ProtoMessage() {}
+
+func (x *LiveForkRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[116]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveForkRequest.ProtoReflect.Descriptor instead.
+func (*LiveForkRequest) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{116}
+}
+
+func (x *LiveForkRequest) GetMachine() *MachineRef {
+	if x != nil {
+		return x.Machine
+	}
+	return nil
+}
+
+func (x *LiveForkRequest) GetName() string {
+	if x != nil && x.Name != nil {
+		return *x.Name
+	}
+	return ""
+}
+
+type LiveRestoreRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Checkpoint    []byte                 `protobuf:"bytes,1,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	Name          *string                `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveRestoreRequest) Reset() {
+	*x = LiveRestoreRequest{}
+	mi := &file_daemon_proto_msgTypes[117]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveRestoreRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveRestoreRequest) ProtoMessage() {}
+
+func (x *LiveRestoreRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[117]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveRestoreRequest.ProtoReflect.Descriptor instead.
+func (*LiveRestoreRequest) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{117}
+}
+
+func (x *LiveRestoreRequest) GetCheckpoint() []byte {
+	if x != nil {
+		return x.Checkpoint
+	}
+	return nil
+}
+
+func (x *LiveRestoreRequest) GetName() string {
+	if x != nil && x.Name != nil {
+		return *x.Name
+	}
+	return ""
+}
+
+// Stopped artifacts are distinct from MachineSnapshot, the observational read model.
+type StorageSnapshotRef struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Reference:
+	//
+	//	*StorageSnapshotRef_Id
+	//	*StorageSnapshotRef_ImageAlias
+	Reference     isStorageSnapshotRef_Reference `protobuf_oneof:"reference"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StorageSnapshotRef) Reset() {
+	*x = StorageSnapshotRef{}
+	mi := &file_daemon_proto_msgTypes[118]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StorageSnapshotRef) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StorageSnapshotRef) ProtoMessage() {}
+
+func (x *StorageSnapshotRef) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[118]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StorageSnapshotRef.ProtoReflect.Descriptor instead.
+func (*StorageSnapshotRef) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{118}
+}
+
+func (x *StorageSnapshotRef) GetReference() isStorageSnapshotRef_Reference {
+	if x != nil {
+		return x.Reference
+	}
+	return nil
+}
+
+func (x *StorageSnapshotRef) GetId() string {
+	if x != nil {
+		if x, ok := x.Reference.(*StorageSnapshotRef_Id); ok {
+			return x.Id
+		}
+	}
+	return ""
+}
+
+func (x *StorageSnapshotRef) GetImageAlias() string {
+	if x != nil {
+		if x, ok := x.Reference.(*StorageSnapshotRef_ImageAlias); ok {
+			return x.ImageAlias
+		}
+	}
+	return ""
+}
+
+type isStorageSnapshotRef_Reference interface {
+	isStorageSnapshotRef_Reference()
+}
+
+type StorageSnapshotRef_Id struct {
+	Id string `protobuf:"bytes,1,opt,name=id,proto3,oneof"`
+}
+
+type StorageSnapshotRef_ImageAlias struct {
+	ImageAlias string `protobuf:"bytes,2,opt,name=image_alias,json=imageAlias,proto3,oneof"`
+}
+
+func (*StorageSnapshotRef_Id) isStorageSnapshotRef_Reference() {}
+
+func (*StorageSnapshotRef_ImageAlias) isStorageSnapshotRef_Reference() {}
+
+type ExternalResourceKey struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Resource:
+	//
+	//	*ExternalResourceKey_DiskOrder
+	//	*ExternalResourceKey_ShareTag
+	Resource      isExternalResourceKey_Resource `protobuf_oneof:"resource"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExternalResourceKey) Reset() {
+	*x = ExternalResourceKey{}
+	mi := &file_daemon_proto_msgTypes[119]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExternalResourceKey) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExternalResourceKey) ProtoMessage() {}
+
+func (x *ExternalResourceKey) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[119]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExternalResourceKey.ProtoReflect.Descriptor instead.
+func (*ExternalResourceKey) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{119}
+}
+
+func (x *ExternalResourceKey) GetResource() isExternalResourceKey_Resource {
+	if x != nil {
+		return x.Resource
+	}
+	return nil
+}
+
+func (x *ExternalResourceKey) GetDiskOrder() uint32 {
+	if x != nil {
+		if x, ok := x.Resource.(*ExternalResourceKey_DiskOrder); ok {
+			return x.DiskOrder
+		}
+	}
+	return 0
+}
+
+func (x *ExternalResourceKey) GetShareTag() string {
+	if x != nil {
+		if x, ok := x.Resource.(*ExternalResourceKey_ShareTag); ok {
+			return x.ShareTag
+		}
+	}
+	return ""
+}
+
+type isExternalResourceKey_Resource interface {
+	isExternalResourceKey_Resource()
+}
+
+type ExternalResourceKey_DiskOrder struct {
+	DiskOrder uint32 `protobuf:"varint,1,opt,name=disk_order,json=diskOrder,proto3,oneof"`
+}
+
+type ExternalResourceKey_ShareTag struct {
+	ShareTag string `protobuf:"bytes,2,opt,name=share_tag,json=shareTag,proto3,oneof"`
+}
+
+func (*ExternalResourceKey_DiskOrder) isExternalResourceKey_Resource() {}
+
+func (*ExternalResourceKey_ShareTag) isExternalResourceKey_Resource() {}
+
+type ExternalResourceMapping struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Resource      *ExternalResourceKey   `protobuf:"bytes,1,opt,name=resource,proto3" json:"resource,omitempty"`
+	Path          []byte                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExternalResourceMapping) Reset() {
+	*x = ExternalResourceMapping{}
+	mi := &file_daemon_proto_msgTypes[120]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExternalResourceMapping) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExternalResourceMapping) ProtoMessage() {}
+
+func (x *ExternalResourceMapping) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[120]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExternalResourceMapping.ProtoReflect.Descriptor instead.
+func (*ExternalResourceMapping) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{120}
+}
+
+func (x *ExternalResourceMapping) GetResource() *ExternalResourceKey {
+	if x != nil {
+		return x.Resource
+	}
+	return nil
+}
+
+func (x *ExternalResourceMapping) GetPath() []byte {
+	if x != nil {
+		return x.Path
+	}
+	return nil
+}
+
+type ExternalResourceMappings struct {
+	state         protoimpl.MessageState     `protogen:"open.v1"`
+	Values        []*ExternalResourceMapping `protobuf:"bytes,1,rep,name=values,proto3" json:"values,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExternalResourceMappings) Reset() {
+	*x = ExternalResourceMappings{}
+	mi := &file_daemon_proto_msgTypes[121]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExternalResourceMappings) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExternalResourceMappings) ProtoMessage() {}
+
+func (x *ExternalResourceMappings) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[121]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExternalResourceMappings.ProtoReflect.Descriptor instead.
+func (*ExternalResourceMappings) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{121}
+}
+
+func (x *ExternalResourceMappings) GetValues() []*ExternalResourceMapping {
+	if x != nil {
+		return x.Values
+	}
+	return nil
+}
+
+type ExternalResourcePolicy struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Policy:
+	//
+	//	*ExternalResourcePolicy_Reject
+	//	*ExternalResourcePolicy_RequireMappings
+	//	*ExternalResourcePolicy_Mappings
+	Policy        isExternalResourcePolicy_Policy `protobuf_oneof:"policy"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExternalResourcePolicy) Reset() {
+	*x = ExternalResourcePolicy{}
+	mi := &file_daemon_proto_msgTypes[122]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExternalResourcePolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExternalResourcePolicy) ProtoMessage() {}
+
+func (x *ExternalResourcePolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[122]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExternalResourcePolicy.ProtoReflect.Descriptor instead.
+func (*ExternalResourcePolicy) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{122}
+}
+
+func (x *ExternalResourcePolicy) GetPolicy() isExternalResourcePolicy_Policy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+func (x *ExternalResourcePolicy) GetReject() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Policy.(*ExternalResourcePolicy_Reject); ok {
+			return x.Reject
+		}
+	}
+	return nil
+}
+
+func (x *ExternalResourcePolicy) GetRequireMappings() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Policy.(*ExternalResourcePolicy_RequireMappings); ok {
+			return x.RequireMappings
+		}
+	}
+	return nil
+}
+
+func (x *ExternalResourcePolicy) GetMappings() *ExternalResourceMappings {
+	if x != nil {
+		if x, ok := x.Policy.(*ExternalResourcePolicy_Mappings); ok {
+			return x.Mappings
+		}
+	}
+	return nil
+}
+
+type isExternalResourcePolicy_Policy interface {
+	isExternalResourcePolicy_Policy()
+}
+
+type ExternalResourcePolicy_Reject struct {
+	Reject *emptypb.Empty `protobuf:"bytes,1,opt,name=reject,proto3,oneof"`
+}
+
+type ExternalResourcePolicy_RequireMappings struct {
+	RequireMappings *emptypb.Empty `protobuf:"bytes,2,opt,name=require_mappings,json=requireMappings,proto3,oneof"`
+}
+
+type ExternalResourcePolicy_Mappings struct {
+	Mappings *ExternalResourceMappings `protobuf:"bytes,3,opt,name=mappings,proto3,oneof"`
+}
+
+func (*ExternalResourcePolicy_Reject) isExternalResourcePolicy_Policy() {}
+
+func (*ExternalResourcePolicy_RequireMappings) isExternalResourcePolicy_Policy() {}
+
+func (*ExternalResourcePolicy_Mappings) isExternalResourcePolicy_Policy() {}
+
+type StoppedForkRequest struct {
+	state             protoimpl.MessageState  `protogen:"open.v1"`
+	Machine           *MachineRef             `protobuf:"bytes,1,opt,name=machine,proto3" json:"machine,omitempty"`
+	Name              *string                 `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	ExternalResources *ExternalResourcePolicy `protobuf:"bytes,3,opt,name=external_resources,json=externalResources,proto3" json:"external_resources,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *StoppedForkRequest) Reset() {
+	*x = StoppedForkRequest{}
+	mi := &file_daemon_proto_msgTypes[123]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StoppedForkRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StoppedForkRequest) ProtoMessage() {}
+
+func (x *StoppedForkRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[123]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StoppedForkRequest.ProtoReflect.Descriptor instead.
+func (*StoppedForkRequest) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{123}
+}
+
+func (x *StoppedForkRequest) GetMachine() *MachineRef {
+	if x != nil {
+		return x.Machine
+	}
+	return nil
+}
+
+func (x *StoppedForkRequest) GetName() string {
+	if x != nil && x.Name != nil {
+		return *x.Name
+	}
+	return ""
+}
+
+func (x *StoppedForkRequest) GetExternalResources() *ExternalResourcePolicy {
+	if x != nil {
+		return x.ExternalResources
+	}
+	return nil
+}
+
+// Creation records external requirements, never destination host mappings.
+// external_resources accepts only reject or require_mappings on this RPC.
+type CreateStorageSnapshotRequest struct {
+	state             protoimpl.MessageState  `protogen:"open.v1"`
+	Machine           *MachineRef             `protobuf:"bytes,1,opt,name=machine,proto3" json:"machine,omitempty"`
+	Name              *string                 `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	ExternalResources *ExternalResourcePolicy `protobuf:"bytes,3,opt,name=external_resources,json=externalResources,proto3" json:"external_resources,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *CreateStorageSnapshotRequest) Reset() {
+	*x = CreateStorageSnapshotRequest{}
+	mi := &file_daemon_proto_msgTypes[124]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateStorageSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateStorageSnapshotRequest) ProtoMessage() {}
+
+func (x *CreateStorageSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[124]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateStorageSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*CreateStorageSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{124}
+}
+
+func (x *CreateStorageSnapshotRequest) GetMachine() *MachineRef {
+	if x != nil {
+		return x.Machine
+	}
+	return nil
+}
+
+func (x *CreateStorageSnapshotRequest) GetName() string {
+	if x != nil && x.Name != nil {
+		return *x.Name
+	}
+	return ""
+}
+
+func (x *CreateStorageSnapshotRequest) GetExternalResources() *ExternalResourcePolicy {
+	if x != nil {
+		return x.ExternalResources
+	}
+	return nil
+}
+
+type RestoreStorageSnapshotRequest struct {
+	state             protoimpl.MessageState  `protogen:"open.v1"`
+	Snapshot          *StorageSnapshotRef     `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
+	Name              *string                 `protobuf:"bytes,2,opt,name=name,proto3,oneof" json:"name,omitempty"`
+	ExternalResources *ExternalResourcePolicy `protobuf:"bytes,3,opt,name=external_resources,json=externalResources,proto3" json:"external_resources,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *RestoreStorageSnapshotRequest) Reset() {
+	*x = RestoreStorageSnapshotRequest{}
+	mi := &file_daemon_proto_msgTypes[125]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreStorageSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreStorageSnapshotRequest) ProtoMessage() {}
+
+func (x *RestoreStorageSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[125]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreStorageSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*RestoreStorageSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{125}
+}
+
+func (x *RestoreStorageSnapshotRequest) GetSnapshot() *StorageSnapshotRef {
+	if x != nil {
+		return x.Snapshot
+	}
+	return nil
+}
+
+func (x *RestoreStorageSnapshotRequest) GetName() string {
+	if x != nil && x.Name != nil {
+		return *x.Name
+	}
+	return ""
+}
+
+func (x *RestoreStorageSnapshotRequest) GetExternalResources() *ExternalResourcePolicy {
+	if x != nil {
+		return x.ExternalResources
+	}
+	return nil
+}
+
+type StorageSnapshotInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	RecordDigest  string                 `protobuf:"bytes,2,opt,name=record_digest,json=recordDigest,proto3" json:"record_digest,omitempty"`
+	Retained      *bool                  `protobuf:"varint,3,opt,name=retained,proto3,oneof" json:"retained,omitempty"`
+	Aliases       []string               `protobuf:"bytes,4,rep,name=aliases,proto3" json:"aliases,omitempty"`
+	CreatedAt     *int64                 `protobuf:"varint,5,opt,name=created_at,json=createdAt,proto3,oneof" json:"created_at,omitempty"`
+	CaptureKind   StorageCaptureKind     `protobuf:"varint,6,opt,name=capture_kind,json=captureKind,proto3,enum=silo.daemon.v1.StorageCaptureKind" json:"capture_kind,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StorageSnapshotInfo) Reset() {
+	*x = StorageSnapshotInfo{}
+	mi := &file_daemon_proto_msgTypes[126]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StorageSnapshotInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StorageSnapshotInfo) ProtoMessage() {}
+
+func (x *StorageSnapshotInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[126]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StorageSnapshotInfo.ProtoReflect.Descriptor instead.
+func (*StorageSnapshotInfo) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{126}
+}
+
+func (x *StorageSnapshotInfo) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *StorageSnapshotInfo) GetRecordDigest() string {
+	if x != nil {
+		return x.RecordDigest
+	}
+	return ""
+}
+
+func (x *StorageSnapshotInfo) GetRetained() bool {
+	if x != nil && x.Retained != nil {
+		return *x.Retained
+	}
+	return false
+}
+
+func (x *StorageSnapshotInfo) GetAliases() []string {
+	if x != nil {
+		return x.Aliases
+	}
+	return nil
+}
+
+func (x *StorageSnapshotInfo) GetCreatedAt() int64 {
+	if x != nil && x.CreatedAt != nil {
+		return *x.CreatedAt
+	}
+	return 0
+}
+
+func (x *StorageSnapshotInfo) GetCaptureKind() StorageCaptureKind {
+	if x != nil {
+		return x.CaptureKind
+	}
+	return StorageCaptureKind_STORAGE_CAPTURE_KIND_UNSPECIFIED
+}
+
+type StorageSnapshotList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Snapshots     []*StorageSnapshotInfo `protobuf:"bytes,1,rep,name=snapshots,proto3" json:"snapshots,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StorageSnapshotList) Reset() {
+	*x = StorageSnapshotList{}
+	mi := &file_daemon_proto_msgTypes[127]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StorageSnapshotList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StorageSnapshotList) ProtoMessage() {}
+
+func (x *StorageSnapshotList) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[127]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StorageSnapshotList.ProtoReflect.Descriptor instead.
+func (*StorageSnapshotList) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{127}
+}
+
+func (x *StorageSnapshotList) GetSnapshots() []*StorageSnapshotInfo {
+	if x != nil {
+		return x.Snapshots
+	}
+	return nil
+}
+
+type LiveDeviceSubject struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Subject:
+	//
+	//	*LiveDeviceSubject_Virtiofs
+	//	*LiveDeviceSubject_Rosetta
+	//	*LiveDeviceSubject_Tap
+	//	*LiveDeviceSubject_Gpu
+	//	*LiveDeviceSubject_Nested
+	//	*LiveDeviceSubject_Tee
+	//	*LiveDeviceSubject_GuestProfile
+	Subject       isLiveDeviceSubject_Subject `protobuf_oneof:"subject"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveDeviceSubject) Reset() {
+	*x = LiveDeviceSubject{}
+	mi := &file_daemon_proto_msgTypes[128]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveDeviceSubject) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveDeviceSubject) ProtoMessage() {}
+
+func (x *LiveDeviceSubject) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[128]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveDeviceSubject.ProtoReflect.Descriptor instead.
+func (*LiveDeviceSubject) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{128}
+}
+
+func (x *LiveDeviceSubject) GetSubject() isLiveDeviceSubject_Subject {
+	if x != nil {
+		return x.Subject
+	}
+	return nil
+}
+
+func (x *LiveDeviceSubject) GetVirtiofs() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Subject.(*LiveDeviceSubject_Virtiofs); ok {
+			return x.Virtiofs
+		}
+	}
+	return nil
+}
+
+func (x *LiveDeviceSubject) GetRosetta() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Subject.(*LiveDeviceSubject_Rosetta); ok {
+			return x.Rosetta
+		}
+	}
+	return nil
+}
+
+func (x *LiveDeviceSubject) GetTap() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Subject.(*LiveDeviceSubject_Tap); ok {
+			return x.Tap
+		}
+	}
+	return nil
+}
+
+func (x *LiveDeviceSubject) GetGpu() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Subject.(*LiveDeviceSubject_Gpu); ok {
+			return x.Gpu
+		}
+	}
+	return nil
+}
+
+func (x *LiveDeviceSubject) GetNested() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Subject.(*LiveDeviceSubject_Nested); ok {
+			return x.Nested
+		}
+	}
+	return nil
+}
+
+func (x *LiveDeviceSubject) GetTee() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Subject.(*LiveDeviceSubject_Tee); ok {
+			return x.Tee
+		}
+	}
+	return nil
+}
+
+func (x *LiveDeviceSubject) GetGuestProfile() string {
+	if x != nil {
+		if x, ok := x.Subject.(*LiveDeviceSubject_GuestProfile); ok {
+			return x.GuestProfile
+		}
+	}
+	return ""
+}
+
+type isLiveDeviceSubject_Subject interface {
+	isLiveDeviceSubject_Subject()
+}
+
+type LiveDeviceSubject_Virtiofs struct {
+	Virtiofs *emptypb.Empty `protobuf:"bytes,1,opt,name=virtiofs,proto3,oneof"`
+}
+
+type LiveDeviceSubject_Rosetta struct {
+	Rosetta *emptypb.Empty `protobuf:"bytes,2,opt,name=rosetta,proto3,oneof"`
+}
+
+type LiveDeviceSubject_Tap struct {
+	Tap *emptypb.Empty `protobuf:"bytes,3,opt,name=tap,proto3,oneof"`
+}
+
+type LiveDeviceSubject_Gpu struct {
+	Gpu *emptypb.Empty `protobuf:"bytes,4,opt,name=gpu,proto3,oneof"`
+}
+
+type LiveDeviceSubject_Nested struct {
+	Nested *emptypb.Empty `protobuf:"bytes,5,opt,name=nested,proto3,oneof"`
+}
+
+type LiveDeviceSubject_Tee struct {
+	Tee *emptypb.Empty `protobuf:"bytes,6,opt,name=tee,proto3,oneof"`
+}
+
+type LiveDeviceSubject_GuestProfile struct {
+	GuestProfile string `protobuf:"bytes,7,opt,name=guest_profile,json=guestProfile,proto3,oneof"`
+}
+
+func (*LiveDeviceSubject_Virtiofs) isLiveDeviceSubject_Subject() {}
+
+func (*LiveDeviceSubject_Rosetta) isLiveDeviceSubject_Subject() {}
+
+func (*LiveDeviceSubject_Tap) isLiveDeviceSubject_Subject() {}
+
+func (*LiveDeviceSubject_Gpu) isLiveDeviceSubject_Subject() {}
+
+func (*LiveDeviceSubject_Nested) isLiveDeviceSubject_Subject() {}
+
+func (*LiveDeviceSubject_Tee) isLiveDeviceSubject_Subject() {}
+
+func (*LiveDeviceSubject_GuestProfile) isLiveDeviceSubject_Subject() {}
+
+type LiveUnsupportedReason struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Code          *LiveReasonCode        `protobuf:"varint,1,opt,name=code,proto3,enum=silo.daemon.v1.LiveReasonCode,oneof" json:"code,omitempty"`
+	Subject       *LiveDeviceSubject     `protobuf:"bytes,2,opt,name=subject,proto3" json:"subject,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveUnsupportedReason) Reset() {
+	*x = LiveUnsupportedReason{}
+	mi := &file_daemon_proto_msgTypes[129]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveUnsupportedReason) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveUnsupportedReason) ProtoMessage() {}
+
+func (x *LiveUnsupportedReason) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[129]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveUnsupportedReason.ProtoReflect.Descriptor instead.
+func (*LiveUnsupportedReason) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{129}
+}
+
+func (x *LiveUnsupportedReason) GetCode() LiveReasonCode {
+	if x != nil && x.Code != nil {
+		return *x.Code
+	}
+	return LiveReasonCode_LIVE_REASON_CODE_UNSPECIFIED
+}
+
+func (x *LiveUnsupportedReason) GetSubject() *LiveDeviceSubject {
+	if x != nil {
+		return x.Subject
+	}
+	return nil
+}
+
+type LiveCapability struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Native *bool                  `protobuf:"varint,1,opt,name=native,proto3,oneof" json:"native,omitempty"`
+	// Types that are valid to be assigned to Availability:
+	//
+	//	*LiveCapability_Supported
+	//	*LiveCapability_Unsupported
+	Availability  isLiveCapability_Availability `protobuf_oneof:"availability"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveCapability) Reset() {
+	*x = LiveCapability{}
+	mi := &file_daemon_proto_msgTypes[130]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveCapability) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveCapability) ProtoMessage() {}
+
+func (x *LiveCapability) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[130]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveCapability.ProtoReflect.Descriptor instead.
+func (*LiveCapability) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{130}
+}
+
+func (x *LiveCapability) GetNative() bool {
+	if x != nil && x.Native != nil {
+		return *x.Native
+	}
+	return false
+}
+
+func (x *LiveCapability) GetAvailability() isLiveCapability_Availability {
+	if x != nil {
+		return x.Availability
+	}
+	return nil
+}
+
+func (x *LiveCapability) GetSupported() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Availability.(*LiveCapability_Supported); ok {
+			return x.Supported
+		}
+	}
+	return nil
+}
+
+func (x *LiveCapability) GetUnsupported() *LiveUnsupportedReason {
+	if x != nil {
+		if x, ok := x.Availability.(*LiveCapability_Unsupported); ok {
+			return x.Unsupported
+		}
+	}
+	return nil
+}
+
+type isLiveCapability_Availability interface {
+	isLiveCapability_Availability()
+}
+
+type LiveCapability_Supported struct {
+	Supported *emptypb.Empty `protobuf:"bytes,2,opt,name=supported,proto3,oneof"`
+}
+
+type LiveCapability_Unsupported struct {
+	Unsupported *LiveUnsupportedReason `protobuf:"bytes,3,opt,name=unsupported,proto3,oneof"`
+}
+
+func (*LiveCapability_Supported) isLiveCapability_Availability() {}
+
+func (*LiveCapability_Unsupported) isLiveCapability_Availability() {}
+
+type LiveCapabilityVector struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pause         *LiveCapability        `protobuf:"bytes,1,opt,name=pause,proto3" json:"pause,omitempty"`
+	Capture       *LiveCapability        `protobuf:"bytes,2,opt,name=capture,proto3" json:"capture,omitempty"`
+	Restore       *LiveCapability        `protobuf:"bytes,3,opt,name=restore,proto3" json:"restore,omitempty"`
+	Fork          *LiveCapability        `protobuf:"bytes,4,opt,name=fork,proto3" json:"fork,omitempty"`
+	Incremental   *LiveCapability        `protobuf:"bytes,5,opt,name=incremental,proto3" json:"incremental,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveCapabilityVector) Reset() {
+	*x = LiveCapabilityVector{}
+	mi := &file_daemon_proto_msgTypes[131]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveCapabilityVector) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveCapabilityVector) ProtoMessage() {}
+
+func (x *LiveCapabilityVector) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[131]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveCapabilityVector.ProtoReflect.Descriptor instead.
+func (*LiveCapabilityVector) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{131}
+}
+
+func (x *LiveCapabilityVector) GetPause() *LiveCapability {
+	if x != nil {
+		return x.Pause
+	}
+	return nil
+}
+
+func (x *LiveCapabilityVector) GetCapture() *LiveCapability {
+	if x != nil {
+		return x.Capture
+	}
+	return nil
+}
+
+func (x *LiveCapabilityVector) GetRestore() *LiveCapability {
+	if x != nil {
+		return x.Restore
+	}
+	return nil
+}
+
+func (x *LiveCapabilityVector) GetFork() *LiveCapability {
+	if x != nil {
+		return x.Fork
+	}
+	return nil
+}
+
+func (x *LiveCapabilityVector) GetIncremental() *LiveCapability {
+	if x != nil {
+		return x.Incremental
+	}
+	return nil
+}
+
+type LiveHostReport struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	SchemaVersion         *uint32                `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3,oneof" json:"schema_version,omitempty"`
+	Scope                 *LiveScope             `protobuf:"varint,2,opt,name=scope,proto3,enum=silo.daemon.v1.LiveScope,oneof" json:"scope,omitempty"`
+	Backend               *LiveBackend           `protobuf:"varint,3,opt,name=backend,proto3,enum=silo.daemon.v1.LiveBackend,oneof" json:"backend,omitempty"`
+	Lane                  *LiveLane              `protobuf:"varint,4,opt,name=lane,proto3,enum=silo.daemon.v1.LiveLane,oneof" json:"lane,omitempty"`
+	Live                  *LiveCapabilityVector  `protobuf:"bytes,5,opt,name=live,proto3" json:"live,omitempty"`
+	BuildIdentity         *string                `protobuf:"bytes,6,opt,name=build_identity,json=buildIdentity,proto3,oneof" json:"build_identity,omitempty"`
+	QualificationIdentity *string                `protobuf:"bytes,7,opt,name=qualification_identity,json=qualificationIdentity,proto3,oneof" json:"qualification_identity,omitempty"`
+	ScenarioDigest        *string                `protobuf:"bytes,8,opt,name=scenario_digest,json=scenarioDigest,proto3,oneof" json:"scenario_digest,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *LiveHostReport) Reset() {
+	*x = LiveHostReport{}
+	mi := &file_daemon_proto_msgTypes[132]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveHostReport) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveHostReport) ProtoMessage() {}
+
+func (x *LiveHostReport) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[132]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveHostReport.ProtoReflect.Descriptor instead.
+func (*LiveHostReport) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{132}
+}
+
+func (x *LiveHostReport) GetSchemaVersion() uint32 {
+	if x != nil && x.SchemaVersion != nil {
+		return *x.SchemaVersion
+	}
+	return 0
+}
+
+func (x *LiveHostReport) GetScope() LiveScope {
+	if x != nil && x.Scope != nil {
+		return *x.Scope
+	}
+	return LiveScope_LIVE_SCOPE_UNSPECIFIED
+}
+
+func (x *LiveHostReport) GetBackend() LiveBackend {
+	if x != nil && x.Backend != nil {
+		return *x.Backend
+	}
+	return LiveBackend_LIVE_BACKEND_UNSPECIFIED
+}
+
+func (x *LiveHostReport) GetLane() LiveLane {
+	if x != nil && x.Lane != nil {
+		return *x.Lane
+	}
+	return LiveLane_LIVE_LANE_UNSPECIFIED
+}
+
+func (x *LiveHostReport) GetLive() *LiveCapabilityVector {
+	if x != nil {
+		return x.Live
+	}
+	return nil
+}
+
+func (x *LiveHostReport) GetBuildIdentity() string {
+	if x != nil && x.BuildIdentity != nil {
+		return *x.BuildIdentity
+	}
+	return ""
+}
+
+func (x *LiveHostReport) GetQualificationIdentity() string {
+	if x != nil && x.QualificationIdentity != nil {
+		return *x.QualificationIdentity
+	}
+	return ""
+}
+
+func (x *LiveHostReport) GetScenarioDigest() string {
+	if x != nil && x.ScenarioDigest != nil {
+		return *x.ScenarioDigest
+	}
+	return ""
+}
+
+type LiveMachineReport struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	SchemaVersion    *uint32                `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3,oneof" json:"schema_version,omitempty"`
+	Scope            *LiveScope             `protobuf:"varint,2,opt,name=scope,proto3,enum=silo.daemon.v1.LiveScope,oneof" json:"scope,omitempty"`
+	MachineId        *string                `protobuf:"bytes,3,opt,name=machine_id,json=machineId,proto3,oneof" json:"machine_id,omitempty"`
+	RunId            *string                `protobuf:"bytes,4,opt,name=run_id,json=runId,proto3,oneof" json:"run_id,omitempty"`
+	MonitorId        *string                `protobuf:"bytes,5,opt,name=monitor_id,json=monitorId,proto3,oneof" json:"monitor_id,omitempty"`
+	Backend          *LiveBackend           `protobuf:"varint,6,opt,name=backend,proto3,enum=silo.daemon.v1.LiveBackend,oneof" json:"backend,omitempty"`
+	Lane             *LiveLane              `protobuf:"varint,7,opt,name=lane,proto3,enum=silo.daemon.v1.LiveLane,oneof" json:"lane,omitempty"`
+	TopologyRevision *uint64                `protobuf:"varint,8,opt,name=topology_revision,json=topologyRevision,proto3,oneof" json:"topology_revision,omitempty"`
+	Live             *LiveCapabilityVector  `protobuf:"bytes,9,opt,name=live,proto3" json:"live,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *LiveMachineReport) Reset() {
+	*x = LiveMachineReport{}
+	mi := &file_daemon_proto_msgTypes[133]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveMachineReport) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveMachineReport) ProtoMessage() {}
+
+func (x *LiveMachineReport) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[133]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveMachineReport.ProtoReflect.Descriptor instead.
+func (*LiveMachineReport) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{133}
+}
+
+func (x *LiveMachineReport) GetSchemaVersion() uint32 {
+	if x != nil && x.SchemaVersion != nil {
+		return *x.SchemaVersion
+	}
+	return 0
+}
+
+func (x *LiveMachineReport) GetScope() LiveScope {
+	if x != nil && x.Scope != nil {
+		return *x.Scope
+	}
+	return LiveScope_LIVE_SCOPE_UNSPECIFIED
+}
+
+func (x *LiveMachineReport) GetMachineId() string {
+	if x != nil && x.MachineId != nil {
+		return *x.MachineId
+	}
+	return ""
+}
+
+func (x *LiveMachineReport) GetRunId() string {
+	if x != nil && x.RunId != nil {
+		return *x.RunId
+	}
+	return ""
+}
+
+func (x *LiveMachineReport) GetMonitorId() string {
+	if x != nil && x.MonitorId != nil {
+		return *x.MonitorId
+	}
+	return ""
+}
+
+func (x *LiveMachineReport) GetBackend() LiveBackend {
+	if x != nil && x.Backend != nil {
+		return *x.Backend
+	}
+	return LiveBackend_LIVE_BACKEND_UNSPECIFIED
+}
+
+func (x *LiveMachineReport) GetLane() LiveLane {
+	if x != nil && x.Lane != nil {
+		return *x.Lane
+	}
+	return LiveLane_LIVE_LANE_UNSPECIFIED
+}
+
+func (x *LiveMachineReport) GetTopologyRevision() uint64 {
+	if x != nil && x.TopologyRevision != nil {
+		return *x.TopologyRevision
+	}
+	return 0
+}
+
+func (x *LiveMachineReport) GetLive() *LiveCapabilityVector {
+	if x != nil {
+		return x.Live
+	}
+	return nil
+}
+
+type LiveOperationUnsupported struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Operation     *LiveOperation         `protobuf:"varint,1,opt,name=operation,proto3,enum=silo.daemon.v1.LiveOperation,oneof" json:"operation,omitempty"`
+	Backend       *LiveBackend           `protobuf:"varint,2,opt,name=backend,proto3,enum=silo.daemon.v1.LiveBackend,oneof" json:"backend,omitempty"`
+	Lane          *LiveLane              `protobuf:"varint,3,opt,name=lane,proto3,enum=silo.daemon.v1.LiveLane,oneof" json:"lane,omitempty"`
+	Reason        *LiveUnsupportedReason `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveOperationUnsupported) Reset() {
+	*x = LiveOperationUnsupported{}
+	mi := &file_daemon_proto_msgTypes[134]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveOperationUnsupported) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveOperationUnsupported) ProtoMessage() {}
+
+func (x *LiveOperationUnsupported) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[134]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveOperationUnsupported.ProtoReflect.Descriptor instead.
+func (*LiveOperationUnsupported) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{134}
+}
+
+func (x *LiveOperationUnsupported) GetOperation() LiveOperation {
+	if x != nil && x.Operation != nil {
+		return *x.Operation
+	}
+	return LiveOperation_LIVE_OPERATION_UNSPECIFIED
+}
+
+func (x *LiveOperationUnsupported) GetBackend() LiveBackend {
+	if x != nil && x.Backend != nil {
+		return *x.Backend
+	}
+	return LiveBackend_LIVE_BACKEND_UNSPECIFIED
+}
+
+func (x *LiveOperationUnsupported) GetLane() LiveLane {
+	if x != nil && x.Lane != nil {
+		return *x.Lane
+	}
+	return LiveLane_LIVE_LANE_UNSPECIFIED
+}
+
+func (x *LiveOperationUnsupported) GetReason() *LiveUnsupportedReason {
+	if x != nil {
+		return x.Reason
+	}
+	return nil
+}
+
 var File_daemon_proto protoreflect.FileDescriptor
 
 const file_daemon_proto_rawDesc = "" +
@@ -10940,10 +13275,22 @@ const file_daemon_proto_rawDesc = "" +
 	"\x05Mount\x12\x16\n" +
 	"\x06source\x18\x01 \x01(\fR\x06source\x12\x10\n" +
 	"\x03tag\x18\x02 \x01(\tR\x03tag\x12\x1b\n" +
-	"\tread_only\x18\x03 \x01(\bR\breadOnly\"7\n" +
+	"\tread_only\x18\x03 \x01(\bR\breadOnly\"V\n" +
+	"\fDiskGeometry\x12\x16\n" +
+	"\x06length\x18\x01 \x01(\x04R\x06length\x12.\n" +
+	"\x13logical_sector_size\x18\x02 \x01(\rR\x11logicalSectorSize\"\xb1\x02\n" +
 	"\x04Disk\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\fR\x04path\x12\x1b\n" +
-	"\tread_only\x18\x02 \x01(\bR\breadOnly\">\n" +
+	"\x04path\x18\x01 \x01(\fR\x04path\x12 \n" +
+	"\tread_only\x18\x02 \x01(\bH\x00R\breadOnly\x88\x01\x01\x121\n" +
+	"\x04role\x18\x03 \x01(\x0e2\x18.silo.daemon.v1.DiskRoleH\x01R\x04role\x88\x01\x01\x127\n" +
+	"\x06format\x18\x04 \x01(\x0e2\x1a.silo.daemon.v1.DiskFormatH\x02R\x06format\x88\x01\x01\x128\n" +
+	"\bgeometry\x18\x05 \x01(\v2\x1c.silo.daemon.v1.DiskGeometryR\bgeometry\x12\x1e\n" +
+	"\bblock_id\x18\x06 \x01(\tH\x03R\ablockId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_read_onlyB\a\n" +
+	"\x05_roleB\t\n" +
+	"\a_formatB\v\n" +
+	"\t_block_id\">\n" +
 	"\aAddress\x12\x12\n" +
 	"\x03tcp\x18\x01 \x01(\tH\x00R\x03tcp\x12\x14\n" +
 	"\x04unix\x18\x02 \x01(\fH\x00R\x04unixB\t\n" +
@@ -11034,7 +13381,13 @@ const file_daemon_proto_rawDesc = "" +
 	"definition\"\x8b\x01\n" +
 	"\x18SetMachineNetworkRequest\x124\n" +
 	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\x129\n" +
-	"\anetwork\x18\x02 \x01(\v2\x1f.silo.daemon.v1.ResolvedNetworkR\anetwork\"\xd6\b\n" +
+	"\anetwork\x18\x02 \x01(\v2\x1f.silo.daemon.v1.ResolvedNetworkR\anetwork\"\x94\x01\n" +
+	"\x18TemporaryDirectoryPolicy\x129\n" +
+	"\vdisk_backed\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\n" +
+	"diskBacked\x122\n" +
+	"\x14tmpfs_capacity_bytes\x18\x02 \x01(\x04H\x00R\x12tmpfsCapacityBytesB\t\n" +
+	"\abacking\"\x87\n" +
+	"\n" +
 	"\x17NormalizedMachineCreate\x12\x17\n" +
 	"\x04name\x18\x01 \x01(\tH\x00R\x04name\x88\x01\x01\x12(\n" +
 	"\rtemplate_name\x18\x02 \x01(\tH\x01R\ftemplateName\x88\x01\x01\x12K\n" +
@@ -11058,7 +13411,9 @@ const file_daemon_proto_rawDesc = "" +
 	"\buserdata\x18\x12 \x01(\tH\bR\buserdata\x88\x01\x01\x129\n" +
 	"\anetwork\x18\x13 \x01(\v2\x1f.silo.daemon.v1.ResolvedNetworkR\anetwork\x12+\n" +
 	"\x05agent\x18\x14 \x01(\v2\x15.silo.daemon.v1.AgentR\x05agent\x12;\n" +
-	"\x0eprovision_user\x18\x15 \x01(\v2\x14.silo.daemon.v1.UserR\rprovisionUser\x1a9\n" +
+	"\x0eprovision_user\x18\x15 \x01(\v2\x14.silo.daemon.v1.UserR\rprovisionUser\x12C\n" +
+	"\froot_profile\x18\x16 \x01(\x0e2\x1b.silo.daemon.v1.RootProfileH\tR\vrootProfile\x88\x01\x01\x12Y\n" +
+	"\x13temporary_directory\x18\x17 \x01(\v2(.silo.daemon.v1.TemporaryDirectoryPolicyR\x12temporaryDirectory\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\a\n" +
@@ -11071,7 +13426,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\x05_cpusB\x0f\n" +
 	"\r_memory_bytesB\x17\n" +
 	"\x15_root_disk_size_bytesB\v\n" +
-	"\t_userdata\"\x94\x02\n" +
+	"\t_userdataB\x0f\n" +
+	"\r_root_profile\"\x94\x02\n" +
 	"\vOciIdentity\x12/\n" +
 	"\x13requested_reference\x18\x01 \x01(\tR\x12requestedReference\x12-\n" +
 	"\x12selected_reference\x18\x02 \x01(\tR\x11selectedReference\x12\x1a\n" +
@@ -11186,7 +13542,7 @@ const file_daemon_proto_rawDesc = "" +
 	"UserUpdate\x12(\n" +
 	"\x03set\x18\x01 \x01(\v2\x14.silo.daemon.v1.UserH\x00R\x03set\x12.\n" +
 	"\x05clear\x18\x02 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x05clearB\b\n" +
-	"\x06update\"\x8c\x06\n" +
+	"\x06update\"\xe7\x06\n" +
 	"\rMachineUpdate\x12\x17\n" +
 	"\x04name\x18\x01 \x01(\tH\x00R\x04name\x88\x01\x01\x121\n" +
 	"\x06labels\x18\x02 \x01(\v2\x19.silo.daemon.v1.StringMapR\x06labels\x12\x17\n" +
@@ -11202,7 +13558,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\x06policy\x18\v \x01(\v2\x1c.silo.daemon.v1.PolicyUpdateR\x06policy\x12C\n" +
 	"\vpublication\x18\f \x01(\v2!.silo.daemon.v1.PublicationUpdateR\vpublication\x121\n" +
 	"\x05guest\x18\r \x01(\v2\x1b.silo.daemon.v1.GuestConfigR\x05guest\x12.\n" +
-	"\x04user\x18\x0e \x01(\v2\x1a.silo.daemon.v1.UserUpdateR\x04userB\a\n" +
+	"\x04user\x18\x0e \x01(\v2\x1a.silo.daemon.v1.UserUpdateR\x04user\x12Y\n" +
+	"\x13temporary_directory\x18\x0f \x01(\v2(.silo.daemon.v1.TemporaryDirectoryPolicyR\x12temporaryDirectoryB\a\n" +
 	"\x05_nameB\a\n" +
 	"\x05_cpusB\x0f\n" +
 	"\r_memory_bytesB\x17\n" +
@@ -11312,7 +13669,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x05steps\x18\x05 \x03(\v2#.silo.daemon.v1.ProvisionStepReportR\x05steps\x12\x1d\n" +
 	"\amessage\x18\x06 \x01(\tH\x00R\amessage\x88\x01\x01B\n" +
 	"\n" +
-	"\b_message\"\xf9\f\n" +
+	"\b_message\"\xda\x0e\n" +
 	"\x0fMachineSnapshot\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12*\n" +
@@ -11350,7 +13707,10 @@ const file_daemon_proto_rawDesc = "" +
 	"last_error\x18\x1a \x01(\tH\x03R\tlastError\x88\x01\x01\x129\n" +
 	"\n" +
 	"updated_at\x18\x1b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12S\n" +
-	"\x13network_observation\x18\x1c \x01(\v2\".silo.daemon.v1.NetworkObservationR\x12networkObservation\x1a9\n" +
+	"\x13network_observation\x18\x1c \x01(\v2\".silo.daemon.v1.NetworkObservationR\x12networkObservation\x125\n" +
+	"\x04live\x18\x1d \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04live\x12I\n" +
+	"\x10prospective_live\x18\x1e \x01(\v2\x1e.silo.daemon.v1.LiveHostReportR\x0fprospectiveLive\x12K\n" +
+	"\rlive_evidence\x18\x1f \x01(\x0e2!.silo.daemon.v1.LiveEvidenceStateH\x04R\fliveEvidence\x88\x01\x01\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a;\n" +
@@ -11360,7 +13720,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\x0e_template_nameB\x11\n" +
 	"\x0f_root_disk_sizeB\t\n" +
 	"\a_run_idB\r\n" +
-	"\v_last_error\"\xa6\x01\n" +
+	"\v_last_errorB\x10\n" +
+	"\x0e_live_evidence\"\xa6\x01\n" +
 	"\x15MachineInventoryEntry\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x123\n" +
@@ -11439,7 +13800,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x05state\x18\x01 \x01(\x0e2\".silo.daemon.v1.PolicySecretsStateR\x05state\x12B\n" +
 	"\vdiagnostics\x18\x02 \x03(\v2 .silo.daemon.v1.SecretDiagnosticR\vdiagnostics\x12E\n" +
 	"\frequirements\x18\x03 \x03(\v2!.silo.daemon.v1.SecretRequirementR\frequirements\x120\n" +
-	"\x05slots\x18\x04 \x03(\v2\x1a.silo.daemon.v1.SecretSlotR\x05slots\"\x90\x04\n" +
+	"\x05slots\x18\x04 \x03(\v2\x1a.silo.daemon.v1.SecretSlotR\x05slots\"\xe5\x04\n" +
 	"\vErrorDetail\x12-\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x19.silo.daemon.v1.ErrorKindR\x04kind\x12-\n" +
 	"\x04code\x18\x02 \x01(\x0e2\x19.silo.daemon.v1.ErrorCodeR\x04code\x12!\n" +
@@ -11450,7 +13811,9 @@ const file_daemon_proto_rawDesc = "" +
 	"currentRun\x88\x01\x01\x12\x1d\n" +
 	"\aprogram\x18\a \x01(\tH\x03R\aprogram\x88\x01\x01\x12*\n" +
 	"\x0enative_variant\x18\b \x01(\tH\x04R\rnativeVariant\x88\x01\x01\x12\\\n" +
-	"\x15launch_failure_reason\x18\t \x01(\x0e2#.silo.daemon.v1.LaunchFailureReasonH\x05R\x13launchFailureReason\x88\x01\x01B\f\n" +
+	"\x15launch_failure_reason\x18\t \x01(\x0e2#.silo.daemon.v1.LaunchFailureReasonH\x05R\x13launchFailureReason\x88\x01\x01\x12S\n" +
+	"\x10live_unsupported\x18\n" +
+	" \x01(\v2(.silo.daemon.v1.LiveOperationUnsupportedR\x0fliveUnsupportedB\f\n" +
 	"\n" +
 	"_referenceB\x0f\n" +
 	"\r_expected_runB\x0e\n" +
@@ -11515,7 +13878,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x13shutdown_protection\x18\a \x01(\x0e2\".silo.daemon.v1.ShutdownProtectionR\x12shutdownProtectionB\r\n" +
 	"\v_diagnosticB\x0f\n" +
 	"\r_approval_urlB\v\n" +
-	"\t_dns_name\"\xbd\x04\n" +
+	"\t_dns_name\"\x94\x06\n" +
 	"\fDaemonStatus\x12'\n" +
 	"\x0fproduct_version\x18\x01 \x01(\tR\x0eproductVersion\x12%\n" +
 	"\x0eprotocol_major\x18\x02 \x01(\rR\rprotocolMajor\x12\x1e\n" +
@@ -11536,8 +13899,12 @@ const file_daemon_proto_rawDesc = "" +
 	"\n" +
 	"updated_at\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12\"\n" +
 	"\n" +
-	"last_error\x18\x0e \x01(\tH\x00R\tlastError\x88\x01\x01B\r\n" +
-	"\v_last_error\"\xdd\x01\n" +
+	"last_error\x18\x0e \x01(\tH\x00R\tlastError\x88\x01\x01\x12A\n" +
+	"\fmanager_live\x18\x0f \x01(\v2\x1e.silo.daemon.v1.LiveHostReportR\vmanagerLive\x12E\n" +
+	"\x0eappliance_live\x18\x10 \x01(\v2\x1e.silo.daemon.v1.LiveHostReportR\rapplianceLive\x123\n" +
+	"\x13live_schema_version\x18\x11 \x01(\rH\x01R\x11liveSchemaVersion\x88\x01\x01B\r\n" +
+	"\v_last_errorB\x16\n" +
+	"\x14_live_schema_version\"\xdd\x01\n" +
 	"\x11RuntimeComponents\x12'\n" +
 	"\x0fsupervisor_path\x18\x01 \x01(\fR\x0esupervisorPath\x12\x1b\n" +
 	"\tnetd_path\x18\x02 \x01(\fR\bnetdPath\x12\x1f\n" +
@@ -11709,7 +14076,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\vAgentStatus\x124\n" +
 	"\bdisabled\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\bdisabled\x128\n" +
 	"\aenabled\x18\x02 \x01(\v2\x1c.silo.daemon.v1.EnabledAgentH\x00R\aenabledB\b\n" +
-	"\x06status\"\xc1\x02\n" +
+	"\x06status\"\xf8\x02\n" +
 	"\rMonitorStatus\x12\x1d\n" +
 	"\n" +
 	"machine_id\x18\x01 \x01(\tR\tmachineId\x12\x1a\n" +
@@ -11718,8 +14085,9 @@ const file_daemon_proto_rawDesc = "" +
 	"\amonitor\x18\x04 \x01(\v2\x1f.silo.daemon.v1.MonitorSnapshotR\amonitor\x12*\n" +
 	"\x02vm\x18\x05 \x01(\v2\x1a.silo.daemon.v1.VmSnapshotR\x02vm\x12<\n" +
 	"\treadiness\x18\x06 \x01(\v2\x1e.silo.daemon.v1.ReadinessStateR\treadiness\x121\n" +
-	"\x05agent\x18\a \x01(\v2\x1b.silo.daemon.v1.AgentStatusR\x05agentB\t\n" +
-	"\a_run_id\"\x95\r\n" +
+	"\x05agent\x18\a \x01(\v2\x1b.silo.daemon.v1.AgentStatusR\x05agent\x125\n" +
+	"\x04live\x18\b \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04liveB\t\n" +
+	"\a_run_id\"\xe4\x0e\n" +
 	"\fSystemStatus\x121\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x1b.silo.daemon.v1.SystemPhaseR\x05phase\x12\"\n" +
 	"\n" +
@@ -11746,7 +14114,10 @@ const file_daemon_proto_rawDesc = "" +
 	"\x1dhost_memory_reclaim_effective\x18\x13 \x01(\bH\fR\x1ahostMemoryReclaimEffective\x88\x01\x01\x12N\n" +
 	"!host_memory_reclaim_qualification\x18\x14 \x01(\tH\rR\x1ehostMemoryReclaimQualification\x88\x01\x01\x12O\n" +
 	"\"host_memory_reclaim_released_bytes\x18\x15 \x01(\x04H\x0eR\x1ehostMemoryReclaimReleasedBytes\x88\x01\x01\x12U\n" +
-	"%host_memory_reclaim_failed_operations\x18\x16 \x01(\x04H\x0fR!hostMemoryReclaimFailedOperations\x88\x01\x01B\r\n" +
+	"%host_memory_reclaim_failed_operations\x18\x16 \x01(\x04H\x0fR!hostMemoryReclaimFailedOperations\x88\x01\x01\x125\n" +
+	"\x04live\x18\x17 \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04live\x12I\n" +
+	"\x10prospective_live\x18\x18 \x01(\v2\x1e.silo.daemon.v1.LiveHostReportR\x0fprospectiveLive\x123\n" +
+	"\x13live_schema_version\x18\x19 \x01(\rH\x10R\x11liveSchemaVersion\x88\x01\x01B\r\n" +
 	"\v_machine_idB\t\n" +
 	"\a_run_idB\x0f\n" +
 	"\r_image_digestB\x13\n" +
@@ -11762,11 +14133,160 @@ const file_daemon_proto_rawDesc = "" +
 	"\x1e_host_memory_reclaim_effectiveB$\n" +
 	"\"_host_memory_reclaim_qualificationB%\n" +
 	"#_host_memory_reclaim_released_bytesB(\n" +
-	"&_host_memory_reclaim_failed_operations*Y\n" +
+	"&_host_memory_reclaim_failed_operationsB\x16\n" +
+	"\x14_live_schema_version\"J\n" +
+	"\x12LiveMachineRequest\x124\n" +
+	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\"l\n" +
+	"\x12LiveCaptureRequest\x124\n" +
+	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\x12\x17\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01B\a\n" +
+	"\x05_name\"i\n" +
+	"\x0fLiveForkRequest\x124\n" +
+	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\x12\x17\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01B\a\n" +
+	"\x05_name\"V\n" +
+	"\x12LiveRestoreRequest\x12\x1e\n" +
+	"\n" +
+	"checkpoint\x18\x01 \x01(\fR\n" +
+	"checkpoint\x12\x17\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01B\a\n" +
+	"\x05_name\"V\n" +
+	"\x12StorageSnapshotRef\x12\x10\n" +
+	"\x02id\x18\x01 \x01(\tH\x00R\x02id\x12!\n" +
+	"\vimage_alias\x18\x02 \x01(\tH\x00R\n" +
+	"imageAliasB\v\n" +
+	"\treference\"a\n" +
+	"\x13ExternalResourceKey\x12\x1f\n" +
+	"\n" +
+	"disk_order\x18\x01 \x01(\rH\x00R\tdiskOrder\x12\x1d\n" +
+	"\tshare_tag\x18\x02 \x01(\tH\x00R\bshareTagB\n" +
+	"\n" +
+	"\bresource\"n\n" +
+	"\x17ExternalResourceMapping\x12?\n" +
+	"\bresource\x18\x01 \x01(\v2#.silo.daemon.v1.ExternalResourceKeyR\bresource\x12\x12\n" +
+	"\x04path\x18\x02 \x01(\fR\x04path\"[\n" +
+	"\x18ExternalResourceMappings\x12?\n" +
+	"\x06values\x18\x01 \x03(\v2'.silo.daemon.v1.ExternalResourceMappingR\x06values\"\xe1\x01\n" +
+	"\x16ExternalResourcePolicy\x120\n" +
+	"\x06reject\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x06reject\x12C\n" +
+	"\x10require_mappings\x18\x02 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x0frequireMappings\x12F\n" +
+	"\bmappings\x18\x03 \x01(\v2(.silo.daemon.v1.ExternalResourceMappingsH\x00R\bmappingsB\b\n" +
+	"\x06policy\"\xc3\x01\n" +
+	"\x12StoppedForkRequest\x124\n" +
+	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\x12\x17\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01\x12U\n" +
+	"\x12external_resources\x18\x03 \x01(\v2&.silo.daemon.v1.ExternalResourcePolicyR\x11externalResourcesB\a\n" +
+	"\x05_name\"\xcd\x01\n" +
+	"\x1cCreateStorageSnapshotRequest\x124\n" +
+	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\x12\x17\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01\x12U\n" +
+	"\x12external_resources\x18\x03 \x01(\v2&.silo.daemon.v1.ExternalResourcePolicyR\x11externalResourcesB\a\n" +
+	"\x05_name\"\xd8\x01\n" +
+	"\x1dRestoreStorageSnapshotRequest\x12>\n" +
+	"\bsnapshot\x18\x01 \x01(\v2\".silo.daemon.v1.StorageSnapshotRefR\bsnapshot\x12\x17\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01\x12U\n" +
+	"\x12external_resources\x18\x03 \x01(\v2&.silo.daemon.v1.ExternalResourcePolicyR\x11externalResourcesB\a\n" +
+	"\x05_name\"\x8c\x02\n" +
+	"\x13StorageSnapshotInfo\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12#\n" +
+	"\rrecord_digest\x18\x02 \x01(\tR\frecordDigest\x12\x1f\n" +
+	"\bretained\x18\x03 \x01(\bH\x00R\bretained\x88\x01\x01\x12\x18\n" +
+	"\aaliases\x18\x04 \x03(\tR\aaliases\x12\"\n" +
+	"\n" +
+	"created_at\x18\x05 \x01(\x03H\x01R\tcreatedAt\x88\x01\x01\x12E\n" +
+	"\fcapture_kind\x18\x06 \x01(\x0e2\".silo.daemon.v1.StorageCaptureKindR\vcaptureKindB\v\n" +
+	"\t_retainedB\r\n" +
+	"\v_created_at\"X\n" +
+	"\x13StorageSnapshotList\x12A\n" +
+	"\tsnapshots\x18\x01 \x03(\v2#.silo.daemon.v1.StorageSnapshotInfoR\tsnapshots\"\xe5\x02\n" +
+	"\x11LiveDeviceSubject\x124\n" +
+	"\bvirtiofs\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\bvirtiofs\x122\n" +
+	"\arosetta\x18\x02 \x01(\v2\x16.google.protobuf.EmptyH\x00R\arosetta\x12*\n" +
+	"\x03tap\x18\x03 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x03tap\x12*\n" +
+	"\x03gpu\x18\x04 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x03gpu\x120\n" +
+	"\x06nested\x18\x05 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x06nested\x12*\n" +
+	"\x03tee\x18\x06 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x03tee\x12%\n" +
+	"\rguest_profile\x18\a \x01(\tH\x00R\fguestProfileB\t\n" +
+	"\asubject\"\x96\x01\n" +
+	"\x15LiveUnsupportedReason\x127\n" +
+	"\x04code\x18\x01 \x01(\x0e2\x1e.silo.daemon.v1.LiveReasonCodeH\x00R\x04code\x88\x01\x01\x12;\n" +
+	"\asubject\x18\x02 \x01(\v2!.silo.daemon.v1.LiveDeviceSubjectR\asubjectB\a\n" +
+	"\x05_code\"\xcb\x01\n" +
+	"\x0eLiveCapability\x12\x1b\n" +
+	"\x06native\x18\x01 \x01(\bH\x01R\x06native\x88\x01\x01\x126\n" +
+	"\tsupported\x18\x02 \x01(\v2\x16.google.protobuf.EmptyH\x00R\tsupported\x12I\n" +
+	"\vunsupported\x18\x03 \x01(\v2%.silo.daemon.v1.LiveUnsupportedReasonH\x00R\vunsupportedB\x0e\n" +
+	"\favailabilityB\t\n" +
+	"\a_native\"\xb6\x02\n" +
+	"\x14LiveCapabilityVector\x124\n" +
+	"\x05pause\x18\x01 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\x05pause\x128\n" +
+	"\acapture\x18\x02 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\acapture\x128\n" +
+	"\arestore\x18\x03 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\arestore\x122\n" +
+	"\x04fork\x18\x04 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\x04fork\x12@\n" +
+	"\vincremental\x18\x05 \x01(\v2\x1e.silo.daemon.v1.LiveCapabilityR\vincremental\"\xa5\x04\n" +
+	"\x0eLiveHostReport\x12*\n" +
+	"\x0eschema_version\x18\x01 \x01(\rH\x00R\rschemaVersion\x88\x01\x01\x124\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\x19.silo.daemon.v1.LiveScopeH\x01R\x05scope\x88\x01\x01\x12:\n" +
+	"\abackend\x18\x03 \x01(\x0e2\x1b.silo.daemon.v1.LiveBackendH\x02R\abackend\x88\x01\x01\x121\n" +
+	"\x04lane\x18\x04 \x01(\x0e2\x18.silo.daemon.v1.LiveLaneH\x03R\x04lane\x88\x01\x01\x128\n" +
+	"\x04live\x18\x05 \x01(\v2$.silo.daemon.v1.LiveCapabilityVectorR\x04live\x12*\n" +
+	"\x0ebuild_identity\x18\x06 \x01(\tH\x04R\rbuildIdentity\x88\x01\x01\x12:\n" +
+	"\x16qualification_identity\x18\a \x01(\tH\x05R\x15qualificationIdentity\x88\x01\x01\x12,\n" +
+	"\x0fscenario_digest\x18\b \x01(\tH\x06R\x0escenarioDigest\x88\x01\x01B\x11\n" +
+	"\x0f_schema_versionB\b\n" +
+	"\x06_scopeB\n" +
+	"\n" +
+	"\b_backendB\a\n" +
+	"\x05_laneB\x11\n" +
+	"\x0f_build_identityB\x19\n" +
+	"\x17_qualification_identityB\x12\n" +
+	"\x10_scenario_digest\"\xa5\x04\n" +
+	"\x11LiveMachineReport\x12*\n" +
+	"\x0eschema_version\x18\x01 \x01(\rH\x00R\rschemaVersion\x88\x01\x01\x124\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\x19.silo.daemon.v1.LiveScopeH\x01R\x05scope\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"machine_id\x18\x03 \x01(\tH\x02R\tmachineId\x88\x01\x01\x12\x1a\n" +
+	"\x06run_id\x18\x04 \x01(\tH\x03R\x05runId\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"monitor_id\x18\x05 \x01(\tH\x04R\tmonitorId\x88\x01\x01\x12:\n" +
+	"\abackend\x18\x06 \x01(\x0e2\x1b.silo.daemon.v1.LiveBackendH\x05R\abackend\x88\x01\x01\x121\n" +
+	"\x04lane\x18\a \x01(\x0e2\x18.silo.daemon.v1.LiveLaneH\x06R\x04lane\x88\x01\x01\x120\n" +
+	"\x11topology_revision\x18\b \x01(\x04H\aR\x10topologyRevision\x88\x01\x01\x128\n" +
+	"\x04live\x18\t \x01(\v2$.silo.daemon.v1.LiveCapabilityVectorR\x04liveB\x11\n" +
+	"\x0f_schema_versionB\b\n" +
+	"\x06_scopeB\r\n" +
+	"\v_machine_idB\t\n" +
+	"\a_run_idB\r\n" +
+	"\v_monitor_idB\n" +
+	"\n" +
+	"\b_backendB\a\n" +
+	"\x05_laneB\x14\n" +
+	"\x12_topology_revision\"\xad\x02\n" +
+	"\x18LiveOperationUnsupported\x12@\n" +
+	"\toperation\x18\x01 \x01(\x0e2\x1d.silo.daemon.v1.LiveOperationH\x00R\toperation\x88\x01\x01\x12:\n" +
+	"\abackend\x18\x02 \x01(\x0e2\x1b.silo.daemon.v1.LiveBackendH\x01R\abackend\x88\x01\x01\x121\n" +
+	"\x04lane\x18\x03 \x01(\x0e2\x18.silo.daemon.v1.LiveLaneH\x02R\x04lane\x88\x01\x01\x12=\n" +
+	"\x06reason\x18\x04 \x01(\v2%.silo.daemon.v1.LiveUnsupportedReasonR\x06reasonB\f\n" +
+	"\n" +
+	"_operationB\n" +
+	"\n" +
+	"\b_backendB\a\n" +
+	"\x05_lane*Y\n" +
 	"\tRetention\x12\x19\n" +
 	"\x15RETENTION_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14RETENTION_PERSISTENT\x10\x01\x12\x17\n" +
-	"\x13RETENTION_EPHEMERAL\x10\x02*7\n" +
+	"\x13RETENTION_EPHEMERAL\x10\x02*\x81\x01\n" +
+	"\bDiskRole\x12\x19\n" +
+	"\x15DISK_ROLE_UNSPECIFIED\x10\x00\x12\x12\n" +
+	"\x0eDISK_ROLE_ROOT\x10\x01\x12\x18\n" +
+	"\x14DISK_ROLE_ROOT_LOWER\x10\x02\x12\x18\n" +
+	"\x14DISK_ROLE_ROOT_UPPER\x10\x03\x12\x12\n" +
+	"\x0eDISK_ROLE_DATA\x10\x04*T\n" +
+	"\n" +
+	"DiskFormat\x12\x1b\n" +
+	"\x17DISK_FORMAT_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fDISK_FORMAT_RAW\x10\x01\x12\x14\n" +
+	"\x10DISK_FORMAT_VMDK\x10\x02*7\n" +
 	"\aGuestOs\x12\x18\n" +
 	"\x14GUEST_OS_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eGUEST_OS_LINUX\x10\x01*\\\n" +
@@ -11782,7 +14302,11 @@ const file_daemon_proto_rawDesc = "" +
 	"\rNetworkDriver\x12\x1e\n" +
 	"\x1aNETWORK_DRIVER_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13NETWORK_DRIVER_AUTO\x10\x01\x12\x17\n" +
-	"\x13NETWORK_DRIVER_NETD\x10\x02*t\n" +
+	"\x13NETWORK_DRIVER_NETD\x10\x02*p\n" +
+	"\vRootProfile\x12\x1c\n" +
+	"\x18ROOT_PROFILE_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17ROOT_PROFILE_OPAQUE_RAW\x10\x01\x12&\n" +
+	"\"ROOT_PROFILE_LINUX_FLAT_OVERLAY_V1\x10\x02*t\n" +
 	"\n" +
 	"PullPolicy\x12\x1b\n" +
 	"\x17PULL_POLICY_UNSPECIFIED\x10\x00\x12\x1a\n" +
@@ -11885,7 +14409,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x10ERROR_KIND_LIMIT\x10\x05\x12\x15\n" +
 	"\x11ERROR_KIND_DENIED\x10\x06\x12\x1a\n" +
 	"\x16ERROR_KIND_UNAVAILABLE\x10\a\x12\x17\n" +
-	"\x13ERROR_KIND_INTERNAL\x10\b*\x89\x02\n" +
+	"\x13ERROR_KIND_INTERNAL\x10\b*\xb4\x02\n" +
 	"\tErrorCode\x12\x1a\n" +
 	"\x16ERROR_CODE_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aERROR_CODE_ALREADY_RUNNING\x10\x01\x12\x1a\n" +
@@ -11894,7 +14418,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\x1dERROR_CODE_MONITOR_CONNECTION\x10\x04\x12'\n" +
 	"#ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED\x10\x05\x12 \n" +
 	"\x1cERROR_CODE_COMMAND_NOT_FOUND\x10\x06\x12\x15\n" +
-	"\x11ERROR_CODE_NATIVE\x10\a*\xec\x03\n" +
+	"\x11ERROR_CODE_NATIVE\x10\a\x12)\n" +
+	"%ERROR_CODE_LIVE_OPERATION_UNSUPPORTED\x10\b*\xec\x03\n" +
 	"\x13LaunchFailureReason\x12%\n" +
 	"!LAUNCH_FAILURE_REASON_UNSPECIFIED\x10\x00\x12+\n" +
 	"'LAUNCH_FAILURE_REASON_COMMAND_NOT_FOUND\x10\x01\x12.\n" +
@@ -12011,13 +14536,52 @@ const file_daemon_proto_rawDesc = "" +
 	" MEMORY_RECLAIM_OUTCOME_RECLAIMED\x10\x01\x12\"\n" +
 	"\x1eMEMORY_RECLAIM_OUTCOME_PARTIAL\x10\x02\x12\"\n" +
 	"\x1eMEMORY_RECLAIM_OUTCOME_NOTHING\x10\x03\x12!\n" +
-	"\x1dMEMORY_RECLAIM_OUTCOME_FAILED\x10\x042\xc2\x02\n" +
+	"\x1dMEMORY_RECLAIM_OUTCOME_FAILED\x10\x04*d\n" +
+	"\x12StorageCaptureKind\x12$\n" +
+	" STORAGE_CAPTURE_KIND_UNSPECIFIED\x10\x00\x12(\n" +
+	"$STORAGE_CAPTURE_KIND_STOPPED_STORAGE\x10\x01*\xba\x01\n" +
+	"\rLiveOperation\x12\x1e\n" +
+	"\x1aLIVE_OPERATION_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14LIVE_OPERATION_PAUSE\x10\x01\x12\x1a\n" +
+	"\x16LIVE_OPERATION_CAPTURE\x10\x02\x12\x1a\n" +
+	"\x16LIVE_OPERATION_RESTORE\x10\x03\x12\x17\n" +
+	"\x13LIVE_OPERATION_FORK\x10\x04\x12\x1e\n" +
+	"\x1aLIVE_OPERATION_INCREMENTAL\x10\x05*n\n" +
+	"\vLiveBackend\x12\x1c\n" +
+	"\x18LIVE_BACKEND_UNSPECIFIED\x10\x00\x12\x15\n" +
+	"\x11LIVE_BACKEND_KRUN\x10\x01\x12\x13\n" +
+	"\x0fLIVE_BACKEND_VZ\x10\x02\x12\x15\n" +
+	"\x11LIVE_BACKEND_MOCK\x10\x03*\x96\x01\n" +
+	"\bLiveLane\x12\x19\n" +
+	"\x15LIVE_LANE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14LIVE_LANE_KVM_X86_64\x10\x01\x12\x1e\n" +
+	"\x1aLIVE_LANE_KVM_ARM64_GIC_V3\x10\x02\x12\x17\n" +
+	"\x13LIVE_LANE_HVF_ARM64\x10\x03\x12\x1c\n" +
+	"\x18LIVE_LANE_NOT_APPLICABLE\x10\x04*T\n" +
+	"\tLiveScope\x12\x1a\n" +
+	"\x16LIVE_SCOPE_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fLIVE_SCOPE_HOST\x10\x01\x12\x16\n" +
+	"\x12LIVE_SCOPE_MACHINE\x10\x02*\xd0\x02\n" +
+	"\x0eLiveReasonCode\x12 \n" +
+	"\x1cLIVE_REASON_CODE_UNSPECIFIED\x10\x00\x12%\n" +
+	"!LIVE_REASON_CODE_BACKEND_EXCLUDED\x10\x01\x12(\n" +
+	"$LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR\x10\x02\x12'\n" +
+	"#LIVE_REASON_CODE_LANE_NOT_QUALIFIED\x10\x03\x12+\n" +
+	"'LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE\x10\x04\x12#\n" +
+	"\x1fLIVE_REASON_CODE_BUILD_EXCLUDED\x10\x05\x12\"\n" +
+	"\x1eLIVE_REASON_CODE_NOT_DELIVERED\x10\x06\x12,\n" +
+	"(LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED\x10\a*\x9f\x01\n" +
+	"\x11LiveEvidenceState\x12#\n" +
+	"\x1fLIVE_EVIDENCE_STATE_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17LIVE_EVIDENCE_STATE_RUN\x10\x01\x12#\n" +
+	"\x1fLIVE_EVIDENCE_STATE_PROSPECTIVE\x10\x02\x12#\n" +
+	"\x1fLIVE_EVIDENCE_STATE_UNAVAILABLE\x10\x032\x91\x03\n" +
 	"\rDaemonService\x12A\n" +
 	"\tGetStatus\x12\x16.google.protobuf.Empty\x1a\x1c.silo.daemon.v1.DaemonStatus\x12E\n" +
 	"\x0eGetRuntimeInfo\x12\x16.google.protobuf.Empty\x1a\x1b.silo.daemon.v1.RuntimeInfo\x12V\n" +
 	"\x15ReportTailscaleStatus\x12%.silo.daemon.v1.TailscaleStatusReport\x1a\x16.google.protobuf.Empty\x12O\n" +
-	"\x0eDrainMutations\x12%.silo.daemon.v1.DrainMutationsRequest\x1a\x16.google.protobuf.Empty2\x91\n" +
-	"\n" +
+	"\x0eDrainMutations\x12%.silo.daemon.v1.DrainMutationsRequest\x1a\x16.google.protobuf.Empty\x12M\n" +
+	"\x13GetLiveCapabilities\x12\x16.google.protobuf.Empty\x1a\x1e.silo.daemon.v1.LiveHostReport2\xb1\r\n" +
 	"\x0eMachineService\x12O\n" +
 	"\fListMachines\x12\x16.google.protobuf.Empty\x1a%.silo.daemon.v1.MachineInventoryEntry0\x01\x12U\n" +
 	"\x10InspectInventory\x12\x1a.silo.daemon.v1.MachineRef\x1a%.silo.daemon.v1.MachineInventoryEntry\x12M\n" +
@@ -12035,20 +14599,31 @@ const file_daemon_proto_rawDesc = "" +
 	"WaitForRun\x12!.silo.daemon.v1.WaitForRunRequest\x1a\x1b.silo.daemon.v1.MachineExit\x12G\n" +
 	"\x0eRemoveAfterRun\x12\x1d.silo.daemon.v1.MachineRunRef\x1a\x16.google.protobuf.Empty\x12G\n" +
 	"\bReadLogs\x12\x1f.silo.daemon.v1.ReadLogsRequest\x1a\x18.silo.daemon.v1.LogChunk0\x01\x12S\n" +
-	"\x10SetMachineSecret\x12'.silo.daemon.v1.SetMachineSecretRequest\x1a\x16.google.protobuf.Empty2\xcc\x03\n" +
+	"\x10SetMachineSecret\x12'.silo.daemon.v1.SetMachineSecretRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
+	"\fPauseMachine\x12\".silo.daemon.v1.LiveMachineRequest\x1a\x16.google.protobuf.Empty\x12N\n" +
+	"\x10CaptureExecution\x12\".silo.daemon.v1.LiveCaptureRequest\x1a\x16.google.protobuf.Empty\x12H\n" +
+	"\rForkExecution\x12\x1f.silo.daemon.v1.LiveForkRequest\x1a\x16.google.protobuf.Empty\x12R\n" +
+	"\vForkStopped\x12\".silo.daemon.v1.StoppedForkRequest\x1a\x1f.silo.daemon.v1.MachineSnapshot\x12d\n" +
+	"\x0fSnapshotStopped\x12,.silo.daemon.v1.CreateStorageSnapshotRequest\x1a#.silo.daemon.v1.StorageSnapshotInfo2\xcc\x03\n" +
 	"\x0eNetworkService\x12U\n" +
 	"\x16ListNetworkDefinitions\x12\x16.google.protobuf.Empty\x1a!.silo.daemon.v1.NetworkDefinition0\x01\x12W\n" +
 	"\x14GetNetworkDefinition\x12\x14.silo.daemon.v1.Name\x1a).silo.daemon.v1.OptionalNetworkDefinition\x12a\n" +
 	"\x17CreateNetworkDefinition\x12..silo.daemon.v1.CreateNetworkDefinitionRequest\x1a\x16.google.protobuf.Empty\x12G\n" +
 	"\x17RemoveNetworkDefinition\x12\x14.silo.daemon.v1.Name\x1a\x16.google.protobuf.Empty\x12^\n" +
-	"\x11SetMachineNetwork\x12(.silo.daemon.v1.SetMachineNetworkRequest\x1a\x1f.silo.daemon.v1.MachineSnapshot2\x8c\x04\n" +
+	"\x11SetMachineNetwork\x12(.silo.daemon.v1.SetMachineNetworkRequest\x1a\x1f.silo.daemon.v1.MachineSnapshot2\x91\b\n" +
 	"\x0eRuntimeService\x12X\n" +
 	"\fResolveImage\x12#.silo.daemon.v1.ResolveImageRequest\x1a!.silo.daemon.v1.ResolveImageEvent0\x01\x12N\n" +
 	"\tPullImage\x12 .silo.daemon.v1.PullImageRequest\x1a\x1d.silo.daemon.v1.ImageProgress0\x01\x12B\n" +
 	"\x12ProposeMachineName\x12\x16.google.protobuf.Empty\x1a\x14.silo.daemon.v1.Name\x12K\n" +
 	"\rParseResource\x12$.silo.daemon.v1.ParseResourceRequest\x1a\x14.silo.daemon.v1.Size\x12Y\n" +
 	"\x0fNormalizePolicy\x12&.silo.daemon.v1.NormalizePolicyRequest\x1a\x1e.silo.daemon.v1.PolicyDocument\x12d\n" +
-	"\x12CheckPolicySecrets\x12).silo.daemon.v1.CheckPolicySecretsRequest\x1a#.silo.daemon.v1.PolicySecretsResultBGZEgithub.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1;daemonv1b\x06proto3"
+	"\x12CheckPolicySecrets\x12).silo.daemon.v1.CheckPolicySecretsRequest\x1a#.silo.daemon.v1.PolicySecretsResult\x12N\n" +
+	"\x10RestoreExecution\x12\".silo.daemon.v1.LiveRestoreRequest\x1a\x16.google.protobuf.Empty\x12a\n" +
+	"\x0fRestoreSnapshot\x12-.silo.daemon.v1.RestoreStorageSnapshotRequest\x1a\x1f.silo.daemon.v1.MachineSnapshot\x12a\n" +
+	"\x16InspectStorageSnapshot\x12\".silo.daemon.v1.StorageSnapshotRef\x1a#.silo.daemon.v1.StorageSnapshotInfo\x12S\n" +
+	"\x14ListStorageSnapshots\x12\x16.google.protobuf.Empty\x1a#.silo.daemon.v1.StorageSnapshotList\x12V\n" +
+	"\x18ReleaseSnapshotRetention\x12\".silo.daemon.v1.StorageSnapshotRef\x1a\x16.google.protobuf.Empty\x12@\n" +
+	"\x10RemoveImageAlias\x12\x14.silo.daemon.v1.Name\x1a\x16.google.protobuf.EmptyBGZEgithub.com/vandycknick/silo/specs/protocol/go/silo/daemon/v1;daemonv1b\x06proto3"
 
 var (
 	file_daemon_proto_rawDescOnce sync.Once
@@ -12062,462 +14637,578 @@ func file_daemon_proto_rawDescGZIP() []byte {
 	return file_daemon_proto_rawDescData
 }
 
-var file_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 40)
-var file_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 118)
+var file_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 50)
+var file_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 141)
 var file_daemon_proto_goTypes = []any{
 	(Retention)(0),                         // 0: silo.daemon.v1.Retention
-	(GuestOs)(0),                           // 1: silo.daemon.v1.GuestOs
-	(PublishBind)(0),                       // 2: silo.daemon.v1.PublishBind
-	(NetworkTopology)(0),                   // 3: silo.daemon.v1.NetworkTopology
-	(NetworkDriver)(0),                     // 4: silo.daemon.v1.NetworkDriver
-	(PullPolicy)(0),                        // 5: silo.daemon.v1.PullPolicy
-	(CacheState)(0),                        // 6: silo.daemon.v1.CacheState
-	(Observation)(0),                       // 7: silo.daemon.v1.Observation
-	(IssueComponent)(0),                    // 8: silo.daemon.v1.IssueComponent
-	(ImageSourceKind)(0),                   // 9: silo.daemon.v1.ImageSourceKind
-	(BootMode)(0),                          // 10: silo.daemon.v1.BootMode
-	(ProvisionStatus)(0),                   // 11: silo.daemon.v1.ProvisionStatus
-	(ProvisionStepStatus)(0),               // 12: silo.daemon.v1.ProvisionStepStatus
-	(ProvisionFailurePolicy)(0),            // 13: silo.daemon.v1.ProvisionFailurePolicy
-	(ReadinessOutcome)(0),                  // 14: silo.daemon.v1.ReadinessOutcome
-	(ExitOutcome)(0),                       // 15: silo.daemon.v1.ExitOutcome
-	(LogSource)(0),                         // 16: silo.daemon.v1.LogSource
-	(LogOutput)(0),                         // 17: silo.daemon.v1.LogOutput
-	(ResourceKind)(0),                      // 18: silo.daemon.v1.ResourceKind
-	(SecretKind)(0),                        // 19: silo.daemon.v1.SecretKind
-	(SecretField)(0),                       // 20: silo.daemon.v1.SecretField
-	(PolicySecretsState)(0),                // 21: silo.daemon.v1.PolicySecretsState
-	(ErrorKind)(0),                         // 22: silo.daemon.v1.ErrorKind
-	(ErrorCode)(0),                         // 23: silo.daemon.v1.ErrorCode
-	(LaunchFailureReason)(0),               // 24: silo.daemon.v1.LaunchFailureReason
-	(NodeState)(0),                         // 25: silo.daemon.v1.NodeState
-	(NetworkObservationIssue)(0),           // 26: silo.daemon.v1.NetworkObservationIssue
-	(CorePhase)(0),                         // 27: silo.daemon.v1.CorePhase
-	(ComponentState)(0),                    // 28: silo.daemon.v1.ComponentState
-	(ShutdownProtection)(0),                // 29: silo.daemon.v1.ShutdownProtection
-	(EnrollmentMode)(0),                    // 30: silo.daemon.v1.EnrollmentMode
-	(VmState)(0),                           // 31: silo.daemon.v1.VmState
-	(ReadinessReason)(0),                   // 32: silo.daemon.v1.ReadinessReason
-	(AgentConnectionState)(0),              // 33: silo.daemon.v1.AgentConnectionState
-	(Freshness)(0),                         // 34: silo.daemon.v1.Freshness
-	(StaleReason)(0),                       // 35: silo.daemon.v1.StaleReason
-	(AgentStatusState)(0),                  // 36: silo.daemon.v1.AgentStatusState
-	(SshBackend)(0),                        // 37: silo.daemon.v1.SshBackend
-	(SystemPhase)(0),                       // 38: silo.daemon.v1.SystemPhase
-	(MemoryReclaimOutcome)(0),              // 39: silo.daemon.v1.MemoryReclaimOutcome
-	(*Name)(nil),                           // 40: silo.daemon.v1.Name
-	(*MachineRef)(nil),                     // 41: silo.daemon.v1.MachineRef
-	(*MachineRunRef)(nil),                  // 42: silo.daemon.v1.MachineRunRef
-	(*StringList)(nil),                     // 43: silo.daemon.v1.StringList
-	(*StringMap)(nil),                      // 44: silo.daemon.v1.StringMap
-	(*EnvironmentPair)(nil),                // 45: silo.daemon.v1.EnvironmentPair
-	(*ProcessConfig)(nil),                  // 46: silo.daemon.v1.ProcessConfig
-	(*Agent)(nil),                          // 47: silo.daemon.v1.Agent
-	(*User)(nil),                           // 48: silo.daemon.v1.User
-	(*GuestConfig)(nil),                    // 49: silo.daemon.v1.GuestConfig
-	(*Mount)(nil),                          // 50: silo.daemon.v1.Mount
-	(*Disk)(nil),                           // 51: silo.daemon.v1.Disk
-	(*Address)(nil),                        // 52: silo.daemon.v1.Address
-	(*Endpoint)(nil),                       // 53: silo.daemon.v1.Endpoint
-	(*Forward)(nil),                        // 54: silo.daemon.v1.Forward
-	(*ForwardList)(nil),                    // 55: silo.daemon.v1.ForwardList
-	(*Vsock)(nil),                          // 56: silo.daemon.v1.Vsock
-	(*Kernel)(nil),                         // 57: silo.daemon.v1.Kernel
-	(*Boot)(nil),                           // 58: silo.daemon.v1.Boot
-	(*Hardware)(nil),                       // 59: silo.daemon.v1.Hardware
-	(*Storage)(nil),                        // 60: silo.daemon.v1.Storage
-	(*VmGuest)(nil),                        // 61: silo.daemon.v1.VmGuest
-	(*VmSpec)(nil),                         // 62: silo.daemon.v1.VmSpec
-	(*PrivateNetwork)(nil),                 // 63: silo.daemon.v1.PrivateNetwork
-	(*ResolvedNetwork)(nil),                // 64: silo.daemon.v1.ResolvedNetwork
-	(*NetworkDefinition)(nil),              // 65: silo.daemon.v1.NetworkDefinition
-	(*OptionalNetworkDefinition)(nil),      // 66: silo.daemon.v1.OptionalNetworkDefinition
-	(*CreateNetworkDefinitionRequest)(nil), // 67: silo.daemon.v1.CreateNetworkDefinitionRequest
-	(*SetMachineNetworkRequest)(nil),       // 68: silo.daemon.v1.SetMachineNetworkRequest
-	(*NormalizedMachineCreate)(nil),        // 69: silo.daemon.v1.NormalizedMachineCreate
-	(*OciIdentity)(nil),                    // 70: silo.daemon.v1.OciIdentity
-	(*ResolvedImage)(nil),                  // 71: silo.daemon.v1.ResolvedImage
-	(*CreateMachineRequest)(nil),           // 72: silo.daemon.v1.CreateMachineRequest
-	(*ImageReferenceProgress)(nil),         // 73: silo.daemon.v1.ImageReferenceProgress
-	(*ManifestProgress)(nil),               // 74: silo.daemon.v1.ManifestProgress
-	(*LayerProgress)(nil),                  // 75: silo.daemon.v1.LayerProgress
-	(*ApplyingLayerProgress)(nil),          // 76: silo.daemon.v1.ApplyingLayerProgress
-	(*ImageProgress)(nil),                  // 77: silo.daemon.v1.ImageProgress
-	(*CreateMachineEvent)(nil),             // 78: silo.daemon.v1.CreateMachineEvent
-	(*ResolveImageRequest)(nil),            // 79: silo.daemon.v1.ResolveImageRequest
-	(*ResolveImageEvent)(nil),              // 80: silo.daemon.v1.ResolveImageEvent
-	(*PullImageRequest)(nil),               // 81: silo.daemon.v1.PullImageRequest
-	(*EgressSecret)(nil),                   // 82: silo.daemon.v1.EgressSecret
-	(*Entrypoint)(nil),                     // 83: silo.daemon.v1.Entrypoint
-	(*StartOptions)(nil),                   // 84: silo.daemon.v1.StartOptions
-	(*StartMachineRequest)(nil),            // 85: silo.daemon.v1.StartMachineRequest
-	(*StopMachineRequest)(nil),             // 86: silo.daemon.v1.StopMachineRequest
-	(*RemoveMachineRequest)(nil),           // 87: silo.daemon.v1.RemoveMachineRequest
-	(*PolicyUpdate)(nil),                   // 88: silo.daemon.v1.PolicyUpdate
-	(*PublicationUpdate)(nil),              // 89: silo.daemon.v1.PublicationUpdate
-	(*UserUpdate)(nil),                     // 90: silo.daemon.v1.UserUpdate
-	(*MachineUpdate)(nil),                  // 91: silo.daemon.v1.MachineUpdate
-	(*UpdateMachineRequest)(nil),           // 92: silo.daemon.v1.UpdateMachineRequest
-	(*WaitReadyRequest)(nil),               // 93: silo.daemon.v1.WaitReadyRequest
-	(*StopRunRequest)(nil),                 // 94: silo.daemon.v1.StopRunRequest
-	(*KillRunRequest)(nil),                 // 95: silo.daemon.v1.KillRunRequest
-	(*WaitForRunRequest)(nil),              // 96: silo.daemon.v1.WaitForRunRequest
-	(*MachineIssue)(nil),                   // 97: silo.daemon.v1.MachineIssue
-	(*LifecycleDetail)(nil),                // 98: silo.daemon.v1.LifecycleDetail
-	(*RunningStatus)(nil),                  // 99: silo.daemon.v1.RunningStatus
-	(*MachineStatus)(nil),                  // 100: silo.daemon.v1.MachineStatus
-	(*Rootfs)(nil),                         // 101: silo.daemon.v1.Rootfs
-	(*MachineTailscale)(nil),               // 102: silo.daemon.v1.MachineTailscale
-	(*BootReport)(nil),                     // 103: silo.daemon.v1.BootReport
-	(*ProvisionStepReport)(nil),            // 104: silo.daemon.v1.ProvisionStepReport
-	(*ProvisionReport)(nil),                // 105: silo.daemon.v1.ProvisionReport
-	(*MachineSnapshot)(nil),                // 106: silo.daemon.v1.MachineSnapshot
-	(*MachineInventoryEntry)(nil),          // 107: silo.daemon.v1.MachineInventoryEntry
-	(*MachineStart)(nil),                   // 108: silo.daemon.v1.MachineStart
-	(*MachineReadiness)(nil),               // 109: silo.daemon.v1.MachineReadiness
-	(*MachineExit)(nil),                    // 110: silo.daemon.v1.MachineExit
-	(*ReadLogsRequest)(nil),                // 111: silo.daemon.v1.ReadLogsRequest
-	(*LogChunk)(nil),                       // 112: silo.daemon.v1.LogChunk
-	(*SetMachineSecretRequest)(nil),        // 113: silo.daemon.v1.SetMachineSecretRequest
-	(*ParseResourceRequest)(nil),           // 114: silo.daemon.v1.ParseResourceRequest
-	(*Size)(nil),                           // 115: silo.daemon.v1.Size
-	(*NormalizePolicyRequest)(nil),         // 116: silo.daemon.v1.NormalizePolicyRequest
-	(*SecretAlternative)(nil),              // 117: silo.daemon.v1.SecretAlternative
-	(*SecretRequirement)(nil),              // 118: silo.daemon.v1.SecretRequirement
-	(*SecretSlot)(nil),                     // 119: silo.daemon.v1.SecretSlot
-	(*PolicyDocument)(nil),                 // 120: silo.daemon.v1.PolicyDocument
-	(*CheckPolicySecretsRequest)(nil),      // 121: silo.daemon.v1.CheckPolicySecretsRequest
-	(*SecretDiagnostic)(nil),               // 122: silo.daemon.v1.SecretDiagnostic
-	(*PolicySecretsResult)(nil),            // 123: silo.daemon.v1.PolicySecretsResult
-	(*ErrorDetail)(nil),                    // 124: silo.daemon.v1.ErrorDetail
-	(*NodeStatus)(nil),                     // 125: silo.daemon.v1.NodeStatus
-	(*NodeObservation)(nil),                // 126: silo.daemon.v1.NodeObservation
-	(*NetworkObservation)(nil),             // 127: silo.daemon.v1.NetworkObservation
-	(*ComponentStatus)(nil),                // 128: silo.daemon.v1.ComponentStatus
-	(*DaemonStatus)(nil),                   // 129: silo.daemon.v1.DaemonStatus
-	(*RuntimeComponents)(nil),              // 130: silo.daemon.v1.RuntimeComponents
-	(*RuntimeInfo)(nil),                    // 131: silo.daemon.v1.RuntimeInfo
-	(*TailscaleStatusReport)(nil),          // 132: silo.daemon.v1.TailscaleStatusReport
-	(*DrainMutationsRequest)(nil),          // 133: silo.daemon.v1.DrainMutationsRequest
-	(*ResourceDefaults)(nil),               // 134: silo.daemon.v1.ResourceDefaults
-	(*ResourceCeilings)(nil),               // 135: silo.daemon.v1.ResourceCeilings
-	(*TailscaleSettings)(nil),              // 136: silo.daemon.v1.TailscaleSettings
-	(*HelperBootstrap)(nil),                // 137: silo.daemon.v1.HelperBootstrap
-	(*MonitorSnapshot)(nil),                // 138: silo.daemon.v1.MonitorSnapshot
-	(*VmSnapshot)(nil),                     // 139: silo.daemon.v1.VmSnapshot
-	(*ReadinessState)(nil),                 // 140: silo.daemon.v1.ReadinessState
-	(*AgentConnection)(nil),                // 141: silo.daemon.v1.AgentConnection
-	(*AgentIdentity)(nil),                  // 142: silo.daemon.v1.AgentIdentity
-	(*SystemInfo)(nil),                     // 143: silo.daemon.v1.SystemInfo
-	(*SshListenerReport)(nil),              // 144: silo.daemon.v1.SshListenerReport
-	(*GuestProvisionReport)(nil),           // 145: silo.daemon.v1.GuestProvisionReport
-	(*AgentStatusReport)(nil),              // 146: silo.daemon.v1.AgentStatusReport
-	(*AgentStatusObservation)(nil),         // 147: silo.daemon.v1.AgentStatusObservation
-	(*EnabledAgent)(nil),                   // 148: silo.daemon.v1.EnabledAgent
-	(*AgentStatus)(nil),                    // 149: silo.daemon.v1.AgentStatus
-	(*MonitorStatus)(nil),                  // 150: silo.daemon.v1.MonitorStatus
-	(*SystemStatus)(nil),                   // 151: silo.daemon.v1.SystemStatus
-	nil,                                    // 152: silo.daemon.v1.StringMap.ValuesEntry
-	nil,                                    // 153: silo.daemon.v1.ProcessConfig.EnvironmentEntry
-	nil,                                    // 154: silo.daemon.v1.VmSpec.AnnotationsEntry
-	nil,                                    // 155: silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
-	nil,                                    // 156: silo.daemon.v1.MachineSnapshot.LabelsEntry
-	nil,                                    // 157: silo.daemon.v1.MachineSnapshot.MetadataEntry
-	(*emptypb.Empty)(nil),                  // 158: google.protobuf.Empty
-	(*durationpb.Duration)(nil),            // 159: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),          // 160: google.protobuf.Timestamp
+	(DiskRole)(0),                          // 1: silo.daemon.v1.DiskRole
+	(DiskFormat)(0),                        // 2: silo.daemon.v1.DiskFormat
+	(GuestOs)(0),                           // 3: silo.daemon.v1.GuestOs
+	(PublishBind)(0),                       // 4: silo.daemon.v1.PublishBind
+	(NetworkTopology)(0),                   // 5: silo.daemon.v1.NetworkTopology
+	(NetworkDriver)(0),                     // 6: silo.daemon.v1.NetworkDriver
+	(RootProfile)(0),                       // 7: silo.daemon.v1.RootProfile
+	(PullPolicy)(0),                        // 8: silo.daemon.v1.PullPolicy
+	(CacheState)(0),                        // 9: silo.daemon.v1.CacheState
+	(Observation)(0),                       // 10: silo.daemon.v1.Observation
+	(IssueComponent)(0),                    // 11: silo.daemon.v1.IssueComponent
+	(ImageSourceKind)(0),                   // 12: silo.daemon.v1.ImageSourceKind
+	(BootMode)(0),                          // 13: silo.daemon.v1.BootMode
+	(ProvisionStatus)(0),                   // 14: silo.daemon.v1.ProvisionStatus
+	(ProvisionStepStatus)(0),               // 15: silo.daemon.v1.ProvisionStepStatus
+	(ProvisionFailurePolicy)(0),            // 16: silo.daemon.v1.ProvisionFailurePolicy
+	(ReadinessOutcome)(0),                  // 17: silo.daemon.v1.ReadinessOutcome
+	(ExitOutcome)(0),                       // 18: silo.daemon.v1.ExitOutcome
+	(LogSource)(0),                         // 19: silo.daemon.v1.LogSource
+	(LogOutput)(0),                         // 20: silo.daemon.v1.LogOutput
+	(ResourceKind)(0),                      // 21: silo.daemon.v1.ResourceKind
+	(SecretKind)(0),                        // 22: silo.daemon.v1.SecretKind
+	(SecretField)(0),                       // 23: silo.daemon.v1.SecretField
+	(PolicySecretsState)(0),                // 24: silo.daemon.v1.PolicySecretsState
+	(ErrorKind)(0),                         // 25: silo.daemon.v1.ErrorKind
+	(ErrorCode)(0),                         // 26: silo.daemon.v1.ErrorCode
+	(LaunchFailureReason)(0),               // 27: silo.daemon.v1.LaunchFailureReason
+	(NodeState)(0),                         // 28: silo.daemon.v1.NodeState
+	(NetworkObservationIssue)(0),           // 29: silo.daemon.v1.NetworkObservationIssue
+	(CorePhase)(0),                         // 30: silo.daemon.v1.CorePhase
+	(ComponentState)(0),                    // 31: silo.daemon.v1.ComponentState
+	(ShutdownProtection)(0),                // 32: silo.daemon.v1.ShutdownProtection
+	(EnrollmentMode)(0),                    // 33: silo.daemon.v1.EnrollmentMode
+	(VmState)(0),                           // 34: silo.daemon.v1.VmState
+	(ReadinessReason)(0),                   // 35: silo.daemon.v1.ReadinessReason
+	(AgentConnectionState)(0),              // 36: silo.daemon.v1.AgentConnectionState
+	(Freshness)(0),                         // 37: silo.daemon.v1.Freshness
+	(StaleReason)(0),                       // 38: silo.daemon.v1.StaleReason
+	(AgentStatusState)(0),                  // 39: silo.daemon.v1.AgentStatusState
+	(SshBackend)(0),                        // 40: silo.daemon.v1.SshBackend
+	(SystemPhase)(0),                       // 41: silo.daemon.v1.SystemPhase
+	(MemoryReclaimOutcome)(0),              // 42: silo.daemon.v1.MemoryReclaimOutcome
+	(StorageCaptureKind)(0),                // 43: silo.daemon.v1.StorageCaptureKind
+	(LiveOperation)(0),                     // 44: silo.daemon.v1.LiveOperation
+	(LiveBackend)(0),                       // 45: silo.daemon.v1.LiveBackend
+	(LiveLane)(0),                          // 46: silo.daemon.v1.LiveLane
+	(LiveScope)(0),                         // 47: silo.daemon.v1.LiveScope
+	(LiveReasonCode)(0),                    // 48: silo.daemon.v1.LiveReasonCode
+	(LiveEvidenceState)(0),                 // 49: silo.daemon.v1.LiveEvidenceState
+	(*Name)(nil),                           // 50: silo.daemon.v1.Name
+	(*MachineRef)(nil),                     // 51: silo.daemon.v1.MachineRef
+	(*MachineRunRef)(nil),                  // 52: silo.daemon.v1.MachineRunRef
+	(*StringList)(nil),                     // 53: silo.daemon.v1.StringList
+	(*StringMap)(nil),                      // 54: silo.daemon.v1.StringMap
+	(*EnvironmentPair)(nil),                // 55: silo.daemon.v1.EnvironmentPair
+	(*ProcessConfig)(nil),                  // 56: silo.daemon.v1.ProcessConfig
+	(*Agent)(nil),                          // 57: silo.daemon.v1.Agent
+	(*User)(nil),                           // 58: silo.daemon.v1.User
+	(*GuestConfig)(nil),                    // 59: silo.daemon.v1.GuestConfig
+	(*Mount)(nil),                          // 60: silo.daemon.v1.Mount
+	(*DiskGeometry)(nil),                   // 61: silo.daemon.v1.DiskGeometry
+	(*Disk)(nil),                           // 62: silo.daemon.v1.Disk
+	(*Address)(nil),                        // 63: silo.daemon.v1.Address
+	(*Endpoint)(nil),                       // 64: silo.daemon.v1.Endpoint
+	(*Forward)(nil),                        // 65: silo.daemon.v1.Forward
+	(*ForwardList)(nil),                    // 66: silo.daemon.v1.ForwardList
+	(*Vsock)(nil),                          // 67: silo.daemon.v1.Vsock
+	(*Kernel)(nil),                         // 68: silo.daemon.v1.Kernel
+	(*Boot)(nil),                           // 69: silo.daemon.v1.Boot
+	(*Hardware)(nil),                       // 70: silo.daemon.v1.Hardware
+	(*Storage)(nil),                        // 71: silo.daemon.v1.Storage
+	(*VmGuest)(nil),                        // 72: silo.daemon.v1.VmGuest
+	(*VmSpec)(nil),                         // 73: silo.daemon.v1.VmSpec
+	(*PrivateNetwork)(nil),                 // 74: silo.daemon.v1.PrivateNetwork
+	(*ResolvedNetwork)(nil),                // 75: silo.daemon.v1.ResolvedNetwork
+	(*NetworkDefinition)(nil),              // 76: silo.daemon.v1.NetworkDefinition
+	(*OptionalNetworkDefinition)(nil),      // 77: silo.daemon.v1.OptionalNetworkDefinition
+	(*CreateNetworkDefinitionRequest)(nil), // 78: silo.daemon.v1.CreateNetworkDefinitionRequest
+	(*SetMachineNetworkRequest)(nil),       // 79: silo.daemon.v1.SetMachineNetworkRequest
+	(*TemporaryDirectoryPolicy)(nil),       // 80: silo.daemon.v1.TemporaryDirectoryPolicy
+	(*NormalizedMachineCreate)(nil),        // 81: silo.daemon.v1.NormalizedMachineCreate
+	(*OciIdentity)(nil),                    // 82: silo.daemon.v1.OciIdentity
+	(*ResolvedImage)(nil),                  // 83: silo.daemon.v1.ResolvedImage
+	(*CreateMachineRequest)(nil),           // 84: silo.daemon.v1.CreateMachineRequest
+	(*ImageReferenceProgress)(nil),         // 85: silo.daemon.v1.ImageReferenceProgress
+	(*ManifestProgress)(nil),               // 86: silo.daemon.v1.ManifestProgress
+	(*LayerProgress)(nil),                  // 87: silo.daemon.v1.LayerProgress
+	(*ApplyingLayerProgress)(nil),          // 88: silo.daemon.v1.ApplyingLayerProgress
+	(*ImageProgress)(nil),                  // 89: silo.daemon.v1.ImageProgress
+	(*CreateMachineEvent)(nil),             // 90: silo.daemon.v1.CreateMachineEvent
+	(*ResolveImageRequest)(nil),            // 91: silo.daemon.v1.ResolveImageRequest
+	(*ResolveImageEvent)(nil),              // 92: silo.daemon.v1.ResolveImageEvent
+	(*PullImageRequest)(nil),               // 93: silo.daemon.v1.PullImageRequest
+	(*EgressSecret)(nil),                   // 94: silo.daemon.v1.EgressSecret
+	(*Entrypoint)(nil),                     // 95: silo.daemon.v1.Entrypoint
+	(*StartOptions)(nil),                   // 96: silo.daemon.v1.StartOptions
+	(*StartMachineRequest)(nil),            // 97: silo.daemon.v1.StartMachineRequest
+	(*StopMachineRequest)(nil),             // 98: silo.daemon.v1.StopMachineRequest
+	(*RemoveMachineRequest)(nil),           // 99: silo.daemon.v1.RemoveMachineRequest
+	(*PolicyUpdate)(nil),                   // 100: silo.daemon.v1.PolicyUpdate
+	(*PublicationUpdate)(nil),              // 101: silo.daemon.v1.PublicationUpdate
+	(*UserUpdate)(nil),                     // 102: silo.daemon.v1.UserUpdate
+	(*MachineUpdate)(nil),                  // 103: silo.daemon.v1.MachineUpdate
+	(*UpdateMachineRequest)(nil),           // 104: silo.daemon.v1.UpdateMachineRequest
+	(*WaitReadyRequest)(nil),               // 105: silo.daemon.v1.WaitReadyRequest
+	(*StopRunRequest)(nil),                 // 106: silo.daemon.v1.StopRunRequest
+	(*KillRunRequest)(nil),                 // 107: silo.daemon.v1.KillRunRequest
+	(*WaitForRunRequest)(nil),              // 108: silo.daemon.v1.WaitForRunRequest
+	(*MachineIssue)(nil),                   // 109: silo.daemon.v1.MachineIssue
+	(*LifecycleDetail)(nil),                // 110: silo.daemon.v1.LifecycleDetail
+	(*RunningStatus)(nil),                  // 111: silo.daemon.v1.RunningStatus
+	(*MachineStatus)(nil),                  // 112: silo.daemon.v1.MachineStatus
+	(*Rootfs)(nil),                         // 113: silo.daemon.v1.Rootfs
+	(*MachineTailscale)(nil),               // 114: silo.daemon.v1.MachineTailscale
+	(*BootReport)(nil),                     // 115: silo.daemon.v1.BootReport
+	(*ProvisionStepReport)(nil),            // 116: silo.daemon.v1.ProvisionStepReport
+	(*ProvisionReport)(nil),                // 117: silo.daemon.v1.ProvisionReport
+	(*MachineSnapshot)(nil),                // 118: silo.daemon.v1.MachineSnapshot
+	(*MachineInventoryEntry)(nil),          // 119: silo.daemon.v1.MachineInventoryEntry
+	(*MachineStart)(nil),                   // 120: silo.daemon.v1.MachineStart
+	(*MachineReadiness)(nil),               // 121: silo.daemon.v1.MachineReadiness
+	(*MachineExit)(nil),                    // 122: silo.daemon.v1.MachineExit
+	(*ReadLogsRequest)(nil),                // 123: silo.daemon.v1.ReadLogsRequest
+	(*LogChunk)(nil),                       // 124: silo.daemon.v1.LogChunk
+	(*SetMachineSecretRequest)(nil),        // 125: silo.daemon.v1.SetMachineSecretRequest
+	(*ParseResourceRequest)(nil),           // 126: silo.daemon.v1.ParseResourceRequest
+	(*Size)(nil),                           // 127: silo.daemon.v1.Size
+	(*NormalizePolicyRequest)(nil),         // 128: silo.daemon.v1.NormalizePolicyRequest
+	(*SecretAlternative)(nil),              // 129: silo.daemon.v1.SecretAlternative
+	(*SecretRequirement)(nil),              // 130: silo.daemon.v1.SecretRequirement
+	(*SecretSlot)(nil),                     // 131: silo.daemon.v1.SecretSlot
+	(*PolicyDocument)(nil),                 // 132: silo.daemon.v1.PolicyDocument
+	(*CheckPolicySecretsRequest)(nil),      // 133: silo.daemon.v1.CheckPolicySecretsRequest
+	(*SecretDiagnostic)(nil),               // 134: silo.daemon.v1.SecretDiagnostic
+	(*PolicySecretsResult)(nil),            // 135: silo.daemon.v1.PolicySecretsResult
+	(*ErrorDetail)(nil),                    // 136: silo.daemon.v1.ErrorDetail
+	(*NodeStatus)(nil),                     // 137: silo.daemon.v1.NodeStatus
+	(*NodeObservation)(nil),                // 138: silo.daemon.v1.NodeObservation
+	(*NetworkObservation)(nil),             // 139: silo.daemon.v1.NetworkObservation
+	(*ComponentStatus)(nil),                // 140: silo.daemon.v1.ComponentStatus
+	(*DaemonStatus)(nil),                   // 141: silo.daemon.v1.DaemonStatus
+	(*RuntimeComponents)(nil),              // 142: silo.daemon.v1.RuntimeComponents
+	(*RuntimeInfo)(nil),                    // 143: silo.daemon.v1.RuntimeInfo
+	(*TailscaleStatusReport)(nil),          // 144: silo.daemon.v1.TailscaleStatusReport
+	(*DrainMutationsRequest)(nil),          // 145: silo.daemon.v1.DrainMutationsRequest
+	(*ResourceDefaults)(nil),               // 146: silo.daemon.v1.ResourceDefaults
+	(*ResourceCeilings)(nil),               // 147: silo.daemon.v1.ResourceCeilings
+	(*TailscaleSettings)(nil),              // 148: silo.daemon.v1.TailscaleSettings
+	(*HelperBootstrap)(nil),                // 149: silo.daemon.v1.HelperBootstrap
+	(*MonitorSnapshot)(nil),                // 150: silo.daemon.v1.MonitorSnapshot
+	(*VmSnapshot)(nil),                     // 151: silo.daemon.v1.VmSnapshot
+	(*ReadinessState)(nil),                 // 152: silo.daemon.v1.ReadinessState
+	(*AgentConnection)(nil),                // 153: silo.daemon.v1.AgentConnection
+	(*AgentIdentity)(nil),                  // 154: silo.daemon.v1.AgentIdentity
+	(*SystemInfo)(nil),                     // 155: silo.daemon.v1.SystemInfo
+	(*SshListenerReport)(nil),              // 156: silo.daemon.v1.SshListenerReport
+	(*GuestProvisionReport)(nil),           // 157: silo.daemon.v1.GuestProvisionReport
+	(*AgentStatusReport)(nil),              // 158: silo.daemon.v1.AgentStatusReport
+	(*AgentStatusObservation)(nil),         // 159: silo.daemon.v1.AgentStatusObservation
+	(*EnabledAgent)(nil),                   // 160: silo.daemon.v1.EnabledAgent
+	(*AgentStatus)(nil),                    // 161: silo.daemon.v1.AgentStatus
+	(*MonitorStatus)(nil),                  // 162: silo.daemon.v1.MonitorStatus
+	(*SystemStatus)(nil),                   // 163: silo.daemon.v1.SystemStatus
+	(*LiveMachineRequest)(nil),             // 164: silo.daemon.v1.LiveMachineRequest
+	(*LiveCaptureRequest)(nil),             // 165: silo.daemon.v1.LiveCaptureRequest
+	(*LiveForkRequest)(nil),                // 166: silo.daemon.v1.LiveForkRequest
+	(*LiveRestoreRequest)(nil),             // 167: silo.daemon.v1.LiveRestoreRequest
+	(*StorageSnapshotRef)(nil),             // 168: silo.daemon.v1.StorageSnapshotRef
+	(*ExternalResourceKey)(nil),            // 169: silo.daemon.v1.ExternalResourceKey
+	(*ExternalResourceMapping)(nil),        // 170: silo.daemon.v1.ExternalResourceMapping
+	(*ExternalResourceMappings)(nil),       // 171: silo.daemon.v1.ExternalResourceMappings
+	(*ExternalResourcePolicy)(nil),         // 172: silo.daemon.v1.ExternalResourcePolicy
+	(*StoppedForkRequest)(nil),             // 173: silo.daemon.v1.StoppedForkRequest
+	(*CreateStorageSnapshotRequest)(nil),   // 174: silo.daemon.v1.CreateStorageSnapshotRequest
+	(*RestoreStorageSnapshotRequest)(nil),  // 175: silo.daemon.v1.RestoreStorageSnapshotRequest
+	(*StorageSnapshotInfo)(nil),            // 176: silo.daemon.v1.StorageSnapshotInfo
+	(*StorageSnapshotList)(nil),            // 177: silo.daemon.v1.StorageSnapshotList
+	(*LiveDeviceSubject)(nil),              // 178: silo.daemon.v1.LiveDeviceSubject
+	(*LiveUnsupportedReason)(nil),          // 179: silo.daemon.v1.LiveUnsupportedReason
+	(*LiveCapability)(nil),                 // 180: silo.daemon.v1.LiveCapability
+	(*LiveCapabilityVector)(nil),           // 181: silo.daemon.v1.LiveCapabilityVector
+	(*LiveHostReport)(nil),                 // 182: silo.daemon.v1.LiveHostReport
+	(*LiveMachineReport)(nil),              // 183: silo.daemon.v1.LiveMachineReport
+	(*LiveOperationUnsupported)(nil),       // 184: silo.daemon.v1.LiveOperationUnsupported
+	nil,                                    // 185: silo.daemon.v1.StringMap.ValuesEntry
+	nil,                                    // 186: silo.daemon.v1.ProcessConfig.EnvironmentEntry
+	nil,                                    // 187: silo.daemon.v1.VmSpec.AnnotationsEntry
+	nil,                                    // 188: silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
+	nil,                                    // 189: silo.daemon.v1.MachineSnapshot.LabelsEntry
+	nil,                                    // 190: silo.daemon.v1.MachineSnapshot.MetadataEntry
+	(*emptypb.Empty)(nil),                  // 191: google.protobuf.Empty
+	(*durationpb.Duration)(nil),            // 192: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),          // 193: google.protobuf.Timestamp
 }
 var file_daemon_proto_depIdxs = []int32{
-	152, // 0: silo.daemon.v1.StringMap.values:type_name -> silo.daemon.v1.StringMap.ValuesEntry
-	43,  // 1: silo.daemon.v1.ProcessConfig.entrypoint:type_name -> silo.daemon.v1.StringList
-	43,  // 2: silo.daemon.v1.ProcessConfig.command:type_name -> silo.daemon.v1.StringList
-	153, // 3: silo.daemon.v1.ProcessConfig.environment:type_name -> silo.daemon.v1.ProcessConfig.EnvironmentEntry
-	158, // 4: silo.daemon.v1.Agent.default_agent:type_name -> google.protobuf.Empty
-	158, // 5: silo.daemon.v1.Agent.none:type_name -> google.protobuf.Empty
-	47,  // 6: silo.daemon.v1.GuestConfig.agent:type_name -> silo.daemon.v1.Agent
-	48,  // 7: silo.daemon.v1.GuestConfig.user:type_name -> silo.daemon.v1.User
-	52,  // 8: silo.daemon.v1.Endpoint.host:type_name -> silo.daemon.v1.Address
-	52,  // 9: silo.daemon.v1.Endpoint.guest:type_name -> silo.daemon.v1.Address
-	53,  // 10: silo.daemon.v1.Forward.listen:type_name -> silo.daemon.v1.Endpoint
-	53,  // 11: silo.daemon.v1.Forward.connect:type_name -> silo.daemon.v1.Endpoint
-	54,  // 12: silo.daemon.v1.ForwardList.values:type_name -> silo.daemon.v1.Forward
-	57,  // 13: silo.daemon.v1.Boot.kernel:type_name -> silo.daemon.v1.Kernel
-	51,  // 14: silo.daemon.v1.Storage.disks:type_name -> silo.daemon.v1.Disk
-	1,   // 15: silo.daemon.v1.VmGuest.os:type_name -> silo.daemon.v1.GuestOs
-	61,  // 16: silo.daemon.v1.VmSpec.guest:type_name -> silo.daemon.v1.VmGuest
-	58,  // 17: silo.daemon.v1.VmSpec.boot:type_name -> silo.daemon.v1.Boot
-	59,  // 18: silo.daemon.v1.VmSpec.hardware:type_name -> silo.daemon.v1.Hardware
-	60,  // 19: silo.daemon.v1.VmSpec.storage:type_name -> silo.daemon.v1.Storage
-	50,  // 20: silo.daemon.v1.VmSpec.mounts:type_name -> silo.daemon.v1.Mount
-	54,  // 21: silo.daemon.v1.VmSpec.forwards:type_name -> silo.daemon.v1.Forward
-	56,  // 22: silo.daemon.v1.VmSpec.vsock:type_name -> silo.daemon.v1.Vsock
-	154, // 23: silo.daemon.v1.VmSpec.annotations:type_name -> silo.daemon.v1.VmSpec.AnnotationsEntry
-	2,   // 24: silo.daemon.v1.PrivateNetwork.publish:type_name -> silo.daemon.v1.PublishBind
-	63,  // 25: silo.daemon.v1.ResolvedNetwork.private:type_name -> silo.daemon.v1.PrivateNetwork
-	158, // 26: silo.daemon.v1.ResolvedNetwork.none:type_name -> google.protobuf.Empty
-	40,  // 27: silo.daemon.v1.ResolvedNetwork.named:type_name -> silo.daemon.v1.Name
-	3,   // 28: silo.daemon.v1.NetworkDefinition.topology:type_name -> silo.daemon.v1.NetworkTopology
-	4,   // 29: silo.daemon.v1.NetworkDefinition.driver:type_name -> silo.daemon.v1.NetworkDriver
-	65,  // 30: silo.daemon.v1.OptionalNetworkDefinition.definition:type_name -> silo.daemon.v1.NetworkDefinition
-	65,  // 31: silo.daemon.v1.CreateNetworkDefinitionRequest.definition:type_name -> silo.daemon.v1.NetworkDefinition
-	41,  // 32: silo.daemon.v1.SetMachineNetworkRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	64,  // 33: silo.daemon.v1.SetMachineNetworkRequest.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	155, // 34: silo.daemon.v1.NormalizedMachineCreate.labels:type_name -> silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
-	46,  // 35: silo.daemon.v1.NormalizedMachineCreate.process:type_name -> silo.daemon.v1.ProcessConfig
-	0,   // 36: silo.daemon.v1.NormalizedMachineCreate.retention:type_name -> silo.daemon.v1.Retention
-	50,  // 37: silo.daemon.v1.NormalizedMachineCreate.mounts:type_name -> silo.daemon.v1.Mount
-	54,  // 38: silo.daemon.v1.NormalizedMachineCreate.forwards:type_name -> silo.daemon.v1.Forward
-	64,  // 39: silo.daemon.v1.NormalizedMachineCreate.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	47,  // 40: silo.daemon.v1.NormalizedMachineCreate.agent:type_name -> silo.daemon.v1.Agent
-	48,  // 41: silo.daemon.v1.NormalizedMachineCreate.provision_user:type_name -> silo.daemon.v1.User
-	5,   // 42: silo.daemon.v1.OciIdentity.pull_policy:type_name -> silo.daemon.v1.PullPolicy
-	70,  // 43: silo.daemon.v1.ResolvedImage.identity:type_name -> silo.daemon.v1.OciIdentity
-	6,   // 44: silo.daemon.v1.ResolvedImage.cache_state:type_name -> silo.daemon.v1.CacheState
-	69,  // 45: silo.daemon.v1.CreateMachineRequest.configuration:type_name -> silo.daemon.v1.NormalizedMachineCreate
-	70,  // 46: silo.daemon.v1.CreateMachineRequest.oci:type_name -> silo.daemon.v1.OciIdentity
-	73,  // 47: silo.daemon.v1.ImageProgress.resolving_manifest:type_name -> silo.daemon.v1.ImageReferenceProgress
-	74,  // 48: silo.daemon.v1.ImageProgress.resolved_manifest:type_name -> silo.daemon.v1.ManifestProgress
-	73,  // 49: silo.daemon.v1.ImageProgress.checking_cache:type_name -> silo.daemon.v1.ImageReferenceProgress
-	73,  // 50: silo.daemon.v1.ImageProgress.cache_hit:type_name -> silo.daemon.v1.ImageReferenceProgress
-	73,  // 51: silo.daemon.v1.ImageProgress.cache_miss:type_name -> silo.daemon.v1.ImageReferenceProgress
-	73,  // 52: silo.daemon.v1.ImageProgress.using_local_disk:type_name -> silo.daemon.v1.ImageReferenceProgress
-	75,  // 53: silo.daemon.v1.ImageProgress.layer_download_started:type_name -> silo.daemon.v1.LayerProgress
-	75,  // 54: silo.daemon.v1.ImageProgress.layer_download_progress:type_name -> silo.daemon.v1.LayerProgress
-	75,  // 55: silo.daemon.v1.ImageProgress.layer_download_verifying:type_name -> silo.daemon.v1.LayerProgress
-	75,  // 56: silo.daemon.v1.ImageProgress.layer_download_finished:type_name -> silo.daemon.v1.LayerProgress
-	75,  // 57: silo.daemon.v1.ImageProgress.layer_download_skipped:type_name -> silo.daemon.v1.LayerProgress
-	76,  // 58: silo.daemon.v1.ImageProgress.applying_layer:type_name -> silo.daemon.v1.ApplyingLayerProgress
-	158, // 59: silo.daemon.v1.ImageProgress.materializing_rootfs:type_name -> google.protobuf.Empty
-	158, // 60: silo.daemon.v1.ImageProgress.publishing_rootfs:type_name -> google.protobuf.Empty
-	158, // 61: silo.daemon.v1.ImageProgress.complete:type_name -> google.protobuf.Empty
-	77,  // 62: silo.daemon.v1.CreateMachineEvent.progress:type_name -> silo.daemon.v1.ImageProgress
-	106, // 63: silo.daemon.v1.CreateMachineEvent.machine:type_name -> silo.daemon.v1.MachineSnapshot
-	5,   // 64: silo.daemon.v1.ResolveImageRequest.pull_policy:type_name -> silo.daemon.v1.PullPolicy
-	77,  // 65: silo.daemon.v1.ResolveImageEvent.progress:type_name -> silo.daemon.v1.ImageProgress
-	71,  // 66: silo.daemon.v1.ResolveImageEvent.image:type_name -> silo.daemon.v1.ResolvedImage
-	45,  // 67: silo.daemon.v1.Entrypoint.environment:type_name -> silo.daemon.v1.EnvironmentPair
-	82,  // 68: silo.daemon.v1.StartOptions.egress_secrets:type_name -> silo.daemon.v1.EgressSecret
-	83,  // 69: silo.daemon.v1.StartOptions.entrypoint:type_name -> silo.daemon.v1.Entrypoint
-	41,  // 70: silo.daemon.v1.StartMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	84,  // 71: silo.daemon.v1.StartMachineRequest.options:type_name -> silo.daemon.v1.StartOptions
-	41,  // 72: silo.daemon.v1.StopMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	159, // 73: silo.daemon.v1.StopMachineRequest.timeout:type_name -> google.protobuf.Duration
-	41,  // 74: silo.daemon.v1.RemoveMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	158, // 75: silo.daemon.v1.PolicyUpdate.clear:type_name -> google.protobuf.Empty
-	2,   // 76: silo.daemon.v1.PublicationUpdate.set:type_name -> silo.daemon.v1.PublishBind
-	158, // 77: silo.daemon.v1.PublicationUpdate.clear:type_name -> google.protobuf.Empty
-	48,  // 78: silo.daemon.v1.UserUpdate.set:type_name -> silo.daemon.v1.User
-	158, // 79: silo.daemon.v1.UserUpdate.clear:type_name -> google.protobuf.Empty
-	44,  // 80: silo.daemon.v1.MachineUpdate.labels:type_name -> silo.daemon.v1.StringMap
-	55,  // 81: silo.daemon.v1.MachineUpdate.forwards:type_name -> silo.daemon.v1.ForwardList
-	56,  // 82: silo.daemon.v1.MachineUpdate.vsock:type_name -> silo.daemon.v1.Vsock
-	64,  // 83: silo.daemon.v1.MachineUpdate.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	88,  // 84: silo.daemon.v1.MachineUpdate.policy:type_name -> silo.daemon.v1.PolicyUpdate
-	89,  // 85: silo.daemon.v1.MachineUpdate.publication:type_name -> silo.daemon.v1.PublicationUpdate
-	49,  // 86: silo.daemon.v1.MachineUpdate.guest:type_name -> silo.daemon.v1.GuestConfig
-	90,  // 87: silo.daemon.v1.MachineUpdate.user:type_name -> silo.daemon.v1.UserUpdate
-	41,  // 88: silo.daemon.v1.UpdateMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	91,  // 89: silo.daemon.v1.UpdateMachineRequest.update:type_name -> silo.daemon.v1.MachineUpdate
-	159, // 90: silo.daemon.v1.WaitReadyRequest.timeout:type_name -> google.protobuf.Duration
-	42,  // 91: silo.daemon.v1.StopRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
-	159, // 92: silo.daemon.v1.StopRunRequest.timeout:type_name -> google.protobuf.Duration
-	159, // 93: silo.daemon.v1.StopRunRequest.force_after:type_name -> google.protobuf.Duration
-	42,  // 94: silo.daemon.v1.KillRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
-	159, // 95: silo.daemon.v1.KillRunRequest.timeout:type_name -> google.protobuf.Duration
-	42,  // 96: silo.daemon.v1.WaitForRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
-	159, // 97: silo.daemon.v1.WaitForRunRequest.timeout:type_name -> google.protobuf.Duration
-	8,   // 98: silo.daemon.v1.MachineIssue.component:type_name -> silo.daemon.v1.IssueComponent
-	158, // 99: silo.daemon.v1.MachineStatus.stopped:type_name -> google.protobuf.Empty
-	98,  // 100: silo.daemon.v1.MachineStatus.starting:type_name -> silo.daemon.v1.LifecycleDetail
-	99,  // 101: silo.daemon.v1.MachineStatus.running:type_name -> silo.daemon.v1.RunningStatus
-	98,  // 102: silo.daemon.v1.MachineStatus.stopping:type_name -> silo.daemon.v1.LifecycleDetail
-	98,  // 103: silo.daemon.v1.MachineStatus.error:type_name -> silo.daemon.v1.LifecycleDetail
-	9,   // 104: silo.daemon.v1.Rootfs.source_kind:type_name -> silo.daemon.v1.ImageSourceKind
-	160, // 105: silo.daemon.v1.Rootfs.created_at:type_name -> google.protobuf.Timestamp
-	10,  // 106: silo.daemon.v1.BootReport.mode:type_name -> silo.daemon.v1.BootMode
-	12,  // 107: silo.daemon.v1.ProvisionStepReport.status:type_name -> silo.daemon.v1.ProvisionStepStatus
-	13,  // 108: silo.daemon.v1.ProvisionStepReport.failure_policy:type_name -> silo.daemon.v1.ProvisionFailurePolicy
-	159, // 109: silo.daemon.v1.ProvisionStepReport.duration:type_name -> google.protobuf.Duration
-	11,  // 110: silo.daemon.v1.ProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
-	160, // 111: silo.daemon.v1.ProvisionReport.started_at:type_name -> google.protobuf.Timestamp
-	160, // 112: silo.daemon.v1.ProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
-	159, // 113: silo.daemon.v1.ProvisionReport.duration:type_name -> google.protobuf.Duration
-	104, // 114: silo.daemon.v1.ProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
-	62,  // 115: silo.daemon.v1.MachineSnapshot.spec:type_name -> silo.daemon.v1.VmSpec
-	0,   // 116: silo.daemon.v1.MachineSnapshot.retention:type_name -> silo.daemon.v1.Retention
-	46,  // 117: silo.daemon.v1.MachineSnapshot.process:type_name -> silo.daemon.v1.ProcessConfig
-	47,  // 118: silo.daemon.v1.MachineSnapshot.agent_mode:type_name -> silo.daemon.v1.Agent
-	160, // 119: silo.daemon.v1.MachineSnapshot.created_at:type_name -> google.protobuf.Timestamp
-	160, // 120: silo.daemon.v1.MachineSnapshot.modified_at:type_name -> google.protobuf.Timestamp
-	101, // 121: silo.daemon.v1.MachineSnapshot.rootfs:type_name -> silo.daemon.v1.Rootfs
-	156, // 122: silo.daemon.v1.MachineSnapshot.labels:type_name -> silo.daemon.v1.MachineSnapshot.LabelsEntry
-	157, // 123: silo.daemon.v1.MachineSnapshot.metadata:type_name -> silo.daemon.v1.MachineSnapshot.MetadataEntry
-	64,  // 124: silo.daemon.v1.MachineSnapshot.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	102, // 125: silo.daemon.v1.MachineSnapshot.tailscale:type_name -> silo.daemon.v1.MachineTailscale
-	49,  // 126: silo.daemon.v1.MachineSnapshot.guest:type_name -> silo.daemon.v1.GuestConfig
-	100, // 127: silo.daemon.v1.MachineSnapshot.status:type_name -> silo.daemon.v1.MachineStatus
-	7,   // 128: silo.daemon.v1.MachineSnapshot.observation:type_name -> silo.daemon.v1.Observation
-	97,  // 129: silo.daemon.v1.MachineSnapshot.issues:type_name -> silo.daemon.v1.MachineIssue
-	103, // 130: silo.daemon.v1.MachineSnapshot.boot_report:type_name -> silo.daemon.v1.BootReport
-	105, // 131: silo.daemon.v1.MachineSnapshot.provision_report:type_name -> silo.daemon.v1.ProvisionReport
-	160, // 132: silo.daemon.v1.MachineSnapshot.started_at:type_name -> google.protobuf.Timestamp
-	160, // 133: silo.daemon.v1.MachineSnapshot.updated_at:type_name -> google.protobuf.Timestamp
-	127, // 134: silo.daemon.v1.MachineSnapshot.network_observation:type_name -> silo.daemon.v1.NetworkObservation
-	106, // 135: silo.daemon.v1.MachineInventoryEntry.data:type_name -> silo.daemon.v1.MachineSnapshot
-	97,  // 136: silo.daemon.v1.MachineInventoryEntry.issues:type_name -> silo.daemon.v1.MachineIssue
-	106, // 137: silo.daemon.v1.MachineStart.data:type_name -> silo.daemon.v1.MachineSnapshot
-	14,  // 138: silo.daemon.v1.MachineReadiness.outcome:type_name -> silo.daemon.v1.ReadinessOutcome
-	106, // 139: silo.daemon.v1.MachineReadiness.data:type_name -> silo.daemon.v1.MachineSnapshot
-	150, // 140: silo.daemon.v1.MachineReadiness.status:type_name -> silo.daemon.v1.MonitorStatus
-	15,  // 141: silo.daemon.v1.MachineExit.outcome:type_name -> silo.daemon.v1.ExitOutcome
-	106, // 142: silo.daemon.v1.MachineExit.data:type_name -> silo.daemon.v1.MachineSnapshot
-	160, // 143: silo.daemon.v1.MachineExit.exited_at:type_name -> google.protobuf.Timestamp
-	16,  // 144: silo.daemon.v1.ReadLogsRequest.source:type_name -> silo.daemon.v1.LogSource
-	17,  // 145: silo.daemon.v1.ReadLogsRequest.output:type_name -> silo.daemon.v1.LogOutput
-	16,  // 146: silo.daemon.v1.LogChunk.source:type_name -> silo.daemon.v1.LogSource
-	17,  // 147: silo.daemon.v1.LogChunk.output:type_name -> silo.daemon.v1.LogOutput
-	18,  // 148: silo.daemon.v1.ParseResourceRequest.kind:type_name -> silo.daemon.v1.ResourceKind
-	158, // 149: silo.daemon.v1.NormalizePolicyRequest.empty:type_name -> google.protobuf.Empty
-	117, // 150: silo.daemon.v1.SecretRequirement.alternatives:type_name -> silo.daemon.v1.SecretAlternative
-	19,  // 151: silo.daemon.v1.SecretSlot.kind:type_name -> silo.daemon.v1.SecretKind
-	20,  // 152: silo.daemon.v1.SecretSlot.field:type_name -> silo.daemon.v1.SecretField
-	119, // 153: silo.daemon.v1.PolicyDocument.secret_slots:type_name -> silo.daemon.v1.SecretSlot
-	118, // 154: silo.daemon.v1.PolicyDocument.secret_requirements:type_name -> silo.daemon.v1.SecretRequirement
-	21,  // 155: silo.daemon.v1.PolicySecretsResult.state:type_name -> silo.daemon.v1.PolicySecretsState
-	122, // 156: silo.daemon.v1.PolicySecretsResult.diagnostics:type_name -> silo.daemon.v1.SecretDiagnostic
-	118, // 157: silo.daemon.v1.PolicySecretsResult.requirements:type_name -> silo.daemon.v1.SecretRequirement
-	119, // 158: silo.daemon.v1.PolicySecretsResult.slots:type_name -> silo.daemon.v1.SecretSlot
-	22,  // 159: silo.daemon.v1.ErrorDetail.kind:type_name -> silo.daemon.v1.ErrorKind
-	23,  // 160: silo.daemon.v1.ErrorDetail.code:type_name -> silo.daemon.v1.ErrorCode
-	24,  // 161: silo.daemon.v1.ErrorDetail.launch_failure_reason:type_name -> silo.daemon.v1.LaunchFailureReason
-	160, // 162: silo.daemon.v1.NodeStatus.updated_at:type_name -> google.protobuf.Timestamp
-	25,  // 163: silo.daemon.v1.NodeStatus.state:type_name -> silo.daemon.v1.NodeState
-	160, // 164: silo.daemon.v1.NodeStatus.key_expiry:type_name -> google.protobuf.Timestamp
-	160, // 165: silo.daemon.v1.NodeObservation.observed_at:type_name -> google.protobuf.Timestamp
-	160, // 166: silo.daemon.v1.NodeObservation.key_expiry:type_name -> google.protobuf.Timestamp
-	125, // 167: silo.daemon.v1.NetworkObservation.live:type_name -> silo.daemon.v1.NodeStatus
-	126, // 168: silo.daemon.v1.NetworkObservation.historical:type_name -> silo.daemon.v1.NodeObservation
-	26,  // 169: silo.daemon.v1.NetworkObservation.issues:type_name -> silo.daemon.v1.NetworkObservationIssue
-	28,  // 170: silo.daemon.v1.ComponentStatus.state:type_name -> silo.daemon.v1.ComponentState
-	29,  // 171: silo.daemon.v1.ComponentStatus.shutdown_protection:type_name -> silo.daemon.v1.ShutdownProtection
-	27,  // 172: silo.daemon.v1.DaemonStatus.core:type_name -> silo.daemon.v1.CorePhase
-	151, // 173: silo.daemon.v1.DaemonStatus.system:type_name -> silo.daemon.v1.SystemStatus
-	128, // 174: silo.daemon.v1.DaemonStatus.tailscale:type_name -> silo.daemon.v1.ComponentStatus
-	160, // 175: silo.daemon.v1.DaemonStatus.updated_at:type_name -> google.protobuf.Timestamp
-	130, // 176: silo.daemon.v1.RuntimeInfo.components:type_name -> silo.daemon.v1.RuntimeComponents
-	128, // 177: silo.daemon.v1.TailscaleStatusReport.status:type_name -> silo.daemon.v1.ComponentStatus
-	30,  // 178: silo.daemon.v1.TailscaleSettings.enrollment_mode:type_name -> silo.daemon.v1.EnrollmentMode
-	134, // 179: silo.daemon.v1.TailscaleSettings.defaults:type_name -> silo.daemon.v1.ResourceDefaults
-	135, // 180: silo.daemon.v1.TailscaleSettings.ceilings:type_name -> silo.daemon.v1.ResourceCeilings
-	159, // 181: silo.daemon.v1.TailscaleSettings.stop_budget:type_name -> google.protobuf.Duration
-	159, // 182: silo.daemon.v1.TailscaleSettings.shutdown_margin:type_name -> google.protobuf.Duration
-	130, // 183: silo.daemon.v1.HelperBootstrap.runtime_components:type_name -> silo.daemon.v1.RuntimeComponents
-	136, // 184: silo.daemon.v1.HelperBootstrap.settings:type_name -> silo.daemon.v1.TailscaleSettings
-	160, // 185: silo.daemon.v1.MonitorSnapshot.observed_at:type_name -> google.protobuf.Timestamp
-	31,  // 186: silo.daemon.v1.VmSnapshot.state:type_name -> silo.daemon.v1.VmState
-	160, // 187: silo.daemon.v1.VmSnapshot.state_changed_at:type_name -> google.protobuf.Timestamp
-	160, // 188: silo.daemon.v1.VmSnapshot.running_since:type_name -> google.protobuf.Timestamp
-	32,  // 189: silo.daemon.v1.ReadinessState.reason:type_name -> silo.daemon.v1.ReadinessReason
-	33,  // 190: silo.daemon.v1.AgentConnection.state:type_name -> silo.daemon.v1.AgentConnectionState
-	160, // 191: silo.daemon.v1.AgentConnection.last_success_at:type_name -> google.protobuf.Timestamp
-	160, // 192: silo.daemon.v1.AgentConnection.last_failure_at:type_name -> google.protobuf.Timestamp
-	37,  // 193: silo.daemon.v1.SshListenerReport.backend:type_name -> silo.daemon.v1.SshBackend
-	11,  // 194: silo.daemon.v1.GuestProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
-	160, // 195: silo.daemon.v1.GuestProvisionReport.started_at:type_name -> google.protobuf.Timestamp
-	160, // 196: silo.daemon.v1.GuestProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
-	159, // 197: silo.daemon.v1.GuestProvisionReport.duration:type_name -> google.protobuf.Duration
-	104, // 198: silo.daemon.v1.GuestProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
-	160, // 199: silo.daemon.v1.AgentStatusReport.observed_at:type_name -> google.protobuf.Timestamp
-	36,  // 200: silo.daemon.v1.AgentStatusReport.state:type_name -> silo.daemon.v1.AgentStatusState
-	143, // 201: silo.daemon.v1.AgentStatusReport.system:type_name -> silo.daemon.v1.SystemInfo
-	103, // 202: silo.daemon.v1.AgentStatusReport.boot:type_name -> silo.daemon.v1.BootReport
-	145, // 203: silo.daemon.v1.AgentStatusReport.provisioning:type_name -> silo.daemon.v1.GuestProvisionReport
-	144, // 204: silo.daemon.v1.AgentStatusReport.ssh:type_name -> silo.daemon.v1.SshListenerReport
-	160, // 205: silo.daemon.v1.AgentStatusObservation.received_at:type_name -> google.protobuf.Timestamp
-	160, // 206: silo.daemon.v1.AgentStatusObservation.stale_at:type_name -> google.protobuf.Timestamp
-	34,  // 207: silo.daemon.v1.AgentStatusObservation.freshness:type_name -> silo.daemon.v1.Freshness
-	35,  // 208: silo.daemon.v1.AgentStatusObservation.stale_reason:type_name -> silo.daemon.v1.StaleReason
-	146, // 209: silo.daemon.v1.AgentStatusObservation.report:type_name -> silo.daemon.v1.AgentStatusReport
-	141, // 210: silo.daemon.v1.EnabledAgent.connection:type_name -> silo.daemon.v1.AgentConnection
-	142, // 211: silo.daemon.v1.EnabledAgent.identity:type_name -> silo.daemon.v1.AgentIdentity
-	147, // 212: silo.daemon.v1.EnabledAgent.status:type_name -> silo.daemon.v1.AgentStatusObservation
-	158, // 213: silo.daemon.v1.AgentStatus.disabled:type_name -> google.protobuf.Empty
-	148, // 214: silo.daemon.v1.AgentStatus.enabled:type_name -> silo.daemon.v1.EnabledAgent
-	138, // 215: silo.daemon.v1.MonitorStatus.monitor:type_name -> silo.daemon.v1.MonitorSnapshot
-	139, // 216: silo.daemon.v1.MonitorStatus.vm:type_name -> silo.daemon.v1.VmSnapshot
-	140, // 217: silo.daemon.v1.MonitorStatus.readiness:type_name -> silo.daemon.v1.ReadinessState
-	149, // 218: silo.daemon.v1.MonitorStatus.agent:type_name -> silo.daemon.v1.AgentStatus
-	38,  // 219: silo.daemon.v1.SystemStatus.phase:type_name -> silo.daemon.v1.SystemPhase
-	160, // 220: silo.daemon.v1.SystemStatus.update_checked_at:type_name -> google.protobuf.Timestamp
-	39,  // 221: silo.daemon.v1.SystemStatus.memory_reclaim_outcome:type_name -> silo.daemon.v1.MemoryReclaimOutcome
-	160, // 222: silo.daemon.v1.SystemStatus.memory_reclaim_at:type_name -> google.protobuf.Timestamp
-	158, // 223: silo.daemon.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	158, // 224: silo.daemon.v1.DaemonService.GetRuntimeInfo:input_type -> google.protobuf.Empty
-	132, // 225: silo.daemon.v1.DaemonService.ReportTailscaleStatus:input_type -> silo.daemon.v1.TailscaleStatusReport
-	133, // 226: silo.daemon.v1.DaemonService.DrainMutations:input_type -> silo.daemon.v1.DrainMutationsRequest
-	158, // 227: silo.daemon.v1.MachineService.ListMachines:input_type -> google.protobuf.Empty
-	41,  // 228: silo.daemon.v1.MachineService.InspectInventory:input_type -> silo.daemon.v1.MachineRef
-	41,  // 229: silo.daemon.v1.MachineService.InspectMachine:input_type -> silo.daemon.v1.MachineRef
-	40,  // 230: silo.daemon.v1.MachineService.EnsureNameAvailable:input_type -> silo.daemon.v1.Name
-	72,  // 231: silo.daemon.v1.MachineService.CreateMachine:input_type -> silo.daemon.v1.CreateMachineRequest
-	85,  // 232: silo.daemon.v1.MachineService.StartMachine:input_type -> silo.daemon.v1.StartMachineRequest
-	86,  // 233: silo.daemon.v1.MachineService.StopMachine:input_type -> silo.daemon.v1.StopMachineRequest
-	87,  // 234: silo.daemon.v1.MachineService.RemoveMachine:input_type -> silo.daemon.v1.RemoveMachineRequest
-	92,  // 235: silo.daemon.v1.MachineService.UpdateMachine:input_type -> silo.daemon.v1.UpdateMachineRequest
-	93,  // 236: silo.daemon.v1.MachineService.WaitReady:input_type -> silo.daemon.v1.WaitReadyRequest
-	94,  // 237: silo.daemon.v1.MachineService.StopRun:input_type -> silo.daemon.v1.StopRunRequest
-	95,  // 238: silo.daemon.v1.MachineService.KillRun:input_type -> silo.daemon.v1.KillRunRequest
-	96,  // 239: silo.daemon.v1.MachineService.WaitForRun:input_type -> silo.daemon.v1.WaitForRunRequest
-	42,  // 240: silo.daemon.v1.MachineService.RemoveAfterRun:input_type -> silo.daemon.v1.MachineRunRef
-	111, // 241: silo.daemon.v1.MachineService.ReadLogs:input_type -> silo.daemon.v1.ReadLogsRequest
-	113, // 242: silo.daemon.v1.MachineService.SetMachineSecret:input_type -> silo.daemon.v1.SetMachineSecretRequest
-	158, // 243: silo.daemon.v1.NetworkService.ListNetworkDefinitions:input_type -> google.protobuf.Empty
-	40,  // 244: silo.daemon.v1.NetworkService.GetNetworkDefinition:input_type -> silo.daemon.v1.Name
-	67,  // 245: silo.daemon.v1.NetworkService.CreateNetworkDefinition:input_type -> silo.daemon.v1.CreateNetworkDefinitionRequest
-	40,  // 246: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:input_type -> silo.daemon.v1.Name
-	68,  // 247: silo.daemon.v1.NetworkService.SetMachineNetwork:input_type -> silo.daemon.v1.SetMachineNetworkRequest
-	79,  // 248: silo.daemon.v1.RuntimeService.ResolveImage:input_type -> silo.daemon.v1.ResolveImageRequest
-	81,  // 249: silo.daemon.v1.RuntimeService.PullImage:input_type -> silo.daemon.v1.PullImageRequest
-	158, // 250: silo.daemon.v1.RuntimeService.ProposeMachineName:input_type -> google.protobuf.Empty
-	114, // 251: silo.daemon.v1.RuntimeService.ParseResource:input_type -> silo.daemon.v1.ParseResourceRequest
-	116, // 252: silo.daemon.v1.RuntimeService.NormalizePolicy:input_type -> silo.daemon.v1.NormalizePolicyRequest
-	121, // 253: silo.daemon.v1.RuntimeService.CheckPolicySecrets:input_type -> silo.daemon.v1.CheckPolicySecretsRequest
-	129, // 254: silo.daemon.v1.DaemonService.GetStatus:output_type -> silo.daemon.v1.DaemonStatus
-	131, // 255: silo.daemon.v1.DaemonService.GetRuntimeInfo:output_type -> silo.daemon.v1.RuntimeInfo
-	158, // 256: silo.daemon.v1.DaemonService.ReportTailscaleStatus:output_type -> google.protobuf.Empty
-	158, // 257: silo.daemon.v1.DaemonService.DrainMutations:output_type -> google.protobuf.Empty
-	107, // 258: silo.daemon.v1.MachineService.ListMachines:output_type -> silo.daemon.v1.MachineInventoryEntry
-	107, // 259: silo.daemon.v1.MachineService.InspectInventory:output_type -> silo.daemon.v1.MachineInventoryEntry
-	106, // 260: silo.daemon.v1.MachineService.InspectMachine:output_type -> silo.daemon.v1.MachineSnapshot
-	158, // 261: silo.daemon.v1.MachineService.EnsureNameAvailable:output_type -> google.protobuf.Empty
-	78,  // 262: silo.daemon.v1.MachineService.CreateMachine:output_type -> silo.daemon.v1.CreateMachineEvent
-	108, // 263: silo.daemon.v1.MachineService.StartMachine:output_type -> silo.daemon.v1.MachineStart
-	106, // 264: silo.daemon.v1.MachineService.StopMachine:output_type -> silo.daemon.v1.MachineSnapshot
-	158, // 265: silo.daemon.v1.MachineService.RemoveMachine:output_type -> google.protobuf.Empty
-	106, // 266: silo.daemon.v1.MachineService.UpdateMachine:output_type -> silo.daemon.v1.MachineSnapshot
-	109, // 267: silo.daemon.v1.MachineService.WaitReady:output_type -> silo.daemon.v1.MachineReadiness
-	106, // 268: silo.daemon.v1.MachineService.StopRun:output_type -> silo.daemon.v1.MachineSnapshot
-	110, // 269: silo.daemon.v1.MachineService.KillRun:output_type -> silo.daemon.v1.MachineExit
-	110, // 270: silo.daemon.v1.MachineService.WaitForRun:output_type -> silo.daemon.v1.MachineExit
-	158, // 271: silo.daemon.v1.MachineService.RemoveAfterRun:output_type -> google.protobuf.Empty
-	112, // 272: silo.daemon.v1.MachineService.ReadLogs:output_type -> silo.daemon.v1.LogChunk
-	158, // 273: silo.daemon.v1.MachineService.SetMachineSecret:output_type -> google.protobuf.Empty
-	65,  // 274: silo.daemon.v1.NetworkService.ListNetworkDefinitions:output_type -> silo.daemon.v1.NetworkDefinition
-	66,  // 275: silo.daemon.v1.NetworkService.GetNetworkDefinition:output_type -> silo.daemon.v1.OptionalNetworkDefinition
-	158, // 276: silo.daemon.v1.NetworkService.CreateNetworkDefinition:output_type -> google.protobuf.Empty
-	158, // 277: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:output_type -> google.protobuf.Empty
-	106, // 278: silo.daemon.v1.NetworkService.SetMachineNetwork:output_type -> silo.daemon.v1.MachineSnapshot
-	80,  // 279: silo.daemon.v1.RuntimeService.ResolveImage:output_type -> silo.daemon.v1.ResolveImageEvent
-	77,  // 280: silo.daemon.v1.RuntimeService.PullImage:output_type -> silo.daemon.v1.ImageProgress
-	40,  // 281: silo.daemon.v1.RuntimeService.ProposeMachineName:output_type -> silo.daemon.v1.Name
-	115, // 282: silo.daemon.v1.RuntimeService.ParseResource:output_type -> silo.daemon.v1.Size
-	120, // 283: silo.daemon.v1.RuntimeService.NormalizePolicy:output_type -> silo.daemon.v1.PolicyDocument
-	123, // 284: silo.daemon.v1.RuntimeService.CheckPolicySecrets:output_type -> silo.daemon.v1.PolicySecretsResult
-	254, // [254:285] is the sub-list for method output_type
-	223, // [223:254] is the sub-list for method input_type
-	223, // [223:223] is the sub-list for extension type_name
-	223, // [223:223] is the sub-list for extension extendee
-	0,   // [0:223] is the sub-list for field type_name
+	185, // 0: silo.daemon.v1.StringMap.values:type_name -> silo.daemon.v1.StringMap.ValuesEntry
+	53,  // 1: silo.daemon.v1.ProcessConfig.entrypoint:type_name -> silo.daemon.v1.StringList
+	53,  // 2: silo.daemon.v1.ProcessConfig.command:type_name -> silo.daemon.v1.StringList
+	186, // 3: silo.daemon.v1.ProcessConfig.environment:type_name -> silo.daemon.v1.ProcessConfig.EnvironmentEntry
+	191, // 4: silo.daemon.v1.Agent.default_agent:type_name -> google.protobuf.Empty
+	191, // 5: silo.daemon.v1.Agent.none:type_name -> google.protobuf.Empty
+	57,  // 6: silo.daemon.v1.GuestConfig.agent:type_name -> silo.daemon.v1.Agent
+	58,  // 7: silo.daemon.v1.GuestConfig.user:type_name -> silo.daemon.v1.User
+	1,   // 8: silo.daemon.v1.Disk.role:type_name -> silo.daemon.v1.DiskRole
+	2,   // 9: silo.daemon.v1.Disk.format:type_name -> silo.daemon.v1.DiskFormat
+	61,  // 10: silo.daemon.v1.Disk.geometry:type_name -> silo.daemon.v1.DiskGeometry
+	63,  // 11: silo.daemon.v1.Endpoint.host:type_name -> silo.daemon.v1.Address
+	63,  // 12: silo.daemon.v1.Endpoint.guest:type_name -> silo.daemon.v1.Address
+	64,  // 13: silo.daemon.v1.Forward.listen:type_name -> silo.daemon.v1.Endpoint
+	64,  // 14: silo.daemon.v1.Forward.connect:type_name -> silo.daemon.v1.Endpoint
+	65,  // 15: silo.daemon.v1.ForwardList.values:type_name -> silo.daemon.v1.Forward
+	68,  // 16: silo.daemon.v1.Boot.kernel:type_name -> silo.daemon.v1.Kernel
+	62,  // 17: silo.daemon.v1.Storage.disks:type_name -> silo.daemon.v1.Disk
+	3,   // 18: silo.daemon.v1.VmGuest.os:type_name -> silo.daemon.v1.GuestOs
+	72,  // 19: silo.daemon.v1.VmSpec.guest:type_name -> silo.daemon.v1.VmGuest
+	69,  // 20: silo.daemon.v1.VmSpec.boot:type_name -> silo.daemon.v1.Boot
+	70,  // 21: silo.daemon.v1.VmSpec.hardware:type_name -> silo.daemon.v1.Hardware
+	71,  // 22: silo.daemon.v1.VmSpec.storage:type_name -> silo.daemon.v1.Storage
+	60,  // 23: silo.daemon.v1.VmSpec.mounts:type_name -> silo.daemon.v1.Mount
+	65,  // 24: silo.daemon.v1.VmSpec.forwards:type_name -> silo.daemon.v1.Forward
+	67,  // 25: silo.daemon.v1.VmSpec.vsock:type_name -> silo.daemon.v1.Vsock
+	187, // 26: silo.daemon.v1.VmSpec.annotations:type_name -> silo.daemon.v1.VmSpec.AnnotationsEntry
+	4,   // 27: silo.daemon.v1.PrivateNetwork.publish:type_name -> silo.daemon.v1.PublishBind
+	74,  // 28: silo.daemon.v1.ResolvedNetwork.private:type_name -> silo.daemon.v1.PrivateNetwork
+	191, // 29: silo.daemon.v1.ResolvedNetwork.none:type_name -> google.protobuf.Empty
+	50,  // 30: silo.daemon.v1.ResolvedNetwork.named:type_name -> silo.daemon.v1.Name
+	5,   // 31: silo.daemon.v1.NetworkDefinition.topology:type_name -> silo.daemon.v1.NetworkTopology
+	6,   // 32: silo.daemon.v1.NetworkDefinition.driver:type_name -> silo.daemon.v1.NetworkDriver
+	76,  // 33: silo.daemon.v1.OptionalNetworkDefinition.definition:type_name -> silo.daemon.v1.NetworkDefinition
+	76,  // 34: silo.daemon.v1.CreateNetworkDefinitionRequest.definition:type_name -> silo.daemon.v1.NetworkDefinition
+	51,  // 35: silo.daemon.v1.SetMachineNetworkRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	75,  // 36: silo.daemon.v1.SetMachineNetworkRequest.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	191, // 37: silo.daemon.v1.TemporaryDirectoryPolicy.disk_backed:type_name -> google.protobuf.Empty
+	188, // 38: silo.daemon.v1.NormalizedMachineCreate.labels:type_name -> silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
+	56,  // 39: silo.daemon.v1.NormalizedMachineCreate.process:type_name -> silo.daemon.v1.ProcessConfig
+	0,   // 40: silo.daemon.v1.NormalizedMachineCreate.retention:type_name -> silo.daemon.v1.Retention
+	60,  // 41: silo.daemon.v1.NormalizedMachineCreate.mounts:type_name -> silo.daemon.v1.Mount
+	65,  // 42: silo.daemon.v1.NormalizedMachineCreate.forwards:type_name -> silo.daemon.v1.Forward
+	75,  // 43: silo.daemon.v1.NormalizedMachineCreate.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	57,  // 44: silo.daemon.v1.NormalizedMachineCreate.agent:type_name -> silo.daemon.v1.Agent
+	58,  // 45: silo.daemon.v1.NormalizedMachineCreate.provision_user:type_name -> silo.daemon.v1.User
+	7,   // 46: silo.daemon.v1.NormalizedMachineCreate.root_profile:type_name -> silo.daemon.v1.RootProfile
+	80,  // 47: silo.daemon.v1.NormalizedMachineCreate.temporary_directory:type_name -> silo.daemon.v1.TemporaryDirectoryPolicy
+	8,   // 48: silo.daemon.v1.OciIdentity.pull_policy:type_name -> silo.daemon.v1.PullPolicy
+	82,  // 49: silo.daemon.v1.ResolvedImage.identity:type_name -> silo.daemon.v1.OciIdentity
+	9,   // 50: silo.daemon.v1.ResolvedImage.cache_state:type_name -> silo.daemon.v1.CacheState
+	81,  // 51: silo.daemon.v1.CreateMachineRequest.configuration:type_name -> silo.daemon.v1.NormalizedMachineCreate
+	82,  // 52: silo.daemon.v1.CreateMachineRequest.oci:type_name -> silo.daemon.v1.OciIdentity
+	85,  // 53: silo.daemon.v1.ImageProgress.resolving_manifest:type_name -> silo.daemon.v1.ImageReferenceProgress
+	86,  // 54: silo.daemon.v1.ImageProgress.resolved_manifest:type_name -> silo.daemon.v1.ManifestProgress
+	85,  // 55: silo.daemon.v1.ImageProgress.checking_cache:type_name -> silo.daemon.v1.ImageReferenceProgress
+	85,  // 56: silo.daemon.v1.ImageProgress.cache_hit:type_name -> silo.daemon.v1.ImageReferenceProgress
+	85,  // 57: silo.daemon.v1.ImageProgress.cache_miss:type_name -> silo.daemon.v1.ImageReferenceProgress
+	85,  // 58: silo.daemon.v1.ImageProgress.using_local_disk:type_name -> silo.daemon.v1.ImageReferenceProgress
+	87,  // 59: silo.daemon.v1.ImageProgress.layer_download_started:type_name -> silo.daemon.v1.LayerProgress
+	87,  // 60: silo.daemon.v1.ImageProgress.layer_download_progress:type_name -> silo.daemon.v1.LayerProgress
+	87,  // 61: silo.daemon.v1.ImageProgress.layer_download_verifying:type_name -> silo.daemon.v1.LayerProgress
+	87,  // 62: silo.daemon.v1.ImageProgress.layer_download_finished:type_name -> silo.daemon.v1.LayerProgress
+	87,  // 63: silo.daemon.v1.ImageProgress.layer_download_skipped:type_name -> silo.daemon.v1.LayerProgress
+	88,  // 64: silo.daemon.v1.ImageProgress.applying_layer:type_name -> silo.daemon.v1.ApplyingLayerProgress
+	191, // 65: silo.daemon.v1.ImageProgress.materializing_rootfs:type_name -> google.protobuf.Empty
+	191, // 66: silo.daemon.v1.ImageProgress.publishing_rootfs:type_name -> google.protobuf.Empty
+	191, // 67: silo.daemon.v1.ImageProgress.complete:type_name -> google.protobuf.Empty
+	89,  // 68: silo.daemon.v1.CreateMachineEvent.progress:type_name -> silo.daemon.v1.ImageProgress
+	118, // 69: silo.daemon.v1.CreateMachineEvent.machine:type_name -> silo.daemon.v1.MachineSnapshot
+	8,   // 70: silo.daemon.v1.ResolveImageRequest.pull_policy:type_name -> silo.daemon.v1.PullPolicy
+	89,  // 71: silo.daemon.v1.ResolveImageEvent.progress:type_name -> silo.daemon.v1.ImageProgress
+	83,  // 72: silo.daemon.v1.ResolveImageEvent.image:type_name -> silo.daemon.v1.ResolvedImage
+	55,  // 73: silo.daemon.v1.Entrypoint.environment:type_name -> silo.daemon.v1.EnvironmentPair
+	94,  // 74: silo.daemon.v1.StartOptions.egress_secrets:type_name -> silo.daemon.v1.EgressSecret
+	95,  // 75: silo.daemon.v1.StartOptions.entrypoint:type_name -> silo.daemon.v1.Entrypoint
+	51,  // 76: silo.daemon.v1.StartMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	96,  // 77: silo.daemon.v1.StartMachineRequest.options:type_name -> silo.daemon.v1.StartOptions
+	51,  // 78: silo.daemon.v1.StopMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	192, // 79: silo.daemon.v1.StopMachineRequest.timeout:type_name -> google.protobuf.Duration
+	51,  // 80: silo.daemon.v1.RemoveMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	191, // 81: silo.daemon.v1.PolicyUpdate.clear:type_name -> google.protobuf.Empty
+	4,   // 82: silo.daemon.v1.PublicationUpdate.set:type_name -> silo.daemon.v1.PublishBind
+	191, // 83: silo.daemon.v1.PublicationUpdate.clear:type_name -> google.protobuf.Empty
+	58,  // 84: silo.daemon.v1.UserUpdate.set:type_name -> silo.daemon.v1.User
+	191, // 85: silo.daemon.v1.UserUpdate.clear:type_name -> google.protobuf.Empty
+	54,  // 86: silo.daemon.v1.MachineUpdate.labels:type_name -> silo.daemon.v1.StringMap
+	66,  // 87: silo.daemon.v1.MachineUpdate.forwards:type_name -> silo.daemon.v1.ForwardList
+	67,  // 88: silo.daemon.v1.MachineUpdate.vsock:type_name -> silo.daemon.v1.Vsock
+	75,  // 89: silo.daemon.v1.MachineUpdate.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	100, // 90: silo.daemon.v1.MachineUpdate.policy:type_name -> silo.daemon.v1.PolicyUpdate
+	101, // 91: silo.daemon.v1.MachineUpdate.publication:type_name -> silo.daemon.v1.PublicationUpdate
+	59,  // 92: silo.daemon.v1.MachineUpdate.guest:type_name -> silo.daemon.v1.GuestConfig
+	102, // 93: silo.daemon.v1.MachineUpdate.user:type_name -> silo.daemon.v1.UserUpdate
+	80,  // 94: silo.daemon.v1.MachineUpdate.temporary_directory:type_name -> silo.daemon.v1.TemporaryDirectoryPolicy
+	51,  // 95: silo.daemon.v1.UpdateMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	103, // 96: silo.daemon.v1.UpdateMachineRequest.update:type_name -> silo.daemon.v1.MachineUpdate
+	192, // 97: silo.daemon.v1.WaitReadyRequest.timeout:type_name -> google.protobuf.Duration
+	52,  // 98: silo.daemon.v1.StopRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
+	192, // 99: silo.daemon.v1.StopRunRequest.timeout:type_name -> google.protobuf.Duration
+	192, // 100: silo.daemon.v1.StopRunRequest.force_after:type_name -> google.protobuf.Duration
+	52,  // 101: silo.daemon.v1.KillRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
+	192, // 102: silo.daemon.v1.KillRunRequest.timeout:type_name -> google.protobuf.Duration
+	52,  // 103: silo.daemon.v1.WaitForRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
+	192, // 104: silo.daemon.v1.WaitForRunRequest.timeout:type_name -> google.protobuf.Duration
+	11,  // 105: silo.daemon.v1.MachineIssue.component:type_name -> silo.daemon.v1.IssueComponent
+	191, // 106: silo.daemon.v1.MachineStatus.stopped:type_name -> google.protobuf.Empty
+	110, // 107: silo.daemon.v1.MachineStatus.starting:type_name -> silo.daemon.v1.LifecycleDetail
+	111, // 108: silo.daemon.v1.MachineStatus.running:type_name -> silo.daemon.v1.RunningStatus
+	110, // 109: silo.daemon.v1.MachineStatus.stopping:type_name -> silo.daemon.v1.LifecycleDetail
+	110, // 110: silo.daemon.v1.MachineStatus.error:type_name -> silo.daemon.v1.LifecycleDetail
+	12,  // 111: silo.daemon.v1.Rootfs.source_kind:type_name -> silo.daemon.v1.ImageSourceKind
+	193, // 112: silo.daemon.v1.Rootfs.created_at:type_name -> google.protobuf.Timestamp
+	13,  // 113: silo.daemon.v1.BootReport.mode:type_name -> silo.daemon.v1.BootMode
+	15,  // 114: silo.daemon.v1.ProvisionStepReport.status:type_name -> silo.daemon.v1.ProvisionStepStatus
+	16,  // 115: silo.daemon.v1.ProvisionStepReport.failure_policy:type_name -> silo.daemon.v1.ProvisionFailurePolicy
+	192, // 116: silo.daemon.v1.ProvisionStepReport.duration:type_name -> google.protobuf.Duration
+	14,  // 117: silo.daemon.v1.ProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
+	193, // 118: silo.daemon.v1.ProvisionReport.started_at:type_name -> google.protobuf.Timestamp
+	193, // 119: silo.daemon.v1.ProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
+	192, // 120: silo.daemon.v1.ProvisionReport.duration:type_name -> google.protobuf.Duration
+	116, // 121: silo.daemon.v1.ProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
+	73,  // 122: silo.daemon.v1.MachineSnapshot.spec:type_name -> silo.daemon.v1.VmSpec
+	0,   // 123: silo.daemon.v1.MachineSnapshot.retention:type_name -> silo.daemon.v1.Retention
+	56,  // 124: silo.daemon.v1.MachineSnapshot.process:type_name -> silo.daemon.v1.ProcessConfig
+	57,  // 125: silo.daemon.v1.MachineSnapshot.agent_mode:type_name -> silo.daemon.v1.Agent
+	193, // 126: silo.daemon.v1.MachineSnapshot.created_at:type_name -> google.protobuf.Timestamp
+	193, // 127: silo.daemon.v1.MachineSnapshot.modified_at:type_name -> google.protobuf.Timestamp
+	113, // 128: silo.daemon.v1.MachineSnapshot.rootfs:type_name -> silo.daemon.v1.Rootfs
+	189, // 129: silo.daemon.v1.MachineSnapshot.labels:type_name -> silo.daemon.v1.MachineSnapshot.LabelsEntry
+	190, // 130: silo.daemon.v1.MachineSnapshot.metadata:type_name -> silo.daemon.v1.MachineSnapshot.MetadataEntry
+	75,  // 131: silo.daemon.v1.MachineSnapshot.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	114, // 132: silo.daemon.v1.MachineSnapshot.tailscale:type_name -> silo.daemon.v1.MachineTailscale
+	59,  // 133: silo.daemon.v1.MachineSnapshot.guest:type_name -> silo.daemon.v1.GuestConfig
+	112, // 134: silo.daemon.v1.MachineSnapshot.status:type_name -> silo.daemon.v1.MachineStatus
+	10,  // 135: silo.daemon.v1.MachineSnapshot.observation:type_name -> silo.daemon.v1.Observation
+	109, // 136: silo.daemon.v1.MachineSnapshot.issues:type_name -> silo.daemon.v1.MachineIssue
+	115, // 137: silo.daemon.v1.MachineSnapshot.boot_report:type_name -> silo.daemon.v1.BootReport
+	117, // 138: silo.daemon.v1.MachineSnapshot.provision_report:type_name -> silo.daemon.v1.ProvisionReport
+	193, // 139: silo.daemon.v1.MachineSnapshot.started_at:type_name -> google.protobuf.Timestamp
+	193, // 140: silo.daemon.v1.MachineSnapshot.updated_at:type_name -> google.protobuf.Timestamp
+	139, // 141: silo.daemon.v1.MachineSnapshot.network_observation:type_name -> silo.daemon.v1.NetworkObservation
+	183, // 142: silo.daemon.v1.MachineSnapshot.live:type_name -> silo.daemon.v1.LiveMachineReport
+	182, // 143: silo.daemon.v1.MachineSnapshot.prospective_live:type_name -> silo.daemon.v1.LiveHostReport
+	49,  // 144: silo.daemon.v1.MachineSnapshot.live_evidence:type_name -> silo.daemon.v1.LiveEvidenceState
+	118, // 145: silo.daemon.v1.MachineInventoryEntry.data:type_name -> silo.daemon.v1.MachineSnapshot
+	109, // 146: silo.daemon.v1.MachineInventoryEntry.issues:type_name -> silo.daemon.v1.MachineIssue
+	118, // 147: silo.daemon.v1.MachineStart.data:type_name -> silo.daemon.v1.MachineSnapshot
+	17,  // 148: silo.daemon.v1.MachineReadiness.outcome:type_name -> silo.daemon.v1.ReadinessOutcome
+	118, // 149: silo.daemon.v1.MachineReadiness.data:type_name -> silo.daemon.v1.MachineSnapshot
+	162, // 150: silo.daemon.v1.MachineReadiness.status:type_name -> silo.daemon.v1.MonitorStatus
+	18,  // 151: silo.daemon.v1.MachineExit.outcome:type_name -> silo.daemon.v1.ExitOutcome
+	118, // 152: silo.daemon.v1.MachineExit.data:type_name -> silo.daemon.v1.MachineSnapshot
+	193, // 153: silo.daemon.v1.MachineExit.exited_at:type_name -> google.protobuf.Timestamp
+	19,  // 154: silo.daemon.v1.ReadLogsRequest.source:type_name -> silo.daemon.v1.LogSource
+	20,  // 155: silo.daemon.v1.ReadLogsRequest.output:type_name -> silo.daemon.v1.LogOutput
+	19,  // 156: silo.daemon.v1.LogChunk.source:type_name -> silo.daemon.v1.LogSource
+	20,  // 157: silo.daemon.v1.LogChunk.output:type_name -> silo.daemon.v1.LogOutput
+	21,  // 158: silo.daemon.v1.ParseResourceRequest.kind:type_name -> silo.daemon.v1.ResourceKind
+	191, // 159: silo.daemon.v1.NormalizePolicyRequest.empty:type_name -> google.protobuf.Empty
+	129, // 160: silo.daemon.v1.SecretRequirement.alternatives:type_name -> silo.daemon.v1.SecretAlternative
+	22,  // 161: silo.daemon.v1.SecretSlot.kind:type_name -> silo.daemon.v1.SecretKind
+	23,  // 162: silo.daemon.v1.SecretSlot.field:type_name -> silo.daemon.v1.SecretField
+	131, // 163: silo.daemon.v1.PolicyDocument.secret_slots:type_name -> silo.daemon.v1.SecretSlot
+	130, // 164: silo.daemon.v1.PolicyDocument.secret_requirements:type_name -> silo.daemon.v1.SecretRequirement
+	24,  // 165: silo.daemon.v1.PolicySecretsResult.state:type_name -> silo.daemon.v1.PolicySecretsState
+	134, // 166: silo.daemon.v1.PolicySecretsResult.diagnostics:type_name -> silo.daemon.v1.SecretDiagnostic
+	130, // 167: silo.daemon.v1.PolicySecretsResult.requirements:type_name -> silo.daemon.v1.SecretRequirement
+	131, // 168: silo.daemon.v1.PolicySecretsResult.slots:type_name -> silo.daemon.v1.SecretSlot
+	25,  // 169: silo.daemon.v1.ErrorDetail.kind:type_name -> silo.daemon.v1.ErrorKind
+	26,  // 170: silo.daemon.v1.ErrorDetail.code:type_name -> silo.daemon.v1.ErrorCode
+	27,  // 171: silo.daemon.v1.ErrorDetail.launch_failure_reason:type_name -> silo.daemon.v1.LaunchFailureReason
+	184, // 172: silo.daemon.v1.ErrorDetail.live_unsupported:type_name -> silo.daemon.v1.LiveOperationUnsupported
+	193, // 173: silo.daemon.v1.NodeStatus.updated_at:type_name -> google.protobuf.Timestamp
+	28,  // 174: silo.daemon.v1.NodeStatus.state:type_name -> silo.daemon.v1.NodeState
+	193, // 175: silo.daemon.v1.NodeStatus.key_expiry:type_name -> google.protobuf.Timestamp
+	193, // 176: silo.daemon.v1.NodeObservation.observed_at:type_name -> google.protobuf.Timestamp
+	193, // 177: silo.daemon.v1.NodeObservation.key_expiry:type_name -> google.protobuf.Timestamp
+	137, // 178: silo.daemon.v1.NetworkObservation.live:type_name -> silo.daemon.v1.NodeStatus
+	138, // 179: silo.daemon.v1.NetworkObservation.historical:type_name -> silo.daemon.v1.NodeObservation
+	29,  // 180: silo.daemon.v1.NetworkObservation.issues:type_name -> silo.daemon.v1.NetworkObservationIssue
+	31,  // 181: silo.daemon.v1.ComponentStatus.state:type_name -> silo.daemon.v1.ComponentState
+	32,  // 182: silo.daemon.v1.ComponentStatus.shutdown_protection:type_name -> silo.daemon.v1.ShutdownProtection
+	30,  // 183: silo.daemon.v1.DaemonStatus.core:type_name -> silo.daemon.v1.CorePhase
+	163, // 184: silo.daemon.v1.DaemonStatus.system:type_name -> silo.daemon.v1.SystemStatus
+	140, // 185: silo.daemon.v1.DaemonStatus.tailscale:type_name -> silo.daemon.v1.ComponentStatus
+	193, // 186: silo.daemon.v1.DaemonStatus.updated_at:type_name -> google.protobuf.Timestamp
+	182, // 187: silo.daemon.v1.DaemonStatus.manager_live:type_name -> silo.daemon.v1.LiveHostReport
+	182, // 188: silo.daemon.v1.DaemonStatus.appliance_live:type_name -> silo.daemon.v1.LiveHostReport
+	142, // 189: silo.daemon.v1.RuntimeInfo.components:type_name -> silo.daemon.v1.RuntimeComponents
+	140, // 190: silo.daemon.v1.TailscaleStatusReport.status:type_name -> silo.daemon.v1.ComponentStatus
+	33,  // 191: silo.daemon.v1.TailscaleSettings.enrollment_mode:type_name -> silo.daemon.v1.EnrollmentMode
+	146, // 192: silo.daemon.v1.TailscaleSettings.defaults:type_name -> silo.daemon.v1.ResourceDefaults
+	147, // 193: silo.daemon.v1.TailscaleSettings.ceilings:type_name -> silo.daemon.v1.ResourceCeilings
+	192, // 194: silo.daemon.v1.TailscaleSettings.stop_budget:type_name -> google.protobuf.Duration
+	192, // 195: silo.daemon.v1.TailscaleSettings.shutdown_margin:type_name -> google.protobuf.Duration
+	142, // 196: silo.daemon.v1.HelperBootstrap.runtime_components:type_name -> silo.daemon.v1.RuntimeComponents
+	148, // 197: silo.daemon.v1.HelperBootstrap.settings:type_name -> silo.daemon.v1.TailscaleSettings
+	193, // 198: silo.daemon.v1.MonitorSnapshot.observed_at:type_name -> google.protobuf.Timestamp
+	34,  // 199: silo.daemon.v1.VmSnapshot.state:type_name -> silo.daemon.v1.VmState
+	193, // 200: silo.daemon.v1.VmSnapshot.state_changed_at:type_name -> google.protobuf.Timestamp
+	193, // 201: silo.daemon.v1.VmSnapshot.running_since:type_name -> google.protobuf.Timestamp
+	35,  // 202: silo.daemon.v1.ReadinessState.reason:type_name -> silo.daemon.v1.ReadinessReason
+	36,  // 203: silo.daemon.v1.AgentConnection.state:type_name -> silo.daemon.v1.AgentConnectionState
+	193, // 204: silo.daemon.v1.AgentConnection.last_success_at:type_name -> google.protobuf.Timestamp
+	193, // 205: silo.daemon.v1.AgentConnection.last_failure_at:type_name -> google.protobuf.Timestamp
+	40,  // 206: silo.daemon.v1.SshListenerReport.backend:type_name -> silo.daemon.v1.SshBackend
+	14,  // 207: silo.daemon.v1.GuestProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
+	193, // 208: silo.daemon.v1.GuestProvisionReport.started_at:type_name -> google.protobuf.Timestamp
+	193, // 209: silo.daemon.v1.GuestProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
+	192, // 210: silo.daemon.v1.GuestProvisionReport.duration:type_name -> google.protobuf.Duration
+	116, // 211: silo.daemon.v1.GuestProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
+	193, // 212: silo.daemon.v1.AgentStatusReport.observed_at:type_name -> google.protobuf.Timestamp
+	39,  // 213: silo.daemon.v1.AgentStatusReport.state:type_name -> silo.daemon.v1.AgentStatusState
+	155, // 214: silo.daemon.v1.AgentStatusReport.system:type_name -> silo.daemon.v1.SystemInfo
+	115, // 215: silo.daemon.v1.AgentStatusReport.boot:type_name -> silo.daemon.v1.BootReport
+	157, // 216: silo.daemon.v1.AgentStatusReport.provisioning:type_name -> silo.daemon.v1.GuestProvisionReport
+	156, // 217: silo.daemon.v1.AgentStatusReport.ssh:type_name -> silo.daemon.v1.SshListenerReport
+	193, // 218: silo.daemon.v1.AgentStatusObservation.received_at:type_name -> google.protobuf.Timestamp
+	193, // 219: silo.daemon.v1.AgentStatusObservation.stale_at:type_name -> google.protobuf.Timestamp
+	37,  // 220: silo.daemon.v1.AgentStatusObservation.freshness:type_name -> silo.daemon.v1.Freshness
+	38,  // 221: silo.daemon.v1.AgentStatusObservation.stale_reason:type_name -> silo.daemon.v1.StaleReason
+	158, // 222: silo.daemon.v1.AgentStatusObservation.report:type_name -> silo.daemon.v1.AgentStatusReport
+	153, // 223: silo.daemon.v1.EnabledAgent.connection:type_name -> silo.daemon.v1.AgentConnection
+	154, // 224: silo.daemon.v1.EnabledAgent.identity:type_name -> silo.daemon.v1.AgentIdentity
+	159, // 225: silo.daemon.v1.EnabledAgent.status:type_name -> silo.daemon.v1.AgentStatusObservation
+	191, // 226: silo.daemon.v1.AgentStatus.disabled:type_name -> google.protobuf.Empty
+	160, // 227: silo.daemon.v1.AgentStatus.enabled:type_name -> silo.daemon.v1.EnabledAgent
+	150, // 228: silo.daemon.v1.MonitorStatus.monitor:type_name -> silo.daemon.v1.MonitorSnapshot
+	151, // 229: silo.daemon.v1.MonitorStatus.vm:type_name -> silo.daemon.v1.VmSnapshot
+	152, // 230: silo.daemon.v1.MonitorStatus.readiness:type_name -> silo.daemon.v1.ReadinessState
+	161, // 231: silo.daemon.v1.MonitorStatus.agent:type_name -> silo.daemon.v1.AgentStatus
+	183, // 232: silo.daemon.v1.MonitorStatus.live:type_name -> silo.daemon.v1.LiveMachineReport
+	41,  // 233: silo.daemon.v1.SystemStatus.phase:type_name -> silo.daemon.v1.SystemPhase
+	193, // 234: silo.daemon.v1.SystemStatus.update_checked_at:type_name -> google.protobuf.Timestamp
+	42,  // 235: silo.daemon.v1.SystemStatus.memory_reclaim_outcome:type_name -> silo.daemon.v1.MemoryReclaimOutcome
+	193, // 236: silo.daemon.v1.SystemStatus.memory_reclaim_at:type_name -> google.protobuf.Timestamp
+	183, // 237: silo.daemon.v1.SystemStatus.live:type_name -> silo.daemon.v1.LiveMachineReport
+	182, // 238: silo.daemon.v1.SystemStatus.prospective_live:type_name -> silo.daemon.v1.LiveHostReport
+	51,  // 239: silo.daemon.v1.LiveMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	51,  // 240: silo.daemon.v1.LiveCaptureRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	51,  // 241: silo.daemon.v1.LiveForkRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	169, // 242: silo.daemon.v1.ExternalResourceMapping.resource:type_name -> silo.daemon.v1.ExternalResourceKey
+	170, // 243: silo.daemon.v1.ExternalResourceMappings.values:type_name -> silo.daemon.v1.ExternalResourceMapping
+	191, // 244: silo.daemon.v1.ExternalResourcePolicy.reject:type_name -> google.protobuf.Empty
+	191, // 245: silo.daemon.v1.ExternalResourcePolicy.require_mappings:type_name -> google.protobuf.Empty
+	171, // 246: silo.daemon.v1.ExternalResourcePolicy.mappings:type_name -> silo.daemon.v1.ExternalResourceMappings
+	51,  // 247: silo.daemon.v1.StoppedForkRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	172, // 248: silo.daemon.v1.StoppedForkRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
+	51,  // 249: silo.daemon.v1.CreateStorageSnapshotRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	172, // 250: silo.daemon.v1.CreateStorageSnapshotRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
+	168, // 251: silo.daemon.v1.RestoreStorageSnapshotRequest.snapshot:type_name -> silo.daemon.v1.StorageSnapshotRef
+	172, // 252: silo.daemon.v1.RestoreStorageSnapshotRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
+	43,  // 253: silo.daemon.v1.StorageSnapshotInfo.capture_kind:type_name -> silo.daemon.v1.StorageCaptureKind
+	176, // 254: silo.daemon.v1.StorageSnapshotList.snapshots:type_name -> silo.daemon.v1.StorageSnapshotInfo
+	191, // 255: silo.daemon.v1.LiveDeviceSubject.virtiofs:type_name -> google.protobuf.Empty
+	191, // 256: silo.daemon.v1.LiveDeviceSubject.rosetta:type_name -> google.protobuf.Empty
+	191, // 257: silo.daemon.v1.LiveDeviceSubject.tap:type_name -> google.protobuf.Empty
+	191, // 258: silo.daemon.v1.LiveDeviceSubject.gpu:type_name -> google.protobuf.Empty
+	191, // 259: silo.daemon.v1.LiveDeviceSubject.nested:type_name -> google.protobuf.Empty
+	191, // 260: silo.daemon.v1.LiveDeviceSubject.tee:type_name -> google.protobuf.Empty
+	48,  // 261: silo.daemon.v1.LiveUnsupportedReason.code:type_name -> silo.daemon.v1.LiveReasonCode
+	178, // 262: silo.daemon.v1.LiveUnsupportedReason.subject:type_name -> silo.daemon.v1.LiveDeviceSubject
+	191, // 263: silo.daemon.v1.LiveCapability.supported:type_name -> google.protobuf.Empty
+	179, // 264: silo.daemon.v1.LiveCapability.unsupported:type_name -> silo.daemon.v1.LiveUnsupportedReason
+	180, // 265: silo.daemon.v1.LiveCapabilityVector.pause:type_name -> silo.daemon.v1.LiveCapability
+	180, // 266: silo.daemon.v1.LiveCapabilityVector.capture:type_name -> silo.daemon.v1.LiveCapability
+	180, // 267: silo.daemon.v1.LiveCapabilityVector.restore:type_name -> silo.daemon.v1.LiveCapability
+	180, // 268: silo.daemon.v1.LiveCapabilityVector.fork:type_name -> silo.daemon.v1.LiveCapability
+	180, // 269: silo.daemon.v1.LiveCapabilityVector.incremental:type_name -> silo.daemon.v1.LiveCapability
+	47,  // 270: silo.daemon.v1.LiveHostReport.scope:type_name -> silo.daemon.v1.LiveScope
+	45,  // 271: silo.daemon.v1.LiveHostReport.backend:type_name -> silo.daemon.v1.LiveBackend
+	46,  // 272: silo.daemon.v1.LiveHostReport.lane:type_name -> silo.daemon.v1.LiveLane
+	181, // 273: silo.daemon.v1.LiveHostReport.live:type_name -> silo.daemon.v1.LiveCapabilityVector
+	47,  // 274: silo.daemon.v1.LiveMachineReport.scope:type_name -> silo.daemon.v1.LiveScope
+	45,  // 275: silo.daemon.v1.LiveMachineReport.backend:type_name -> silo.daemon.v1.LiveBackend
+	46,  // 276: silo.daemon.v1.LiveMachineReport.lane:type_name -> silo.daemon.v1.LiveLane
+	181, // 277: silo.daemon.v1.LiveMachineReport.live:type_name -> silo.daemon.v1.LiveCapabilityVector
+	44,  // 278: silo.daemon.v1.LiveOperationUnsupported.operation:type_name -> silo.daemon.v1.LiveOperation
+	45,  // 279: silo.daemon.v1.LiveOperationUnsupported.backend:type_name -> silo.daemon.v1.LiveBackend
+	46,  // 280: silo.daemon.v1.LiveOperationUnsupported.lane:type_name -> silo.daemon.v1.LiveLane
+	179, // 281: silo.daemon.v1.LiveOperationUnsupported.reason:type_name -> silo.daemon.v1.LiveUnsupportedReason
+	191, // 282: silo.daemon.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	191, // 283: silo.daemon.v1.DaemonService.GetRuntimeInfo:input_type -> google.protobuf.Empty
+	144, // 284: silo.daemon.v1.DaemonService.ReportTailscaleStatus:input_type -> silo.daemon.v1.TailscaleStatusReport
+	145, // 285: silo.daemon.v1.DaemonService.DrainMutations:input_type -> silo.daemon.v1.DrainMutationsRequest
+	191, // 286: silo.daemon.v1.DaemonService.GetLiveCapabilities:input_type -> google.protobuf.Empty
+	191, // 287: silo.daemon.v1.MachineService.ListMachines:input_type -> google.protobuf.Empty
+	51,  // 288: silo.daemon.v1.MachineService.InspectInventory:input_type -> silo.daemon.v1.MachineRef
+	51,  // 289: silo.daemon.v1.MachineService.InspectMachine:input_type -> silo.daemon.v1.MachineRef
+	50,  // 290: silo.daemon.v1.MachineService.EnsureNameAvailable:input_type -> silo.daemon.v1.Name
+	84,  // 291: silo.daemon.v1.MachineService.CreateMachine:input_type -> silo.daemon.v1.CreateMachineRequest
+	97,  // 292: silo.daemon.v1.MachineService.StartMachine:input_type -> silo.daemon.v1.StartMachineRequest
+	98,  // 293: silo.daemon.v1.MachineService.StopMachine:input_type -> silo.daemon.v1.StopMachineRequest
+	99,  // 294: silo.daemon.v1.MachineService.RemoveMachine:input_type -> silo.daemon.v1.RemoveMachineRequest
+	104, // 295: silo.daemon.v1.MachineService.UpdateMachine:input_type -> silo.daemon.v1.UpdateMachineRequest
+	105, // 296: silo.daemon.v1.MachineService.WaitReady:input_type -> silo.daemon.v1.WaitReadyRequest
+	106, // 297: silo.daemon.v1.MachineService.StopRun:input_type -> silo.daemon.v1.StopRunRequest
+	107, // 298: silo.daemon.v1.MachineService.KillRun:input_type -> silo.daemon.v1.KillRunRequest
+	108, // 299: silo.daemon.v1.MachineService.WaitForRun:input_type -> silo.daemon.v1.WaitForRunRequest
+	52,  // 300: silo.daemon.v1.MachineService.RemoveAfterRun:input_type -> silo.daemon.v1.MachineRunRef
+	123, // 301: silo.daemon.v1.MachineService.ReadLogs:input_type -> silo.daemon.v1.ReadLogsRequest
+	125, // 302: silo.daemon.v1.MachineService.SetMachineSecret:input_type -> silo.daemon.v1.SetMachineSecretRequest
+	164, // 303: silo.daemon.v1.MachineService.PauseMachine:input_type -> silo.daemon.v1.LiveMachineRequest
+	165, // 304: silo.daemon.v1.MachineService.CaptureExecution:input_type -> silo.daemon.v1.LiveCaptureRequest
+	166, // 305: silo.daemon.v1.MachineService.ForkExecution:input_type -> silo.daemon.v1.LiveForkRequest
+	173, // 306: silo.daemon.v1.MachineService.ForkStopped:input_type -> silo.daemon.v1.StoppedForkRequest
+	174, // 307: silo.daemon.v1.MachineService.SnapshotStopped:input_type -> silo.daemon.v1.CreateStorageSnapshotRequest
+	191, // 308: silo.daemon.v1.NetworkService.ListNetworkDefinitions:input_type -> google.protobuf.Empty
+	50,  // 309: silo.daemon.v1.NetworkService.GetNetworkDefinition:input_type -> silo.daemon.v1.Name
+	78,  // 310: silo.daemon.v1.NetworkService.CreateNetworkDefinition:input_type -> silo.daemon.v1.CreateNetworkDefinitionRequest
+	50,  // 311: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:input_type -> silo.daemon.v1.Name
+	79,  // 312: silo.daemon.v1.NetworkService.SetMachineNetwork:input_type -> silo.daemon.v1.SetMachineNetworkRequest
+	91,  // 313: silo.daemon.v1.RuntimeService.ResolveImage:input_type -> silo.daemon.v1.ResolveImageRequest
+	93,  // 314: silo.daemon.v1.RuntimeService.PullImage:input_type -> silo.daemon.v1.PullImageRequest
+	191, // 315: silo.daemon.v1.RuntimeService.ProposeMachineName:input_type -> google.protobuf.Empty
+	126, // 316: silo.daemon.v1.RuntimeService.ParseResource:input_type -> silo.daemon.v1.ParseResourceRequest
+	128, // 317: silo.daemon.v1.RuntimeService.NormalizePolicy:input_type -> silo.daemon.v1.NormalizePolicyRequest
+	133, // 318: silo.daemon.v1.RuntimeService.CheckPolicySecrets:input_type -> silo.daemon.v1.CheckPolicySecretsRequest
+	167, // 319: silo.daemon.v1.RuntimeService.RestoreExecution:input_type -> silo.daemon.v1.LiveRestoreRequest
+	175, // 320: silo.daemon.v1.RuntimeService.RestoreSnapshot:input_type -> silo.daemon.v1.RestoreStorageSnapshotRequest
+	168, // 321: silo.daemon.v1.RuntimeService.InspectStorageSnapshot:input_type -> silo.daemon.v1.StorageSnapshotRef
+	191, // 322: silo.daemon.v1.RuntimeService.ListStorageSnapshots:input_type -> google.protobuf.Empty
+	168, // 323: silo.daemon.v1.RuntimeService.ReleaseSnapshotRetention:input_type -> silo.daemon.v1.StorageSnapshotRef
+	50,  // 324: silo.daemon.v1.RuntimeService.RemoveImageAlias:input_type -> silo.daemon.v1.Name
+	141, // 325: silo.daemon.v1.DaemonService.GetStatus:output_type -> silo.daemon.v1.DaemonStatus
+	143, // 326: silo.daemon.v1.DaemonService.GetRuntimeInfo:output_type -> silo.daemon.v1.RuntimeInfo
+	191, // 327: silo.daemon.v1.DaemonService.ReportTailscaleStatus:output_type -> google.protobuf.Empty
+	191, // 328: silo.daemon.v1.DaemonService.DrainMutations:output_type -> google.protobuf.Empty
+	182, // 329: silo.daemon.v1.DaemonService.GetLiveCapabilities:output_type -> silo.daemon.v1.LiveHostReport
+	119, // 330: silo.daemon.v1.MachineService.ListMachines:output_type -> silo.daemon.v1.MachineInventoryEntry
+	119, // 331: silo.daemon.v1.MachineService.InspectInventory:output_type -> silo.daemon.v1.MachineInventoryEntry
+	118, // 332: silo.daemon.v1.MachineService.InspectMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	191, // 333: silo.daemon.v1.MachineService.EnsureNameAvailable:output_type -> google.protobuf.Empty
+	90,  // 334: silo.daemon.v1.MachineService.CreateMachine:output_type -> silo.daemon.v1.CreateMachineEvent
+	120, // 335: silo.daemon.v1.MachineService.StartMachine:output_type -> silo.daemon.v1.MachineStart
+	118, // 336: silo.daemon.v1.MachineService.StopMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	191, // 337: silo.daemon.v1.MachineService.RemoveMachine:output_type -> google.protobuf.Empty
+	118, // 338: silo.daemon.v1.MachineService.UpdateMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	121, // 339: silo.daemon.v1.MachineService.WaitReady:output_type -> silo.daemon.v1.MachineReadiness
+	118, // 340: silo.daemon.v1.MachineService.StopRun:output_type -> silo.daemon.v1.MachineSnapshot
+	122, // 341: silo.daemon.v1.MachineService.KillRun:output_type -> silo.daemon.v1.MachineExit
+	122, // 342: silo.daemon.v1.MachineService.WaitForRun:output_type -> silo.daemon.v1.MachineExit
+	191, // 343: silo.daemon.v1.MachineService.RemoveAfterRun:output_type -> google.protobuf.Empty
+	124, // 344: silo.daemon.v1.MachineService.ReadLogs:output_type -> silo.daemon.v1.LogChunk
+	191, // 345: silo.daemon.v1.MachineService.SetMachineSecret:output_type -> google.protobuf.Empty
+	191, // 346: silo.daemon.v1.MachineService.PauseMachine:output_type -> google.protobuf.Empty
+	191, // 347: silo.daemon.v1.MachineService.CaptureExecution:output_type -> google.protobuf.Empty
+	191, // 348: silo.daemon.v1.MachineService.ForkExecution:output_type -> google.protobuf.Empty
+	118, // 349: silo.daemon.v1.MachineService.ForkStopped:output_type -> silo.daemon.v1.MachineSnapshot
+	176, // 350: silo.daemon.v1.MachineService.SnapshotStopped:output_type -> silo.daemon.v1.StorageSnapshotInfo
+	76,  // 351: silo.daemon.v1.NetworkService.ListNetworkDefinitions:output_type -> silo.daemon.v1.NetworkDefinition
+	77,  // 352: silo.daemon.v1.NetworkService.GetNetworkDefinition:output_type -> silo.daemon.v1.OptionalNetworkDefinition
+	191, // 353: silo.daemon.v1.NetworkService.CreateNetworkDefinition:output_type -> google.protobuf.Empty
+	191, // 354: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:output_type -> google.protobuf.Empty
+	118, // 355: silo.daemon.v1.NetworkService.SetMachineNetwork:output_type -> silo.daemon.v1.MachineSnapshot
+	92,  // 356: silo.daemon.v1.RuntimeService.ResolveImage:output_type -> silo.daemon.v1.ResolveImageEvent
+	89,  // 357: silo.daemon.v1.RuntimeService.PullImage:output_type -> silo.daemon.v1.ImageProgress
+	50,  // 358: silo.daemon.v1.RuntimeService.ProposeMachineName:output_type -> silo.daemon.v1.Name
+	127, // 359: silo.daemon.v1.RuntimeService.ParseResource:output_type -> silo.daemon.v1.Size
+	132, // 360: silo.daemon.v1.RuntimeService.NormalizePolicy:output_type -> silo.daemon.v1.PolicyDocument
+	135, // 361: silo.daemon.v1.RuntimeService.CheckPolicySecrets:output_type -> silo.daemon.v1.PolicySecretsResult
+	191, // 362: silo.daemon.v1.RuntimeService.RestoreExecution:output_type -> google.protobuf.Empty
+	118, // 363: silo.daemon.v1.RuntimeService.RestoreSnapshot:output_type -> silo.daemon.v1.MachineSnapshot
+	176, // 364: silo.daemon.v1.RuntimeService.InspectStorageSnapshot:output_type -> silo.daemon.v1.StorageSnapshotInfo
+	177, // 365: silo.daemon.v1.RuntimeService.ListStorageSnapshots:output_type -> silo.daemon.v1.StorageSnapshotList
+	191, // 366: silo.daemon.v1.RuntimeService.ReleaseSnapshotRetention:output_type -> google.protobuf.Empty
+	191, // 367: silo.daemon.v1.RuntimeService.RemoveImageAlias:output_type -> google.protobuf.Empty
+	325, // [325:368] is the sub-list for method output_type
+	282, // [282:325] is the sub-list for method input_type
+	282, // [282:282] is the sub-list for extension type_name
+	282, // [282:282] is the sub-list for extension extendee
+	0,   // [0:282] is the sub-list for field type_name
 }
 
 func init() { file_daemon_proto_init() }
@@ -12536,36 +15227,41 @@ func file_daemon_proto_init() {
 		(*Agent_None)(nil),
 		(*Agent_CustomPath)(nil),
 	}
-	file_daemon_proto_msgTypes[12].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[12].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[13].OneofWrappers = []any{
 		(*Address_Tcp)(nil),
 		(*Address_Unix)(nil),
 	}
-	file_daemon_proto_msgTypes[13].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[14].OneofWrappers = []any{
 		(*Endpoint_Host)(nil),
 		(*Endpoint_Guest)(nil),
 		(*Endpoint_Vsock)(nil),
 	}
-	file_daemon_proto_msgTypes[14].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[16].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[15].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[17].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[18].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[19].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[21].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[23].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[24].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[20].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[22].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[24].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[25].OneofWrappers = []any{
 		(*ResolvedNetwork_Private)(nil),
 		(*ResolvedNetwork_None)(nil),
 		(*ResolvedNetwork_Named)(nil),
 	}
-	file_daemon_proto_msgTypes[29].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[32].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[30].OneofWrappers = []any{
+		(*TemporaryDirectoryPolicy_DiskBacked)(nil),
+		(*TemporaryDirectoryPolicy_TmpfsCapacityBytes)(nil),
+	}
+	file_daemon_proto_msgTypes[31].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[34].OneofWrappers = []any{
 		(*CreateMachineRequest_Oci)(nil),
 		(*CreateMachineRequest_DiskPath)(nil),
 	}
-	file_daemon_proto_msgTypes[34].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[35].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[36].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[37].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[37].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[38].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[39].OneofWrappers = []any{
 		(*ImageProgress_ResolvingManifest)(nil),
 		(*ImageProgress_ResolvedManifest)(nil),
 		(*ImageProgress_CheckingCache)(nil),
@@ -12582,79 +15278,116 @@ func file_daemon_proto_init() {
 		(*ImageProgress_PublishingRootfs)(nil),
 		(*ImageProgress_Complete)(nil),
 	}
-	file_daemon_proto_msgTypes[38].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[40].OneofWrappers = []any{
 		(*CreateMachineEvent_Progress)(nil),
 		(*CreateMachineEvent_Machine)(nil),
 	}
-	file_daemon_proto_msgTypes[40].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[42].OneofWrappers = []any{
 		(*ResolveImageEvent_Progress)(nil),
 		(*ResolveImageEvent_Image)(nil),
 	}
-	file_daemon_proto_msgTypes[43].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[46].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[48].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[45].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[48].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[50].OneofWrappers = []any{
 		(*PolicyUpdate_Set)(nil),
 		(*PolicyUpdate_Clear)(nil),
 	}
-	file_daemon_proto_msgTypes[49].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[51].OneofWrappers = []any{
 		(*PublicationUpdate_Set)(nil),
 		(*PublicationUpdate_Clear)(nil),
 	}
-	file_daemon_proto_msgTypes[50].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[52].OneofWrappers = []any{
 		(*UserUpdate_Set)(nil),
 		(*UserUpdate_Clear)(nil),
 	}
-	file_daemon_proto_msgTypes[51].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[53].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[54].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[58].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[59].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[60].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[55].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[56].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[60].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[61].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[62].OneofWrappers = []any{
 		(*MachineStatus_Stopped)(nil),
 		(*MachineStatus_Starting)(nil),
 		(*MachineStatus_Running)(nil),
 		(*MachineStatus_Stopping)(nil),
 		(*MachineStatus_Error)(nil),
 	}
-	file_daemon_proto_msgTypes[61].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[63].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[64].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[65].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[66].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[70].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[71].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[76].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[67].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[68].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[72].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[73].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[78].OneofWrappers = []any{
 		(*NormalizePolicyRequest_Hcl)(nil),
 		(*NormalizePolicyRequest_CanonicalJson)(nil),
 		(*NormalizePolicyRequest_Empty)(nil),
 	}
-	file_daemon_proto_msgTypes[81].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[82].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[83].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[84].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[85].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[88].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[89].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[92].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[97].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[86].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[87].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[90].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[91].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[94].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[99].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[101].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[103].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[105].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[106].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[107].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[109].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[108].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[109].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[111].OneofWrappers = []any{
 		(*AgentStatus_Disabled)(nil),
 		(*AgentStatus_Enabled)(nil),
 	}
-	file_daemon_proto_msgTypes[110].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[111].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[112].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[113].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[115].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[116].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[117].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[118].OneofWrappers = []any{
+		(*StorageSnapshotRef_Id)(nil),
+		(*StorageSnapshotRef_ImageAlias)(nil),
+	}
+	file_daemon_proto_msgTypes[119].OneofWrappers = []any{
+		(*ExternalResourceKey_DiskOrder)(nil),
+		(*ExternalResourceKey_ShareTag)(nil),
+	}
+	file_daemon_proto_msgTypes[122].OneofWrappers = []any{
+		(*ExternalResourcePolicy_Reject)(nil),
+		(*ExternalResourcePolicy_RequireMappings)(nil),
+		(*ExternalResourcePolicy_Mappings)(nil),
+	}
+	file_daemon_proto_msgTypes[123].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[124].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[125].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[126].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[128].OneofWrappers = []any{
+		(*LiveDeviceSubject_Virtiofs)(nil),
+		(*LiveDeviceSubject_Rosetta)(nil),
+		(*LiveDeviceSubject_Tap)(nil),
+		(*LiveDeviceSubject_Gpu)(nil),
+		(*LiveDeviceSubject_Nested)(nil),
+		(*LiveDeviceSubject_Tee)(nil),
+		(*LiveDeviceSubject_GuestProfile)(nil),
+	}
+	file_daemon_proto_msgTypes[129].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[130].OneofWrappers = []any{
+		(*LiveCapability_Supported)(nil),
+		(*LiveCapability_Unsupported)(nil),
+	}
+	file_daemon_proto_msgTypes[132].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[133].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[134].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_daemon_proto_rawDesc), len(file_daemon_proto_rawDesc)),
-			NumEnums:      40,
-			NumMessages:   118,
+			NumEnums:      50,
+			NumMessages:   141,
 			NumExtensions: 0,
 			NumServices:   4,
 		},
