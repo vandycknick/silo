@@ -49,6 +49,6 @@ def test_bearer_policy_machine_starts_ready(silo: Silo, workspace: Workspace, ca
     assert http[0]["credential"]["status"] == "selected"
     assert http[0]["verdict"] == "allow"
     silo.stop(name)
-    assert silo.show(name)["state"] == "stopped"
+    assert silo.info(name)["state"] == "stopped"
     silo.rm(name)
-    assert silo.run("show", name, expect=1).returncode == 1
+    assert silo.run("info", name, expect=1).returncode == 1

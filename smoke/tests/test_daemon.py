@@ -70,7 +70,7 @@ def test_daemon_managed_vm_lifecycle(
     secrets = workspace.machine_secrets(machine_id).read_bytes()
     assert stat.S_IMODE(workspace.machine_secrets(machine_id).stat().st_mode) == 0o600
     silo.stop(name)
-    assert silo.show(name)["state"] == "stopped"
+    assert silo.info(name)["state"] == "stopped"
     silo.start(name)
     second = silo.wait_ready(name)
     assert second["run_id"] != first["run_id"]
@@ -91,9 +91,9 @@ def test_daemon_managed_vm_lifecycle(
             proc.kill()
             proc.wait(timeout=10)
     silo.stop(name)
-    assert silo.show(name)["state"] == "stopped"
+    assert silo.info(name)["state"] == "stopped"
     silo.rm(name)
-    assert silo.run("show", name, expect=1).returncode == 1
+    assert silo.run("info", name, expect=1).returncode == 1
     assert silo.ls() == []
 
 
@@ -133,7 +133,7 @@ def test_daemon_managed_disk_create_update_remove(
     assert created["labels"] == {"k": "v"}
     assert created["rootfs"]["source_kind"] == "disk"
     silo.run("set", "disk-b", "cpus=1")
-    assert silo.show("disk-b")["resources"]["cpus"] == 1
+    assert silo.info("disk-b")["resources"]["cpus"] == 1
     silo.rm("disk-b")
-    assert silo.run("show", "disk-b", expect=1).returncode == 1
+    assert silo.run("info", "disk-b", expect=1).returncode == 1
     assert [machine["name"] for machine in silo.ls()] == ["disk-a"]

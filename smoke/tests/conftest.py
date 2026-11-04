@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
 import platform
 
 from pluggy import Result
 import pytest
 
-from silo_smoke import config as smoke_config, image_cache, images, preflight
+from silo_smoke import config as smoke_config, image_cache, images, overlay, preflight
 from silo_smoke.cli import Silo, Vm
 from silo_smoke.config import SmokeConfig
 from silo_smoke.daemon import Daemon
@@ -79,6 +80,17 @@ def registry(config: SmokeConfig) -> Generator[LoopbackRegistry, None, None]:
 @pytest.fixture(scope="session")
 def basic_image(config: SmokeConfig, registry: LoopbackRegistry) -> str:
     return registry.publish(images.build(images.BASIC, images.fetch_alpine(config.cache_dir)), "basic")
+
+
+@pytest.fixture(scope="session")
+def overlay_probe(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return overlay.compile_probe(tmp_path_factory.mktemp("overlay-probe") / "probe")
+
+
+@pytest.fixture(scope="session")
+def overlay_image_bytes(config: SmokeConfig, overlay_probe: Path) -> images.OciImage:
+    """Share only immutable OCI fixture bytes, never a machine or private Home."""
+    return overlay.image(config, overlay_probe)
 
 
 @pytest.fixture

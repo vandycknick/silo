@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from pathlib import Path
 import shutil
 import ssl
@@ -29,14 +30,21 @@ def _system_trust_bundle() -> bytes:
 
 
 class Workspace:
-    def __init__(self, config: SmokeConfig, registry_ca: Path) -> None:
+    def __init__(self, config: SmokeConfig, registry_ca: Path, *, parent: Path | None = None, runtime_parent: Path | None = None) -> None:
         self.config = config
-        self.root = Path(tempfile.mkdtemp(prefix="silo-smoke-", dir=RUN_ROOT_PARENT))
+        # Linux callers can select durable scratch with a process-local TMPDIR.
+        # Keep macOS's deliberately short socket-safe /private/tmp default.
+        if parent is None:
+            parent = Path(os.environ.get("TMPDIR", RUN_ROOT_PARENT) if platform.system() == "Linux" else RUN_ROOT_PARENT)
+        self.root = Path(tempfile.mkdtemp(prefix="silo-smoke-", dir=parent))
         self.root.chmod(0o700)
         self.user_home = self.root / "user"
         self.silo_home = self.root / "state"
         self.config_home = self.root / "config"
-        self.run_root = self.root / "run"
+        # Durable mounted state may have a long path. Generated sockets/locks
+        # can live in a separately owned short runtime tree, never disk bytes.
+        self._runtime_directory = Path(tempfile.mkdtemp(prefix="silo-run-", dir=runtime_parent)) if runtime_parent is not None else None
+        self.run_root = (self._runtime_directory or self.root) / "run"
         self.evidence = self.root / "evidence"
         self._trust_bundle = self.root / "ca-bundle.pem"
         self._machines: list[str] = []
@@ -47,6 +55,8 @@ class Workspace:
             directory.mkdir(mode=0o700)
             directory.chmod(0o700)
         self._trust_bundle.write_bytes(_system_trust_bundle() + registry_ca.read_bytes())
+        if self._runtime_directory is not None:
+            self.record("runtime-placement", f"persistent={self.silo_home}\nruntime={self.run_root}\n")
 
     def env(self, **overrides: str) -> dict[str, str]:
         environment = {
@@ -100,9 +110,11 @@ class Workspace:
                         self.record("cleanup", output.decode(errors="replace") if isinstance(output, bytes) else output)
 
     def cleanup(self, failed: bool) -> None:
+        retain = failed or self.config.keep
         for name in reversed(self._machines):
             self._cleanup_command("stop", name, "--force", "--timeout", "10s")
-            self._cleanup_command("rm", name, "--force")
+            if not retain:
+                self._cleanup_command("rm", name, "--force")
         for daemon in reversed(self._daemons):
             try:
                 daemon.terminate(timeout=15)
@@ -112,10 +124,14 @@ class Workspace:
                     daemon.kill()
                 except Exception as kill_error:
                     self.record("cleanup", f"Daemon kill failed: {kill_error}\n")
-        if failed or self.config.keep:
+        if retain:
             print(f"Evidence retained at {self.root}")
+            if self._runtime_directory is not None:
+                print(f"Generated runtime evidence retained at {self._runtime_directory}")
         else:
             shutil.rmtree(self.root)
+            if self._runtime_directory is not None:
+                shutil.rmtree(self._runtime_directory)
 
     def machine_secrets(self, machine_id: str) -> Path:
         return self.silo_home / "machines" / machine_id / "secrets.json"

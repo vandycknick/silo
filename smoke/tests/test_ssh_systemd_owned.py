@@ -109,7 +109,7 @@ def _profile_finish(workspace: Workspace, initial: tuple[int, ProcessSample] | N
 
 
 def _fresh(silo: Silo, name: str) -> dict[str, Any]:
-    status = silo.show(name)
+    status = silo.info(name)
     assert status["observation"] == "observed", status
     assert status["state"] == "running", status
     assert status["guest"]["status"] == "running", status

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+import fcntl
 import http.server
 import re
 import shutil
@@ -14,11 +17,19 @@ from urllib.parse import urlsplit
 from .images import OciImage
 
 
-_CA_LOCK = threading.Lock()
-
 
 def ca_cert_path(cache_dir: Path) -> Path:
     return cache_dir / "registry-ca" / "ca.pem"
+
+
+@contextmanager
+def _ca_lock(cache_dir: Path) -> Iterator[None]:
+    directory = ca_cert_path(cache_dir).parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Separate pytest processes share the CA and OpenSSL's mutable serial file.
+    with (directory / "ca.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def _openssl(*args: str) -> None:
@@ -28,10 +39,9 @@ def _openssl(*args: str) -> None:
 def ensure_ca(cache_dir: Path) -> tuple[Path, Path]:
     cert = ca_cert_path(cache_dir)
     key = cert.with_name("ca.key")
-    with _CA_LOCK:
+    with _ca_lock(cache_dir):
         if cert.is_file() and key.is_file():
             return cert, key
-        cert.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryDirectory(dir=cert.parent) as temporary:
             temporary_key = Path(temporary) / "ca.key"
             temporary_cert = Path(temporary) / "ca.pem"
@@ -72,7 +82,7 @@ class LoopbackRegistry:
             key.chmod(0o600)
             _openssl("req", "-new", "-key", str(key), "-subj", "/CN=localhost", "-out", str(csr))
             extensions.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n")
-            with _CA_LOCK:
+            with _ca_lock(cache_dir):
                 _openssl("x509", "-req", "-in", str(csr), "-CA", str(self.ca_path), "-CAkey", str(ca_key),
                          "-CAcreateserial", "-days", "3650", "-extfile", str(extensions), "-out", str(leaf))
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
