@@ -17,6 +17,11 @@ name = "guest-lifecycle-controller"
 path = "examples/guest_lifecycle_controller.rs"
 test = false
 
+[[example]]
+name = "native-live-api"
+path = "examples/native_live_api.rs"
+test = false
+
 [features]
 # Compiles the in-process mock virtualization backend for tests. Never enabled
 # in release builds; test runs use --all-features.

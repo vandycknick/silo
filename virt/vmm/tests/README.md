@@ -23,10 +23,14 @@ never native host discovery. Real `--backend krun` queries now consume the
 dependency's read-only system KVM/HVF observations and live in
 `smoke/tests/test_native_capabilities.py`, even though they create no VM.
 
-Phase 9 linked-fact tests expect native pause on recognized implemented lanes,
-but no public operation is delivered or qualified. They also cover the boundary
-where an implemented primitive must not grant admission, even with a known host.
-Capture, restore, fork and incremental remain native-unsupported. These tests
+Phase 11 linked-fact tests expect native pause on all three recognized lanes.
+KVM x86_64 also supports native capture, restore, fork and incremental; those
+four primitives remain unsupported and pending on KVM arm64 and HVF arm64.
+Excluded lanes support none of the five primitives. No public operation is
+delivered or qualified. The tests cover independent per-operation mapping and
+ensure every supported primitive still refuses public admission with both an
+admitted host and unknown host facts. Even declared delivery on an admitted host
+does not bypass the separate runtime qualification requirement. These tests
 do not qualify runtime execution on KVM arm64 or HVF.
 
 To query the actual monitor, build its binary (not only the unit-test harness)
@@ -40,8 +44,10 @@ target/debug/silo-vmm capabilities --backend krun --json
 
 The development shell supplies the native compiler and libclang prerequisites.
 Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
-set. The krun query performs read-only host discovery, not a VM run; its
-`native: true` pause field is not public support or a qualification grant.
+set. The krun query performs read-only host discovery, not a VM run. Its
+`native: true` fields follow the lane matrix above and do not grant public
+support or runtime qualification; public availability remains `not-delivered`
+for every operation, including when mutable qualification grants are supplied.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust

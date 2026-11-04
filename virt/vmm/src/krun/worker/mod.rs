@@ -37,6 +37,8 @@ pub(crate) fn main() -> eyre::Result<()> {
         mux,
         storage_lease,
         raw_handles,
+        state_files: _,
+        standalone: _,
     } = fds::Bootstrap::adopt_fixed()?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let shutdown_signals = block_shutdown_signal()?;
@@ -79,6 +81,8 @@ pub(crate) fn main() -> eyre::Result<()> {
                     stderr: console.as_fd(),
                 },
                 vsock_mux: mux,
+                console_ports: Vec::new(),
+                managed_network: None,
             },
             |control| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

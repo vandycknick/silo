@@ -177,6 +177,22 @@ native bytes and only the smoke batching changed. These changes remove known
 redundant sessions, not assertions or default cases. No elapsed-time improvement
 is established until the complete selection runs.
 
+Phase 11 additionally batches fourteen Data-device transport lookups and the
+two persistence setup/readback clusters without crossing lifecycle boundaries.
+The reserved-encoding positive controls reuse the session's immutable OCI body;
+each control machine and malformed image remains private to its test. This
+removes 19 guest sessions and three redundant image constructions.
+
+The complete 87-case selection passed before and after with identical staged
+monitor, kernel, initramfs, agent and netd bytes: 943.32 seconds before and
+931.16 seconds after (12.16 seconds lower, still above 15 minutes). The after
+run used an isolated Phase-10 source checkout plus the smoke changes, preserving
+fault-fixture source-hash checks while native implementation continued elsewhere.
+One earlier comparison was invalidated by those checks and is retained as a
+failure, not timing evidence. Reports and input hashes are under
+`.tmp/plan/evidence/phase-11/`; this single pair does not establish a general
+performance guarantee.
+
 
 ## Isolation and evidence
 
@@ -977,3 +993,70 @@ real availability reason. APFS/fclonefileat and native macOS remain
 from Linux. Preserve and rerun Phase 4's existing opcode/unaligned-range,
 pre-operation backing length/reopened-capacity, unsupported-punch fallback and
 maintenance-upper fstrim/sentinel oracles unchanged alongside these new gates.
+
+## Public native capture/restore API proof
+
+`silo_smoke/native_live_api.py` drives the standalone
+`native-live-api` example through the real Silo engine and libkrun Rust API.
+It is an explicitly invoked Linux x86_64 KVM proof, never a Cargo VM test.
+It does not deliver the monitor's public live commands or qualify other host
+lanes. Native diagnostic controller modules supply guest transport and
+independent validation, not the native operations under test.
+
+Build from clean, revision-bound native source. The production producer
+identity deliberately rejects dirty or unknown native provenance. Do not
+enable diagnostic native features or bypass that check to obtain a passing
+capture. Build the example and stage the runtime before invoking a cohort:
+
+```sh
+cargo build --locked -p silo-vmm --example native-live-api
+make stage KERNEL_PATH="$PRODUCTION_KERNEL"
+python3 smoke/silo_smoke/native_live_api.py \
+  --native-root "$NATIVE_CHECKOUT" \
+  --entry target/debug/examples/native-live-api \
+  --netd "$STAGED_RUNTIME/bin/netd" \
+  --guest-init "$GUEST_INIT" --register-fixture "$REGISTER_FIXTURE" \
+  --kernel "$PRODUCTION_KERNEL" --kernel-config "$KERNEL_CONFIG" \
+  --evidence "$NEW_EVIDENCE_DIRECTORY" --case api
+```
+
+Use absolute input paths and a new evidence directory for each invocation.
+`--guest-init` and `--register-fixture` are the retained real-provider guest
+programs from the native standalone proof, not Silo's normal guest agent.
+Keep the exact executable, kernel, configuration and guest input bytes needed
+to reproduce the cohort, together with the source and input identities.
+
+Run bounded cohorts sequentially. `positive` exercises generation on the
+production kernel; `api` exercises capture and fresh-process restore;
+`incremental` checks baseline and dirty-union behavior. `faults`, `late`,
+`absent`, `expiry` and `restore-timeout` use the separately built generation
+diagnostic kernel. `partial` requires the distinct fixture in
+`virt/vmm/examples/native_live_api/native_generation_partial.{patch,h}`,
+applied after the production driver patch, instead of the earlier generation
+fault patch. Preserve the ordinary kernel configuration and keep these
+diagnostic kernels separate from production inputs.
+The pending-generation cohort captures and resumes the exact source request
+within its original deadline. It authenticates and seals the immutable capture
+outputs after the source's exact ACK, before restoring the child. Output identity
+and writer-closure checks guard that deferred seal; the deadline is not renewed.
+
+`restore-failures` uses the production kernel. `failures` additionally needs
+`--enospc-directory` naming a new empty mountpoint inside a private user/mount
+namespace (`unshare --user --map-root-user --mount`). Its bounded tmpfs
+exercises actual ENOSPC; do not substitute host disk exhaustion or `/dev/full`.
+Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`,
+only after the exercised native lane's support declarations have been approved.
+The public availability vector must still report `not-delivered`.
+
+`api-report.json`, per-process logs, captured manifests and input identities
+are the evidence. Ordinary successful cohorts require acknowledged native
+cleanup. OS reaping is a separate fact, not a native stop acknowledgement;
+the explicit worker-death case instead requires the expected SIGKILL status
+and released ownership. Cleanup success never turns an unexpected restore
+failure into a passing proof. Keep failed payloads for diagnosis.
+Completed candidates must close writers before reporting success. Failed RAM
+attempts instead retain their output descriptors until explicit abandonment;
+the failure cohort checks writer closure after that resolution, without
+mistaking retained failure ownership for a completed candidate.
+Remove successful bulk RAM/disk outputs only after preserving their evidence
+and confirming that every owner and retained consumer has terminated.

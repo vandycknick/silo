@@ -142,10 +142,6 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
         assert_eq!(live.len(), 5);
         for operation in LiveOperation::ALL {
             assert_eq!(
-                live[operation.as_str()]["native"],
-                backend == "krun" && operation == LiveOperation::Pause
-            );
-            assert_eq!(
                 live[operation.as_str()]["availability"]["status"],
                 "unsupported"
             );

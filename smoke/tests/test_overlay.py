@@ -57,10 +57,28 @@ def test_overlay_production_persistence_index_metadata_whiteouts(silo: Silo, ove
     assert overlay.filesystem_magic(silo, name, "/") == overlay.OVERLAYFS_SUPER_MAGIC
     overlay.probe(silo, name, "lower-ro")
     overlay.probe(silo, name, "metadata")
-    index_inode = silo.exec(name, "stat", "-c", "%i", "/run/silo/rootfs/upperfs/work/index", user="root").stdout.strip()
-    silo.exec(name, overlay.PROBE, "durable", "/root-committed", user="root")
-    silo.exec(name, overlay.PROBE, "durable", "/tmp/tmp-committed", user="root")
-    assert silo.exec(name, "stat", "-c", "%d", "/", "/tmp", user="root").stdout.splitlines()[0] == silo.exec(name, "stat", "-c", "%d", "/tmp", user="root").stdout.strip()
+    setup = silo.exec(name, "sh", "-eu", "-c", """
+stat -c '%i' /run/silo/rootfs/upperfs/work/index
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+"$1" durable /root-committed
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+"$1" durable /tmp/tmp-committed
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+stat -c '%d' / /tmp
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+stat -c '%d' /tmp
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+""", "overlay-persist-setup", overlay.PROBE, user="root").stdout
+    setup_parts = setup.split("SILO_OVERLAY_PERSIST_BOUNDARY\n")
+    assert len(setup_parts) == 6 and setup_parts[-1] == "", setup
+    index_lines = setup_parts[0].split("\n")
+    assert len(index_lines) == 2 and index_lines[-1] == "", setup_parts[0]
+    index_inode = index_lines[0].strip()
+    devices = setup_parts[3].split("\n")
+    tmp_device = setup_parts[4].split("\n")
+    assert len(devices) == 3 and devices[-1] == "", setup_parts[3]
+    assert len(tmp_device) == 2 and tmp_device[-1] == "", setup_parts[4]
+    assert devices[0] == tmp_device[0].strip()
     overlay.orderly_guest_shutdown(silo, name)
     assert silo.info(name)["state"] == "stopped"
     assert overlay.digest(lower) == before
@@ -73,9 +91,21 @@ def test_overlay_production_persistence_index_metadata_whiteouts(silo: Silo, ove
     assert procs.run_id(silo.ws, name) != first_run
     silo.ws.record("overlay-restart-identity", json.dumps({"before": first_frame, "after": next_frame, "oldRun": first_run, "newRun": procs.run_id(silo.ws, name), "oldMonitor": first_monitor, "newMonitor": procs.vmm_pid(silo.ws, name)}) + "\n")
     overlay.probe(silo, name, "persist-check")
-    assert silo.exec(name, "stat", "-c", "%i", "/run/silo/rootfs/upperfs/work/index", user="root").stdout.strip() == index_inode
-    for path in ("/root-committed", "/tmp/tmp-committed"):
-        assert silo.exec(name, "cat", path, user="root").stdout == "committed\n"
+    readback = silo.exec(name, "sh", "-eu", "-c", """
+stat -c '%i' /run/silo/rootfs/upperfs/work/index
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+cat /root-committed
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+cat /tmp/tmp-committed
+printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
+""", "overlay-persist-readback", user="root").stdout
+    readback_parts = readback.split("SILO_OVERLAY_PERSIST_BOUNDARY\n")
+    assert len(readback_parts) == 4 and readback_parts[-1] == "", readback
+    index_lines = readback_parts[0].split("\n")
+    assert len(index_lines) == 2 and index_lines[-1] == "", readback_parts[0]
+    assert index_lines[0].strip() == index_inode
+    assert readback_parts[1] == "committed\n"
+    assert readback_parts[2] == "committed\n"
     assert overlay.observation(silo, name)["root"]["upper"]["filesystemUuid"] == observed["root"]["upper"]["filesystemUuid"]
     assert overlay.digest(lower) == before
 
@@ -364,9 +394,9 @@ def test_overlay_directory_scale_dir_nlink_htree(silo: Silo, overlay_image: str)
 
 
 @pytest.mark.parametrize("reserved", ["trusted.overlay.opaque", "user.overlay.opaque", "char-zero"])
-def test_overlay_reserved_oci_encodings_reject_before_machine_publication(silo: Silo, config: SmokeConfig, registry: LoopbackRegistry, overlay_probe: Path, reserved: str) -> None:
+def test_overlay_reserved_oci_encodings_reject_before_machine_publication(silo: Silo, config: SmokeConfig, registry: LoopbackRegistry, overlay_probe: Path, overlay_image_bytes: images.OciImage, reserved: str) -> None:
     from uuid import UUID
-    admitted = registry.publish(overlay.image(config, overlay_probe), "overlay-reserved-positive-control")
+    admitted = registry.publish(overlay_image_bytes, "overlay-reserved-positive-control")
     silo.create("reserved-control", admitted, "--root-profile", overlay.PROFILE, "--disk-size", "64mib", "--network", "none")
     before = {UUID(machine["id"]) for machine in silo.ls()}
     image = overlay.image(config, overlay_probe, reserved=reserved)
@@ -770,10 +800,19 @@ def test_vmdk_native_attachment_reserve_edge(silo: Silo, workspace: Workspace, o
     lower = overlay.records(descriptor)[0].path
     lower_before = overlay.digest(lower)
     overlay.probe(silo, name, "lower-ro")
+    data_devices = [devices[f"silo-data-{index}"][0] for index in range(len(data))]
+    transport_output = silo.exec(name, "sh", "-eu", "-c", """
+for device do
+    printf '%s\\t' "$device"
+    readlink -f "/sys/block/$device/device"
+done
+""", "overlay-data-transports", *data_devices, user="root").stdout
+    transport_lines = transport_output.split("\n")
+    assert len(transport_lines) == len(data_devices) + 1 and transport_lines[-1] == "", transport_output
     data_virtio = {}
-    for index in range(len(data)):
-        device_name = devices[f"silo-data-{index}"][0]
-        target = silo.exec(name, "readlink", "-f", f"/sys/block/{device_name}/device", user="root").stdout.strip()
+    for index, device_name in enumerate(data_devices):
+        observed_device, separator, target = transport_lines[index].partition("\t")
+        assert separator == "\t" and observed_device == device_name, transport_lines[index]
         data_virtio[f"silo-data-{index}"] = Path(target).name
         assert re.fullmatch(r"virtio[0-9]+", data_virtio[f"silo-data-{index}"]), target
 
