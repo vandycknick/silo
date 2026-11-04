@@ -11,11 +11,14 @@ mod image;
 mod machine;
 mod machine_id;
 mod network;
+pub(crate) mod snapshot;
+pub(crate) mod storage;
 
 pub(crate) use db_config::DbConfig;
 pub(crate) use image::{
-    ImageConfigRecord, ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord,
-    ImageRefRecord, ImageRootfsArtifactRecord, MachineRootfsRecord, OciImageRecord,
+    CacheCleanupDeferral, CacheRecoveryReport, ImageConfigRecord, ImageLayerRecord,
+    ImageManifestLayerRecord, ImageManifestRecord, ImageRefRecord, ImageRootfsArtifactRecord,
+    MachineRootfsRecord, OciImageRecord,
 };
 pub(crate) use machine::{MachineConfig, MachineRuntimeState, MachineState};
 pub(crate) use machine_id::{looks_like_id_prefix, MachineId};

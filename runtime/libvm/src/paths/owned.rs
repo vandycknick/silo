@@ -5,9 +5,9 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
-use nix::fcntl::{fcntl, open, openat, FcntlArg, OFlag};
-use nix::sys::stat::{fchmod, fstat, mkdirat, Mode, SFlag};
-use nix::unistd::{ftruncate, geteuid, mkdir};
+use nix::fcntl::{fcntl, open, openat, AtFlags, FcntlArg, OFlag};
+use nix::sys::stat::{fchmod, fstat, fstatat, mkdirat, Mode, SFlag};
+use nix::unistd::{ftruncate, geteuid, mkdir, unlinkat, UnlinkatFlags};
 
 use crate::LibVmError;
 
@@ -20,6 +20,27 @@ pub(crate) struct OwnedDirectory {
 }
 
 impl OwnedDirectory {
+    pub(crate) fn fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), LibVmError> {
+        sync_directory(&self.fd, &self.path)
+    }
+    pub(crate) fn try_clone(&self) -> Result<Self, LibVmError> {
+        Ok(Self {
+            fd: self
+                .fd
+                .try_clone()
+                .map_err(|error| invalid(&self.path, error))?,
+            path: self.path.clone(),
+        })
+    }
+
     /// Duplicates this directory, keeping CLOEXEC until cleared in the child.
     pub(crate) fn duplicate_inheritable(&self) -> Result<OwnedFd, LibVmError> {
         let fd = fcntl(&self.fd, FcntlArg::F_DUPFD_CLOEXEC(3))
@@ -31,6 +52,11 @@ impl OwnedDirectory {
         let parent = path
             .parent()
             .ok_or_else(|| invalid(path, "has no parent directory"))?;
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
         fs::create_dir_all(parent).map_err(|error| invalid(path, error))?;
 
         let created = match mkdir(path, PRIVATE_DIRECTORY_MODE) {
@@ -41,6 +67,8 @@ impl OwnedDirectory {
         let fd = open_directory(path)?;
         if created {
             fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(path, error))?;
+            sync_directory(&fd, path)?;
+            sync_directory(&open_directory(parent)?, parent)?;
         }
         validate_directory(&fd, path, created)?;
         Ok(Self {
@@ -160,7 +188,7 @@ impl OwnedDirectory {
         let fd = match openat(
             &self.fd,
             name,
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
@@ -180,6 +208,36 @@ impl OwnedDirectory {
             ));
         }
         remove_entry(self.fd.as_raw_fd(), &self.path, std::ffi::OsStr::new(name))
+    }
+
+    /// Remove only the admitted open directory, never a reopened mutable root
+    /// name. Both admission and final unlink bind the parent entry to this FD.
+    pub(crate) fn remove_open_tree(
+        &self,
+        name: &str,
+        verified_child: &OwnedDirectory,
+    ) -> Result<(), LibVmError> {
+        if !is_single_component(name) {
+            return Err(invalid(
+                &self.path.join(name),
+                "removal target is not one path component",
+            ));
+        }
+        let path = self.path.join(name);
+        validate_directory(&verified_child.fd, &path, true)?;
+        verify_directory_entry(
+            self.fd.as_raw_fd(),
+            std::ffi::OsStr::new(name),
+            &verified_child.fd,
+            &path,
+        )?;
+        remove_directory_contents(&verified_child.fd, &path)?;
+        unlink_verified_directory(
+            self.fd.as_raw_fd(),
+            std::ffi::OsStr::new(name),
+            &verified_child.fd,
+            &path,
+        )
     }
 
     pub(crate) fn write_file(&self, name: &str, contents: &[u8]) -> Result<(), LibVmError> {
@@ -245,13 +303,52 @@ fn remove_entry(
     };
 
     if let Some(directory) = directory {
-        for child in directory_entries(&directory, &path)? {
-            remove_entry(directory.as_raw_fd(), &path, &child)?;
-        }
-        unlink_at(parent_raw_fd, name, libc::AT_REMOVEDIR, &path)
+        remove_directory_contents(&directory, &path)?;
+        unlink_verified_directory(parent_raw_fd, name, &directory, &path)
     } else {
         unlink_at(parent_raw_fd, name, 0, &path)
     }
+}
+
+fn remove_directory_contents(directory: &OwnedFd, path: &Path) -> Result<(), LibVmError> {
+    for child in directory_entries(directory, path)? {
+        remove_entry(directory.as_raw_fd(), path, &child)?;
+    }
+    Ok(())
+}
+
+fn verify_directory_entry(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    directory: &OwnedFd,
+    path: &Path,
+) -> Result<(), LibVmError> {
+    let parent = unsafe { BorrowedFd::borrow_raw(parent_fd) };
+    let held = fstat(directory).map_err(|error| invalid(path, error))?;
+    let entry = fstatat(parent, Path::new(name), AtFlags::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| invalid(path, error))?;
+    if SFlag::from_bits_truncate(entry.st_mode) != SFlag::S_IFDIR
+        || entry.st_dev != held.st_dev
+        || entry.st_ino != held.st_ino
+    {
+        return Err(invalid(
+            path,
+            "directory entry no longer names the admitted open inode",
+        ));
+    }
+    Ok(())
+}
+
+fn unlink_verified_directory(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    directory: &OwnedFd,
+    path: &Path,
+) -> Result<(), LibVmError> {
+    verify_directory_entry(parent_fd, name, directory, path)?;
+    let parent = unsafe { BorrowedFd::borrow_raw(parent_fd) };
+    unlinkat(parent, Path::new(name), UnlinkatFlags::RemoveDir)
+        .map_err(|error| invalid(path, error))
 }
 
 fn directory_entries(fd: &OwnedFd, path: &Path) -> Result<Vec<OsString>, LibVmError> {
@@ -503,5 +600,89 @@ mod tests {
             std::fs::read(external.join("keep")).expect("read external sentinel"),
             b"safe"
         );
+    }
+
+    #[test]
+    fn remove_open_tree_rejects_name_replacement_after_directory_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = OwnedDirectory::open_root(&temp.path().join("owned")).unwrap();
+        let admitted = parent.create_dir("candidate").unwrap().unwrap();
+        admitted.write_file("original", b"owned original").unwrap();
+        let moved = parent.path().join("moved");
+        std::fs::rename(admitted.path(), &moved).unwrap();
+        let replacement = parent.create_dir("candidate").unwrap().unwrap();
+        replacement.write_file("keep", b"not admitted").unwrap();
+        assert!(parent.remove_open_tree("candidate", &admitted).is_err());
+        assert_eq!(
+            std::fs::read(moved.join("original")).unwrap(),
+            b"owned original"
+        );
+        assert_eq!(
+            std::fs::read(replacement.path().join("keep")).unwrap(),
+            b"not admitted"
+        );
+    }
+
+    #[test]
+    fn open_directory_traversal_cannot_switch_to_a_replacement_root() {
+        use crate::paths::owned::{
+            remove_directory_contents, unlink_verified_directory, verify_directory_entry,
+        };
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = OwnedDirectory::open_root(&temp.path().join("owned")).unwrap();
+        let admitted = parent.create_dir("candidate").unwrap().unwrap();
+        admitted.write_file("original", b"owned original").unwrap();
+        let name = std::ffi::OsStr::new("candidate");
+        verify_directory_entry(
+            parent.fd().as_raw_fd(),
+            name,
+            admitted.fd(),
+            admitted.path(),
+        )
+        .unwrap();
+        // Rename precisely after entry validation, before recursive traversal.
+        let moved = parent.path().join("moved");
+        std::fs::rename(admitted.path(), &moved).unwrap();
+        let replacement = parent.create_dir("candidate").unwrap().unwrap();
+        replacement.write_file("keep", b"not admitted").unwrap();
+        remove_directory_contents(admitted.fd(), admitted.path()).unwrap();
+        assert!(!moved.join("original").exists());
+        assert_eq!(
+            std::fs::read(replacement.path().join("keep")).unwrap(),
+            b"not admitted"
+        );
+        assert!(unlink_verified_directory(
+            parent.fd().as_raw_fd(),
+            name,
+            admitted.fd(),
+            admitted.path()
+        )
+        .is_err());
+        assert!(replacement.path().is_dir());
+    }
+
+    #[test]
+    fn verified_directory_unlink_rejects_empty_replacement_after_traversal() {
+        use crate::paths::owned::{remove_directory_contents, unlink_verified_directory};
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = OwnedDirectory::open_root(&temp.path().join("owned")).unwrap();
+        let admitted = parent.create_dir("candidate").unwrap().unwrap();
+        admitted.write_file("original", b"owned original").unwrap();
+        remove_directory_contents(admitted.fd(), admitted.path()).unwrap();
+        let moved = parent.path().join("moved");
+        std::fs::rename(admitted.path(), &moved).unwrap();
+        let replacement = parent.create_dir("candidate").unwrap().unwrap();
+        // Empty is deliberate: an unchecked rmdir would remove this inode.
+        assert!(unlink_verified_directory(
+            parent.fd().as_raw_fd(),
+            std::ffi::OsStr::new("candidate"),
+            admitted.fd(),
+            admitted.path()
+        )
+        .is_err());
+        assert!(replacement.path().is_dir());
+        assert!(moved.is_dir());
     }
 }
