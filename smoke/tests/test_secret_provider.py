@@ -121,7 +121,7 @@ def test_secret_provider_reloads_expired_payload(
         }
         assert store.read_bytes() == before
         silo.stop(name)
-        assert silo.show(name)["state"] == "stopped"
+        assert silo.info(name)["state"] == "stopped"
         silo.rm(name)
     finally:
         if provider.poll() is None:

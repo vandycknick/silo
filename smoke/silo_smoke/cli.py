@@ -72,8 +72,8 @@ class Silo:
         result = self.run(*args, "--format", "json", stdin=stdin, timeout=timeout, expect=expect, env=env, label=label)
         return json.loads(result.stdout)
 
-    def show(self, name: str) -> dict[str, Any]:
-        return self.json("show", name)
+    def info(self, name: str) -> dict[str, Any]:
+        return self.json("info", name)
 
     def ls(self) -> list[dict[str, Any]]:
         return self.json("ls")
@@ -81,7 +81,7 @@ class Silo:
     def wait_ready(self, name: str, timeout: float = 90) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while True:
-            last = self.show(name)
+            last = self.info(name)
             if last.get("observation") == "observed" and last.get("state") == "running" and last.get("ready") is True:
                 return last
             remaining = deadline - time.monotonic()
@@ -92,7 +92,7 @@ class Silo:
     def create(self, name: str, image: str, *flags: str) -> dict[str, Any]:
         self.run("create", image, "--name", name, *flags)
         self.ws.register_machine(name)
-        return self.show(name)
+        return self.info(name)
 
     def start(self, name: str) -> None:
         self.run("start", name)
@@ -113,7 +113,7 @@ class Silo:
         return self.run("shell", name, "--user", user, stdin=script, expect=expect)
 
     def machine_id(self, name: str) -> str:
-        return str(self.show(name)["id"])
+        return str(self.info(name)["id"])
 
     def popen(
         self, *args: str, env: dict[str, str] | None = None,
@@ -121,6 +121,7 @@ class Silo:
         stdout: int | IO[bytes] | None = subprocess.PIPE,
         stderr: int | IO[bytes] | None = subprocess.PIPE,
         cwd: str | Path | None = None,
+        start_new_session: bool = False,
     ) -> subprocess.Popen[bytes]:
         self.ws.record(args[0] if args else "silo", f"$ silo {shlex.join(args)}\n")
-        return subprocess.Popen([str(self.ws.config.silo), *args], env=self.ws.env() if env is None else env, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, start_new_session=False)
+        return subprocess.Popen([str(self.ws.config.silo), *args], env=self.ws.env() if env is None else env, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, start_new_session=start_new_session)

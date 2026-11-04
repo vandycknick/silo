@@ -10,7 +10,7 @@ package = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not slow'"
 markers = [
   "daemon: starts a private Silo daemon",
   "system: needs SILO_SMOKE_SYSTEM_IMAGE",

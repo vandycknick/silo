@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import platform
 import stat
 from uuid import UUID
 
+from silo_smoke import overlay, shutdown
 from silo_smoke.cli import Silo
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -32,8 +34,31 @@ def test_create_start_ready_stop_restart_rm(
     host_bytes = known_host.read_bytes()
     secret_bytes = secrets.read_bytes()
     assert stat.S_IMODE(secrets.stat().st_mode) == 0o600
-    silo.stop(name, timeout="20s")
-    assert silo.show(name)["state"] == "stopped"
+    processes = ()
+    lease = None
+    if platform.system() == "Linux":
+        bound, lease = shutdown.holder(silo, name)
+        identities = {entry["role"]: entry["pid"] for entry in bound["holders"]}
+        monitor = shutdown.Process(identities["monitor"])
+        worker = shutdown.Process(identities["krun-worker"])
+        processes = (monitor, worker)
+        assert overlay.worker_pid_of_monitor(monitor.pid) == worker.pid
+        root = workspace.silo_home / "machines" / created["id"] / "root.raw"
+        for process in processes:
+            shutdown.handles(silo, process.pid, [root, lease])
+    try:
+        silo.stop(name, timeout="20s")
+        if platform.system() == "Linux":
+            terminal = shutdown.exit_record(silo, name, run_id)
+            for process in processes:
+                process.wait()
+            assert lease is not None and not shutdown.lease_busy(lease)
+            shutdown.assert_clean(silo, name, terminal)
+            assert overlay.ext4(root)["incompat"] & 4 == 0
+    finally:
+        for process in processes:
+            process.close()
+    assert silo.info(name)["state"] == "stopped"
     silo.start(name)
     restarted = silo.wait_ready(name)
     assert restarted["state"] == "running"
@@ -44,13 +69,13 @@ def test_create_start_ready_stop_restart_rm(
     assert secrets.read_bytes() == secret_bytes
     silo.stop(name, timeout="20s")
     silo.rm(name)
-    removed = silo.run("show", name, expect=1)
+    removed = silo.run("info", name, expect=1)
     assert "not found" in removed.stderr
     assert silo.ls() == []
 
 
-def test_show_unavailable_without_runtime(silo: Silo) -> None:
-    result = silo.run("show", "never-created", expect=1)
+def test_info_unavailable_without_runtime(silo: Silo) -> None:
+    result = silo.run("info", "never-created", expect=1)
     assert result.stderr != ""
     assert "not found" in result.stderr
 
@@ -64,5 +89,5 @@ def test_boot_failure_leaves_machine_stopped(
     silo.create(name, basic_image, "--cpus", "1", "--memory", "512mb", "--vsock", "--network", "none", "--kernel", str(kernel))
     result = silo.run("start", name, expect=None)
     assert result.returncode != 0
-    assert silo.show(name)["state"] == "stopped"
+    assert silo.info(name)["state"] == "stopped"
     assert silo.run("rm", name, "--force").returncode == 0

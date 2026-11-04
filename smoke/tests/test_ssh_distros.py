@@ -126,4 +126,4 @@ def test_distro_certificate_two_boots(
             assert "native SSH certificate authentication succeeded" in serial, serial[-2000:]
             assert 'key_id="silo:cli:' in serial
         silo.stop(name)
-        assert silo.show(name)["state"] == "stopped"
+        assert silo.info(name)["state"] == "stopped"

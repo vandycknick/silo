@@ -6,8 +6,8 @@
 //! silo-vmm binary compiled with the mock backend so libvm integration tests can
 //! spawn a real monitor process on hosts without virtualization support.
 //!
-//! Every scenario field is optional; an absent field (or an absent scenario
-//! file altogether) means the happy-path default: the machine boots
+//! An absent optional scenario field means the happy-path default. An
+//! explicitly selected scenario file must exist and contain valid JSON. The machine boots
 //! immediately, the fake guest agent becomes ready, executions run real host
 //! subprocesses in a sandbox, and the filesystem service operates on a
 //! per-machine temp directory.
@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
+use vm_spec::live::{LiveAvailability, LiveCapabilityVector, LiveLane, LiveOperation, LiveScope};
 
 /// Scripted behavior for one mock-backed machine.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Scenario {
     pub boot: BootScenario,
@@ -31,10 +32,12 @@ pub struct Scenario {
     pub vsock: VsockScenario,
     pub filesystem: FilesystemScenario,
     pub forward: ForwardScenario,
+    /// Test-only transport grants. Never qualifies a production backend.
+    pub live: Option<LiveScenario>,
 }
 
 /// Behavior of `machine.start()`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct BootScenario {
     /// Delay before start() returns, in milliseconds.
@@ -44,7 +47,7 @@ pub struct BootScenario {
 }
 
 /// Behavior of the running machine.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct RunScenario {
     /// Simulate a VMM crash this many milliseconds after boot:
@@ -55,7 +58,7 @@ pub struct RunScenario {
 }
 
 /// Behavior of the serial device.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct SerialScenario {
     /// Lines written to the serial device after boot (newline-terminated),
@@ -78,7 +81,7 @@ impl Default for SerialScenario {
 }
 
 /// Behavior of the fake guest agent (status/metrics services).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct AgentScenario {
     /// Delay before the agent reports Ready, in milliseconds.
@@ -98,7 +101,7 @@ pub struct AgentScenario {
 }
 
 /// Behavior of the fake guest process service.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct ExecScenario {
     /// Force every launch to fail with this reason instead of spawning.
@@ -110,7 +113,7 @@ pub struct ExecScenario {
 }
 
 /// Behavior of vsock ports beyond the built-in control (1027) and SSH (22).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct VsockScenario {
     /// Ports that refuse host connections even when configured.
@@ -120,7 +123,7 @@ pub struct VsockScenario {
 }
 
 /// Behavior of the fake guest filesystem service.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct FilesystemScenario {
     /// Guest paths that fail with a structured error code.
@@ -129,7 +132,7 @@ pub struct FilesystemScenario {
 }
 
 /// Behavior of the mock guest forward dialer and capability check.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct ForwardScenario {
     /// Canonical guest target addresses answered with `ERR refused`.
@@ -138,6 +141,69 @@ pub struct ForwardScenario {
     pub unsupported: bool,
     /// Override the pending inbound connection parking timeout in milliseconds.
     pub park_timeout_ms: Option<u64>,
+}
+
+/// Complete host vector and optional strictly narrowing machine vector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "LiveScenarioFields"
+)]
+pub struct LiveScenario {
+    pub lane: LiveLane,
+    pub host: LiveCapabilityVector,
+    pub machine: Option<LiveCapabilityVector>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiveScenarioFields {
+    lane: LiveLane,
+    host: LiveCapabilityVector,
+    machine: Option<LiveCapabilityVector>,
+}
+
+impl TryFrom<LiveScenarioFields> for LiveScenario {
+    type Error = String;
+
+    fn try_from(fields: LiveScenarioFields) -> Result<Self, Self::Error> {
+        let scenario = Self {
+            lane: fields.lane,
+            host: fields.host,
+            machine: fields.machine,
+        };
+        scenario.validate()?;
+        Ok(scenario)
+    }
+}
+
+impl LiveScenario {
+    pub fn validate(&self) -> Result<(), String> {
+        self.host.validate(LiveScope::Host)?;
+        if let Some(machine) = &self.machine {
+            machine.validate(LiveScope::Machine)?;
+            for operation in LiveOperation::ALL {
+                let host = self.host.get(operation);
+                let narrowed = machine.get(operation);
+                if narrowed.native && !host.native {
+                    return Err(format!(
+                        "machine scenario promotes native {}",
+                        operation.as_str()
+                    ));
+                }
+                if matches!(host.availability, LiveAvailability::Unsupported { .. })
+                    && narrowed != host
+                {
+                    return Err(format!(
+                        "machine scenario changes host refusal for {}",
+                        operation.as_str()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Scenario {
@@ -150,13 +216,10 @@ impl Scenario {
         serde_json::to_string_pretty(self).expect("scenario serializes")
     }
 
-    /// Load a scenario file; a missing file is the happy-path default.
+    /// Load an explicitly selected scenario. Missing files are errors.
     pub fn load(path: &Path) -> io::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => Self::from_json(&contents).map_err(io::Error::other),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err),
-        }
+        let contents = std::fs::read_to_string(path)?;
+        Self::from_json(&contents).map_err(io::Error::other)
     }
 
     /// Write the scenario to a file, creating parent directories.
@@ -252,7 +315,7 @@ fn target_dir(workspace_root: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::*;
 
     #[test]
     fn default_scenario_round_trips() {
@@ -299,10 +362,70 @@ mod tests {
     }
 
     #[test]
-    fn missing_scenario_file_is_default() {
+    fn missing_scenario_file_is_an_error() {
         let path =
             std::env::temp_dir().join(format!("test-utils-missing-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(Scenario::load(&path).expect("load"), Scenario::default());
+        assert_eq!(
+            Scenario::load(&path).expect_err("missing").kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn capabilities_scenario_rejects_host_device_reasons_and_machine_promotions() {
+        use vm_spec::live::{
+            LiveCapability, LiveDeviceSubject, LiveReasonCode, LiveUnsupportedReason,
+        };
+        let excluded = LiveCapabilityVector::all_unsupported(LiveReasonCode::BackendExcluded);
+        let supported = LiveCapability {
+            native: true,
+            availability: LiveAvailability::Supported,
+        };
+        let mut host = excluded.clone();
+        host.pause = supported.clone();
+        let mut machine = host.clone();
+        machine.pause.availability = LiveAvailability::Unsupported {
+            reason: LiveUnsupportedReason::device(LiveDeviceSubject::Rosetta),
+        };
+        let valid = LiveScenario {
+            lane: LiveLane::KvmX86_64,
+            host: host.clone(),
+            machine: Some(machine.clone()),
+        };
+        assert!(valid.validate().is_ok());
+        let scenario = Scenario {
+            live: Some(valid),
+            ..Default::default()
+        };
+        assert_eq!(
+            Scenario::from_json(&scenario.to_json()).expect("roundtrip"),
+            scenario
+        );
+
+        let host_device = LiveScenario {
+            lane: LiveLane::NotApplicable,
+            host: machine,
+            machine: None,
+        };
+        assert!(host_device.validate().is_err());
+        assert!(serde_json::from_value::<LiveScenario>(
+            serde_json::to_value(host_device).expect("serialize")
+        )
+        .is_err());
+        let promoted = LiveScenario {
+            lane: LiveLane::NotApplicable,
+            host: excluded.clone(),
+            machine: Some(host),
+        };
+        assert!(promoted.validate().is_err());
+        let mut different_reason = excluded.clone();
+        different_reason.pause = LiveCapability::unsupported(LiveReasonCode::NotDelivered);
+        assert!(LiveScenario {
+            lane: LiveLane::NotApplicable,
+            host: excluded,
+            machine: Some(different_reason)
+        }
+        .validate()
+        .is_err());
     }
 }
