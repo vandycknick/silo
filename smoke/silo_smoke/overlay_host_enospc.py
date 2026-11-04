@@ -27,9 +27,6 @@ def main() -> None:
     upper = Path(request["upper"])
     scratch = Path(request["scratch"])
     evidence = Path(request["evidence"])
-    # Temporary diagnostic run: retain the existing native stderr debug stream
-    # even when forced cleanup cannot publish the backend's in-memory tail.
-    os.environ["RUST_LOG"] = "info,silo_vmm::virt::backend::krun::owner=debug"
     assert os.getuid() == 0 and os.readlink("/proc/self/ns/user") != request["outer_user_namespace"]
     assert Path("/proc/self/uid_map").read_text().split()[1] == request["outer_uid"]
     scratch.mkdir(mode=0o700)
