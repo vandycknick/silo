@@ -26,6 +26,7 @@ use crate::exec_log::{ExecLogSource, ExecLogWriter};
 use crate::guest::process_client;
 use crate::state::{InstanceStore, ReadyAgentIdentity};
 
+#[path = "execution/startup.rs"]
 mod startup;
 pub(crate) use startup::{spawn_startup_command, StartupCommandHandle, StartupCommandStartError};
 

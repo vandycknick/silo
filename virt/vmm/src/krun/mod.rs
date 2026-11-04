@@ -10,11 +10,10 @@ mod host;
 mod network;
 mod rosetta;
 mod status;
+pub(crate) mod storage_holder;
 pub(crate) mod worker;
 
-pub(crate) use crate::krun::config::{
-    validate_config, Disk, KrunConfig, Mount, NetUnixgram, Network,
-};
+pub(crate) use crate::krun::config::{validate_config, KrunConfig, Mount, NetUnixgram, Network};
 pub(crate) use crate::krun::error::KrunBackendError;
 #[cfg(target_os = "linux")]
 pub(crate) use crate::krun::host::check_host;

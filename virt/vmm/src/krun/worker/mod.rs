@@ -2,7 +2,7 @@
 
 #[cfg(target_os = "macos")]
 mod admission;
-mod fds;
+pub(crate) mod fds;
 pub(crate) mod wire;
 
 use std::io;
@@ -35,6 +35,8 @@ pub(crate) fn main() -> eyre::Result<()> {
         watchdog,
         console,
         mux,
+        storage_lease,
+        raw_handles,
     } = fds::Bootstrap::adopt_fixed()?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let shutdown_signals = block_shutdown_signal()?;
@@ -44,7 +46,13 @@ pub(crate) fn main() -> eyre::Result<()> {
     let events = Arc::new(Mutex::new(EventWriter(events)));
     let mut stage = StartupStage::Spawned;
     let result = (|| -> eyre::Result<()> {
-        let config = wire::read_config(&mut std::fs::File::from(config))?;
+        let mut config = wire::read_config(&mut std::fs::File::from(config))?;
+        fds::validate_lease(
+            storage_lease.as_fd(),
+            config.storage_context.storage_lease.file_device,
+            config.storage_context.storage_lease.file_inode,
+        )?;
+        bind_raw_handles(&mut config, &raw_handles)?;
         if config.vsock_mux != mux.is_some() {
             return Err(wire::invalid("mux descriptor does not match the worker config").into());
         }
@@ -106,7 +114,76 @@ pub(crate) fn main() -> eyre::Result<()> {
             },
         );
     }
-    result
+    if let Err(error) = &result {
+        eprintln!("krun worker failed: {error:#}");
+    }
+    // Native build can already have started detached attachment-owning threads.
+    // Keep the lease and retained FD bindings alive until actual process exit,
+    // including event-loop/build error paths. Never return and drop them first.
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
+}
+
+fn bind_raw_handles(config: &mut crate::krun::KrunConfig, handles: &[OwnedFd]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let bindings = &config.storage_context.raw_handles;
+    let raw_count = config
+        .disks
+        .iter()
+        .filter(|disk| disk.format == vm_spec::DiskFormat::Raw)
+        .count();
+    if handles.len() != bindings.len() || bindings.len() != raw_count {
+        return Err(wire::invalid(
+            "Raw descriptor coverage differs from the complete disk set",
+        ));
+    }
+    let mut next = 0;
+    for (disk_index, disk) in config.disks.iter_mut().enumerate() {
+        if disk.format != vm_spec::DiskFormat::Raw {
+            continue;
+        }
+        let binding = &bindings[next];
+        let fd = &handles[next];
+        if binding.disk_index as usize != disk_index
+            || binding.child_fd != 9 + next as i32
+            || fd.as_raw_fd() != binding.child_fd
+            || binding.read_only != disk.read_only
+            || binding.length_bytes != disk.geometry.length
+        {
+            return Err(wire::invalid("Raw descriptor does not match its disk"));
+        }
+        let metadata = nix::sys::stat::fstat(fd)?;
+        let flags = nix::fcntl::OFlag::from_bits_truncate(nix::fcntl::fcntl(
+            fd,
+            nix::fcntl::FcntlArg::F_GETFL,
+        )?);
+        let access = flags & nix::fcntl::OFlag::O_ACCMODE;
+        if metadata.st_dev as u64 != binding.device
+            || metadata.st_ino as u64 != binding.inode
+            || (nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode)
+                == nix::sys::stat::SFlag::S_IFREG
+                && metadata.st_size as u64 != binding.length_bytes)
+            || access
+                != if binding.read_only {
+                    nix::fcntl::OFlag::O_RDONLY
+                } else {
+                    nix::fcntl::OFlag::O_RDWR
+                }
+        {
+            return Err(wire::invalid(
+                "Raw backing identity, length or access mismatch",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            disk.path = std::path::Path::new("/proc/self/fd").join(binding.child_fd.to_string());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            disk.path = std::path::Path::new("/dev/fd").join(binding.child_fd.to_string());
+        }
+        next += 1;
+    }
+    Ok(())
 }
 
 struct EventWriter(OwnedFd);

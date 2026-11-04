@@ -9,7 +9,39 @@ cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::backend::kru
 cargo test --locked -p silo-vmm --all-features --bin silo-vmm exit_command::
 cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::serial::tests::
 cargo test --locked -p libvm machine::lifecycle::tests::
+cargo test --locked -p silo-vmm --all-features --bin silo-vmm machine::tests::vm_spec_machine_config_attaches_spec_disks_in_order
+cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::config::tests::
+cargo test --locked -p silo-vmm --all-features --bin silo-vmm krun::engine::tests::
+cargo test --locked -p silo-vmm --all-features --bin silo-vmm capabilities::
+cargo test --locked -p silo-vmm --all-features --bin silo-vmm build_inputs::
+cargo test --locked -p silo-vmm --all-features --bin silo-vmm dependency_source::
+cargo test --locked -p silo-vmm --all-features --test capabilities
 ```
+
+Capability Cargo tests use pure linked build facts or the VZ/scenario backend,
+never native host discovery. Real `--backend krun` queries now consume the
+dependency's read-only system KVM/HVF observations and live in
+`smoke/tests/test_native_capabilities.py`, even though they create no VM.
+
+Phase 9 linked-fact tests expect native pause on recognized implemented lanes,
+but no public operation is delivered or qualified. They also cover the boundary
+where an implemented primitive must not grant admission, even with a known host.
+Capture, restore, fork and incremental remain native-unsupported. These tests
+do not qualify runtime execution on KVM arm64 or HVF.
+
+To query the actual monitor, build its binary (not only the unit-test harness)
+in the repository development shell with the configured libkrun dependency
+available:
+
+```sh
+cargo build --locked -p silo-vmm --bin silo-vmm
+target/debug/silo-vmm capabilities --backend krun --json
+```
+
+The development shell supplies the native compiler and libclang prerequisites.
+Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
+set. The krun query performs read-only host discovery, not a VM run; its
+`native: true` pause field is not public support or a qualification grant.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust
@@ -26,15 +58,21 @@ unit-test harness. The worker is that same executable spawned with argv[0]
 | 5 | watchdog FIFO |
 | 6 | console PTY slave |
 | 7 | vsock mux stream, only when the config enables it |
+| 8 | one generation lease, required even before config arrives |
+| 9..24 | retained Raw handles in manifest order, at most 16 |
 
 The tests cover:
 
 - The fixed descriptor mapping: wrong access modes, repeated or aliased
   resources, opposite ends of one pipe, a pipe where a TTY is required, a
-  missing role, a datagram or unconnected vsock mux, and any inherited
-  descriptor above fd 7 all fail closed before the worker emits an event.
+  missing role, a datagram or unconnected vsock mux, and unexpected inherited
+  descriptors (including optional-role holes) all fail closed before events.
 - The config read: empty, truncated, trailing, and oversized (above 16 MiB)
   documents are rejected, and decode errors are redacted.
+- Typed storage private-boundary checks: required role, format, geometry,
+  identity and access; complete lower/upper pairs; exact managed serials;
+  duplicate identities; roots preceding Data; malformed, unknown and old
+  ordered-only disk shapes. These tests execute parsers and projections only.
 - Bounded event framing, watchdog closure while the config is still incomplete
   and while the event channel is full, partial-request signal and parent-loss
   cancellation, and native startup-failure finalization. The latter uses an
@@ -42,6 +80,13 @@ The tests cover:
   successful virtualization.
 - The exit runner: it exists only when `--exit-command` is given, holds only its
   trigger descriptor, and still runs the command when the supervisor is killed.
+- Real Linux child descriptor enumeration, CLOEXEC restoration, a shared-flock
+  OFD held through exec and watchdog exit, and an unrelated child remaining
+  alive without delaying lease release. Colliding source/target mappings run
+  through the production pre-exec installer, not a synthetic FD mapper.
+- Manager launch unit tests execute a retained ELF through `/proc/self/fd/N`
+  after child cleanup and check that its CLOEXEC executable FD is absent after
+  exec. These tests need no guest or hypervisor.
 
 Every launched fixture has a deadline and a separate owned process group for
 failure cleanup. Tests never kill system-wide processes. Tests that use a generic
@@ -112,3 +157,10 @@ reclaim savings, and explicit VZ operation need their separate real-host scenari
 See [silo-vmm architecture](../../../docs/architecture/silo-vmm.md) for
 results and remaining limitations. A debug stage is not release-archive or
 macOS-signature qualification.
+
+Flat-overlay/VMDK runtime qualification uses `smoke/tests/`, through the real
+libvm, monitor and worker path, not additional native Cargo tests. In particular,
+read-only handle evidence must inspect the actual worker's descriptor and every
+lower backing handle, not the monitor. Serial fault fixtures are isolated
+source-copy builds, never a shipped validation bypass. Private wire-contract
+and VZ rejection unit tests do not qualify a native host lane.

@@ -57,4 +57,5 @@ pub struct DaemonContext {
     pub(crate) forwards: Arc<crate::forward::ForwardTable>,
     pub(crate) stop_requested: CancellationToken,
     pub(crate) shutdown: CancellationToken,
+    pub(crate) shutdown_state: Arc<crate::guest::shutdown::ShutdownState>,
 }

@@ -30,6 +30,7 @@ use crate::virt::VmExit;
 mod krun;
 #[cfg(feature = "mock-backend")]
 pub(crate) mod mock;
+pub(crate) mod storage;
 #[cfg(target_os = "macos")]
 mod vz;
 
@@ -62,6 +63,14 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
         Ok(self.try_wait().await?.is_some())
     }
 
+    /// Finalize retained storage only after every native owner is terminal.
+    async fn finalize_storage(
+        &self,
+        _guest_protocol_completed: bool,
+    ) -> Result<StorageFinalization, VirtError> {
+        Ok(StorageFinalization::default())
+    }
+
     /// Dynamically connect to a guest endpoint port, consuming its admission lease.
     async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError>;
 
@@ -87,6 +96,14 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
         None
     }
+}
+
+/// Independently observed host storage facts, never inferred from exit status.
+#[derive(Debug, Clone, Default)]
+pub struct StorageFinalization {
+    pub host_writes_flushed: bool,
+    pub attachments_closed: bool,
+    pub error: Option<String>,
 }
 
 /// A single launch attempt, including failures before a VM exists.
@@ -152,25 +169,6 @@ impl BackendKind {
             BackendKind::Mock,
         ]
     }
-
-    /// Today's pinned selection policy: krun on Linux and macOS.
-    ///
-    /// A future user-facing backend picker replaces callers of this with
-    /// "user preference, validated against `compiled()` + `probe()`".
-    pub fn default_for_host() -> Result<BackendKind, VirtError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            Ok(BackendKind::Krun)
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            Err(VirtError::UnsupportedBackend {
-                kind: "none",
-                reason: "no virtualization backend is available for this host platform".to_string(),
-            })
-        }
-    }
 }
 
 impl fmt::Display for BackendKind {
@@ -184,6 +182,7 @@ pub(crate) fn create_backend(
     kind: BackendKind,
     config: VmConfig,
 ) -> Result<Arc<dyn VirtBackend>, VirtError> {
+    storage::publish_holders(&config, None)?;
     match kind {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         BackendKind::Krun => Ok(Arc::new(krun::KrunBackend::new(config)?)),
@@ -201,7 +200,7 @@ pub(crate) fn create_backend(
 
 #[cfg(test)]
 mod tests {
-    use crate::virt::backend::{BackendKind, StartAttempt};
+    use crate::virt::backend::StartAttempt;
 
     #[test]
     fn attempts_are_terminal_even_before_a_vm_exists() {
@@ -230,14 +229,5 @@ mod tests {
                 1
             );
         });
-    }
-
-    #[test]
-    fn default_backend_matches_platform() {
-        let kind = BackendKind::default_for_host().expect("host platform should be supported");
-        #[cfg(target_os = "linux")]
-        assert_eq!(kind, BackendKind::Krun);
-        #[cfg(target_os = "macos")]
-        assert_eq!(kind, BackendKind::Krun);
     }
 }

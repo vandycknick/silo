@@ -65,8 +65,24 @@ struct MonitorService {
 
 impl MonitorService {
     fn status(&self) -> Result<HostStatus, Status> {
-        let mut status = self.store.status().map_err(store_status)?;
-        status.run_id = Some(self.machine_run_id.clone());
+        let status = self.store.status().map_err(store_status)?;
+        let live = status
+            .live
+            .as_ref()
+            .ok_or_else(|| Status::internal("monitor live evidence missing"))?;
+        if status.run_id.as_deref() != Some(self.machine_run_id.as_str())
+            || live.run_id.as_deref() != Some(self.machine_run_id.as_str())
+            || live.machine_id != status.machine_id
+            || live.monitor_id
+                != status
+                    .monitor
+                    .as_ref()
+                    .and_then(|monitor| monitor.instance_id.clone())
+        {
+            return Err(Status::internal(
+                "monitor live evidence does not match current run",
+            ));
+        }
         Ok(status)
     }
 }
@@ -794,19 +810,41 @@ mod tests {
         let machine = uuid::Uuid::new_v4().to_string();
         let run = uuid::Uuid::new_v4().to_string();
         let monitor = crate::services::MonitorService {
-            store: std::sync::Arc::new(crate::state::InstanceStore::new(
-                machine.clone(),
-                "test".into(),
-                true,
-                "krun".into(),
-            )),
+            store: std::sync::Arc::new(
+                crate::state::InstanceStore::new(
+                    machine.clone(),
+                    "test".into(),
+                    true,
+                    crate::state::RunLiveProfile {
+                        run_id: run.clone(),
+                        backend: vm_spec::live::LiveBackend::Krun,
+                        lane: vm_spec::live::LiveLane::KvmX86_64,
+                        live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                            vm_spec::live::LiveReasonCode::NotDelivered,
+                        ),
+                    },
+                )
+                .expect("valid monitor state"),
+            ),
             machine_run_id: run.clone(),
             finite_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             waiter_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
         let status = monitor.status().unwrap();
-        assert_eq!(status.machine_id, Some(machine));
-        assert_eq!(status.run_id, Some(run));
+        let live = vm_spec::live::LiveMachineReport::try_from(status.live.clone().expect("live"))
+            .expect("valid live");
+        assert_eq!(status.machine_id, Some(machine.clone()));
+        assert_eq!(status.run_id, Some(run.clone()));
+        assert_eq!(live.machine_id, machine);
+        assert_eq!(live.run_id, run);
+        assert_eq!(
+            live.monitor_id,
+            status
+                .monitor
+                .expect("monitor")
+                .instance_id
+                .expect("monitor id")
+        );
         assert_eq!(status.readiness.unwrap().ready, Some(false));
     }
     use bytes::Bytes;
@@ -872,5 +910,135 @@ mod tests {
         }
         assert_eq!(backend_task.await.expect("backend joins"), b"request");
         assert_eq!(response, b"response after EOF");
+    }
+    #[tokio::test]
+    async fn root_metrics_rpc_relays_all_fields_inside_existing_observation_frame() {
+        use protocol::v1::{
+            vm_monitor_service_client::VmMonitorServiceClient,
+            vm_monitor_service_server::VmMonitorServiceServer, AgentIdentity, AgentMetricReport,
+            AgentMetrics, AgentStatus, AgentStatusReport, AgentStatusState, GetMetricsRequest,
+            MetricSnapshot, RootStorageKind, RootStorageMetrics, TemporaryDirectoryKind,
+            TemporaryDirectoryMetrics,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let store = Arc::new(crate::state::new_instance_store(
+            uuid::Uuid::new_v4().to_string(),
+            "root-relay".into(),
+            true,
+        ));
+        let instance = "00000000-0000-4000-8000-000000000002";
+        let observed_at = prost_types::Timestamp {
+            seconds: 1,
+            nanos: 2,
+        };
+        store
+            .observe_status(
+                AgentStatus {
+                    identity: Some(AgentIdentity {
+                        instance_id: Some(instance.into()),
+                        version: Some("test".into()),
+                        boot_id: Some("00000000-0000-4000-8000-000000000003".into()),
+                    }),
+                    report: Some(AgentStatusReport {
+                        observed_at: Some(observed_at),
+                        state: Some(AgentStatusState::Ready as i32),
+                        ..Default::default()
+                    }),
+                },
+                Duration::from_secs(300),
+            )
+            .unwrap();
+        let report = AgentMetricReport {
+            observed_at: Some(observed_at),
+            snapshot: Some(MetricSnapshot {
+                root_storage: Some(RootStorageMetrics {
+                    kind: Some(RootStorageKind::LinuxFlatOverlayV1 as i32),
+                    upper_profile: Some("silo-upper-ext4-v1".into()),
+                    upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
+                    upper_backing_bytes: Some(67_112_960),
+                    upper_filesystem_bytes: Some(67_108_864),
+                    unusable_tail_bytes: Some(4096),
+                    filesystem_overhead_bytes: Some(5_668_864),
+                    upper_usable_bytes: Some(61_440_000),
+                    upper_used_bytes: Some(53_248_000),
+                    upper_free_bytes: Some(8_192_000),
+                    upper_available_bytes: Some(4_096_000),
+                    upper_total_inodes: Some(8192),
+                    upper_free_inodes: Some(0),
+                    upper_available_inodes: Some(0),
+                    shared_lower_logical_bytes: Some(268_435_456),
+                    temporary_directory: Some(TemporaryDirectoryMetrics {
+                        kind: Some(TemporaryDirectoryKind::Tmpfs as i32),
+                        capacity_bytes: Some(1_048_576),
+                        used_bytes: Some(4096),
+                        free_bytes: Some(1_044_480),
+                        available_bytes: Some(1_044_480),
+                        persistent: Some(false),
+                        memory_charged: Some(true),
+                    }),
+                }),
+                ..Default::default()
+            }),
+        };
+        store
+            .observe_metrics(
+                AgentMetrics {
+                    agent_instance_id: Some(instance.into()),
+                    report: Some(report.clone()),
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        let service = crate::services::MonitorService {
+            store,
+            machine_run_id: uuid::Uuid::new_v4().to_string(),
+            finite_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            waiter_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let stopped = shutdown.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(VmMonitorServiceServer::new(service))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stopped.cancelled_owned(),
+                )
+                .await
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(2))
+            .connect()
+            .await
+            .unwrap();
+        let mut client = VmMonitorServiceClient::new(channel);
+        let response = client.get_metrics(GetMetricsRequest {}).await;
+        drop(client);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let observation = response.unwrap().into_inner().metrics.unwrap();
+        assert_eq!(observation.agent_instance_id.as_deref(), Some(instance));
+        assert_eq!(
+            observation.freshness,
+            Some(protocol::v1::Freshness::Stale as i32)
+        );
+        assert_eq!(
+            observation.stale_reason,
+            Some(protocol::v1::StaleReason::ReceiptAge as i32)
+        );
+        assert!(observation.received_at.is_some() && observation.stale_at.is_some());
+        assert_eq!(observation.report, Some(report));
     }
 }

@@ -45,7 +45,7 @@ const STDIO_CHUNK_BYTES: usize = 8192;
 
 #[derive(Debug)]
 pub(crate) struct MockGuest {
-    scenario: Scenario,
+    scenario: Arc<Scenario>,
     guest_root: PathBuf,
     identity: Mutex<Identity>,
     status: watch::Sender<AgentStatus>,
@@ -60,7 +60,7 @@ struct Identity {
 }
 
 impl MockGuest {
-    pub(crate) fn new(scenario: Scenario, guest_root: PathBuf) -> Self {
+    pub(crate) fn new(scenario: Arc<Scenario>, guest_root: PathBuf) -> Self {
         let identity = Identity {
             instance_id: scenario
                 .agent
@@ -423,6 +423,7 @@ fn agent_status(identity: &Identity, state: AgentStatusState) -> AgentStatus {
             }),
             provisioning: None,
             ssh: None,
+            lifecycle: None,
         }),
     }
 }
@@ -453,6 +454,7 @@ fn agent_metrics(instance_id: String) -> AgentMetrics {
                 network_interfaces: Vec::new(),
                 block_devices: Vec::new(),
                 memory_reclaim: None,
+                root_storage: None,
             }),
         }),
     }
@@ -477,6 +479,45 @@ struct AgentService {
 impl GuestAgentService for AgentService {
     type WatchStatusStream = StatusStream;
     type WatchMetricsStream = MetricsStream;
+    type OrderlyShutdownStream = Pin<
+        Box<dyn Stream<Item = Result<protocol::v1::ShutdownGuestFrame, Status>> + Send + 'static>,
+    >;
+
+    async fn freeze_workloads(
+        &self,
+        _: Request<protocol::v1::FreezeWorkloadsRequest>,
+    ) -> Result<Response<protocol::v1::FreezeWorkloadsResponse>, Status> {
+        Err(Status::unimplemented(
+            "scenario backend has no workload freezer",
+        ))
+    }
+
+    async fn activate(
+        &self,
+        _: Request<protocol::v1::ActivateRequest>,
+    ) -> Result<Response<protocol::v1::ActivateResponse>, Status> {
+        Err(Status::unimplemented(
+            "scenario backend has no guest activation",
+        ))
+    }
+
+    async fn thaw(
+        &self,
+        _: Request<protocol::v1::ThawRequest>,
+    ) -> Result<Response<protocol::v1::ThawResponse>, Status> {
+        Err(Status::unimplemented(
+            "scenario backend has no workload freezer",
+        ))
+    }
+
+    async fn orderly_shutdown(
+        &self,
+        _: Request<Streaming<protocol::v1::ShutdownHostFrame>>,
+    ) -> Result<Response<Self::OrderlyShutdownStream>, Status> {
+        Err(Status::unimplemented(
+            "scenario backend has no admitted storage shutdown authority",
+        ))
+    }
 
     async fn get_status(
         &self,

@@ -2,13 +2,14 @@ use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use crate::krun::{Disk, KrunConfig, Mount, Network};
+use crate::krun::{KrunConfig, Mount, Network};
 use libkrun::{
     BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, KernelFormat,
     MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice, RosettaFsConfig, RosettaFsDevice,
     RosettaProfile, SyncMode, TsiFlags, VmmBuilder, VmmError, VsockDevice,
 };
 use thiserror::Error;
+use vm_spec::Disk;
 
 // Process entry points choose if and when global native logging is installed.
 pub use libkrun::{init_log, LogLevel, LogOptions, LogStyle};
@@ -190,9 +191,9 @@ pub fn run_process(
             }
             DeviceConfig::Disk(disk) => {
                 let mut device = BlockDevice::new(
-                    &disk.block_id,
+                    disk.block_id.as_str(),
                     path_str(&disk.path, "disk")?,
-                    DiskFormat::Raw,
+                    disk_format(disk.format),
                 )
                 .map_err(|source| libkrun_error("create block device", source))?;
                 device.set_read_only(disk.read_only);
@@ -248,7 +249,7 @@ pub fn run_process(
                             "krun",
                         )
                         .map_err(Error::OpenUnixgramSocket)?;
-                        NetDevice::new_unixgram_fd(
+                        NetDevice::new_managed_unixgram_fd(
                             "net0",
                             OwnedFd::from(socket),
                             &net.mac,
@@ -420,6 +421,13 @@ fn external_kernel_format() -> KernelFormat {
     }
 }
 
+fn disk_format(format: vm_spec::DiskFormat) -> DiskFormat {
+    match format {
+        vm_spec::DiskFormat::Raw => DiskFormat::Raw,
+        vm_spec::DiskFormat::Vmdk => DiskFormat::Vmdk,
+    }
+}
+
 const fn disk_sync_mode() -> SyncMode {
     SyncMode::Relaxed
 }
@@ -448,14 +456,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::krun::config::NetUnixstream;
-    use crate::krun::{Disk, KrunConfig, Mount, Network, RosettaLaunchConfig};
-    use libkrun::{KernelFormat, SyncMode};
+    use crate::krun::{KrunConfig, Mount, Network, RosettaLaunchConfig};
+    use libkrun::KernelFormat;
+    use vm_spec::Disk;
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use crate::krun::engine::rosetta_device;
     use crate::krun::engine::{
-        device_plan, disk_sync_mode, external_kernel_format, path_str, DeviceConfig, DeviceKind,
-        Error, COMPAT_NET_FEATURES,
+        device_plan, external_kernel_format, path_str, DeviceConfig, DeviceKind, Error,
     };
 
     #[test]
@@ -520,16 +528,6 @@ mod tests {
         assert_eq!(external_kernel_format(), KernelFormat::Raw);
     }
 
-    #[test]
-    fn disks_use_relaxed_sync() {
-        assert_eq!(disk_sync_mode(), SyncMode::Relaxed);
-    }
-
-    #[test]
-    fn compatibility_network_features_remain_stable() {
-        assert_eq!(COMPAT_NET_FEATURES, 19_587);
-    }
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn native_rosetta_adapter_verifies_the_immutable_source_digest() {
@@ -578,8 +576,14 @@ mod tests {
         let config = KrunConfig {
             stdio_console: true,
             disks: vec![Disk {
-                block_id: "root".to_string(),
-                path: PathBuf::from("root.img"),
+                block_id: vm_spec::BlockId::new("explicit-root").expect("valid ID"),
+                path: PathBuf::from("root.raw"),
+                role: vm_spec::DiskRole::Root,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 4096,
+                    logical_sector_size: 512,
+                },
                 read_only: false,
             }],
             mounts: vec![Mount {

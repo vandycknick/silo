@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -26,6 +26,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(30);
 const FORCE_OBSERVATION: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const WORKER_EXECUTABLE: &str = "/proc/self/exe";
 
 /// Published lifecycle of one worker generation. `Reaped` means the child is
 /// gone but the owner is still draining channels; `Exited` is terminal.
@@ -63,13 +65,21 @@ struct Spawned {
 }
 
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    #[cfg(not(target_os = "linux"))]
     let (read, write) = nix::unistd::pipe()?;
     Ok((inherit::normalize(read)?, inherit::normalize(write)?))
 }
 
-/// Spawn `krun` with the fixed descriptor table of the worker contract:
-/// 3 config, 4 events, 5 watchdog, 6 console, 7 vsock mux.
-fn spawn(console: OwnedFd, mux: OwnedFd) -> io::Result<Spawned> {
+/// Spawn `krun` with fixed roles 3..6, optional mux 7, the generation lease
+/// at 8, and the complete checked Raw backing table at 9+.
+fn spawn(
+    console: OwnedFd,
+    mux: OwnedFd,
+    lease: &OwnedFd,
+    raw_handles: &[OwnedFd],
+) -> io::Result<Spawned> {
     let console = inherit::normalize(console)?;
     let mux = inherit::normalize(mux)?;
     let (config, send) = pipe()?;
@@ -81,17 +91,35 @@ fn spawn(console: OwnedFd, mux: OwnedFd) -> io::Result<Spawned> {
     let config_sender = Sender::from_owned_fd(send)?;
     let event_receiver = Receiver::from_owned_fd(receive)?;
     let diagnostic_receiver = Receiver::from_owned_fd(diagnostics)?;
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new(WORKER_EXECUTABLE);
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg0(WORKER_NAME)
+        .env_remove("_VM_STORAGE_LEASES")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
     command.kill_on_drop(true);
-    inherit::install(
-        command.as_std_mut(),
-        &[&config, &events, &watchdog, &console, &mux],
-    );
+    if raw_handles.len() > 16 {
+        return Err(wire::invalid(
+            "Raw descriptor table exceeds the total disk bound",
+        ));
+    }
+    let mut mapping = [(0, 0); 22];
+    mapping[..6].copy_from_slice(&[
+        (config.as_raw_fd(), 3),
+        (events.as_raw_fd(), 4),
+        (watchdog.as_raw_fd(), 5),
+        (console.as_raw_fd(), 6),
+        (mux.as_raw_fd(), 7),
+        (lease.as_raw_fd(), 8),
+    ]);
+    for (index, fd) in raw_handles.iter().enumerate() {
+        mapping[6 + index] = (fd.as_raw_fd(), 9 + index as i32);
+    }
+    inherit::install(command.as_std_mut(), &mapping[..6 + raw_handles.len()])?;
     let child = command.spawn()?;
     Ok(Spawned {
         child,
@@ -176,10 +204,18 @@ impl Owner {
         config: crate::krun::KrunConfig,
         console: OwnedFd,
         mux: OwnedFd,
+        raw_handles: Vec<OwnedFd>,
+        vm_config: &crate::virt::config::VmConfig,
     ) -> VmExit {
         if self.stop.is_cancelled() || self.force.is_cancelled() {
             return VmExit::stopped(StartupStage::Spawned);
         }
+        let Some(launch) = vm_config.storage_launch() else {
+            return VmExit::failed(
+                StartupStage::Spawned,
+                "managed worker lacks storage launch identity",
+            );
+        };
         let frame = match wire::encode_config(&config) {
             Ok(frame) => frame,
             Err(error) => return VmExit::failed(StartupStage::Spawned, error.to_string()),
@@ -190,12 +226,35 @@ impl Owner {
             mut events,
             diagnostics,
             _keepalive,
-        } = match spawn(console, mux) {
+        } = match spawn(console, mux, &launch.lease, &raw_handles) {
             Ok(spawned) => spawned,
             Err(error) => {
                 return VmExit::failed(StartupStage::Spawned, format!("spawn krun worker: {error}"))
             }
         };
+        // Only the child keeps checked duplicates. Parent proof handles remain
+        // owned by PreparedAttachments through post-reap finalization.
+        drop(raw_handles);
+        let publication = child
+            .id()
+            .ok_or_else(|| io::Error::other("spawned worker has no process identity"))
+            .and_then(|pid| crate::virt::backend::storage::publish_holders(vm_config, Some(pid)));
+        if let Err(error) = publication {
+            let _ = child.start_kill();
+            loop {
+                match child.wait().await {
+                    Ok(_) => break,
+                    Err(wait_error) => {
+                        tracing::error!(%wait_error, "holder publication failed; retaining worker reaper");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            return VmExit::failed(
+                StartupStage::Spawned,
+                format!("publish storage holders before worker configuration: {error}"),
+            );
+        }
         let pid = child.id().unwrap_or_default();
         tracing::info!(worker_pid = pid, "krun worker spawned");
         let tail = Arc::new(Mutex::new(Tail::default()));
@@ -507,5 +566,37 @@ mod tests {
         assert!(!valid_stage(StartupStage::Spawned, StartupStage::Build));
         assert!(!valid_stage(StartupStage::Build, StartupStage::Build));
         assert!(!valid_stage(StartupStage::Started, StartupStage::Admission));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_reexec_uses_loaded_elf_after_monitor_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("silo-vmm-worker-reexec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let temp = TempDir(directory);
+        std::fs::set_permissions(&temp.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = temp.0.join("loaded-monitor");
+        let replacement = temp.0.join("new-monitor");
+        std::fs::copy("/bin/sh", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::copy("/bin/false", &replacement).unwrap();
+        let output = std::process::Command::new(&executable)
+            .arg("-c")
+            .arg("mv -- \"$1\" \"$2\" || exit 92; \"$2\"; test \"$?\" -eq 1 || exit 93; exec \"$3\" -c 'printf loaded-monitor-worker'")
+            .arg("worker-reexec-fixture")
+            .arg(&replacement)
+            .arg(&executable)
+            .arg(crate::virt::backend::krun::owner::WORKER_EXECUTABLE)
+            .output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"loaded-monitor-worker");
     }
 }

@@ -3,6 +3,28 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::virt::error::VirtError;
+use vm_spec::Disk;
+
+/// One admitted generation's close-only OFD lease and exact launch binding.
+#[derive(Debug, Clone)]
+pub struct StorageLaunch {
+    pub machine_id: String,
+    pub run_id: String,
+    pub binding: protocol::shutdown::StorageLeaseBinding,
+    pub lease: Arc<std::os::fd::OwnedFd>,
+    pub holder_path: PathBuf,
+}
+
+impl PartialEq for StorageLaunch {
+    fn eq(&self, other: &Self) -> bool {
+        self.machine_id == other.machine_id
+            && self.run_id == other.run_id
+            && self.binding == other.binding
+            && self.holder_path == other.holder_path
+    }
+}
+
+impl Eq for StorageLaunch {}
 
 /// Opaque, persistable machine identity.
 ///
@@ -72,13 +94,6 @@ impl PartialEq for MachineIdentifier {
 
 impl Eq for MachineIdentifier {}
 
-/// A block device attached to the guest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiskImage {
-    pub path: PathBuf,
-    pub read_only: bool,
-}
-
 /// A host directory exposed to the guest as a virtiofs share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedDirectory {
@@ -133,9 +148,9 @@ pub struct VzOptions {
 /// `mock-backend` feature); other backends ignore them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MockOptions {
-    /// Absolute path to a scenario file scripting the mock's behavior.
-    /// Absent means the happy-path default scenario.
-    pub scenario: Option<PathBuf>,
+    /// Immutable parsed scenario shared by admission and construction.
+    #[cfg(feature = "mock-backend")]
+    pub resolved_scenario: Option<Arc<test_utils::Scenario>>,
 }
 
 /// Declarative description of a machine, independent of any backend.
@@ -154,12 +169,13 @@ pub struct VmConfig {
     kernel_cmdline: Vec<String>,
     nested_virtualization: bool,
     network: NetworkMode,
-    disks: Vec<DiskImage>,
+    disks: Vec<Disk>,
     mounts: Vec<SharedDirectory>,
     rosetta: RosettaIntent,
     krun: KrunOptions,
     vz: VzOptions,
     mock: MockOptions,
+    storage_launch: Option<StorageLaunch>,
 }
 
 impl VmConfig {
@@ -182,6 +198,15 @@ impl VmConfig {
 
     pub fn base_directory(&self) -> &Path {
         &self.base_directory
+    }
+
+    pub fn storage_launch(&self) -> Option<&StorageLaunch> {
+        self.storage_launch.as_ref()
+    }
+
+    pub fn with_storage_launch(mut self, launch: StorageLaunch) -> Self {
+        self.storage_launch = Some(launch);
+        self
     }
 
     pub fn cpus(&self) -> Option<usize> {
@@ -212,7 +237,7 @@ impl VmConfig {
         &self.network
     }
 
-    pub fn disks(&self) -> &[DiskImage] {
+    pub fn disks(&self) -> &[Disk] {
         &self.disks
     }
 
@@ -239,21 +264,20 @@ impl VmConfig {
 
     pub(crate) fn park_timeout(&self) -> Duration {
         #[cfg(feature = "mock-backend")]
-        if let Some(path) = self.mock().scenario.as_deref() {
-            if let Ok(scenario) = test_utils::Scenario::load(path) {
-                if let Some(timeout_ms) = scenario.forward.park_timeout_ms {
-                    return Duration::from_millis(timeout_ms);
-                }
-            }
+        if let Some(timeout_ms) = self
+            .mock()
+            .resolved_scenario
+            .as_ref()
+            .and_then(|scenario| scenario.forward.park_timeout_ms)
+        {
+            return Duration::from_millis(timeout_ms);
         }
         crate::forward::inbound::PARK_TIMEOUT
     }
 
-    /// Set the mock scenario path on an already-built config (used when the
-    /// start request selects the mock backend after spec resolution).
     #[cfg(feature = "mock-backend")]
-    pub fn set_mock_scenario(&mut self, path: impl Into<PathBuf>) {
-        self.mock.scenario = Some(path.into());
+    pub(crate) fn set_resolved_mock_scenario(&mut self, scenario: Arc<test_utils::Scenario>) {
+        self.mock.resolved_scenario = Some(scenario);
     }
 
     #[cfg(test)]
@@ -325,7 +349,7 @@ impl VmConfigBuilder {
         self
     }
 
-    pub fn disk(mut self, disk: DiskImage) -> Self {
+    pub fn disk(mut self, disk: Disk) -> Self {
         self.config.disks.push(disk);
         self
     }
@@ -378,6 +402,7 @@ pub(crate) fn validate_common(config: &VmConfig) -> Result<(), VirtError> {
     if config.memory_mib == Some(0) {
         return Err(invalid("memory size must be nonzero".to_string()));
     }
+    vm_spec::Storage::validate_disks(&config.disks).map_err(invalid)?;
     if config.rosetta != RosettaIntent::Disabled
         && config
             .mounts
@@ -393,9 +418,81 @@ pub(crate) fn validate_common(config: &VmConfig) -> Result<(), VirtError> {
     Ok(())
 }
 
+/// VZ accepts only raw opaque roots and raw data attachments. Check before
+/// framework storage constructors or host availability probes.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn validate_vz_disks(config: &VmConfig) -> Result<(), VirtError> {
+    if config.disks().iter().any(|disk| {
+        disk.format != vm_spec::DiskFormat::Raw
+            || matches!(
+                disk.role,
+                vm_spec::DiskRole::RootLower | vm_spec::DiskRole::RootUpper
+            )
+    }) {
+        return Err(VirtError::InvalidConfig {
+            name: config.name().to_string(),
+            reason: "VZ does not support VMDK or managed overlay root attachments".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::virt::config::*;
+
+    fn raw_root() -> Disk {
+        Disk {
+            path: "/tmp/root.vmdk".into(),
+            role: vm_spec::DiskRole::Root,
+            format: vm_spec::DiskFormat::Raw,
+            geometry: vm_spec::DiskGeometry {
+                length: 64 << 20,
+                logical_sector_size: 512,
+            },
+            block_id: vm_spec::BlockId::new("raw-root").expect("root ID"),
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn vz_disk_admission_uses_types_not_filename_suffixes() {
+        let raw = base_builder().disk(raw_root()).build();
+        validate_common(&raw).expect("raw root");
+        validate_vz_disks(&raw).expect("Raw is valid even with .vmdk suffix");
+        for (role, format) in [
+            (vm_spec::DiskRole::RootLower, vm_spec::DiskFormat::Vmdk),
+            (vm_spec::DiskRole::RootUpper, vm_spec::DiskFormat::Raw),
+            (vm_spec::DiskRole::Data, vm_spec::DiskFormat::Vmdk),
+        ] {
+            let config = base_builder()
+                .disk(Disk {
+                    path: "/tmp/without-format-suffix".into(),
+                    role,
+                    format,
+                    ..raw_root()
+                })
+                .build();
+            let error = validate_vz_disks(&config).expect_err("reject unsupported attachment");
+            assert!(error.to_string().contains("VZ does not support"));
+        }
+    }
+
+    #[test]
+    fn common_validation_rejects_direct_invalid_storage_before_backend_effects() {
+        let config = base_builder().disk(raw_root()).disk(raw_root()).build();
+        assert!(validate_common(&config).is_err());
+        let config = base_builder()
+            .disk(Disk {
+                geometry: vm_spec::DiskGeometry {
+                    length: 513,
+                    logical_sector_size: 512,
+                },
+                ..raw_root()
+            })
+            .build();
+        assert!(validate_common(&config).is_err());
+    }
 
     fn base_builder() -> VmConfigBuilder {
         VmConfig::builder("test-vm")
@@ -419,12 +516,26 @@ mod tests {
     #[test]
     fn builder_collects_devices_in_order() {
         let config = base_builder()
-            .disk(DiskImage {
+            .disk(Disk {
                 path: "/tmp/a.img".into(),
+                role: vm_spec::DiskRole::Root,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 4096,
+                    logical_sector_size: 512,
+                },
+                block_id: vm_spec::BlockId::new("raw-root").expect("valid ID"),
                 read_only: false,
             })
-            .disk(DiskImage {
+            .disk(Disk {
                 path: "/tmp/b.img".into(),
+                role: vm_spec::DiskRole::Data,
+                format: vm_spec::DiskFormat::Raw,
+                geometry: vm_spec::DiskGeometry {
+                    length: 8192,
+                    logical_sector_size: 512,
+                },
+                block_id: vm_spec::BlockId::new("data-proof").expect("valid ID"),
                 read_only: true,
             })
             .mount(SharedDirectory {

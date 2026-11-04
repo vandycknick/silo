@@ -3,10 +3,10 @@ mod inherit;
 mod mux;
 mod owner;
 
-use crate::krun::{Disk as KrunDisk, Mount as KrunMount};
+use crate::krun::Mount as KrunMount;
 use crate::virt::backend::{HostMemoryReclaimReport, StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
-use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
+use crate::virt::config::{validate_common, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::exit::StartupStage;
 use crate::virt::stream::{
@@ -45,6 +45,9 @@ pub(crate) struct KrunBackend {
     force: CancellationToken,
     console: Mutex<Option<OwnedFd>>,
     serial: Mutex<Option<(File, File)>>,
+    attachments: Arc<Mutex<Option<crate::virt::backend::storage::PreparedAttachments>>>,
+    storage_finalization: watch::Sender<Option<crate::virt::backend::StorageFinalization>>,
+    storage_finalization_started: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -231,6 +234,9 @@ impl KrunBackend {
             force: CancellationToken::new(),
             console: Mutex::new(Some(pty.slave)),
             serial: Mutex::new(Some((master.try_clone()?, master))),
+            attachments: Arc::new(Mutex::new(None)),
+            storage_finalization: watch::Sender::new(None),
+            storage_finalization_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -270,6 +276,7 @@ impl VirtBackend for KrunBackend {
         let guard = self.stop.clone().drop_guard();
         let config = self.config.clone();
         let running_mux = self.mux.clone();
+        let attachments = self.attachments.clone();
         let registry = self.vsock_registry.clone();
         let session = self.session.clone();
         let console = self
@@ -287,14 +294,26 @@ impl VirtBackend for KrunBackend {
         tokio::spawn(async move {
             let result = async {
                 prepare(&config)?;
-                let launch = engine_config(&config)?;
+                let mut launch = engine_config(&config)?;
+                let mut prepared =
+                    crate::virt::backend::storage::PreparedAttachments::open(&config)?;
+                let handles = prepared.worker_handles()?;
+                launch.storage_context = crate::virt::backend::storage::worker_context(
+                    config
+                        .storage_launch()
+                        .ok_or_else(|| VirtError::Backend("missing storage launch".to_string()))?,
+                    std::mem::take(&mut prepared.raw_bindings),
+                );
+                *attachments.lock().unwrap_or_else(PoisonError::into_inner) = Some(prepared);
                 let console = console.ok_or_else(|| {
                     VirtError::Backend("krun console already consumed".to_string())
                 })?;
                 let (mux, task, child_mux) =
                     mux::KrunVsockMux::pair(registry.clone(), session.clone(), &[])?;
                 *running_mux.lock().await = Some(mux.clone());
-                let exit = owner.run(launch, console, child_mux).await;
+                let exit = owner
+                    .run(launch, console, child_mux, handles, &config)
+                    .await;
                 session.shutdown();
                 registry.fence_session(&session);
                 mux.shutdown().await;
@@ -365,6 +384,40 @@ impl VirtBackend for KrunBackend {
             *self.state.borrow(),
             owner::Phase::Reaped | owner::Phase::Exited(_)
         ))
+    }
+
+    async fn finalize_storage(
+        &self,
+        guest_protocol_completed: bool,
+    ) -> Result<crate::virt::backend::StorageFinalization, VirtError> {
+        self.completion().await?;
+        if !self
+            .storage_finalization_started
+            .swap(true, Ordering::AcqRel)
+        {
+            let prepared = self
+                .attachments
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let completion = self.storage_finalization.clone();
+            // Ownership transfers without an intervening await, so cancelling
+            // this waiter cannot cancel synchronization or release its lease.
+            crate::virt::backend::storage::spawn_finalization(
+                prepared,
+                completion,
+                guest_protocol_completed,
+            );
+        }
+        let mut completion = self.storage_finalization.subscribe();
+        loop {
+            if let Some(report) = completion.borrow().clone() {
+                return Ok(report);
+            }
+            completion.changed().await.map_err(|_| {
+                VirtError::Backend("storage finalizer closed without completion".to_string())
+            })?;
+        }
     }
 
     async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
@@ -562,15 +615,11 @@ fn engine_config(config: &VmConfig) -> Result<crate::krun::KrunConfig, VirtError
         kernel: config.kernel_path().map(Path::to_path_buf),
         initramfs: config.initramfs_path().map(Path::to_path_buf),
         cmdline: build_boot_args(config),
-        disks: config
-            .disks()
-            .iter()
-            .enumerate()
-            .map(|(index, disk)| krun_disk(format!("disk{index}"), disk))
-            .collect(),
+        disks: config.disks().to_vec(),
         mounts: config.mounts().iter().map(krun_mount).collect(),
         vsock_mux: true,
         vsock_cid: None,
+        storage_context: protocol::shutdown::WorkerStorageContext::default(),
         network: match config.network() {
             NetworkMode::UnixDatagram { peer_path, mac } => {
                 crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
@@ -584,14 +633,6 @@ fn engine_config(config: &VmConfig) -> Result<crate::krun::KrunConfig, VirtError
         balloon: true,
         rosetta: config.krun().prepared_rosetta.clone(),
     })
-}
-
-fn krun_disk(block_id: String, disk: &DiskImage) -> KrunDisk {
-    KrunDisk {
-        block_id,
-        path: disk.path.clone(),
-        read_only: disk.read_only,
-    }
 }
 
 fn krun_mount(mount: &SharedDirectory) -> KrunMount {

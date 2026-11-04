@@ -12,6 +12,11 @@ path = "src/main.rs"
 name = "silo-rprobe-vz-harness"
 path = "src/bin/rprobe_vz_harness.rs"
 
+[[example]]
+name = "guest-lifecycle-controller"
+path = "examples/guest_lifecycle_controller.rs"
+test = false
+
 [features]
 # Compiles the in-process mock virtualization backend for tests. Never enabled
 # in release builds; test runs use --all-features.
@@ -38,6 +43,7 @@ prost-types = "0.14.4"
 rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "signal", "sync", "fs", "process"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
@@ -65,3 +71,6 @@ kvm-ioctls = "0.22.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 rprobe = { path = "../../guest/rprobe" }
 vz = { path = "../../virt/vz" }
+
+[build-dependencies]
+sha2 = "0.11.0"
