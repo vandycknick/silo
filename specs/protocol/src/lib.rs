@@ -1,3 +1,4 @@
+pub mod lifecycle;
 pub mod live;
 pub mod shutdown;
 

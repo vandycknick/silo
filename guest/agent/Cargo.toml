@@ -13,6 +13,7 @@ forward-spec = { path = "../../specs/forward-spec", features = ["tokio"] }
 protocol = { path = "../../specs/protocol" }
 rootfs-spec = { path = "../../specs/rootfs-spec" }
 eyre = "0.6.12"
+flate2 = "1.1.9"
 libc = "0.2"
 futures = "0.3.33"
 bytes = "1.12.1"

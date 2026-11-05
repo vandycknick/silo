@@ -11,6 +11,7 @@
 //! ```
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
@@ -294,10 +295,18 @@ impl Supervisor {
             return Ok(());
         };
         if let Some(candidate) = &upgrade.candidate_machine_id {
-            if let Some(digest) = runtime
-                .inspect_machine(candidate)
-                .await
-                .ok()
+            let observed = runtime.inspect_machine(candidate).await.ok();
+            if observed.as_ref().is_some_and(|machine| {
+                machine.run_id.is_some()
+                    && !machine.status.is_running()
+                    && !matches!(
+                        machine.status,
+                        MachineStatus::Starting { .. } | MachineStatus::Stopping { .. }
+                    )
+            }) {
+                return Ok(());
+            }
+            if let Some(digest) = observed
                 .and_then(|machine| machine.rootfs)
                 .and_then(|rootfs| rootfs.selected_manifest_digest)
             {
@@ -386,6 +395,9 @@ impl Supervisor {
         let runtime = connected(&mut self.runtime)?;
         let checked = async {
             let current = runtime.inspect_machine(&active.machine_id).await?;
+            if !current.status.is_running() {
+                return Ok(None);
+            }
             crate::daemon::upgrade::check(runtime, &self.desired.image, &current).await
         }
         .await;
@@ -558,88 +570,110 @@ fn live_report_for_run(
 
 /// One startup attempt: recover an interrupted upgrade, ensure the VM exists, boot or
 /// adopt it, and activate the engine.
-async fn attempt(
-    runtime: &mut Option<SystemRuntime>,
-    runtime_config: &libvm::RuntimeConfig,
-    paths: &DaemonPaths,
-    desired: &DesiredSystem,
-    status: &mut SystemStatus,
-    publisher: &StatusPublisher,
-) -> eyre::Result<Active> {
-    status.live = None;
-    status.prospective_live = None;
-    publish(publisher, status)?;
-    status.prospective_live = Some(
-        libvm::LiveCapabilityQuery::open(runtime_config)?
-            .host_report()
-            .await?,
-    );
-    publish(publisher, status)?;
-    if runtime.is_none() {
-        *runtime = Some(SystemRuntime::connect(runtime_config.clone()).await?);
-    }
-    let runtime = connected(runtime)?;
-    crate::daemon::upgrade::remove_abandoned_qualifications(runtime).await?;
-    if DaemonRecord::load(paths)?
-        .and_then(|record| record.upgrade)
-        .is_some_and(|upgrade| !upgrade.complete)
-    {
-        append_log(paths, "recovering an interrupted system image upgrade")?;
-        crate::daemon::upgrade::recover(runtime, paths).await?;
-    }
-    status.phase = SystemPhase::Creating;
-    publish(publisher, status)?;
-    ensure_docker_socket_parent(&desired.config.docker_socket)?;
-    let (record, machine_data) = ensure_system_machine(runtime, paths, desired).await?;
-    status.machine_id = Some(machine_data.id.clone());
-    status.image_digest = machine_data
-        .rootfs
-        .as_ref()
-        .and_then(|rootfs| rootfs.selected_manifest_digest.clone());
-    let machine = runtime.machine(&machine_data.id).await?;
-    let run_id = match machine_data.status {
-        MachineStatus::Running { .. } | MachineStatus::Starting { .. } => machine_data
-            .run_id
-            .clone()
-            .ok_or_else(|| eyre::eyre!("the running system VM reports no run ID"))?,
-        MachineStatus::Stopping { .. } => bail!("recorded system VM is stopping; wait and retry"),
-        _ => {
-            status.phase = SystemPhase::StartingVm;
-            publish(publisher, status)?;
-            let options = libvm::MachineStartOptions::new();
-            machine.start_with_options(options).await?.run_id
+fn attempt<'a>(
+    runtime: &'a mut Option<SystemRuntime>,
+    runtime_config: &'a libvm::RuntimeConfig,
+    paths: &'a DaemonPaths,
+    desired: &'a DesiredSystem,
+    status: &'a mut SystemStatus,
+    publisher: &'a StatusPublisher,
+) -> impl Future<Output = eyre::Result<Active>> + 'a {
+    // Construct the large provisioning future outside the caller's poll frame.
+    // Boxing inside start still reserves its construction temporary on that
+    // frame throughout every nested poll, overflowing a Tokio worker stack.
+    Box::pin(async move {
+        status.live = None;
+        status.prospective_live = None;
+        publish(publisher, status)?;
+        status.prospective_live = Some(
+            libvm::LiveCapabilityQuery::open(runtime_config)?
+                .host_report()
+                .await?,
+        );
+        publish(publisher, status)?;
+        if runtime.is_none() {
+            *runtime = Some(SystemRuntime::connect(runtime_config.clone()).await?);
         }
-    };
-    let run_id = run_id.to_string();
-    let live = live_report_for_run(machine.inspect().await?.live, &machine_data.id, &run_id)?;
-    status.run_id = Some(run_id);
-    status.actual_backend = Some(live.backend.to_string());
-    status.live = Some(live);
-    status.phase = SystemPhase::WaitingGuest;
-    publish(publisher, status)?;
-    let readiness = machine.wait_ready(READY_TIMEOUT).await?;
-    if readiness.outcome != MachineReadinessOutcome::Ready {
-        bail!("system guest readiness ended with {:?}", readiness.outcome);
-    }
-    status.phase = SystemPhase::ActivatingEngine;
-    publish(publisher, status)?;
-    activate(
-        &machine,
-        &desired.config,
-        &machine_data.spec,
-        record.data_uuid,
-    )
-    .await?;
-    // Activation returns once the guest units are up; the host-side socket forward
-    // becomes live shortly after the guest half exists, so poll rather than probe once.
-    wait_docker_socket(&desired.config.docker_socket, ENGINE_REACHABLE_TIMEOUT).await?;
-    status.phase = SystemPhase::Ready;
-    status.last_error = None;
-    publish(publisher, status)?;
-    append_log(paths, "system Docker engine ready")?;
-    Ok(Active {
-        machine,
-        machine_id: machine_data.id,
+        let runtime = connected(runtime)?;
+        crate::daemon::upgrade::remove_abandoned_qualifications(runtime).await?;
+        if DaemonRecord::load(paths)?
+            .and_then(|record| record.upgrade)
+            .is_some_and(|upgrade| !upgrade.complete)
+        {
+            append_log(paths, "recovering an interrupted system image upgrade")?;
+            Box::pin(crate::daemon::upgrade::recover(runtime, paths)).await?;
+        }
+        status.phase = SystemPhase::Creating;
+        publish(publisher, status)?;
+        ensure_docker_socket_parent(&desired.config.docker_socket)?;
+        let (record, machine_data) =
+            Box::pin(ensure_system_machine(runtime, paths, desired)).await?;
+        status.machine_id = Some(machine_data.id.clone());
+        status.image_digest = machine_data
+            .rootfs
+            .as_ref()
+            .and_then(|rootfs| rootfs.selected_manifest_digest.clone());
+        let machine = runtime.machine(&machine_data.id).await?;
+        let run_id = match machine_data.status {
+            MachineStatus::Running { .. } | MachineStatus::Starting { .. } => machine_data
+                .run_id
+                .clone()
+                .ok_or_else(|| eyre::eyre!("the running system VM reports no run ID"))?,
+            MachineStatus::Stopping { .. } => {
+                bail!("recorded system VM is stopping; wait and retry")
+            }
+            MachineStatus::Pausing { .. }
+            | MachineStatus::Paused { .. }
+            | MachineStatus::Capturing { .. }
+            | MachineStatus::Restoring { .. }
+            | MachineStatus::Activating { .. }
+            | MachineStatus::ActivationFailed { .. } => {
+                bail!(
+                    "recorded system VM is {}; explicit user action required",
+                    machine_data.status.label()
+                )
+            }
+            MachineStatus::Error { .. } if machine_data.run_id.is_some() => {
+                bail!("recorded system VM is fenced in error; stop it explicitly")
+            }
+            _ => {
+                status.phase = SystemPhase::StartingVm;
+                publish(publisher, status)?;
+                let options = libvm::MachineStartOptions::new();
+                Box::pin(machine.start_with_options(options)).await?.run_id
+            }
+        };
+        let run_id = run_id.to_string();
+        let live = live_report_for_run(machine.inspect().await?.live, &machine_data.id, &run_id)?;
+        status.run_id = Some(run_id);
+        status.actual_backend = Some(live.backend.to_string());
+        status.live = Some(live);
+        status.phase = SystemPhase::WaitingGuest;
+        publish(publisher, status)?;
+        let readiness = machine.wait_ready(READY_TIMEOUT).await?;
+        if readiness.outcome != MachineReadinessOutcome::Ready {
+            bail!("system guest readiness ended with {:?}", readiness.outcome);
+        }
+        status.phase = SystemPhase::ActivatingEngine;
+        publish(publisher, status)?;
+        activate(
+            &machine,
+            &desired.config,
+            &machine_data.spec,
+            record.data_uuid,
+        )
+        .await?;
+        // Activation returns once the guest units are up; the host-side socket forward
+        // becomes live shortly after the guest half exists, so poll rather than probe once.
+        wait_docker_socket(&desired.config.docker_socket, ENGINE_REACHABLE_TIMEOUT).await?;
+        status.phase = SystemPhase::Ready;
+        status.last_error = None;
+        publish(publisher, status)?;
+        append_log(paths, "system Docker engine ready")?;
+        Ok(Active {
+            machine,
+            machine_id: machine_data.id,
+        })
     })
 }
 

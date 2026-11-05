@@ -84,12 +84,7 @@ impl RuntimeStatus {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        matches!(
-            self.state,
-            MachineRuntimeState::Starting
-                | MachineRuntimeState::Running
-                | MachineRuntimeState::Stopping
-        )
+        self.state.is_live() || self.pid.is_some()
     }
 }
 
@@ -315,7 +310,14 @@ impl Runtime {
                 message: "runtime has no native catalog observation adapter".to_string(),
             })?;
         let (config, state) = store.lookup(reference).await?;
-        crate::machine::live::observe_run(&self.paths, config, state).await
+        let pending = store
+            .pending_pause(config.id, state.run_id.as_deref())
+            .await?;
+        Ok(
+            crate::machine::live::observe_run(&self.paths, config, state)
+                .await?
+                .with_pending_pause(pending),
+        )
     }
 
     /// Execution restore is not delivered. Refuse before opening the artifact
@@ -1102,6 +1104,7 @@ impl Runtime {
             .observe_machine_state(metadata, persisted.as_ref())
             .await?;
         if machine_state_needs_writeback(persisted.as_ref(), &observed.state)
+            || observed.state.vmm_pid.is_some()
             || !self
                 .store
                 .launch_storage_operations(metadata.id)
@@ -1112,7 +1115,16 @@ impl Runtime {
                 let state = self.machine_state(metadata.id).await?;
                 return Ok(RuntimeStatus::from_machine_state(&state));
             };
-            return self.reconcile_machine_runtime_locked(metadata).await;
+            self.reconcile_machine_runtime_locked(metadata).await?;
+            if observed.state.vmm_pid.is_some() {
+                if let Err(error) = crate::machine::live_operations::reconcile(self, metadata).await
+                {
+                    tracing::warn!(machine = %metadata.id, %error, "live reconciliation retained uncertainty");
+                }
+            }
+            return Ok(RuntimeStatus::from_machine_state(
+                &self.machine_state(metadata.id).await?,
+            ));
         }
         Ok(RuntimeStatus::from_machine_state(&observed.state))
     }
@@ -1172,14 +1184,7 @@ impl Runtime {
             }
         }
         if operations.is_empty() {
-            if matches!(
-                state.status,
-                MachineRuntimeState::Starting
-                    | MachineRuntimeState::Running
-                    | MachineRuntimeState::Stopping
-            ) || state.run_id.is_some()
-                || state.vmm_pid.is_some()
-            {
+            if state.status.is_live() || state.run_id.is_some() || state.vmm_pid.is_some() {
                 return Err(crate::machine::root_storage::invalid(
                     "admitted lifecycle generation has no retained launch operation",
                 ));
@@ -1245,14 +1250,10 @@ impl Runtime {
                     .into(),
             });
         }
-        if matches!(
-            next.status,
-            MachineRuntimeState::Starting
-                | MachineRuntimeState::Running
-                | MachineRuntimeState::Stopping
-        ) || operations.is_empty()
-        {
-            self.store.save_machine_state(next).await?;
+        if next.status.is_live() || next.vmm_pid.is_some() || operations.is_empty() {
+            if machine_state_needs_writeback(expected, next) {
+                self.store.save_machine_state(next).await?;
+            }
             return Ok(true);
         }
         for operation in operations {
@@ -1377,13 +1378,7 @@ impl Runtime {
             .cloned()
             .unwrap_or_else(|| stopped_machine_state(metadata.id, None));
         let mut terminal_storage_observed = runtime.is_some_and(|state| {
-            state.run_id.is_some()
-                && matches!(
-                    state.status,
-                    MachineRuntimeState::Starting
-                        | MachineRuntimeState::Running
-                        | MachineRuntimeState::Stopping
-                )
+            state.run_id.is_some() && (state.status.is_live() || state.vmm_pid.is_some())
         });
         if live_pid.is_none() {
             for operation in self.store.launch_storage_operations(metadata.id).await? {
@@ -1818,12 +1813,7 @@ impl Runtime {
         last_error: Option<String>,
     ) -> Result<bool, LibVmError> {
         let state = self.machine_state(config.id).await?;
-        if !matches!(
-            state.status,
-            MachineRuntimeState::Starting
-                | MachineRuntimeState::Running
-                | MachineRuntimeState::Stopping
-        ) {
+        if !state.status.is_live() && state.vmm_pid.is_none() {
             return Ok(true);
         }
         if !vmm_run_identity_matches(&state, &generation) {
@@ -2361,7 +2351,8 @@ impl Runtime {
             issues.push(MachineIssue::new(MachineIssueComponent::Network, error));
         }
         let mut live = None;
-        let (status, boot_report, provision_report) = if runtime_status.is_running()
+        let mut lifecycle = None;
+        let (status, boot_report, provision_report) = if runtime_status.is_active()
             && observation == MachineObservation::Observed
         {
             let response =
@@ -2383,6 +2374,40 @@ impl Runtime {
                     });
             match response {
                 Ok((mut response, report)) => {
+                    lifecycle = match crate::machine::live::projection_from_status(&response) {
+                        Ok(projection) => Some(projection),
+                        Err(error) => {
+                            issues.push(MachineIssue::new(MachineIssueComponent::Telemetry, error));
+                            if let Some(readiness) = response.readiness.as_mut() {
+                                readiness.ready = Some(false);
+                            }
+                            None
+                        }
+                    };
+                    if let (Some(current), Ok(store)) = (&mut lifecycle, self.native_store()) {
+                        let target = current
+                            .lifecycle
+                            .current_pause
+                            .as_ref()
+                            .map(|pause| &pause.operation_id)
+                            .or_else(|| {
+                                current
+                                    .lifecycle
+                                    .activity
+                                    .as_ref()
+                                    .map(|activity| &activity.operation_id)
+                            });
+                        if let Some(target) = target {
+                            current.operation = store
+                                .live_operation(
+                                    config.id,
+                                    &current.report.run_id,
+                                    &current.report.monitor_id,
+                                    target,
+                                )
+                                .await?;
+                        }
+                    }
                     live = Some(report);
                     let listener =
                         response
@@ -2450,9 +2475,10 @@ impl Runtime {
                         &message,
                     ));
                     (
-                        MachineStatus::running_with_message(format!(
-                            "silo-vmm get_status failed: {message}"
-                        )),
+                        MachineStatus::from_machine_state(
+                            state.status,
+                            Some(format!("silo-vmm get_status failed: {message}")),
+                        ),
                         None,
                         None,
                     )
@@ -2486,7 +2512,7 @@ impl Runtime {
             storage.stop_outcome = outcome;
         }
         let run_id = runtime_status
-            .is_running()
+            .is_active()
             .then(|| {
                 runtime_status
                     .run_id
@@ -2505,6 +2531,7 @@ impl Runtime {
         );
         data.storage = storage;
         data.live = live;
+        data.lifecycle = lifecycle;
         if !runtime_status.is_active() && observation == MachineObservation::Observed {
             match self.live_capabilities().await {
                 Ok(report) => data.prospective_live = Some(report),
@@ -6686,6 +6713,27 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_holders_fence_clean_missing_and_malformed_exits_until_actual_completion() {
+        // A concurrent test's fork can briefly inherit the lease even with
+        // CLOEXEC. Keep the immediate final-close assertion process-isolated.
+        if std::env::var_os("SILO_LIVE_HOLDER_TEST_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::core::tests::live_holders_fence_clean_missing_and_malformed_exits_until_actual_completion",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("SILO_LIVE_HOLDER_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         for record in ["clean", "missing", "malformed"] {
             let temp = tempfile::tempdir().unwrap();
             let (runtime, config, storage) = shutdown_storage_fixture(&temp).await;

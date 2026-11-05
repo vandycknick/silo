@@ -47,7 +47,8 @@ pub struct Control {
     handle: std::sync::Arc<libkrun::VmmHandle>,
 }
 
-// The normal worker transport deliberately does not dispatch live commands yet.
+// The worker lifecycle server consumes pause, cancel, ClockOnly resume and
+// observation; capture and restore controls remain unused until their phases.
 #[allow(dead_code)]
 impl Control {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

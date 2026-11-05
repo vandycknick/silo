@@ -180,7 +180,6 @@ fn capabilities_excluded_query_does_not_initialize_paths_and_binds_native_build_
     )));
     assert!(report.qualification_identity.starts_with("v2:native="));
     assert!(!report.qualification_identity.contains("native=unobserved"));
-    assert!(report.qualification_identity.ends_with(":empty"));
     assert!(report.scenario_digest.is_none());
     assert_eq!(snapshot(&temp.0), before, "query created or modified state");
 }

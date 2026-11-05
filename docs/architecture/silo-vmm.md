@@ -181,6 +181,37 @@ machine, reads the cached exit, writes `vm.exit.json` (with the `backend`
 block described in ADR 0018), reports failure on the syncpipe, removes the
 pidfile and triggers the exit runner, in that order.
 
+## Live Pause Ownership
+
+`live/coordinator.rs` owns the run's Pause/Resume/Cancel journal and fences.
+The manager persists each exact request before sending it over `vm.sock`;
+reconnection observes the same operation and current pause authority, rather
+than creating another pause. Historical success does not authorize a consumed
+token. A new `CancelOperation` is rejected while `Paused`; cancellation is
+the recovery exit from an unfinished or failed `Pausing`.
+
+The monitor drains new session, mutation and forward-connection setup before
+freezing the workload. Existing streams remain attached. The worker's dedicated
+lifecycle socket owns native tokens; only a positive native barrier publishes
+`Paused`. Stop terminates a paused worker without resuming it.
+Host forward arrivals are refused while fenced even when guest transport is
+unavailable; they cannot be parked for admission after resume.
+
+On Linux x86_64, the guest reports actual same-boot clock evidence, refreshed
+after Freeze: TSC, every online CPU's deadline clockevent, a non-PIT broadcast
+device (including a completed empty read), and absence of speaker consumers.
+When `/proc/modules` is absent, the agent verifies `CONFIG_MODULES` in a bounded
+decode of the running kernel's `/proc/config.gz`. Missing or contradictory
+evidence fails closed. The coordinator checks the boot identity; the worker
+installs the observed retired-PIT profile before native pause.
+
+Resume retains parked-status freshness until native positively releases the
+pause. After the ClockOnly generation acknowledgement, it requires a same-identity
+status receipt observed after native release, then exact guest Thaw and readiness,
+before reporting `Running`. A lost Thaw acknowledgement requires
+a new freeze and native pause, with a new token; failed recovery stays fenced.
+Operation deadlines are never extended by parked freshness or transport retries.
+
 ## Exit Runner
 
 When `--exit-command` is given, `main()` forks an idle runner immediately after

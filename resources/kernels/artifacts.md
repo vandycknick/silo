@@ -243,7 +243,7 @@ x86_64 KVM. The immutable boot-admission entry records exactly:
 | --- | --- |
 | Kernel | Linux `7.2.2`, SHA256 `ec6fee8b1885a71e78306fea384f4ff6687fd151b6f279c23117785027748f33` |
 | Reusable base initramfs | SHA256 `632d14f7ea50ee018a5e7a78f50a27fbdac2bb163589ec56e2e928b36e7015b8` |
-| Actual monitor and worker executable | SHA256 `fa8167e2a005393c1ae09f69485c1bb724dcdaded8c4f9f6374970ff7cf4e997` |
+| Actual monitor and worker executable | SHA256 `08798da88922cdb0e9c15a2831b81540c0ad2e79962f7c56542c33655a9d0bad` |
 | Actual resolved Kconfig | SHA256 `f3dab6adffce7cadde5ce693f9403ce88d66ab9f4ec503f7860ce9020cb142e6` |
 | Native source revision | `5d862f5faf10724f238302c47969cc4f5ac2bb80` |
 | Guest / host lane | `amd64` / Linux `x86_64`, KVM |
@@ -251,10 +251,10 @@ x86_64 KVM. The immutable boot-admission entry records exactly:
 | Rendering / attachment | `linux-overlayfs-mountinfo-v1` / `krun-virtio-blk-v1` |
 
 Retained candidate evidence:
-`/home/nickvd/sm/silo-smoke-lr8y94xp/evidence/overlay-candidate-proof.log` and
-`/home/nickvd/sm/silo-smoke-lr8y94xp/evidence/overlay-candidate-tuple.log`.
+`.tmp/plan/evidence/phase-13/overlay-candidate-proof.log` and
+`.tmp/plan/evidence/phase-13/overlay-candidate-tuple.log`.
 The tuple records native build identity
-`v2:path:clean:5d862f5faf10724f238302c47969cc4f5ac2bb80:content=6886c177227dd9a586deaddd3a28338a00712d33db019f82edff015890ab4c79:inputs=a6d7a48f7000c7a9a1d49f72eef8cfa73cec7e01cfde8addd92da6dc578dbc74`.
+`v2:path:clean:5d862f5faf10724f238302c47969cc4f5ac2bb80:content=6886c177227dd9a586deaddd3a28338a00712d33db019f82edff015890ab4c79:inputs=aa4d235c309eaa10da81ededb6f76836bc8eda1006bf88d5b074718371841cfc`.
 Main independently extracted the exact tested kernel's embedded IKCONFIG and
 verified byte equality with the supplied resolved `.config`, binding the
 configuration to the executable rather than trusting its pathname. The

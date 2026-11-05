@@ -76,13 +76,27 @@ pub async fn run(
         }
     };
 
+    // Seal live admission and continuations before publishing Stopping so no
+    // late pause/resume/cancel step can reopen fences or publish a state.
+    let stop_mode = ctx.live.begin_stop();
     handles.mark_stopping().await;
     match trigger {
         ShutdownTrigger::Requested(message) => {
             if let Err(error) = ctx.store.set_vm_state(VmState::Stopping, message) {
                 errors.push(error.to_string());
             }
-            if let Err(error) = graceful_stop(&ctx, &mut signals).await {
+            let stopped = match stop_mode {
+                crate::live::coordinator::StopMode::Graceful => {
+                    graceful_stop(&ctx, &mut signals).await
+                }
+                // A paused, fenced or frozen machine is never resumed or
+                // thawed to stop it: the backend owner terminates and reaps.
+                crate::live::coordinator::StopMode::Terminate => {
+                    tracing::info!(instance = %ctx.machine.name(), "stopping a live-held machine without resuming it");
+                    ctx.machine.force_stop().await.map_err(eyre::Report::from)
+                }
+            };
+            if let Err(error) = stopped {
                 errors.push(error.to_string());
             }
             match wait_for_machine_stop(&ctx.machine).await {

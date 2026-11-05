@@ -33,15 +33,28 @@ pub(super) struct FilesystemProxy {
     machine: VirtualMachine,
     shutdown: CancellationToken,
     capacity: std::sync::Arc<Semaphore>,
+    gate: std::sync::Arc<crate::live::gate::LiveGate>,
 }
 
 impl FilesystemProxy {
-    pub(super) fn new(machine: VirtualMachine, shutdown: CancellationToken) -> Self {
+    pub(super) fn new(
+        machine: VirtualMachine,
+        shutdown: CancellationToken,
+        gate: std::sync::Arc<crate::live::gate::LiveGate>,
+    ) -> Self {
         Self {
             machine,
             shutdown,
             capacity: std::sync::Arc::new(Semaphore::new(8)),
+            gate,
         }
+    }
+
+    /// Guest filesystem mutations are fenced by live lifecycle operations.
+    fn admit_mutation(&self) -> Result<crate::live::gate::GatePermit, Status> {
+        self.gate
+            .try_admit(crate::live::gate::GateKind::FilesystemMutation)
+            .map_err(crate::live::gate::GateRefusal::status)
     }
 
     async fn client(&self) -> Result<GuestFilesystemServiceClient<Channel>, Status> {
@@ -103,6 +116,7 @@ impl GuestFilesystemService for FilesystemProxy {
         &self,
         request: Request<RemoveEntryRequest>,
     ) -> Result<Response<RemoveEntryResponse>, Status> {
+        let _mutation = self.admit_mutation()?;
         let _permit = self.admit()?;
         let request = request.into_inner();
         let path = validate_path(request.path, false)?;
@@ -230,7 +244,10 @@ impl GuestFilesystemService for FilesystemProxy {
         &self,
         request: Request<tonic::Streaming<UploadFileRequest>>,
     ) -> Result<Response<UploadFileResponse>, Status> {
+        // Held until the guest RPC settles; a closing fence aborts ingress.
+        let _mutation = self.admit_mutation()?;
         let _permit = self.admit()?;
+        let gate = self.gate.clone();
         let mut input = request.into_inner();
         let deadline = tokio::time::Instant::now() + TRANSFER_TOTAL_TIMEOUT;
         let mut idle_deadline = tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT;
@@ -273,18 +290,28 @@ impl GuestFilesystemService for FilesystemProxy {
                 let mut total = 0_usize;
                 loop {
                     let progress_deadline = idle_deadline.min(deadline);
-                    let message =
-                        match tokio::time::timeout_at(progress_deadline, input.next()).await {
-                            Ok(Some(message)) => message,
-                            Ok(None) => return Ok::<(), Option<Status>>(()),
-                            Err(_) => {
-                                return Err(Some(protocol::detailed_status(
-                                    Status::deadline_exceeded(
-                                        "upload made no progress before its deadline",
-                                    ),
-                                )));
-                            }
-                        };
+                    let next = tokio::select! {
+                        () = gate.closed() => {
+                            return Err(Some(protocol::status_with_error(
+                                Code::FailedPrecondition,
+                                ErrorCode::PreconditionFailed,
+                                "upload aborted: guest filesystem mutations are fenced by a live lifecycle operation",
+                                None,
+                            )));
+                        }
+                        next = tokio::time::timeout_at(progress_deadline, input.next()) => next,
+                    };
+                    let message = match next {
+                        Ok(Some(message)) => message,
+                        Ok(None) => return Ok::<(), Option<Status>>(()),
+                        Err(_) => {
+                            return Err(Some(protocol::detailed_status(
+                                Status::deadline_exceeded(
+                                    "upload made no progress before its deadline",
+                                ),
+                            )));
+                        }
+                    };
                     let message = message.map_err(Some)?;
                     let data = match message.payload {
                         Some(protocol::v1::upload_file_request::Payload::Chunk(ByteChunk {
@@ -435,6 +462,7 @@ impl GuestFilesystemService for FilesystemProxy {
         &self,
         request: Request<CreateDirectoryRequest>,
     ) -> Result<Response<CreateDirectoryResponse>, Status> {
+        let _mutation = self.admit_mutation()?;
         let _permit = self.admit()?;
         let request = request.into_inner();
         let path = validate_path(request.path, false)?;

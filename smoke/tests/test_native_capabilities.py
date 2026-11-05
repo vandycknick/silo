@@ -51,13 +51,18 @@ def test_native_capabilities_machine_less_binding_and_no_mutable_grants(config: 
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         capability = report["live"][operation]
         assert capability["native"] is (report["lane"] == "kvm-x86_64" or operation == "pause")
-        assert capability["availability"] == {"status": "unsupported", "reason": {"code": "not-delivered", "subject": None}}
+        if operation == "pause":
+            expected = ({"status": "supported"} if report["lane"] == "kvm-x86_64" else
+                        {"status": "unsupported", "reason": {"code": "lane-not-qualified", "subject": None}})
+        else:
+            expected = {"status": "unsupported", "reason": {"code": "not-delivered", "subject": None}}
+        assert capability["availability"] == expected
     identity = native_source_identity(report)
     assert identity.kind == "path"
     assert identity.content != "unknown"
     qualification = report["qualificationIdentity"]
     assert qualification.startswith("v2:native=") and "native=unobserved" not in qualification
-    assert qualification.endswith(":empty") and len(qualification) <= 256
+    assert len(qualification) <= 256
     assert snapshot(tmp_path) == before, "query created or modified runtime state"
 
 

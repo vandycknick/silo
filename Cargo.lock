@@ -53,6 +53,7 @@ dependencies = [
  "bytes",
  "clap",
  "eyre",
+ "flate2",
  "forward-spec",
  "futures",
  "libc",

@@ -144,6 +144,8 @@ pub(crate) fn main() -> eyre::Result<()> {
         mux,
         storage_lease,
         raw_handles,
+        // The standalone table never includes the normal lifecycle endpoint.
+        lifecycle: _,
         state_files,
         standalone,
     } = Bootstrap::adopt_standalone_fixed(restore)?;

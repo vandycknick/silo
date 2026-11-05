@@ -3,6 +3,9 @@
 #[cfg(target_os = "macos")]
 mod admission;
 pub(crate) mod fds;
+pub(crate) mod lifecycle;
+pub(crate) mod lifecycle_wire;
+mod native;
 pub(crate) mod wire;
 
 use std::io;
@@ -37,6 +40,7 @@ pub(crate) fn main() -> eyre::Result<()> {
         mux,
         storage_lease,
         raw_handles,
+        lifecycle: lifecycle_endpoint,
         state_files: _,
         standalone: _,
     } = fds::Bootstrap::adopt_fixed()?;
@@ -58,6 +62,9 @@ pub(crate) fn main() -> eyre::Result<()> {
         if config.vsock_mux != mux.is_some() {
             return Err(wire::invalid("mux descriptor does not match the worker config").into());
         }
+        let lifecycle_endpoint = lifecycle_endpoint
+            .ok_or_else(|| wire::invalid("normal worker lacks its lifecycle endpoint"))?;
+        let binding = lifecycle_binding(&config)?;
         engine::init_log(
             None,
             engine::LogLevel::Info,
@@ -100,6 +107,19 @@ pub(crate) fn main() -> eyre::Result<()> {
                             Err(error) => eprintln!("krun signal wait failed: {error}"),
                         })?;
                 }
+                // Serving starts a thread and returns: native dispatch must run
+                // before any blocking native lifecycle call can complete.
+                lifecycle::serve(
+                    lifecycle_endpoint,
+                    binding,
+                    native::KrunNative::new(control.clone(), &config),
+                    Box::new(|reason: &str| {
+                        eprintln!("krun lifecycle control lost: {reason}");
+                        // nix exposes no immediate _exit. A worker that lost its
+                        // only lifecycle authority terminates; it never resumes.
+                        unsafe { nix::libc::_exit(124) }
+                    }),
+                )?;
                 start_status_reporter(events.clone(), control)?;
                 emit(&events, &Event::BackendStarted {})?;
                 stage = StartupStage::Started;
@@ -124,6 +144,20 @@ pub(crate) fn main() -> eyre::Result<()> {
     // Keep the lease and retained FD bindings alive until actual process exit,
     // including event-loop/build error paths. Never return and drop them first.
     std::process::exit(if result.is_ok() { 0 } else { 1 });
+}
+
+/// The worker's exact launch identity, repeated in the lifecycle Hello.
+fn lifecycle_binding(config: &crate::krun::KrunConfig) -> io::Result<lifecycle::Binding> {
+    let parse = |value: &str| {
+        uuid::Uuid::parse_str(value)
+            .ok()
+            .filter(|id| !id.is_nil() && id.hyphenated().to_string() == value)
+            .ok_or_else(|| wire::invalid("worker launch identity is not a canonical UUID"))
+    };
+    Ok(lifecycle::Binding {
+        machine_id: parse(&config.storage_context.machine_id)?,
+        run_id: parse(&config.storage_context.run_id)?,
+    })
 }
 
 fn bind_raw_handles(config: &mut crate::krun::KrunConfig, handles: &[OwnedFd]) -> io::Result<()> {

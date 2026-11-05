@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 #[path = "../src/virt/backend/krun/inherit.rs"]
 mod fd_policy;
 
-struct Process(Option<Child>, Option<Lease>);
+/// A spawned process, its storage lease and, for direct workers, the
+/// monitor-side lifecycle endpoint. Both outlive the child until it is reaped.
+struct Process(Option<Child>, Option<Lease>, Option<OwnedFd>);
 impl Process {
     fn output(self) -> Output {
         self.output_with_timeout(Duration::from_secs(5))
@@ -70,6 +72,8 @@ impl Drop for Process {
             }
             let _ = child.wait();
         }
+        // The monitor end of the lifecycle pair closes only after the reap.
+        drop(self.2.take());
     }
 }
 
@@ -101,6 +105,13 @@ fn worker_command() -> Command {
     let mut command = command();
     command.arg0(WORKER_NAME);
     command
+}
+
+/// Connected lifecycle stream pair: (monitor end, worker end). Both are CLOEXEC;
+/// only an explicit mapping onto the lifecycle role reaches the worker.
+fn lifecycle_pair() -> (OwnedFd, OwnedFd) {
+    let (monitor, worker) = std::os::unix::net::UnixStream::pair().expect("lifecycle pair");
+    (monitor.into(), worker.into())
 }
 
 fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
@@ -153,8 +164,10 @@ fn worker_with_attachments(
         });
     }
     let lease = Lease::new();
+    let (lifecycle, lifecycle_worker) = lifecycle_pair();
     let mut mapping = mapping(&[&config, &reporter, &watchdog, &pty.slave]);
     mapping.push((lease.file.as_raw_fd(), 8));
+    mapping.push((lifecycle_worker.as_raw_fd(), fd_policy::LIFECYCLE_CHILD_FD));
     if let Some(mux) = mux {
         mapping.push((mux.as_raw_fd(), 7));
     }
@@ -168,6 +181,7 @@ fn worker_with_attachments(
     let child = Process(
         Some(command.spawn().expect("spawn actual worker")),
         Some(lease),
+        Some(lifecycle),
     );
     (child, writer.into(), keepalive, events.into(), pty.master)
 }
@@ -512,7 +526,7 @@ fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
         ])
         .arg("--exit-command-arg")
         .arg(&marker);
-    let process = Process(Some(command.spawn().expect("supervisor")), None);
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     let supervisor_pid = process.0.as_ref().expect("child").id();
     let output = process.output();
     assert!(!output.status.success());
@@ -623,7 +637,7 @@ fn parked_supervisor(
             .arg(marker);
     }
     install_supervisor(&mut command, fixture, &[&request]);
-    let process = Process(Some(command.spawn().expect("supervisor")), None);
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     drop(request);
     fixture.wait_for_request();
     (process, keep_request_open)
@@ -700,7 +714,7 @@ fn startup_signal_cancels_an_incomplete_request_without_a_blocking_reader() {
     // The shared inheritance helper maps descriptors onto 3, 4, ... in order.
     command.env("_VM_STARTPIPE", "3");
     install_supervisor(&mut command, &fixture, &[&reader]);
-    let process = Process(Some(command.spawn().expect("supervisor")), None);
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     drop(reader);
     let mut writer = std::fs::File::from(writer);
     writer.write_all(b"{").expect("partial supervisor request");
@@ -735,7 +749,7 @@ fn parent_loss_cancels_an_incomplete_supervisor_request() {
     let mut command = fixture.command_base().0;
     command.env("_VM_STARTPIPE", "3").env("_VM_SYNCPIPE", "4");
     install_supervisor(&mut command, &fixture, &[&request, &sync]);
-    let process = Process(Some(command.spawn().expect("supervisor")), None);
+    let process = Process(Some(command.spawn().expect("supervisor")), None, None);
     drop((request, sync));
     fixture.wait_for_request();
     drop(parent);
@@ -766,6 +780,30 @@ fn watchdog_runs_before_the_config_is_complete() {
     drop(config);
 }
 
+/// Spawn the actual worker with `roles` on 3.., a fresh lease on 8 and, when
+/// present, `lifecycle` on the lifecycle role, then wait for its exit.
+fn spawn_worker_roles(
+    roles: &[&OwnedFd],
+    lifecycle: Option<&OwnedFd>,
+    configure: impl FnOnce(&mut Command),
+) -> Output {
+    let mut command = worker_command();
+    let lease = Lease::new();
+    let mut mapped = mapping(roles);
+    mapped.push((lease.file.as_raw_fd(), 8));
+    if let Some(lifecycle) = lifecycle {
+        mapped.push((lifecycle.as_raw_fd(), fd_policy::LIFECYCLE_CHILD_FD));
+    }
+    fd_policy::install(&mut command, &mapped).expect("worker role mapping");
+    configure(&mut command);
+    Process(
+        Some(command.spawn().expect("spawn worker")),
+        Some(lease),
+        None,
+    )
+    .output()
+}
+
 #[test]
 fn invalid_descriptor_roles_fail_before_any_worker_event() {
     let (config, writer) = pipe();
@@ -774,6 +812,9 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
     let alias = config.try_clone().expect("aliased resource");
     let pty = nix::pty::openpty(None, None).expect("PTY");
     let valid = [&config, &reporter, &watchdog, &pty.slave];
+    // Every case carries a valid lifecycle endpoint unless that role is under
+    // test, so each failure is attributable to exactly one invalid role.
+    let (_monitor, lifecycle) = lifecycle_pair();
     for (label, slot, bad) in [
         ("write-only config", 0, &keepalive),
         ("read-only events", 1, &events),
@@ -784,33 +825,19 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
     ] {
         let mut roles = valid;
         roles[slot] = bad;
-        let mut command = worker_command();
-        let lease = Lease::new();
-        let mut mapped = mapping(&roles);
-        mapped.push((lease.file.as_raw_fd(), 8));
-        fd_policy::install(&mut command, &mapped).expect("invalid role mapping");
-        let output = Process(
-            Some(command.spawn().expect("spawn worker with a bad role")),
-            Some(lease),
-        )
-        .output();
+        let output = spawn_worker_roles(&roles, Some(&lifecycle), |_| {});
         assert!(!output.status.success(), "{label}");
     }
 
-    let mut missing = worker_command();
-    let missing_lease = Lease::new();
-    let mut missing_map = mapping(&valid[..3]);
-    missing_map.push((missing_lease.file.as_raw_fd(), 8));
-    fd_policy::install(&mut missing, &missing_map).expect("missing role mapping");
     assert!(
-        !Process(
-            Some(missing.spawn().expect("worker without console")),
-            Some(missing_lease)
-        )
-        .output()
-        .status
-        .success(),
-        "missing role"
+        !spawn_worker_roles(&valid[..3], Some(&lifecycle), |_| {})
+            .status
+            .success(),
+        "missing console role"
+    );
+    assert!(
+        !spawn_worker_roles(&valid, None, |_| {}).status.success(),
+        "normal worker without its lifecycle endpoint"
     );
 
     let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().expect("datagram");
@@ -824,45 +851,45 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
     .expect("unconnected stream");
     let unconnected = fd_policy::normalize(unconnected).expect("normalize unconnected stream");
     for mux in [&datagram, &unconnected] {
-        let mut command = worker_command();
-        let lease = Lease::new();
-        let mut mapped = mapping(&[&config, &reporter, &watchdog, &pty.slave, mux]);
-        mapped.push((lease.file.as_raw_fd(), 8));
-        fd_policy::install(&mut command, &mapped).expect("mux mapping");
-        assert!(!Process(
-            Some(command.spawn().expect("invalid mux worker")),
-            Some(lease)
-        )
-        .output()
-        .status
-        .success());
+        let roles = [&config, &reporter, &watchdog, &pty.slave, mux];
+        assert!(!spawn_worker_roles(&roles, Some(&lifecycle), |_| {})
+            .status
+            .success());
     }
 
-    // An inherited descriptor above the fixed table fails closed.
-    let mut extra = worker_command();
-    let extra_lease = Lease::new();
-    let mut extra_map = mapping(&valid);
-    extra_map.push((extra_lease.file.as_raw_fd(), 8));
-    fd_policy::install(&mut extra, &extra_map).expect("extra mapping");
-    // SAFETY: dup2 is async-signal-safe; this runs after the fixed mapping.
-    unsafe {
-        extra.pre_exec(|| {
-            if nix::libc::dup2(3, 9) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    // The lifecycle role is a connected stream socket distinct from every role.
+    let (lifecycle_fifo, _fifo_writer) = pipe();
+    for (label, bad) in [
+        ("datagram lifecycle", &datagram),
+        ("unconnected lifecycle", &unconnected),
+        ("pipe lifecycle", &lifecycle_fifo),
+    ] {
+        let output = spawn_worker_roles(&valid, Some(bad), |_| {});
+        assert!(!output.status.success(), "{label}");
     }
+    let (mux, _mux_peer) = std::os::unix::net::UnixStream::pair().expect("mux pair");
+    let mux: OwnedFd = mux.into();
+    let roles = [&config, &reporter, &watchdog, &pty.slave, &mux];
     assert!(
-        !Process(
-            Some(extra.spawn().expect("worker with extra fd")),
-            Some(extra_lease)
-        )
-        .output()
-        .status
-        .success(),
-        "descriptor above the table"
+        !spawn_worker_roles(&roles, Some(&mux), |_| {})
+            .status
+            .success(),
+        "lifecycle aliases the mux"
     );
+
+    // An inherited descriptor above the fixed table fails closed.
+    let extra = spawn_worker_roles(&valid, Some(&lifecycle), |command| {
+        // SAFETY: dup2 is async-signal-safe; this runs after the fixed mapping.
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::dup2(3, 9) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+    assert!(!extra.status.success(), "descriptor above the table");
 
     drop(reporter);
     let mut bytes = Vec::new();
@@ -949,8 +976,8 @@ fn worker_lease_continues_the_ofd_until_process_exit_without_unrelated_leaks() {
     descriptors.sort_unstable();
     assert_eq!(
         descriptors,
-        [0, 1, 2, 3, 4, 5, 6, 8],
-        "exact table, including mux hole"
+        [0, 1, 2, 3, 4, 5, 6, 8, 32],
+        "exact table, including mux hole and the lifecycle endpoint"
     );
     let lease = worker.1.as_mut().expect("lease fixture");
     let identity = lease.file.metadata().unwrap();
@@ -965,6 +992,7 @@ fn worker_lease_continues_the_ofd_until_process_exit_without_unrelated_leaks() {
         .unwrap();
     let unrelated = Process(
         Some(Command::new("/bin/sleep").arg("30").spawn().unwrap()),
+        None,
         None,
     );
     let unrelated_pid = unrelated.0.as_ref().unwrap().id();
@@ -1056,6 +1084,71 @@ fn mapped_inheritance_parks_source_cycles_above_all_targets() {
     }
 }
 
+#[test]
+fn only_the_lifecycle_role_crosses_into_the_standalone_range() {
+    let (_monitor, worker) = lifecycle_pair();
+    let source = worker.as_raw_fd();
+    for target in [0, 2, 25, 28, 29, 31, 33] {
+        assert!(
+            fd_policy::install(&mut Command::new("/bin/sh"), &[(source, target)]).is_err(),
+            "target {target} is not a normal worker role"
+        );
+    }
+    assert!(
+        fd_policy::install(&mut Command::new("/bin/sh"), &[(2, 32)]).is_err(),
+        "stdio is never a mapping source"
+    );
+    // Every normal role at once fits the bounded table; one more cannot.
+    let mut table: Vec<_> = (3..=24)
+        .chain([fd_policy::LIFECYCLE_CHILD_FD])
+        .map(|target| (source, target))
+        .collect();
+    fd_policy::install(&mut Command::new("/bin/sh"), &table).expect("full normal table");
+    table.push((source, 3));
+    assert!(
+        fd_policy::install(&mut Command::new("/bin/sh"), &table).is_err(),
+        "bounded table"
+    );
+    assert!(
+        fd_policy::install(&mut Command::new("/bin/sh"), &[(source, 32), (source, 32)]).is_err(),
+        "duplicate target"
+    );
+}
+
+#[test]
+fn real_child_inherits_exactly_the_lifecycle_endpoint_at_32() {
+    use std::os::fd::FromRawFd;
+    let (monitor, worker) = lifecycle_pair();
+    let (unrelated, unrelated_worker) = lifecycle_pair();
+    // Park the unrelated end above 32 so its number never names the role.
+    let unrelated_worker = {
+        let raw = nix::fcntl::fcntl(
+            &unrelated_worker,
+            nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(fd_policy::LIFECYCLE_CHILD_FD + 1),
+        )
+        .expect("park unrelated endpoint");
+        drop(unrelated_worker);
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    };
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(format!(
+        "printf lifecycle >&32 && {{ printf leak >&{} ; }} 2>/dev/null; exit 0",
+        unrelated_worker.as_raw_fd()
+    ));
+    fd_policy::install(&mut command, &[(worker.as_raw_fd(), 32)]).expect("install");
+    assert!(command.status().expect("spawn real child").success());
+    // The parent's copies must not keep either pair open.
+    drop(worker);
+    drop(unrelated_worker);
+    for (endpoint, expected) in [(monitor, "lifecycle"), (unrelated, "")] {
+        let mut received = String::new();
+        std::os::unix::net::UnixStream::from(endpoint)
+            .read_to_string(&mut received)
+            .expect("read until EOF");
+        assert_eq!(received, expected, "only FD 32 is inherited");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn worker_adopts_only_the_optional_mux_and_bounded_raw_table_before_config() {
@@ -1083,7 +1176,11 @@ fn worker_adopts_only_the_optional_mux_and_bounded_raw_table_before_config() {
     }
     let mut descriptors = open_descriptors(pid);
     descriptors.sort_unstable();
-    assert_eq!(descriptors, (0..=10).collect::<Vec<_>>());
+    assert_eq!(
+        descriptors,
+        (0..=10).chain([32]).collect::<Vec<_>>(),
+        "fixed roles, mux, Raw table and the lifecycle endpoint only"
+    );
     let expected = raw.file.metadata().unwrap();
     for fd in [9, 10] {
         let actual = std::fs::metadata(format!("/proc/{pid}/fd/{fd}")).unwrap();
@@ -1160,6 +1257,7 @@ async fn native_guest_cases(scenarios: &[NativeExit]) {
     for (generation, &scenario) in scenarios.iter().enumerate() {
         let mut process = Process(
             Some(fixture.command().spawn().expect("native supervisor")),
+            None,
             None,
         );
         fixture.wait_for_guest(&mut process, generation).await;

@@ -22,10 +22,13 @@ pub(crate) mod capacity;
 mod config;
 mod error;
 pub(crate) mod exit;
+pub mod lifecycle;
 mod machine;
 mod serial;
 mod stream;
 
+#[cfg(all(test, feature = "mock-backend"))]
+pub(crate) use backend::mock::test_storage_launch;
 pub use backend::BackendKind;
 pub use backend::HostMemoryReclaimReport;
 pub(crate) use backend::StorageFinalization;

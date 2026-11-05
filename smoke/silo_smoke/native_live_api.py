@@ -974,9 +974,10 @@ def capabilities_cohort(args, _echo) -> dict:
         "actual host capability schema")
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         require(value["live"][operation]["native"] is True, "Main has not qualified/flipped the exercised native lane")
-        require(value["live"][operation]["availability"] == {
-            "status": "unsupported", "reason": {"code": "not-delivered", "subject": None}},
-            "standalone proof must not deliver the public operation")
+        expected = ({"status": "supported"} if operation == "pause" else
+                    {"status": "unsupported", "reason": {"code": "not-delivered", "subject": None}})
+        require(value["live"][operation]["availability"] == expected,
+                "public delivery must match the independently qualified Phase 13 pause boundary")
     return {"command": command, "elapsed_ns": time.monotonic_ns() - started,
         "exit_status": result.returncode, "monitor_sha256": digest(args.monitor),
         "actual_json": value, "guest_started": False}

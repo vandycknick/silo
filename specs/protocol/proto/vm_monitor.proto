@@ -11,6 +11,14 @@ service VmMonitorService {
   rpc GetStatus(GetStatusRequest) returns (HostStatus);
   rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
   rpc GetMetrics(GetMetricsRequest) returns (HostMetrics);
+  // ADR 0021 live commands for the current run only. A malformed envelope is
+  // INVALID_ARGUMENT; every well-formed request receives a typed body.
+  rpc Pause(PauseRequest) returns (PauseResponse);
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+  rpc Capture(CaptureRequest) returns (CaptureResponse);
+  rpc ReleaseCapture(ReleaseCaptureRequest) returns (ReleaseCaptureResponse);
 }
 
 service VmAccessService {
@@ -45,6 +53,14 @@ enum VmState {
   VM_STATE_STOPPING = 3;
   VM_STATE_STOPPED = 4;
   VM_STATE_FAILED = 5;
+  VM_STATE_PAUSING = 6;
+  VM_STATE_PAUSED = 7;
+  VM_STATE_CAPTURING = 8;
+  VM_STATE_RESTORING = 9;
+  VM_STATE_ACTIVATING = 10;
+  VM_STATE_ACTIVATION_FAILED = 11;
+  // Live, fenced and process-owned; only stop leaves it. FAILED stays terminal.
+  VM_STATE_ERROR = 12;
 }
 
 enum ReadinessReason {
@@ -59,6 +75,13 @@ enum ReadinessReason {
   READINESS_REASON_GUEST_STARTING = 8;
   READINESS_REASON_GUEST_FAILED = 9;
   READINESS_REASON_GUEST_REPORTED_READY = 10;
+  READINESS_REASON_VM_PAUSING = 11;
+  READINESS_REASON_VM_PAUSED = 12;
+  READINESS_REASON_VM_CAPTURING = 13;
+  READINESS_REASON_VM_RESTORING = 14;
+  READINESS_REASON_VM_ACTIVATING = 15;
+  READINESS_REASON_VM_ACTIVATION_FAILED = 16;
+  READINESS_REASON_VM_ERROR = 17;
 }
 
 enum AgentConnectionState {
@@ -145,6 +168,8 @@ message HostStatus {
   optional string run_id = 7;
   // Mandatory, exact run/topology-fenced evidence from the actual backend.
   LiveMachineReport live = 8;
+  // Always present: current pause authority, active stage and sticky error.
+  LiveLifecycle lifecycle = 9;
 }
 
 message AgentMetricsObservation {
@@ -287,4 +312,301 @@ message LiveOperationUnsupported {
   optional LiveBackend backend = 2;
   optional LiveLane lane = 3;
   LiveUnsupportedReason reason = 4;
+}
+
+message LiveCommandEnvelope {
+  // Canonical lowercase non-nil UUIDs. Machine/run must be this monitor's.
+  optional string machine_id = 1;
+  optional string run_id = 2;
+  // Chosen and persisted by libvm before send; the replay/conflict key.
+  optional string request_id = 3;
+}
+
+message PauseOwner {
+  oneof owner {
+    google.protobuf.Empty user = 1;
+    string capture_operation_id = 2;
+  }
+}
+
+// Public projection of exact native pause authority. The opaque native token
+// never leaves the worker.
+message PauseToken {
+  optional string machine_id = 1;
+  optional string run_id = 2;
+  // Nonzero, strictly increasing per run, including lost-thaw recovery.
+  optional uint64 generation = 3;
+  PauseOwner owner = 4;
+}
+
+// Current authority only, never a historical establishing token.
+message CurrentPause {
+  PauseToken token = 1;
+  optional string operation_id = 2;
+  optional uint64 freeze_epoch = 3;
+}
+
+message PauseRequest {
+  LiveCommandEnvelope envelope = 1;
+}
+
+message ResumeRequest {
+  LiveCommandEnvelope envelope = 1;
+  optional string operation_id = 2;
+  PauseToken token = 3;
+}
+
+message GetOperationRequest {
+  LiveCommandEnvelope envelope = 1;
+  optional string operation_id = 2;
+}
+
+message CancelOperationRequest {
+  LiveCommandEnvelope envelope = 1;
+  optional string operation_id = 2;
+}
+
+enum CapturePolicy {
+  CAPTURE_POLICY_UNSPECIFIED = 0;
+  CAPTURE_POLICY_FULL = 1;
+  CAPTURE_POLICY_INCREMENTAL = 2;
+}
+
+enum CaptureResumePolicy {
+  CAPTURE_RESUME_POLICY_UNSPECIFIED = 0;
+  CAPTURE_RESUME_POLICY_RESUME_IF_ACQUIRED = 1;
+  CAPTURE_RESUME_POLICY_PRESERVE = 2;
+}
+
+message CaptureRequest {
+  LiveCommandEnvelope envelope = 1;
+  optional string expected_configuration_digest = 2;
+  optional CapturePolicy policy = 3;
+  optional CaptureResumePolicy resume_policy = 4;
+}
+
+message ReleaseCaptureRequest {
+  LiveCommandEnvelope envelope = 1;
+  optional string operation_id = 2;
+}
+
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  OPERATION_KIND_PAUSE = 1;
+  OPERATION_KIND_CAPTURE = 2;
+}
+
+enum OperationStatus {
+  OPERATION_STATUS_UNSPECIFIED = 0;
+  OPERATION_STATUS_IN_PROGRESS = 1;
+  OPERATION_STATUS_SUCCEEDED = 2;
+  OPERATION_STATUS_FAILED = 3;
+}
+
+message GuestFreezeObservation {
+  optional GuestLifecycleState state = 1;
+  optional uint64 freeze_epoch = 2;
+  repeated string workload_roots = 3;
+  repeated string observed_frozen_roots = 4;
+  optional bool rollback_succeeded = 5;
+  optional string failure = 6;
+}
+
+// Original terminal success of a Pause, immutable for the run lifetime.
+message PauseEstablished {
+  PauseToken token = 1;
+  optional uint64 freeze_epoch = 2;
+  GuestFreezeObservation guest = 3;
+  optional bool capture_eligible = 4;
+}
+
+enum LiveStage {
+  LIVE_STAGE_UNSPECIFIED = 0;
+  LIVE_STAGE_MONITOR_DRAIN = 1;
+  LIVE_STAGE_GUEST_FREEZE = 2;
+  LIVE_STAGE_NATIVE_PAUSE = 3;
+  LIVE_STAGE_PAUSE_FAILED = 4;
+  LIVE_STAGE_ROLLBACK_THAW = 5;
+  LIVE_STAGE_CANCEL_NATIVE = 6;
+  LIVE_STAGE_CANCEL_THAW = 7;
+  LIVE_STAGE_RESUME_NATIVE = 8;
+  LIVE_STAGE_RESUME_CLOCK = 9;
+  LIVE_STAGE_RESUME_HANDSHAKE = 10;
+  LIVE_STAGE_RESUME_THAW = 11;
+  LIVE_STAGE_READINESS = 12;
+  LIVE_STAGE_RECOVERY_FREEZE = 13;
+  LIVE_STAGE_RECOVERY_PAUSE = 14;
+  LIVE_STAGE_ADMISSION = 15;
+}
+
+enum LiveFailureCode {
+  LIVE_FAILURE_CODE_UNSPECIFIED = 0;
+  LIVE_FAILURE_CODE_DRAIN_TIMED_OUT = 1;
+  LIVE_FAILURE_CODE_GUEST_UNAVAILABLE = 2;
+  LIVE_FAILURE_CODE_GUEST_IDENTITY_MISMATCH = 3;
+  LIVE_FAILURE_CODE_FREEZE_FAILED = 4;
+  LIVE_FAILURE_CODE_FREEZE_TIMED_OUT = 5;
+  LIVE_FAILURE_CODE_NATIVE_PAUSE_FAILED = 6;
+  LIVE_FAILURE_CODE_NATIVE_UNCERTAIN = 7;
+  LIVE_FAILURE_CODE_CANCELLED = 8;
+  LIVE_FAILURE_CODE_NATIVE_ROLLBACK_FAILED = 9;
+  LIVE_FAILURE_CODE_THAW_FAILED = 10;
+  LIVE_FAILURE_CODE_THAW_UNACKNOWLEDGED = 11;
+  LIVE_FAILURE_CODE_NATIVE_RESUME_FAILED = 12;
+  LIVE_FAILURE_CODE_CLOCK_GENERATION_FAILED = 13;
+  LIVE_FAILURE_CODE_HANDSHAKE_FAILED = 14;
+  LIVE_FAILURE_CODE_READINESS_FAILED = 15;
+  LIVE_FAILURE_CODE_RECOVERY_FREEZE_FAILED = 16;
+  LIVE_FAILURE_CODE_RECOVERY_PAUSE_FAILED = 17;
+  LIVE_FAILURE_CODE_WORKER_LOST = 18;
+  LIVE_FAILURE_CODE_STOPPED = 19;
+  LIVE_FAILURE_CODE_DEADLINE_EXCEEDED = 20;
+}
+
+message LiveFailure {
+  optional LiveFailureCode code = 1;
+  optional LiveStage stage = 2;
+  optional string message = 3;
+  GuestFreezeObservation guest = 4;
+}
+
+message LiveOperationRecord {
+  optional string operation_id = 1;
+  optional OperationKind kind = 2;
+  optional OperationStatus status = 3;
+  oneof result {
+    PauseEstablished pause = 4;
+    LiveFailure failure = 5;
+  }
+}
+
+enum LiveCommandKind {
+  LIVE_COMMAND_KIND_UNSPECIFIED = 0;
+  LIVE_COMMAND_KIND_PAUSE = 1;
+  LIVE_COMMAND_KIND_RESUME = 2;
+  LIVE_COMMAND_KIND_GET_OPERATION = 3;
+  LIVE_COMMAND_KIND_CANCEL_OPERATION = 4;
+  LIVE_COMMAND_KIND_CAPTURE = 5;
+  LIVE_COMMAND_KIND_RELEASE_CAPTURE = 6;
+}
+
+// Present exactly while PAUSING: active stage or failed pause awaiting cancel.
+message LiveActivity {
+  optional string operation_id = 1;
+  optional string request_id = 2;
+  optional LiveCommandKind command = 3;
+  optional LiveStage stage = 4;
+}
+
+message LiveLifecycle {
+  CurrentPause current_pause = 1;
+  LiveActivity activity = 2;
+  LiveFailure error = 3;
+}
+
+enum LiveRejectionCode {
+  LIVE_REJECTION_CODE_UNSPECIFIED = 0;
+  LIVE_REJECTION_CODE_WRONG_MACHINE = 1;
+  LIVE_REJECTION_CODE_WRONG_RUN = 2;
+  LIVE_REJECTION_CODE_REQUEST_CONFLICT = 3;
+  LIVE_REJECTION_CODE_INVALID_STATE = 4;
+  LIVE_REJECTION_CODE_OPERATION_NOT_FOUND = 5;
+  LIVE_REJECTION_CODE_STALE_TOKEN = 6;
+  LIVE_REJECTION_CODE_FOREIGN_TOKEN = 7;
+  LIVE_REJECTION_CODE_UNSUPPORTED = 8;
+  LIVE_REJECTION_CODE_WRONG_TARGET = 9;
+  LIVE_REJECTION_CODE_MONITOR_STOPPING = 10;
+}
+
+// Typed refusal without effects.
+message LiveRejection {
+  optional LiveRejectionCode code = 1;
+  optional VmState state = 2;
+  // Present exactly when code is UNSUPPORTED.
+  LiveOperationUnsupported unsupported = 3;
+  optional string message = 4;
+}
+
+message LiveOperationReceipt {
+  optional string operation_id = 1;
+  optional OperationKind kind = 2;
+  optional VmState state = 3;
+}
+
+message PauseResponse {
+  oneof outcome {
+    LiveOperationReceipt accepted = 1;
+    LiveRejection rejected = 2;
+  }
+}
+
+message CaptureResponse {
+  oneof outcome {
+    LiveOperationReceipt accepted = 1;
+    LiveRejection rejected = 2;
+  }
+}
+
+// Completion implies RUNNING after clock, transport, thaw and readiness.
+message ResumeCompleted {
+  PauseToken consumed_token = 1;
+  optional uint64 thawed_epoch = 2;
+}
+
+// PAUSED: current_pause is the requested token (native kept it parked) or a
+// strictly newer recovered authority. ERROR: no authority.
+message ResumeFailed {
+  LiveFailure cause = 1;
+  optional VmState state = 2;
+  CurrentPause current_pause = 3;
+  LiveFailure recovery_failure = 4;
+  PauseToken requested_token = 5;
+}
+
+message ResumeResponse {
+  oneof outcome {
+    ResumeCompleted resumed = 1;
+    ResumeFailed failed = 2;
+    LiveRejection rejected = 3;
+  }
+}
+
+message OperationObservation {
+  LiveOperationRecord operation = 1;
+  optional VmState state = 2;
+  CurrentPause current_pause = 3;
+  LiveActivity activity = 4;
+}
+
+message GetOperationResponse {
+  oneof outcome {
+    OperationObservation observation = 1;
+    LiveRejection rejected = 2;
+  }
+}
+
+message CancelCompleted {
+  optional bool effective = 1;
+  LiveOperationRecord operation = 2;
+  optional VmState state = 3;
+}
+
+message CancelFailed {
+  LiveFailure cause = 1;
+  LiveOperationRecord operation = 2;
+  optional VmState state = 3;
+}
+
+message CancelOperationResponse {
+  oneof outcome {
+    CancelCompleted completed = 1;
+    CancelFailed failed = 2;
+    LiveRejection rejected = 3;
+  }
+}
+
+message ReleaseCaptureResponse {
+  oneof outcome {
+    LiveRejection rejected = 1;
+  }
 }

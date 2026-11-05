@@ -127,6 +127,37 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     if let Some(run) = &view.run_id {
         rows.push(("Run".into(), run.clone()));
     }
+    if let Some(current) = &view.lifecycle {
+        if let Some(pause) = &current.lifecycle.current_pause {
+            rows.push(("Pause operation".into(), pause.operation_id.to_string()));
+            rows.push((
+                "Pause generation".into(),
+                pause.token.generation.to_string(),
+            ));
+            rows.push((
+                "Pause owner".into(),
+                match &pause.token.owner {
+                    vm_spec::lifecycle::PauseOwner::User => "user".into(),
+                    vm_spec::lifecycle::PauseOwner::Capture { operation_id } => {
+                        format!("capture({operation_id})")
+                    }
+                },
+            ));
+        }
+        if let Some(activity) = &current.lifecycle.activity {
+            rows.push(("Live operation".into(), activity.operation_id.to_string()));
+            rows.push(("Live stage".into(), activity.stage.to_string()));
+        }
+        if let Some(error) = &current.lifecycle.error {
+            rows.push(("Live failure".into(), error.to_string()));
+        }
+        if let Some(operation) = &current.operation {
+            rows.push((
+                "Original operation result".into(),
+                operation.status().to_string(),
+            ));
+        }
+    }
     if let Some(outcome) = view.storage_stop_outcome {
         let label = match outcome {
             libvm::StorageStopOutcome::Clean => "clean",

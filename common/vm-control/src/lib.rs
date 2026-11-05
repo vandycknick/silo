@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod live;
 pub mod network;
 pub mod node_status;
+pub mod pause;
 pub mod policy;
 pub mod readiness;
 pub mod reports;

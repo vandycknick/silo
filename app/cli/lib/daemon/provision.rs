@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use eyre::{bail, Context as _};
-use libvm::{ImagePullPolicy, MachineData, MachineStatus, Memory};
+use libvm::{ImagePullPolicy, MachineData, Memory};
 use uuid::Uuid;
 
 use crate::daemon::record::DaemonRecord;
@@ -196,12 +196,7 @@ pub(crate) async fn find_system_machine(
 }
 
 pub(crate) fn is_live(machine: &MachineData) -> bool {
-    matches!(
-        machine.status,
-        MachineStatus::Running { .. }
-            | MachineStatus::Starting { .. }
-            | MachineStatus::Stopping { .. }
-    )
+    machine.status.is_active() || machine.run_id.is_some()
 }
 
 /// Whether libvm labels mark `machine` as belonging to this installation.

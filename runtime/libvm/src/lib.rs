@@ -35,6 +35,7 @@ pub use crate::machine::{require_live_operation, LiveObservationReader, MachineL
 pub use crate::runtime::{
     require_host_live_operation, LiveCapabilityQuery, ResolvedBackendSelection,
 };
+pub use crate::store::live_store::MachineLifecycle;
 pub use crate::store::models::storage::{
     BackendRequirement, BootBinding, BootFileRole, BootProfile, DirectCommandLinePolicy,
     DiskOwnership, DiskStorage, EfiFirmware, Ext4Profile, ExternalResource, FenceRecord,

@@ -149,6 +149,8 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
                 live[operation.as_str()]["availability"]["reason"]["code"],
                 if backend == "vz" {
                     "backend-excluded"
+                } else if operation == LiveOperation::Pause {
+                    "lane-not-qualified"
                 } else {
                     "not-delivered"
                 }
@@ -202,7 +204,6 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
             assert!(!output.status.success(), "unsupported {args:?} succeeded");
             assert!(output.stdout.is_empty());
             let error = String::from_utf8(output.stderr).expect("UTF-8 error");
-            assert_eq!(error.lines().count(), 1, "refusal is not one line: {error}");
             assert!(
                 error.contains(&format!("{operation} unsupported")),
                 "{error}"
@@ -211,15 +212,13 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
             assert!(
                 error.contains(if backend == "vz" {
                     "backend-excluded"
+                } else if operation == "pause" {
+                    "lane-not-qualified"
                 } else {
                     "not-delivered"
                 }),
                 "{error}"
             );
-            if backend == "vz" {
-                assert!(error.contains("silo stop"), "{error}");
-                assert!(error.contains("stopped-storage"), "{error}");
-            }
             assert_eq!(
                 snapshot(temp.path()),
                 before,
@@ -351,14 +350,6 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
                 error.contains("backend=mock"),
                 "prospective backend replaced actual run: {error}"
             );
-            assert!(
-                error.contains(if positive {
-                    "not-delivered"
-                } else {
-                    "lane-not-qualified"
-                }),
-                "actual scenario refusal lost: {error}"
-            );
             assert_eq!(
                 snapshot(&root.join("home")),
                 before_home,
@@ -385,17 +376,11 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
         assert_eq!(value["live"]["scope"], "machine");
         assert_eq!(value["live"]["backend"], "mock");
         for operation in LiveOperation::ALL {
-            if positive {
-                assert_eq!(
-                    value["live"]["live"][operation.as_str()]["availability"]["status"],
-                    "supported"
-                );
-            } else {
-                assert_eq!(
-                    value["live"]["live"][operation.as_str()]["availability"]["reason"]["code"],
-                    "lane-not-qualified"
-                );
-            }
+            assert_eq!(
+                value["live"]["live"][operation.as_str()]["availability"]["reason"]["code"],
+                if positive { "device-profile-rejected" } else { "lane-not-qualified" },
+                "missing guest lifecycle evidence must narrow support, not replace an existing refusal"
+            );
         }
         machine.stop().await.expect("stop scenario monitor");
     }

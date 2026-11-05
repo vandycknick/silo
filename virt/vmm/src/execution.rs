@@ -46,6 +46,7 @@ pub(crate) struct ExecutionService {
     shutdown: CancellationToken,
     active: Arc<ActiveExecutions>,
     exec_log: Option<ExecLogWriter>,
+    gate: Arc<crate::live::gate::LiveGate>,
 }
 
 impl ExecutionService {
@@ -58,6 +59,7 @@ impl ExecutionService {
             shutdown: ctx.shutdown.clone(),
             active: Arc::new(ActiveExecutions::new(EXECUTION_CAPACITY)),
             exec_log,
+            gate: ctx.live.gate().clone(),
         }
     }
 
@@ -111,6 +113,12 @@ impl VmExecutionService for ExecutionService {
             ));
         };
         let (execution_id, agent) = self.validate_start(&start)?;
+        // Covers session setup until the guest reports start, never the
+        // lifetime of the process.
+        let setup = self
+            .gate
+            .try_admit(crate::live::gate::GateKind::ExecSession)
+            .map_err(crate::live::gate::GateRefusal::status)?;
         let lease = self.active.acquire(execution_id)?;
         let identity_changes = self.store.subscribe_ready_agent_identity();
         let (events, receiver) = mpsc::channel(QUEUE_CAPACITY);
@@ -135,6 +143,10 @@ impl VmExecutionService for ExecutionService {
             cancellation.clone(),
             identity_changes,
             lease,
+            ExecutionFence {
+                gate: self.gate.clone(),
+                _setup: Some(setup),
+            },
         ));
         Ok(Response::new(Box::pin(HostEventStream {
             receiver: ReceiverStream::new(receiver),
@@ -231,6 +243,7 @@ async fn run_execution(
     cancellation: CancellationToken,
     mut identity_changes: tokio::sync::watch::Receiver<Option<ReadyAgentIdentity>>,
     _lease: ExecutionLease,
+    mut fence: ExecutionFence,
 ) {
     let current = match store.ready_agent_identity() {
         Ok(identity) => identity,
@@ -371,6 +384,8 @@ async fn run_execution(
                         translate_event(guest, &mut guest_state).map_err(Status::unavailable)
                     }) {
                     Ok((event, terminal)) => {
+                        // The guest settled session setup (started or failed).
+                        fence._setup = None;
                         log_execution_output(exec_log.as_ref(), execution_id, &event);
                         if events.send(Ok(event)).await.is_err() { return; }
                         if terminal { return; }
@@ -403,7 +418,7 @@ async fn run_execution(
                         return;
                     }
                     match guest_control(control) {
-                    Ok(control) => match forward_guest_control(control, &guest_inputs, &cancellation, &shutdown).await {
+                    Ok(control) => match forward_guest_control(control, &guest_inputs, &fence.gate, &cancellation, &shutdown).await {
                         Ok(()) => {}
                         Err(error) => {
                             let _ = events.send(Err(protocol::detailed_status(error))).await;
@@ -442,12 +457,27 @@ fn cancelled_before_start_event() -> ExecutionEvent {
     }
 }
 
+/// Live lifecycle fence of one execution: setup admission plus the gate
+/// every later stdin/signal/resize input waits on while fenced.
+struct ExecutionFence {
+    gate: Arc<crate::live::gate::LiveGate>,
+    _setup: Option<crate::live::gate::GatePermit>,
+}
+
 async fn forward_guest_control(
     control: GuestProcessInput,
     guest_inputs: &mpsc::Sender<GuestProcessInput>,
+    gate: &Arc<crate::live::gate::LiveGate>,
     cancellation: &CancellationToken,
     shutdown: &CancellationToken,
 ) -> Result<(), Status> {
+    let _input = tokio::select! {
+        permit = gate.admit(crate::live::gate::GateKind::SessionInput) => {
+            permit.map_err(crate::live::gate::GateRefusal::status)?
+        }
+        _ = cancellation.cancelled() => return Err(Status::cancelled("execution client disconnected")),
+        _ = shutdown.cancelled() => return Err(stopping()),
+    };
     tokio::select! {
         result = guest_inputs.send(control) => result.map_err(|_| protocol::detailed_status(Status::unavailable("guest input stream closed"))),
         _ = cancellation.cancelled() => Err(Status::cancelled("execution client disconnected")),

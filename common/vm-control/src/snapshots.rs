@@ -59,6 +59,28 @@ pub fn status_to_wire(v: &libvm::MachineStatus) -> Result<w::MachineStatus, Conv
             libvm::MachineStatus::Error { message } => Status::Error(w::LifecycleDetail {
                 message: message.clone(),
             }),
+            libvm::MachineStatus::Pausing { message } => Status::Pausing(w::LifecycleDetail {
+                message: message.clone(),
+            }),
+            libvm::MachineStatus::Paused { message } => Status::Paused(w::LifecycleDetail {
+                message: message.clone(),
+            }),
+            libvm::MachineStatus::Capturing { message } => Status::Capturing(w::LifecycleDetail {
+                message: message.clone(),
+            }),
+            libvm::MachineStatus::Restoring { message } => Status::Restoring(w::LifecycleDetail {
+                message: message.clone(),
+            }),
+            libvm::MachineStatus::Activating { message } => {
+                Status::Activating(w::LifecycleDetail {
+                    message: message.clone(),
+                })
+            }
+            libvm::MachineStatus::ActivationFailed { message } => {
+                Status::ActivationFailed(w::LifecycleDetail {
+                    message: message.clone(),
+                })
+            }
             _ => return Err(invalid("status", "unsupported native variant")),
         }),
     })
@@ -75,6 +97,14 @@ pub fn status_from_wire(v: w::MachineStatus) -> Result<libvm::MachineStatus, Con
         },
         Status::Stopping(v) => libvm::MachineStatus::Stopping { message: v.message },
         Status::Error(v) => libvm::MachineStatus::Error { message: v.message },
+        Status::Pausing(v) => libvm::MachineStatus::Pausing { message: v.message },
+        Status::Paused(v) => libvm::MachineStatus::Paused { message: v.message },
+        Status::Capturing(v) => libvm::MachineStatus::Capturing { message: v.message },
+        Status::Restoring(v) => libvm::MachineStatus::Restoring { message: v.message },
+        Status::Activating(v) => libvm::MachineStatus::Activating { message: v.message },
+        Status::ActivationFailed(v) => {
+            libvm::MachineStatus::ActivationFailed { message: v.message }
+        }
     })
 }
 pub fn issue_to_wire(v: &libvm::MachineIssue) -> w::MachineIssue {
@@ -184,6 +214,11 @@ pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, Co
         last_error: v.last_error.clone(),
         updated_at: Some(timestamp(v.updated_at)),
         network_observation: None,
+        lifecycle: v
+            .lifecycle
+            .as_ref()
+            .map(crate::pause::projection_to_wire)
+            .transpose()?,
         live: v
             .live
             .as_ref()
@@ -278,6 +313,18 @@ pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, C
     out.last_error = v.last_error;
     out.updated_at = timestamp_seconds(v.updated_at, "updated_at")?;
     out.live = v.live.map(crate::live::machine_from_wire).transpose()?;
+    out.lifecycle = v
+        .lifecycle
+        .map(crate::pause::projection_from_wire)
+        .transpose()?;
+    if let Some(lifecycle) = &out.lifecycle {
+        if !crate::live::same_machine_identity(&lifecycle.report.machine_id, &out.id)
+            || out.run_id.as_ref().map(ToString::to_string).as_deref()
+                != Some(lifecycle.report.run_id.as_str())
+        {
+            return Err(invalid("machine.lifecycle", "projection identity mismatch"));
+        }
+    }
     out.prospective_live = v
         .prospective_live
         .map(crate::live::host_from_wire)

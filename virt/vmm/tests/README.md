@@ -26,12 +26,12 @@ dependency's read-only system KVM/HVF observations and live in
 Phase 11 linked-fact tests expect native pause on all three recognized lanes.
 KVM x86_64 also supports native capture, restore, fork and incremental; those
 four primitives remain unsupported and pending on KVM arm64 and HVF arm64.
-Excluded lanes support none of the five primitives. No public operation is
-delivered or qualified. The tests cover independent per-operation mapping and
-ensure every supported primitive still refuses public admission with both an
-admitted host and unknown host facts. Even declared delivery on an admitted host
-does not bypass the separate runtime qualification requirement. These tests
-do not qualify runtime execution on KVM arm64 or HVF.
+Excluded lanes support none of the five primitives. Public pause is delivered
+with an immutable Linux KVM x86_64 qualification record bound to the verified
+native/build identity. Capture, restore, fork and incremental remain
+not-delivered. Tests distinguish native support, public delivery, host admission
+and qualification; none may substitute for another. These Cargo tests do not
+qualify runtime execution on KVM arm64 or HVF.
 
 To query the actual monitor, build its binary (not only the unit-test harness)
 in the repository development shell with the configured libkrun dependency
@@ -46,8 +46,9 @@ The development shell supplies the native compiler and libclang prerequisites.
 Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
 set. The krun query performs read-only host discovery, not a VM run. Its
 `native: true` fields follow the lane matrix above and do not grant public
-support or runtime qualification; public availability remains `not-delivered`
-for every operation, including when mutable qualification grants are supplied.
+support or runtime qualification. Only the exact compiled qualification admits
+public pause; capture, restore, fork and incremental remain `not-delivered`.
+Mutable qualification grants cannot change any of these results.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust

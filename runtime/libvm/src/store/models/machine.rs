@@ -68,6 +68,12 @@ pub(crate) enum MachineRuntimeState {
     Stopped,
     Starting,
     Running,
+    Pausing,
+    Paused,
+    Capturing,
+    Restoring,
+    Activating,
+    ActivationFailed,
     Stopping,
     Error,
 }
@@ -78,6 +84,12 @@ impl MachineRuntimeState {
             Self::Stopped => "stopped",
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Pausing => "pausing",
+            Self::Paused => "paused",
+            Self::Capturing => "capturing",
+            Self::Restoring => "restoring",
+            Self::Activating => "activating",
+            Self::ActivationFailed => "activation_failed",
             Self::Stopping => "stopping",
             Self::Error => "error",
         }
@@ -88,6 +100,12 @@ impl MachineRuntimeState {
             "stopped" => Ok(Self::Stopped),
             "starting" => Ok(Self::Starting),
             "running" => Ok(Self::Running),
+            "pausing" => Ok(Self::Pausing),
+            "paused" => Ok(Self::Paused),
+            "capturing" => Ok(Self::Capturing),
+            "restoring" => Ok(Self::Restoring),
+            "activating" => Ok(Self::Activating),
+            "activation_failed" => Ok(Self::ActivationFailed),
             "stopping" => Ok(Self::Stopping),
             "error" => Ok(Self::Error),
             other => Err(format!("unknown machine runtime state {other:?}")),
@@ -96,6 +114,12 @@ impl MachineRuntimeState {
 
     pub(crate) fn is_running(self) -> bool {
         matches!(self, Self::Running)
+    }
+
+    /// Nonterminal execution states. Error may also retain a live monitor;
+    /// callers deciding resource ownership must check the monitor identity.
+    pub(crate) fn is_live(self) -> bool {
+        !matches!(self, Self::Stopped | Self::Error)
     }
 }
 
@@ -134,6 +158,12 @@ mod tests {
             MachineRuntimeState::Stopped,
             MachineRuntimeState::Starting,
             MachineRuntimeState::Running,
+            MachineRuntimeState::Pausing,
+            MachineRuntimeState::Paused,
+            MachineRuntimeState::Capturing,
+            MachineRuntimeState::Restoring,
+            MachineRuntimeState::Activating,
+            MachineRuntimeState::ActivationFailed,
             MachineRuntimeState::Stopping,
             MachineRuntimeState::Error,
         ] {
@@ -146,7 +176,7 @@ mod tests {
 
     #[test]
     fn machine_runtime_state_rejects_unknown_storage_string() {
-        let err = MachineRuntimeState::parse("paused").expect_err("unknown state should fail");
+        let err = MachineRuntimeState::parse("unknown").expect_err("unknown state should fail");
 
         assert!(err.contains("unknown machine runtime state"));
     }

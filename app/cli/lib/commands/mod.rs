@@ -49,6 +49,7 @@ pub enum Command {
     Info(info::Cmd),
     System(system::Cmd),
     Pause(live::Pause),
+    Resume(live::Resume),
     Snapshot(live::Snapshot),
     Fork(live::Fork),
     Restore(live::Restore),
@@ -63,7 +64,7 @@ impl Command {
     pub(crate) fn transport_admission(&self) -> silo_vm_control::transport::Admission {
         use silo_vm_control::transport::Admission;
         match self {
-            Self::Pause(_) | Self::System(_) => Admission::Owned,
+            Self::Pause(_) | Self::Resume(_) | Self::System(_) => Admission::Owned,
             Self::Snapshot(command) if command.is_live() => Admission::Owned,
             Self::Fork(command) if command.live => Admission::Owned,
             Self::Restore(command) if command.execution => Admission::Owned,
@@ -91,6 +92,7 @@ impl Command {
             Self::Info(command) => command.run(context).await,
             Self::System(command) => command.run(context).await,
             Self::Pause(command) => command.run(context).await,
+            Self::Resume(command) => command.run(context).await,
             Self::Snapshot(command) => command.run(context).await,
             Self::Fork(command) => command.run(context).await,
             Self::Restore(command) => command.run(context).await,

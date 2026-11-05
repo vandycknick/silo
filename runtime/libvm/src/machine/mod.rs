@@ -7,6 +7,7 @@ mod inspect;
 mod lifecycle;
 mod lifecycle_options;
 pub(crate) mod live;
+pub(crate) mod live_operations;
 mod logs;
 mod memory;
 mod mounts;

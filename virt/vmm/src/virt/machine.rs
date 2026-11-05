@@ -205,6 +205,17 @@ impl VirtualMachine {
         self.inner.backend.try_wait().await
     }
 
+    /// The finite native lifecycle seam (pause, ClockOnly resume, cancel,
+    /// observation). Dropping the returned future never cancels accepted
+    /// native work; an identical retry joins it.
+    pub async fn lifecycle(
+        &self,
+        request: crate::virt::lifecycle::LifecycleRequest,
+    ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
+    {
+        self.inner.backend.lifecycle(request).await
+    }
+
     /// Finish checked attachment cleanup after every native owner is terminal.
     /// A terminal exit code itself supplies none of the storage facts.
     pub(crate) async fn finalize_storage(
@@ -385,6 +396,14 @@ mod tests {
         async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
             let (device, _peer) = tokio::io::duplex(1);
             Ok(SerialDevice::from_duplex(device))
+        }
+
+        async fn lifecycle(
+            &self,
+            _request: crate::virt::lifecycle::LifecycleRequest,
+        ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
+        {
+            Err(crate::virt::lifecycle::LifecycleError::Unsupported { backend: "test" })
         }
     }
 

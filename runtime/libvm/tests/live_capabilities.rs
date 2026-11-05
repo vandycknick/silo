@@ -558,7 +558,7 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
             let error = bounded_refusal(
                 async move {
                     match operation {
-                        LiveOperation::Pause => machine.pause(&observed).await,
+                        LiveOperation::Pause => machine.pause(&observed).await.map(|_| ()),
                         LiveOperation::Capture => machine.capture(&observed).await,
                         LiveOperation::Fork => {
                             machine
@@ -618,30 +618,19 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
 }
 
 #[tokio::test]
-async fn live_capabilities_positive_mock_cannot_execute_undelivered_manager() {
-    let fixture = Fixture::new(&scenario(None, false)).await;
+async fn live_capabilities_positive_mock_cannot_execute_undelivered_capture_or_fork() {
+    let fixture = Fixture::new(&pause_scenario(Default::default())).await;
     let observation = LiveObservationReader::open(&fixture.config)
         .expect("reader")
         .observe(&fixture.reference())
         .await
         .expect("observe positive scenario");
     assert_eq!(
-        observation.report().live.pause.availability,
+        observation.report().live.capture.availability,
         LiveAvailability::Supported
     );
     let before = snapshot(&fixture.home);
     let before_catalog = live_catalog::snapshot(&fixture.home).await;
-    unsupported(
-        fixture
-            .machine
-            .pause(&observation)
-            .await
-            .expect_err("positive scenario is not manager delivery"),
-        LiveOperation::Pause,
-        LiveBackend::Mock,
-        LiveReasonCode::NotDelivered,
-        None,
-    );
     unsupported(
         fixture
             .machine
@@ -667,6 +656,527 @@ async fn live_capabilities_positive_mock_cannot_execute_undelivered_manager() {
     assert_eq!(snapshot(&fixture.home), before);
     assert_eq!(live_catalog::snapshot(&fixture.home).await, before_catalog);
     fixture.stop().await;
+}
+
+fn pause_scenario(lifecycle: test_utils::LifecycleScenario) -> Scenario {
+    Scenario {
+        lifecycle: Some(lifecycle),
+        ..scenario(None, false)
+    }
+}
+
+async fn wait_pause_state(
+    machine: &Machine,
+    expected: vm_spec::lifecycle::VmLifecycleState,
+) -> libvm::MachineLiveObservation {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let observation = machine.observe_live().await.unwrap();
+        if observation.state().unwrap() == expected {
+            return observation;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lifecycle did not reach {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn pause_independent_manager_recovers_lost_receipt_replay_conflict_and_stops_parked() {
+    use vm_spec::lifecycle::*;
+    let fixture = Fixture::new(&pause_scenario(Default::default())).await;
+    let before = fixture.machine.monitor_status().await.unwrap();
+    let observed = fixture.machine.observe_live().await.unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let receipt = fixture
+        .machine
+        .pause_with_request(&observed, request_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        receipt,
+        LiveCommandResult::Pause(PauseOutcome::Accepted { .. })
+    ));
+    // Deliberately discard the establishing response. Another Runtime must use
+    // the monitor and durable intent, not memory in the original handle.
+    let paused = wait_pause_state(&fixture.machine, VmLifecycleState::Paused).await;
+    let current = paused.lifecycle().unwrap().current_pause.unwrap();
+    let captures = fixture
+        .home
+        .join("machines")
+        .join(fixture.machine.id())
+        .join("captures");
+    assert_eq!(std::fs::metadata(&captures).unwrap().mode() & 0o777, 0o700);
+    assert!(std::fs::read_dir(&captures).unwrap().next().is_none());
+    let child = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .kill_on_drop(true)
+            .args(["--exact", "pause_manager_restart_child", "--nocapture"])
+            .env("SILO_PAUSE_MANAGER_HOME", &fixture.home)
+            .env("SILO_PAUSE_MANAGER_RUN_ROOT", &fixture.run_root)
+            .env("SILO_PAUSE_MANAGER_ASSETS", fixture.temp.path())
+            .env(
+                "SILO_PAUSE_MANAGER_TOKEN",
+                serde_json::to_string(&current).unwrap(),
+            )
+            .output(),
+    )
+    .await
+    .expect("independent manager deadline")
+    .unwrap();
+    assert!(
+        child.status.success(),
+        "independent manager: stdout={} stderr={}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let independent = Runtime::new(fixture.config.clone()).await.unwrap();
+    let machine = independent.get_machine(&fixture.reference()).await.unwrap();
+    let fresh = machine.observe_live().await.unwrap();
+    assert_eq!(
+        fresh.lifecycle().unwrap().current_pause.as_ref(),
+        Some(&current)
+    );
+    let operation = machine
+        .get_operation(&fresh, uuid::Uuid::new_v4(), current.operation_id.clone())
+        .await
+        .unwrap();
+    let LiveCommandResult::GetOperation(GetOperationOutcome::Observation { observation }) =
+        operation
+    else {
+        panic!("operation not observed");
+    };
+    assert_eq!(observation.operation.status(), OperationStatus::Succeeded);
+    let OperationOutcome::Succeeded { pause } = observation.operation.outcome else {
+        panic!("no establishing token");
+    };
+    assert_eq!(pause.token, current.token);
+    assert_eq!(
+        machine
+            .pause_with_request(&fresh, request_id)
+            .await
+            .unwrap(),
+        receipt
+    );
+    let conflict = machine
+        .live_command(
+            &fresh,
+            LiveCommand::Resume(ResumeCommand {
+                envelope: LiveCommandEnvelope {
+                    machine_id: current.token.machine_id.clone(),
+                    run_id: current.token.run_id.clone(),
+                    request_id: LiveId::parse(&request_id.to_string()).unwrap(),
+                },
+                operation_id: current.operation_id.clone(),
+                token: current.token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        conflict.rejection().unwrap().reason.code(),
+        LiveRejectionCode::RequestConflict
+    );
+    let inspected = machine.inspect().await.unwrap();
+    assert_eq!(inspected.status.label(), "paused");
+    assert!(!inspected.status.ready());
+    assert_eq!(inspected.run_id, before.run_id);
+    let snapshot = machine.monitor_status().await.unwrap();
+    match (&snapshot.agent, &before.agent) {
+        (libvm::MachineAgentStatus::Enabled(after), libvm::MachineAgentStatus::Enabled(before)) => {
+            assert_eq!(after.identity, before.identity)
+        }
+        _ => panic!("scenario must retain its enabled resident agent"),
+    }
+    machine.stop().await.unwrap();
+    assert_eq!(machine.inspect().await.unwrap().status.label(), "stopped");
+}
+
+#[tokio::test]
+async fn pause_lost_thaw_recovery_keeps_original_success_and_resume_replay_cannot_consume_new_token(
+) {
+    use vm_spec::lifecycle::*;
+    let lifecycle = test_utils::LifecycleScenario {
+        thaw: vec![test_utils::GuestThawStep {
+            delay_ms: 0,
+            result: test_utils::GuestThawResult::DropResponse,
+        }],
+        ..Default::default()
+    };
+    let fixture = Fixture::new(&pause_scenario(lifecycle)).await;
+    let established = fixture
+        .machine
+        .pause(&fixture.machine.observe_live().await.unwrap())
+        .await
+        .unwrap();
+    let original = established.lifecycle.current_pause.unwrap();
+    let observed = fixture.machine.observe_live().await.unwrap();
+    let resume_id = uuid::Uuid::new_v4();
+    let result = fixture
+        .machine
+        .resume_with_request(&observed, resume_id)
+        .await
+        .unwrap();
+    let LiveCommandResult::Resume(ResumeOutcome::Failed { failed }) = &result else {
+        panic!("lost thaw must fail resume explicitly: {result:?}");
+    };
+    assert_eq!(failed.state, VmLifecycleState::Paused);
+    let recovered = failed.current_pause.as_ref().unwrap();
+    assert!(recovered.token.generation > original.token.generation);
+    assert!(recovered.freeze_epoch > original.freeze_epoch);
+    let current = fixture.machine.observe_live().await.unwrap();
+    assert_eq!(
+        current.lifecycle().unwrap().current_pause.as_ref(),
+        Some(recovered)
+    );
+    let original_request = LiveCommand::Resume(ResumeCommand {
+        envelope: LiveCommandEnvelope {
+            machine_id: original.token.machine_id.clone(),
+            run_id: original.token.run_id.clone(),
+            request_id: LiveId::parse(&resume_id.to_string()).unwrap(),
+        },
+        operation_id: original.operation_id.clone(),
+        token: original.token.clone(),
+    });
+    assert_eq!(
+        fixture
+            .machine
+            .live_command(&current, original_request)
+            .await
+            .unwrap(),
+        result
+    );
+    assert_eq!(
+        fixture
+            .machine
+            .observe_live()
+            .await
+            .unwrap()
+            .lifecycle()
+            .unwrap()
+            .current_pause
+            .as_ref(),
+        Some(recovered)
+    );
+    let queried = fixture
+        .machine
+        .get_operation(
+            &current,
+            uuid::Uuid::new_v4(),
+            original.operation_id.clone(),
+        )
+        .await
+        .unwrap();
+    let LiveCommandResult::GetOperation(GetOperationOutcome::Observation { observation }) = queried
+    else {
+        panic!("missing operation");
+    };
+    let OperationOutcome::Succeeded { pause } = observation.operation.outcome else {
+        panic!("original Pause changed");
+    };
+    assert_eq!(pause.token, original.token);
+    assert_eq!(observation.current_pause.as_ref(), Some(recovered));
+    let resumed = fixture.machine.resume(&current).await.unwrap();
+    assert_eq!(resumed.state, VmLifecycleState::Running);
+    assert!(resumed.lifecycle.current_pause.is_none());
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn pause_partial_failure_cancel_and_failed_rollback_preserve_recovery_exit() {
+    use vm_spec::lifecycle::*;
+    for rollback_fails in [false, true] {
+        let lifecycle = test_utils::LifecycleScenario {
+            native_pause: vec![test_utils::NativePauseStep {
+                delay_ms: 0,
+                result: test_utils::NativePauseResult::Fail,
+            }],
+            native_cancel: if rollback_fails {
+                vec![test_utils::NativeCancelStep {
+                    delay_ms: 0,
+                    result: test_utils::NativeCancelResult::Fail,
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let fixture = Fixture::new(&pause_scenario(lifecycle)).await;
+        assert!(fixture
+            .machine
+            .pause(&fixture.machine.observe_live().await.unwrap())
+            .await
+            .is_err());
+        let failed = wait_pause_state(&fixture.machine, VmLifecycleState::Pausing).await;
+        let lifecycle = failed.lifecycle().unwrap();
+        assert!(lifecycle.current_pause.is_none());
+        assert_eq!(
+            lifecycle.activity.as_ref().unwrap().stage,
+            LiveStage::PauseFailed
+        );
+        let target = lifecycle.activity.unwrap().operation_id;
+        let result = fixture
+            .machine
+            .cancel_operation(&failed, uuid::Uuid::new_v4(), target)
+            .await
+            .unwrap();
+        if rollback_fails {
+            assert!(matches!(
+                result,
+                LiveCommandResult::CancelOperation(CancelOperationOutcome::Failed { .. })
+            ));
+            let current = fixture.machine.observe_live().await.unwrap();
+            assert_eq!(current.state().unwrap(), VmLifecycleState::Error);
+            assert!(current.lifecycle().unwrap().error.is_some());
+        } else {
+            assert!(matches!(
+                result,
+                LiveCommandResult::CancelOperation(CancelOperationOutcome::Completed { .. })
+            ));
+            assert_eq!(
+                fixture
+                    .machine
+                    .observe_live()
+                    .await
+                    .unwrap()
+                    .state()
+                    .unwrap(),
+                VmLifecycleState::Running
+            );
+        }
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn pause_dropped_resume_waiter_reconciles_original_request_without_consuming_authority_twice()
+{
+    use vm_spec::lifecycle::*;
+    let lifecycle = test_utils::LifecycleScenario {
+        native_resume: vec![test_utils::NativeResumeStep {
+            delay_ms: 400,
+            result: test_utils::NativeResumeResult::Complete,
+            clock_delay_ms: 0,
+        }],
+        ..Default::default()
+    };
+    let fixture = Fixture::new(&pause_scenario(lifecycle)).await;
+    let established = fixture
+        .machine
+        .pause(&fixture.machine.observe_live().await.unwrap())
+        .await
+        .unwrap();
+    let original = established.lifecycle.current_pause.unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let command = LiveCommand::Resume(ResumeCommand {
+        envelope: LiveCommandEnvelope {
+            machine_id: original.token.machine_id.clone(),
+            run_id: original.token.run_id.clone(),
+            request_id: LiveId::parse(&request_id.to_string()).unwrap(),
+        },
+        operation_id: original.operation_id.clone(),
+        token: original.token.clone(),
+    });
+    let machine = fixture.machine.clone();
+    let request = command.clone();
+    let observed = machine.observe_live().await.unwrap();
+    let waiter = tokio::spawn(async move { machine.live_command(&observed, request).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = fixture.machine.observe_live().await.unwrap();
+        if observed
+            .lifecycle()
+            .unwrap()
+            .activity
+            .is_some_and(|activity| activity.request_id.as_str() == request_id.to_string())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resume was not admitted"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    waiter.abort();
+    let _ = waiter.await;
+    let independent = Runtime::new(fixture.config.clone()).await.unwrap();
+    let machine = independent.get_machine(&fixture.reference()).await.unwrap();
+    let current = machine.reconcile_live().await.unwrap();
+    assert_eq!(current.state, VmLifecycleState::Running);
+    assert!(current.lifecycle.current_pause.is_none());
+    let replay = machine
+        .live_command(&machine.observe_live().await.unwrap(), command)
+        .await
+        .unwrap();
+    let LiveCommandResult::Resume(ResumeOutcome::Resumed { resumed }) = replay else {
+        panic!("original Resume did not settle");
+    };
+    assert_eq!(resumed.consumed_token, original.token);
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(fixture.home.join("state.db"))
+        .read_only(true)
+        .create_if_missing(false);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM live_command WHERE json_extract(input_json,'$.command.command')='resume'")
+        .fetch_one(&mut connection).await.unwrap();
+    connection.close().await.unwrap();
+    assert_eq!(count, 1, "recovery invented a replacement Resume identity");
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn pause_manager_restart_child() {
+    let Some(home) = std::env::var_os("SILO_PAUSE_MANAGER_HOME") else {
+        return;
+    };
+    let run = std::env::var_os("SILO_PAUSE_MANAGER_RUN_ROOT").unwrap();
+    let assets = PathBuf::from(std::env::var_os("SILO_PAUSE_MANAGER_ASSETS").unwrap());
+    let expected: vm_spec::lifecycle::CurrentPause =
+        serde_json::from_str(&std::env::var("SILO_PAUSE_MANAGER_TOKEN").unwrap()).unwrap();
+    let binary = test_utils::mock_vmm_binary();
+    let components = ResolvedRuntimeComponents::from_paths(
+        binary.to_path_buf(),
+        binary.to_path_buf(),
+        assets.join("kernel"),
+        assets.join("initramfs"),
+        assets.join("agent"),
+        assets.clone(),
+    )
+    .unwrap();
+    let config = RuntimeConfig::local(home)
+        .with_run_root(run)
+        .with_runtime_components(components)
+        .with_mock_vmm(assets.join("scenario.json"));
+    let observed = LiveObservationReader::open(&config)
+        .unwrap()
+        .observe(&MachineRef::parse("source").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.lifecycle().unwrap().current_pause.as_ref(),
+        Some(&expected)
+    );
+    let runtime = Runtime::new(config).await.unwrap();
+    let machine = runtime
+        .get_machine(&MachineRef::parse("source").unwrap())
+        .await
+        .unwrap();
+    let current = machine.reconcile_live().await.unwrap();
+    assert_eq!(current.state, vm_spec::lifecycle::VmLifecycleState::Paused);
+    assert_eq!(current.lifecycle.current_pause.as_ref(), Some(&expected));
+    // The independent manager exits without any continuation policy.
+}
+
+#[tokio::test]
+async fn pause_freeze_and_recovery_failure_rows_are_fenced_without_fabricated_authority() {
+    use vm_spec::lifecycle::*;
+    for fault in [false, true] {
+        let lifecycle = test_utils::LifecycleScenario {
+            freeze: vec![test_utils::GuestFreezeStep {
+                delay_ms: 0,
+                result: if fault {
+                    test_utils::GuestFreezeResult::Faulted
+                } else {
+                    test_utils::GuestFreezeResult::FreezeFailed
+                },
+            }],
+            ..Default::default()
+        };
+        let fixture = Fixture::new(&pause_scenario(lifecycle)).await;
+        assert!(fixture
+            .machine
+            .pause(&fixture.machine.observe_live().await.unwrap())
+            .await
+            .is_err());
+        let current = fixture.machine.observe_live().await.unwrap();
+        assert_eq!(
+            current.state().unwrap(),
+            if fault {
+                VmLifecycleState::Error
+            } else {
+                VmLifecycleState::Running
+            }
+        );
+        assert!(current.lifecycle().unwrap().current_pause.is_none());
+        fixture.stop().await;
+    }
+    for native_failure in [false, true] {
+        let lifecycle = test_utils::LifecycleScenario {
+            thaw: vec![test_utils::GuestThawStep {
+                delay_ms: 0,
+                result: test_utils::GuestThawResult::DropResponse,
+            }],
+            freeze: if native_failure {
+                Vec::new()
+            } else {
+                vec![
+                    test_utils::GuestFreezeStep {
+                        delay_ms: 0,
+                        result: test_utils::GuestFreezeResult::Frozen,
+                    },
+                    test_utils::GuestFreezeStep {
+                        delay_ms: 0,
+                        result: test_utils::GuestFreezeResult::Faulted,
+                    },
+                ]
+            },
+            native_pause: if native_failure {
+                vec![
+                    test_utils::NativePauseStep {
+                        delay_ms: 0,
+                        result: test_utils::NativePauseResult::Complete,
+                    },
+                    test_utils::NativePauseStep {
+                        delay_ms: 0,
+                        result: test_utils::NativePauseResult::Fail,
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let fixture = Fixture::new(&pause_scenario(lifecycle)).await;
+        let established = fixture
+            .machine
+            .pause(&fixture.machine.observe_live().await.unwrap())
+            .await
+            .unwrap();
+        let result = fixture
+            .machine
+            .resume_with_request(
+                &fixture.machine.observe_live().await.unwrap(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        let LiveCommandResult::Resume(ResumeOutcome::Failed { failed }) = result else {
+            panic!("recovery failure must be explicit");
+        };
+        assert_eq!(failed.state, VmLifecycleState::Error);
+        assert!(failed.current_pause.is_none());
+        assert!(failed.recovery_failure.is_some());
+        let current = fixture.machine.observe_live().await.unwrap();
+        assert_eq!(current.state().unwrap(), VmLifecycleState::Error);
+        assert!(current.lifecycle().unwrap().current_pause.is_none());
+        let target = established.lifecycle.current_pause.unwrap().operation_id;
+        let query = fixture
+            .machine
+            .get_operation(&current, uuid::Uuid::new_v4(), target)
+            .await
+            .unwrap();
+        let LiveCommandResult::GetOperation(GetOperationOutcome::Observation { observation }) =
+            query
+        else {
+            panic!("Error must retain GetOperation");
+        };
+        assert_eq!(observation.operation.status(), OperationStatus::Succeeded);
+        fixture.stop().await;
+    }
 }
 
 // A real separate process proves cold observation without an initialized
@@ -1196,7 +1706,7 @@ async fn live_capabilities_wrong_machine_evidence_fails_before_unsupported_reaso
     let before_catalog = live_catalog::snapshot(&fixture.home).await;
     let before_run = snapshot(&fixture.run_root);
     for result in [
-        other.pause(&observation).await,
+        other.pause(&observation).await.map(|_| ()),
         other.capture(&observation).await,
         other
             .fork_execution(&observation, Some("unallocated"))

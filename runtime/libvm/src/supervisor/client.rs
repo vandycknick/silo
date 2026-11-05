@@ -82,6 +82,87 @@ impl VmmClient {
         .map_err(|_| VmmClientError::Protocol("vm monitor inspection timed out after 2s".into()))?
     }
 
+    /// One exact, already-durable command. A transport timeout never implies
+    /// cancellation or grants permission to submit a replacement identity.
+    pub(crate) async fn lifecycle(
+        &self,
+        command: vm_spec::lifecycle::LiveCommand,
+    ) -> Result<vm_spec::lifecycle::LiveCommandResult, VmmClientError> {
+        use vm_spec::lifecycle::{LiveCommand as C, LiveCommandResult as R};
+        command.validate().map_err(VmmClientError::Protocol)?;
+        let mut client = monitor_client(self.channel().await?);
+        let result = match command {
+            C::Pause(command) => R::Pause(
+                client
+                    .pause(timed_request(
+                        protocol::v1::PauseRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("pause RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::Resume(command) => R::Resume(
+                client
+                    .resume(timed_request(
+                        protocol::v1::ResumeRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("resume RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::GetOperation(command) => R::GetOperation(
+                client
+                    .get_operation(timed_request(
+                        protocol::v1::GetOperationRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("get-operation RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::CancelOperation(command) => R::CancelOperation(
+                client
+                    .cancel_operation(timed_request(
+                        protocol::v1::CancelOperationRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("cancel-operation RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::Capture(command) => R::Capture(
+                client
+                    .capture(timed_request(
+                        protocol::v1::CaptureRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("capture RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+            C::ReleaseCapture(command) => R::ReleaseCapture(
+                client
+                    .release_capture(timed_request(
+                        protocol::v1::ReleaseCaptureRequest::from(command),
+                        RPC_TIMEOUT,
+                    ))
+                    .await
+                    .map_err(|error| rpc_error("release-capture RPC failed", error))?
+                    .into_inner()
+                    .try_into()?,
+            ),
+        };
+        result.validate().map_err(VmmClientError::Protocol)?;
+        Ok(result)
+    }
+
     pub(crate) async fn wait_ready(
         &self,
         timeout: Duration,

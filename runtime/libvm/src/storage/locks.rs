@@ -142,8 +142,32 @@ mod tests {
     use crate::paths::OwnedDirectory;
     use crate::storage::locks::{acquire, blocking};
 
+    fn isolated(name: &str) -> bool {
+        if std::env::var("SILO_LEASE_TEST_CHILD").as_deref() == Ok(name) {
+            return false;
+        }
+        // Other libtest threads fork subprocesses. CLOEXEC does not prevent
+        // those children briefly retaining our OFD between fork and exec.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env("SILO_LEASE_TEST_CHILD", name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     #[test]
     fn duplicate_extends_lease_and_stable_file_survives_drop() {
+        if isolated("storage::locks::tests::duplicate_extends_lease_and_stable_file_survives_drop")
+        {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let directory = OwnedDirectory::open_root(&temp.path().join("locks")).unwrap();
         let lease = blocking(&directory, "op.lease", FlockArg::LockShared).unwrap();
@@ -165,6 +189,9 @@ mod tests {
 
     #[test]
     fn fresh_and_existing_lease_openers_never_replace_or_recreate_inodes() {
+        if isolated("storage::locks::tests::fresh_and_existing_lease_openers_never_replace_or_recreate_inodes") {
+            return;
+        }
         use crate::storage::locks::{acquire_existing, acquire_new};
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();

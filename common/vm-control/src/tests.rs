@@ -188,6 +188,14 @@ fn inventory_retains_unreadable_identity_and_all_lifecycle_states() {
             message: None,
         },
         libvm::MachineStatus::Stopping { message: None },
+        libvm::MachineStatus::Pausing { message: None },
+        libvm::MachineStatus::Paused {
+            message: Some("user-owned".into()),
+        },
+        libvm::MachineStatus::Capturing { message: None },
+        libvm::MachineStatus::Restoring { message: None },
+        libvm::MachineStatus::Activating { message: None },
+        libvm::MachineStatus::ActivationFailed { message: None },
         libvm::MachineStatus::Error {
             message: Some("failed".into()),
         },
@@ -458,6 +466,7 @@ fn readiness_preserves_each_outcome_and_reason() {
                         reason,
                     },
                     agent: libvm::MachineAgentStatus::Disabled,
+                    lifecycle: Default::default(),
                     live: vm_spec::live::LiveMachineReport {
                         schema_version: 1,
                         scope: vm_spec::live::LiveScope::Machine,

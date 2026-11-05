@@ -44,10 +44,7 @@ impl Cmd {
             .checked_add(self.timeout)
             .ok_or_else(|| eyre::eyre!("restart timeout is too large"))?;
 
-        if matches!(
-            data.status,
-            MachineStatus::Running { .. } | MachineStatus::Stopping { .. }
-        ) {
+        if data.status.is_active() || data.run_id.is_some() {
             if self.force {
                 spinner.step("Killing", &name);
             } else {

@@ -744,9 +744,16 @@ a VM. Unknown VM/GIC admission remains unknown, and neither API access nor optio
 HVF symbol presence grants public live availability. In Phase 9, native pause is
 true on recognized implemented lanes; native capture, restore, fork and incremental
 remain not implemented. Primitive support is not lane qualification: unrun KVM
-arm64 and HVF lanes remain pending. Public operations remain `not-delivered`, and
-the shipped qualification set is empty. Host and effective-profile admission
-requirements are unchanged.
+arm64 and HVF lanes remain pending. At that stage public operations remain
+`not-delivered`, and the shipped qualification set is empty. Host and
+effective-profile admission requirements are unchanged.
+
+Phase 13 delivers public pause/resume with a supervisor-verified Linux KVM
+x86_64 qualification record. Other lanes remain unqualified. Capture, restore,
+fork and incremental remain `not-delivered` until their delivery stages pass.
+The real guest gate covers native pause, ClockOnly acknowledgement, exact thaw,
+retained sessions, durable manager reconciliation and stop without resume.
+
 The native query's lane is authoritative, including build-feature and unknown
 inventory exclusions. Because the current public schema requires an explicit
 krun lane, native `Unsupported` produces a typed discovery refusal rather than a

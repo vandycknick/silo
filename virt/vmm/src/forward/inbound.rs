@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 use crate::forward::host_socket::{HostStream, OwnedHostListener};
 use crate::forward::{ForwardEntry, GuestHalfAvailability};
+use crate::live::gate::{GateKind, GatePermit, LiveGate};
 use crate::virt::VirtualMachine;
 
 const MAX_PARKED_PER_FORWARD: usize = 64;
@@ -24,6 +25,7 @@ pub(crate) async fn serve(
     listener: OwnedHostListener,
     entry: Arc<ForwardEntry>,
     machine: VirtualMachine,
+    gate: Arc<LiveGate>,
     park_timeout: Duration,
 ) {
     let mut availability = entry.availability.subscribe();
@@ -35,7 +37,7 @@ pub(crate) async fn serve(
         tokio::select! {
             _ = entry.shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
-                Ok(stream) => admit(stream, &entry, &machine, &availability, &mut parked, &mut connections, park_timeout).await,
+                Ok(stream) => admit(stream, &entry, &machine, &gate, &availability, &mut parked, &mut connections, park_timeout).await,
                 Err(error) => tracing::warn!(forward = %entry.name, %error, "forward accept failed"),
             },
             changed = availability.changed() => {
@@ -50,12 +52,14 @@ pub(crate) async fn serve(
                                 let _ = parked_connection.stream.shutdown().await;
                                 continue;
                             }
-                            spawn_connection(
+                            dispatch(
                                 parked_connection.stream,
-                                entry.clone(),
-                                machine.clone(),
+                                &entry,
+                                &machine,
+                                &gate,
                                 &mut connections,
-                            );
+                            )
+                            .await;
                         }
                     }
                     GuestHalfAvailability::Unsupported => {
@@ -85,10 +89,12 @@ pub(crate) async fn serve(
     while connections.join_next().await.is_some() {}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn admit(
     mut stream: HostStream,
     entry: &Arc<ForwardEntry>,
     machine: &VirtualMachine,
+    gate: &Arc<LiveGate>,
     availability: &tokio::sync::watch::Receiver<GuestHalfAvailability>,
     parked: &mut VecDeque<Parked>,
     connections: &mut JoinSet<()>,
@@ -97,9 +103,20 @@ async fn admit(
     let current = availability.borrow().clone();
     match current {
         GuestHalfAvailability::Available(_) => {
-            spawn_connection(stream, entry.clone(), machine.clone(), connections)
+            dispatch(stream, entry, machine, gate, connections).await
         }
         GuestHalfAvailability::Unknown if parked.len() < MAX_PARKED_PER_FORWARD => {
+            // Admission must happen when the host connection arrives, not
+            // retroactively when the guest half becomes available.
+            let _admission = match gate.try_admit(GateKind::ForwardConnection) {
+                Ok(permit) => permit,
+                Err(refusal) => {
+                    entry.refuse();
+                    tracing::debug!(forward = %entry.name, %refusal, "forward connection refused");
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+            };
             parked.push_back(Parked {
                 stream,
                 deadline: Instant::now() + park_timeout,
@@ -112,14 +129,30 @@ async fn admit(
     }
 }
 
-fn spawn_connection(
-    stream: HostStream,
-    entry: Arc<ForwardEntry>,
-    machine: VirtualMachine,
+/// Start guest-side setup for one host connection. Setup (vsock connect and
+/// the agent CONNECT exchange) is admitted through the live fence before any
+/// guest contact; the permit ends once the relay is established, so a pause
+/// drains in-flight setup without waiting for established streams.
+async fn dispatch(
+    mut stream: HostStream,
+    entry: &Arc<ForwardEntry>,
+    machine: &VirtualMachine,
+    gate: &Arc<LiveGate>,
     connections: &mut JoinSet<()>,
 ) {
+    let setup = match gate.try_admit(GateKind::ForwardConnection) {
+        Ok(setup) => setup,
+        Err(refusal) => {
+            entry.refuse();
+            tracing::debug!(forward = %entry.name, %refusal, "forward connection refused");
+            let _ = stream.shutdown().await;
+            return;
+        }
+    };
+    let entry = entry.clone();
+    let machine = machine.clone();
     connections.spawn(async move {
-        if let Err(error) = handle_connection(stream, entry.clone(), machine).await {
+        if let Err(error) = handle_connection(stream, entry.clone(), machine, setup).await {
             entry.refuse();
             tracing::debug!(forward = %entry.name, target = %entry.spec.connect, %error, "forward connection refused");
         }
@@ -130,6 +163,7 @@ async fn handle_connection(
     mut client: HostStream,
     entry: Arc<ForwardEntry>,
     machine: VirtualMachine,
+    setup: GatePermit,
 ) -> eyre::Result<()> {
     let lifetime = entry
         .connection_lifetime()
@@ -161,6 +195,7 @@ async fn handle_connection(
         }
         }) => result.map_err(|_| eyre::eyre!("forward setup timed out"))??,
     };
+    drop(setup);
     let _connection = entry.connection_opened();
     crate::vsock::relay::relay(&mut client, &mut guest, lifetime)
         .await
@@ -171,11 +206,120 @@ async fn handle_connection(
 mod tests {
     use std::time::Duration;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use crate::live::gate::LiveGate;
+    use crate::virt::{BackendKind, VirtualMachine, VmConfig};
+
+    async fn echoed(client: &mut TcpStream, payload: &[u8]) -> Vec<u8> {
+        client.write_all(payload).await.unwrap();
+        let mut received = vec![0; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut received))
+            .await
+            .expect("echo before deadline")
+            .unwrap();
+        received
+    }
+
+    /// A refused connection is closed without ever reaching the guest echo.
+    async fn assert_refused(address: std::net::SocketAddr) {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let _ = client.write_all(b"x").await;
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut byte))
+            .await
+            .expect("refusal before deadline");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "fenced connection reached the guest: {read:?}"
+        );
+    }
+
     #[test]
     fn park_timeout_default_is_thirty_seconds() {
         assert_eq!(
             crate::forward::inbound::PARK_TIMEOUT,
             Duration::from_secs(30)
         );
+    }
+
+    #[tokio::test]
+    async fn live_fence_refuses_new_forward_connections_and_keeps_established_streams() {
+        let root =
+            std::path::Path::new("/tmp").join(format!("fl-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&root).unwrap();
+        let config = VmConfig::builder("forward-fence")
+            .base_directory(&root)
+            .kernel(std::path::Path::new("/mock-kernel"))
+            .build();
+        let machine = VirtualMachine::with_backend(BackendKind::Mock, config).unwrap();
+        machine.start().await.unwrap();
+        let gate = LiveGate::new();
+        // Inbound vsock forward onto the mock guest's byte echo port.
+        let forward = forward_spec::Forward::new(
+            forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+                "127.0.0.1:0".parse().unwrap(),
+            )),
+            forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+        );
+        let table = crate::forward::ForwardTable::prepare_machine(
+            &[forward],
+            &root,
+            None,
+            crate::forward::inbound::PARK_TIMEOUT,
+            gate.clone(),
+        )
+        .await
+        .unwrap();
+        table.activate(machine.clone());
+        let entry = table.entries().remove(0);
+        let Some(forward_spec::Endpoint::Host(forward_spec::Address::Tcp(address))) =
+            entry.snapshot().bound
+        else {
+            panic!("inbound forward must report its bound TCP listener");
+        };
+
+        let mut established = TcpStream::connect(address).await.unwrap();
+        assert_eq!(echoed(&mut established, b"before").await, b"before");
+        assert_eq!(entry.snapshot().active_connections, 1);
+
+        // The setup permit ends once the relay is up: an established stream
+        // never delays the drain and keeps relaying while fenced.
+        assert!(gate.close());
+        gate.drain(tokio::time::Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(echoed(&mut established, b"during").await, b"during");
+
+        // New connection setup is refused before any guest contact.
+        assert_refused(address).await;
+        let snapshot = entry.snapshot();
+        assert_eq!(snapshot.refused_connections, 1);
+        assert_eq!(snapshot.active_connections, 1);
+
+        // Unavailable guest transport must not park arrivals across a fence.
+        let available = entry
+            .availability
+            .send_replace(crate::forward::GuestHalfAvailability::Unknown);
+        assert_refused(address).await;
+        assert_eq!(entry.snapshot().refused_connections, 2);
+        entry.availability.send_replace(available);
+
+        assert!(gate.reopen());
+        let mut reopened = TcpStream::connect(address).await.unwrap();
+        assert_eq!(echoed(&mut reopened, b"after").await, b"after");
+        assert_eq!(echoed(&mut established, b"still").await, b"still");
+
+        // Stop seals the fence for good.
+        gate.seal();
+        assert_refused(address).await;
+        assert_eq!(entry.snapshot().refused_connections, 3);
+        assert_eq!(echoed(&mut established, b"final").await, b"final");
+
+        drop((established, reopened));
+        table.shutdown().await.unwrap();
+        machine.stop().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

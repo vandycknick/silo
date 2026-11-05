@@ -3,6 +3,7 @@ mod catalog_guard;
 mod config_store;
 mod image_store;
 pub(crate) mod layer_store;
+pub(crate) mod live_store;
 pub(crate) mod machine_store;
 #[cfg(test)]
 mod mock_store;

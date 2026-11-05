@@ -169,6 +169,7 @@ async fn run_surface(
         mux_listener,
         mux_owner_uid,
         machine.clone(),
+        forwards.live_gate().clone(),
         shutdown.clone(),
     ));
     for (port, path, listener) in listeners {
@@ -245,6 +246,14 @@ async fn reconcile_runtime(
     tasks: &mut JoinSet<()>,
     shutdown: &CancellationToken,
 ) -> bool {
+    // Listener registrations wait while live fences are closed; the periodic
+    // scan retries them after the machine is Running again.
+    let Ok(_admitted) = forwards
+        .live_gate()
+        .try_admit(crate::live::gate::GateKind::VsockRegistration)
+    else {
+        return true;
+    };
     let _registration = forwards.lock_registrations().await;
     let forward_ports = forwards.registered_ports();
     let discovered = match discovery::scan(runtime_dir, mux_filename) {
@@ -489,6 +498,7 @@ mod tests {
             &runtime_dir,
             None,
             crate::forward::inbound::PARK_TIMEOUT,
+            crate::live::gate::LiveGate::new(),
         )
         .await
         .expect("prepare empty forward table");

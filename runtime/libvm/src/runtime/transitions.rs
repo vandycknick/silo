@@ -108,7 +108,7 @@ fn start_requested(
     run_id: String,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    if is_active(state.status) {
+    if is_active(state.status) || state.vmm_pid.is_some() {
         return Err(TransitionError::AlreadyActive);
     }
 
@@ -152,10 +152,10 @@ fn monitor_observed(
     now: i64,
 ) -> Result<MachineState, TransitionError> {
     let status = match state.status {
-        MachineRuntimeState::Starting => MachineRuntimeState::Starting,
-        MachineRuntimeState::Stopping => MachineRuntimeState::Stopping,
-        _ => MachineRuntimeState::Running,
+        MachineRuntimeState::Stopped => MachineRuntimeState::Running,
+        status => status,
     };
+    let last_error = state.last_error.clone();
 
     Ok(replace_runtime(
         state,
@@ -163,7 +163,7 @@ fn monitor_observed(
         Some(pid),
         started_at,
         run_id,
-        None,
+        last_error,
         now,
     ))
 }
@@ -192,10 +192,9 @@ fn stop_requested(
     run_id: Option<String>,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    if matches!(
-        state.status,
-        MachineRuntimeState::Stopped | MachineRuntimeState::Error
-    ) {
+    if state.status == MachineRuntimeState::Stopped
+        || (state.status == MachineRuntimeState::Error && state.vmm_pid.is_none())
+    {
         return Err(TransitionError::NotRunning);
     }
     require_generation(&state, pid, started_at, run_id.as_deref())?;
@@ -342,17 +341,14 @@ fn replace_runtime(
 }
 
 fn is_active(status: MachineRuntimeState) -> bool {
-    matches!(
-        status,
-        MachineRuntimeState::Starting
-            | MachineRuntimeState::Running
-            | MachineRuntimeState::Stopping
-    )
+    status.is_live()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reduce, Event, StartFailure, TransitionError, START_TIMEOUT_ERROR};
+    use crate::runtime::transitions::{
+        reduce, Event, StartFailure, TransitionError, START_TIMEOUT_ERROR,
+    };
     use crate::store::models::{MachineId, MachineRuntimeState, MachineState};
 
     const NOW: i64 = 100;
@@ -673,5 +669,70 @@ mod tests {
         assert_eq!(next.status, MachineRuntimeState::Error);
         assert_eq!(next.run_id, None);
         assert_eq!(next.last_error.as_deref(), Some(START_TIMEOUT_ERROR));
+    }
+
+    #[test]
+    fn pause_reconnect_preserves_every_live_state_and_error_then_stops_without_resume() {
+        for status in [
+            MachineRuntimeState::Pausing,
+            MachineRuntimeState::Paused,
+            MachineRuntimeState::Capturing,
+            MachineRuntimeState::Restoring,
+            MachineRuntimeState::Activating,
+            MachineRuntimeState::ActivationFailed,
+            MachineRuntimeState::Error,
+        ] {
+            let mut original = running();
+            original.status = status;
+            original.last_error = Some("retained lifecycle failure".into());
+            let observed = reduce(
+                original.clone(),
+                Event::MonitorObserved {
+                    pid: 123,
+                    started_at: Some(42),
+                    run_id: Some("run-1".into()),
+                },
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(observed.status, status);
+            assert_eq!(observed.last_error, original.last_error);
+            assert_eq!(observed.run_id, original.run_id);
+            assert_eq!(
+                reduce(
+                    observed.clone(),
+                    Event::StartRequested {
+                        run_id: "replacement".into()
+                    },
+                    NOW
+                ),
+                Err(TransitionError::AlreadyActive)
+            );
+            let stopping = reduce(
+                observed,
+                Event::StopRequested {
+                    pid: 123,
+                    started_at: Some(42),
+                    run_id: Some("run-1".into()),
+                },
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(stopping.status, MachineRuntimeState::Stopping);
+            assert_eq!(stopping.run_id.as_deref(), Some("run-1"));
+            let terminal = reduce(
+                stopping,
+                Event::StopCompleted {
+                    pid: 123,
+                    started_at: Some(42),
+                    run_id: Some("run-1".into()),
+                    last_error: None,
+                },
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(terminal.status, MachineRuntimeState::Stopped);
+            assert_eq!(terminal.vmm_pid, None);
+        }
     }
 }

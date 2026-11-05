@@ -211,6 +211,20 @@ impl ControlState {
         }
     }
 
+    pub(super) async fn observe_machine_live(
+        &self,
+        reference: &libvm::MachineRef,
+    ) -> Result<libvm::MachineLiveObservation, Status> {
+        match self.runtime.get() {
+            Some(runtime) => runtime.observe_live(reference).await.map_err(native),
+            None => libvm::LiveObservationReader::open(&self.config)
+                .map_err(native)?
+                .observe(reference)
+                .await
+                .map_err(native),
+        }
+    }
+
     pub(super) async fn require_machine_live(
         &self,
         reference: &libvm::MachineRef,

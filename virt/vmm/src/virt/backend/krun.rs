@@ -4,11 +4,15 @@ mod mux;
 mod owner;
 
 use crate::krun::Mount as KrunMount;
+use crate::virt::backend::lifecycle::LifecycleClient;
 use crate::virt::backend::{HostMemoryReclaimReport, StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
 use crate::virt::config::{validate_common, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::exit::StartupStage;
+use crate::virt::lifecycle::{
+    LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse,
+};
 use crate::virt::stream::{
     KrunVsockSession, PendingUnixVsock, SerialDevice, VsockListener, VsockStream,
 };
@@ -48,6 +52,8 @@ pub(crate) struct KrunBackend {
     attachments: Arc<Mutex<Option<crate::virt::backend::storage::PreparedAttachments>>>,
     storage_finalization: watch::Sender<Option<crate::virt::backend::StorageFinalization>>,
     storage_finalization_started: std::sync::atomic::AtomicBool,
+    /// The run's lifecycle client, present from worker spawn onward.
+    lifecycle: Arc<Mutex<Option<LifecycleClient>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -237,7 +243,15 @@ impl KrunBackend {
             attachments: Arc::new(Mutex::new(None)),
             storage_finalization: watch::Sender::new(None),
             storage_finalization_started: std::sync::atomic::AtomicBool::new(false),
+            lifecycle: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn lifecycle_client(&self) -> Option<LifecycleClient> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     async fn completion(&self) -> Result<VmExit, VirtError> {
@@ -284,6 +298,7 @@ impl VirtBackend for KrunBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        let lifecycle = self.lifecycle.clone();
         let owner = owner::Owner {
             state: self.state.clone(),
             stop: self.stop.clone(),
@@ -308,11 +323,25 @@ impl VirtBackend for KrunBackend {
                 let console = console.ok_or_else(|| {
                     VirtError::Backend("krun console already consumed".to_string())
                 })?;
+                let binding = crate::virt::backend::lifecycle::launch_binding(&config)
+                    .ok_or_else(|| VirtError::Backend("missing storage launch".to_string()))??;
+                let (parent_lifecycle, child_lifecycle) =
+                    crate::virt::backend::lifecycle::lifecycle_pair()?;
+                let (client, lifecycle_faults) = LifecycleClient::start(parent_lifecycle, binding)?;
+                *lifecycle.lock().unwrap_or_else(PoisonError::into_inner) = Some(client);
                 let (mux, task, child_mux) =
                     mux::KrunVsockMux::pair(registry.clone(), session.clone(), &[])?;
                 *running_mux.lock().await = Some(mux.clone());
                 let exit = owner
-                    .run(launch, console, child_mux, handles, &config)
+                    .run(
+                        launch,
+                        console,
+                        child_mux,
+                        handles,
+                        child_lifecycle,
+                        lifecycle_faults,
+                        &config,
+                    )
                     .await;
                 session.shutdown();
                 registry.fence_session(&session);
@@ -354,6 +383,11 @@ impl VirtBackend for KrunBackend {
 
     async fn stop(&self) -> Result<(), VirtError> {
         self.stop.cancel();
+        // Stop never resumes: it only closes lifecycle admission; the owner
+        // terminates the worker and the endpoint reports the loss.
+        if let Some(client) = self.lifecycle_client() {
+            client.close_admission();
+        }
         if self.attempt.reserve() {
             self.session.shutdown();
             self.vsock_registry.fence_session(&self.session);
@@ -461,6 +495,20 @@ impl VirtBackend for KrunBackend {
         &self,
     ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
         Some(self.host_memory_reclaim.subscribe())
+    }
+
+    async fn lifecycle(
+        &self,
+        request: LifecycleRequest,
+    ) -> Result<LifecycleResponse, LifecycleError> {
+        request.validate().map_err(LifecycleError::Rejected)?;
+        match self.lifecycle_client() {
+            Some(client) => client.lifecycle(request).await,
+            None if self.stop.is_cancelled() => {
+                Err(LifecycleError::Rejected(LifecycleRejection::Stopping))
+            }
+            None => Err(LifecycleError::Rejected(LifecycleRejection::NotReady)),
+        }
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {

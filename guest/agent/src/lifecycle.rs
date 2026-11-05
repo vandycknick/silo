@@ -268,6 +268,7 @@ impl RuntimeContext {
             ) {
                 report.state = Some(v1::AgentStatusState::Starting as i32);
                 report.code = Some("WORKLOAD_NOT_READY".into());
+                report.message = Some("workload lifecycle is not ready".into());
             }
             report.lifecycle = Some(lifecycle);
         }
@@ -324,9 +325,16 @@ impl Lifecycle {
         forwards: crate::forward::listen::GuestForwardServiceImpl,
         status: watch::Sender<v1::AgentStatus>,
     ) -> Arc<Self> {
+        let generation_driver_ready = crate::generation::driver_ready();
+        let clock_profile = crate::clock_profile::observe(&runtime.expected().boot_id);
         runtime.lifecycle.send_modify(|status| {
             status.unsupported_reason = controller.unsupported_reason();
             status.workload_roots = controller.roots();
+            status.generation_driver_ready = Some(generation_driver_ready);
+            match clock_profile {
+                Ok(profile) => status.clock_profile = Some(profile),
+                Err(error) => status.clock_profile_unavailable_reason = Some(error.to_string()),
+            }
         });
         Arc::new(Self {
             runtime,
@@ -540,7 +548,20 @@ impl Lifecycle {
         }
         .await;
         match result {
-            Ok(()) => self.publish(State::Frozen, reference, true, None, None),
+            Ok(()) => {
+                let profile = crate::clock_profile::observe(&self.runtime.expected().boot_id);
+                self.runtime.lifecycle.send_modify(|status| match profile {
+                    Ok(profile) => {
+                        status.clock_profile = Some(profile);
+                        status.clock_profile_unavailable_reason = None;
+                    }
+                    Err(error) => {
+                        status.clock_profile = None;
+                        status.clock_profile_unavailable_reason = Some(error.to_string());
+                    }
+                });
+                self.publish(State::Frozen, reference, true, None, None);
+            }
             Err(error) => {
                 let observed = self.controller.is_frozen().unwrap_or(false);
                 let rollback_deadline = tokio::time::Instant::now() + Duration::from_secs(5);

@@ -5,9 +5,17 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-/// Fixed roles, one generation lease, and at most sixteen Raw attachments.
-const MAX_CHILD_FDS: usize = 22;
-const LAST_CHILD_FD: i32 = 24;
+/// Fixed roles, one generation lease, at most sixteen Raw attachments and the
+/// lifecycle endpoint. Standalone-only roles 25..=31 are never installed here.
+const MAX_CHILD_FDS: usize = 23;
+const LAST_FIXED_CHILD_FD: i32 = 24;
+/// The worker's lifecycle role. Kept literal so this policy compiles standalone
+/// in the real-executable tests; the owner asserts it equals the worker table.
+pub(crate) const LIFECYCLE_CHILD_FD: i32 = 32;
+
+fn child_target(target: i32) -> bool {
+    (3..=LAST_FIXED_CHILD_FD).contains(&target) || target == LIFECYCLE_CHILD_FD
+}
 
 /// Install an exact, bounded child-only descriptor map. Source copies are parked
 /// above every target before any target is overwritten, including mapping cycles.
@@ -18,7 +26,7 @@ pub(crate) fn install(command: &mut Command, descriptors: &[(i32, i32)]) -> io::
     let mut mappings = [(-1, -1); MAX_CHILD_FDS];
     for (index, &(source, target)) in descriptors.iter().enumerate() {
         if source < 3
-            || !(3..=LAST_CHILD_FD).contains(&target)
+            || !child_target(target)
             || descriptors[..index]
                 .iter()
                 .any(|&(_, prior)| prior == target)
@@ -36,7 +44,7 @@ pub(crate) fn install(command: &mut Command, descriptors: &[(i32, i32)]) -> io::
             let mut parked = [-1; MAX_CHILD_FDS];
             for index in 0..count {
                 let source = std::os::fd::BorrowedFd::borrow_raw(mappings[index].0);
-                parked[index] = fcntl(source, FcntlArg::F_DUPFD_CLOEXEC(LAST_CHILD_FD + 1))
+                parked[index] = fcntl(source, FcntlArg::F_DUPFD_CLOEXEC(LIFECYCLE_CHILD_FD + 1))
                     .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
             }
             // nix's owned dup2 wrapper would close these intentionally inherited

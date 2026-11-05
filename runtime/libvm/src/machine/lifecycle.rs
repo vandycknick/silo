@@ -404,10 +404,9 @@ impl Machine {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             require_current_run(&config, &status, expected_run_id)?;
-            if matches!(
-                status.state,
-                MachineRuntimeState::Stopped | MachineRuntimeState::Error
-            ) {
+            if status.state == MachineRuntimeState::Stopped
+                || (status.state == MachineRuntimeState::Error && status.pid.is_none())
+            {
                 runtime.cleanup_machine_resources_locked(&config).await?;
                 return runtime.machine_inspect_data(config).await;
             }
@@ -609,10 +608,7 @@ impl Machine {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             require_current_run(&config, &status, expected_run_id)?;
-            if matches!(
-                status.state,
-                MachineRuntimeState::Stopped | MachineRuntimeState::Error
-            ) {
+            if !status.is_active() {
                 return Err(LibVmError::MachineNotRunning {
                     reference: config.name.clone(),
                 });
@@ -941,12 +937,7 @@ impl Machine {
         // exiting. Preserve the persisted process identity long enough to wait for that final
         // shutdown work instead of reconciling the missing pidfile as an already-stopped run.
         let persisted = runtime.machine_state(config.id).await?;
-        if matches!(
-            persisted.status,
-            MachineRuntimeState::Starting
-                | MachineRuntimeState::Running
-                | MachineRuntimeState::Stopping
-        ) {
+        if persisted.status.is_live() || persisted.vmm_pid.is_some() {
             if let Some(pid) = persisted.vmm_pid {
                 let generation = VmmRunIdentity {
                     pid,

@@ -190,6 +190,7 @@ pub struct MachineMonitorStatus {
     pub readiness: MachineReadinessState,
     pub agent: MachineAgentStatus,
     pub live: vm_spec::live::LiveMachineReport,
+    pub lifecycle: vm_spec::lifecycle::LiveLifecycle,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMonitorSnapshot {
@@ -211,6 +212,13 @@ pub enum MachineVmState {
     Stopping,
     Stopped,
     Failed,
+    Pausing,
+    Paused,
+    Capturing,
+    Restoring,
+    Activating,
+    ActivationFailed,
+    Error,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineReadinessState {
@@ -223,6 +231,13 @@ pub enum MachineReadinessReason {
     VmStopping,
     VmStopped,
     VmFailed,
+    VmPausing,
+    VmPaused,
+    VmCapturing,
+    VmRestoring,
+    VmActivating,
+    VmActivationFailed,
+    VmError,
     AgentNotRequired,
     AgentUnavailable,
     AgentStatusStale,
@@ -667,7 +682,7 @@ impl Machine {
         self.runtime().machine_inspect_data(config).await
     }
     pub async fn monitor_status(&self) -> Result<MachineMonitorStatus, LibVmError> {
-        let config = self.running_config().await?;
+        let config = self.live_config().await?;
         self.runtime()
             .supervisor()
             .client(self.machine_id())
@@ -677,7 +692,7 @@ impl Machine {
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn wait_ready(&self, timeout: Duration) -> Result<MachineReadiness, LibVmError> {
-        let config = self.running_config().await?;
+        let config = self.live_config().await?;
         self.runtime()
             .supervisor()
             .client(self.machine_id())
@@ -687,7 +702,7 @@ impl Machine {
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn metrics(&self) -> Result<MachineMetrics, LibVmError> {
-        let config = self.running_config().await?;
+        let config = self.live_config().await?;
         self.runtime()
             .supervisor()
             .client(self.machine_id())
@@ -873,6 +888,23 @@ impl Machine {
             .await
             .map_err(|message| monitor_error(config.name, message))
     }
+    async fn live_config(&self) -> Result<MachineConfig, LibVmError> {
+        let runtime = self.runtime();
+        let config = runtime
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        if !runtime
+            .reconcile_machine_runtime_best_effort(&config)
+            .await?
+            .is_active()
+        {
+            return Err(LibVmError::MachineNotRunning {
+                reference: config.name,
+            });
+        }
+        Ok(config)
+    }
+
     pub(crate) async fn running_config(&self) -> Result<MachineConfig, LibVmError> {
         let runtime = self.runtime();
         let config = runtime
@@ -1138,8 +1170,8 @@ where
     T::try_from(value).map_err(|_| format!("silo-vmm response has unknown {field} value {value}"))
 }
 macro_rules! protocol_enum { ($name:ident, $wire:ident => $public:ident, { $($source:ident => $target:ident),+ $(,)? }) => { fn $name(value: i32, field: &str) -> Result<$public, String> { match enum_value::<v1::$wire>(value, field)? { $(v1::$wire::$source => Ok($public::$target),)+ v1::$wire::Unspecified => Err(format!("silo-vmm response has unspecified {field}")), } } }; }
-protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed });
-protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady });
+protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed, Pausing => Pausing, Paused => Paused, Capturing => Capturing, Restoring => Restoring, Activating => Activating, ActivationFailed => ActivationFailed, Error => Error });
+protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady, VmPausing => VmPausing, VmPaused => VmPaused, VmCapturing => VmCapturing, VmRestoring => VmRestoring, VmActivating => VmActivating, VmActivationFailed => VmActivationFailed, VmError => VmError });
 protocol_enum!(connection_state, AgentConnectionState => MachineAgentConnectionState, { Connecting => Connecting, Responsive => Responsive, Unresponsive => Unresponsive });
 protocol_enum!(freshness, Freshness => MachineFreshness, { Fresh => Fresh, Stale => Stale });
 protocol_enum!(stale_reason, StaleReason => MachineStaleReason, { ReceiptAge => ReceiptAge, MonitorStopping => MonitorStopping });
@@ -1154,6 +1186,20 @@ impl TryFrom<v1::HostStatus> for MachineMonitorStatus {
     fn try_from(value: v1::HostStatus) -> Result<Self, Self::Error> {
         let live =
             crate::machine::live::report_from_status(&value).map_err(|error| error.to_string())?;
+        let vm = required(value.vm, "vm")?;
+        let lifecycle: vm_spec::lifecycle::LiveLifecycle =
+            required(value.lifecycle, "lifecycle")?.try_into()?;
+        let state = protocol::lifecycle::vm_state_from_wire(vm.state)?;
+        lifecycle.validate_for(state)?;
+        if !state.readiness_eligible()
+            && value
+                .readiness
+                .as_ref()
+                .and_then(|readiness| readiness.ready)
+                == Some(true)
+        {
+            return Err("monitor reports readiness outside Running".into());
+        }
         Ok(Self {
             machine_id: canonical_uuid(value.machine_id, "machine_id")?,
             run_id: value
@@ -1166,10 +1212,11 @@ impl TryFrom<v1::HostStatus> for MachineMonitorStatus {
                 .transpose()?,
             name: required_text(value.name, "name", protocol::MAX_INFO_BYTES)?,
             monitor: required(value.monitor, "monitor")?.try_into()?,
-            vm: required(value.vm, "vm")?.try_into()?,
+            vm: vm.try_into()?,
             readiness: required(value.readiness, "readiness")?.try_into()?,
             agent: required(value.agent, "agent")?.try_into()?,
             live,
+            lifecycle,
         })
     }
 }
@@ -2107,6 +2154,7 @@ mod tests {
                 .unwrap(),
             ),
             run_id: Some("00000000-0000-4000-8000-000000000003".into()),
+            lifecycle: Some(Default::default()),
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
             monitor: Some(v1::MonitorSnapshot {
