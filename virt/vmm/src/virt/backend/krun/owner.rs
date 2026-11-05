@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::krun::worker::wire::{self, Event, MAX_EVENT};
 use crate::krun::worker::WORKER_NAME;
 use crate::virt::backend::krun::{host_memory_reclaim_report, inherit};
+use crate::virt::backend::lifecycle::LifecycleFault;
 use crate::virt::backend::HostMemoryReclaimReport;
 use crate::virt::exit::{Diagnostic, ForceReason, ProcessExit, StartupStage, VmExit, VmOutcome};
 
@@ -28,6 +29,8 @@ const FORCE_OBSERVATION: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
 const WORKER_EXECUTABLE: &str = "/proc/self/exe";
+// The child-side mapper and the worker's adoption table name one role.
+const _: () = assert!(inherit::LIFECYCLE_CHILD_FD == crate::krun::worker::fds::LIFECYCLE_FD);
 
 /// Published lifecycle of one worker generation. `Reaped` means the child is
 /// gone but the owner is still draining channels; `Exited` is terminal.
@@ -73,15 +76,18 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Spawn `krun` with fixed roles 3..6, optional mux 7, the generation lease
-/// at 8, and the complete checked Raw backing table at 9+.
+/// at 8, the complete checked Raw backing table at 9+ and the lifecycle
+/// endpoint at 32. The parent's copy of the child endpoint closes here.
 fn spawn(
     console: OwnedFd,
     mux: OwnedFd,
     lease: &OwnedFd,
     raw_handles: &[OwnedFd],
+    lifecycle: OwnedFd,
 ) -> io::Result<Spawned> {
     let console = inherit::normalize(console)?;
     let mux = inherit::normalize(mux)?;
+    let lifecycle = inherit::normalize(lifecycle)?;
     let (config, send) = pipe()?;
     let (receive, events) = pipe()?;
     let (diagnostics, output) = pipe()?;
@@ -107,19 +113,23 @@ fn spawn(
             "Raw descriptor table exceeds the total disk bound",
         ));
     }
-    let mut mapping = [(0, 0); 22];
-    mapping[..6].copy_from_slice(&[
+    let mut mapping = [(0, 0); 23];
+    mapping[..7].copy_from_slice(&[
         (config.as_raw_fd(), 3),
         (events.as_raw_fd(), 4),
         (watchdog.as_raw_fd(), 5),
         (console.as_raw_fd(), 6),
         (mux.as_raw_fd(), 7),
         (lease.as_raw_fd(), 8),
+        (
+            lifecycle.as_raw_fd(),
+            crate::krun::worker::fds::LIFECYCLE_FD,
+        ),
     ]);
     for (index, fd) in raw_handles.iter().enumerate() {
-        mapping[6 + index] = (fd.as_raw_fd(), 9 + index as i32);
+        mapping[7 + index] = (fd.as_raw_fd(), 9 + index as i32);
     }
-    inherit::install(command.as_std_mut(), &mapping[..6 + raw_handles.len()])?;
+    inherit::install(command.as_std_mut(), &mapping[..7 + raw_handles.len()])?;
     let child = command.spawn()?;
     Ok(Spawned {
         child,
@@ -199,12 +209,15 @@ fn force(
 }
 
 impl Owner {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run(
         &self,
         config: crate::krun::KrunConfig,
         console: OwnedFd,
         mux: OwnedFd,
         raw_handles: Vec<OwnedFd>,
+        lifecycle: OwnedFd,
+        mut lifecycle_faults: mpsc::Receiver<LifecycleFault>,
         vm_config: &crate::virt::config::VmConfig,
     ) -> VmExit {
         if self.stop.is_cancelled() || self.force.is_cancelled() {
@@ -226,7 +239,7 @@ impl Owner {
             mut events,
             diagnostics,
             _keepalive,
-        } = match spawn(console, mux, &launch.lease, &raw_handles) {
+        } = match spawn(console, mux, &launch.lease, &raw_handles, lifecycle) {
             Ok(spawned) => spawned,
             Err(error) => {
                 return VmExit::failed(StartupStage::Spawned, format!("spawn krun worker: {error}"))
@@ -284,6 +297,10 @@ impl Owner {
         let mut shutdown_requested = false;
         let startup_deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         let mut stop_deadline = startup_deadline;
+        let mut lifecycle_open = true;
+        // EOF races the reaper at normal exit; a live worker without its
+        // lifecycle endpoint is a protocol failure after this grace.
+        let mut lifecycle_closed: Option<tokio::time::Instant> = None;
         let status = loop {
             tokio::select! {
                 biased;
@@ -348,6 +365,28 @@ impl Owner {
                         if let Err(error) = force(&mut child, reason, &mut forced) { tracing::warn!(%error, "failed to terminate failed worker"); }
                         stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
                     }
+                }
+                fault = lifecycle_faults.recv(), if lifecycle_open => {
+                    lifecycle_open = false;
+                    match fault {
+                        Some(LifecycleFault::Protocol(message)) if !stopping => {
+                            failure.get_or_insert(format!("worker lifecycle protocol failure: {message}"));
+                            stopping = true;
+                            if let Err(error) = force(&mut child, ForceReason::ProtocolFailure, &mut forced) { tracing::warn!(%error, "failed to terminate worker after lifecycle failure"); }
+                            stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
+                        }
+                        Some(LifecycleFault::Protocol(_)) => {}
+                        Some(LifecycleFault::Closed) | None => {
+                            lifecycle_closed = Some(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(lifecycle_closed.unwrap_or(stop_deadline)), if lifecycle_closed.is_some() && !stopping => {
+                    lifecycle_closed = None;
+                    failure.get_or_insert_with(|| "worker closed its lifecycle endpoint while alive".to_string());
+                    stopping = true;
+                    if let Err(error) = force(&mut child, ForceReason::ProtocolFailure, &mut forced) { tracing::warn!(%error, "failed to terminate worker after lifecycle loss"); }
+                    stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
                 }
                 result = &mut transmission, if !transmitted => {
                     transmitted = true;

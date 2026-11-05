@@ -1873,31 +1873,52 @@ func (EnrollmentMode) EnumDescriptor() ([]byte, []int) {
 type VmState int32
 
 const (
-	VmState_VM_STATE_UNSPECIFIED VmState = 0
-	VmState_VM_STATE_STARTING    VmState = 1
-	VmState_VM_STATE_RUNNING     VmState = 2
-	VmState_VM_STATE_STOPPING    VmState = 3
-	VmState_VM_STATE_STOPPED     VmState = 4
-	VmState_VM_STATE_FAILED      VmState = 5
+	VmState_VM_STATE_UNSPECIFIED       VmState = 0
+	VmState_VM_STATE_STARTING          VmState = 1
+	VmState_VM_STATE_RUNNING           VmState = 2
+	VmState_VM_STATE_STOPPING          VmState = 3
+	VmState_VM_STATE_STOPPED           VmState = 4
+	VmState_VM_STATE_FAILED            VmState = 5
+	VmState_VM_STATE_PAUSING           VmState = 6
+	VmState_VM_STATE_PAUSED            VmState = 7
+	VmState_VM_STATE_CAPTURING         VmState = 8
+	VmState_VM_STATE_RESTORING         VmState = 9
+	VmState_VM_STATE_ACTIVATING        VmState = 10
+	VmState_VM_STATE_ACTIVATION_FAILED VmState = 11
+	VmState_VM_STATE_ERROR             VmState = 12
 )
 
 // Enum value maps for VmState.
 var (
 	VmState_name = map[int32]string{
-		0: "VM_STATE_UNSPECIFIED",
-		1: "VM_STATE_STARTING",
-		2: "VM_STATE_RUNNING",
-		3: "VM_STATE_STOPPING",
-		4: "VM_STATE_STOPPED",
-		5: "VM_STATE_FAILED",
+		0:  "VM_STATE_UNSPECIFIED",
+		1:  "VM_STATE_STARTING",
+		2:  "VM_STATE_RUNNING",
+		3:  "VM_STATE_STOPPING",
+		4:  "VM_STATE_STOPPED",
+		5:  "VM_STATE_FAILED",
+		6:  "VM_STATE_PAUSING",
+		7:  "VM_STATE_PAUSED",
+		8:  "VM_STATE_CAPTURING",
+		9:  "VM_STATE_RESTORING",
+		10: "VM_STATE_ACTIVATING",
+		11: "VM_STATE_ACTIVATION_FAILED",
+		12: "VM_STATE_ERROR",
 	}
 	VmState_value = map[string]int32{
-		"VM_STATE_UNSPECIFIED": 0,
-		"VM_STATE_STARTING":    1,
-		"VM_STATE_RUNNING":     2,
-		"VM_STATE_STOPPING":    3,
-		"VM_STATE_STOPPED":     4,
-		"VM_STATE_FAILED":      5,
+		"VM_STATE_UNSPECIFIED":       0,
+		"VM_STATE_STARTING":          1,
+		"VM_STATE_RUNNING":           2,
+		"VM_STATE_STOPPING":          3,
+		"VM_STATE_STOPPED":           4,
+		"VM_STATE_FAILED":            5,
+		"VM_STATE_PAUSING":           6,
+		"VM_STATE_PAUSED":            7,
+		"VM_STATE_CAPTURING":         8,
+		"VM_STATE_RESTORING":         9,
+		"VM_STATE_ACTIVATING":        10,
+		"VM_STATE_ACTIVATION_FAILED": 11,
+		"VM_STATE_ERROR":             12,
 	}
 )
 
@@ -1942,6 +1963,13 @@ const (
 	ReadinessReason_READINESS_REASON_GUEST_STARTING       ReadinessReason = 8
 	ReadinessReason_READINESS_REASON_GUEST_FAILED         ReadinessReason = 9
 	ReadinessReason_READINESS_REASON_GUEST_REPORTED_READY ReadinessReason = 10
+	ReadinessReason_READINESS_REASON_VM_PAUSING           ReadinessReason = 11
+	ReadinessReason_READINESS_REASON_VM_PAUSED            ReadinessReason = 12
+	ReadinessReason_READINESS_REASON_VM_CAPTURING         ReadinessReason = 13
+	ReadinessReason_READINESS_REASON_VM_RESTORING         ReadinessReason = 14
+	ReadinessReason_READINESS_REASON_VM_ACTIVATING        ReadinessReason = 15
+	ReadinessReason_READINESS_REASON_VM_ACTIVATION_FAILED ReadinessReason = 16
+	ReadinessReason_READINESS_REASON_VM_ERROR             ReadinessReason = 17
 )
 
 // Enum value maps for ReadinessReason.
@@ -1958,6 +1986,13 @@ var (
 		8:  "READINESS_REASON_GUEST_STARTING",
 		9:  "READINESS_REASON_GUEST_FAILED",
 		10: "READINESS_REASON_GUEST_REPORTED_READY",
+		11: "READINESS_REASON_VM_PAUSING",
+		12: "READINESS_REASON_VM_PAUSED",
+		13: "READINESS_REASON_VM_CAPTURING",
+		14: "READINESS_REASON_VM_RESTORING",
+		15: "READINESS_REASON_VM_ACTIVATING",
+		16: "READINESS_REASON_VM_ACTIVATION_FAILED",
+		17: "READINESS_REASON_VM_ERROR",
 	}
 	ReadinessReason_value = map[string]int32{
 		"READINESS_REASON_UNSPECIFIED":          0,
@@ -1971,6 +2006,13 @@ var (
 		"READINESS_REASON_GUEST_STARTING":       8,
 		"READINESS_REASON_GUEST_FAILED":         9,
 		"READINESS_REASON_GUEST_REPORTED_READY": 10,
+		"READINESS_REASON_VM_PAUSING":           11,
+		"READINESS_REASON_VM_PAUSED":            12,
+		"READINESS_REASON_VM_CAPTURING":         13,
+		"READINESS_REASON_VM_RESTORING":         14,
+		"READINESS_REASON_VM_ACTIVATING":        15,
+		"READINESS_REASON_VM_ACTIVATION_FAILED": 16,
+		"READINESS_REASON_VM_ERROR":             17,
 	}
 )
 
@@ -2389,6 +2431,380 @@ func (MemoryReclaimOutcome) EnumDescriptor() ([]byte, []int) {
 	return file_daemon_proto_rawDescGZIP(), []int{42}
 }
 
+type LiveCommandKind int32
+
+const (
+	LiveCommandKind_LIVE_COMMAND_KIND_UNSPECIFIED      LiveCommandKind = 0
+	LiveCommandKind_LIVE_COMMAND_KIND_PAUSE            LiveCommandKind = 1
+	LiveCommandKind_LIVE_COMMAND_KIND_RESUME           LiveCommandKind = 2
+	LiveCommandKind_LIVE_COMMAND_KIND_GET_OPERATION    LiveCommandKind = 3
+	LiveCommandKind_LIVE_COMMAND_KIND_CANCEL_OPERATION LiveCommandKind = 4
+	LiveCommandKind_LIVE_COMMAND_KIND_CAPTURE          LiveCommandKind = 5
+	LiveCommandKind_LIVE_COMMAND_KIND_RELEASE_CAPTURE  LiveCommandKind = 6
+)
+
+// Enum value maps for LiveCommandKind.
+var (
+	LiveCommandKind_name = map[int32]string{
+		0: "LIVE_COMMAND_KIND_UNSPECIFIED",
+		1: "LIVE_COMMAND_KIND_PAUSE",
+		2: "LIVE_COMMAND_KIND_RESUME",
+		3: "LIVE_COMMAND_KIND_GET_OPERATION",
+		4: "LIVE_COMMAND_KIND_CANCEL_OPERATION",
+		5: "LIVE_COMMAND_KIND_CAPTURE",
+		6: "LIVE_COMMAND_KIND_RELEASE_CAPTURE",
+	}
+	LiveCommandKind_value = map[string]int32{
+		"LIVE_COMMAND_KIND_UNSPECIFIED":      0,
+		"LIVE_COMMAND_KIND_PAUSE":            1,
+		"LIVE_COMMAND_KIND_RESUME":           2,
+		"LIVE_COMMAND_KIND_GET_OPERATION":    3,
+		"LIVE_COMMAND_KIND_CANCEL_OPERATION": 4,
+		"LIVE_COMMAND_KIND_CAPTURE":          5,
+		"LIVE_COMMAND_KIND_RELEASE_CAPTURE":  6,
+	}
+)
+
+func (x LiveCommandKind) Enum() *LiveCommandKind {
+	p := new(LiveCommandKind)
+	*p = x
+	return p
+}
+
+func (x LiveCommandKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveCommandKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[43].Descriptor()
+}
+
+func (LiveCommandKind) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[43]
+}
+
+func (x LiveCommandKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveCommandKind.Descriptor instead.
+func (LiveCommandKind) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{43}
+}
+
+type LiveStage int32
+
+const (
+	LiveStage_LIVE_STAGE_UNSPECIFIED      LiveStage = 0
+	LiveStage_LIVE_STAGE_MONITOR_DRAIN    LiveStage = 1
+	LiveStage_LIVE_STAGE_GUEST_FREEZE     LiveStage = 2
+	LiveStage_LIVE_STAGE_NATIVE_PAUSE     LiveStage = 3
+	LiveStage_LIVE_STAGE_PAUSE_FAILED     LiveStage = 4
+	LiveStage_LIVE_STAGE_ROLLBACK_THAW    LiveStage = 5
+	LiveStage_LIVE_STAGE_CANCEL_NATIVE    LiveStage = 6
+	LiveStage_LIVE_STAGE_CANCEL_THAW      LiveStage = 7
+	LiveStage_LIVE_STAGE_RESUME_NATIVE    LiveStage = 8
+	LiveStage_LIVE_STAGE_RESUME_CLOCK     LiveStage = 9
+	LiveStage_LIVE_STAGE_RESUME_HANDSHAKE LiveStage = 10
+	LiveStage_LIVE_STAGE_RESUME_THAW      LiveStage = 11
+	LiveStage_LIVE_STAGE_READINESS        LiveStage = 12
+	LiveStage_LIVE_STAGE_RECOVERY_FREEZE  LiveStage = 13
+	LiveStage_LIVE_STAGE_RECOVERY_PAUSE   LiveStage = 14
+	LiveStage_LIVE_STAGE_ADMISSION        LiveStage = 15
+)
+
+// Enum value maps for LiveStage.
+var (
+	LiveStage_name = map[int32]string{
+		0:  "LIVE_STAGE_UNSPECIFIED",
+		1:  "LIVE_STAGE_MONITOR_DRAIN",
+		2:  "LIVE_STAGE_GUEST_FREEZE",
+		3:  "LIVE_STAGE_NATIVE_PAUSE",
+		4:  "LIVE_STAGE_PAUSE_FAILED",
+		5:  "LIVE_STAGE_ROLLBACK_THAW",
+		6:  "LIVE_STAGE_CANCEL_NATIVE",
+		7:  "LIVE_STAGE_CANCEL_THAW",
+		8:  "LIVE_STAGE_RESUME_NATIVE",
+		9:  "LIVE_STAGE_RESUME_CLOCK",
+		10: "LIVE_STAGE_RESUME_HANDSHAKE",
+		11: "LIVE_STAGE_RESUME_THAW",
+		12: "LIVE_STAGE_READINESS",
+		13: "LIVE_STAGE_RECOVERY_FREEZE",
+		14: "LIVE_STAGE_RECOVERY_PAUSE",
+		15: "LIVE_STAGE_ADMISSION",
+	}
+	LiveStage_value = map[string]int32{
+		"LIVE_STAGE_UNSPECIFIED":      0,
+		"LIVE_STAGE_MONITOR_DRAIN":    1,
+		"LIVE_STAGE_GUEST_FREEZE":     2,
+		"LIVE_STAGE_NATIVE_PAUSE":     3,
+		"LIVE_STAGE_PAUSE_FAILED":     4,
+		"LIVE_STAGE_ROLLBACK_THAW":    5,
+		"LIVE_STAGE_CANCEL_NATIVE":    6,
+		"LIVE_STAGE_CANCEL_THAW":      7,
+		"LIVE_STAGE_RESUME_NATIVE":    8,
+		"LIVE_STAGE_RESUME_CLOCK":     9,
+		"LIVE_STAGE_RESUME_HANDSHAKE": 10,
+		"LIVE_STAGE_RESUME_THAW":      11,
+		"LIVE_STAGE_READINESS":        12,
+		"LIVE_STAGE_RECOVERY_FREEZE":  13,
+		"LIVE_STAGE_RECOVERY_PAUSE":   14,
+		"LIVE_STAGE_ADMISSION":        15,
+	}
+)
+
+func (x LiveStage) Enum() *LiveStage {
+	p := new(LiveStage)
+	*p = x
+	return p
+}
+
+func (x LiveStage) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveStage) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[44].Descriptor()
+}
+
+func (LiveStage) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[44]
+}
+
+func (x LiveStage) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveStage.Descriptor instead.
+func (LiveStage) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{44}
+}
+
+type LiveFailureCode int32
+
+const (
+	LiveFailureCode_LIVE_FAILURE_CODE_UNSPECIFIED             LiveFailureCode = 0
+	LiveFailureCode_LIVE_FAILURE_CODE_DRAIN_TIMED_OUT         LiveFailureCode = 1
+	LiveFailureCode_LIVE_FAILURE_CODE_GUEST_UNAVAILABLE       LiveFailureCode = 2
+	LiveFailureCode_LIVE_FAILURE_CODE_GUEST_IDENTITY_MISMATCH LiveFailureCode = 3
+	LiveFailureCode_LIVE_FAILURE_CODE_FREEZE_FAILED           LiveFailureCode = 4
+	LiveFailureCode_LIVE_FAILURE_CODE_FREEZE_TIMED_OUT        LiveFailureCode = 5
+	LiveFailureCode_LIVE_FAILURE_CODE_NATIVE_PAUSE_FAILED     LiveFailureCode = 6
+	LiveFailureCode_LIVE_FAILURE_CODE_NATIVE_UNCERTAIN        LiveFailureCode = 7
+	LiveFailureCode_LIVE_FAILURE_CODE_CANCELLED               LiveFailureCode = 8
+	LiveFailureCode_LIVE_FAILURE_CODE_NATIVE_ROLLBACK_FAILED  LiveFailureCode = 9
+	LiveFailureCode_LIVE_FAILURE_CODE_THAW_FAILED             LiveFailureCode = 10
+	LiveFailureCode_LIVE_FAILURE_CODE_THAW_UNACKNOWLEDGED     LiveFailureCode = 11
+	LiveFailureCode_LIVE_FAILURE_CODE_NATIVE_RESUME_FAILED    LiveFailureCode = 12
+	LiveFailureCode_LIVE_FAILURE_CODE_CLOCK_GENERATION_FAILED LiveFailureCode = 13
+	LiveFailureCode_LIVE_FAILURE_CODE_HANDSHAKE_FAILED        LiveFailureCode = 14
+	LiveFailureCode_LIVE_FAILURE_CODE_READINESS_FAILED        LiveFailureCode = 15
+	LiveFailureCode_LIVE_FAILURE_CODE_RECOVERY_FREEZE_FAILED  LiveFailureCode = 16
+	LiveFailureCode_LIVE_FAILURE_CODE_RECOVERY_PAUSE_FAILED   LiveFailureCode = 17
+	LiveFailureCode_LIVE_FAILURE_CODE_WORKER_LOST             LiveFailureCode = 18
+	LiveFailureCode_LIVE_FAILURE_CODE_STOPPED                 LiveFailureCode = 19
+	LiveFailureCode_LIVE_FAILURE_CODE_DEADLINE_EXCEEDED       LiveFailureCode = 20
+)
+
+// Enum value maps for LiveFailureCode.
+var (
+	LiveFailureCode_name = map[int32]string{
+		0:  "LIVE_FAILURE_CODE_UNSPECIFIED",
+		1:  "LIVE_FAILURE_CODE_DRAIN_TIMED_OUT",
+		2:  "LIVE_FAILURE_CODE_GUEST_UNAVAILABLE",
+		3:  "LIVE_FAILURE_CODE_GUEST_IDENTITY_MISMATCH",
+		4:  "LIVE_FAILURE_CODE_FREEZE_FAILED",
+		5:  "LIVE_FAILURE_CODE_FREEZE_TIMED_OUT",
+		6:  "LIVE_FAILURE_CODE_NATIVE_PAUSE_FAILED",
+		7:  "LIVE_FAILURE_CODE_NATIVE_UNCERTAIN",
+		8:  "LIVE_FAILURE_CODE_CANCELLED",
+		9:  "LIVE_FAILURE_CODE_NATIVE_ROLLBACK_FAILED",
+		10: "LIVE_FAILURE_CODE_THAW_FAILED",
+		11: "LIVE_FAILURE_CODE_THAW_UNACKNOWLEDGED",
+		12: "LIVE_FAILURE_CODE_NATIVE_RESUME_FAILED",
+		13: "LIVE_FAILURE_CODE_CLOCK_GENERATION_FAILED",
+		14: "LIVE_FAILURE_CODE_HANDSHAKE_FAILED",
+		15: "LIVE_FAILURE_CODE_READINESS_FAILED",
+		16: "LIVE_FAILURE_CODE_RECOVERY_FREEZE_FAILED",
+		17: "LIVE_FAILURE_CODE_RECOVERY_PAUSE_FAILED",
+		18: "LIVE_FAILURE_CODE_WORKER_LOST",
+		19: "LIVE_FAILURE_CODE_STOPPED",
+		20: "LIVE_FAILURE_CODE_DEADLINE_EXCEEDED",
+	}
+	LiveFailureCode_value = map[string]int32{
+		"LIVE_FAILURE_CODE_UNSPECIFIED":             0,
+		"LIVE_FAILURE_CODE_DRAIN_TIMED_OUT":         1,
+		"LIVE_FAILURE_CODE_GUEST_UNAVAILABLE":       2,
+		"LIVE_FAILURE_CODE_GUEST_IDENTITY_MISMATCH": 3,
+		"LIVE_FAILURE_CODE_FREEZE_FAILED":           4,
+		"LIVE_FAILURE_CODE_FREEZE_TIMED_OUT":        5,
+		"LIVE_FAILURE_CODE_NATIVE_PAUSE_FAILED":     6,
+		"LIVE_FAILURE_CODE_NATIVE_UNCERTAIN":        7,
+		"LIVE_FAILURE_CODE_CANCELLED":               8,
+		"LIVE_FAILURE_CODE_NATIVE_ROLLBACK_FAILED":  9,
+		"LIVE_FAILURE_CODE_THAW_FAILED":             10,
+		"LIVE_FAILURE_CODE_THAW_UNACKNOWLEDGED":     11,
+		"LIVE_FAILURE_CODE_NATIVE_RESUME_FAILED":    12,
+		"LIVE_FAILURE_CODE_CLOCK_GENERATION_FAILED": 13,
+		"LIVE_FAILURE_CODE_HANDSHAKE_FAILED":        14,
+		"LIVE_FAILURE_CODE_READINESS_FAILED":        15,
+		"LIVE_FAILURE_CODE_RECOVERY_FREEZE_FAILED":  16,
+		"LIVE_FAILURE_CODE_RECOVERY_PAUSE_FAILED":   17,
+		"LIVE_FAILURE_CODE_WORKER_LOST":             18,
+		"LIVE_FAILURE_CODE_STOPPED":                 19,
+		"LIVE_FAILURE_CODE_DEADLINE_EXCEEDED":       20,
+	}
+)
+
+func (x LiveFailureCode) Enum() *LiveFailureCode {
+	p := new(LiveFailureCode)
+	*p = x
+	return p
+}
+
+func (x LiveFailureCode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LiveFailureCode) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[45].Descriptor()
+}
+
+func (LiveFailureCode) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[45]
+}
+
+func (x LiveFailureCode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LiveFailureCode.Descriptor instead.
+func (LiveFailureCode) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{45}
+}
+
+type GuestLifecycleState int32
+
+const (
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_UNSPECIFIED       GuestLifecycleState = 0
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_RUNNING           GuestLifecycleState = 1
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_FREEZING          GuestLifecycleState = 2
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_FROZEN            GuestLifecycleState = 3
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_ACTIVATING        GuestLifecycleState = 4
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_ACTIVATED_FROZEN  GuestLifecycleState = 5
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_THAWING           GuestLifecycleState = 6
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_THAWED            GuestLifecycleState = 7
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_FREEZE_FAILED     GuestLifecycleState = 8
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_ACTIVATION_FAILED GuestLifecycleState = 9
+	GuestLifecycleState_GUEST_LIFECYCLE_STATE_FAULTED           GuestLifecycleState = 10
+)
+
+// Enum value maps for GuestLifecycleState.
+var (
+	GuestLifecycleState_name = map[int32]string{
+		0:  "GUEST_LIFECYCLE_STATE_UNSPECIFIED",
+		1:  "GUEST_LIFECYCLE_STATE_RUNNING",
+		2:  "GUEST_LIFECYCLE_STATE_FREEZING",
+		3:  "GUEST_LIFECYCLE_STATE_FROZEN",
+		4:  "GUEST_LIFECYCLE_STATE_ACTIVATING",
+		5:  "GUEST_LIFECYCLE_STATE_ACTIVATED_FROZEN",
+		6:  "GUEST_LIFECYCLE_STATE_THAWING",
+		7:  "GUEST_LIFECYCLE_STATE_THAWED",
+		8:  "GUEST_LIFECYCLE_STATE_FREEZE_FAILED",
+		9:  "GUEST_LIFECYCLE_STATE_ACTIVATION_FAILED",
+		10: "GUEST_LIFECYCLE_STATE_FAULTED",
+	}
+	GuestLifecycleState_value = map[string]int32{
+		"GUEST_LIFECYCLE_STATE_UNSPECIFIED":       0,
+		"GUEST_LIFECYCLE_STATE_RUNNING":           1,
+		"GUEST_LIFECYCLE_STATE_FREEZING":          2,
+		"GUEST_LIFECYCLE_STATE_FROZEN":            3,
+		"GUEST_LIFECYCLE_STATE_ACTIVATING":        4,
+		"GUEST_LIFECYCLE_STATE_ACTIVATED_FROZEN":  5,
+		"GUEST_LIFECYCLE_STATE_THAWING":           6,
+		"GUEST_LIFECYCLE_STATE_THAWED":            7,
+		"GUEST_LIFECYCLE_STATE_FREEZE_FAILED":     8,
+		"GUEST_LIFECYCLE_STATE_ACTIVATION_FAILED": 9,
+		"GUEST_LIFECYCLE_STATE_FAULTED":           10,
+	}
+)
+
+func (x GuestLifecycleState) Enum() *GuestLifecycleState {
+	p := new(GuestLifecycleState)
+	*p = x
+	return p
+}
+
+func (x GuestLifecycleState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (GuestLifecycleState) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[46].Descriptor()
+}
+
+func (GuestLifecycleState) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[46]
+}
+
+func (x GuestLifecycleState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use GuestLifecycleState.Descriptor instead.
+func (GuestLifecycleState) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{46}
+}
+
+type OperationKind int32
+
+const (
+	OperationKind_OPERATION_KIND_UNSPECIFIED OperationKind = 0
+	OperationKind_OPERATION_KIND_PAUSE       OperationKind = 1
+	OperationKind_OPERATION_KIND_CAPTURE     OperationKind = 2
+)
+
+// Enum value maps for OperationKind.
+var (
+	OperationKind_name = map[int32]string{
+		0: "OPERATION_KIND_UNSPECIFIED",
+		1: "OPERATION_KIND_PAUSE",
+		2: "OPERATION_KIND_CAPTURE",
+	}
+	OperationKind_value = map[string]int32{
+		"OPERATION_KIND_UNSPECIFIED": 0,
+		"OPERATION_KIND_PAUSE":       1,
+		"OPERATION_KIND_CAPTURE":     2,
+	}
+)
+
+func (x OperationKind) Enum() *OperationKind {
+	p := new(OperationKind)
+	*p = x
+	return p
+}
+
+func (x OperationKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (OperationKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_daemon_proto_enumTypes[47].Descriptor()
+}
+
+func (OperationKind) Type() protoreflect.EnumType {
+	return &file_daemon_proto_enumTypes[47]
+}
+
+func (x OperationKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use OperationKind.Descriptor instead.
+func (OperationKind) EnumDescriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{47}
+}
+
 type StorageCaptureKind int32
 
 const (
@@ -2419,11 +2835,11 @@ func (x StorageCaptureKind) String() string {
 }
 
 func (StorageCaptureKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[43].Descriptor()
+	return file_daemon_proto_enumTypes[48].Descriptor()
 }
 
 func (StorageCaptureKind) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[43]
+	return &file_daemon_proto_enumTypes[48]
 }
 
 func (x StorageCaptureKind) Number() protoreflect.EnumNumber {
@@ -2432,7 +2848,7 @@ func (x StorageCaptureKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use StorageCaptureKind.Descriptor instead.
 func (StorageCaptureKind) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{43}
+	return file_daemon_proto_rawDescGZIP(), []int{48}
 }
 
 type LiveOperation int32
@@ -2477,11 +2893,11 @@ func (x LiveOperation) String() string {
 }
 
 func (LiveOperation) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[44].Descriptor()
+	return file_daemon_proto_enumTypes[49].Descriptor()
 }
 
 func (LiveOperation) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[44]
+	return &file_daemon_proto_enumTypes[49]
 }
 
 func (x LiveOperation) Number() protoreflect.EnumNumber {
@@ -2490,7 +2906,7 @@ func (x LiveOperation) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LiveOperation.Descriptor instead.
 func (LiveOperation) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{44}
+	return file_daemon_proto_rawDescGZIP(), []int{49}
 }
 
 type LiveBackend int32
@@ -2529,11 +2945,11 @@ func (x LiveBackend) String() string {
 }
 
 func (LiveBackend) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[45].Descriptor()
+	return file_daemon_proto_enumTypes[50].Descriptor()
 }
 
 func (LiveBackend) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[45]
+	return &file_daemon_proto_enumTypes[50]
 }
 
 func (x LiveBackend) Number() protoreflect.EnumNumber {
@@ -2542,7 +2958,7 @@ func (x LiveBackend) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LiveBackend.Descriptor instead.
 func (LiveBackend) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{45}
+	return file_daemon_proto_rawDescGZIP(), []int{50}
 }
 
 type LiveLane int32
@@ -2584,11 +3000,11 @@ func (x LiveLane) String() string {
 }
 
 func (LiveLane) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[46].Descriptor()
+	return file_daemon_proto_enumTypes[51].Descriptor()
 }
 
 func (LiveLane) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[46]
+	return &file_daemon_proto_enumTypes[51]
 }
 
 func (x LiveLane) Number() protoreflect.EnumNumber {
@@ -2597,7 +3013,7 @@ func (x LiveLane) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LiveLane.Descriptor instead.
 func (LiveLane) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{46}
+	return file_daemon_proto_rawDescGZIP(), []int{51}
 }
 
 type LiveScope int32
@@ -2633,11 +3049,11 @@ func (x LiveScope) String() string {
 }
 
 func (LiveScope) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[47].Descriptor()
+	return file_daemon_proto_enumTypes[52].Descriptor()
 }
 
 func (LiveScope) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[47]
+	return &file_daemon_proto_enumTypes[52]
 }
 
 func (x LiveScope) Number() protoreflect.EnumNumber {
@@ -2646,7 +3062,7 @@ func (x LiveScope) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LiveScope.Descriptor instead.
 func (LiveScope) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{47}
+	return file_daemon_proto_rawDescGZIP(), []int{52}
 }
 
 type LiveReasonCode int32
@@ -2697,11 +3113,11 @@ func (x LiveReasonCode) String() string {
 }
 
 func (LiveReasonCode) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[48].Descriptor()
+	return file_daemon_proto_enumTypes[53].Descriptor()
 }
 
 func (LiveReasonCode) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[48]
+	return &file_daemon_proto_enumTypes[53]
 }
 
 func (x LiveReasonCode) Number() protoreflect.EnumNumber {
@@ -2710,7 +3126,7 @@ func (x LiveReasonCode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LiveReasonCode.Descriptor instead.
 func (LiveReasonCode) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{48}
+	return file_daemon_proto_rawDescGZIP(), []int{53}
 }
 
 type LiveEvidenceState int32
@@ -2749,11 +3165,11 @@ func (x LiveEvidenceState) String() string {
 }
 
 func (LiveEvidenceState) Descriptor() protoreflect.EnumDescriptor {
-	return file_daemon_proto_enumTypes[49].Descriptor()
+	return file_daemon_proto_enumTypes[54].Descriptor()
 }
 
 func (LiveEvidenceState) Type() protoreflect.EnumType {
-	return &file_daemon_proto_enumTypes[49]
+	return &file_daemon_proto_enumTypes[54]
 }
 
 func (x LiveEvidenceState) Number() protoreflect.EnumNumber {
@@ -2762,7 +3178,7 @@ func (x LiveEvidenceState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LiveEvidenceState.Descriptor instead.
 func (LiveEvidenceState) EnumDescriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{49}
+	return file_daemon_proto_rawDescGZIP(), []int{54}
 }
 
 type Name struct {
@@ -7188,6 +7604,12 @@ type MachineStatus struct {
 	//	*MachineStatus_Running
 	//	*MachineStatus_Stopping
 	//	*MachineStatus_Error
+	//	*MachineStatus_Pausing
+	//	*MachineStatus_Paused
+	//	*MachineStatus_Capturing
+	//	*MachineStatus_Restoring
+	//	*MachineStatus_Activating
+	//	*MachineStatus_ActivationFailed
 	Status        isMachineStatus_Status `protobuf_oneof:"status"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -7275,6 +7697,60 @@ func (x *MachineStatus) GetError() *LifecycleDetail {
 	return nil
 }
 
+func (x *MachineStatus) GetPausing() *LifecycleDetail {
+	if x != nil {
+		if x, ok := x.Status.(*MachineStatus_Pausing); ok {
+			return x.Pausing
+		}
+	}
+	return nil
+}
+
+func (x *MachineStatus) GetPaused() *LifecycleDetail {
+	if x != nil {
+		if x, ok := x.Status.(*MachineStatus_Paused); ok {
+			return x.Paused
+		}
+	}
+	return nil
+}
+
+func (x *MachineStatus) GetCapturing() *LifecycleDetail {
+	if x != nil {
+		if x, ok := x.Status.(*MachineStatus_Capturing); ok {
+			return x.Capturing
+		}
+	}
+	return nil
+}
+
+func (x *MachineStatus) GetRestoring() *LifecycleDetail {
+	if x != nil {
+		if x, ok := x.Status.(*MachineStatus_Restoring); ok {
+			return x.Restoring
+		}
+	}
+	return nil
+}
+
+func (x *MachineStatus) GetActivating() *LifecycleDetail {
+	if x != nil {
+		if x, ok := x.Status.(*MachineStatus_Activating); ok {
+			return x.Activating
+		}
+	}
+	return nil
+}
+
+func (x *MachineStatus) GetActivationFailed() *LifecycleDetail {
+	if x != nil {
+		if x, ok := x.Status.(*MachineStatus_ActivationFailed); ok {
+			return x.ActivationFailed
+		}
+	}
+	return nil
+}
+
 type isMachineStatus_Status interface {
 	isMachineStatus_Status()
 }
@@ -7299,6 +7775,30 @@ type MachineStatus_Error struct {
 	Error *LifecycleDetail `protobuf:"bytes,5,opt,name=error,proto3,oneof"`
 }
 
+type MachineStatus_Pausing struct {
+	Pausing *LifecycleDetail `protobuf:"bytes,6,opt,name=pausing,proto3,oneof"`
+}
+
+type MachineStatus_Paused struct {
+	Paused *LifecycleDetail `protobuf:"bytes,7,opt,name=paused,proto3,oneof"`
+}
+
+type MachineStatus_Capturing struct {
+	Capturing *LifecycleDetail `protobuf:"bytes,8,opt,name=capturing,proto3,oneof"`
+}
+
+type MachineStatus_Restoring struct {
+	Restoring *LifecycleDetail `protobuf:"bytes,9,opt,name=restoring,proto3,oneof"`
+}
+
+type MachineStatus_Activating struct {
+	Activating *LifecycleDetail `protobuf:"bytes,10,opt,name=activating,proto3,oneof"`
+}
+
+type MachineStatus_ActivationFailed struct {
+	ActivationFailed *LifecycleDetail `protobuf:"bytes,11,opt,name=activation_failed,json=activationFailed,proto3,oneof"`
+}
+
 func (*MachineStatus_Stopped) isMachineStatus_Status() {}
 
 func (*MachineStatus_Starting) isMachineStatus_Status() {}
@@ -7308,6 +7808,18 @@ func (*MachineStatus_Running) isMachineStatus_Status() {}
 func (*MachineStatus_Stopping) isMachineStatus_Status() {}
 
 func (*MachineStatus_Error) isMachineStatus_Status() {}
+
+func (*MachineStatus_Pausing) isMachineStatus_Status() {}
+
+func (*MachineStatus_Paused) isMachineStatus_Status() {}
+
+func (*MachineStatus_Capturing) isMachineStatus_Status() {}
+
+func (*MachineStatus_Restoring) isMachineStatus_Status() {}
+
+func (*MachineStatus_Activating) isMachineStatus_Status() {}
+
+func (*MachineStatus_ActivationFailed) isMachineStatus_Status() {}
 
 type Rootfs struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
@@ -7794,6 +8306,7 @@ type MachineSnapshot struct {
 	Live               *LiveMachineReport     `protobuf:"bytes,29,opt,name=live,proto3" json:"live,omitempty"`
 	ProspectiveLive    *LiveHostReport        `protobuf:"bytes,30,opt,name=prospective_live,json=prospectiveLive,proto3" json:"prospective_live,omitempty"`
 	LiveEvidence       *LiveEvidenceState     `protobuf:"varint,31,opt,name=live_evidence,json=liveEvidence,proto3,enum=silo.daemon.v1.LiveEvidenceState,oneof" json:"live_evidence,omitempty"`
+	Lifecycle          *MachineLifecycle      `protobuf:"bytes,32,opt,name=lifecycle,proto3" json:"lifecycle,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -8043,6 +8556,13 @@ func (x *MachineSnapshot) GetLiveEvidence() LiveEvidenceState {
 		return *x.LiveEvidence
 	}
 	return LiveEvidenceState_LIVE_EVIDENCE_STATE_UNSPECIFIED
+}
+
+func (x *MachineSnapshot) GetLifecycle() *MachineLifecycle {
+	if x != nil {
+		return x.Lifecycle
+	}
+	return nil
 }
 
 type MachineInventoryEntry struct {
@@ -11368,6 +11888,7 @@ type MonitorStatus struct {
 	Readiness     *ReadinessState        `protobuf:"bytes,6,opt,name=readiness,proto3" json:"readiness,omitempty"`
 	Agent         *AgentStatus           `protobuf:"bytes,7,opt,name=agent,proto3" json:"agent,omitempty"`
 	Live          *LiveMachineReport     `protobuf:"bytes,8,opt,name=live,proto3" json:"live,omitempty"`
+	Lifecycle     *LiveLifecycle         `protobuf:"bytes,9,opt,name=lifecycle,proto3" json:"lifecycle,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -11454,6 +11975,13 @@ func (x *MonitorStatus) GetAgent() *AgentStatus {
 func (x *MonitorStatus) GetLive() *LiveMachineReport {
 	if x != nil {
 		return x.Live
+	}
+	return nil
+}
+
+func (x *MonitorStatus) GetLifecycle() *LiveLifecycle {
+	if x != nil {
+		return x.Lifecycle
 	}
 	return nil
 }
@@ -11754,6 +12282,746 @@ func (x *LiveMachineRequest) GetMachine() *MachineRef {
 	return nil
 }
 
+type PauseOwner struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Owner:
+	//
+	//	*PauseOwner_User
+	//	*PauseOwner_CaptureOperationId
+	Owner         isPauseOwner_Owner `protobuf_oneof:"owner"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PauseOwner) Reset() {
+	*x = PauseOwner{}
+	mi := &file_daemon_proto_msgTypes[115]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PauseOwner) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PauseOwner) ProtoMessage() {}
+
+func (x *PauseOwner) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[115]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PauseOwner.ProtoReflect.Descriptor instead.
+func (*PauseOwner) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{115}
+}
+
+func (x *PauseOwner) GetOwner() isPauseOwner_Owner {
+	if x != nil {
+		return x.Owner
+	}
+	return nil
+}
+
+func (x *PauseOwner) GetUser() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Owner.(*PauseOwner_User); ok {
+			return x.User
+		}
+	}
+	return nil
+}
+
+func (x *PauseOwner) GetCaptureOperationId() string {
+	if x != nil {
+		if x, ok := x.Owner.(*PauseOwner_CaptureOperationId); ok {
+			return x.CaptureOperationId
+		}
+	}
+	return ""
+}
+
+type isPauseOwner_Owner interface {
+	isPauseOwner_Owner()
+}
+
+type PauseOwner_User struct {
+	User *emptypb.Empty `protobuf:"bytes,1,opt,name=user,proto3,oneof"`
+}
+
+type PauseOwner_CaptureOperationId struct {
+	CaptureOperationId string `protobuf:"bytes,2,opt,name=capture_operation_id,json=captureOperationId,proto3,oneof"`
+}
+
+func (*PauseOwner_User) isPauseOwner_Owner() {}
+
+func (*PauseOwner_CaptureOperationId) isPauseOwner_Owner() {}
+
+type PauseToken struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MachineId     string                 `protobuf:"bytes,1,opt,name=machine_id,json=machineId,proto3" json:"machine_id,omitempty"`
+	RunId         string                 `protobuf:"bytes,2,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	Generation    uint64                 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
+	Owner         *PauseOwner            `protobuf:"bytes,4,opt,name=owner,proto3" json:"owner,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PauseToken) Reset() {
+	*x = PauseToken{}
+	mi := &file_daemon_proto_msgTypes[116]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PauseToken) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PauseToken) ProtoMessage() {}
+
+func (x *PauseToken) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[116]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PauseToken.ProtoReflect.Descriptor instead.
+func (*PauseToken) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{116}
+}
+
+func (x *PauseToken) GetMachineId() string {
+	if x != nil {
+		return x.MachineId
+	}
+	return ""
+}
+
+func (x *PauseToken) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+func (x *PauseToken) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *PauseToken) GetOwner() *PauseOwner {
+	if x != nil {
+		return x.Owner
+	}
+	return nil
+}
+
+type CurrentPause struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Token         *PauseToken            `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	OperationId   string                 `protobuf:"bytes,2,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	FreezeEpoch   uint64                 `protobuf:"varint,3,opt,name=freeze_epoch,json=freezeEpoch,proto3" json:"freeze_epoch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CurrentPause) Reset() {
+	*x = CurrentPause{}
+	mi := &file_daemon_proto_msgTypes[117]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CurrentPause) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CurrentPause) ProtoMessage() {}
+
+func (x *CurrentPause) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[117]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CurrentPause.ProtoReflect.Descriptor instead.
+func (*CurrentPause) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{117}
+}
+
+func (x *CurrentPause) GetToken() *PauseToken {
+	if x != nil {
+		return x.Token
+	}
+	return nil
+}
+
+func (x *CurrentPause) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
+	}
+	return ""
+}
+
+func (x *CurrentPause) GetFreezeEpoch() uint64 {
+	if x != nil {
+		return x.FreezeEpoch
+	}
+	return 0
+}
+
+type GuestFreezeObservation struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	State               GuestLifecycleState    `protobuf:"varint,1,opt,name=state,proto3,enum=silo.daemon.v1.GuestLifecycleState" json:"state,omitempty"`
+	FreezeEpoch         *uint64                `protobuf:"varint,2,opt,name=freeze_epoch,json=freezeEpoch,proto3,oneof" json:"freeze_epoch,omitempty"`
+	WorkloadRoots       []string               `protobuf:"bytes,3,rep,name=workload_roots,json=workloadRoots,proto3" json:"workload_roots,omitempty"`
+	ObservedFrozenRoots []string               `protobuf:"bytes,4,rep,name=observed_frozen_roots,json=observedFrozenRoots,proto3" json:"observed_frozen_roots,omitempty"`
+	RollbackSucceeded   *bool                  `protobuf:"varint,5,opt,name=rollback_succeeded,json=rollbackSucceeded,proto3,oneof" json:"rollback_succeeded,omitempty"`
+	Failure             *string                `protobuf:"bytes,6,opt,name=failure,proto3,oneof" json:"failure,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *GuestFreezeObservation) Reset() {
+	*x = GuestFreezeObservation{}
+	mi := &file_daemon_proto_msgTypes[118]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuestFreezeObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuestFreezeObservation) ProtoMessage() {}
+
+func (x *GuestFreezeObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[118]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuestFreezeObservation.ProtoReflect.Descriptor instead.
+func (*GuestFreezeObservation) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{118}
+}
+
+func (x *GuestFreezeObservation) GetState() GuestLifecycleState {
+	if x != nil {
+		return x.State
+	}
+	return GuestLifecycleState_GUEST_LIFECYCLE_STATE_UNSPECIFIED
+}
+
+func (x *GuestFreezeObservation) GetFreezeEpoch() uint64 {
+	if x != nil && x.FreezeEpoch != nil {
+		return *x.FreezeEpoch
+	}
+	return 0
+}
+
+func (x *GuestFreezeObservation) GetWorkloadRoots() []string {
+	if x != nil {
+		return x.WorkloadRoots
+	}
+	return nil
+}
+
+func (x *GuestFreezeObservation) GetObservedFrozenRoots() []string {
+	if x != nil {
+		return x.ObservedFrozenRoots
+	}
+	return nil
+}
+
+func (x *GuestFreezeObservation) GetRollbackSucceeded() bool {
+	if x != nil && x.RollbackSucceeded != nil {
+		return *x.RollbackSucceeded
+	}
+	return false
+}
+
+func (x *GuestFreezeObservation) GetFailure() string {
+	if x != nil && x.Failure != nil {
+		return *x.Failure
+	}
+	return ""
+}
+
+type LiveFailure struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Code          LiveFailureCode         `protobuf:"varint,1,opt,name=code,proto3,enum=silo.daemon.v1.LiveFailureCode" json:"code,omitempty"`
+	Stage         LiveStage               `protobuf:"varint,2,opt,name=stage,proto3,enum=silo.daemon.v1.LiveStage" json:"stage,omitempty"`
+	Message       *string                 `protobuf:"bytes,3,opt,name=message,proto3,oneof" json:"message,omitempty"`
+	Guest         *GuestFreezeObservation `protobuf:"bytes,4,opt,name=guest,proto3" json:"guest,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveFailure) Reset() {
+	*x = LiveFailure{}
+	mi := &file_daemon_proto_msgTypes[119]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveFailure) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveFailure) ProtoMessage() {}
+
+func (x *LiveFailure) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[119]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveFailure.ProtoReflect.Descriptor instead.
+func (*LiveFailure) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{119}
+}
+
+func (x *LiveFailure) GetCode() LiveFailureCode {
+	if x != nil {
+		return x.Code
+	}
+	return LiveFailureCode_LIVE_FAILURE_CODE_UNSPECIFIED
+}
+
+func (x *LiveFailure) GetStage() LiveStage {
+	if x != nil {
+		return x.Stage
+	}
+	return LiveStage_LIVE_STAGE_UNSPECIFIED
+}
+
+func (x *LiveFailure) GetMessage() string {
+	if x != nil && x.Message != nil {
+		return *x.Message
+	}
+	return ""
+}
+
+func (x *LiveFailure) GetGuest() *GuestFreezeObservation {
+	if x != nil {
+		return x.Guest
+	}
+	return nil
+}
+
+type LiveActivity struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	OperationId   string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	RequestId     string                 `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Command       LiveCommandKind        `protobuf:"varint,3,opt,name=command,proto3,enum=silo.daemon.v1.LiveCommandKind" json:"command,omitempty"`
+	Stage         LiveStage              `protobuf:"varint,4,opt,name=stage,proto3,enum=silo.daemon.v1.LiveStage" json:"stage,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveActivity) Reset() {
+	*x = LiveActivity{}
+	mi := &file_daemon_proto_msgTypes[120]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveActivity) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveActivity) ProtoMessage() {}
+
+func (x *LiveActivity) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[120]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveActivity.ProtoReflect.Descriptor instead.
+func (*LiveActivity) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{120}
+}
+
+func (x *LiveActivity) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
+	}
+	return ""
+}
+
+func (x *LiveActivity) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *LiveActivity) GetCommand() LiveCommandKind {
+	if x != nil {
+		return x.Command
+	}
+	return LiveCommandKind_LIVE_COMMAND_KIND_UNSPECIFIED
+}
+
+func (x *LiveActivity) GetStage() LiveStage {
+	if x != nil {
+		return x.Stage
+	}
+	return LiveStage_LIVE_STAGE_UNSPECIFIED
+}
+
+type LiveLifecycle struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	CurrentPause  *CurrentPause          `protobuf:"bytes,1,opt,name=current_pause,json=currentPause,proto3" json:"current_pause,omitempty"`
+	Activity      *LiveActivity          `protobuf:"bytes,2,opt,name=activity,proto3" json:"activity,omitempty"`
+	Error         *LiveFailure           `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveLifecycle) Reset() {
+	*x = LiveLifecycle{}
+	mi := &file_daemon_proto_msgTypes[121]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveLifecycle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveLifecycle) ProtoMessage() {}
+
+func (x *LiveLifecycle) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[121]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveLifecycle.ProtoReflect.Descriptor instead.
+func (*LiveLifecycle) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{121}
+}
+
+func (x *LiveLifecycle) GetCurrentPause() *CurrentPause {
+	if x != nil {
+		return x.CurrentPause
+	}
+	return nil
+}
+
+func (x *LiveLifecycle) GetActivity() *LiveActivity {
+	if x != nil {
+		return x.Activity
+	}
+	return nil
+}
+
+func (x *LiveLifecycle) GetError() *LiveFailure {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+type PauseEstablished struct {
+	state           protoimpl.MessageState  `protogen:"open.v1"`
+	Token           *PauseToken             `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	FreezeEpoch     uint64                  `protobuf:"varint,2,opt,name=freeze_epoch,json=freezeEpoch,proto3" json:"freeze_epoch,omitempty"`
+	Guest           *GuestFreezeObservation `protobuf:"bytes,3,opt,name=guest,proto3" json:"guest,omitempty"`
+	CaptureEligible bool                    `protobuf:"varint,4,opt,name=capture_eligible,json=captureEligible,proto3" json:"capture_eligible,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *PauseEstablished) Reset() {
+	*x = PauseEstablished{}
+	mi := &file_daemon_proto_msgTypes[122]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PauseEstablished) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PauseEstablished) ProtoMessage() {}
+
+func (x *PauseEstablished) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[122]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PauseEstablished.ProtoReflect.Descriptor instead.
+func (*PauseEstablished) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{122}
+}
+
+func (x *PauseEstablished) GetToken() *PauseToken {
+	if x != nil {
+		return x.Token
+	}
+	return nil
+}
+
+func (x *PauseEstablished) GetFreezeEpoch() uint64 {
+	if x != nil {
+		return x.FreezeEpoch
+	}
+	return 0
+}
+
+func (x *PauseEstablished) GetGuest() *GuestFreezeObservation {
+	if x != nil {
+		return x.Guest
+	}
+	return nil
+}
+
+func (x *PauseEstablished) GetCaptureEligible() bool {
+	if x != nil {
+		return x.CaptureEligible
+	}
+	return false
+}
+
+type LiveOperationRecord struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	OperationId string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	Kind        OperationKind          `protobuf:"varint,2,opt,name=kind,proto3,enum=silo.daemon.v1.OperationKind" json:"kind,omitempty"`
+	// Types that are valid to be assigned to Outcome:
+	//
+	//	*LiveOperationRecord_InProgress
+	//	*LiveOperationRecord_Succeeded
+	//	*LiveOperationRecord_Failed
+	Outcome       isLiveOperationRecord_Outcome `protobuf_oneof:"outcome"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LiveOperationRecord) Reset() {
+	*x = LiveOperationRecord{}
+	mi := &file_daemon_proto_msgTypes[123]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LiveOperationRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LiveOperationRecord) ProtoMessage() {}
+
+func (x *LiveOperationRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[123]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LiveOperationRecord.ProtoReflect.Descriptor instead.
+func (*LiveOperationRecord) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{123}
+}
+
+func (x *LiveOperationRecord) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
+	}
+	return ""
+}
+
+func (x *LiveOperationRecord) GetKind() OperationKind {
+	if x != nil {
+		return x.Kind
+	}
+	return OperationKind_OPERATION_KIND_UNSPECIFIED
+}
+
+func (x *LiveOperationRecord) GetOutcome() isLiveOperationRecord_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
+func (x *LiveOperationRecord) GetInProgress() *emptypb.Empty {
+	if x != nil {
+		if x, ok := x.Outcome.(*LiveOperationRecord_InProgress); ok {
+			return x.InProgress
+		}
+	}
+	return nil
+}
+
+func (x *LiveOperationRecord) GetSucceeded() *PauseEstablished {
+	if x != nil {
+		if x, ok := x.Outcome.(*LiveOperationRecord_Succeeded); ok {
+			return x.Succeeded
+		}
+	}
+	return nil
+}
+
+func (x *LiveOperationRecord) GetFailed() *LiveFailure {
+	if x != nil {
+		if x, ok := x.Outcome.(*LiveOperationRecord_Failed); ok {
+			return x.Failed
+		}
+	}
+	return nil
+}
+
+type isLiveOperationRecord_Outcome interface {
+	isLiveOperationRecord_Outcome()
+}
+
+type LiveOperationRecord_InProgress struct {
+	InProgress *emptypb.Empty `protobuf:"bytes,3,opt,name=in_progress,json=inProgress,proto3,oneof"`
+}
+
+type LiveOperationRecord_Succeeded struct {
+	Succeeded *PauseEstablished `protobuf:"bytes,4,opt,name=succeeded,proto3,oneof"`
+}
+
+type LiveOperationRecord_Failed struct {
+	Failed *LiveFailure `protobuf:"bytes,5,opt,name=failed,proto3,oneof"`
+}
+
+func (*LiveOperationRecord_InProgress) isLiveOperationRecord_Outcome() {}
+
+func (*LiveOperationRecord_Succeeded) isLiveOperationRecord_Outcome() {}
+
+func (*LiveOperationRecord_Failed) isLiveOperationRecord_Outcome() {}
+
+type MachineLifecycle struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Report        *LiveMachineReport     `protobuf:"bytes,1,opt,name=report,proto3" json:"report,omitempty"`
+	State         VmState                `protobuf:"varint,2,opt,name=state,proto3,enum=silo.daemon.v1.VmState" json:"state,omitempty"`
+	Lifecycle     *LiveLifecycle         `protobuf:"bytes,3,opt,name=lifecycle,proto3" json:"lifecycle,omitempty"`
+	Operation     *LiveOperationRecord   `protobuf:"bytes,4,opt,name=operation,proto3" json:"operation,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MachineLifecycle) Reset() {
+	*x = MachineLifecycle{}
+	mi := &file_daemon_proto_msgTypes[124]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MachineLifecycle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MachineLifecycle) ProtoMessage() {}
+
+func (x *MachineLifecycle) ProtoReflect() protoreflect.Message {
+	mi := &file_daemon_proto_msgTypes[124]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MachineLifecycle.ProtoReflect.Descriptor instead.
+func (*MachineLifecycle) Descriptor() ([]byte, []int) {
+	return file_daemon_proto_rawDescGZIP(), []int{124}
+}
+
+func (x *MachineLifecycle) GetReport() *LiveMachineReport {
+	if x != nil {
+		return x.Report
+	}
+	return nil
+}
+
+func (x *MachineLifecycle) GetState() VmState {
+	if x != nil {
+		return x.State
+	}
+	return VmState_VM_STATE_UNSPECIFIED
+}
+
+func (x *MachineLifecycle) GetLifecycle() *LiveLifecycle {
+	if x != nil {
+		return x.Lifecycle
+	}
+	return nil
+}
+
+func (x *MachineLifecycle) GetOperation() *LiveOperationRecord {
+	if x != nil {
+		return x.Operation
+	}
+	return nil
+}
+
 type LiveCaptureRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Machine       *MachineRef            `protobuf:"bytes,1,opt,name=machine,proto3" json:"machine,omitempty"`
@@ -11764,7 +13032,7 @@ type LiveCaptureRequest struct {
 
 func (x *LiveCaptureRequest) Reset() {
 	*x = LiveCaptureRequest{}
-	mi := &file_daemon_proto_msgTypes[115]
+	mi := &file_daemon_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11776,7 +13044,7 @@ func (x *LiveCaptureRequest) String() string {
 func (*LiveCaptureRequest) ProtoMessage() {}
 
 func (x *LiveCaptureRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[115]
+	mi := &file_daemon_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11789,7 +13057,7 @@ func (x *LiveCaptureRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveCaptureRequest.ProtoReflect.Descriptor instead.
 func (*LiveCaptureRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{115}
+	return file_daemon_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *LiveCaptureRequest) GetMachine() *MachineRef {
@@ -11816,7 +13084,7 @@ type LiveForkRequest struct {
 
 func (x *LiveForkRequest) Reset() {
 	*x = LiveForkRequest{}
-	mi := &file_daemon_proto_msgTypes[116]
+	mi := &file_daemon_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11828,7 +13096,7 @@ func (x *LiveForkRequest) String() string {
 func (*LiveForkRequest) ProtoMessage() {}
 
 func (x *LiveForkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[116]
+	mi := &file_daemon_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11841,7 +13109,7 @@ func (x *LiveForkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveForkRequest.ProtoReflect.Descriptor instead.
 func (*LiveForkRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{116}
+	return file_daemon_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *LiveForkRequest) GetMachine() *MachineRef {
@@ -11868,7 +13136,7 @@ type LiveRestoreRequest struct {
 
 func (x *LiveRestoreRequest) Reset() {
 	*x = LiveRestoreRequest{}
-	mi := &file_daemon_proto_msgTypes[117]
+	mi := &file_daemon_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11880,7 +13148,7 @@ func (x *LiveRestoreRequest) String() string {
 func (*LiveRestoreRequest) ProtoMessage() {}
 
 func (x *LiveRestoreRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[117]
+	mi := &file_daemon_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11893,7 +13161,7 @@ func (x *LiveRestoreRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveRestoreRequest.ProtoReflect.Descriptor instead.
 func (*LiveRestoreRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{117}
+	return file_daemon_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *LiveRestoreRequest) GetCheckpoint() []byte {
@@ -11924,7 +13192,7 @@ type StorageSnapshotRef struct {
 
 func (x *StorageSnapshotRef) Reset() {
 	*x = StorageSnapshotRef{}
-	mi := &file_daemon_proto_msgTypes[118]
+	mi := &file_daemon_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11936,7 +13204,7 @@ func (x *StorageSnapshotRef) String() string {
 func (*StorageSnapshotRef) ProtoMessage() {}
 
 func (x *StorageSnapshotRef) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[118]
+	mi := &file_daemon_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11949,7 +13217,7 @@ func (x *StorageSnapshotRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageSnapshotRef.ProtoReflect.Descriptor instead.
 func (*StorageSnapshotRef) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{118}
+	return file_daemon_proto_rawDescGZIP(), []int{128}
 }
 
 func (x *StorageSnapshotRef) GetReference() isStorageSnapshotRef_Reference {
@@ -12006,7 +13274,7 @@ type ExternalResourceKey struct {
 
 func (x *ExternalResourceKey) Reset() {
 	*x = ExternalResourceKey{}
-	mi := &file_daemon_proto_msgTypes[119]
+	mi := &file_daemon_proto_msgTypes[129]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12018,7 +13286,7 @@ func (x *ExternalResourceKey) String() string {
 func (*ExternalResourceKey) ProtoMessage() {}
 
 func (x *ExternalResourceKey) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[119]
+	mi := &file_daemon_proto_msgTypes[129]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12031,7 +13299,7 @@ func (x *ExternalResourceKey) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExternalResourceKey.ProtoReflect.Descriptor instead.
 func (*ExternalResourceKey) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{119}
+	return file_daemon_proto_rawDescGZIP(), []int{129}
 }
 
 func (x *ExternalResourceKey) GetResource() isExternalResourceKey_Resource {
@@ -12085,7 +13353,7 @@ type ExternalResourceMapping struct {
 
 func (x *ExternalResourceMapping) Reset() {
 	*x = ExternalResourceMapping{}
-	mi := &file_daemon_proto_msgTypes[120]
+	mi := &file_daemon_proto_msgTypes[130]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12097,7 +13365,7 @@ func (x *ExternalResourceMapping) String() string {
 func (*ExternalResourceMapping) ProtoMessage() {}
 
 func (x *ExternalResourceMapping) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[120]
+	mi := &file_daemon_proto_msgTypes[130]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12110,7 +13378,7 @@ func (x *ExternalResourceMapping) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExternalResourceMapping.ProtoReflect.Descriptor instead.
 func (*ExternalResourceMapping) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{120}
+	return file_daemon_proto_rawDescGZIP(), []int{130}
 }
 
 func (x *ExternalResourceMapping) GetResource() *ExternalResourceKey {
@@ -12136,7 +13404,7 @@ type ExternalResourceMappings struct {
 
 func (x *ExternalResourceMappings) Reset() {
 	*x = ExternalResourceMappings{}
-	mi := &file_daemon_proto_msgTypes[121]
+	mi := &file_daemon_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12148,7 +13416,7 @@ func (x *ExternalResourceMappings) String() string {
 func (*ExternalResourceMappings) ProtoMessage() {}
 
 func (x *ExternalResourceMappings) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[121]
+	mi := &file_daemon_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12161,7 +13429,7 @@ func (x *ExternalResourceMappings) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExternalResourceMappings.ProtoReflect.Descriptor instead.
 func (*ExternalResourceMappings) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{121}
+	return file_daemon_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *ExternalResourceMappings) GetValues() []*ExternalResourceMapping {
@@ -12185,7 +13453,7 @@ type ExternalResourcePolicy struct {
 
 func (x *ExternalResourcePolicy) Reset() {
 	*x = ExternalResourcePolicy{}
-	mi := &file_daemon_proto_msgTypes[122]
+	mi := &file_daemon_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12197,7 +13465,7 @@ func (x *ExternalResourcePolicy) String() string {
 func (*ExternalResourcePolicy) ProtoMessage() {}
 
 func (x *ExternalResourcePolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[122]
+	mi := &file_daemon_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12210,7 +13478,7 @@ func (x *ExternalResourcePolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExternalResourcePolicy.ProtoReflect.Descriptor instead.
 func (*ExternalResourcePolicy) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{122}
+	return file_daemon_proto_rawDescGZIP(), []int{132}
 }
 
 func (x *ExternalResourcePolicy) GetPolicy() isExternalResourcePolicy_Policy {
@@ -12280,7 +13548,7 @@ type StoppedForkRequest struct {
 
 func (x *StoppedForkRequest) Reset() {
 	*x = StoppedForkRequest{}
-	mi := &file_daemon_proto_msgTypes[123]
+	mi := &file_daemon_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12292,7 +13560,7 @@ func (x *StoppedForkRequest) String() string {
 func (*StoppedForkRequest) ProtoMessage() {}
 
 func (x *StoppedForkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[123]
+	mi := &file_daemon_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12305,7 +13573,7 @@ func (x *StoppedForkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoppedForkRequest.ProtoReflect.Descriptor instead.
 func (*StoppedForkRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{123}
+	return file_daemon_proto_rawDescGZIP(), []int{133}
 }
 
 func (x *StoppedForkRequest) GetMachine() *MachineRef {
@@ -12342,7 +13610,7 @@ type CreateStorageSnapshotRequest struct {
 
 func (x *CreateStorageSnapshotRequest) Reset() {
 	*x = CreateStorageSnapshotRequest{}
-	mi := &file_daemon_proto_msgTypes[124]
+	mi := &file_daemon_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12354,7 +13622,7 @@ func (x *CreateStorageSnapshotRequest) String() string {
 func (*CreateStorageSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateStorageSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[124]
+	mi := &file_daemon_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12367,7 +13635,7 @@ func (x *CreateStorageSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateStorageSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateStorageSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{124}
+	return file_daemon_proto_rawDescGZIP(), []int{134}
 }
 
 func (x *CreateStorageSnapshotRequest) GetMachine() *MachineRef {
@@ -12402,7 +13670,7 @@ type RestoreStorageSnapshotRequest struct {
 
 func (x *RestoreStorageSnapshotRequest) Reset() {
 	*x = RestoreStorageSnapshotRequest{}
-	mi := &file_daemon_proto_msgTypes[125]
+	mi := &file_daemon_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12414,7 +13682,7 @@ func (x *RestoreStorageSnapshotRequest) String() string {
 func (*RestoreStorageSnapshotRequest) ProtoMessage() {}
 
 func (x *RestoreStorageSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[125]
+	mi := &file_daemon_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12427,7 +13695,7 @@ func (x *RestoreStorageSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreStorageSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*RestoreStorageSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{125}
+	return file_daemon_proto_rawDescGZIP(), []int{135}
 }
 
 func (x *RestoreStorageSnapshotRequest) GetSnapshot() *StorageSnapshotRef {
@@ -12465,7 +13733,7 @@ type StorageSnapshotInfo struct {
 
 func (x *StorageSnapshotInfo) Reset() {
 	*x = StorageSnapshotInfo{}
-	mi := &file_daemon_proto_msgTypes[126]
+	mi := &file_daemon_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12477,7 +13745,7 @@ func (x *StorageSnapshotInfo) String() string {
 func (*StorageSnapshotInfo) ProtoMessage() {}
 
 func (x *StorageSnapshotInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[126]
+	mi := &file_daemon_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12490,7 +13758,7 @@ func (x *StorageSnapshotInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageSnapshotInfo.ProtoReflect.Descriptor instead.
 func (*StorageSnapshotInfo) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{126}
+	return file_daemon_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *StorageSnapshotInfo) GetId() string {
@@ -12544,7 +13812,7 @@ type StorageSnapshotList struct {
 
 func (x *StorageSnapshotList) Reset() {
 	*x = StorageSnapshotList{}
-	mi := &file_daemon_proto_msgTypes[127]
+	mi := &file_daemon_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12556,7 +13824,7 @@ func (x *StorageSnapshotList) String() string {
 func (*StorageSnapshotList) ProtoMessage() {}
 
 func (x *StorageSnapshotList) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[127]
+	mi := &file_daemon_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12569,7 +13837,7 @@ func (x *StorageSnapshotList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StorageSnapshotList.ProtoReflect.Descriptor instead.
 func (*StorageSnapshotList) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{127}
+	return file_daemon_proto_rawDescGZIP(), []int{137}
 }
 
 func (x *StorageSnapshotList) GetSnapshots() []*StorageSnapshotInfo {
@@ -12597,7 +13865,7 @@ type LiveDeviceSubject struct {
 
 func (x *LiveDeviceSubject) Reset() {
 	*x = LiveDeviceSubject{}
-	mi := &file_daemon_proto_msgTypes[128]
+	mi := &file_daemon_proto_msgTypes[138]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12609,7 +13877,7 @@ func (x *LiveDeviceSubject) String() string {
 func (*LiveDeviceSubject) ProtoMessage() {}
 
 func (x *LiveDeviceSubject) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[128]
+	mi := &file_daemon_proto_msgTypes[138]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12622,7 +13890,7 @@ func (x *LiveDeviceSubject) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveDeviceSubject.ProtoReflect.Descriptor instead.
 func (*LiveDeviceSubject) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{128}
+	return file_daemon_proto_rawDescGZIP(), []int{138}
 }
 
 func (x *LiveDeviceSubject) GetSubject() isLiveDeviceSubject_Subject {
@@ -12751,7 +14019,7 @@ type LiveUnsupportedReason struct {
 
 func (x *LiveUnsupportedReason) Reset() {
 	*x = LiveUnsupportedReason{}
-	mi := &file_daemon_proto_msgTypes[129]
+	mi := &file_daemon_proto_msgTypes[139]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12763,7 +14031,7 @@ func (x *LiveUnsupportedReason) String() string {
 func (*LiveUnsupportedReason) ProtoMessage() {}
 
 func (x *LiveUnsupportedReason) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[129]
+	mi := &file_daemon_proto_msgTypes[139]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12776,7 +14044,7 @@ func (x *LiveUnsupportedReason) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveUnsupportedReason.ProtoReflect.Descriptor instead.
 func (*LiveUnsupportedReason) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{129}
+	return file_daemon_proto_rawDescGZIP(), []int{139}
 }
 
 func (x *LiveUnsupportedReason) GetCode() LiveReasonCode {
@@ -12807,7 +14075,7 @@ type LiveCapability struct {
 
 func (x *LiveCapability) Reset() {
 	*x = LiveCapability{}
-	mi := &file_daemon_proto_msgTypes[130]
+	mi := &file_daemon_proto_msgTypes[140]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12819,7 +14087,7 @@ func (x *LiveCapability) String() string {
 func (*LiveCapability) ProtoMessage() {}
 
 func (x *LiveCapability) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[130]
+	mi := &file_daemon_proto_msgTypes[140]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12832,7 +14100,7 @@ func (x *LiveCapability) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveCapability.ProtoReflect.Descriptor instead.
 func (*LiveCapability) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{130}
+	return file_daemon_proto_rawDescGZIP(), []int{140}
 }
 
 func (x *LiveCapability) GetNative() bool {
@@ -12896,7 +14164,7 @@ type LiveCapabilityVector struct {
 
 func (x *LiveCapabilityVector) Reset() {
 	*x = LiveCapabilityVector{}
-	mi := &file_daemon_proto_msgTypes[131]
+	mi := &file_daemon_proto_msgTypes[141]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12908,7 +14176,7 @@ func (x *LiveCapabilityVector) String() string {
 func (*LiveCapabilityVector) ProtoMessage() {}
 
 func (x *LiveCapabilityVector) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[131]
+	mi := &file_daemon_proto_msgTypes[141]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12921,7 +14189,7 @@ func (x *LiveCapabilityVector) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveCapabilityVector.ProtoReflect.Descriptor instead.
 func (*LiveCapabilityVector) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{131}
+	return file_daemon_proto_rawDescGZIP(), []int{141}
 }
 
 func (x *LiveCapabilityVector) GetPause() *LiveCapability {
@@ -12975,7 +14243,7 @@ type LiveHostReport struct {
 
 func (x *LiveHostReport) Reset() {
 	*x = LiveHostReport{}
-	mi := &file_daemon_proto_msgTypes[132]
+	mi := &file_daemon_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12987,7 +14255,7 @@ func (x *LiveHostReport) String() string {
 func (*LiveHostReport) ProtoMessage() {}
 
 func (x *LiveHostReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[132]
+	mi := &file_daemon_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13000,7 +14268,7 @@ func (x *LiveHostReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveHostReport.ProtoReflect.Descriptor instead.
 func (*LiveHostReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{132}
+	return file_daemon_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *LiveHostReport) GetSchemaVersion() uint32 {
@@ -13076,7 +14344,7 @@ type LiveMachineReport struct {
 
 func (x *LiveMachineReport) Reset() {
 	*x = LiveMachineReport{}
-	mi := &file_daemon_proto_msgTypes[133]
+	mi := &file_daemon_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13088,7 +14356,7 @@ func (x *LiveMachineReport) String() string {
 func (*LiveMachineReport) ProtoMessage() {}
 
 func (x *LiveMachineReport) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[133]
+	mi := &file_daemon_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13101,7 +14369,7 @@ func (x *LiveMachineReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveMachineReport.ProtoReflect.Descriptor instead.
 func (*LiveMachineReport) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{133}
+	return file_daemon_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *LiveMachineReport) GetSchemaVersion() uint32 {
@@ -13179,7 +14447,7 @@ type LiveOperationUnsupported struct {
 
 func (x *LiveOperationUnsupported) Reset() {
 	*x = LiveOperationUnsupported{}
-	mi := &file_daemon_proto_msgTypes[134]
+	mi := &file_daemon_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13191,7 +14459,7 @@ func (x *LiveOperationUnsupported) String() string {
 func (*LiveOperationUnsupported) ProtoMessage() {}
 
 func (x *LiveOperationUnsupported) ProtoReflect() protoreflect.Message {
-	mi := &file_daemon_proto_msgTypes[134]
+	mi := &file_daemon_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13204,7 +14472,7 @@ func (x *LiveOperationUnsupported) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LiveOperationUnsupported.ProtoReflect.Descriptor instead.
 func (*LiveOperationUnsupported) Descriptor() ([]byte, []int) {
-	return file_daemon_proto_rawDescGZIP(), []int{134}
+	return file_daemon_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *LiveOperationUnsupported) GetOperation() LiveOperation {
@@ -13616,13 +14884,22 @@ const file_daemon_proto_rawDesc = "" +
 	"guestReady\x12\x1d\n" +
 	"\amessage\x18\x03 \x01(\tH\x00R\amessage\x88\x01\x01B\n" +
 	"\n" +
-	"\b_message\"\xbf\x02\n" +
+	"\b_message\"\xcc\x05\n" +
 	"\rMachineStatus\x122\n" +
 	"\astopped\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\astopped\x12=\n" +
 	"\bstarting\x18\x02 \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\bstarting\x129\n" +
 	"\arunning\x18\x03 \x01(\v2\x1d.silo.daemon.v1.RunningStatusH\x00R\arunning\x12=\n" +
 	"\bstopping\x18\x04 \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\bstopping\x127\n" +
-	"\x05error\x18\x05 \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\x05errorB\b\n" +
+	"\x05error\x18\x05 \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\x05error\x12;\n" +
+	"\apausing\x18\x06 \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\apausing\x129\n" +
+	"\x06paused\x18\a \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\x06paused\x12?\n" +
+	"\tcapturing\x18\b \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\tcapturing\x12?\n" +
+	"\trestoring\x18\t \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\trestoring\x12A\n" +
+	"\n" +
+	"activating\x18\n" +
+	" \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\n" +
+	"activating\x12N\n" +
+	"\x11activation_failed\x18\v \x01(\v2\x1f.silo.daemon.v1.LifecycleDetailH\x00R\x10activationFailedB\b\n" +
 	"\x06status\"\x83\x04\n" +
 	"\x06Rootfs\x12@\n" +
 	"\vsource_kind\x18\x01 \x01(\x0e2\x1f.silo.daemon.v1.ImageSourceKindR\n" +
@@ -13685,7 +14962,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x05steps\x18\x05 \x03(\v2#.silo.daemon.v1.ProvisionStepReportR\x05steps\x12\x1d\n" +
 	"\amessage\x18\x06 \x01(\tH\x00R\amessage\x88\x01\x01B\n" +
 	"\n" +
-	"\b_message\"\xda\x0e\n" +
+	"\b_message\"\x9a\x0f\n" +
 	"\x0fMachineSnapshot\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12*\n" +
@@ -13726,7 +15003,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\x13network_observation\x18\x1c \x01(\v2\".silo.daemon.v1.NetworkObservationR\x12networkObservation\x125\n" +
 	"\x04live\x18\x1d \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04live\x12I\n" +
 	"\x10prospective_live\x18\x1e \x01(\v2\x1e.silo.daemon.v1.LiveHostReportR\x0fprospectiveLive\x12K\n" +
-	"\rlive_evidence\x18\x1f \x01(\x0e2!.silo.daemon.v1.LiveEvidenceStateH\x04R\fliveEvidence\x88\x01\x01\x1a9\n" +
+	"\rlive_evidence\x18\x1f \x01(\x0e2!.silo.daemon.v1.LiveEvidenceStateH\x04R\fliveEvidence\x88\x01\x01\x12>\n" +
+	"\tlifecycle\x18  \x01(\v2 .silo.daemon.v1.MachineLifecycleR\tlifecycle\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a;\n" +
@@ -14092,7 +15370,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\vAgentStatus\x124\n" +
 	"\bdisabled\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\bdisabled\x128\n" +
 	"\aenabled\x18\x02 \x01(\v2\x1c.silo.daemon.v1.EnabledAgentH\x00R\aenabledB\b\n" +
-	"\x06status\"\xf8\x02\n" +
+	"\x06status\"\xb5\x03\n" +
 	"\rMonitorStatus\x12\x1d\n" +
 	"\n" +
 	"machine_id\x18\x01 \x01(\tR\tmachineId\x12\x1a\n" +
@@ -14102,7 +15380,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\x02vm\x18\x05 \x01(\v2\x1a.silo.daemon.v1.VmSnapshotR\x02vm\x12<\n" +
 	"\treadiness\x18\x06 \x01(\v2\x1e.silo.daemon.v1.ReadinessStateR\treadiness\x121\n" +
 	"\x05agent\x18\a \x01(\v2\x1b.silo.daemon.v1.AgentStatusR\x05agent\x125\n" +
-	"\x04live\x18\b \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04liveB\t\n" +
+	"\x04live\x18\b \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x04live\x12;\n" +
+	"\tlifecycle\x18\t \x01(\v2\x1d.silo.daemon.v1.LiveLifecycleR\tlifecycleB\t\n" +
 	"\a_run_id\"\xa9\x10\n" +
 	"\fSystemStatus\x121\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x1b.silo.daemon.v1.SystemPhaseR\x05phase\x12\"\n" +
@@ -14156,7 +15435,71 @@ const file_daemon_proto_rawDesc = "" +
 	"\x1c_host_memory_reclaim_backingB\x1d\n" +
 	"\x1b_host_memory_reclaim_reason\"J\n" +
 	"\x12LiveMachineRequest\x124\n" +
-	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\"l\n" +
+	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\"w\n" +
+	"\n" +
+	"PauseOwner\x12,\n" +
+	"\x04user\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\x04user\x122\n" +
+	"\x14capture_operation_id\x18\x02 \x01(\tH\x00R\x12captureOperationIdB\a\n" +
+	"\x05owner\"\x94\x01\n" +
+	"\n" +
+	"PauseToken\x12\x1d\n" +
+	"\n" +
+	"machine_id\x18\x01 \x01(\tR\tmachineId\x12\x15\n" +
+	"\x06run_id\x18\x02 \x01(\tR\x05runId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x03 \x01(\x04R\n" +
+	"generation\x120\n" +
+	"\x05owner\x18\x04 \x01(\v2\x1a.silo.daemon.v1.PauseOwnerR\x05owner\"\x86\x01\n" +
+	"\fCurrentPause\x120\n" +
+	"\x05token\x18\x01 \x01(\v2\x1a.silo.daemon.v1.PauseTokenR\x05token\x12!\n" +
+	"\foperation_id\x18\x02 \x01(\tR\voperationId\x12!\n" +
+	"\ffreeze_epoch\x18\x03 \x01(\x04R\vfreezeEpoch\"\xdd\x02\n" +
+	"\x16GuestFreezeObservation\x129\n" +
+	"\x05state\x18\x01 \x01(\x0e2#.silo.daemon.v1.GuestLifecycleStateR\x05state\x12&\n" +
+	"\ffreeze_epoch\x18\x02 \x01(\x04H\x00R\vfreezeEpoch\x88\x01\x01\x12%\n" +
+	"\x0eworkload_roots\x18\x03 \x03(\tR\rworkloadRoots\x122\n" +
+	"\x15observed_frozen_roots\x18\x04 \x03(\tR\x13observedFrozenRoots\x122\n" +
+	"\x12rollback_succeeded\x18\x05 \x01(\bH\x01R\x11rollbackSucceeded\x88\x01\x01\x12\x1d\n" +
+	"\afailure\x18\x06 \x01(\tH\x02R\afailure\x88\x01\x01B\x0f\n" +
+	"\r_freeze_epochB\x15\n" +
+	"\x13_rollback_succeededB\n" +
+	"\n" +
+	"\b_failure\"\xdc\x01\n" +
+	"\vLiveFailure\x123\n" +
+	"\x04code\x18\x01 \x01(\x0e2\x1f.silo.daemon.v1.LiveFailureCodeR\x04code\x12/\n" +
+	"\x05stage\x18\x02 \x01(\x0e2\x19.silo.daemon.v1.LiveStageR\x05stage\x12\x1d\n" +
+	"\amessage\x18\x03 \x01(\tH\x00R\amessage\x88\x01\x01\x12<\n" +
+	"\x05guest\x18\x04 \x01(\v2&.silo.daemon.v1.GuestFreezeObservationR\x05guestB\n" +
+	"\n" +
+	"\b_message\"\xbc\x01\n" +
+	"\fLiveActivity\x12!\n" +
+	"\foperation_id\x18\x01 \x01(\tR\voperationId\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x02 \x01(\tR\trequestId\x129\n" +
+	"\acommand\x18\x03 \x01(\x0e2\x1f.silo.daemon.v1.LiveCommandKindR\acommand\x12/\n" +
+	"\x05stage\x18\x04 \x01(\x0e2\x19.silo.daemon.v1.LiveStageR\x05stage\"\xbf\x01\n" +
+	"\rLiveLifecycle\x12A\n" +
+	"\rcurrent_pause\x18\x01 \x01(\v2\x1c.silo.daemon.v1.CurrentPauseR\fcurrentPause\x128\n" +
+	"\bactivity\x18\x02 \x01(\v2\x1c.silo.daemon.v1.LiveActivityR\bactivity\x121\n" +
+	"\x05error\x18\x03 \x01(\v2\x1b.silo.daemon.v1.LiveFailureR\x05error\"\xd0\x01\n" +
+	"\x10PauseEstablished\x120\n" +
+	"\x05token\x18\x01 \x01(\v2\x1a.silo.daemon.v1.PauseTokenR\x05token\x12!\n" +
+	"\ffreeze_epoch\x18\x02 \x01(\x04R\vfreezeEpoch\x12<\n" +
+	"\x05guest\x18\x03 \x01(\v2&.silo.daemon.v1.GuestFreezeObservationR\x05guest\x12)\n" +
+	"\x10capture_eligible\x18\x04 \x01(\bR\x0fcaptureEligible\"\xaa\x02\n" +
+	"\x13LiveOperationRecord\x12!\n" +
+	"\foperation_id\x18\x01 \x01(\tR\voperationId\x121\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x1d.silo.daemon.v1.OperationKindR\x04kind\x129\n" +
+	"\vin_progress\x18\x03 \x01(\v2\x16.google.protobuf.EmptyH\x00R\n" +
+	"inProgress\x12@\n" +
+	"\tsucceeded\x18\x04 \x01(\v2 .silo.daemon.v1.PauseEstablishedH\x00R\tsucceeded\x125\n" +
+	"\x06failed\x18\x05 \x01(\v2\x1b.silo.daemon.v1.LiveFailureH\x00R\x06failedB\t\n" +
+	"\aoutcome\"\xfc\x01\n" +
+	"\x10MachineLifecycle\x129\n" +
+	"\x06report\x18\x01 \x01(\v2!.silo.daemon.v1.LiveMachineReportR\x06report\x12-\n" +
+	"\x05state\x18\x02 \x01(\x0e2\x17.silo.daemon.v1.VmStateR\x05state\x12;\n" +
+	"\tlifecycle\x18\x03 \x01(\v2\x1d.silo.daemon.v1.LiveLifecycleR\tlifecycle\x12A\n" +
+	"\toperation\x18\x04 \x01(\v2#.silo.daemon.v1.LiveOperationRecordR\toperation\"l\n" +
 	"\x12LiveCaptureRequest\x124\n" +
 	"\amachine\x18\x01 \x01(\v2\x1a.silo.daemon.v1.MachineRefR\amachine\x12\x17\n" +
 	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01B\a\n" +
@@ -14491,14 +15834,22 @@ const file_daemon_proto_rawDesc = "" +
 	"\x1bENROLLMENT_MODE_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19ENROLLMENT_MODE_OAUTH_APP\x10\x01\x12\x1f\n" +
 	"\x1bENROLLMENT_MODE_INTERACTIVE\x10\x02\x12\x18\n" +
-	"\x14ENROLLMENT_MODE_NONE\x10\x03*\x92\x01\n" +
+	"\x14ENROLLMENT_MODE_NONE\x10\x03*\xba\x02\n" +
 	"\aVmState\x12\x18\n" +
 	"\x14VM_STATE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11VM_STATE_STARTING\x10\x01\x12\x14\n" +
 	"\x10VM_STATE_RUNNING\x10\x02\x12\x15\n" +
 	"\x11VM_STATE_STOPPING\x10\x03\x12\x14\n" +
 	"\x10VM_STATE_STOPPED\x10\x04\x12\x13\n" +
-	"\x0fVM_STATE_FAILED\x10\x05*\xa5\x03\n" +
+	"\x0fVM_STATE_FAILED\x10\x05\x12\x14\n" +
+	"\x10VM_STATE_PAUSING\x10\x06\x12\x13\n" +
+	"\x0fVM_STATE_PAUSED\x10\a\x12\x16\n" +
+	"\x12VM_STATE_CAPTURING\x10\b\x12\x16\n" +
+	"\x12VM_STATE_RESTORING\x10\t\x12\x17\n" +
+	"\x13VM_STATE_ACTIVATING\x10\n" +
+	"\x12\x1e\n" +
+	"\x1aVM_STATE_ACTIVATION_FAILED\x10\v\x12\x12\n" +
+	"\x0eVM_STATE_ERROR\x10\f*\x9a\x05\n" +
 	"\x0fReadinessReason\x12 \n" +
 	"\x1cREADINESS_REASON_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cREADINESS_REASON_VM_STARTING\x10\x01\x12 \n" +
@@ -14511,7 +15862,14 @@ const file_daemon_proto_rawDesc = "" +
 	"\x1fREADINESS_REASON_GUEST_STARTING\x10\b\x12!\n" +
 	"\x1dREADINESS_REASON_GUEST_FAILED\x10\t\x12)\n" +
 	"%READINESS_REASON_GUEST_REPORTED_READY\x10\n" +
-	"*\xb5\x01\n" +
+	"\x12\x1f\n" +
+	"\x1bREADINESS_REASON_VM_PAUSING\x10\v\x12\x1e\n" +
+	"\x1aREADINESS_REASON_VM_PAUSED\x10\f\x12!\n" +
+	"\x1dREADINESS_REASON_VM_CAPTURING\x10\r\x12!\n" +
+	"\x1dREADINESS_REASON_VM_RESTORING\x10\x0e\x12\"\n" +
+	"\x1eREADINESS_REASON_VM_ACTIVATING\x10\x0f\x12)\n" +
+	"%READINESS_REASON_VM_ACTIVATION_FAILED\x10\x10\x12\x1d\n" +
+	"\x19READINESS_REASON_VM_ERROR\x10\x11*\xb5\x01\n" +
 	"\x14AgentConnectionState\x12&\n" +
 	"\"AGENT_CONNECTION_STATE_UNSPECIFIED\x10\x00\x12%\n" +
 	"!AGENT_CONNECTION_STATE_CONNECTING\x10\x01\x12%\n" +
@@ -14556,7 +15914,73 @@ const file_daemon_proto_rawDesc = "" +
 	" MEMORY_RECLAIM_OUTCOME_RECLAIMED\x10\x01\x12\"\n" +
 	"\x1eMEMORY_RECLAIM_OUTCOME_PARTIAL\x10\x02\x12\"\n" +
 	"\x1eMEMORY_RECLAIM_OUTCOME_NOTHING\x10\x03\x12!\n" +
-	"\x1dMEMORY_RECLAIM_OUTCOME_FAILED\x10\x04*d\n" +
+	"\x1dMEMORY_RECLAIM_OUTCOME_FAILED\x10\x04*\x82\x02\n" +
+	"\x0fLiveCommandKind\x12!\n" +
+	"\x1dLIVE_COMMAND_KIND_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17LIVE_COMMAND_KIND_PAUSE\x10\x01\x12\x1c\n" +
+	"\x18LIVE_COMMAND_KIND_RESUME\x10\x02\x12#\n" +
+	"\x1fLIVE_COMMAND_KIND_GET_OPERATION\x10\x03\x12&\n" +
+	"\"LIVE_COMMAND_KIND_CANCEL_OPERATION\x10\x04\x12\x1d\n" +
+	"\x19LIVE_COMMAND_KIND_CAPTURE\x10\x05\x12%\n" +
+	"!LIVE_COMMAND_KIND_RELEASE_CAPTURE\x10\x06*\xdf\x03\n" +
+	"\tLiveStage\x12\x1a\n" +
+	"\x16LIVE_STAGE_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18LIVE_STAGE_MONITOR_DRAIN\x10\x01\x12\x1b\n" +
+	"\x17LIVE_STAGE_GUEST_FREEZE\x10\x02\x12\x1b\n" +
+	"\x17LIVE_STAGE_NATIVE_PAUSE\x10\x03\x12\x1b\n" +
+	"\x17LIVE_STAGE_PAUSE_FAILED\x10\x04\x12\x1c\n" +
+	"\x18LIVE_STAGE_ROLLBACK_THAW\x10\x05\x12\x1c\n" +
+	"\x18LIVE_STAGE_CANCEL_NATIVE\x10\x06\x12\x1a\n" +
+	"\x16LIVE_STAGE_CANCEL_THAW\x10\a\x12\x1c\n" +
+	"\x18LIVE_STAGE_RESUME_NATIVE\x10\b\x12\x1b\n" +
+	"\x17LIVE_STAGE_RESUME_CLOCK\x10\t\x12\x1f\n" +
+	"\x1bLIVE_STAGE_RESUME_HANDSHAKE\x10\n" +
+	"\x12\x1a\n" +
+	"\x16LIVE_STAGE_RESUME_THAW\x10\v\x12\x18\n" +
+	"\x14LIVE_STAGE_READINESS\x10\f\x12\x1e\n" +
+	"\x1aLIVE_STAGE_RECOVERY_FREEZE\x10\r\x12\x1d\n" +
+	"\x19LIVE_STAGE_RECOVERY_PAUSE\x10\x0e\x12\x18\n" +
+	"\x14LIVE_STAGE_ADMISSION\x10\x0f*\xe1\x06\n" +
+	"\x0fLiveFailureCode\x12!\n" +
+	"\x1dLIVE_FAILURE_CODE_UNSPECIFIED\x10\x00\x12%\n" +
+	"!LIVE_FAILURE_CODE_DRAIN_TIMED_OUT\x10\x01\x12'\n" +
+	"#LIVE_FAILURE_CODE_GUEST_UNAVAILABLE\x10\x02\x12-\n" +
+	")LIVE_FAILURE_CODE_GUEST_IDENTITY_MISMATCH\x10\x03\x12#\n" +
+	"\x1fLIVE_FAILURE_CODE_FREEZE_FAILED\x10\x04\x12&\n" +
+	"\"LIVE_FAILURE_CODE_FREEZE_TIMED_OUT\x10\x05\x12)\n" +
+	"%LIVE_FAILURE_CODE_NATIVE_PAUSE_FAILED\x10\x06\x12&\n" +
+	"\"LIVE_FAILURE_CODE_NATIVE_UNCERTAIN\x10\a\x12\x1f\n" +
+	"\x1bLIVE_FAILURE_CODE_CANCELLED\x10\b\x12,\n" +
+	"(LIVE_FAILURE_CODE_NATIVE_ROLLBACK_FAILED\x10\t\x12!\n" +
+	"\x1dLIVE_FAILURE_CODE_THAW_FAILED\x10\n" +
+	"\x12)\n" +
+	"%LIVE_FAILURE_CODE_THAW_UNACKNOWLEDGED\x10\v\x12*\n" +
+	"&LIVE_FAILURE_CODE_NATIVE_RESUME_FAILED\x10\f\x12-\n" +
+	")LIVE_FAILURE_CODE_CLOCK_GENERATION_FAILED\x10\r\x12&\n" +
+	"\"LIVE_FAILURE_CODE_HANDSHAKE_FAILED\x10\x0e\x12&\n" +
+	"\"LIVE_FAILURE_CODE_READINESS_FAILED\x10\x0f\x12,\n" +
+	"(LIVE_FAILURE_CODE_RECOVERY_FREEZE_FAILED\x10\x10\x12+\n" +
+	"'LIVE_FAILURE_CODE_RECOVERY_PAUSE_FAILED\x10\x11\x12!\n" +
+	"\x1dLIVE_FAILURE_CODE_WORKER_LOST\x10\x12\x12\x1d\n" +
+	"\x19LIVE_FAILURE_CODE_STOPPED\x10\x13\x12'\n" +
+	"#LIVE_FAILURE_CODE_DEADLINE_EXCEEDED\x10\x14*\xb5\x03\n" +
+	"\x13GuestLifecycleState\x12%\n" +
+	"!GUEST_LIFECYCLE_STATE_UNSPECIFIED\x10\x00\x12!\n" +
+	"\x1dGUEST_LIFECYCLE_STATE_RUNNING\x10\x01\x12\"\n" +
+	"\x1eGUEST_LIFECYCLE_STATE_FREEZING\x10\x02\x12 \n" +
+	"\x1cGUEST_LIFECYCLE_STATE_FROZEN\x10\x03\x12$\n" +
+	" GUEST_LIFECYCLE_STATE_ACTIVATING\x10\x04\x12*\n" +
+	"&GUEST_LIFECYCLE_STATE_ACTIVATED_FROZEN\x10\x05\x12!\n" +
+	"\x1dGUEST_LIFECYCLE_STATE_THAWING\x10\x06\x12 \n" +
+	"\x1cGUEST_LIFECYCLE_STATE_THAWED\x10\a\x12'\n" +
+	"#GUEST_LIFECYCLE_STATE_FREEZE_FAILED\x10\b\x12+\n" +
+	"'GUEST_LIFECYCLE_STATE_ACTIVATION_FAILED\x10\t\x12!\n" +
+	"\x1dGUEST_LIFECYCLE_STATE_FAULTED\x10\n" +
+	"*e\n" +
+	"\rOperationKind\x12\x1e\n" +
+	"\x1aOPERATION_KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14OPERATION_KIND_PAUSE\x10\x01\x12\x1a\n" +
+	"\x16OPERATION_KIND_CAPTURE\x10\x02*d\n" +
 	"\x12StorageCaptureKind\x12$\n" +
 	" STORAGE_CAPTURE_KIND_UNSPECIFIED\x10\x00\x12(\n" +
 	"$STORAGE_CAPTURE_KIND_STOPPED_STORAGE\x10\x01*\xba\x01\n" +
@@ -14601,7 +16025,7 @@ const file_daemon_proto_rawDesc = "" +
 	"\x0eGetRuntimeInfo\x12\x16.google.protobuf.Empty\x1a\x1b.silo.daemon.v1.RuntimeInfo\x12V\n" +
 	"\x15ReportTailscaleStatus\x12%.silo.daemon.v1.TailscaleStatusReport\x1a\x16.google.protobuf.Empty\x12O\n" +
 	"\x0eDrainMutations\x12%.silo.daemon.v1.DrainMutationsRequest\x1a\x16.google.protobuf.Empty\x12M\n" +
-	"\x13GetLiveCapabilities\x12\x16.google.protobuf.Empty\x1a\x1e.silo.daemon.v1.LiveHostReport2\xb1\r\n" +
+	"\x13GetLiveCapabilities\x12\x16.google.protobuf.Empty\x1a\x1e.silo.daemon.v1.LiveHostReport2\x90\x0e\n" +
 	"\x0eMachineService\x12O\n" +
 	"\fListMachines\x12\x16.google.protobuf.Empty\x1a%.silo.daemon.v1.MachineInventoryEntry0\x01\x12U\n" +
 	"\x10InspectInventory\x12\x1a.silo.daemon.v1.MachineRef\x1a%.silo.daemon.v1.MachineInventoryEntry\x12M\n" +
@@ -14619,8 +16043,9 @@ const file_daemon_proto_rawDesc = "" +
 	"WaitForRun\x12!.silo.daemon.v1.WaitForRunRequest\x1a\x1b.silo.daemon.v1.MachineExit\x12G\n" +
 	"\x0eRemoveAfterRun\x12\x1d.silo.daemon.v1.MachineRunRef\x1a\x16.google.protobuf.Empty\x12G\n" +
 	"\bReadLogs\x12\x1f.silo.daemon.v1.ReadLogsRequest\x1a\x18.silo.daemon.v1.LogChunk0\x01\x12S\n" +
-	"\x10SetMachineSecret\x12'.silo.daemon.v1.SetMachineSecretRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
-	"\fPauseMachine\x12\".silo.daemon.v1.LiveMachineRequest\x1a\x16.google.protobuf.Empty\x12N\n" +
+	"\x10SetMachineSecret\x12'.silo.daemon.v1.SetMachineSecretRequest\x1a\x16.google.protobuf.Empty\x12S\n" +
+	"\fPauseMachine\x12\".silo.daemon.v1.LiveMachineRequest\x1a\x1f.silo.daemon.v1.MachineSnapshot\x12T\n" +
+	"\rResumeMachine\x12\".silo.daemon.v1.LiveMachineRequest\x1a\x1f.silo.daemon.v1.MachineSnapshot\x12N\n" +
 	"\x10CaptureExecution\x12\".silo.daemon.v1.LiveCaptureRequest\x1a\x16.google.protobuf.Empty\x12H\n" +
 	"\rForkExecution\x12\x1f.silo.daemon.v1.LiveForkRequest\x1a\x16.google.protobuf.Empty\x12R\n" +
 	"\vForkStopped\x12\".silo.daemon.v1.StoppedForkRequest\x1a\x1f.silo.daemon.v1.MachineSnapshot\x12d\n" +
@@ -14657,8 +16082,8 @@ func file_daemon_proto_rawDescGZIP() []byte {
 	return file_daemon_proto_rawDescData
 }
 
-var file_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 50)
-var file_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 141)
+var file_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 55)
+var file_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 151)
 var file_daemon_proto_goTypes = []any{
 	(Retention)(0),                         // 0: silo.daemon.v1.Retention
 	(DiskRole)(0),                          // 1: silo.daemon.v1.DiskRole
@@ -14703,532 +16128,579 @@ var file_daemon_proto_goTypes = []any{
 	(SshBackend)(0),                        // 40: silo.daemon.v1.SshBackend
 	(SystemPhase)(0),                       // 41: silo.daemon.v1.SystemPhase
 	(MemoryReclaimOutcome)(0),              // 42: silo.daemon.v1.MemoryReclaimOutcome
-	(StorageCaptureKind)(0),                // 43: silo.daemon.v1.StorageCaptureKind
-	(LiveOperation)(0),                     // 44: silo.daemon.v1.LiveOperation
-	(LiveBackend)(0),                       // 45: silo.daemon.v1.LiveBackend
-	(LiveLane)(0),                          // 46: silo.daemon.v1.LiveLane
-	(LiveScope)(0),                         // 47: silo.daemon.v1.LiveScope
-	(LiveReasonCode)(0),                    // 48: silo.daemon.v1.LiveReasonCode
-	(LiveEvidenceState)(0),                 // 49: silo.daemon.v1.LiveEvidenceState
-	(*Name)(nil),                           // 50: silo.daemon.v1.Name
-	(*MachineRef)(nil),                     // 51: silo.daemon.v1.MachineRef
-	(*MachineRunRef)(nil),                  // 52: silo.daemon.v1.MachineRunRef
-	(*StringList)(nil),                     // 53: silo.daemon.v1.StringList
-	(*StringMap)(nil),                      // 54: silo.daemon.v1.StringMap
-	(*EnvironmentPair)(nil),                // 55: silo.daemon.v1.EnvironmentPair
-	(*ProcessConfig)(nil),                  // 56: silo.daemon.v1.ProcessConfig
-	(*Agent)(nil),                          // 57: silo.daemon.v1.Agent
-	(*User)(nil),                           // 58: silo.daemon.v1.User
-	(*GuestConfig)(nil),                    // 59: silo.daemon.v1.GuestConfig
-	(*Mount)(nil),                          // 60: silo.daemon.v1.Mount
-	(*DiskGeometry)(nil),                   // 61: silo.daemon.v1.DiskGeometry
-	(*Disk)(nil),                           // 62: silo.daemon.v1.Disk
-	(*Address)(nil),                        // 63: silo.daemon.v1.Address
-	(*Endpoint)(nil),                       // 64: silo.daemon.v1.Endpoint
-	(*Forward)(nil),                        // 65: silo.daemon.v1.Forward
-	(*ForwardList)(nil),                    // 66: silo.daemon.v1.ForwardList
-	(*Vsock)(nil),                          // 67: silo.daemon.v1.Vsock
-	(*Kernel)(nil),                         // 68: silo.daemon.v1.Kernel
-	(*Boot)(nil),                           // 69: silo.daemon.v1.Boot
-	(*Hardware)(nil),                       // 70: silo.daemon.v1.Hardware
-	(*Storage)(nil),                        // 71: silo.daemon.v1.Storage
-	(*VmGuest)(nil),                        // 72: silo.daemon.v1.VmGuest
-	(*VmSpec)(nil),                         // 73: silo.daemon.v1.VmSpec
-	(*PrivateNetwork)(nil),                 // 74: silo.daemon.v1.PrivateNetwork
-	(*ResolvedNetwork)(nil),                // 75: silo.daemon.v1.ResolvedNetwork
-	(*NetworkDefinition)(nil),              // 76: silo.daemon.v1.NetworkDefinition
-	(*OptionalNetworkDefinition)(nil),      // 77: silo.daemon.v1.OptionalNetworkDefinition
-	(*CreateNetworkDefinitionRequest)(nil), // 78: silo.daemon.v1.CreateNetworkDefinitionRequest
-	(*SetMachineNetworkRequest)(nil),       // 79: silo.daemon.v1.SetMachineNetworkRequest
-	(*TemporaryDirectoryPolicy)(nil),       // 80: silo.daemon.v1.TemporaryDirectoryPolicy
-	(*NormalizedMachineCreate)(nil),        // 81: silo.daemon.v1.NormalizedMachineCreate
-	(*OciIdentity)(nil),                    // 82: silo.daemon.v1.OciIdentity
-	(*ResolvedImage)(nil),                  // 83: silo.daemon.v1.ResolvedImage
-	(*CreateMachineRequest)(nil),           // 84: silo.daemon.v1.CreateMachineRequest
-	(*ImageReferenceProgress)(nil),         // 85: silo.daemon.v1.ImageReferenceProgress
-	(*ManifestProgress)(nil),               // 86: silo.daemon.v1.ManifestProgress
-	(*LayerProgress)(nil),                  // 87: silo.daemon.v1.LayerProgress
-	(*ApplyingLayerProgress)(nil),          // 88: silo.daemon.v1.ApplyingLayerProgress
-	(*ImageProgress)(nil),                  // 89: silo.daemon.v1.ImageProgress
-	(*CreateMachineEvent)(nil),             // 90: silo.daemon.v1.CreateMachineEvent
-	(*ResolveImageRequest)(nil),            // 91: silo.daemon.v1.ResolveImageRequest
-	(*ResolveImageEvent)(nil),              // 92: silo.daemon.v1.ResolveImageEvent
-	(*PullImageRequest)(nil),               // 93: silo.daemon.v1.PullImageRequest
-	(*EgressSecret)(nil),                   // 94: silo.daemon.v1.EgressSecret
-	(*Entrypoint)(nil),                     // 95: silo.daemon.v1.Entrypoint
-	(*StartOptions)(nil),                   // 96: silo.daemon.v1.StartOptions
-	(*StartMachineRequest)(nil),            // 97: silo.daemon.v1.StartMachineRequest
-	(*StopMachineRequest)(nil),             // 98: silo.daemon.v1.StopMachineRequest
-	(*RemoveMachineRequest)(nil),           // 99: silo.daemon.v1.RemoveMachineRequest
-	(*PolicyUpdate)(nil),                   // 100: silo.daemon.v1.PolicyUpdate
-	(*PublicationUpdate)(nil),              // 101: silo.daemon.v1.PublicationUpdate
-	(*UserUpdate)(nil),                     // 102: silo.daemon.v1.UserUpdate
-	(*MachineUpdate)(nil),                  // 103: silo.daemon.v1.MachineUpdate
-	(*UpdateMachineRequest)(nil),           // 104: silo.daemon.v1.UpdateMachineRequest
-	(*WaitReadyRequest)(nil),               // 105: silo.daemon.v1.WaitReadyRequest
-	(*StopRunRequest)(nil),                 // 106: silo.daemon.v1.StopRunRequest
-	(*KillRunRequest)(nil),                 // 107: silo.daemon.v1.KillRunRequest
-	(*WaitForRunRequest)(nil),              // 108: silo.daemon.v1.WaitForRunRequest
-	(*MachineIssue)(nil),                   // 109: silo.daemon.v1.MachineIssue
-	(*LifecycleDetail)(nil),                // 110: silo.daemon.v1.LifecycleDetail
-	(*RunningStatus)(nil),                  // 111: silo.daemon.v1.RunningStatus
-	(*MachineStatus)(nil),                  // 112: silo.daemon.v1.MachineStatus
-	(*Rootfs)(nil),                         // 113: silo.daemon.v1.Rootfs
-	(*MachineTailscale)(nil),               // 114: silo.daemon.v1.MachineTailscale
-	(*BootReport)(nil),                     // 115: silo.daemon.v1.BootReport
-	(*ProvisionStepReport)(nil),            // 116: silo.daemon.v1.ProvisionStepReport
-	(*ProvisionReport)(nil),                // 117: silo.daemon.v1.ProvisionReport
-	(*MachineSnapshot)(nil),                // 118: silo.daemon.v1.MachineSnapshot
-	(*MachineInventoryEntry)(nil),          // 119: silo.daemon.v1.MachineInventoryEntry
-	(*MachineStart)(nil),                   // 120: silo.daemon.v1.MachineStart
-	(*MachineReadiness)(nil),               // 121: silo.daemon.v1.MachineReadiness
-	(*MachineExit)(nil),                    // 122: silo.daemon.v1.MachineExit
-	(*ReadLogsRequest)(nil),                // 123: silo.daemon.v1.ReadLogsRequest
-	(*LogChunk)(nil),                       // 124: silo.daemon.v1.LogChunk
-	(*SetMachineSecretRequest)(nil),        // 125: silo.daemon.v1.SetMachineSecretRequest
-	(*ParseResourceRequest)(nil),           // 126: silo.daemon.v1.ParseResourceRequest
-	(*Size)(nil),                           // 127: silo.daemon.v1.Size
-	(*NormalizePolicyRequest)(nil),         // 128: silo.daemon.v1.NormalizePolicyRequest
-	(*SecretAlternative)(nil),              // 129: silo.daemon.v1.SecretAlternative
-	(*SecretRequirement)(nil),              // 130: silo.daemon.v1.SecretRequirement
-	(*SecretSlot)(nil),                     // 131: silo.daemon.v1.SecretSlot
-	(*PolicyDocument)(nil),                 // 132: silo.daemon.v1.PolicyDocument
-	(*CheckPolicySecretsRequest)(nil),      // 133: silo.daemon.v1.CheckPolicySecretsRequest
-	(*SecretDiagnostic)(nil),               // 134: silo.daemon.v1.SecretDiagnostic
-	(*PolicySecretsResult)(nil),            // 135: silo.daemon.v1.PolicySecretsResult
-	(*ErrorDetail)(nil),                    // 136: silo.daemon.v1.ErrorDetail
-	(*NodeStatus)(nil),                     // 137: silo.daemon.v1.NodeStatus
-	(*NodeObservation)(nil),                // 138: silo.daemon.v1.NodeObservation
-	(*NetworkObservation)(nil),             // 139: silo.daemon.v1.NetworkObservation
-	(*ComponentStatus)(nil),                // 140: silo.daemon.v1.ComponentStatus
-	(*DaemonStatus)(nil),                   // 141: silo.daemon.v1.DaemonStatus
-	(*RuntimeComponents)(nil),              // 142: silo.daemon.v1.RuntimeComponents
-	(*RuntimeInfo)(nil),                    // 143: silo.daemon.v1.RuntimeInfo
-	(*TailscaleStatusReport)(nil),          // 144: silo.daemon.v1.TailscaleStatusReport
-	(*DrainMutationsRequest)(nil),          // 145: silo.daemon.v1.DrainMutationsRequest
-	(*ResourceDefaults)(nil),               // 146: silo.daemon.v1.ResourceDefaults
-	(*ResourceCeilings)(nil),               // 147: silo.daemon.v1.ResourceCeilings
-	(*TailscaleSettings)(nil),              // 148: silo.daemon.v1.TailscaleSettings
-	(*HelperBootstrap)(nil),                // 149: silo.daemon.v1.HelperBootstrap
-	(*MonitorSnapshot)(nil),                // 150: silo.daemon.v1.MonitorSnapshot
-	(*VmSnapshot)(nil),                     // 151: silo.daemon.v1.VmSnapshot
-	(*ReadinessState)(nil),                 // 152: silo.daemon.v1.ReadinessState
-	(*AgentConnection)(nil),                // 153: silo.daemon.v1.AgentConnection
-	(*AgentIdentity)(nil),                  // 154: silo.daemon.v1.AgentIdentity
-	(*SystemInfo)(nil),                     // 155: silo.daemon.v1.SystemInfo
-	(*SshListenerReport)(nil),              // 156: silo.daemon.v1.SshListenerReport
-	(*GuestProvisionReport)(nil),           // 157: silo.daemon.v1.GuestProvisionReport
-	(*AgentStatusReport)(nil),              // 158: silo.daemon.v1.AgentStatusReport
-	(*AgentStatusObservation)(nil),         // 159: silo.daemon.v1.AgentStatusObservation
-	(*EnabledAgent)(nil),                   // 160: silo.daemon.v1.EnabledAgent
-	(*AgentStatus)(nil),                    // 161: silo.daemon.v1.AgentStatus
-	(*MonitorStatus)(nil),                  // 162: silo.daemon.v1.MonitorStatus
-	(*SystemStatus)(nil),                   // 163: silo.daemon.v1.SystemStatus
-	(*LiveMachineRequest)(nil),             // 164: silo.daemon.v1.LiveMachineRequest
-	(*LiveCaptureRequest)(nil),             // 165: silo.daemon.v1.LiveCaptureRequest
-	(*LiveForkRequest)(nil),                // 166: silo.daemon.v1.LiveForkRequest
-	(*LiveRestoreRequest)(nil),             // 167: silo.daemon.v1.LiveRestoreRequest
-	(*StorageSnapshotRef)(nil),             // 168: silo.daemon.v1.StorageSnapshotRef
-	(*ExternalResourceKey)(nil),            // 169: silo.daemon.v1.ExternalResourceKey
-	(*ExternalResourceMapping)(nil),        // 170: silo.daemon.v1.ExternalResourceMapping
-	(*ExternalResourceMappings)(nil),       // 171: silo.daemon.v1.ExternalResourceMappings
-	(*ExternalResourcePolicy)(nil),         // 172: silo.daemon.v1.ExternalResourcePolicy
-	(*StoppedForkRequest)(nil),             // 173: silo.daemon.v1.StoppedForkRequest
-	(*CreateStorageSnapshotRequest)(nil),   // 174: silo.daemon.v1.CreateStorageSnapshotRequest
-	(*RestoreStorageSnapshotRequest)(nil),  // 175: silo.daemon.v1.RestoreStorageSnapshotRequest
-	(*StorageSnapshotInfo)(nil),            // 176: silo.daemon.v1.StorageSnapshotInfo
-	(*StorageSnapshotList)(nil),            // 177: silo.daemon.v1.StorageSnapshotList
-	(*LiveDeviceSubject)(nil),              // 178: silo.daemon.v1.LiveDeviceSubject
-	(*LiveUnsupportedReason)(nil),          // 179: silo.daemon.v1.LiveUnsupportedReason
-	(*LiveCapability)(nil),                 // 180: silo.daemon.v1.LiveCapability
-	(*LiveCapabilityVector)(nil),           // 181: silo.daemon.v1.LiveCapabilityVector
-	(*LiveHostReport)(nil),                 // 182: silo.daemon.v1.LiveHostReport
-	(*LiveMachineReport)(nil),              // 183: silo.daemon.v1.LiveMachineReport
-	(*LiveOperationUnsupported)(nil),       // 184: silo.daemon.v1.LiveOperationUnsupported
-	nil,                                    // 185: silo.daemon.v1.StringMap.ValuesEntry
-	nil,                                    // 186: silo.daemon.v1.ProcessConfig.EnvironmentEntry
-	nil,                                    // 187: silo.daemon.v1.VmSpec.AnnotationsEntry
-	nil,                                    // 188: silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
-	nil,                                    // 189: silo.daemon.v1.MachineSnapshot.LabelsEntry
-	nil,                                    // 190: silo.daemon.v1.MachineSnapshot.MetadataEntry
-	(*emptypb.Empty)(nil),                  // 191: google.protobuf.Empty
-	(*durationpb.Duration)(nil),            // 192: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),          // 193: google.protobuf.Timestamp
+	(LiveCommandKind)(0),                   // 43: silo.daemon.v1.LiveCommandKind
+	(LiveStage)(0),                         // 44: silo.daemon.v1.LiveStage
+	(LiveFailureCode)(0),                   // 45: silo.daemon.v1.LiveFailureCode
+	(GuestLifecycleState)(0),               // 46: silo.daemon.v1.GuestLifecycleState
+	(OperationKind)(0),                     // 47: silo.daemon.v1.OperationKind
+	(StorageCaptureKind)(0),                // 48: silo.daemon.v1.StorageCaptureKind
+	(LiveOperation)(0),                     // 49: silo.daemon.v1.LiveOperation
+	(LiveBackend)(0),                       // 50: silo.daemon.v1.LiveBackend
+	(LiveLane)(0),                          // 51: silo.daemon.v1.LiveLane
+	(LiveScope)(0),                         // 52: silo.daemon.v1.LiveScope
+	(LiveReasonCode)(0),                    // 53: silo.daemon.v1.LiveReasonCode
+	(LiveEvidenceState)(0),                 // 54: silo.daemon.v1.LiveEvidenceState
+	(*Name)(nil),                           // 55: silo.daemon.v1.Name
+	(*MachineRef)(nil),                     // 56: silo.daemon.v1.MachineRef
+	(*MachineRunRef)(nil),                  // 57: silo.daemon.v1.MachineRunRef
+	(*StringList)(nil),                     // 58: silo.daemon.v1.StringList
+	(*StringMap)(nil),                      // 59: silo.daemon.v1.StringMap
+	(*EnvironmentPair)(nil),                // 60: silo.daemon.v1.EnvironmentPair
+	(*ProcessConfig)(nil),                  // 61: silo.daemon.v1.ProcessConfig
+	(*Agent)(nil),                          // 62: silo.daemon.v1.Agent
+	(*User)(nil),                           // 63: silo.daemon.v1.User
+	(*GuestConfig)(nil),                    // 64: silo.daemon.v1.GuestConfig
+	(*Mount)(nil),                          // 65: silo.daemon.v1.Mount
+	(*DiskGeometry)(nil),                   // 66: silo.daemon.v1.DiskGeometry
+	(*Disk)(nil),                           // 67: silo.daemon.v1.Disk
+	(*Address)(nil),                        // 68: silo.daemon.v1.Address
+	(*Endpoint)(nil),                       // 69: silo.daemon.v1.Endpoint
+	(*Forward)(nil),                        // 70: silo.daemon.v1.Forward
+	(*ForwardList)(nil),                    // 71: silo.daemon.v1.ForwardList
+	(*Vsock)(nil),                          // 72: silo.daemon.v1.Vsock
+	(*Kernel)(nil),                         // 73: silo.daemon.v1.Kernel
+	(*Boot)(nil),                           // 74: silo.daemon.v1.Boot
+	(*Hardware)(nil),                       // 75: silo.daemon.v1.Hardware
+	(*Storage)(nil),                        // 76: silo.daemon.v1.Storage
+	(*VmGuest)(nil),                        // 77: silo.daemon.v1.VmGuest
+	(*VmSpec)(nil),                         // 78: silo.daemon.v1.VmSpec
+	(*PrivateNetwork)(nil),                 // 79: silo.daemon.v1.PrivateNetwork
+	(*ResolvedNetwork)(nil),                // 80: silo.daemon.v1.ResolvedNetwork
+	(*NetworkDefinition)(nil),              // 81: silo.daemon.v1.NetworkDefinition
+	(*OptionalNetworkDefinition)(nil),      // 82: silo.daemon.v1.OptionalNetworkDefinition
+	(*CreateNetworkDefinitionRequest)(nil), // 83: silo.daemon.v1.CreateNetworkDefinitionRequest
+	(*SetMachineNetworkRequest)(nil),       // 84: silo.daemon.v1.SetMachineNetworkRequest
+	(*TemporaryDirectoryPolicy)(nil),       // 85: silo.daemon.v1.TemporaryDirectoryPolicy
+	(*NormalizedMachineCreate)(nil),        // 86: silo.daemon.v1.NormalizedMachineCreate
+	(*OciIdentity)(nil),                    // 87: silo.daemon.v1.OciIdentity
+	(*ResolvedImage)(nil),                  // 88: silo.daemon.v1.ResolvedImage
+	(*CreateMachineRequest)(nil),           // 89: silo.daemon.v1.CreateMachineRequest
+	(*ImageReferenceProgress)(nil),         // 90: silo.daemon.v1.ImageReferenceProgress
+	(*ManifestProgress)(nil),               // 91: silo.daemon.v1.ManifestProgress
+	(*LayerProgress)(nil),                  // 92: silo.daemon.v1.LayerProgress
+	(*ApplyingLayerProgress)(nil),          // 93: silo.daemon.v1.ApplyingLayerProgress
+	(*ImageProgress)(nil),                  // 94: silo.daemon.v1.ImageProgress
+	(*CreateMachineEvent)(nil),             // 95: silo.daemon.v1.CreateMachineEvent
+	(*ResolveImageRequest)(nil),            // 96: silo.daemon.v1.ResolveImageRequest
+	(*ResolveImageEvent)(nil),              // 97: silo.daemon.v1.ResolveImageEvent
+	(*PullImageRequest)(nil),               // 98: silo.daemon.v1.PullImageRequest
+	(*EgressSecret)(nil),                   // 99: silo.daemon.v1.EgressSecret
+	(*Entrypoint)(nil),                     // 100: silo.daemon.v1.Entrypoint
+	(*StartOptions)(nil),                   // 101: silo.daemon.v1.StartOptions
+	(*StartMachineRequest)(nil),            // 102: silo.daemon.v1.StartMachineRequest
+	(*StopMachineRequest)(nil),             // 103: silo.daemon.v1.StopMachineRequest
+	(*RemoveMachineRequest)(nil),           // 104: silo.daemon.v1.RemoveMachineRequest
+	(*PolicyUpdate)(nil),                   // 105: silo.daemon.v1.PolicyUpdate
+	(*PublicationUpdate)(nil),              // 106: silo.daemon.v1.PublicationUpdate
+	(*UserUpdate)(nil),                     // 107: silo.daemon.v1.UserUpdate
+	(*MachineUpdate)(nil),                  // 108: silo.daemon.v1.MachineUpdate
+	(*UpdateMachineRequest)(nil),           // 109: silo.daemon.v1.UpdateMachineRequest
+	(*WaitReadyRequest)(nil),               // 110: silo.daemon.v1.WaitReadyRequest
+	(*StopRunRequest)(nil),                 // 111: silo.daemon.v1.StopRunRequest
+	(*KillRunRequest)(nil),                 // 112: silo.daemon.v1.KillRunRequest
+	(*WaitForRunRequest)(nil),              // 113: silo.daemon.v1.WaitForRunRequest
+	(*MachineIssue)(nil),                   // 114: silo.daemon.v1.MachineIssue
+	(*LifecycleDetail)(nil),                // 115: silo.daemon.v1.LifecycleDetail
+	(*RunningStatus)(nil),                  // 116: silo.daemon.v1.RunningStatus
+	(*MachineStatus)(nil),                  // 117: silo.daemon.v1.MachineStatus
+	(*Rootfs)(nil),                         // 118: silo.daemon.v1.Rootfs
+	(*MachineTailscale)(nil),               // 119: silo.daemon.v1.MachineTailscale
+	(*BootReport)(nil),                     // 120: silo.daemon.v1.BootReport
+	(*ProvisionStepReport)(nil),            // 121: silo.daemon.v1.ProvisionStepReport
+	(*ProvisionReport)(nil),                // 122: silo.daemon.v1.ProvisionReport
+	(*MachineSnapshot)(nil),                // 123: silo.daemon.v1.MachineSnapshot
+	(*MachineInventoryEntry)(nil),          // 124: silo.daemon.v1.MachineInventoryEntry
+	(*MachineStart)(nil),                   // 125: silo.daemon.v1.MachineStart
+	(*MachineReadiness)(nil),               // 126: silo.daemon.v1.MachineReadiness
+	(*MachineExit)(nil),                    // 127: silo.daemon.v1.MachineExit
+	(*ReadLogsRequest)(nil),                // 128: silo.daemon.v1.ReadLogsRequest
+	(*LogChunk)(nil),                       // 129: silo.daemon.v1.LogChunk
+	(*SetMachineSecretRequest)(nil),        // 130: silo.daemon.v1.SetMachineSecretRequest
+	(*ParseResourceRequest)(nil),           // 131: silo.daemon.v1.ParseResourceRequest
+	(*Size)(nil),                           // 132: silo.daemon.v1.Size
+	(*NormalizePolicyRequest)(nil),         // 133: silo.daemon.v1.NormalizePolicyRequest
+	(*SecretAlternative)(nil),              // 134: silo.daemon.v1.SecretAlternative
+	(*SecretRequirement)(nil),              // 135: silo.daemon.v1.SecretRequirement
+	(*SecretSlot)(nil),                     // 136: silo.daemon.v1.SecretSlot
+	(*PolicyDocument)(nil),                 // 137: silo.daemon.v1.PolicyDocument
+	(*CheckPolicySecretsRequest)(nil),      // 138: silo.daemon.v1.CheckPolicySecretsRequest
+	(*SecretDiagnostic)(nil),               // 139: silo.daemon.v1.SecretDiagnostic
+	(*PolicySecretsResult)(nil),            // 140: silo.daemon.v1.PolicySecretsResult
+	(*ErrorDetail)(nil),                    // 141: silo.daemon.v1.ErrorDetail
+	(*NodeStatus)(nil),                     // 142: silo.daemon.v1.NodeStatus
+	(*NodeObservation)(nil),                // 143: silo.daemon.v1.NodeObservation
+	(*NetworkObservation)(nil),             // 144: silo.daemon.v1.NetworkObservation
+	(*ComponentStatus)(nil),                // 145: silo.daemon.v1.ComponentStatus
+	(*DaemonStatus)(nil),                   // 146: silo.daemon.v1.DaemonStatus
+	(*RuntimeComponents)(nil),              // 147: silo.daemon.v1.RuntimeComponents
+	(*RuntimeInfo)(nil),                    // 148: silo.daemon.v1.RuntimeInfo
+	(*TailscaleStatusReport)(nil),          // 149: silo.daemon.v1.TailscaleStatusReport
+	(*DrainMutationsRequest)(nil),          // 150: silo.daemon.v1.DrainMutationsRequest
+	(*ResourceDefaults)(nil),               // 151: silo.daemon.v1.ResourceDefaults
+	(*ResourceCeilings)(nil),               // 152: silo.daemon.v1.ResourceCeilings
+	(*TailscaleSettings)(nil),              // 153: silo.daemon.v1.TailscaleSettings
+	(*HelperBootstrap)(nil),                // 154: silo.daemon.v1.HelperBootstrap
+	(*MonitorSnapshot)(nil),                // 155: silo.daemon.v1.MonitorSnapshot
+	(*VmSnapshot)(nil),                     // 156: silo.daemon.v1.VmSnapshot
+	(*ReadinessState)(nil),                 // 157: silo.daemon.v1.ReadinessState
+	(*AgentConnection)(nil),                // 158: silo.daemon.v1.AgentConnection
+	(*AgentIdentity)(nil),                  // 159: silo.daemon.v1.AgentIdentity
+	(*SystemInfo)(nil),                     // 160: silo.daemon.v1.SystemInfo
+	(*SshListenerReport)(nil),              // 161: silo.daemon.v1.SshListenerReport
+	(*GuestProvisionReport)(nil),           // 162: silo.daemon.v1.GuestProvisionReport
+	(*AgentStatusReport)(nil),              // 163: silo.daemon.v1.AgentStatusReport
+	(*AgentStatusObservation)(nil),         // 164: silo.daemon.v1.AgentStatusObservation
+	(*EnabledAgent)(nil),                   // 165: silo.daemon.v1.EnabledAgent
+	(*AgentStatus)(nil),                    // 166: silo.daemon.v1.AgentStatus
+	(*MonitorStatus)(nil),                  // 167: silo.daemon.v1.MonitorStatus
+	(*SystemStatus)(nil),                   // 168: silo.daemon.v1.SystemStatus
+	(*LiveMachineRequest)(nil),             // 169: silo.daemon.v1.LiveMachineRequest
+	(*PauseOwner)(nil),                     // 170: silo.daemon.v1.PauseOwner
+	(*PauseToken)(nil),                     // 171: silo.daemon.v1.PauseToken
+	(*CurrentPause)(nil),                   // 172: silo.daemon.v1.CurrentPause
+	(*GuestFreezeObservation)(nil),         // 173: silo.daemon.v1.GuestFreezeObservation
+	(*LiveFailure)(nil),                    // 174: silo.daemon.v1.LiveFailure
+	(*LiveActivity)(nil),                   // 175: silo.daemon.v1.LiveActivity
+	(*LiveLifecycle)(nil),                  // 176: silo.daemon.v1.LiveLifecycle
+	(*PauseEstablished)(nil),               // 177: silo.daemon.v1.PauseEstablished
+	(*LiveOperationRecord)(nil),            // 178: silo.daemon.v1.LiveOperationRecord
+	(*MachineLifecycle)(nil),               // 179: silo.daemon.v1.MachineLifecycle
+	(*LiveCaptureRequest)(nil),             // 180: silo.daemon.v1.LiveCaptureRequest
+	(*LiveForkRequest)(nil),                // 181: silo.daemon.v1.LiveForkRequest
+	(*LiveRestoreRequest)(nil),             // 182: silo.daemon.v1.LiveRestoreRequest
+	(*StorageSnapshotRef)(nil),             // 183: silo.daemon.v1.StorageSnapshotRef
+	(*ExternalResourceKey)(nil),            // 184: silo.daemon.v1.ExternalResourceKey
+	(*ExternalResourceMapping)(nil),        // 185: silo.daemon.v1.ExternalResourceMapping
+	(*ExternalResourceMappings)(nil),       // 186: silo.daemon.v1.ExternalResourceMappings
+	(*ExternalResourcePolicy)(nil),         // 187: silo.daemon.v1.ExternalResourcePolicy
+	(*StoppedForkRequest)(nil),             // 188: silo.daemon.v1.StoppedForkRequest
+	(*CreateStorageSnapshotRequest)(nil),   // 189: silo.daemon.v1.CreateStorageSnapshotRequest
+	(*RestoreStorageSnapshotRequest)(nil),  // 190: silo.daemon.v1.RestoreStorageSnapshotRequest
+	(*StorageSnapshotInfo)(nil),            // 191: silo.daemon.v1.StorageSnapshotInfo
+	(*StorageSnapshotList)(nil),            // 192: silo.daemon.v1.StorageSnapshotList
+	(*LiveDeviceSubject)(nil),              // 193: silo.daemon.v1.LiveDeviceSubject
+	(*LiveUnsupportedReason)(nil),          // 194: silo.daemon.v1.LiveUnsupportedReason
+	(*LiveCapability)(nil),                 // 195: silo.daemon.v1.LiveCapability
+	(*LiveCapabilityVector)(nil),           // 196: silo.daemon.v1.LiveCapabilityVector
+	(*LiveHostReport)(nil),                 // 197: silo.daemon.v1.LiveHostReport
+	(*LiveMachineReport)(nil),              // 198: silo.daemon.v1.LiveMachineReport
+	(*LiveOperationUnsupported)(nil),       // 199: silo.daemon.v1.LiveOperationUnsupported
+	nil,                                    // 200: silo.daemon.v1.StringMap.ValuesEntry
+	nil,                                    // 201: silo.daemon.v1.ProcessConfig.EnvironmentEntry
+	nil,                                    // 202: silo.daemon.v1.VmSpec.AnnotationsEntry
+	nil,                                    // 203: silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
+	nil,                                    // 204: silo.daemon.v1.MachineSnapshot.LabelsEntry
+	nil,                                    // 205: silo.daemon.v1.MachineSnapshot.MetadataEntry
+	(*emptypb.Empty)(nil),                  // 206: google.protobuf.Empty
+	(*durationpb.Duration)(nil),            // 207: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),          // 208: google.protobuf.Timestamp
 }
 var file_daemon_proto_depIdxs = []int32{
-	185, // 0: silo.daemon.v1.StringMap.values:type_name -> silo.daemon.v1.StringMap.ValuesEntry
-	53,  // 1: silo.daemon.v1.ProcessConfig.entrypoint:type_name -> silo.daemon.v1.StringList
-	53,  // 2: silo.daemon.v1.ProcessConfig.command:type_name -> silo.daemon.v1.StringList
-	186, // 3: silo.daemon.v1.ProcessConfig.environment:type_name -> silo.daemon.v1.ProcessConfig.EnvironmentEntry
-	191, // 4: silo.daemon.v1.Agent.default_agent:type_name -> google.protobuf.Empty
-	191, // 5: silo.daemon.v1.Agent.none:type_name -> google.protobuf.Empty
-	57,  // 6: silo.daemon.v1.GuestConfig.agent:type_name -> silo.daemon.v1.Agent
-	58,  // 7: silo.daemon.v1.GuestConfig.user:type_name -> silo.daemon.v1.User
+	200, // 0: silo.daemon.v1.StringMap.values:type_name -> silo.daemon.v1.StringMap.ValuesEntry
+	58,  // 1: silo.daemon.v1.ProcessConfig.entrypoint:type_name -> silo.daemon.v1.StringList
+	58,  // 2: silo.daemon.v1.ProcessConfig.command:type_name -> silo.daemon.v1.StringList
+	201, // 3: silo.daemon.v1.ProcessConfig.environment:type_name -> silo.daemon.v1.ProcessConfig.EnvironmentEntry
+	206, // 4: silo.daemon.v1.Agent.default_agent:type_name -> google.protobuf.Empty
+	206, // 5: silo.daemon.v1.Agent.none:type_name -> google.protobuf.Empty
+	62,  // 6: silo.daemon.v1.GuestConfig.agent:type_name -> silo.daemon.v1.Agent
+	63,  // 7: silo.daemon.v1.GuestConfig.user:type_name -> silo.daemon.v1.User
 	1,   // 8: silo.daemon.v1.Disk.role:type_name -> silo.daemon.v1.DiskRole
 	2,   // 9: silo.daemon.v1.Disk.format:type_name -> silo.daemon.v1.DiskFormat
-	61,  // 10: silo.daemon.v1.Disk.geometry:type_name -> silo.daemon.v1.DiskGeometry
-	63,  // 11: silo.daemon.v1.Endpoint.host:type_name -> silo.daemon.v1.Address
-	63,  // 12: silo.daemon.v1.Endpoint.guest:type_name -> silo.daemon.v1.Address
-	64,  // 13: silo.daemon.v1.Forward.listen:type_name -> silo.daemon.v1.Endpoint
-	64,  // 14: silo.daemon.v1.Forward.connect:type_name -> silo.daemon.v1.Endpoint
-	65,  // 15: silo.daemon.v1.ForwardList.values:type_name -> silo.daemon.v1.Forward
-	68,  // 16: silo.daemon.v1.Boot.kernel:type_name -> silo.daemon.v1.Kernel
-	62,  // 17: silo.daemon.v1.Storage.disks:type_name -> silo.daemon.v1.Disk
+	66,  // 10: silo.daemon.v1.Disk.geometry:type_name -> silo.daemon.v1.DiskGeometry
+	68,  // 11: silo.daemon.v1.Endpoint.host:type_name -> silo.daemon.v1.Address
+	68,  // 12: silo.daemon.v1.Endpoint.guest:type_name -> silo.daemon.v1.Address
+	69,  // 13: silo.daemon.v1.Forward.listen:type_name -> silo.daemon.v1.Endpoint
+	69,  // 14: silo.daemon.v1.Forward.connect:type_name -> silo.daemon.v1.Endpoint
+	70,  // 15: silo.daemon.v1.ForwardList.values:type_name -> silo.daemon.v1.Forward
+	73,  // 16: silo.daemon.v1.Boot.kernel:type_name -> silo.daemon.v1.Kernel
+	67,  // 17: silo.daemon.v1.Storage.disks:type_name -> silo.daemon.v1.Disk
 	3,   // 18: silo.daemon.v1.VmGuest.os:type_name -> silo.daemon.v1.GuestOs
-	72,  // 19: silo.daemon.v1.VmSpec.guest:type_name -> silo.daemon.v1.VmGuest
-	69,  // 20: silo.daemon.v1.VmSpec.boot:type_name -> silo.daemon.v1.Boot
-	70,  // 21: silo.daemon.v1.VmSpec.hardware:type_name -> silo.daemon.v1.Hardware
-	71,  // 22: silo.daemon.v1.VmSpec.storage:type_name -> silo.daemon.v1.Storage
-	60,  // 23: silo.daemon.v1.VmSpec.mounts:type_name -> silo.daemon.v1.Mount
-	65,  // 24: silo.daemon.v1.VmSpec.forwards:type_name -> silo.daemon.v1.Forward
-	67,  // 25: silo.daemon.v1.VmSpec.vsock:type_name -> silo.daemon.v1.Vsock
-	187, // 26: silo.daemon.v1.VmSpec.annotations:type_name -> silo.daemon.v1.VmSpec.AnnotationsEntry
+	77,  // 19: silo.daemon.v1.VmSpec.guest:type_name -> silo.daemon.v1.VmGuest
+	74,  // 20: silo.daemon.v1.VmSpec.boot:type_name -> silo.daemon.v1.Boot
+	75,  // 21: silo.daemon.v1.VmSpec.hardware:type_name -> silo.daemon.v1.Hardware
+	76,  // 22: silo.daemon.v1.VmSpec.storage:type_name -> silo.daemon.v1.Storage
+	65,  // 23: silo.daemon.v1.VmSpec.mounts:type_name -> silo.daemon.v1.Mount
+	70,  // 24: silo.daemon.v1.VmSpec.forwards:type_name -> silo.daemon.v1.Forward
+	72,  // 25: silo.daemon.v1.VmSpec.vsock:type_name -> silo.daemon.v1.Vsock
+	202, // 26: silo.daemon.v1.VmSpec.annotations:type_name -> silo.daemon.v1.VmSpec.AnnotationsEntry
 	4,   // 27: silo.daemon.v1.PrivateNetwork.publish:type_name -> silo.daemon.v1.PublishBind
-	74,  // 28: silo.daemon.v1.ResolvedNetwork.private:type_name -> silo.daemon.v1.PrivateNetwork
-	191, // 29: silo.daemon.v1.ResolvedNetwork.none:type_name -> google.protobuf.Empty
-	50,  // 30: silo.daemon.v1.ResolvedNetwork.named:type_name -> silo.daemon.v1.Name
+	79,  // 28: silo.daemon.v1.ResolvedNetwork.private:type_name -> silo.daemon.v1.PrivateNetwork
+	206, // 29: silo.daemon.v1.ResolvedNetwork.none:type_name -> google.protobuf.Empty
+	55,  // 30: silo.daemon.v1.ResolvedNetwork.named:type_name -> silo.daemon.v1.Name
 	5,   // 31: silo.daemon.v1.NetworkDefinition.topology:type_name -> silo.daemon.v1.NetworkTopology
 	6,   // 32: silo.daemon.v1.NetworkDefinition.driver:type_name -> silo.daemon.v1.NetworkDriver
-	76,  // 33: silo.daemon.v1.OptionalNetworkDefinition.definition:type_name -> silo.daemon.v1.NetworkDefinition
-	76,  // 34: silo.daemon.v1.CreateNetworkDefinitionRequest.definition:type_name -> silo.daemon.v1.NetworkDefinition
-	51,  // 35: silo.daemon.v1.SetMachineNetworkRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	75,  // 36: silo.daemon.v1.SetMachineNetworkRequest.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	191, // 37: silo.daemon.v1.TemporaryDirectoryPolicy.disk_backed:type_name -> google.protobuf.Empty
-	188, // 38: silo.daemon.v1.NormalizedMachineCreate.labels:type_name -> silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
-	56,  // 39: silo.daemon.v1.NormalizedMachineCreate.process:type_name -> silo.daemon.v1.ProcessConfig
+	81,  // 33: silo.daemon.v1.OptionalNetworkDefinition.definition:type_name -> silo.daemon.v1.NetworkDefinition
+	81,  // 34: silo.daemon.v1.CreateNetworkDefinitionRequest.definition:type_name -> silo.daemon.v1.NetworkDefinition
+	56,  // 35: silo.daemon.v1.SetMachineNetworkRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	80,  // 36: silo.daemon.v1.SetMachineNetworkRequest.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	206, // 37: silo.daemon.v1.TemporaryDirectoryPolicy.disk_backed:type_name -> google.protobuf.Empty
+	203, // 38: silo.daemon.v1.NormalizedMachineCreate.labels:type_name -> silo.daemon.v1.NormalizedMachineCreate.LabelsEntry
+	61,  // 39: silo.daemon.v1.NormalizedMachineCreate.process:type_name -> silo.daemon.v1.ProcessConfig
 	0,   // 40: silo.daemon.v1.NormalizedMachineCreate.retention:type_name -> silo.daemon.v1.Retention
-	60,  // 41: silo.daemon.v1.NormalizedMachineCreate.mounts:type_name -> silo.daemon.v1.Mount
-	65,  // 42: silo.daemon.v1.NormalizedMachineCreate.forwards:type_name -> silo.daemon.v1.Forward
-	75,  // 43: silo.daemon.v1.NormalizedMachineCreate.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	57,  // 44: silo.daemon.v1.NormalizedMachineCreate.agent:type_name -> silo.daemon.v1.Agent
-	58,  // 45: silo.daemon.v1.NormalizedMachineCreate.provision_user:type_name -> silo.daemon.v1.User
+	65,  // 41: silo.daemon.v1.NormalizedMachineCreate.mounts:type_name -> silo.daemon.v1.Mount
+	70,  // 42: silo.daemon.v1.NormalizedMachineCreate.forwards:type_name -> silo.daemon.v1.Forward
+	80,  // 43: silo.daemon.v1.NormalizedMachineCreate.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	62,  // 44: silo.daemon.v1.NormalizedMachineCreate.agent:type_name -> silo.daemon.v1.Agent
+	63,  // 45: silo.daemon.v1.NormalizedMachineCreate.provision_user:type_name -> silo.daemon.v1.User
 	7,   // 46: silo.daemon.v1.NormalizedMachineCreate.root_profile:type_name -> silo.daemon.v1.RootProfile
-	80,  // 47: silo.daemon.v1.NormalizedMachineCreate.temporary_directory:type_name -> silo.daemon.v1.TemporaryDirectoryPolicy
+	85,  // 47: silo.daemon.v1.NormalizedMachineCreate.temporary_directory:type_name -> silo.daemon.v1.TemporaryDirectoryPolicy
 	8,   // 48: silo.daemon.v1.OciIdentity.pull_policy:type_name -> silo.daemon.v1.PullPolicy
-	82,  // 49: silo.daemon.v1.ResolvedImage.identity:type_name -> silo.daemon.v1.OciIdentity
+	87,  // 49: silo.daemon.v1.ResolvedImage.identity:type_name -> silo.daemon.v1.OciIdentity
 	9,   // 50: silo.daemon.v1.ResolvedImage.cache_state:type_name -> silo.daemon.v1.CacheState
-	81,  // 51: silo.daemon.v1.CreateMachineRequest.configuration:type_name -> silo.daemon.v1.NormalizedMachineCreate
-	82,  // 52: silo.daemon.v1.CreateMachineRequest.oci:type_name -> silo.daemon.v1.OciIdentity
-	85,  // 53: silo.daemon.v1.ImageProgress.resolving_manifest:type_name -> silo.daemon.v1.ImageReferenceProgress
-	86,  // 54: silo.daemon.v1.ImageProgress.resolved_manifest:type_name -> silo.daemon.v1.ManifestProgress
-	85,  // 55: silo.daemon.v1.ImageProgress.checking_cache:type_name -> silo.daemon.v1.ImageReferenceProgress
-	85,  // 56: silo.daemon.v1.ImageProgress.cache_hit:type_name -> silo.daemon.v1.ImageReferenceProgress
-	85,  // 57: silo.daemon.v1.ImageProgress.cache_miss:type_name -> silo.daemon.v1.ImageReferenceProgress
-	85,  // 58: silo.daemon.v1.ImageProgress.using_local_disk:type_name -> silo.daemon.v1.ImageReferenceProgress
-	87,  // 59: silo.daemon.v1.ImageProgress.layer_download_started:type_name -> silo.daemon.v1.LayerProgress
-	87,  // 60: silo.daemon.v1.ImageProgress.layer_download_progress:type_name -> silo.daemon.v1.LayerProgress
-	87,  // 61: silo.daemon.v1.ImageProgress.layer_download_verifying:type_name -> silo.daemon.v1.LayerProgress
-	87,  // 62: silo.daemon.v1.ImageProgress.layer_download_finished:type_name -> silo.daemon.v1.LayerProgress
-	87,  // 63: silo.daemon.v1.ImageProgress.layer_download_skipped:type_name -> silo.daemon.v1.LayerProgress
-	88,  // 64: silo.daemon.v1.ImageProgress.applying_layer:type_name -> silo.daemon.v1.ApplyingLayerProgress
-	191, // 65: silo.daemon.v1.ImageProgress.materializing_rootfs:type_name -> google.protobuf.Empty
-	191, // 66: silo.daemon.v1.ImageProgress.publishing_rootfs:type_name -> google.protobuf.Empty
-	191, // 67: silo.daemon.v1.ImageProgress.complete:type_name -> google.protobuf.Empty
-	89,  // 68: silo.daemon.v1.CreateMachineEvent.progress:type_name -> silo.daemon.v1.ImageProgress
-	118, // 69: silo.daemon.v1.CreateMachineEvent.machine:type_name -> silo.daemon.v1.MachineSnapshot
+	86,  // 51: silo.daemon.v1.CreateMachineRequest.configuration:type_name -> silo.daemon.v1.NormalizedMachineCreate
+	87,  // 52: silo.daemon.v1.CreateMachineRequest.oci:type_name -> silo.daemon.v1.OciIdentity
+	90,  // 53: silo.daemon.v1.ImageProgress.resolving_manifest:type_name -> silo.daemon.v1.ImageReferenceProgress
+	91,  // 54: silo.daemon.v1.ImageProgress.resolved_manifest:type_name -> silo.daemon.v1.ManifestProgress
+	90,  // 55: silo.daemon.v1.ImageProgress.checking_cache:type_name -> silo.daemon.v1.ImageReferenceProgress
+	90,  // 56: silo.daemon.v1.ImageProgress.cache_hit:type_name -> silo.daemon.v1.ImageReferenceProgress
+	90,  // 57: silo.daemon.v1.ImageProgress.cache_miss:type_name -> silo.daemon.v1.ImageReferenceProgress
+	90,  // 58: silo.daemon.v1.ImageProgress.using_local_disk:type_name -> silo.daemon.v1.ImageReferenceProgress
+	92,  // 59: silo.daemon.v1.ImageProgress.layer_download_started:type_name -> silo.daemon.v1.LayerProgress
+	92,  // 60: silo.daemon.v1.ImageProgress.layer_download_progress:type_name -> silo.daemon.v1.LayerProgress
+	92,  // 61: silo.daemon.v1.ImageProgress.layer_download_verifying:type_name -> silo.daemon.v1.LayerProgress
+	92,  // 62: silo.daemon.v1.ImageProgress.layer_download_finished:type_name -> silo.daemon.v1.LayerProgress
+	92,  // 63: silo.daemon.v1.ImageProgress.layer_download_skipped:type_name -> silo.daemon.v1.LayerProgress
+	93,  // 64: silo.daemon.v1.ImageProgress.applying_layer:type_name -> silo.daemon.v1.ApplyingLayerProgress
+	206, // 65: silo.daemon.v1.ImageProgress.materializing_rootfs:type_name -> google.protobuf.Empty
+	206, // 66: silo.daemon.v1.ImageProgress.publishing_rootfs:type_name -> google.protobuf.Empty
+	206, // 67: silo.daemon.v1.ImageProgress.complete:type_name -> google.protobuf.Empty
+	94,  // 68: silo.daemon.v1.CreateMachineEvent.progress:type_name -> silo.daemon.v1.ImageProgress
+	123, // 69: silo.daemon.v1.CreateMachineEvent.machine:type_name -> silo.daemon.v1.MachineSnapshot
 	8,   // 70: silo.daemon.v1.ResolveImageRequest.pull_policy:type_name -> silo.daemon.v1.PullPolicy
-	89,  // 71: silo.daemon.v1.ResolveImageEvent.progress:type_name -> silo.daemon.v1.ImageProgress
-	83,  // 72: silo.daemon.v1.ResolveImageEvent.image:type_name -> silo.daemon.v1.ResolvedImage
-	55,  // 73: silo.daemon.v1.Entrypoint.environment:type_name -> silo.daemon.v1.EnvironmentPair
-	94,  // 74: silo.daemon.v1.StartOptions.egress_secrets:type_name -> silo.daemon.v1.EgressSecret
-	95,  // 75: silo.daemon.v1.StartOptions.entrypoint:type_name -> silo.daemon.v1.Entrypoint
-	51,  // 76: silo.daemon.v1.StartMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	96,  // 77: silo.daemon.v1.StartMachineRequest.options:type_name -> silo.daemon.v1.StartOptions
-	51,  // 78: silo.daemon.v1.StopMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	192, // 79: silo.daemon.v1.StopMachineRequest.timeout:type_name -> google.protobuf.Duration
-	51,  // 80: silo.daemon.v1.RemoveMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	191, // 81: silo.daemon.v1.PolicyUpdate.clear:type_name -> google.protobuf.Empty
+	94,  // 71: silo.daemon.v1.ResolveImageEvent.progress:type_name -> silo.daemon.v1.ImageProgress
+	88,  // 72: silo.daemon.v1.ResolveImageEvent.image:type_name -> silo.daemon.v1.ResolvedImage
+	60,  // 73: silo.daemon.v1.Entrypoint.environment:type_name -> silo.daemon.v1.EnvironmentPair
+	99,  // 74: silo.daemon.v1.StartOptions.egress_secrets:type_name -> silo.daemon.v1.EgressSecret
+	100, // 75: silo.daemon.v1.StartOptions.entrypoint:type_name -> silo.daemon.v1.Entrypoint
+	56,  // 76: silo.daemon.v1.StartMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	101, // 77: silo.daemon.v1.StartMachineRequest.options:type_name -> silo.daemon.v1.StartOptions
+	56,  // 78: silo.daemon.v1.StopMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	207, // 79: silo.daemon.v1.StopMachineRequest.timeout:type_name -> google.protobuf.Duration
+	56,  // 80: silo.daemon.v1.RemoveMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	206, // 81: silo.daemon.v1.PolicyUpdate.clear:type_name -> google.protobuf.Empty
 	4,   // 82: silo.daemon.v1.PublicationUpdate.set:type_name -> silo.daemon.v1.PublishBind
-	191, // 83: silo.daemon.v1.PublicationUpdate.clear:type_name -> google.protobuf.Empty
-	58,  // 84: silo.daemon.v1.UserUpdate.set:type_name -> silo.daemon.v1.User
-	191, // 85: silo.daemon.v1.UserUpdate.clear:type_name -> google.protobuf.Empty
-	54,  // 86: silo.daemon.v1.MachineUpdate.labels:type_name -> silo.daemon.v1.StringMap
-	66,  // 87: silo.daemon.v1.MachineUpdate.forwards:type_name -> silo.daemon.v1.ForwardList
-	67,  // 88: silo.daemon.v1.MachineUpdate.vsock:type_name -> silo.daemon.v1.Vsock
-	75,  // 89: silo.daemon.v1.MachineUpdate.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	100, // 90: silo.daemon.v1.MachineUpdate.policy:type_name -> silo.daemon.v1.PolicyUpdate
-	101, // 91: silo.daemon.v1.MachineUpdate.publication:type_name -> silo.daemon.v1.PublicationUpdate
-	59,  // 92: silo.daemon.v1.MachineUpdate.guest:type_name -> silo.daemon.v1.GuestConfig
-	102, // 93: silo.daemon.v1.MachineUpdate.user:type_name -> silo.daemon.v1.UserUpdate
-	80,  // 94: silo.daemon.v1.MachineUpdate.temporary_directory:type_name -> silo.daemon.v1.TemporaryDirectoryPolicy
-	51,  // 95: silo.daemon.v1.UpdateMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	103, // 96: silo.daemon.v1.UpdateMachineRequest.update:type_name -> silo.daemon.v1.MachineUpdate
-	192, // 97: silo.daemon.v1.WaitReadyRequest.timeout:type_name -> google.protobuf.Duration
-	52,  // 98: silo.daemon.v1.StopRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
-	192, // 99: silo.daemon.v1.StopRunRequest.timeout:type_name -> google.protobuf.Duration
-	192, // 100: silo.daemon.v1.StopRunRequest.force_after:type_name -> google.protobuf.Duration
-	52,  // 101: silo.daemon.v1.KillRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
-	192, // 102: silo.daemon.v1.KillRunRequest.timeout:type_name -> google.protobuf.Duration
-	52,  // 103: silo.daemon.v1.WaitForRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
-	192, // 104: silo.daemon.v1.WaitForRunRequest.timeout:type_name -> google.protobuf.Duration
+	206, // 83: silo.daemon.v1.PublicationUpdate.clear:type_name -> google.protobuf.Empty
+	63,  // 84: silo.daemon.v1.UserUpdate.set:type_name -> silo.daemon.v1.User
+	206, // 85: silo.daemon.v1.UserUpdate.clear:type_name -> google.protobuf.Empty
+	59,  // 86: silo.daemon.v1.MachineUpdate.labels:type_name -> silo.daemon.v1.StringMap
+	71,  // 87: silo.daemon.v1.MachineUpdate.forwards:type_name -> silo.daemon.v1.ForwardList
+	72,  // 88: silo.daemon.v1.MachineUpdate.vsock:type_name -> silo.daemon.v1.Vsock
+	80,  // 89: silo.daemon.v1.MachineUpdate.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	105, // 90: silo.daemon.v1.MachineUpdate.policy:type_name -> silo.daemon.v1.PolicyUpdate
+	106, // 91: silo.daemon.v1.MachineUpdate.publication:type_name -> silo.daemon.v1.PublicationUpdate
+	64,  // 92: silo.daemon.v1.MachineUpdate.guest:type_name -> silo.daemon.v1.GuestConfig
+	107, // 93: silo.daemon.v1.MachineUpdate.user:type_name -> silo.daemon.v1.UserUpdate
+	85,  // 94: silo.daemon.v1.MachineUpdate.temporary_directory:type_name -> silo.daemon.v1.TemporaryDirectoryPolicy
+	56,  // 95: silo.daemon.v1.UpdateMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	108, // 96: silo.daemon.v1.UpdateMachineRequest.update:type_name -> silo.daemon.v1.MachineUpdate
+	207, // 97: silo.daemon.v1.WaitReadyRequest.timeout:type_name -> google.protobuf.Duration
+	57,  // 98: silo.daemon.v1.StopRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
+	207, // 99: silo.daemon.v1.StopRunRequest.timeout:type_name -> google.protobuf.Duration
+	207, // 100: silo.daemon.v1.StopRunRequest.force_after:type_name -> google.protobuf.Duration
+	57,  // 101: silo.daemon.v1.KillRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
+	207, // 102: silo.daemon.v1.KillRunRequest.timeout:type_name -> google.protobuf.Duration
+	57,  // 103: silo.daemon.v1.WaitForRunRequest.machine:type_name -> silo.daemon.v1.MachineRunRef
+	207, // 104: silo.daemon.v1.WaitForRunRequest.timeout:type_name -> google.protobuf.Duration
 	11,  // 105: silo.daemon.v1.MachineIssue.component:type_name -> silo.daemon.v1.IssueComponent
-	191, // 106: silo.daemon.v1.MachineStatus.stopped:type_name -> google.protobuf.Empty
-	110, // 107: silo.daemon.v1.MachineStatus.starting:type_name -> silo.daemon.v1.LifecycleDetail
-	111, // 108: silo.daemon.v1.MachineStatus.running:type_name -> silo.daemon.v1.RunningStatus
-	110, // 109: silo.daemon.v1.MachineStatus.stopping:type_name -> silo.daemon.v1.LifecycleDetail
-	110, // 110: silo.daemon.v1.MachineStatus.error:type_name -> silo.daemon.v1.LifecycleDetail
-	12,  // 111: silo.daemon.v1.Rootfs.source_kind:type_name -> silo.daemon.v1.ImageSourceKind
-	193, // 112: silo.daemon.v1.Rootfs.created_at:type_name -> google.protobuf.Timestamp
-	13,  // 113: silo.daemon.v1.BootReport.mode:type_name -> silo.daemon.v1.BootMode
-	15,  // 114: silo.daemon.v1.ProvisionStepReport.status:type_name -> silo.daemon.v1.ProvisionStepStatus
-	16,  // 115: silo.daemon.v1.ProvisionStepReport.failure_policy:type_name -> silo.daemon.v1.ProvisionFailurePolicy
-	192, // 116: silo.daemon.v1.ProvisionStepReport.duration:type_name -> google.protobuf.Duration
-	14,  // 117: silo.daemon.v1.ProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
-	193, // 118: silo.daemon.v1.ProvisionReport.started_at:type_name -> google.protobuf.Timestamp
-	193, // 119: silo.daemon.v1.ProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
-	192, // 120: silo.daemon.v1.ProvisionReport.duration:type_name -> google.protobuf.Duration
-	116, // 121: silo.daemon.v1.ProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
-	73,  // 122: silo.daemon.v1.MachineSnapshot.spec:type_name -> silo.daemon.v1.VmSpec
-	0,   // 123: silo.daemon.v1.MachineSnapshot.retention:type_name -> silo.daemon.v1.Retention
-	56,  // 124: silo.daemon.v1.MachineSnapshot.process:type_name -> silo.daemon.v1.ProcessConfig
-	57,  // 125: silo.daemon.v1.MachineSnapshot.agent_mode:type_name -> silo.daemon.v1.Agent
-	193, // 126: silo.daemon.v1.MachineSnapshot.created_at:type_name -> google.protobuf.Timestamp
-	193, // 127: silo.daemon.v1.MachineSnapshot.modified_at:type_name -> google.protobuf.Timestamp
-	113, // 128: silo.daemon.v1.MachineSnapshot.rootfs:type_name -> silo.daemon.v1.Rootfs
-	189, // 129: silo.daemon.v1.MachineSnapshot.labels:type_name -> silo.daemon.v1.MachineSnapshot.LabelsEntry
-	190, // 130: silo.daemon.v1.MachineSnapshot.metadata:type_name -> silo.daemon.v1.MachineSnapshot.MetadataEntry
-	75,  // 131: silo.daemon.v1.MachineSnapshot.network:type_name -> silo.daemon.v1.ResolvedNetwork
-	114, // 132: silo.daemon.v1.MachineSnapshot.tailscale:type_name -> silo.daemon.v1.MachineTailscale
-	59,  // 133: silo.daemon.v1.MachineSnapshot.guest:type_name -> silo.daemon.v1.GuestConfig
-	112, // 134: silo.daemon.v1.MachineSnapshot.status:type_name -> silo.daemon.v1.MachineStatus
-	10,  // 135: silo.daemon.v1.MachineSnapshot.observation:type_name -> silo.daemon.v1.Observation
-	109, // 136: silo.daemon.v1.MachineSnapshot.issues:type_name -> silo.daemon.v1.MachineIssue
-	115, // 137: silo.daemon.v1.MachineSnapshot.boot_report:type_name -> silo.daemon.v1.BootReport
-	117, // 138: silo.daemon.v1.MachineSnapshot.provision_report:type_name -> silo.daemon.v1.ProvisionReport
-	193, // 139: silo.daemon.v1.MachineSnapshot.started_at:type_name -> google.protobuf.Timestamp
-	193, // 140: silo.daemon.v1.MachineSnapshot.updated_at:type_name -> google.protobuf.Timestamp
-	139, // 141: silo.daemon.v1.MachineSnapshot.network_observation:type_name -> silo.daemon.v1.NetworkObservation
-	183, // 142: silo.daemon.v1.MachineSnapshot.live:type_name -> silo.daemon.v1.LiveMachineReport
-	182, // 143: silo.daemon.v1.MachineSnapshot.prospective_live:type_name -> silo.daemon.v1.LiveHostReport
-	49,  // 144: silo.daemon.v1.MachineSnapshot.live_evidence:type_name -> silo.daemon.v1.LiveEvidenceState
-	118, // 145: silo.daemon.v1.MachineInventoryEntry.data:type_name -> silo.daemon.v1.MachineSnapshot
-	109, // 146: silo.daemon.v1.MachineInventoryEntry.issues:type_name -> silo.daemon.v1.MachineIssue
-	118, // 147: silo.daemon.v1.MachineStart.data:type_name -> silo.daemon.v1.MachineSnapshot
-	17,  // 148: silo.daemon.v1.MachineReadiness.outcome:type_name -> silo.daemon.v1.ReadinessOutcome
-	118, // 149: silo.daemon.v1.MachineReadiness.data:type_name -> silo.daemon.v1.MachineSnapshot
-	162, // 150: silo.daemon.v1.MachineReadiness.status:type_name -> silo.daemon.v1.MonitorStatus
-	18,  // 151: silo.daemon.v1.MachineExit.outcome:type_name -> silo.daemon.v1.ExitOutcome
-	118, // 152: silo.daemon.v1.MachineExit.data:type_name -> silo.daemon.v1.MachineSnapshot
-	193, // 153: silo.daemon.v1.MachineExit.exited_at:type_name -> google.protobuf.Timestamp
-	19,  // 154: silo.daemon.v1.ReadLogsRequest.source:type_name -> silo.daemon.v1.LogSource
-	20,  // 155: silo.daemon.v1.ReadLogsRequest.output:type_name -> silo.daemon.v1.LogOutput
-	19,  // 156: silo.daemon.v1.LogChunk.source:type_name -> silo.daemon.v1.LogSource
-	20,  // 157: silo.daemon.v1.LogChunk.output:type_name -> silo.daemon.v1.LogOutput
-	21,  // 158: silo.daemon.v1.ParseResourceRequest.kind:type_name -> silo.daemon.v1.ResourceKind
-	191, // 159: silo.daemon.v1.NormalizePolicyRequest.empty:type_name -> google.protobuf.Empty
-	129, // 160: silo.daemon.v1.SecretRequirement.alternatives:type_name -> silo.daemon.v1.SecretAlternative
-	22,  // 161: silo.daemon.v1.SecretSlot.kind:type_name -> silo.daemon.v1.SecretKind
-	23,  // 162: silo.daemon.v1.SecretSlot.field:type_name -> silo.daemon.v1.SecretField
-	131, // 163: silo.daemon.v1.PolicyDocument.secret_slots:type_name -> silo.daemon.v1.SecretSlot
-	130, // 164: silo.daemon.v1.PolicyDocument.secret_requirements:type_name -> silo.daemon.v1.SecretRequirement
-	24,  // 165: silo.daemon.v1.PolicySecretsResult.state:type_name -> silo.daemon.v1.PolicySecretsState
-	134, // 166: silo.daemon.v1.PolicySecretsResult.diagnostics:type_name -> silo.daemon.v1.SecretDiagnostic
-	130, // 167: silo.daemon.v1.PolicySecretsResult.requirements:type_name -> silo.daemon.v1.SecretRequirement
-	131, // 168: silo.daemon.v1.PolicySecretsResult.slots:type_name -> silo.daemon.v1.SecretSlot
-	25,  // 169: silo.daemon.v1.ErrorDetail.kind:type_name -> silo.daemon.v1.ErrorKind
-	26,  // 170: silo.daemon.v1.ErrorDetail.code:type_name -> silo.daemon.v1.ErrorCode
-	27,  // 171: silo.daemon.v1.ErrorDetail.launch_failure_reason:type_name -> silo.daemon.v1.LaunchFailureReason
-	184, // 172: silo.daemon.v1.ErrorDetail.live_unsupported:type_name -> silo.daemon.v1.LiveOperationUnsupported
-	193, // 173: silo.daemon.v1.NodeStatus.updated_at:type_name -> google.protobuf.Timestamp
-	28,  // 174: silo.daemon.v1.NodeStatus.state:type_name -> silo.daemon.v1.NodeState
-	193, // 175: silo.daemon.v1.NodeStatus.key_expiry:type_name -> google.protobuf.Timestamp
-	193, // 176: silo.daemon.v1.NodeObservation.observed_at:type_name -> google.protobuf.Timestamp
-	193, // 177: silo.daemon.v1.NodeObservation.key_expiry:type_name -> google.protobuf.Timestamp
-	137, // 178: silo.daemon.v1.NetworkObservation.live:type_name -> silo.daemon.v1.NodeStatus
-	138, // 179: silo.daemon.v1.NetworkObservation.historical:type_name -> silo.daemon.v1.NodeObservation
-	29,  // 180: silo.daemon.v1.NetworkObservation.issues:type_name -> silo.daemon.v1.NetworkObservationIssue
-	31,  // 181: silo.daemon.v1.ComponentStatus.state:type_name -> silo.daemon.v1.ComponentState
-	32,  // 182: silo.daemon.v1.ComponentStatus.shutdown_protection:type_name -> silo.daemon.v1.ShutdownProtection
-	30,  // 183: silo.daemon.v1.DaemonStatus.core:type_name -> silo.daemon.v1.CorePhase
-	163, // 184: silo.daemon.v1.DaemonStatus.system:type_name -> silo.daemon.v1.SystemStatus
-	140, // 185: silo.daemon.v1.DaemonStatus.tailscale:type_name -> silo.daemon.v1.ComponentStatus
-	193, // 186: silo.daemon.v1.DaemonStatus.updated_at:type_name -> google.protobuf.Timestamp
-	182, // 187: silo.daemon.v1.DaemonStatus.manager_live:type_name -> silo.daemon.v1.LiveHostReport
-	182, // 188: silo.daemon.v1.DaemonStatus.appliance_live:type_name -> silo.daemon.v1.LiveHostReport
-	142, // 189: silo.daemon.v1.RuntimeInfo.components:type_name -> silo.daemon.v1.RuntimeComponents
-	140, // 190: silo.daemon.v1.TailscaleStatusReport.status:type_name -> silo.daemon.v1.ComponentStatus
-	33,  // 191: silo.daemon.v1.TailscaleSettings.enrollment_mode:type_name -> silo.daemon.v1.EnrollmentMode
-	146, // 192: silo.daemon.v1.TailscaleSettings.defaults:type_name -> silo.daemon.v1.ResourceDefaults
-	147, // 193: silo.daemon.v1.TailscaleSettings.ceilings:type_name -> silo.daemon.v1.ResourceCeilings
-	192, // 194: silo.daemon.v1.TailscaleSettings.stop_budget:type_name -> google.protobuf.Duration
-	192, // 195: silo.daemon.v1.TailscaleSettings.shutdown_margin:type_name -> google.protobuf.Duration
-	142, // 196: silo.daemon.v1.HelperBootstrap.runtime_components:type_name -> silo.daemon.v1.RuntimeComponents
-	148, // 197: silo.daemon.v1.HelperBootstrap.settings:type_name -> silo.daemon.v1.TailscaleSettings
-	193, // 198: silo.daemon.v1.MonitorSnapshot.observed_at:type_name -> google.protobuf.Timestamp
-	34,  // 199: silo.daemon.v1.VmSnapshot.state:type_name -> silo.daemon.v1.VmState
-	193, // 200: silo.daemon.v1.VmSnapshot.state_changed_at:type_name -> google.protobuf.Timestamp
-	193, // 201: silo.daemon.v1.VmSnapshot.running_since:type_name -> google.protobuf.Timestamp
-	35,  // 202: silo.daemon.v1.ReadinessState.reason:type_name -> silo.daemon.v1.ReadinessReason
-	36,  // 203: silo.daemon.v1.AgentConnection.state:type_name -> silo.daemon.v1.AgentConnectionState
-	193, // 204: silo.daemon.v1.AgentConnection.last_success_at:type_name -> google.protobuf.Timestamp
-	193, // 205: silo.daemon.v1.AgentConnection.last_failure_at:type_name -> google.protobuf.Timestamp
-	40,  // 206: silo.daemon.v1.SshListenerReport.backend:type_name -> silo.daemon.v1.SshBackend
-	14,  // 207: silo.daemon.v1.GuestProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
-	193, // 208: silo.daemon.v1.GuestProvisionReport.started_at:type_name -> google.protobuf.Timestamp
-	193, // 209: silo.daemon.v1.GuestProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
-	192, // 210: silo.daemon.v1.GuestProvisionReport.duration:type_name -> google.protobuf.Duration
-	116, // 211: silo.daemon.v1.GuestProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
-	193, // 212: silo.daemon.v1.AgentStatusReport.observed_at:type_name -> google.protobuf.Timestamp
-	39,  // 213: silo.daemon.v1.AgentStatusReport.state:type_name -> silo.daemon.v1.AgentStatusState
-	155, // 214: silo.daemon.v1.AgentStatusReport.system:type_name -> silo.daemon.v1.SystemInfo
-	115, // 215: silo.daemon.v1.AgentStatusReport.boot:type_name -> silo.daemon.v1.BootReport
-	157, // 216: silo.daemon.v1.AgentStatusReport.provisioning:type_name -> silo.daemon.v1.GuestProvisionReport
-	156, // 217: silo.daemon.v1.AgentStatusReport.ssh:type_name -> silo.daemon.v1.SshListenerReport
-	193, // 218: silo.daemon.v1.AgentStatusObservation.received_at:type_name -> google.protobuf.Timestamp
-	193, // 219: silo.daemon.v1.AgentStatusObservation.stale_at:type_name -> google.protobuf.Timestamp
-	37,  // 220: silo.daemon.v1.AgentStatusObservation.freshness:type_name -> silo.daemon.v1.Freshness
-	38,  // 221: silo.daemon.v1.AgentStatusObservation.stale_reason:type_name -> silo.daemon.v1.StaleReason
-	158, // 222: silo.daemon.v1.AgentStatusObservation.report:type_name -> silo.daemon.v1.AgentStatusReport
-	153, // 223: silo.daemon.v1.EnabledAgent.connection:type_name -> silo.daemon.v1.AgentConnection
-	154, // 224: silo.daemon.v1.EnabledAgent.identity:type_name -> silo.daemon.v1.AgentIdentity
-	159, // 225: silo.daemon.v1.EnabledAgent.status:type_name -> silo.daemon.v1.AgentStatusObservation
-	191, // 226: silo.daemon.v1.AgentStatus.disabled:type_name -> google.protobuf.Empty
-	160, // 227: silo.daemon.v1.AgentStatus.enabled:type_name -> silo.daemon.v1.EnabledAgent
-	150, // 228: silo.daemon.v1.MonitorStatus.monitor:type_name -> silo.daemon.v1.MonitorSnapshot
-	151, // 229: silo.daemon.v1.MonitorStatus.vm:type_name -> silo.daemon.v1.VmSnapshot
-	152, // 230: silo.daemon.v1.MonitorStatus.readiness:type_name -> silo.daemon.v1.ReadinessState
-	161, // 231: silo.daemon.v1.MonitorStatus.agent:type_name -> silo.daemon.v1.AgentStatus
-	183, // 232: silo.daemon.v1.MonitorStatus.live:type_name -> silo.daemon.v1.LiveMachineReport
-	41,  // 233: silo.daemon.v1.SystemStatus.phase:type_name -> silo.daemon.v1.SystemPhase
-	193, // 234: silo.daemon.v1.SystemStatus.update_checked_at:type_name -> google.protobuf.Timestamp
-	42,  // 235: silo.daemon.v1.SystemStatus.memory_reclaim_outcome:type_name -> silo.daemon.v1.MemoryReclaimOutcome
-	193, // 236: silo.daemon.v1.SystemStatus.memory_reclaim_at:type_name -> google.protobuf.Timestamp
-	183, // 237: silo.daemon.v1.SystemStatus.live:type_name -> silo.daemon.v1.LiveMachineReport
-	182, // 238: silo.daemon.v1.SystemStatus.prospective_live:type_name -> silo.daemon.v1.LiveHostReport
-	51,  // 239: silo.daemon.v1.LiveMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	51,  // 240: silo.daemon.v1.LiveCaptureRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	51,  // 241: silo.daemon.v1.LiveForkRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	169, // 242: silo.daemon.v1.ExternalResourceMapping.resource:type_name -> silo.daemon.v1.ExternalResourceKey
-	170, // 243: silo.daemon.v1.ExternalResourceMappings.values:type_name -> silo.daemon.v1.ExternalResourceMapping
-	191, // 244: silo.daemon.v1.ExternalResourcePolicy.reject:type_name -> google.protobuf.Empty
-	191, // 245: silo.daemon.v1.ExternalResourcePolicy.require_mappings:type_name -> google.protobuf.Empty
-	171, // 246: silo.daemon.v1.ExternalResourcePolicy.mappings:type_name -> silo.daemon.v1.ExternalResourceMappings
-	51,  // 247: silo.daemon.v1.StoppedForkRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	172, // 248: silo.daemon.v1.StoppedForkRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
-	51,  // 249: silo.daemon.v1.CreateStorageSnapshotRequest.machine:type_name -> silo.daemon.v1.MachineRef
-	172, // 250: silo.daemon.v1.CreateStorageSnapshotRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
-	168, // 251: silo.daemon.v1.RestoreStorageSnapshotRequest.snapshot:type_name -> silo.daemon.v1.StorageSnapshotRef
-	172, // 252: silo.daemon.v1.RestoreStorageSnapshotRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
-	43,  // 253: silo.daemon.v1.StorageSnapshotInfo.capture_kind:type_name -> silo.daemon.v1.StorageCaptureKind
-	176, // 254: silo.daemon.v1.StorageSnapshotList.snapshots:type_name -> silo.daemon.v1.StorageSnapshotInfo
-	191, // 255: silo.daemon.v1.LiveDeviceSubject.virtiofs:type_name -> google.protobuf.Empty
-	191, // 256: silo.daemon.v1.LiveDeviceSubject.rosetta:type_name -> google.protobuf.Empty
-	191, // 257: silo.daemon.v1.LiveDeviceSubject.tap:type_name -> google.protobuf.Empty
-	191, // 258: silo.daemon.v1.LiveDeviceSubject.gpu:type_name -> google.protobuf.Empty
-	191, // 259: silo.daemon.v1.LiveDeviceSubject.nested:type_name -> google.protobuf.Empty
-	191, // 260: silo.daemon.v1.LiveDeviceSubject.tee:type_name -> google.protobuf.Empty
-	48,  // 261: silo.daemon.v1.LiveUnsupportedReason.code:type_name -> silo.daemon.v1.LiveReasonCode
-	178, // 262: silo.daemon.v1.LiveUnsupportedReason.subject:type_name -> silo.daemon.v1.LiveDeviceSubject
-	191, // 263: silo.daemon.v1.LiveCapability.supported:type_name -> google.protobuf.Empty
-	179, // 264: silo.daemon.v1.LiveCapability.unsupported:type_name -> silo.daemon.v1.LiveUnsupportedReason
-	180, // 265: silo.daemon.v1.LiveCapabilityVector.pause:type_name -> silo.daemon.v1.LiveCapability
-	180, // 266: silo.daemon.v1.LiveCapabilityVector.capture:type_name -> silo.daemon.v1.LiveCapability
-	180, // 267: silo.daemon.v1.LiveCapabilityVector.restore:type_name -> silo.daemon.v1.LiveCapability
-	180, // 268: silo.daemon.v1.LiveCapabilityVector.fork:type_name -> silo.daemon.v1.LiveCapability
-	180, // 269: silo.daemon.v1.LiveCapabilityVector.incremental:type_name -> silo.daemon.v1.LiveCapability
-	47,  // 270: silo.daemon.v1.LiveHostReport.scope:type_name -> silo.daemon.v1.LiveScope
-	45,  // 271: silo.daemon.v1.LiveHostReport.backend:type_name -> silo.daemon.v1.LiveBackend
-	46,  // 272: silo.daemon.v1.LiveHostReport.lane:type_name -> silo.daemon.v1.LiveLane
-	181, // 273: silo.daemon.v1.LiveHostReport.live:type_name -> silo.daemon.v1.LiveCapabilityVector
-	47,  // 274: silo.daemon.v1.LiveMachineReport.scope:type_name -> silo.daemon.v1.LiveScope
-	45,  // 275: silo.daemon.v1.LiveMachineReport.backend:type_name -> silo.daemon.v1.LiveBackend
-	46,  // 276: silo.daemon.v1.LiveMachineReport.lane:type_name -> silo.daemon.v1.LiveLane
-	181, // 277: silo.daemon.v1.LiveMachineReport.live:type_name -> silo.daemon.v1.LiveCapabilityVector
-	44,  // 278: silo.daemon.v1.LiveOperationUnsupported.operation:type_name -> silo.daemon.v1.LiveOperation
-	45,  // 279: silo.daemon.v1.LiveOperationUnsupported.backend:type_name -> silo.daemon.v1.LiveBackend
-	46,  // 280: silo.daemon.v1.LiveOperationUnsupported.lane:type_name -> silo.daemon.v1.LiveLane
-	179, // 281: silo.daemon.v1.LiveOperationUnsupported.reason:type_name -> silo.daemon.v1.LiveUnsupportedReason
-	191, // 282: silo.daemon.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
-	191, // 283: silo.daemon.v1.DaemonService.GetRuntimeInfo:input_type -> google.protobuf.Empty
-	144, // 284: silo.daemon.v1.DaemonService.ReportTailscaleStatus:input_type -> silo.daemon.v1.TailscaleStatusReport
-	145, // 285: silo.daemon.v1.DaemonService.DrainMutations:input_type -> silo.daemon.v1.DrainMutationsRequest
-	191, // 286: silo.daemon.v1.DaemonService.GetLiveCapabilities:input_type -> google.protobuf.Empty
-	191, // 287: silo.daemon.v1.MachineService.ListMachines:input_type -> google.protobuf.Empty
-	51,  // 288: silo.daemon.v1.MachineService.InspectInventory:input_type -> silo.daemon.v1.MachineRef
-	51,  // 289: silo.daemon.v1.MachineService.InspectMachine:input_type -> silo.daemon.v1.MachineRef
-	50,  // 290: silo.daemon.v1.MachineService.EnsureNameAvailable:input_type -> silo.daemon.v1.Name
-	84,  // 291: silo.daemon.v1.MachineService.CreateMachine:input_type -> silo.daemon.v1.CreateMachineRequest
-	97,  // 292: silo.daemon.v1.MachineService.StartMachine:input_type -> silo.daemon.v1.StartMachineRequest
-	98,  // 293: silo.daemon.v1.MachineService.StopMachine:input_type -> silo.daemon.v1.StopMachineRequest
-	99,  // 294: silo.daemon.v1.MachineService.RemoveMachine:input_type -> silo.daemon.v1.RemoveMachineRequest
-	104, // 295: silo.daemon.v1.MachineService.UpdateMachine:input_type -> silo.daemon.v1.UpdateMachineRequest
-	105, // 296: silo.daemon.v1.MachineService.WaitReady:input_type -> silo.daemon.v1.WaitReadyRequest
-	106, // 297: silo.daemon.v1.MachineService.StopRun:input_type -> silo.daemon.v1.StopRunRequest
-	107, // 298: silo.daemon.v1.MachineService.KillRun:input_type -> silo.daemon.v1.KillRunRequest
-	108, // 299: silo.daemon.v1.MachineService.WaitForRun:input_type -> silo.daemon.v1.WaitForRunRequest
-	52,  // 300: silo.daemon.v1.MachineService.RemoveAfterRun:input_type -> silo.daemon.v1.MachineRunRef
-	123, // 301: silo.daemon.v1.MachineService.ReadLogs:input_type -> silo.daemon.v1.ReadLogsRequest
-	125, // 302: silo.daemon.v1.MachineService.SetMachineSecret:input_type -> silo.daemon.v1.SetMachineSecretRequest
-	164, // 303: silo.daemon.v1.MachineService.PauseMachine:input_type -> silo.daemon.v1.LiveMachineRequest
-	165, // 304: silo.daemon.v1.MachineService.CaptureExecution:input_type -> silo.daemon.v1.LiveCaptureRequest
-	166, // 305: silo.daemon.v1.MachineService.ForkExecution:input_type -> silo.daemon.v1.LiveForkRequest
-	173, // 306: silo.daemon.v1.MachineService.ForkStopped:input_type -> silo.daemon.v1.StoppedForkRequest
-	174, // 307: silo.daemon.v1.MachineService.SnapshotStopped:input_type -> silo.daemon.v1.CreateStorageSnapshotRequest
-	191, // 308: silo.daemon.v1.NetworkService.ListNetworkDefinitions:input_type -> google.protobuf.Empty
-	50,  // 309: silo.daemon.v1.NetworkService.GetNetworkDefinition:input_type -> silo.daemon.v1.Name
-	78,  // 310: silo.daemon.v1.NetworkService.CreateNetworkDefinition:input_type -> silo.daemon.v1.CreateNetworkDefinitionRequest
-	50,  // 311: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:input_type -> silo.daemon.v1.Name
-	79,  // 312: silo.daemon.v1.NetworkService.SetMachineNetwork:input_type -> silo.daemon.v1.SetMachineNetworkRequest
-	91,  // 313: silo.daemon.v1.RuntimeService.ResolveImage:input_type -> silo.daemon.v1.ResolveImageRequest
-	93,  // 314: silo.daemon.v1.RuntimeService.PullImage:input_type -> silo.daemon.v1.PullImageRequest
-	191, // 315: silo.daemon.v1.RuntimeService.ProposeMachineName:input_type -> google.protobuf.Empty
-	126, // 316: silo.daemon.v1.RuntimeService.ParseResource:input_type -> silo.daemon.v1.ParseResourceRequest
-	128, // 317: silo.daemon.v1.RuntimeService.NormalizePolicy:input_type -> silo.daemon.v1.NormalizePolicyRequest
-	133, // 318: silo.daemon.v1.RuntimeService.CheckPolicySecrets:input_type -> silo.daemon.v1.CheckPolicySecretsRequest
-	167, // 319: silo.daemon.v1.RuntimeService.RestoreExecution:input_type -> silo.daemon.v1.LiveRestoreRequest
-	175, // 320: silo.daemon.v1.RuntimeService.RestoreSnapshot:input_type -> silo.daemon.v1.RestoreStorageSnapshotRequest
-	168, // 321: silo.daemon.v1.RuntimeService.InspectStorageSnapshot:input_type -> silo.daemon.v1.StorageSnapshotRef
-	191, // 322: silo.daemon.v1.RuntimeService.ListStorageSnapshots:input_type -> google.protobuf.Empty
-	168, // 323: silo.daemon.v1.RuntimeService.ReleaseSnapshotRetention:input_type -> silo.daemon.v1.StorageSnapshotRef
-	50,  // 324: silo.daemon.v1.RuntimeService.RemoveImageAlias:input_type -> silo.daemon.v1.Name
-	141, // 325: silo.daemon.v1.DaemonService.GetStatus:output_type -> silo.daemon.v1.DaemonStatus
-	143, // 326: silo.daemon.v1.DaemonService.GetRuntimeInfo:output_type -> silo.daemon.v1.RuntimeInfo
-	191, // 327: silo.daemon.v1.DaemonService.ReportTailscaleStatus:output_type -> google.protobuf.Empty
-	191, // 328: silo.daemon.v1.DaemonService.DrainMutations:output_type -> google.protobuf.Empty
-	182, // 329: silo.daemon.v1.DaemonService.GetLiveCapabilities:output_type -> silo.daemon.v1.LiveHostReport
-	119, // 330: silo.daemon.v1.MachineService.ListMachines:output_type -> silo.daemon.v1.MachineInventoryEntry
-	119, // 331: silo.daemon.v1.MachineService.InspectInventory:output_type -> silo.daemon.v1.MachineInventoryEntry
-	118, // 332: silo.daemon.v1.MachineService.InspectMachine:output_type -> silo.daemon.v1.MachineSnapshot
-	191, // 333: silo.daemon.v1.MachineService.EnsureNameAvailable:output_type -> google.protobuf.Empty
-	90,  // 334: silo.daemon.v1.MachineService.CreateMachine:output_type -> silo.daemon.v1.CreateMachineEvent
-	120, // 335: silo.daemon.v1.MachineService.StartMachine:output_type -> silo.daemon.v1.MachineStart
-	118, // 336: silo.daemon.v1.MachineService.StopMachine:output_type -> silo.daemon.v1.MachineSnapshot
-	191, // 337: silo.daemon.v1.MachineService.RemoveMachine:output_type -> google.protobuf.Empty
-	118, // 338: silo.daemon.v1.MachineService.UpdateMachine:output_type -> silo.daemon.v1.MachineSnapshot
-	121, // 339: silo.daemon.v1.MachineService.WaitReady:output_type -> silo.daemon.v1.MachineReadiness
-	118, // 340: silo.daemon.v1.MachineService.StopRun:output_type -> silo.daemon.v1.MachineSnapshot
-	122, // 341: silo.daemon.v1.MachineService.KillRun:output_type -> silo.daemon.v1.MachineExit
-	122, // 342: silo.daemon.v1.MachineService.WaitForRun:output_type -> silo.daemon.v1.MachineExit
-	191, // 343: silo.daemon.v1.MachineService.RemoveAfterRun:output_type -> google.protobuf.Empty
-	124, // 344: silo.daemon.v1.MachineService.ReadLogs:output_type -> silo.daemon.v1.LogChunk
-	191, // 345: silo.daemon.v1.MachineService.SetMachineSecret:output_type -> google.protobuf.Empty
-	191, // 346: silo.daemon.v1.MachineService.PauseMachine:output_type -> google.protobuf.Empty
-	191, // 347: silo.daemon.v1.MachineService.CaptureExecution:output_type -> google.protobuf.Empty
-	191, // 348: silo.daemon.v1.MachineService.ForkExecution:output_type -> google.protobuf.Empty
-	118, // 349: silo.daemon.v1.MachineService.ForkStopped:output_type -> silo.daemon.v1.MachineSnapshot
-	176, // 350: silo.daemon.v1.MachineService.SnapshotStopped:output_type -> silo.daemon.v1.StorageSnapshotInfo
-	76,  // 351: silo.daemon.v1.NetworkService.ListNetworkDefinitions:output_type -> silo.daemon.v1.NetworkDefinition
-	77,  // 352: silo.daemon.v1.NetworkService.GetNetworkDefinition:output_type -> silo.daemon.v1.OptionalNetworkDefinition
-	191, // 353: silo.daemon.v1.NetworkService.CreateNetworkDefinition:output_type -> google.protobuf.Empty
-	191, // 354: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:output_type -> google.protobuf.Empty
-	118, // 355: silo.daemon.v1.NetworkService.SetMachineNetwork:output_type -> silo.daemon.v1.MachineSnapshot
-	92,  // 356: silo.daemon.v1.RuntimeService.ResolveImage:output_type -> silo.daemon.v1.ResolveImageEvent
-	89,  // 357: silo.daemon.v1.RuntimeService.PullImage:output_type -> silo.daemon.v1.ImageProgress
-	50,  // 358: silo.daemon.v1.RuntimeService.ProposeMachineName:output_type -> silo.daemon.v1.Name
-	127, // 359: silo.daemon.v1.RuntimeService.ParseResource:output_type -> silo.daemon.v1.Size
-	132, // 360: silo.daemon.v1.RuntimeService.NormalizePolicy:output_type -> silo.daemon.v1.PolicyDocument
-	135, // 361: silo.daemon.v1.RuntimeService.CheckPolicySecrets:output_type -> silo.daemon.v1.PolicySecretsResult
-	191, // 362: silo.daemon.v1.RuntimeService.RestoreExecution:output_type -> google.protobuf.Empty
-	118, // 363: silo.daemon.v1.RuntimeService.RestoreSnapshot:output_type -> silo.daemon.v1.MachineSnapshot
-	176, // 364: silo.daemon.v1.RuntimeService.InspectStorageSnapshot:output_type -> silo.daemon.v1.StorageSnapshotInfo
-	177, // 365: silo.daemon.v1.RuntimeService.ListStorageSnapshots:output_type -> silo.daemon.v1.StorageSnapshotList
-	191, // 366: silo.daemon.v1.RuntimeService.ReleaseSnapshotRetention:output_type -> google.protobuf.Empty
-	191, // 367: silo.daemon.v1.RuntimeService.RemoveImageAlias:output_type -> google.protobuf.Empty
-	325, // [325:368] is the sub-list for method output_type
-	282, // [282:325] is the sub-list for method input_type
-	282, // [282:282] is the sub-list for extension type_name
-	282, // [282:282] is the sub-list for extension extendee
-	0,   // [0:282] is the sub-list for field type_name
+	206, // 106: silo.daemon.v1.MachineStatus.stopped:type_name -> google.protobuf.Empty
+	115, // 107: silo.daemon.v1.MachineStatus.starting:type_name -> silo.daemon.v1.LifecycleDetail
+	116, // 108: silo.daemon.v1.MachineStatus.running:type_name -> silo.daemon.v1.RunningStatus
+	115, // 109: silo.daemon.v1.MachineStatus.stopping:type_name -> silo.daemon.v1.LifecycleDetail
+	115, // 110: silo.daemon.v1.MachineStatus.error:type_name -> silo.daemon.v1.LifecycleDetail
+	115, // 111: silo.daemon.v1.MachineStatus.pausing:type_name -> silo.daemon.v1.LifecycleDetail
+	115, // 112: silo.daemon.v1.MachineStatus.paused:type_name -> silo.daemon.v1.LifecycleDetail
+	115, // 113: silo.daemon.v1.MachineStatus.capturing:type_name -> silo.daemon.v1.LifecycleDetail
+	115, // 114: silo.daemon.v1.MachineStatus.restoring:type_name -> silo.daemon.v1.LifecycleDetail
+	115, // 115: silo.daemon.v1.MachineStatus.activating:type_name -> silo.daemon.v1.LifecycleDetail
+	115, // 116: silo.daemon.v1.MachineStatus.activation_failed:type_name -> silo.daemon.v1.LifecycleDetail
+	12,  // 117: silo.daemon.v1.Rootfs.source_kind:type_name -> silo.daemon.v1.ImageSourceKind
+	208, // 118: silo.daemon.v1.Rootfs.created_at:type_name -> google.protobuf.Timestamp
+	13,  // 119: silo.daemon.v1.BootReport.mode:type_name -> silo.daemon.v1.BootMode
+	15,  // 120: silo.daemon.v1.ProvisionStepReport.status:type_name -> silo.daemon.v1.ProvisionStepStatus
+	16,  // 121: silo.daemon.v1.ProvisionStepReport.failure_policy:type_name -> silo.daemon.v1.ProvisionFailurePolicy
+	207, // 122: silo.daemon.v1.ProvisionStepReport.duration:type_name -> google.protobuf.Duration
+	14,  // 123: silo.daemon.v1.ProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
+	208, // 124: silo.daemon.v1.ProvisionReport.started_at:type_name -> google.protobuf.Timestamp
+	208, // 125: silo.daemon.v1.ProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
+	207, // 126: silo.daemon.v1.ProvisionReport.duration:type_name -> google.protobuf.Duration
+	121, // 127: silo.daemon.v1.ProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
+	78,  // 128: silo.daemon.v1.MachineSnapshot.spec:type_name -> silo.daemon.v1.VmSpec
+	0,   // 129: silo.daemon.v1.MachineSnapshot.retention:type_name -> silo.daemon.v1.Retention
+	61,  // 130: silo.daemon.v1.MachineSnapshot.process:type_name -> silo.daemon.v1.ProcessConfig
+	62,  // 131: silo.daemon.v1.MachineSnapshot.agent_mode:type_name -> silo.daemon.v1.Agent
+	208, // 132: silo.daemon.v1.MachineSnapshot.created_at:type_name -> google.protobuf.Timestamp
+	208, // 133: silo.daemon.v1.MachineSnapshot.modified_at:type_name -> google.protobuf.Timestamp
+	118, // 134: silo.daemon.v1.MachineSnapshot.rootfs:type_name -> silo.daemon.v1.Rootfs
+	204, // 135: silo.daemon.v1.MachineSnapshot.labels:type_name -> silo.daemon.v1.MachineSnapshot.LabelsEntry
+	205, // 136: silo.daemon.v1.MachineSnapshot.metadata:type_name -> silo.daemon.v1.MachineSnapshot.MetadataEntry
+	80,  // 137: silo.daemon.v1.MachineSnapshot.network:type_name -> silo.daemon.v1.ResolvedNetwork
+	119, // 138: silo.daemon.v1.MachineSnapshot.tailscale:type_name -> silo.daemon.v1.MachineTailscale
+	64,  // 139: silo.daemon.v1.MachineSnapshot.guest:type_name -> silo.daemon.v1.GuestConfig
+	117, // 140: silo.daemon.v1.MachineSnapshot.status:type_name -> silo.daemon.v1.MachineStatus
+	10,  // 141: silo.daemon.v1.MachineSnapshot.observation:type_name -> silo.daemon.v1.Observation
+	114, // 142: silo.daemon.v1.MachineSnapshot.issues:type_name -> silo.daemon.v1.MachineIssue
+	120, // 143: silo.daemon.v1.MachineSnapshot.boot_report:type_name -> silo.daemon.v1.BootReport
+	122, // 144: silo.daemon.v1.MachineSnapshot.provision_report:type_name -> silo.daemon.v1.ProvisionReport
+	208, // 145: silo.daemon.v1.MachineSnapshot.started_at:type_name -> google.protobuf.Timestamp
+	208, // 146: silo.daemon.v1.MachineSnapshot.updated_at:type_name -> google.protobuf.Timestamp
+	144, // 147: silo.daemon.v1.MachineSnapshot.network_observation:type_name -> silo.daemon.v1.NetworkObservation
+	198, // 148: silo.daemon.v1.MachineSnapshot.live:type_name -> silo.daemon.v1.LiveMachineReport
+	197, // 149: silo.daemon.v1.MachineSnapshot.prospective_live:type_name -> silo.daemon.v1.LiveHostReport
+	54,  // 150: silo.daemon.v1.MachineSnapshot.live_evidence:type_name -> silo.daemon.v1.LiveEvidenceState
+	179, // 151: silo.daemon.v1.MachineSnapshot.lifecycle:type_name -> silo.daemon.v1.MachineLifecycle
+	123, // 152: silo.daemon.v1.MachineInventoryEntry.data:type_name -> silo.daemon.v1.MachineSnapshot
+	114, // 153: silo.daemon.v1.MachineInventoryEntry.issues:type_name -> silo.daemon.v1.MachineIssue
+	123, // 154: silo.daemon.v1.MachineStart.data:type_name -> silo.daemon.v1.MachineSnapshot
+	17,  // 155: silo.daemon.v1.MachineReadiness.outcome:type_name -> silo.daemon.v1.ReadinessOutcome
+	123, // 156: silo.daemon.v1.MachineReadiness.data:type_name -> silo.daemon.v1.MachineSnapshot
+	167, // 157: silo.daemon.v1.MachineReadiness.status:type_name -> silo.daemon.v1.MonitorStatus
+	18,  // 158: silo.daemon.v1.MachineExit.outcome:type_name -> silo.daemon.v1.ExitOutcome
+	123, // 159: silo.daemon.v1.MachineExit.data:type_name -> silo.daemon.v1.MachineSnapshot
+	208, // 160: silo.daemon.v1.MachineExit.exited_at:type_name -> google.protobuf.Timestamp
+	19,  // 161: silo.daemon.v1.ReadLogsRequest.source:type_name -> silo.daemon.v1.LogSource
+	20,  // 162: silo.daemon.v1.ReadLogsRequest.output:type_name -> silo.daemon.v1.LogOutput
+	19,  // 163: silo.daemon.v1.LogChunk.source:type_name -> silo.daemon.v1.LogSource
+	20,  // 164: silo.daemon.v1.LogChunk.output:type_name -> silo.daemon.v1.LogOutput
+	21,  // 165: silo.daemon.v1.ParseResourceRequest.kind:type_name -> silo.daemon.v1.ResourceKind
+	206, // 166: silo.daemon.v1.NormalizePolicyRequest.empty:type_name -> google.protobuf.Empty
+	134, // 167: silo.daemon.v1.SecretRequirement.alternatives:type_name -> silo.daemon.v1.SecretAlternative
+	22,  // 168: silo.daemon.v1.SecretSlot.kind:type_name -> silo.daemon.v1.SecretKind
+	23,  // 169: silo.daemon.v1.SecretSlot.field:type_name -> silo.daemon.v1.SecretField
+	136, // 170: silo.daemon.v1.PolicyDocument.secret_slots:type_name -> silo.daemon.v1.SecretSlot
+	135, // 171: silo.daemon.v1.PolicyDocument.secret_requirements:type_name -> silo.daemon.v1.SecretRequirement
+	24,  // 172: silo.daemon.v1.PolicySecretsResult.state:type_name -> silo.daemon.v1.PolicySecretsState
+	139, // 173: silo.daemon.v1.PolicySecretsResult.diagnostics:type_name -> silo.daemon.v1.SecretDiagnostic
+	135, // 174: silo.daemon.v1.PolicySecretsResult.requirements:type_name -> silo.daemon.v1.SecretRequirement
+	136, // 175: silo.daemon.v1.PolicySecretsResult.slots:type_name -> silo.daemon.v1.SecretSlot
+	25,  // 176: silo.daemon.v1.ErrorDetail.kind:type_name -> silo.daemon.v1.ErrorKind
+	26,  // 177: silo.daemon.v1.ErrorDetail.code:type_name -> silo.daemon.v1.ErrorCode
+	27,  // 178: silo.daemon.v1.ErrorDetail.launch_failure_reason:type_name -> silo.daemon.v1.LaunchFailureReason
+	199, // 179: silo.daemon.v1.ErrorDetail.live_unsupported:type_name -> silo.daemon.v1.LiveOperationUnsupported
+	208, // 180: silo.daemon.v1.NodeStatus.updated_at:type_name -> google.protobuf.Timestamp
+	28,  // 181: silo.daemon.v1.NodeStatus.state:type_name -> silo.daemon.v1.NodeState
+	208, // 182: silo.daemon.v1.NodeStatus.key_expiry:type_name -> google.protobuf.Timestamp
+	208, // 183: silo.daemon.v1.NodeObservation.observed_at:type_name -> google.protobuf.Timestamp
+	208, // 184: silo.daemon.v1.NodeObservation.key_expiry:type_name -> google.protobuf.Timestamp
+	142, // 185: silo.daemon.v1.NetworkObservation.live:type_name -> silo.daemon.v1.NodeStatus
+	143, // 186: silo.daemon.v1.NetworkObservation.historical:type_name -> silo.daemon.v1.NodeObservation
+	29,  // 187: silo.daemon.v1.NetworkObservation.issues:type_name -> silo.daemon.v1.NetworkObservationIssue
+	31,  // 188: silo.daemon.v1.ComponentStatus.state:type_name -> silo.daemon.v1.ComponentState
+	32,  // 189: silo.daemon.v1.ComponentStatus.shutdown_protection:type_name -> silo.daemon.v1.ShutdownProtection
+	30,  // 190: silo.daemon.v1.DaemonStatus.core:type_name -> silo.daemon.v1.CorePhase
+	168, // 191: silo.daemon.v1.DaemonStatus.system:type_name -> silo.daemon.v1.SystemStatus
+	145, // 192: silo.daemon.v1.DaemonStatus.tailscale:type_name -> silo.daemon.v1.ComponentStatus
+	208, // 193: silo.daemon.v1.DaemonStatus.updated_at:type_name -> google.protobuf.Timestamp
+	197, // 194: silo.daemon.v1.DaemonStatus.manager_live:type_name -> silo.daemon.v1.LiveHostReport
+	197, // 195: silo.daemon.v1.DaemonStatus.appliance_live:type_name -> silo.daemon.v1.LiveHostReport
+	147, // 196: silo.daemon.v1.RuntimeInfo.components:type_name -> silo.daemon.v1.RuntimeComponents
+	145, // 197: silo.daemon.v1.TailscaleStatusReport.status:type_name -> silo.daemon.v1.ComponentStatus
+	33,  // 198: silo.daemon.v1.TailscaleSettings.enrollment_mode:type_name -> silo.daemon.v1.EnrollmentMode
+	151, // 199: silo.daemon.v1.TailscaleSettings.defaults:type_name -> silo.daemon.v1.ResourceDefaults
+	152, // 200: silo.daemon.v1.TailscaleSettings.ceilings:type_name -> silo.daemon.v1.ResourceCeilings
+	207, // 201: silo.daemon.v1.TailscaleSettings.stop_budget:type_name -> google.protobuf.Duration
+	207, // 202: silo.daemon.v1.TailscaleSettings.shutdown_margin:type_name -> google.protobuf.Duration
+	147, // 203: silo.daemon.v1.HelperBootstrap.runtime_components:type_name -> silo.daemon.v1.RuntimeComponents
+	153, // 204: silo.daemon.v1.HelperBootstrap.settings:type_name -> silo.daemon.v1.TailscaleSettings
+	208, // 205: silo.daemon.v1.MonitorSnapshot.observed_at:type_name -> google.protobuf.Timestamp
+	34,  // 206: silo.daemon.v1.VmSnapshot.state:type_name -> silo.daemon.v1.VmState
+	208, // 207: silo.daemon.v1.VmSnapshot.state_changed_at:type_name -> google.protobuf.Timestamp
+	208, // 208: silo.daemon.v1.VmSnapshot.running_since:type_name -> google.protobuf.Timestamp
+	35,  // 209: silo.daemon.v1.ReadinessState.reason:type_name -> silo.daemon.v1.ReadinessReason
+	36,  // 210: silo.daemon.v1.AgentConnection.state:type_name -> silo.daemon.v1.AgentConnectionState
+	208, // 211: silo.daemon.v1.AgentConnection.last_success_at:type_name -> google.protobuf.Timestamp
+	208, // 212: silo.daemon.v1.AgentConnection.last_failure_at:type_name -> google.protobuf.Timestamp
+	40,  // 213: silo.daemon.v1.SshListenerReport.backend:type_name -> silo.daemon.v1.SshBackend
+	14,  // 214: silo.daemon.v1.GuestProvisionReport.status:type_name -> silo.daemon.v1.ProvisionStatus
+	208, // 215: silo.daemon.v1.GuestProvisionReport.started_at:type_name -> google.protobuf.Timestamp
+	208, // 216: silo.daemon.v1.GuestProvisionReport.finished_at:type_name -> google.protobuf.Timestamp
+	207, // 217: silo.daemon.v1.GuestProvisionReport.duration:type_name -> google.protobuf.Duration
+	121, // 218: silo.daemon.v1.GuestProvisionReport.steps:type_name -> silo.daemon.v1.ProvisionStepReport
+	208, // 219: silo.daemon.v1.AgentStatusReport.observed_at:type_name -> google.protobuf.Timestamp
+	39,  // 220: silo.daemon.v1.AgentStatusReport.state:type_name -> silo.daemon.v1.AgentStatusState
+	160, // 221: silo.daemon.v1.AgentStatusReport.system:type_name -> silo.daemon.v1.SystemInfo
+	120, // 222: silo.daemon.v1.AgentStatusReport.boot:type_name -> silo.daemon.v1.BootReport
+	162, // 223: silo.daemon.v1.AgentStatusReport.provisioning:type_name -> silo.daemon.v1.GuestProvisionReport
+	161, // 224: silo.daemon.v1.AgentStatusReport.ssh:type_name -> silo.daemon.v1.SshListenerReport
+	208, // 225: silo.daemon.v1.AgentStatusObservation.received_at:type_name -> google.protobuf.Timestamp
+	208, // 226: silo.daemon.v1.AgentStatusObservation.stale_at:type_name -> google.protobuf.Timestamp
+	37,  // 227: silo.daemon.v1.AgentStatusObservation.freshness:type_name -> silo.daemon.v1.Freshness
+	38,  // 228: silo.daemon.v1.AgentStatusObservation.stale_reason:type_name -> silo.daemon.v1.StaleReason
+	163, // 229: silo.daemon.v1.AgentStatusObservation.report:type_name -> silo.daemon.v1.AgentStatusReport
+	158, // 230: silo.daemon.v1.EnabledAgent.connection:type_name -> silo.daemon.v1.AgentConnection
+	159, // 231: silo.daemon.v1.EnabledAgent.identity:type_name -> silo.daemon.v1.AgentIdentity
+	164, // 232: silo.daemon.v1.EnabledAgent.status:type_name -> silo.daemon.v1.AgentStatusObservation
+	206, // 233: silo.daemon.v1.AgentStatus.disabled:type_name -> google.protobuf.Empty
+	165, // 234: silo.daemon.v1.AgentStatus.enabled:type_name -> silo.daemon.v1.EnabledAgent
+	155, // 235: silo.daemon.v1.MonitorStatus.monitor:type_name -> silo.daemon.v1.MonitorSnapshot
+	156, // 236: silo.daemon.v1.MonitorStatus.vm:type_name -> silo.daemon.v1.VmSnapshot
+	157, // 237: silo.daemon.v1.MonitorStatus.readiness:type_name -> silo.daemon.v1.ReadinessState
+	166, // 238: silo.daemon.v1.MonitorStatus.agent:type_name -> silo.daemon.v1.AgentStatus
+	198, // 239: silo.daemon.v1.MonitorStatus.live:type_name -> silo.daemon.v1.LiveMachineReport
+	176, // 240: silo.daemon.v1.MonitorStatus.lifecycle:type_name -> silo.daemon.v1.LiveLifecycle
+	41,  // 241: silo.daemon.v1.SystemStatus.phase:type_name -> silo.daemon.v1.SystemPhase
+	208, // 242: silo.daemon.v1.SystemStatus.update_checked_at:type_name -> google.protobuf.Timestamp
+	42,  // 243: silo.daemon.v1.SystemStatus.memory_reclaim_outcome:type_name -> silo.daemon.v1.MemoryReclaimOutcome
+	208, // 244: silo.daemon.v1.SystemStatus.memory_reclaim_at:type_name -> google.protobuf.Timestamp
+	198, // 245: silo.daemon.v1.SystemStatus.live:type_name -> silo.daemon.v1.LiveMachineReport
+	197, // 246: silo.daemon.v1.SystemStatus.prospective_live:type_name -> silo.daemon.v1.LiveHostReport
+	56,  // 247: silo.daemon.v1.LiveMachineRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	206, // 248: silo.daemon.v1.PauseOwner.user:type_name -> google.protobuf.Empty
+	170, // 249: silo.daemon.v1.PauseToken.owner:type_name -> silo.daemon.v1.PauseOwner
+	171, // 250: silo.daemon.v1.CurrentPause.token:type_name -> silo.daemon.v1.PauseToken
+	46,  // 251: silo.daemon.v1.GuestFreezeObservation.state:type_name -> silo.daemon.v1.GuestLifecycleState
+	45,  // 252: silo.daemon.v1.LiveFailure.code:type_name -> silo.daemon.v1.LiveFailureCode
+	44,  // 253: silo.daemon.v1.LiveFailure.stage:type_name -> silo.daemon.v1.LiveStage
+	173, // 254: silo.daemon.v1.LiveFailure.guest:type_name -> silo.daemon.v1.GuestFreezeObservation
+	43,  // 255: silo.daemon.v1.LiveActivity.command:type_name -> silo.daemon.v1.LiveCommandKind
+	44,  // 256: silo.daemon.v1.LiveActivity.stage:type_name -> silo.daemon.v1.LiveStage
+	172, // 257: silo.daemon.v1.LiveLifecycle.current_pause:type_name -> silo.daemon.v1.CurrentPause
+	175, // 258: silo.daemon.v1.LiveLifecycle.activity:type_name -> silo.daemon.v1.LiveActivity
+	174, // 259: silo.daemon.v1.LiveLifecycle.error:type_name -> silo.daemon.v1.LiveFailure
+	171, // 260: silo.daemon.v1.PauseEstablished.token:type_name -> silo.daemon.v1.PauseToken
+	173, // 261: silo.daemon.v1.PauseEstablished.guest:type_name -> silo.daemon.v1.GuestFreezeObservation
+	47,  // 262: silo.daemon.v1.LiveOperationRecord.kind:type_name -> silo.daemon.v1.OperationKind
+	206, // 263: silo.daemon.v1.LiveOperationRecord.in_progress:type_name -> google.protobuf.Empty
+	177, // 264: silo.daemon.v1.LiveOperationRecord.succeeded:type_name -> silo.daemon.v1.PauseEstablished
+	174, // 265: silo.daemon.v1.LiveOperationRecord.failed:type_name -> silo.daemon.v1.LiveFailure
+	198, // 266: silo.daemon.v1.MachineLifecycle.report:type_name -> silo.daemon.v1.LiveMachineReport
+	34,  // 267: silo.daemon.v1.MachineLifecycle.state:type_name -> silo.daemon.v1.VmState
+	176, // 268: silo.daemon.v1.MachineLifecycle.lifecycle:type_name -> silo.daemon.v1.LiveLifecycle
+	178, // 269: silo.daemon.v1.MachineLifecycle.operation:type_name -> silo.daemon.v1.LiveOperationRecord
+	56,  // 270: silo.daemon.v1.LiveCaptureRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	56,  // 271: silo.daemon.v1.LiveForkRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	184, // 272: silo.daemon.v1.ExternalResourceMapping.resource:type_name -> silo.daemon.v1.ExternalResourceKey
+	185, // 273: silo.daemon.v1.ExternalResourceMappings.values:type_name -> silo.daemon.v1.ExternalResourceMapping
+	206, // 274: silo.daemon.v1.ExternalResourcePolicy.reject:type_name -> google.protobuf.Empty
+	206, // 275: silo.daemon.v1.ExternalResourcePolicy.require_mappings:type_name -> google.protobuf.Empty
+	186, // 276: silo.daemon.v1.ExternalResourcePolicy.mappings:type_name -> silo.daemon.v1.ExternalResourceMappings
+	56,  // 277: silo.daemon.v1.StoppedForkRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	187, // 278: silo.daemon.v1.StoppedForkRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
+	56,  // 279: silo.daemon.v1.CreateStorageSnapshotRequest.machine:type_name -> silo.daemon.v1.MachineRef
+	187, // 280: silo.daemon.v1.CreateStorageSnapshotRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
+	183, // 281: silo.daemon.v1.RestoreStorageSnapshotRequest.snapshot:type_name -> silo.daemon.v1.StorageSnapshotRef
+	187, // 282: silo.daemon.v1.RestoreStorageSnapshotRequest.external_resources:type_name -> silo.daemon.v1.ExternalResourcePolicy
+	48,  // 283: silo.daemon.v1.StorageSnapshotInfo.capture_kind:type_name -> silo.daemon.v1.StorageCaptureKind
+	191, // 284: silo.daemon.v1.StorageSnapshotList.snapshots:type_name -> silo.daemon.v1.StorageSnapshotInfo
+	206, // 285: silo.daemon.v1.LiveDeviceSubject.virtiofs:type_name -> google.protobuf.Empty
+	206, // 286: silo.daemon.v1.LiveDeviceSubject.rosetta:type_name -> google.protobuf.Empty
+	206, // 287: silo.daemon.v1.LiveDeviceSubject.tap:type_name -> google.protobuf.Empty
+	206, // 288: silo.daemon.v1.LiveDeviceSubject.gpu:type_name -> google.protobuf.Empty
+	206, // 289: silo.daemon.v1.LiveDeviceSubject.nested:type_name -> google.protobuf.Empty
+	206, // 290: silo.daemon.v1.LiveDeviceSubject.tee:type_name -> google.protobuf.Empty
+	53,  // 291: silo.daemon.v1.LiveUnsupportedReason.code:type_name -> silo.daemon.v1.LiveReasonCode
+	193, // 292: silo.daemon.v1.LiveUnsupportedReason.subject:type_name -> silo.daemon.v1.LiveDeviceSubject
+	206, // 293: silo.daemon.v1.LiveCapability.supported:type_name -> google.protobuf.Empty
+	194, // 294: silo.daemon.v1.LiveCapability.unsupported:type_name -> silo.daemon.v1.LiveUnsupportedReason
+	195, // 295: silo.daemon.v1.LiveCapabilityVector.pause:type_name -> silo.daemon.v1.LiveCapability
+	195, // 296: silo.daemon.v1.LiveCapabilityVector.capture:type_name -> silo.daemon.v1.LiveCapability
+	195, // 297: silo.daemon.v1.LiveCapabilityVector.restore:type_name -> silo.daemon.v1.LiveCapability
+	195, // 298: silo.daemon.v1.LiveCapabilityVector.fork:type_name -> silo.daemon.v1.LiveCapability
+	195, // 299: silo.daemon.v1.LiveCapabilityVector.incremental:type_name -> silo.daemon.v1.LiveCapability
+	52,  // 300: silo.daemon.v1.LiveHostReport.scope:type_name -> silo.daemon.v1.LiveScope
+	50,  // 301: silo.daemon.v1.LiveHostReport.backend:type_name -> silo.daemon.v1.LiveBackend
+	51,  // 302: silo.daemon.v1.LiveHostReport.lane:type_name -> silo.daemon.v1.LiveLane
+	196, // 303: silo.daemon.v1.LiveHostReport.live:type_name -> silo.daemon.v1.LiveCapabilityVector
+	52,  // 304: silo.daemon.v1.LiveMachineReport.scope:type_name -> silo.daemon.v1.LiveScope
+	50,  // 305: silo.daemon.v1.LiveMachineReport.backend:type_name -> silo.daemon.v1.LiveBackend
+	51,  // 306: silo.daemon.v1.LiveMachineReport.lane:type_name -> silo.daemon.v1.LiveLane
+	196, // 307: silo.daemon.v1.LiveMachineReport.live:type_name -> silo.daemon.v1.LiveCapabilityVector
+	49,  // 308: silo.daemon.v1.LiveOperationUnsupported.operation:type_name -> silo.daemon.v1.LiveOperation
+	50,  // 309: silo.daemon.v1.LiveOperationUnsupported.backend:type_name -> silo.daemon.v1.LiveBackend
+	51,  // 310: silo.daemon.v1.LiveOperationUnsupported.lane:type_name -> silo.daemon.v1.LiveLane
+	194, // 311: silo.daemon.v1.LiveOperationUnsupported.reason:type_name -> silo.daemon.v1.LiveUnsupportedReason
+	206, // 312: silo.daemon.v1.DaemonService.GetStatus:input_type -> google.protobuf.Empty
+	206, // 313: silo.daemon.v1.DaemonService.GetRuntimeInfo:input_type -> google.protobuf.Empty
+	149, // 314: silo.daemon.v1.DaemonService.ReportTailscaleStatus:input_type -> silo.daemon.v1.TailscaleStatusReport
+	150, // 315: silo.daemon.v1.DaemonService.DrainMutations:input_type -> silo.daemon.v1.DrainMutationsRequest
+	206, // 316: silo.daemon.v1.DaemonService.GetLiveCapabilities:input_type -> google.protobuf.Empty
+	206, // 317: silo.daemon.v1.MachineService.ListMachines:input_type -> google.protobuf.Empty
+	56,  // 318: silo.daemon.v1.MachineService.InspectInventory:input_type -> silo.daemon.v1.MachineRef
+	56,  // 319: silo.daemon.v1.MachineService.InspectMachine:input_type -> silo.daemon.v1.MachineRef
+	55,  // 320: silo.daemon.v1.MachineService.EnsureNameAvailable:input_type -> silo.daemon.v1.Name
+	89,  // 321: silo.daemon.v1.MachineService.CreateMachine:input_type -> silo.daemon.v1.CreateMachineRequest
+	102, // 322: silo.daemon.v1.MachineService.StartMachine:input_type -> silo.daemon.v1.StartMachineRequest
+	103, // 323: silo.daemon.v1.MachineService.StopMachine:input_type -> silo.daemon.v1.StopMachineRequest
+	104, // 324: silo.daemon.v1.MachineService.RemoveMachine:input_type -> silo.daemon.v1.RemoveMachineRequest
+	109, // 325: silo.daemon.v1.MachineService.UpdateMachine:input_type -> silo.daemon.v1.UpdateMachineRequest
+	110, // 326: silo.daemon.v1.MachineService.WaitReady:input_type -> silo.daemon.v1.WaitReadyRequest
+	111, // 327: silo.daemon.v1.MachineService.StopRun:input_type -> silo.daemon.v1.StopRunRequest
+	112, // 328: silo.daemon.v1.MachineService.KillRun:input_type -> silo.daemon.v1.KillRunRequest
+	113, // 329: silo.daemon.v1.MachineService.WaitForRun:input_type -> silo.daemon.v1.WaitForRunRequest
+	57,  // 330: silo.daemon.v1.MachineService.RemoveAfterRun:input_type -> silo.daemon.v1.MachineRunRef
+	128, // 331: silo.daemon.v1.MachineService.ReadLogs:input_type -> silo.daemon.v1.ReadLogsRequest
+	130, // 332: silo.daemon.v1.MachineService.SetMachineSecret:input_type -> silo.daemon.v1.SetMachineSecretRequest
+	169, // 333: silo.daemon.v1.MachineService.PauseMachine:input_type -> silo.daemon.v1.LiveMachineRequest
+	169, // 334: silo.daemon.v1.MachineService.ResumeMachine:input_type -> silo.daemon.v1.LiveMachineRequest
+	180, // 335: silo.daemon.v1.MachineService.CaptureExecution:input_type -> silo.daemon.v1.LiveCaptureRequest
+	181, // 336: silo.daemon.v1.MachineService.ForkExecution:input_type -> silo.daemon.v1.LiveForkRequest
+	188, // 337: silo.daemon.v1.MachineService.ForkStopped:input_type -> silo.daemon.v1.StoppedForkRequest
+	189, // 338: silo.daemon.v1.MachineService.SnapshotStopped:input_type -> silo.daemon.v1.CreateStorageSnapshotRequest
+	206, // 339: silo.daemon.v1.NetworkService.ListNetworkDefinitions:input_type -> google.protobuf.Empty
+	55,  // 340: silo.daemon.v1.NetworkService.GetNetworkDefinition:input_type -> silo.daemon.v1.Name
+	83,  // 341: silo.daemon.v1.NetworkService.CreateNetworkDefinition:input_type -> silo.daemon.v1.CreateNetworkDefinitionRequest
+	55,  // 342: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:input_type -> silo.daemon.v1.Name
+	84,  // 343: silo.daemon.v1.NetworkService.SetMachineNetwork:input_type -> silo.daemon.v1.SetMachineNetworkRequest
+	96,  // 344: silo.daemon.v1.RuntimeService.ResolveImage:input_type -> silo.daemon.v1.ResolveImageRequest
+	98,  // 345: silo.daemon.v1.RuntimeService.PullImage:input_type -> silo.daemon.v1.PullImageRequest
+	206, // 346: silo.daemon.v1.RuntimeService.ProposeMachineName:input_type -> google.protobuf.Empty
+	131, // 347: silo.daemon.v1.RuntimeService.ParseResource:input_type -> silo.daemon.v1.ParseResourceRequest
+	133, // 348: silo.daemon.v1.RuntimeService.NormalizePolicy:input_type -> silo.daemon.v1.NormalizePolicyRequest
+	138, // 349: silo.daemon.v1.RuntimeService.CheckPolicySecrets:input_type -> silo.daemon.v1.CheckPolicySecretsRequest
+	182, // 350: silo.daemon.v1.RuntimeService.RestoreExecution:input_type -> silo.daemon.v1.LiveRestoreRequest
+	190, // 351: silo.daemon.v1.RuntimeService.RestoreSnapshot:input_type -> silo.daemon.v1.RestoreStorageSnapshotRequest
+	183, // 352: silo.daemon.v1.RuntimeService.InspectStorageSnapshot:input_type -> silo.daemon.v1.StorageSnapshotRef
+	206, // 353: silo.daemon.v1.RuntimeService.ListStorageSnapshots:input_type -> google.protobuf.Empty
+	183, // 354: silo.daemon.v1.RuntimeService.ReleaseSnapshotRetention:input_type -> silo.daemon.v1.StorageSnapshotRef
+	55,  // 355: silo.daemon.v1.RuntimeService.RemoveImageAlias:input_type -> silo.daemon.v1.Name
+	146, // 356: silo.daemon.v1.DaemonService.GetStatus:output_type -> silo.daemon.v1.DaemonStatus
+	148, // 357: silo.daemon.v1.DaemonService.GetRuntimeInfo:output_type -> silo.daemon.v1.RuntimeInfo
+	206, // 358: silo.daemon.v1.DaemonService.ReportTailscaleStatus:output_type -> google.protobuf.Empty
+	206, // 359: silo.daemon.v1.DaemonService.DrainMutations:output_type -> google.protobuf.Empty
+	197, // 360: silo.daemon.v1.DaemonService.GetLiveCapabilities:output_type -> silo.daemon.v1.LiveHostReport
+	124, // 361: silo.daemon.v1.MachineService.ListMachines:output_type -> silo.daemon.v1.MachineInventoryEntry
+	124, // 362: silo.daemon.v1.MachineService.InspectInventory:output_type -> silo.daemon.v1.MachineInventoryEntry
+	123, // 363: silo.daemon.v1.MachineService.InspectMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	206, // 364: silo.daemon.v1.MachineService.EnsureNameAvailable:output_type -> google.protobuf.Empty
+	95,  // 365: silo.daemon.v1.MachineService.CreateMachine:output_type -> silo.daemon.v1.CreateMachineEvent
+	125, // 366: silo.daemon.v1.MachineService.StartMachine:output_type -> silo.daemon.v1.MachineStart
+	123, // 367: silo.daemon.v1.MachineService.StopMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	206, // 368: silo.daemon.v1.MachineService.RemoveMachine:output_type -> google.protobuf.Empty
+	123, // 369: silo.daemon.v1.MachineService.UpdateMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	126, // 370: silo.daemon.v1.MachineService.WaitReady:output_type -> silo.daemon.v1.MachineReadiness
+	123, // 371: silo.daemon.v1.MachineService.StopRun:output_type -> silo.daemon.v1.MachineSnapshot
+	127, // 372: silo.daemon.v1.MachineService.KillRun:output_type -> silo.daemon.v1.MachineExit
+	127, // 373: silo.daemon.v1.MachineService.WaitForRun:output_type -> silo.daemon.v1.MachineExit
+	206, // 374: silo.daemon.v1.MachineService.RemoveAfterRun:output_type -> google.protobuf.Empty
+	129, // 375: silo.daemon.v1.MachineService.ReadLogs:output_type -> silo.daemon.v1.LogChunk
+	206, // 376: silo.daemon.v1.MachineService.SetMachineSecret:output_type -> google.protobuf.Empty
+	123, // 377: silo.daemon.v1.MachineService.PauseMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	123, // 378: silo.daemon.v1.MachineService.ResumeMachine:output_type -> silo.daemon.v1.MachineSnapshot
+	206, // 379: silo.daemon.v1.MachineService.CaptureExecution:output_type -> google.protobuf.Empty
+	206, // 380: silo.daemon.v1.MachineService.ForkExecution:output_type -> google.protobuf.Empty
+	123, // 381: silo.daemon.v1.MachineService.ForkStopped:output_type -> silo.daemon.v1.MachineSnapshot
+	191, // 382: silo.daemon.v1.MachineService.SnapshotStopped:output_type -> silo.daemon.v1.StorageSnapshotInfo
+	81,  // 383: silo.daemon.v1.NetworkService.ListNetworkDefinitions:output_type -> silo.daemon.v1.NetworkDefinition
+	82,  // 384: silo.daemon.v1.NetworkService.GetNetworkDefinition:output_type -> silo.daemon.v1.OptionalNetworkDefinition
+	206, // 385: silo.daemon.v1.NetworkService.CreateNetworkDefinition:output_type -> google.protobuf.Empty
+	206, // 386: silo.daemon.v1.NetworkService.RemoveNetworkDefinition:output_type -> google.protobuf.Empty
+	123, // 387: silo.daemon.v1.NetworkService.SetMachineNetwork:output_type -> silo.daemon.v1.MachineSnapshot
+	97,  // 388: silo.daemon.v1.RuntimeService.ResolveImage:output_type -> silo.daemon.v1.ResolveImageEvent
+	94,  // 389: silo.daemon.v1.RuntimeService.PullImage:output_type -> silo.daemon.v1.ImageProgress
+	55,  // 390: silo.daemon.v1.RuntimeService.ProposeMachineName:output_type -> silo.daemon.v1.Name
+	132, // 391: silo.daemon.v1.RuntimeService.ParseResource:output_type -> silo.daemon.v1.Size
+	137, // 392: silo.daemon.v1.RuntimeService.NormalizePolicy:output_type -> silo.daemon.v1.PolicyDocument
+	140, // 393: silo.daemon.v1.RuntimeService.CheckPolicySecrets:output_type -> silo.daemon.v1.PolicySecretsResult
+	206, // 394: silo.daemon.v1.RuntimeService.RestoreExecution:output_type -> google.protobuf.Empty
+	123, // 395: silo.daemon.v1.RuntimeService.RestoreSnapshot:output_type -> silo.daemon.v1.MachineSnapshot
+	191, // 396: silo.daemon.v1.RuntimeService.InspectStorageSnapshot:output_type -> silo.daemon.v1.StorageSnapshotInfo
+	192, // 397: silo.daemon.v1.RuntimeService.ListStorageSnapshots:output_type -> silo.daemon.v1.StorageSnapshotList
+	206, // 398: silo.daemon.v1.RuntimeService.ReleaseSnapshotRetention:output_type -> google.protobuf.Empty
+	206, // 399: silo.daemon.v1.RuntimeService.RemoveImageAlias:output_type -> google.protobuf.Empty
+	356, // [356:400] is the sub-list for method output_type
+	312, // [312:356] is the sub-list for method input_type
+	312, // [312:312] is the sub-list for extension type_name
+	312, // [312:312] is the sub-list for extension extendee
+	0,   // [0:312] is the sub-list for field type_name
 }
 
 func init() { file_daemon_proto_init() }
@@ -15331,6 +16803,12 @@ func file_daemon_proto_init() {
 		(*MachineStatus_Running)(nil),
 		(*MachineStatus_Stopping)(nil),
 		(*MachineStatus_Error)(nil),
+		(*MachineStatus_Pausing)(nil),
+		(*MachineStatus_Paused)(nil),
+		(*MachineStatus_Capturing)(nil),
+		(*MachineStatus_Restoring)(nil),
+		(*MachineStatus_Activating)(nil),
+		(*MachineStatus_ActivationFailed)(nil),
 	}
 	file_daemon_proto_msgTypes[63].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[65].OneofWrappers = []any{}
@@ -15364,27 +16842,38 @@ func file_daemon_proto_init() {
 	}
 	file_daemon_proto_msgTypes[112].OneofWrappers = []any{}
 	file_daemon_proto_msgTypes[113].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[115].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[116].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[117].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[118].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[115].OneofWrappers = []any{
+		(*PauseOwner_User)(nil),
+		(*PauseOwner_CaptureOperationId)(nil),
+	}
+	file_daemon_proto_msgTypes[118].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[119].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[123].OneofWrappers = []any{
+		(*LiveOperationRecord_InProgress)(nil),
+		(*LiveOperationRecord_Succeeded)(nil),
+		(*LiveOperationRecord_Failed)(nil),
+	}
+	file_daemon_proto_msgTypes[125].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[126].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[127].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[128].OneofWrappers = []any{
 		(*StorageSnapshotRef_Id)(nil),
 		(*StorageSnapshotRef_ImageAlias)(nil),
 	}
-	file_daemon_proto_msgTypes[119].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[129].OneofWrappers = []any{
 		(*ExternalResourceKey_DiskOrder)(nil),
 		(*ExternalResourceKey_ShareTag)(nil),
 	}
-	file_daemon_proto_msgTypes[122].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[132].OneofWrappers = []any{
 		(*ExternalResourcePolicy_Reject)(nil),
 		(*ExternalResourcePolicy_RequireMappings)(nil),
 		(*ExternalResourcePolicy_Mappings)(nil),
 	}
-	file_daemon_proto_msgTypes[123].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[124].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[125].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[126].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[128].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[133].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[134].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[135].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[136].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[138].OneofWrappers = []any{
 		(*LiveDeviceSubject_Virtiofs)(nil),
 		(*LiveDeviceSubject_Rosetta)(nil),
 		(*LiveDeviceSubject_Tap)(nil),
@@ -15393,21 +16882,21 @@ func file_daemon_proto_init() {
 		(*LiveDeviceSubject_Tee)(nil),
 		(*LiveDeviceSubject_GuestProfile)(nil),
 	}
-	file_daemon_proto_msgTypes[129].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[130].OneofWrappers = []any{
+	file_daemon_proto_msgTypes[139].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[140].OneofWrappers = []any{
 		(*LiveCapability_Supported)(nil),
 		(*LiveCapability_Unsupported)(nil),
 	}
-	file_daemon_proto_msgTypes[132].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[133].OneofWrappers = []any{}
-	file_daemon_proto_msgTypes[134].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[142].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[143].OneofWrappers = []any{}
+	file_daemon_proto_msgTypes[144].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_daemon_proto_rawDesc), len(file_daemon_proto_rawDesc)),
-			NumEnums:      50,
-			NumMessages:   141,
+			NumEnums:      55,
+			NumMessages:   151,
 			NumExtensions: 0,
 			NumServices:   4,
 		},

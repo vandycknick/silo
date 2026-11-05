@@ -138,6 +138,24 @@ impl ObservationStore {
         transaction.commit().await?;
         Ok((config, state))
     }
+    pub(crate) async fn pending_pause(
+        &self,
+        machine_id: crate::store::models::MachineId,
+        run_id: Option<&str>,
+    ) -> Result<Option<crate::store::live_store::LiveCommandIntent>, LibVmError> {
+        let Some(run_id) = run_id else {
+            return Ok(None);
+        };
+        let json: Option<String> = sqlx::query_scalar("SELECT json(input_json) FROM live_command WHERE machine_id=?1 AND run_id=?2 AND result_json IS NULL AND json_extract(input_json,'$.command.command')='pause' ORDER BY rowid LIMIT 1")
+            .bind(machine_id.to_string()).bind(run_id).fetch_optional(&self.pool).await?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|error| LibVmError::LiveProtocol {
+                message: error.to_string(),
+            })
+        })
+        .transpose()
+    }
+
     pub(crate) async fn machine_storage(
         &self,
         id: crate::store::models::MachineId,

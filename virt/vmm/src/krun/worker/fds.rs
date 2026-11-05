@@ -17,6 +17,10 @@
 //! | 26 | restore layout, read-only regular file              |
 //! | 27 | restore execution, read-only regular file           |
 //! | 28 | restore devices, read-only regular file             |
+//! | 29 | managed network: connected datagram socket (standalone only) |
+//! | 30 | console input: connected stream socket (standalone only)     |
+//! | 31 | console output: connected stream socket (standalone only)    |
+//! | 32 | lifecycle: connected stream socket (normal worker only)      |
 //!
 //! The optional mux hole stays closed; no other descriptor may be open.
 
@@ -36,9 +40,11 @@ pub(crate) const MUX_FD: RawFd = 7;
 pub(crate) const STORAGE_LEASE_FD: RawFd = 8;
 pub(crate) const FIRST_RAW_FD: RawFd = 9;
 const MAX_RAW_HANDLES: usize = 16;
-const MAX_INHERITED_FDS: usize = 13 + MAX_RAW_HANDLES;
+const MAX_INHERITED_FDS: usize = 14 + MAX_RAW_HANDLES;
 pub(crate) const RESTORE_STATE_FDS: [RawFd; 4] = [25, 26, 27, 28];
 pub(crate) const STANDALONE_ENDPOINT_FDS: [RawFd; 3] = [29, 30, 31];
+/// The normal worker's monitor lifecycle endpoint; above every other role.
+pub(crate) const LIFECYCLE_FD: RawFd = 32;
 
 #[allow(dead_code)] // Consumed only by the explicit standalone API entry.
 pub(crate) struct StandaloneEndpoints {
@@ -64,6 +70,8 @@ pub(crate) struct Bootstrap {
     pub(crate) mux: Option<OwnedFd>,
     pub(crate) storage_lease: OwnedFd,
     pub(crate) raw_handles: Vec<OwnedFd>,
+    /// Required by the normal worker; never present for the standalone entry.
+    pub(crate) lifecycle: Option<OwnedFd>,
     #[allow(dead_code)] // Only the explicit standalone entry consumes these roles.
     pub(crate) state_files: Option<RestoreStateFiles>,
     #[allow(dead_code)]
@@ -81,6 +89,7 @@ enum Role {
     Raw,
     State { maximum: u64 },
     Network,
+    Lifecycle,
 }
 
 impl Bootstrap {
@@ -113,6 +122,7 @@ impl Bootstrap {
             }
         }
         let raw_handles = &raw_handles[..raw_count];
+        let lifecycle = (!standalone).then_some(LIFECYCLE_FD);
         let mut allowed = [0; MAX_INHERITED_FDS];
         let mut count = 0;
         for raw in [
@@ -125,6 +135,7 @@ impl Bootstrap {
         .into_iter()
         .chain(mux)
         .chain(raw_handles.iter().copied())
+        .chain(lifecycle)
         .chain(restore.then_some(RESTORE_STATE_FDS).into_iter().flatten())
         .chain(
             standalone
@@ -144,6 +155,7 @@ impl Bootstrap {
             mux,
             STORAGE_LEASE_FD,
             raw_handles,
+            lifecycle,
             restore.then_some(RESTORE_STATE_FDS),
             standalone.then_some(STANDALONE_ENDPOINT_FDS),
         )
@@ -170,6 +182,7 @@ impl Bootstrap {
             raw_handles,
             None,
             None,
+            None,
         )
     }
 
@@ -182,6 +195,7 @@ impl Bootstrap {
         mux: Option<RawFd>,
         storage_lease: RawFd,
         raw_handles: &[RawFd],
+        lifecycle: Option<RawFd>,
         state: Option<[RawFd; 4]>,
         standalone: Option<[RawFd; 3]>,
     ) -> io::Result<Self> {
@@ -204,6 +218,7 @@ impl Bootstrap {
             .chain(mux.map(|raw| (raw, Role::Mux)))
             .chain(std::iter::once((storage_lease, Role::StorageLease)))
             .chain(raw_handles.iter().map(|&raw| (raw, Role::Raw)))
+            .chain(lifecycle.map(|raw| (raw, Role::Lifecycle)))
             .chain(state.into_iter().flat_map(|fds| {
                 fds.into_iter().zip([
                     Role::State { maximum: 1 << 40 },
@@ -274,6 +289,13 @@ impl Bootstrap {
                     }
                     getpeername::<UnixAddr>(raw)?;
                 }
+                Role::Lifecycle if kind == SFlag::S_IFSOCK && access == OFlag::O_RDWR => {
+                    use nix::sys::socket::{getpeername, getsockopt, sockopt, SockType, UnixAddr};
+                    if getsockopt(&fd, sockopt::SockType)? != SockType::Stream {
+                        return Err(invalid("lifecycle endpoint must be a stream socket"));
+                    }
+                    getpeername::<UnixAddr>(raw)?;
+                }
                 Role::Network if kind == SFlag::S_IFSOCK => {
                     use nix::sys::socket::{getpeername, getsockopt, sockopt, SockType, UnixAddr};
                     if getsockopt(&fd, sockopt::SockType)? != SockType::Datagram {
@@ -317,6 +339,7 @@ impl Bootstrap {
                     .iter()
                     .map(|&raw| OwnedFd::from_raw_fd(raw))
                     .collect(),
+                lifecycle: lifecycle.map(|raw| OwnedFd::from_raw_fd(raw)),
                 state_files: state.map(|[ram, layout, execution, devices]| RestoreStateFiles {
                     ram: std::fs::File::from_raw_fd(ram),
                     layout: std::fs::File::from_raw_fd(layout),
@@ -632,6 +655,7 @@ mod tests {
                 None,
                 lease.as_raw_fd(),
                 disks,
+                None,
                 Some(state),
                 None,
             )
@@ -709,6 +733,7 @@ mod tests {
             None,
             lease.into_raw_fd(),
             &[],
+            None,
             Some(files.map(IntoRawFd::into_raw_fd)),
             None,
         )
@@ -732,6 +757,108 @@ mod tests {
             );
         }
         drop(adopted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn lease(root: &std::path::Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join("lease"))
+            .unwrap()
+    }
+
+    #[test]
+    fn lifecycle_role_requires_a_distinct_connected_stream_socket() {
+        use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+        let root = std::env::temp_dir().join(format!("worker-lifecycle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let (config, _config_writer) = nix::unistd::pipe().unwrap();
+        let (_events_reader, events) = nix::unistd::pipe().unwrap();
+        let (watchdog, _watchdog_writer) = nix::unistd::pipe().unwrap();
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let lease = lease(&root);
+        let (mux, _mux_peer) = UnixStream::pair().unwrap();
+        let (datagram, _datagram_peer) = UnixDatagram::pair().unwrap();
+        let unconnected = UnixListener::bind(root.join("unconnected.sock")).unwrap();
+        let refuse = |lifecycle: std::os::fd::RawFd| {
+            assert!(Bootstrap::adopt_with_state(
+                config.as_raw_fd(),
+                events.as_raw_fd(),
+                watchdog.as_raw_fd(),
+                pty.slave.as_raw_fd(),
+                Some(mux.as_raw_fd()),
+                lease.as_raw_fd(),
+                &[],
+                Some(lifecycle),
+                None,
+                None,
+            )
+            .is_err());
+            // Validation failure never adopts or closes a caller descriptor.
+            for fd in [config.as_raw_fd(), mux.as_raw_fd(), lifecycle] {
+                assert!(unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } >= 0);
+            }
+        };
+        refuse(datagram.as_raw_fd());
+        refuse(unconnected.as_raw_fd());
+        refuse(mux.as_raw_fd());
+        let alias = mux.try_clone().unwrap();
+        refuse(alias.as_raw_fd());
+        refuse(config.as_raw_fd());
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_adoption_owns_the_endpoint_with_cloexec() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        let root =
+            std::env::temp_dir().join(format!("worker-lifecycle-adopt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let (config, _config_writer) = nix::unistd::pipe().unwrap();
+        let (_events_reader, events) = nix::unistd::pipe().unwrap();
+        let (watchdog, _watchdog_writer) = nix::unistd::pipe().unwrap();
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let (child, mut parent) = UnixStream::pair().unwrap();
+        fcntl(&child, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        let adopted = Bootstrap::adopt_with_state(
+            config.into_raw_fd(),
+            events.into_raw_fd(),
+            watchdog.into_raw_fd(),
+            pty.slave.into_raw_fd(),
+            None,
+            lease(&root).into_raw_fd(),
+            &[],
+            Some(child.into_raw_fd()),
+            None,
+            None,
+        )
+        .unwrap();
+        let endpoint = adopted.lifecycle.as_ref().expect("lifecycle endpoint");
+        assert!(
+            FdFlag::from_bits_retain(fcntl(endpoint, FcntlArg::F_GETFD).unwrap())
+                .contains(FdFlag::FD_CLOEXEC)
+        );
+        let mut endpoint = UnixStream::from(endpoint.try_clone().unwrap());
+        endpoint.write_all(b"ok").unwrap();
+        let mut received = [0; 2];
+        parent.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ok");
+        drop(endpoint);
+        drop(adopted);
+        let mut eof = [0; 1];
+        assert_eq!(
+            parent.read(&mut eof).unwrap(),
+            0,
+            "adopted endpoint closes on drop"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

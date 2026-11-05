@@ -76,6 +76,12 @@ dispatch, so the daemon's working directory cannot change their meaning.
   provisioning, supervision and image upgrades. Appliance networking remains
   separate from ordinary VM networking.
 
+Appliance startup runs on the normal bounded Tokio worker stack. Its large
+provisioning, upgrade-recovery and cold-start futures are heap-pinned at their
+startup boundaries so nested inspection and RPC decoding do not exhaust that
+stack. They remain owned by the same startup attempt; shutdown cancellation
+and retry deadlines are unchanged.
+
 `silo daemon run` has no further subcommands: running it starts the foreground
 daemon. The CLI registers the native service without copying default-filled
 configuration into arguments. The service reads configuration on every launch

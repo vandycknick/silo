@@ -91,6 +91,9 @@ pub(crate) struct ForwardTable {
     return_listener: Mutex<Option<crate::virt::VsockListener>>,
     return_task: Mutex<Option<OwnedTask>>,
     invalid_warning: Mutex<Option<std::time::Instant>>,
+    /// Live lifecycle fence for forward registrations, new inbound forward
+    /// connections and vsock registrations.
+    gate: Arc<crate::live::gate::LiveGate>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +108,8 @@ pub(crate) enum OpenError {
     NotRunning(String),
     #[error("{0}")]
     Unavailable(String),
+    #[error("{0}")]
+    Fenced(crate::live::gate::GateRefusal),
 }
 
 impl ForwardTable {
@@ -113,6 +118,7 @@ impl ForwardTable {
         runtime_dir: &Path,
         mux_filename: Option<&str>,
         park_timeout: Duration,
+        gate: Arc<crate::live::gate::LiveGate>,
     ) -> eyre::Result<Arc<Self>> {
         validate_forward_set(forwards, runtime_dir, mux_filename)
             .map_err(|error| eyre::eyre!("validate machine-scoped forwards: {error}"))?;
@@ -140,6 +146,7 @@ impl ForwardTable {
             return_listener: Mutex::new(None),
             return_task: Mutex::new(None),
             invalid_warning: Mutex::new(None),
+            gate,
         });
         for spec in forwards {
             let entry = table
@@ -304,6 +311,10 @@ impl ForwardTable {
         self.operation.lock().await
     }
 
+    pub(crate) fn live_gate(&self) -> &Arc<crate::live::gate::LiveGate> {
+        &self.gate
+    }
+
     fn activate_entry(self: &Arc<Self>, entry: Arc<ForwardEntry>, machine: VirtualMachine) {
         if let Some(listener) = entry
             .listener
@@ -315,6 +326,7 @@ impl ForwardTable {
                 listener,
                 entry.clone(),
                 machine.clone(),
+                self.gate.clone(),
                 self.park_timeout,
             ));
         }
@@ -328,7 +340,11 @@ impl ForwardTable {
             entry.spawn(outbound::serve_raw(listener, entry.clone()));
         }
         if entry.shape == ForwardShape::OutboundAgent {
-            entry.spawn(agent::supervise_listener(machine, entry.clone()));
+            entry.spawn(agent::supervise_listener(
+                machine,
+                entry.clone(),
+                self.gate.clone(),
+            ));
         }
     }
 
@@ -336,6 +352,11 @@ impl ForwardTable {
         self: &Arc<Self>,
         spec: Forward,
     ) -> Result<Arc<ForwardEntry>, OpenError> {
+        // The permit covers the registration install, not the forward lifetime.
+        let _admitted = self
+            .gate
+            .try_admit(crate::live::gate::GateKind::ForwardRegistration)
+            .map_err(OpenError::Fenced)?;
         let _operation = self.operation.lock().await;
         if !self.running.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
             return Err(OpenError::NotRunning("VM is not running".to_string()));
@@ -877,6 +898,7 @@ mod tests {
                 &root,
                 None,
                 crate::forward::inbound::PARK_TIMEOUT,
+                crate::live::gate::LiveGate::new(),
             )
             .await
             .err()
@@ -897,10 +919,15 @@ mod tests {
             std::path::Path::new("/tmp").join(format!("fr-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("listen");
-        let table =
-            ForwardTable::prepare_machine(&[], &root, None, crate::forward::inbound::PARK_TIMEOUT)
-                .await
-                .unwrap();
+        let table = ForwardTable::prepare_machine(
+            &[],
+            &root,
+            None,
+            crate::forward::inbound::PARK_TIMEOUT,
+            crate::live::gate::LiveGate::new(),
+        )
+        .await
+        .unwrap();
         let capacity = VsockCapacity::new("forward-unit-test");
         for port in 5000..6100 {
             let spec = forward_spec::Forward::new(
@@ -941,6 +968,7 @@ mod tests {
             std::path::Path::new("/unused"),
             None,
             crate::forward::inbound::PARK_TIMEOUT,
+            crate::live::gate::LiveGate::new(),
         )
         .await
         .unwrap();

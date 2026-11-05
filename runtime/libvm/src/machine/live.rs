@@ -14,15 +14,60 @@ use crate::LibVmError;
 
 /// Evidence for exactly one observed monitor/run. No public constructor or
 /// deserializer can turn a generic machine/host report into this value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MachineLiveObservation {
     machine_id: MachineId,
     report: LiveMachineReport,
+    status: protocol::v1::HostStatus,
+    pending_pause: bool,
 }
 
 impl MachineLiveObservation {
     pub fn report(&self) -> &LiveMachineReport {
         &self.report
+    }
+
+    /// New Pause requires capability admission; reconnecting an already durable
+    /// exact Pause intent must not be stranded by a narrowed guest vector.
+    pub fn require_pause_submission(&self) -> Result<(), LibVmError> {
+        if self.pending_pause {
+            Ok(())
+        } else {
+            require_live_operation(self, LiveOperation::Pause)
+        }
+    }
+
+    pub(crate) fn with_pending_pause(
+        mut self,
+        pending: Option<crate::store::live_store::LiveCommandIntent>,
+    ) -> Self {
+        self.pending_pause = pending.is_some_and(|pending| {
+            matches!(pending.command, vm_spec::lifecycle::LiveCommand::Pause(_))
+                && pending.command.envelope().machine_id.as_str() == self.report.machine_id
+                && pending.command.envelope().run_id.as_str() == self.report.run_id
+                && pending.report.monitor_id == self.report.monitor_id
+                && pending.report.topology_revision == self.report.topology_revision
+        });
+        self
+    }
+
+    pub fn lifecycle(&self) -> Result<vm_spec::lifecycle::LiveLifecycle, LibVmError> {
+        self.status
+            .lifecycle
+            .clone()
+            .ok_or_else(|| protocol("status.lifecycle is missing"))?
+            .try_into()
+            .map_err(protocol)
+    }
+
+    pub fn state(&self) -> Result<vm_spec::lifecycle::VmLifecycleState, LibVmError> {
+        let state = self
+            .status
+            .vm
+            .as_ref()
+            .and_then(|vm| vm.state)
+            .ok_or_else(|| protocol("status.vm.state is missing"))?;
+        protocol::lifecycle::vm_state_from_wire(Some(state)).map_err(protocol)
     }
 }
 
@@ -58,10 +103,19 @@ impl LiveObservationReader {
         reference: &MachineRef,
     ) -> Result<MachineLiveObservation, LibVmError> {
         let store = ObservationStore::open(&self.catalog).await?;
-        let result = store.lookup(reference).await;
+        let result = async {
+            let (config, state) = store.lookup(reference).await?;
+            let pending = store
+                .pending_pause(config.id, state.run_id.as_deref())
+                .await?;
+            Ok::<_, LibVmError>((config, state, pending))
+        }
+        .await;
         store.close().await?;
-        let (config, state) = result?;
-        observe_run(&self.paths, config, state).await
+        let (config, state, pending) = result?;
+        Ok(observe_run(&self.paths, config, state)
+            .await?
+            .with_pending_pause(pending))
     }
 }
 
@@ -70,7 +124,7 @@ pub(crate) async fn observe_run(
     config: MachineConfig,
     state: MachineState,
 ) -> Result<MachineLiveObservation, LibVmError> {
-    if !state.status.is_running() {
+    if !state.status.is_live() && state.vmm_pid.is_none() {
         return Err(LibVmError::MachineNotRunning {
             reference: config.name,
         });
@@ -85,7 +139,13 @@ pub(crate) async fn observe_run(
         .await
         .map_err(|error| observation(&config.name, error.to_string()))?;
     let report = report_from_status(&response)?;
-    bind_run(config.id, &config.name, run, report)
+    let mut observation = bind_run(config.id, &config.name, run, report)?;
+    observation.status = response;
+    observation
+        .lifecycle()?
+        .validate_for(observation.state()?)
+        .map_err(protocol)?;
+    Ok(observation)
 }
 
 fn bind_run(
@@ -108,7 +168,28 @@ fn bind_run(
             current: Some(MachineRunId::from_raw(report.run_id)),
         });
     }
-    Ok(MachineLiveObservation { machine_id, report })
+    Ok(MachineLiveObservation {
+        machine_id,
+        report,
+        status: Default::default(),
+        pending_pause: false,
+    })
+}
+
+pub(crate) fn projection_from_status(
+    status: &protocol::v1::HostStatus,
+) -> Result<crate::MachineLifecycle, LibVmError> {
+    let report = report_from_status(status)?;
+    let machine_id = report
+        .machine_id
+        .parse()
+        .map_err(|_| protocol("invalid lifecycle machine identity"))?;
+    crate::machine::live_operations::projection(&MachineLiveObservation {
+        machine_id,
+        report,
+        status: status.clone(),
+        pending_pause: false,
+    })
 }
 
 /// Mandatory wire conversion and equality with the outer run fence. Kept
@@ -159,6 +240,7 @@ pub fn require_live_operation(
     let report = observation.report();
     let reason = match &report.live.get(operation).availability {
         LiveAvailability::Unsupported { reason } => reason.clone(),
+        LiveAvailability::Supported if operation == LiveOperation::Pause => return Ok(()),
         LiveAvailability::Supported => LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
     };
     Err(LibVmError::LiveOperationUnsupported {
@@ -176,8 +258,11 @@ impl Machine {
             .await
     }
 
-    pub async fn pause(&self, observation: &MachineLiveObservation) -> Result<(), LibVmError> {
-        self.require_exact_live(observation, LiveOperation::Pause)
+    pub async fn pause(
+        &self,
+        observation: &MachineLiveObservation,
+    ) -> Result<crate::MachineLifecycle, LibVmError> {
+        self.pause_and_wait(observation).await
     }
 
     pub async fn capture(&self, observation: &MachineLiveObservation) -> Result<(), LibVmError> {
@@ -338,5 +423,34 @@ mod tests {
                 error => panic!("wrong refusal: {error}"),
             }
         }
+    }
+    #[test]
+    fn pause_recovery_witness_never_grants_a_new_pause_or_foreign_monitor() {
+        use vm_spec::lifecycle::{LiveCommand, LiveCommandEnvelope, LiveId, PauseCommand};
+        let report = report();
+        let mut observed = bind_run(
+            report.machine_id.parse().unwrap(),
+            "machine",
+            &report.run_id.clone(),
+            report.clone(),
+        )
+        .unwrap();
+        let intent = crate::store::live_store::LiveCommandIntent {
+            report: report.clone(),
+            command: LiveCommand::Pause(PauseCommand {
+                envelope: LiveCommandEnvelope {
+                    machine_id: LiveId::parse(&report.machine_id).unwrap(),
+                    run_id: LiveId::parse(&report.run_id).unwrap(),
+                    request_id: LiveId::parse(&uuid::Uuid::new_v4().to_string()).unwrap(),
+                },
+            }),
+        };
+        observed = observed.with_pending_pause(Some(intent.clone()));
+        assert!(observed.require_pause_submission().is_ok());
+        assert!(require_live_operation(&observed, LiveOperation::Pause).is_err());
+        let mut foreign = intent;
+        foreign.report.monitor_id = uuid::Uuid::new_v4().to_string();
+        observed = observed.with_pending_pause(Some(foreign));
+        assert!(observed.require_pause_submission().is_err());
     }
 }

@@ -34,6 +34,8 @@ use tonic::transport::server::Router;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use crate::virt::backend::mock::freezer::{GuestAdmission, GuestLifecycle};
+
 type StatusStream = Pin<Box<dyn Stream<Item = Result<AgentStatus, Status>> + Send + 'static>>;
 type MetricsStream = Pin<Box<dyn Stream<Item = Result<AgentMetrics, Status>> + Send + 'static>>;
 type EventStream = Pin<Box<dyn Stream<Item = Result<GuestProcessEvent, Status>> + Send + 'static>>;
@@ -51,6 +53,11 @@ pub(crate) struct MockGuest {
     status: watch::Sender<AgentStatus>,
     /// Bumping this generation ends every open watch/event stream.
     stream_generation: watch::Sender<u64>,
+    /// Launch `(machine_id, run_id)` the guest runtime is bound to.
+    launch: Option<(String, String)>,
+    admission: Arc<GuestAdmission>,
+    /// Present only when the scenario models lifecycle evidence.
+    lifecycle: Option<Arc<GuestLifecycle>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +67,11 @@ struct Identity {
 }
 
 impl MockGuest {
-    pub(crate) fn new(scenario: Arc<Scenario>, guest_root: PathBuf) -> Self {
+    pub(crate) fn new(
+        scenario: Arc<Scenario>,
+        guest_root: PathBuf,
+        launch: Option<(String, String)>,
+    ) -> Self {
         let identity = Identity {
             instance_id: scenario
                 .agent
@@ -73,7 +84,19 @@ impl MockGuest {
                 .clone()
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
         };
-        let starting = agent_status(&identity, AgentStatusState::Starting);
+        let admission = Arc::new(GuestAdmission::default());
+        let lifecycle = scenario.lifecycle.as_ref().map(|lifecycle| {
+            Arc::new(GuestLifecycle::new(
+                lifecycle,
+                launch.clone(),
+                admission.clone(),
+            ))
+        });
+        let starting = agent_status(
+            &identity,
+            AgentStatusState::Starting,
+            lifecycle.as_ref().map(|lifecycle| lifecycle.status()),
+        );
         let (status, _) = watch::channel(starting);
         let (stream_generation, _) = watch::channel(0);
         Self {
@@ -82,7 +105,35 @@ impl MockGuest {
             identity: Mutex::new(identity),
             status,
             stream_generation,
+            launch,
+            admission,
+            lifecycle,
         }
+    }
+
+    pub(crate) fn admission(&self) -> Arc<GuestAdmission> {
+        self.admission.clone()
+    }
+
+    /// The guest's exact runtime identity as the agent would compare it.
+    fn expected_identity(&self) -> protocol::v1::ExpectedGuestIdentity {
+        let (machine_id, run_id) = self.launch.clone().unwrap_or_default();
+        let identity = self.lock_identity();
+        protocol::v1::ExpectedGuestIdentity {
+            machine_id,
+            run_id,
+            agent_instance_id: identity.instance_id.clone(),
+            boot_id: identity.boot_id.clone(),
+        }
+    }
+
+    fn boot_ready(&self) -> bool {
+        self.status
+            .borrow()
+            .report
+            .as_ref()
+            .and_then(|report| report.state)
+            == Some(AgentStatusState::Ready as i32)
     }
 
     pub(crate) fn guest_root(&self) -> &Path {
@@ -106,6 +157,33 @@ impl MockGuest {
             .agent
             .restart_after_ms
             .map(Duration::from_millis);
+        if let Some(lifecycle) = guest.lifecycle.clone() {
+            let projected = guest.clone();
+            let mut changes = lifecycle.subscribe();
+            let mut stopped = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        changed = changes.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            let status = changes.borrow_and_update().clone();
+                            projected.status.send_modify(|agent| {
+                                if let Some(report) = agent.report.as_mut() {
+                                    report.lifecycle = Some(status);
+                                }
+                            });
+                        }
+                        changed = stopped.changed() => {
+                            if changed.is_err() || *stopped.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
         tokio::spawn(async move {
             if !never_ready {
                 tokio::time::sleep(ready_delay).await;
@@ -143,7 +221,9 @@ impl MockGuest {
 
     fn publish(&self, state: AgentStatusState) {
         let identity = self.lock_identity().clone();
-        self.status.send_replace(agent_status(&identity, state));
+        let lifecycle = self.lifecycle.as_ref().map(|lifecycle| lifecycle.status());
+        self.status
+            .send_replace(agent_status(&identity, state, lifecycle));
     }
 
     fn lock_identity(&self) -> std::sync::MutexGuard<'_, Identity> {
@@ -162,6 +242,7 @@ pub(crate) async fn guest_router(guest: Arc<MockGuest>) -> Router {
     let filesystem = crate::virt::backend::mock::fs::MockFilesystemService::new(
         guest.guest_root().to_path_buf(),
         guest.scenario.filesystem.clone(),
+        guest.admission(),
     );
     let forward = (!guest.scenario.forward.unsupported).then(|| {
         GuestForwardServiceServer::new(ForwardService {
@@ -386,7 +467,11 @@ fn now() -> Timestamp {
     }
 }
 
-fn agent_status(identity: &Identity, state: AgentStatusState) -> AgentStatus {
+fn agent_status(
+    identity: &Identity,
+    state: AgentStatusState,
+    lifecycle: Option<protocol::v1::GuestLifecycleStatus>,
+) -> AgentStatus {
     let (code, message) = match state {
         AgentStatusState::Starting => (
             Some("STARTING".to_string()),
@@ -423,7 +508,7 @@ fn agent_status(identity: &Identity, state: AgentStatusState) -> AgentStatus {
             }),
             provisioning: None,
             ssh: None,
-            lifecycle: None,
+            lifecycle,
         }),
     }
 }
@@ -485,11 +570,19 @@ impl GuestAgentService for AgentService {
 
     async fn freeze_workloads(
         &self,
-        _: Request<protocol::v1::FreezeWorkloadsRequest>,
+        request: Request<protocol::v1::FreezeWorkloadsRequest>,
     ) -> Result<Response<protocol::v1::FreezeWorkloadsResponse>, Status> {
-        Err(Status::unimplemented(
-            "scenario backend has no workload freezer",
-        ))
+        let lifecycle = self
+            .guest
+            .lifecycle
+            .clone()
+            .ok_or_else(|| Status::unimplemented("scenario backend has no workload freezer"))?;
+        let current = self.guest.expected_identity();
+        let boot_ready = self.guest.boot_ready();
+        lifecycle
+            .freeze(request.into_inner(), &current, boot_ready)
+            .await
+            .map(Response::new)
     }
 
     async fn activate(
@@ -503,11 +596,18 @@ impl GuestAgentService for AgentService {
 
     async fn thaw(
         &self,
-        _: Request<protocol::v1::ThawRequest>,
+        request: Request<protocol::v1::ThawRequest>,
     ) -> Result<Response<protocol::v1::ThawResponse>, Status> {
-        Err(Status::unimplemented(
-            "scenario backend has no workload freezer",
-        ))
+        let lifecycle = self
+            .guest
+            .lifecycle
+            .clone()
+            .ok_or_else(|| Status::unimplemented("scenario backend has no workload freezer"))?;
+        let current = self.guest.expected_identity();
+        lifecycle
+            .thaw(request.into_inner(), &current)
+            .await
+            .map(Response::new)
     }
 
     async fn orderly_shutdown(
@@ -629,6 +729,7 @@ impl GuestProcessService for ProcessService {
         &self,
         request: Request<Streaming<GuestProcessInput>>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
+        self.guest.admission.admit_session()?;
         let mut input = request.into_inner();
         let start = match input.next().await {
             Some(Ok(GuestProcessInput {

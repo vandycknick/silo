@@ -4,8 +4,8 @@ use std::time::Duration;
 use libvm::{
     ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineData,
     MachineExitOutcome, MachineKillOptions, MachineRef, MachineRetention, MachineRunId,
-    MachineStatus, MachineStopOptions, MachineUpdate, MachineWaitOptions, Memory,
-    NetworkDefinition, NetworkDriver, NetworkTopology, ReadOnlyRuntime, Runtime, RuntimeConfig,
+    MachineStopOptions, MachineUpdate, MachineWaitOptions, Memory, NetworkDefinition,
+    NetworkDriver, NetworkTopology, ReadOnlyRuntime, Runtime, RuntimeConfig,
 };
 use silo_vm_control::create::{NormalizedMachineCreate, ResolvedNetwork};
 
@@ -76,6 +76,55 @@ impl LocalVmService {
                 eyre::bail!("local runtime configuration unavailable")
             }
         }
+    }
+
+    async fn observe_machine_live(
+        &self,
+        reference: &MachineRef,
+    ) -> eyre::Result<libvm::MachineLiveObservation> {
+        Ok(match self {
+            Self::Ready(runtime) => runtime.observe_live(reference).await?,
+            Self::Uninitialized {
+                config: Some(config),
+                ..
+            } => {
+                libvm::LiveObservationReader::open(config)?
+                    .observe(reference)
+                    .await?
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable")
+            }
+        })
+    }
+
+    pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
+        let reference = MachineRef::parse(reference)?;
+        if let Self::Uninitialized {
+            config: Some(config),
+            ..
+        } = self
+        {
+            if !libvm::LiveObservationReader::open(config)?.catalog_exists()? {
+                libvm::require_host_live_operation(
+                    &self.live_capabilities().await?,
+                    vm_spec::live::LiveOperation::Pause,
+                )?;
+            }
+        }
+        let observation = self.observe_machine_live(&reference).await?;
+        observation.require_pause_submission()?;
+        let machine = self.runtime().await?.get_machine(&reference).await?;
+        machine.pause(&observation).await?;
+        Ok(machine.inspect().await?)
+    }
+
+    pub(crate) async fn resume_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
+        let reference = MachineRef::parse(reference)?;
+        let observation = self.observe_machine_live(&reference).await?;
+        let machine = self.runtime().await?.get_machine(&reference).await?;
+        machine.resume(&observation).await?;
+        Ok(machine.inspect().await?)
     }
 
     pub(crate) async fn require_machine_live(
@@ -373,12 +422,7 @@ impl LocalVmService {
             {
                 Ok(exit)
                     if exit.outcome == MachineExitOutcome::Unknown
-                        && matches!(
-                            exit.machine.status,
-                            MachineStatus::Starting { .. }
-                                | MachineStatus::Running { .. }
-                                | MachineStatus::Stopping { .. }
-                        ) => {}
+                        && (exit.machine.status.is_active() || exit.machine.run_id.is_some()) => {}
                 Ok(_) => break,
                 Err(libvm::LibVmError::MachineStaleGeneration { .. }) => return Ok(()),
                 Err(error) => return Err(error.into()),

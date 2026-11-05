@@ -291,6 +291,7 @@ const (
 	MachineService_ReadLogs_FullMethodName            = "/silo.daemon.v1.MachineService/ReadLogs"
 	MachineService_SetMachineSecret_FullMethodName    = "/silo.daemon.v1.MachineService/SetMachineSecret"
 	MachineService_PauseMachine_FullMethodName        = "/silo.daemon.v1.MachineService/PauseMachine"
+	MachineService_ResumeMachine_FullMethodName       = "/silo.daemon.v1.MachineService/ResumeMachine"
 	MachineService_CaptureExecution_FullMethodName    = "/silo.daemon.v1.MachineService/CaptureExecution"
 	MachineService_ForkExecution_FullMethodName       = "/silo.daemon.v1.MachineService/ForkExecution"
 	MachineService_ForkStopped_FullMethodName         = "/silo.daemon.v1.MachineService/ForkStopped"
@@ -317,7 +318,8 @@ type MachineServiceClient interface {
 	RemoveAfterRun(ctx context.Context, in *MachineRunRef, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ReadLogs(ctx context.Context, in *ReadLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogChunk], error)
 	SetMachineSecret(ctx context.Context, in *SetMachineSecretRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
+	ResumeMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ForkStopped(ctx context.Context, in *StoppedForkRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
@@ -519,10 +521,20 @@ func (c *machineServiceClient) SetMachineSecret(ctx context.Context, in *SetMach
 	return out, nil
 }
 
-func (c *machineServiceClient) PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *machineServiceClient) PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(MachineSnapshot)
 	err := c.cc.Invoke(ctx, MachineService_PauseMachine_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *machineServiceClient) ResumeMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSnapshot)
+	err := c.cc.Invoke(ctx, MachineService_ResumeMachine_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -589,7 +601,8 @@ type MachineServiceServer interface {
 	RemoveAfterRun(context.Context, *MachineRunRef) (*emptypb.Empty, error)
 	ReadLogs(*ReadLogsRequest, grpc.ServerStreamingServer[LogChunk]) error
 	SetMachineSecret(context.Context, *SetMachineSecretRequest) (*emptypb.Empty, error)
-	PauseMachine(context.Context, *LiveMachineRequest) (*emptypb.Empty, error)
+	PauseMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error)
+	ResumeMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error)
 	CaptureExecution(context.Context, *LiveCaptureRequest) (*emptypb.Empty, error)
 	ForkExecution(context.Context, *LiveForkRequest) (*emptypb.Empty, error)
 	ForkStopped(context.Context, *StoppedForkRequest) (*MachineSnapshot, error)
@@ -652,8 +665,11 @@ func (UnimplementedMachineServiceServer) ReadLogs(*ReadLogsRequest, grpc.ServerS
 func (UnimplementedMachineServiceServer) SetMachineSecret(context.Context, *SetMachineSecretRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetMachineSecret not implemented")
 }
-func (UnimplementedMachineServiceServer) PauseMachine(context.Context, *LiveMachineRequest) (*emptypb.Empty, error) {
+func (UnimplementedMachineServiceServer) PauseMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error) {
 	return nil, status.Error(codes.Unimplemented, "method PauseMachine not implemented")
+}
+func (UnimplementedMachineServiceServer) ResumeMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeMachine not implemented")
 }
 func (UnimplementedMachineServiceServer) CaptureExecution(context.Context, *LiveCaptureRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CaptureExecution not implemented")
@@ -973,6 +989,24 @@ func _MachineService_PauseMachine_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MachineService_ResumeMachine_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LiveMachineRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).ResumeMachine(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_ResumeMachine_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).ResumeMachine(ctx, req.(*LiveMachineRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MachineService_CaptureExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(LiveCaptureRequest)
 	if err := dec(in); err != nil {
@@ -1107,6 +1141,10 @@ var MachineService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PauseMachine",
 			Handler:    _MachineService_PauseMachine_Handler,
+		},
+		{
+			MethodName: "ResumeMachine",
+			Handler:    _MachineService_ResumeMachine_Handler,
 		},
 		{
 			MethodName: "CaptureExecution",

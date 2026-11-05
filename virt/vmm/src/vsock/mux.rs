@@ -15,6 +15,7 @@ pub(crate) async fn serve(
     listener: UnixListener,
     owner_uid: u32,
     machine: VirtualMachine,
+    gate: std::sync::Arc<crate::live::gate::LiveGate>,
     shutdown: CancellationToken,
 ) {
     let mut connections = JoinSet::new();
@@ -36,9 +37,10 @@ pub(crate) async fn serve(
                     };
                     tracing::debug!(uid = credentials.uid(), pid = ?credentials.pid(), "accepted vsock mux connection");
                     let machine = machine.clone();
+                    let gate = gate.clone();
                     let shutdown = shutdown.clone();
                     connections.spawn(async move {
-                        if let Err(error) = handle_connection(stream, machine, shutdown).await {
+                        if let Err(error) = handle_connection(stream, machine, &gate, shutdown).await {
                             tracing::debug!(%error, "closed vsock mux connection without acknowledgement");
                         }
                     });
@@ -58,12 +60,18 @@ pub(crate) async fn serve(
 async fn handle_connection(
     mut client: UnixStream,
     machine: VirtualMachine,
+    gate: &std::sync::Arc<crate::live::gate::LiveGate>,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     let port = tokio::select! {
         result = read_command(&mut client) => result?,
         _ = shutdown.cancelled() => return Ok(()),
     };
+    // New session setup is fenced while a live lifecycle holds the machine;
+    // the client sees EOF instead of an acknowledgement.
+    let setup = gate
+        .try_admit(crate::live::gate::GateKind::VsockSession)
+        .map_err(|refusal| eyre::eyre!("{refusal}"))?;
     let lease = machine.reserve_public_vsock()?;
     let mut guest = tokio::select! {
         result = tokio::time::timeout(
@@ -78,6 +86,7 @@ async fn handle_connection(
     client
         .write_all(format!("OK {source_port}\n").as_bytes())
         .await?;
+    drop(setup);
     relay::relay(&mut client, &mut guest, shutdown).await?;
     Ok(())
 }

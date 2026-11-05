@@ -66,14 +66,17 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<()> {
+    pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
         match self {
-            Self::Local(service) => {
-                service
-                    .require_machine_live(reference, vm_spec::live::LiveOperation::Pause)
-                    .await
-            }
+            Self::Local(service) => service.pause_machine(reference).await,
             Self::Daemon(service) => service.pause_machine(reference).await,
+        }
+    }
+
+    pub(crate) async fn resume_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
+        match self {
+            Self::Local(service) => service.resume_machine(reference).await,
+            Self::Daemon(service) => service.resume_machine(reference).await,
         }
     }
 

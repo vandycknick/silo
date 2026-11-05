@@ -1019,3 +1019,153 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
     assert!(owner.components.get().is_none());
     assert!(!owner.host.home().join("state.db").exists());
 }
+
+#[tokio::test]
+async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters() {
+    use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
+    use w::machine_service_client::MachineServiceClient;
+    let root = tempfile::Builder::new()
+        .prefix("silo-pause-api-")
+        .tempdir()
+        .unwrap();
+    let binary = test_utils::mock_vmm_binary();
+    for name in ["kernel", "initramfs", "agent"] {
+        let path = root.path().join(name);
+        std::fs::write(&path, b"scenario-asset").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let supported = LiveCapability {
+        native: true,
+        availability: LiveAvailability::Supported,
+    };
+    let scenario = test_utils::Scenario {
+        lifecycle: Some(Default::default()),
+        live: Some(test_utils::LiveScenario {
+            lane: LiveLane::KvmX86_64,
+            host: LiveCapabilityVector {
+                pause: supported.clone(),
+                capture: supported.clone(),
+                restore: supported.clone(),
+                fork: supported.clone(),
+                incremental: supported,
+            },
+            machine: None,
+        }),
+        ..Default::default()
+    };
+    let scenario_path = root.path().join("scenario.json");
+    scenario.write_to(&scenario_path).unwrap();
+    let components = libvm::ResolvedRuntimeComponents::from_paths(
+        binary.to_path_buf(),
+        binary.to_path_buf(),
+        root.path().join("kernel"),
+        root.path().join("initramfs"),
+        root.path().join("agent"),
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    let config = libvm::RuntimeConfig::local(root.path().join("home"))
+        .with_run_root(root.path().join("run"))
+        .with_runtime_components(components.clone())
+        .with_mock_vmm(&scenario_path);
+    let runtime = libvm::Runtime::new(config.clone()).await.unwrap();
+    let disk = root.path().join("root.raw");
+    std::fs::write(&disk, vec![0; 4096]).unwrap();
+    let machine = runtime
+        .machine()
+        .name("pause-api")
+        .image_source(libvm::ImageSource::Disk(disk))
+        .network(|network| network.none())
+        .create()
+        .await
+        .unwrap();
+    let started = machine.start().await.unwrap();
+    assert_eq!(
+        machine
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .unwrap()
+            .outcome,
+        libvm::MachineReadinessOutcome::Ready
+    );
+    struct Cleanup(Option<nix::unistd::Pid>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+    }
+    let pid: i32 = std::fs::read_to_string(
+        root.path()
+            .join("run/machines")
+            .join(machine.id())
+            .join("vm.pid"),
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let mut cleanup = Cleanup(Some(nix::unistd::Pid::from_raw(pid)));
+    let mut owner = state(root.path());
+    Arc::get_mut(&mut owner).unwrap().config = config.clone();
+    assert!(owner.runtime.set(runtime).is_ok());
+    assert!(owner.components.set(components).is_ok());
+    let control = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner, control.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let socket = control.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut daemon = MachineServiceClient::new(channel);
+    let request = || w::LiveMachineRequest {
+        machine: Some(w::MachineRef {
+            reference: Some(w::machine_ref::Reference::Name("pause-api".into())),
+        }),
+    };
+    let parked = silo_vm_control::snapshots::snapshot_from_wire(
+        daemon.pause_machine(request()).await.unwrap().into_inner(),
+    )
+    .unwrap();
+    assert_eq!(parked.status.label(), "paused");
+    assert!(!parked.status.ready());
+    let authority = parked.lifecycle.unwrap().lifecycle.current_pause.unwrap();
+    assert_eq!(authority.token.owner, vm_spec::lifecycle::PauseOwner::User);
+    assert_eq!(parked.run_id.as_ref(), Some(&started.run_id));
+    let mut local = crate::api::AppApi::local(config);
+    let resumed = local.resume_machine("pause-api").await.unwrap();
+    assert_eq!(resumed.status.label(), "running");
+    assert_eq!(resumed.run_id.as_ref(), Some(&started.run_id));
+    let parked_again = local.pause_machine("pause-api").await.unwrap();
+    assert!(
+        parked_again
+            .lifecycle
+            .unwrap()
+            .lifecycle
+            .current_pause
+            .unwrap()
+            .token
+            .generation
+            > authority.token.generation
+    );
+    let resumed = silo_vm_control::snapshots::snapshot_from_wire(
+        daemon.resume_machine(request()).await.unwrap().into_inner(),
+    )
+    .unwrap();
+    assert_eq!(resumed.status.label(), "running");
+    assert_eq!(resumed.run_id.as_ref(), Some(&started.run_id));
+    machine.stop().await.unwrap();
+    cleanup.0 = None;
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+}

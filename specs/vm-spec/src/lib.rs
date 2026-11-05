@@ -1,3 +1,4 @@
+pub mod lifecycle;
 pub mod live;
 
 use std::collections::{BTreeMap, BTreeSet};

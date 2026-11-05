@@ -12,8 +12,10 @@ use protocol::v1::vm_execution_service_server::VmExecutionServiceServer;
 use protocol::v1::vm_forward_service_server::VmForwardServiceServer;
 use protocol::v1::vm_monitor_service_server::{VmMonitorService, VmMonitorServiceServer};
 use protocol::v1::{
-    ByteChunk, GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, WaitReadyOutcome,
-    WaitReadyRequest, WaitReadyResponse,
+    ByteChunk, CancelOperationRequest, CancelOperationResponse, CaptureRequest, CaptureResponse,
+    GetMetricsRequest, GetOperationRequest, GetOperationResponse, GetStatusRequest, HostMetrics,
+    HostStatus, PauseRequest, PauseResponse, ReleaseCaptureRequest, ReleaseCaptureResponse,
+    ResumeRequest, ResumeResponse, WaitReadyOutcome, WaitReadyRequest, WaitReadyResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -23,10 +25,13 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tonic_health::server::{health_reporter, HealthReporter};
+use vm_spec::lifecycle::{LiveCommand, LiveCommandResult};
 
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::execution::ExecutionService;
 use crate::guest::spawn_guest_services;
+use crate::live::coordinator::{LiveCoordinator, LiveError};
+use crate::live::gate::{GateKind, GateRefusal, LiveGate};
 use crate::startup::SyncReporter;
 use crate::state::{InstanceStore, StoreError, WaitOutcome};
 
@@ -61,6 +66,51 @@ struct MonitorService {
     machine_run_id: String,
     finite_capacity: Arc<Semaphore>,
     waiter_capacity: Arc<Semaphore>,
+    live: Arc<LiveCoordinator>,
+}
+
+impl MonitorService {
+    /// Decode, run and encode one live command. A malformed request has no
+    /// trustworthy identity and is INVALID_ARGUMENT; every well-formed one
+    /// receives a typed body.
+    async fn live_command<WireRequest, Command, WireResponse>(
+        &self,
+        request: WireRequest,
+        capacity: &Arc<Semaphore>,
+        wrap: fn(Command) -> LiveCommand,
+        unwrap: fn(LiveCommandResult) -> Option<WireResponse>,
+    ) -> Result<Response<WireResponse>, Status>
+    where
+        Command: TryFrom<WireRequest, Error = String>,
+    {
+        let _permit = admission(capacity, "live command")?;
+        let command = Command::try_from(request).map_err(|error| {
+            protocol::detailed_status(Status::invalid_argument(format!(
+                "invalid live command: {error}"
+            )))
+        })?;
+        let result = self.live.handle(wrap(command)).await.map_err(live_status)?;
+        result
+            .validate()
+            .map_err(|error| Status::internal(format!("invalid live result: {error}")))?;
+        unwrap(result)
+            .map(Response::new)
+            .ok_or_else(|| Status::internal("live result does not match its command"))
+    }
+}
+
+fn live_status(error: LiveError) -> Status {
+    protocol::detailed_status(Status::internal(error.to_string()))
+}
+
+fn encode<D, W: TryFrom<D, Error = String>>(value: D) -> Option<W> {
+    match W::try_from(value) {
+        Ok(wire) => Some(wire),
+        Err(error) => {
+            tracing::error!(%error, "live result failed strict encoding");
+            None
+        }
+    }
 }
 
 impl MonitorService {
@@ -134,6 +184,102 @@ impl VmMonitorService for MonitorService {
         let _permit = admission(&self.finite_capacity, "monitor finite RPC")?;
         Ok(Response::new(self.store.metrics().map_err(store_status)?))
     }
+
+    async fn pause(
+        &self,
+        request: Request<PauseRequest>,
+    ) -> Result<Response<PauseResponse>, Status> {
+        self.live_command(
+            request.into_inner(),
+            &self.finite_capacity,
+            LiveCommand::Pause,
+            |result| match result {
+                LiveCommandResult::Pause(outcome) => encode(outcome),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn resume(
+        &self,
+        request: Request<ResumeRequest>,
+    ) -> Result<Response<ResumeResponse>, Status> {
+        self.live_command(
+            request.into_inner(),
+            &self.waiter_capacity,
+            LiveCommand::Resume,
+            |result| match result {
+                LiveCommandResult::Resume(outcome) => encode(outcome),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn get_operation(
+        &self,
+        request: Request<GetOperationRequest>,
+    ) -> Result<Response<GetOperationResponse>, Status> {
+        self.live_command(
+            request.into_inner(),
+            &self.finite_capacity,
+            LiveCommand::GetOperation,
+            |result| match result {
+                LiveCommandResult::GetOperation(outcome) => encode(outcome),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn cancel_operation(
+        &self,
+        request: Request<CancelOperationRequest>,
+    ) -> Result<Response<CancelOperationResponse>, Status> {
+        self.live_command(
+            request.into_inner(),
+            &self.waiter_capacity,
+            LiveCommand::CancelOperation,
+            |result| match result {
+                LiveCommandResult::CancelOperation(outcome) => encode(outcome),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn capture(
+        &self,
+        request: Request<CaptureRequest>,
+    ) -> Result<Response<CaptureResponse>, Status> {
+        self.live_command(
+            request.into_inner(),
+            &self.finite_capacity,
+            LiveCommand::Capture,
+            |result| match result {
+                LiveCommandResult::Capture(outcome) => encode(outcome),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn release_capture(
+        &self,
+        request: Request<ReleaseCaptureRequest>,
+    ) -> Result<Response<ReleaseCaptureResponse>, Status> {
+        self.live_command(
+            request.into_inner(),
+            &self.finite_capacity,
+            LiveCommand::ReleaseCapture,
+            |result| match result {
+                LiveCommandResult::ReleaseCapture(outcome) => encode(outcome),
+                _ => None,
+            },
+        )
+        .await
+    }
 }
 
 #[derive(Clone)]
@@ -142,6 +288,7 @@ struct AccessService {
     serial: Arc<SerialConsole>,
     shutdown: CancellationToken,
     ssh_capacity: Arc<Semaphore>,
+    gate: Arc<LiveGate>,
 }
 type ChunkStream = Pin<Box<dyn Stream<Item = Result<ByteChunk, Status>> + Send>>;
 
@@ -163,6 +310,10 @@ impl VmAccessService for AccessService {
             ));
         }
         let permit = admission(&self.ssh_capacity, "SSH stream")?;
+        let setup = self
+            .gate
+            .try_admit(GateKind::SshSession)
+            .map_err(GateRefusal::status)?;
         // Acquiring the backend before responding keeps a successful RPC meaningful.
         let stream = tokio::time::timeout(
             BACKEND_SETUP_TIMEOUT,
@@ -178,11 +329,13 @@ impl VmAccessService for AccessService {
             )
         })?
         .map_err(ssh_backend_status)?;
+        drop(setup);
         Ok(Response::new(Box::pin(relay(
             stream,
             request.into_inner(),
             self.shutdown.clone(),
             permit,
+            self.gate.clone(),
         ))))
     }
 
@@ -220,6 +373,7 @@ impl VmAccessService for AccessService {
             stream,
             request.into_inner(),
             self.shutdown.clone(),
+            self.gate.clone(),
         ))))
     }
 }
@@ -347,15 +501,21 @@ pub async fn start_services(
         machine_run_id: ctx.machine_run_id.to_string(),
         finite_capacity: Arc::new(Semaphore::new(64)),
         waiter_capacity: Arc::new(Semaphore::new(64)),
+        live: ctx.live.clone(),
     };
     let access = AccessService {
         machine: ctx.machine.clone(),
         serial: ctx.serial_console.clone(),
         shutdown: ctx.shutdown.clone(),
         ssh_capacity: Arc::new(Semaphore::new(32)),
+        gate: ctx.live.gate().clone(),
     };
     let execution = ExecutionService::new(ctx, exec_log.clone());
-    let filesystem = FilesystemProxy::new(ctx.machine.clone(), ctx.shutdown.clone());
+    let filesystem = FilesystemProxy::new(
+        ctx.machine.clone(),
+        ctx.shutdown.clone(),
+        ctx.live.gate().clone(),
+    );
     let forwards = crate::forward::service::ForwardService::new(ctx.forwards.clone());
     let mut control_socket = tokio::spawn(async move {
         let monitor = VmMonitorServiceServer::new(monitor)
@@ -640,6 +800,7 @@ fn relay<S, I>(
     mut input: I,
     shutdown: CancellationToken,
     _permit: OwnedSemaphorePermit,
+    gate: Arc<LiveGate>,
 ) -> ReceiverStream<Result<ByteChunk, Status>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -659,6 +820,11 @@ where
                     )));
                 }
                 if !data.is_empty() {
+                    // Session input waits while live fences hold the machine.
+                    let _input = gate
+                        .admit(GateKind::SessionInput)
+                        .await
+                        .map_err(GateRefusal::status)?;
                     if let Err(error) = write.write_all(&data).await {
                         if clean_disconnect(&error) {
                             return Ok(());
@@ -713,10 +879,13 @@ fn relay_serial(
     mut serial: SerialStream,
     mut input: tonic::Streaming<ByteChunk>,
     shutdown: CancellationToken,
+    gate: Arc<LiveGate>,
 ) -> ReceiverStream<Result<ByteChunk, Status>> {
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         let mut input_closed = false;
+        // Input held while live fences are closed; output stays observable.
+        let mut pending: Option<bytes::Bytes> = None;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
@@ -730,12 +899,20 @@ fn relay_serial(
                     Ok(None) => return,
                     Err(error) => { let _ = tx.send(Err(protocol::detailed_status(Status::from(error)))).await; return; }
                 },
-                message = input.next(), if !input_closed => match message {
+                admitted = gate.admit(GateKind::SerialInput), if pending.is_some() => match admitted {
+                    Ok(_input) => {
+                        if let Some(data) = pending.take() {
+                            if let Err(error) = serial.write_input(&data).await { let _ = tx.send(Err(protocol::detailed_status(Status::from(error)))).await; return; }
+                        }
+                    }
+                    Err(refusal) => { let _ = tx.send(Err(refusal.status())).await; return; }
+                },
+                message = input.next(), if !input_closed && pending.is_none() => match message {
                     Some(Ok(chunk)) => {
                         let data = chunk.data.unwrap_or_default();
                         if data.len() > ACCEPTED_CHUNK_BYTES { let _ = tx.send(Err(protocol::detailed_status(Status::invalid_argument("access chunks may not exceed 64 KiB")))).await; return; }
                         if !data.is_empty() {
-                            if let Err(error) = serial.write_input(&data).await { let _ = tx.send(Err(protocol::detailed_status(Status::from(error)))).await; return; }
+                            pending = Some(data);
                         }
                     }
                     Some(Err(error)) => { let _ = tx.send(Err(error)).await; return; }
@@ -809,23 +986,25 @@ mod tests {
     fn generic_status_fences_machine_and_run_before_guest_readiness() {
         let machine = uuid::Uuid::new_v4().to_string();
         let run = uuid::Uuid::new_v4().to_string();
+        let store = std::sync::Arc::new(
+            crate::state::InstanceStore::new(
+                machine.clone(),
+                "test".into(),
+                true,
+                crate::state::RunLiveProfile {
+                    run_id: run.clone(),
+                    backend: vm_spec::live::LiveBackend::Krun,
+                    lane: vm_spec::live::LiveLane::KvmX86_64,
+                    live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                        vm_spec::live::LiveReasonCode::NotDelivered,
+                    ),
+                },
+            )
+            .expect("valid monitor state"),
+        );
         let monitor = crate::services::MonitorService {
-            store: std::sync::Arc::new(
-                crate::state::InstanceStore::new(
-                    machine.clone(),
-                    "test".into(),
-                    true,
-                    crate::state::RunLiveProfile {
-                        run_id: run.clone(),
-                        backend: vm_spec::live::LiveBackend::Krun,
-                        lane: vm_spec::live::LiveLane::KvmX86_64,
-                        live: vm_spec::live::LiveCapabilityVector::all_unsupported(
-                            vm_spec::live::LiveReasonCode::NotDelivered,
-                        ),
-                    },
-                )
-                .expect("valid monitor state"),
-            ),
+            live: idle_live(&store, &machine, &run),
+            store,
             machine_run_id: run.clone(),
             finite_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             waiter_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -881,6 +1060,7 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Semaphore::new(1))
                 .try_acquire_owned()
                 .expect("relay permit"),
+            crate::live::gate::LiveGate::new(),
         );
         input_tx
             .send(Ok(ByteChunk {
@@ -911,6 +1091,48 @@ mod tests {
         assert_eq!(backend_task.await.expect("backend joins"), b"request");
         assert_eq!(response, b"response after EOF");
     }
+    #[tokio::test]
+    async fn access_relay_holds_session_input_while_fenced_and_keeps_output() {
+        let (server, mut backend) = tokio::io::duplex(1024);
+        let gate = crate::live::gate::LiveGate::new();
+        gate.close();
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(2);
+        let mut output = relay(
+            server,
+            ReceiverStream::new(input_rx),
+            CancellationToken::new(),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("relay permit"),
+            gate.clone(),
+        );
+        input_tx
+            .send(Ok(ByteChunk {
+                data: Some(Bytes::from_static(b"held")),
+            }))
+            .await
+            .expect("send input");
+        backend.write_all(b"out").await.expect("guest output");
+        let chunk = output.next().await.expect("output").expect("chunk");
+        assert_eq!(chunk.data.expect("data").as_ref(), b"out");
+        let mut received = [0_u8; 4];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                backend.read_exact(&mut received)
+            )
+            .await
+            .is_err(),
+            "fenced input must not reach the guest"
+        );
+        assert!(gate.reopen());
+        backend
+            .read_exact(&mut received)
+            .await
+            .expect("input after reopen");
+        assert_eq!(&received, b"held");
+    }
+
     #[tokio::test]
     async fn root_metrics_rpc_relays_all_fields_inside_existing_observation_frame() {
         use protocol::v1::{
@@ -991,9 +1213,12 @@ mod tests {
                 Duration::ZERO,
             )
             .unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        let machine = store.status().unwrap().machine_id.unwrap();
         let service = crate::services::MonitorService {
+            live: idle_live(&store, &machine, &run),
             store,
-            machine_run_id: uuid::Uuid::new_v4().to_string(),
+            machine_run_id: run,
             finite_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
             waiter_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -1040,5 +1265,206 @@ mod tests {
         );
         assert!(observation.received_at.is_some() && observation.stale_at.is_some());
         assert_eq!(observation.report, Some(report));
+    }
+
+    /// A coordinator over an unstarted scenario machine: enough for the
+    /// admission paths that never reach the guest or native lifecycle.
+    fn idle_live(
+        store: &std::sync::Arc<crate::state::InstanceStore>,
+        machine: &str,
+        run: &str,
+    ) -> std::sync::Arc<crate::live::coordinator::LiveCoordinator> {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "sv-{:x}-{:x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let config = crate::virt::VmConfig::builder("services-live")
+            .base_directory(&root)
+            .kernel(std::path::Path::new("/mock-kernel"))
+            .build();
+        let virtual_machine =
+            crate::virt::VirtualMachine::with_backend(crate::virt::BackendKind::Mock, config)
+                .expect("mock machine");
+        crate::live::coordinator::LiveCoordinator::new(
+            uuid::Uuid::parse_str(machine).expect("machine uuid"),
+            uuid::Uuid::parse_str(run).expect("run uuid"),
+            store.clone(),
+            virtual_machine,
+            crate::live::gate::LiveGate::new(),
+            crate::live::coordinator::LiveTimeouts::default(),
+        )
+        .expect("coordinator")
+    }
+
+    #[tokio::test]
+    async fn live_commands_cross_the_wire_strictly_typed() {
+        use protocol::v1::{
+            vm_monitor_service_client::VmMonitorServiceClient,
+            vm_monitor_service_server::VmMonitorServiceServer, CaptureRequest, GetOperationRequest,
+            LiveCommandEnvelope, PauseRequest, ReleaseCaptureRequest,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+        use vm_spec::lifecycle::{
+            CaptureOutcome, GetOperationOutcome, LiveRejectionCode, PauseOutcome,
+            ReleaseCaptureOutcome, VmLifecycleState,
+        };
+
+        let machine = uuid::Uuid::new_v4().to_string();
+        let run = uuid::Uuid::new_v4().to_string();
+        let store = Arc::new(
+            crate::state::InstanceStore::new(
+                machine.clone(),
+                "wire".into(),
+                true,
+                crate::state::RunLiveProfile {
+                    run_id: run.clone(),
+                    backend: vm_spec::live::LiveBackend::Krun,
+                    lane: vm_spec::live::LiveLane::KvmX86_64,
+                    live: vm_spec::live::LiveCapabilityVector::all_unsupported(
+                        vm_spec::live::LiveReasonCode::NotDelivered,
+                    ),
+                },
+            )
+            .expect("valid monitor state"),
+        );
+        store
+            .set_vm_state(protocol::v1::VmState::Running, "running")
+            .unwrap();
+        let service = crate::services::MonitorService {
+            live: idle_live(&store, &machine, &run),
+            store,
+            machine_run_id: run.clone(),
+            finite_capacity: Arc::new(tokio::sync::Semaphore::new(8)),
+            waiter_capacity: Arc::new(tokio::sync::Semaphore::new(8)),
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let stopped = shutdown.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(VmMonitorServiceServer::new(service))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stopped.cancelled_owned(),
+                )
+                .await
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .connect()
+            .await
+            .unwrap();
+        let mut client = VmMonitorServiceClient::new(channel);
+        let envelope = |run: &str| LiveCommandEnvelope {
+            machine_id: Some(machine.clone()),
+            run_id: Some(run.to_string()),
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+
+        // Malformed envelope: no trustworthy identity, transport error.
+        let mut malformed = envelope(&run);
+        malformed.request_id = Some("00000000-0000-0000-0000-000000000000".into());
+        let error = client
+            .pause(PauseRequest {
+                envelope: Some(malformed),
+            })
+            .await
+            .expect_err("nil request id");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            client
+                .pause(PauseRequest { envelope: None })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        // Foreign run: typed rejection body.
+        let foreign = client
+            .pause(PauseRequest {
+                envelope: Some(envelope(&uuid::Uuid::new_v4().to_string())),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let PauseOutcome::Rejected { rejection } = PauseOutcome::try_from(foreign).unwrap() else {
+            panic!("foreign run is rejected");
+        };
+        assert_eq!(rejection.reason.code(), LiveRejectionCode::WrongRun);
+
+        // Unsupported pause carries the live vector's exact typed reason.
+        let unsupported = client
+            .pause(PauseRequest {
+                envelope: Some(envelope(&run)),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let PauseOutcome::Rejected { rejection } = PauseOutcome::try_from(unsupported).unwrap()
+        else {
+            panic!("unqualified pause is rejected");
+        };
+        assert_eq!(rejection.reason.code(), LiveRejectionCode::Unsupported);
+        assert_eq!(rejection.state, VmLifecycleState::Running);
+
+        let unknown = client
+            .get_operation(GetOperationRequest {
+                envelope: Some(envelope(&run)),
+                operation_id: Some(uuid::Uuid::new_v4().to_string()),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let GetOperationOutcome::Rejected { rejection } =
+            GetOperationOutcome::try_from(unknown).unwrap()
+        else {
+            panic!("unknown operation is typed");
+        };
+        assert_eq!(
+            rejection.reason.code(),
+            LiveRejectionCode::OperationNotFound
+        );
+
+        let capture = client
+            .capture(CaptureRequest {
+                envelope: Some(envelope(&run)),
+                expected_configuration_digest: Some("sha256:abc".into()),
+                policy: Some(protocol::v1::CapturePolicy::Full as i32),
+                resume_policy: Some(protocol::v1::CaptureResumePolicy::Preserve as i32),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            CaptureOutcome::try_from(capture).unwrap(),
+            CaptureOutcome::Rejected { rejection } if rejection.reason.code() == LiveRejectionCode::Unsupported
+        ));
+        let release = client
+            .release_capture(ReleaseCaptureRequest {
+                envelope: Some(envelope(&run)),
+                operation_id: Some(uuid::Uuid::new_v4().to_string()),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let ReleaseCaptureOutcome::Rejected { rejection } =
+            ReleaseCaptureOutcome::try_from(release).unwrap();
+        assert_eq!(rejection.reason.code(), LiveRejectionCode::Unsupported);
+
+        drop(client);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

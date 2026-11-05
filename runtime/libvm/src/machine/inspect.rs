@@ -196,6 +196,8 @@ pub struct MachineData {
     pub live: Option<vm_spec::live::LiveMachineReport>,
     /// Prospective next-start selection, only for an observed stopped machine.
     pub prospective_live: Option<vm_spec::live::LiveHostReport>,
+    /// Current exact-monitor authority, separate from historical Pause success.
+    pub lifecycle: Option<crate::MachineLifecycle>,
     /// Latest guest boot report observed by silo-vmm, when the guest registered one.
     pub boot_report: Option<MachineBootReport>,
     /// Latest guest provisioning report observed by silo-vmm, when the guest registered one.
@@ -240,6 +242,7 @@ impl MachineData {
             run_id: None,
             live: None,
             prospective_live: None,
+            lifecycle: None,
             boot_report: None,
             provision_report: None,
             started_at: None,
@@ -300,6 +303,7 @@ impl MachineData {
             run_id,
             live: None,
             prospective_live: None,
+            lifecycle: None,
             boot_report,
             provision_report,
             started_at: state.started_at,
@@ -553,6 +557,24 @@ pub enum MachineStatus {
         /// Optional human-readable status detail.
         message: Option<String>,
     },
+    Pausing {
+        message: Option<String>,
+    },
+    Paused {
+        message: Option<String>,
+    },
+    Capturing {
+        message: Option<String>,
+    },
+    Restoring {
+        message: Option<String>,
+    },
+    Activating {
+        message: Option<String>,
+    },
+    ActivationFailed {
+        message: Option<String>,
+    },
     /// silo-vmm is stopping.
     Stopping {
         /// Optional human-readable status detail.
@@ -578,6 +600,24 @@ impl MachineStatus {
                 guest_ready: false,
                 message: None,
             },
+            MachineRuntimeState::Pausing => Self::Pausing {
+                message: last_error,
+            },
+            MachineRuntimeState::Paused => Self::Paused {
+                message: last_error,
+            },
+            MachineRuntimeState::Capturing => Self::Capturing {
+                message: last_error,
+            },
+            MachineRuntimeState::Restoring => Self::Restoring {
+                message: last_error,
+            },
+            MachineRuntimeState::Activating => Self::Activating {
+                message: last_error,
+            },
+            MachineRuntimeState::ActivationFailed => Self::ActivationFailed {
+                message: last_error,
+            },
             MachineRuntimeState::Stopping => Self::Stopping { message: None },
             MachineRuntimeState::Error => Self::Error {
                 message: non_empty_message(last_error),
@@ -597,27 +637,34 @@ impl MachineStatus {
         match VmState::try_from(vm.state.unwrap_or_default()).unwrap_or(VmState::Unspecified) {
             VmState::Stopped => Self::Stopped,
             VmState::Starting => Self::Starting { message },
-            VmState::Running | VmState::Unspecified => Self::Running {
+            VmState::Running => Self::Running {
                 ready,
                 guest_ready,
                 message,
             },
             VmState::Stopping => Self::Stopping { message },
+            VmState::Pausing => Self::Pausing { message },
+            VmState::Paused => Self::Paused { message },
+            VmState::Capturing => Self::Capturing { message },
+            VmState::Restoring => Self::Restoring { message },
+            VmState::Activating => Self::Activating { message },
+            VmState::ActivationFailed => Self::ActivationFailed { message },
+            VmState::Error => Self::Error { message },
             VmState::Failed => Self::Error { message },
-        }
-    }
-
-    pub(crate) fn running_with_message(message: String) -> Self {
-        Self::Running {
-            ready: false,
-            guest_ready: false,
-            message: non_empty_message(Some(message)),
+            VmState::Unspecified => Self::Error {
+                message: Some("monitor returned an unspecified lifecycle state".into()),
+            },
         }
     }
 
     /// Returns true when silo-vmm is running.
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
+    }
+
+    /// A nonterminal lifecycle, including parked and fenced execution.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, Self::Stopped | Self::Error { .. })
     }
 
     /// Returns true when the machine satisfies its configured readiness policy.
@@ -642,6 +689,12 @@ impl MachineStatus {
             Self::Stopped => "stopped",
             Self::Starting { .. } => "starting",
             Self::Running { .. } => "running",
+            Self::Pausing { .. } => "pausing",
+            Self::Paused { .. } => "paused",
+            Self::Capturing { .. } => "capturing",
+            Self::Restoring { .. } => "restoring",
+            Self::Activating { .. } => "activating",
+            Self::ActivationFailed { .. } => "activation-failed",
             Self::Stopping { .. } => "stopping",
             Self::Error { .. } => "error",
         }
@@ -653,6 +706,12 @@ impl MachineStatus {
             Self::Stopped => None,
             Self::Starting { message }
             | Self::Running { message, .. }
+            | Self::Pausing { message }
+            | Self::Paused { message }
+            | Self::Capturing { message }
+            | Self::Restoring { message }
+            | Self::Activating { message }
+            | Self::ActivationFailed { message }
             | Self::Stopping { message }
             | Self::Error { message } => message.as_deref(),
         }
@@ -671,6 +730,12 @@ impl From<MachineStatus> for MachineRuntimeState {
             MachineStatus::Stopped => Self::Stopped,
             MachineStatus::Starting { .. } => Self::Starting,
             MachineStatus::Running { .. } => Self::Running,
+            MachineStatus::Pausing { .. } => Self::Pausing,
+            MachineStatus::Paused { .. } => Self::Paused,
+            MachineStatus::Capturing { .. } => Self::Capturing,
+            MachineStatus::Restoring { .. } => Self::Restoring,
+            MachineStatus::Activating { .. } => Self::Activating,
+            MachineStatus::ActivationFailed { .. } => Self::ActivationFailed,
             MachineStatus::Stopping { .. } => Self::Stopping,
             MachineStatus::Error { .. } => Self::Error,
         }
@@ -847,5 +912,33 @@ mod tests {
         let second = crate::MachineData::new("machine".to_string(), "second".to_string(), spec);
         assert!(second.external_resources.is_empty());
         assert_eq!(first.external_resources.len(), 2);
+    }
+    #[test]
+    fn pause_lifecycle_never_inherits_ready_or_running_from_retained_telemetry() {
+        for (state, label) in [
+            (VmState::Pausing, "pausing"),
+            (VmState::Paused, "paused"),
+            (VmState::Capturing, "capturing"),
+            (VmState::Restoring, "restoring"),
+            (VmState::Activating, "activating"),
+            (VmState::ActivationFailed, "activation-failed"),
+            (VmState::Error, "error"),
+        ] {
+            let status = MachineStatus::from_protocol(HostStatus {
+                vm: Some(VmSnapshot {
+                    state: Some(state as i32),
+                    ..Default::default()
+                }),
+                readiness: Some(Readiness {
+                    ready: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert_eq!(status.label(), label);
+            assert!(!status.ready());
+            assert!(!status.guest_ready());
+            assert!(!status.is_running());
+        }
     }
 }

@@ -23,6 +23,7 @@ mod finalize;
 mod forward;
 mod guest;
 mod krun;
+mod live;
 mod lock;
 mod machine;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

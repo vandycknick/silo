@@ -583,11 +583,22 @@ pub async fn init(
     )?);
     let (machine, park_timeout) = create_virtual_machine(selected_backend, machine_config.config)?;
     primary_machine.set(machine.clone(), shutdown_state.clone())?;
+    let live_gate = crate::live::gate::LiveGate::new();
+    let live = crate::live::coordinator::LiveCoordinator::new(
+        machine_uuid,
+        run_uuid,
+        store.clone(),
+        machine.clone(),
+        live_gate.clone(),
+        crate::live::coordinator::LiveTimeouts::default(),
+    )
+    .map_err(eyre::Report::msg)?;
     let forwards = crate::forward::ForwardTable::prepare_machine(
         &spec.forwards,
         runtime.runtime_dir(),
         mux_filename,
         park_timeout,
+        live_gate,
     )
     .await?;
     if !guest_services_enabled {
@@ -672,6 +683,7 @@ pub async fn init(
             stop_requested: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             shutdown_state,
+            live,
         },
         startup_command: start_request.startup_command,
         vsock_surface,

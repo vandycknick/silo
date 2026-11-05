@@ -19,6 +19,55 @@ CREATE TABLE machine_state (
     state_json          BLOB NOT NULL
 );
 
+-- Command history is immutable intent plus a separately retained response.
+-- Current pause authority is deliberately not derived from historical results.
+CREATE TABLE live_command (
+    machine_id TEXT NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    monitor_id TEXT NOT NULL,
+    input_json BLOB NOT NULL,
+    result_json BLOB,
+    PRIMARY KEY (machine_id, run_id, request_id)
+);
+CREATE INDEX live_command_pending ON live_command(machine_id, run_id)
+WHERE result_json IS NULL;
+CREATE TRIGGER live_command_intent_immutable
+BEFORE UPDATE OF machine_id, run_id, request_id, monitor_id, input_json ON live_command
+BEGIN SELECT RAISE(ABORT, 'live command intent is immutable'); END;
+CREATE TRIGGER live_command_result_immutable
+BEFORE UPDATE OF result_json ON live_command WHEN OLD.result_json IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'live command result is immutable'); END;
+CREATE TABLE live_run (
+    machine_id TEXT PRIMARY KEY NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    monitor_id TEXT NOT NULL,
+    projection_json BLOB NOT NULL
+);
+CREATE TABLE live_operation (
+    machine_id TEXT NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    monitor_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    terminal INTEGER NOT NULL CHECK (terminal IN (0,1)),
+    record_json BLOB NOT NULL,
+    PRIMARY KEY (machine_id, run_id, operation_id)
+);
+CREATE TRIGGER live_operation_terminal_immutable
+BEFORE UPDATE ON live_operation WHEN OLD.terminal = 1
+BEGIN SELECT RAISE(ABORT, 'terminal live operation is immutable'); END;
+CREATE TRIGGER live_run_authority_follows_machine
+AFTER UPDATE ON machine_state
+BEGIN
+    DELETE FROM live_run WHERE machine_id = NEW.machine_id AND (
+        NEW.status IN ('stopped', 'stopping') OR
+        CASE WHEN json_valid(NEW.state_json, 8) THEN
+            json_extract(NEW.state_json, '$.vmmonPid') IS NULL OR
+            run_id IS NOT json_extract(NEW.state_json, '$.runId')
+        ELSE 1 END
+    );
+END;
+
 CREATE TABLE network_instances (
     id                      TEXT PRIMARY KEY,
     driver                  TEXT NOT NULL,

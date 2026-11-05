@@ -13,6 +13,9 @@
 //! - The exit status is cached: `wait`/`try_wait` after the machine exits (or
 //!   after `stop`) resolve immediately and never hang.
 //! - `open_serial` is called exactly once per boot, by the serial console.
+//! - `lifecycle` is the finite native pause/resume seam. Accepted native work
+//!   outlives a dropped caller; backends without a native pause authority
+//!   refuse every request as `Unsupported`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -28,6 +31,7 @@ use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
 use crate::virt::VmExit;
 
 mod krun;
+pub(crate) mod lifecycle;
 #[cfg(feature = "mock-backend")]
 pub(crate) mod mock;
 pub(crate) mod storage;
@@ -96,6 +100,13 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
         None
     }
+
+    /// The finite native lifecycle seam. Backends without a native pause
+    /// authority refuse every request, including observation, as Unsupported.
+    async fn lifecycle(
+        &self,
+        request: crate::virt::lifecycle::LifecycleRequest,
+    ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>;
 }
 
 /// Independently observed host storage facts, never inferred from exit status.

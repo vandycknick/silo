@@ -196,6 +196,7 @@ mod tests {
             std::path::Path::new("/unused"),
             None,
             crate::forward::inbound::PARK_TIMEOUT,
+            crate::live::gate::LiveGate::new(),
         )
         .await
         .unwrap();

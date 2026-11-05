@@ -160,11 +160,12 @@ impl LocalPaths {
     ) -> Result<OwnedDirectory, LibVmError> {
         let root = OwnedDirectory::open_root(self.roots.home())?;
         let machines = root.ensure_dir(MACHINES_DIR_NAME)?;
-        if machines.create_dir(&machine_id.to_string())?.is_none() {
-            return Err(LibVmError::MachineIdAlreadyExists {
+        let machine = machines
+            .create_dir(&machine_id.to_string())?
+            .ok_or_else(|| LibVmError::MachineIdAlreadyExists {
                 id: machine_id.to_string(),
-            });
-        }
+            })?;
+        machine.ensure_dir("captures")?;
         Ok(machines)
     }
 

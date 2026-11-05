@@ -60,15 +60,30 @@ impl DaemonVmService {
             .transpose()?)
     }
 
-    pub(crate) async fn pause_machine(&self, value: &str) -> eyre::Result<()> {
-        self.machines
-            .clone()
-            .pause_machine(w::LiveMachineRequest {
-                machine: Some(reference(value)?),
-            })
-            .await
-            .map_err(native_status)?;
-        Ok(())
+    pub(crate) async fn pause_machine(&self, value: &str) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.machines
+                .clone()
+                .pause_machine(w::LiveMachineRequest {
+                    machine: Some(reference(value)?),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn resume_machine(&self, value: &str) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.machines
+                .clone()
+                .resume_machine(w::LiveMachineRequest {
+                    machine: Some(reference(value)?),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
     }
 
     pub(crate) async fn capture_execution(

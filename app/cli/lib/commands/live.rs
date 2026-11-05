@@ -11,7 +11,29 @@ pub struct Pause {
 }
 impl Pause {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        context.app_api().await?.pause_machine(&self.machine).await
+        context
+            .app_api()
+            .await?
+            .pause_machine(&self.machine)
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Resume the current user-owned pause of a VM")]
+pub struct Resume {
+    #[arg(value_name = "VM")]
+    machine: String,
+}
+impl Resume {
+    pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        context
+            .app_api()
+            .await?
+            .resume_machine(&self.machine)
+            .await?;
+        Ok(())
     }
 }
 

@@ -64,6 +64,25 @@ shutdown cutover. Those lanes are the restored activation tests below; no
 absent lane is counted as passing and no cold activation substitutes for the
 exact host generation barrier.
 
+### Public pause and resident resume (Phase 13)
+
+```sh
+cargo build --locked -p libvm --example live_acceptance
+make smoke SMOKE_ARGS='tests/test_pause.py tests/test_guest_lifecycle.py -k pause --keep'
+```
+
+The real CLI gate retains one guest counter stream across pause and ClockOnly
+resume. It checks frozen workload evidence, user-owned authority, fresh-manager
+reconciliation, exact replay and GetOperation, stale-token and paused-cancel
+refusal, fenced new execution, unchanged boot/run identity and reseed count,
+and the exact generation acknowledgement. A second pause is stopped without
+resuming; the gate waits for the actual owners and checks storage-lease release.
+The image-owned-init negative gate rejects before allocating a live command.
+
+`live_acceptance` is a standalone Rust public-API consumer, not a VM-starting
+Cargo test. Only the supervisor-verified immutable build/lane qualification
+grants public pause. Runtime files or environment variables cannot grant it.
+
 ### Restored guest activation (Phase 12)
 
 `silo_smoke/guest_restored.py` joins the standalone `native-live-api` owner
@@ -1111,7 +1130,9 @@ namespace (`unshare --user --map-root-user --mount`). Its bounded tmpfs
 exercises actual ENOSPC; do not substitute host disk exhaustion or `/dev/full`.
 Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`,
 only after the exercised native lane's support declarations have been approved.
-The public availability vector must still report `not-delivered`.
+The qualified Phase 13 build reports public pause supported; capture, restore,
+fork and incremental remain `not-delivered`. Standalone native proofs grant no
+additional public capability.
 
 `api-report.json`, per-process logs, captured manifests and input identities
 are the evidence. Ordinary successful cohorts require acknowledged native

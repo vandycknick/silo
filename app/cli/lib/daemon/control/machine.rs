@@ -23,11 +23,44 @@ impl w::machine_service_server::MachineService for Service {
     async fn pause_machine(
         &self,
         r: Request<w::LiveMachineRequest>,
-    ) -> Result<Response<()>, Status> {
-        let reference = reference(r.into_inner().machine)?;
-        self.require_machine_live(&reference, vm_spec::live::LiveOperation::Pause)
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let reference = reference(r.get_ref().machine.clone())?;
+        if !libvm::LiveObservationReader::open(&self.config)
+            .map_err(native)?
+            .catalog_exists()
+            .map_err(native)?
+        {
+            self.require_machine_live(&reference, vm_spec::live::LiveOperation::Pause)
+                .await?;
+        }
+        let observation = self.observe_machine_live(&reference).await?;
+        observation.require_pause_submission().map_err(native)?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let machine = state.machine(&reference).await?;
+                machine.pause(&observation).await.map_err(native)?;
+                snapshot(&machine.inspect().await.map_err(native)?)
+            })
             .await?;
-        Ok(Response::new(()))
+        Ok(Response::new(result))
+    }
+
+    async fn resume_machine(
+        &self,
+        r: Request<w::LiveMachineRequest>,
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let reference = reference(r.get_ref().machine.clone())?;
+        let observation = self.observe_machine_live(&reference).await?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let machine = state.machine(&reference).await?;
+                machine.resume(&observation).await.map_err(native)?;
+                snapshot(&machine.inspect().await.map_err(native)?)
+            })
+            .await?;
+        Ok(Response::new(result))
     }
 
     async fn capture_execution(

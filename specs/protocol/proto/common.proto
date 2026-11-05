@@ -348,4 +348,50 @@ message GuestLifecycleStatus {
   string machine_id = 8;
   string run_id = 9;
   optional string activation_id = 10;
+  // Boot-observed bound Silo 0x5347 driver with supported, healthy sysfs ABI.
+  // This is admission evidence, never proof of a later request acknowledgement.
+  optional bool generation_driver_ready = 11;
+  // Bounded actual observations from this boot, never diagnostic defaults.
+  GuestClockProfile clock_profile = 12;
+  optional string clock_profile_unavailable_reason = 13;
+}
+
+enum GuestClocksource {
+  GUEST_CLOCKSOURCE_UNSPECIFIED = 0;
+  GUEST_CLOCKSOURCE_TSC = 1;
+}
+
+enum GuestClockeventDevice {
+  GUEST_CLOCKEVENT_DEVICE_UNSPECIFIED = 0;
+  GUEST_CLOCKEVENT_DEVICE_LAPIC_DEADLINE = 1;
+}
+
+message GuestOnlineClockevent {
+  uint32 cpu = 1;
+  GuestClockeventDevice device = 2;
+}
+
+enum GuestBroadcastClockeventKind {
+  GUEST_BROADCAST_CLOCKEVENT_KIND_UNSPECIFIED = 0;
+  // An actual read completed at EOF with zero bytes.
+  GUEST_BROADCAST_CLOCKEVENT_KIND_NO_DEVICE = 1;
+  GUEST_BROADCAST_CLOCKEVENT_KIND_NON_PIT = 2;
+}
+
+enum GuestModulesEvidence {
+  GUEST_MODULES_EVIDENCE_UNSPECIFIED = 0;
+  GUEST_MODULES_EVIDENCE_PROC_MODULES = 1;
+  // Actual built-in kernel configuration explicitly disables CONFIG_MODULES.
+  GUEST_MODULES_EVIDENCE_BUILT_IN_DISABLED = 2;
+}
+
+message GuestClockProfile {
+  string boot_id = 1;
+  string kernel_identity = 2;
+  GuestClocksource clocksource = 3;
+  repeated GuestOnlineClockevent online_clockevents = 4;
+  GuestBroadcastClockeventKind broadcast_kind = 5;
+  string broadcast_device = 6;
+  GuestModulesEvidence modules = 7;
+  bool no_speaker_consumers = 8;
 }

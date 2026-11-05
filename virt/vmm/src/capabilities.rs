@@ -16,7 +16,7 @@ use vm_spec::live::{
 };
 
 pub(crate) const MAX_SCENARIO_BYTES: usize = 1024 * 1024;
-const DELIVERED: &[LiveOperation] = &[];
+const DELIVERED: &[LiveOperation] = &[LiveOperation::Pause];
 
 #[derive(Debug, Parser)]
 #[command(name = "silo-vmm capabilities")]
@@ -190,6 +190,8 @@ impl ResolvedSelection {
 
     pub(crate) fn host_report(&self) -> eyre::Result<LiveHostReport> {
         let build = compiled_build();
+        let qualification_identity = build.qualification_identity()?;
+        let qualification_ready = build.qualification_ready();
         // Only the selected native backend may touch its machine-less host API.
         let native_report = (self.backend == LiveBackend::Krun).then(native::query_live_host);
         let lane = native_report
@@ -206,7 +208,13 @@ impl ResolvedSelection {
             backend_allowed: self.backend == LiveBackend::Krun,
             native: operations.is_some_and(|operations| native_primitive(operation, operations)),
             delivered: DELIVERED.contains(&operation),
-            qualified: qualification_matches(&build, lane, operation, QUALIFICATIONS),
+            qualified: qualification_matches(
+                &qualification_identity,
+                qualification_ready,
+                lane,
+                operation,
+                QUALIFICATIONS,
+            ),
             host,
         })?;
         #[cfg(feature = "mock-backend")]
@@ -225,7 +233,7 @@ impl ResolvedSelection {
             lane,
             live,
             build_identity: build.public_identity(),
-            qualification_identity: build.qualification_identity()?,
+            qualification_identity,
             scenario_digest: self.scenario_digest.clone(),
         };
         report.validate().map_err(eyre::Report::msg)?;
@@ -345,7 +353,7 @@ impl BuildIdentity<'_> {
             write!(binding, "{byte:02x}")?;
         }
         Ok(format!(
-            "v2:native={native}:binding={binding}:eligible={}:empty",
+            "v2:native={native}:binding={binding}:eligible={}",
             self.qualification_ready()
         ))
     }
@@ -396,26 +404,32 @@ fn compiled_build() -> BuildIdentity<'static> {
 }
 
 struct Qualification<'a> {
-    build: BuildIdentity<'a>,
+    binding: &'a str,
     lane: LiveLane,
     operations: &'a [LiveOperation],
     evidence: &'a str,
 }
 
-// Native primitive evidence does not grant a shipped public qualification.
-const QUALIFICATIONS: &[Qualification<'static>] = &[];
+// Supervisor-verified real CLI/guest pause, ClockOnly resume and paused stop.
+const QUALIFICATIONS: &[Qualification<'static>] = &[Qualification {
+    binding: "v2:native=0fa0aee416ebb566c0e3cfbc587d54af860c3928a8c268c97404627968a6f3d0:binding=3c986fc2e8e8dd765cce37c76c3a407812b98839389e0752da0370623abcb8a7:eligible=true",
+    lane: LiveLane::KvmX86_64,
+    operations: &[LiveOperation::Pause],
+    evidence: "phase-13/pause-corrected-guest.xml; worker, coordinator and durable-manager gates",
+}];
 
 fn qualification_matches(
-    build: &BuildIdentity<'_>,
+    binding: &str,
+    eligible: bool,
     lane: LiveLane,
     operation: LiveOperation,
     records: &[Qualification<'_>],
 ) -> bool {
-    if records.is_empty() || !build.qualification_ready() {
+    if records.is_empty() || !eligible {
         return false;
     }
     records.iter().any(|record| {
-        record.build == *build
+        record.binding == binding
             && record.lane == lane
             && record.operations.contains(&operation)
             && !record.evidence.is_empty()
@@ -621,6 +635,21 @@ impl EffectiveProfile {
     }
 }
 
+/// The state owner supplies a rejection unless fresh, exact guest identity,
+/// containment and the bound generation driver have all been observed.
+/// Always narrow the original machine vector, never a prior narrowed result.
+pub(crate) fn narrow_for_guest(
+    live: LiveCapabilityVector,
+    rejection: Option<&str>,
+) -> LiveCapabilityVector {
+    narrow(
+        live,
+        rejection.map(|profile| LiveDeviceSubject::GuestProfile {
+            profile: profile.to_owned(),
+        }),
+    )
+}
+
 fn narrow(live: LiveCapabilityVector, subject: Option<LiveDeviceSubject>) -> LiveCapabilityVector {
     vector(|operation| {
         let mut capability = live.get(operation).clone();
@@ -638,6 +667,23 @@ fn narrow(live: LiveCapabilityVector, subject: Option<LiveDeviceSubject>) -> Liv
 #[cfg(test)]
 mod tests {
     use crate::capabilities::*;
+
+    fn qualification_matches(
+        build: &BuildIdentity<'_>,
+        lane: LiveLane,
+        operation: LiveOperation,
+        records: &[Qualification<'_>],
+    ) -> bool {
+        crate::capabilities::qualification_matches(
+            &build
+                .qualification_identity()
+                .expect("canonical build binding"),
+            build.qualification_ready(),
+            lane,
+            operation,
+            records,
+        )
+    }
 
     fn admitted() -> HostAdmission {
         HostAdmission {
@@ -866,7 +912,9 @@ mod tests {
         let native = known_native_build();
         let build = known_build(&native);
         let records = [Qualification {
-            build,
+            binding: &build
+                .qualification_identity()
+                .expect("canonical build binding"),
             lane: LiveLane::KvmX86_64,
             operations: &[LiveOperation::Pause],
             evidence: "unit-evidence",
@@ -939,7 +987,9 @@ mod tests {
             &records
         ));
         let no_evidence = [Qualification {
-            build,
+            binding: &build
+                .qualification_identity()
+                .expect("canonical build binding"),
             lane: LiveLane::KvmX86_64,
             operations: &[LiveOperation::Pause],
             evidence: "",
@@ -1045,7 +1095,9 @@ mod tests {
         {
             let build = known_build(&native);
             let records = [Qualification {
-                build,
+                binding: &build
+                    .qualification_identity()
+                    .expect("canonical build binding"),
                 lane: LiveLane::KvmX86_64,
                 operations: &LiveOperation::ALL,
                 evidence: "cannot-override-partial-facts",
@@ -1074,7 +1126,7 @@ mod tests {
             .qualification_identity()
             .expect("baseline identity");
         let records = [Qualification {
-            build: baseline,
+            binding: &identity,
             lane: LiveLane::KvmX86_64,
             operations: &LiveOperation::ALL,
             evidence: "unit-evidence",
@@ -1130,7 +1182,9 @@ mod tests {
         assert_eq!(compiled.native_build, Some(native::compiled_live_build()));
         assert_eq!(native::compiled_live_build().query_abi, 1);
         let records = [Qualification {
-            build: compiled,
+            binding: &compiled
+                .qualification_identity()
+                .expect("canonical build binding"),
             lane: LiveLane::KvmX86_64,
             operations: &LiveOperation::ALL,
             evidence: "not-production-evidence",
@@ -1159,11 +1213,8 @@ mod tests {
             .qualification_identity()
             .expect("canonical identity");
         assert!(!identity.contains("native=unobserved"));
-        assert!(identity.ends_with(":empty"));
         assert!(identity.len() <= 256);
         assert!(compiled.public_identity().len() <= 256);
-        assert!(QUALIFICATIONS.is_empty());
-        assert!(DELIVERED.is_empty());
     }
 
     #[test]
@@ -1280,14 +1331,14 @@ mod tests {
                     &compiled,
                     native_lane(lane).expect("recognized native lane"),
                     operation,
-                    QUALIFICATIONS,
+                    &[],
                 );
                 assert!(!qualified);
                 for host in [admitted(), HostAdmission::not_evaluated()] {
                     let capability = evaluate(EvaluationFacts {
                         backend_allowed: true,
                         native,
-                        delivered: DELIVERED.contains(&operation),
+                        delivered: false,
                         qualified,
                         host,
                     })
@@ -1405,6 +1456,28 @@ mod tests {
             EffectiveProfile::from_config(&config).rejection(),
             Some(LiveDeviceSubject::Virtiofs)
         );
+    }
+
+    #[test]
+    fn guest_admission_preserves_native_and_existing_refusal() {
+        let mut baseline = LiveCapabilityVector::all_unsupported(LiveReasonCode::NotDelivered);
+        baseline.pause = LiveCapability {
+            native: true,
+            availability: LiveAvailability::Supported,
+        };
+        let rejected = narrow_for_guest(baseline.clone(), Some("generation-driver-unobserved"));
+        assert!(rejected.pause.native);
+        assert_eq!(
+            rejected.pause.availability,
+            LiveAvailability::Unsupported {
+                reason: LiveUnsupportedReason::device(LiveDeviceSubject::GuestProfile {
+                    profile: "generation-driver-unobserved".into(),
+                }),
+            }
+        );
+        assert_eq!(rejected.capture, baseline.capture);
+        assert_eq!(narrow_for_guest(rejected.clone(), None), rejected);
+        assert_eq!(narrow_for_guest(baseline.clone(), None), baseline);
     }
 
     #[test]

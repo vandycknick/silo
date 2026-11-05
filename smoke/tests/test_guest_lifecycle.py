@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from silo_smoke import guest_activation_network, guest_lifecycle, guest_restored, images
+from silo_smoke import guest_activation_network, guest_lifecycle, guest_restored, images, pause, procs
 from silo_smoke.cli import Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
@@ -29,6 +29,31 @@ def image_owned_lifecycle_init(config: SmokeConfig, registry: LoopbackRegistry) 
 
 def test_freeze_refuses_uncontained_image_init_before_effects(silo: Silo, image_owned_lifecycle_init: str) -> None:
     guest_lifecycle.run(silo, image_owned_lifecycle_init, unsupported=True)
+
+
+def test_pause_rejects_uncontained_guest_before_operation(silo: Silo, image_owned_lifecycle_init: str) -> None:
+    name = "pause-uncontained"
+    silo.create(name, image_owned_lifecycle_init, "--cpus", "1", "--memory", "512mib", "--vsock", "--network", "none")
+    silo.start(name)
+    running = silo.wait_ready(name)
+    assert running["guest"]["boot"]["agent_is_pid1"] is False
+    capability = running["lifecycle"]["report"]["live"]["pause"]
+    assert capability["availability"]["status"] == "unsupported", capability
+    assert capability["availability"]["reason"]["code"] == "device-profile-rejected", capability
+    before = procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command")
+    counter = pause.Counter(silo, name)
+    try:
+        counter.advances()
+        refused = silo.run("pause", name, expect=None)
+        assert refused.returncode != 0
+        counter.advances()
+        after = silo.info(name)
+        assert after["state"] == "running" and after["run_id"] == running["run_id"]
+        assert after["lifecycle"]["lifecycle"]["currentPause"] is None
+        assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command") == before
+    finally:
+        counter.close()
+        silo.stop(name)
 
 
 @pytest.fixture(scope="session")

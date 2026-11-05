@@ -32,6 +32,8 @@ mod forward;
 mod guest;
 #[path = "../src/krun/mod.rs"]
 mod krun;
+#[path = "../src/live.rs"]
+mod live;
 #[path = "../src/lock/mod.rs"]
 mod lock;
 #[path = "../src/machine.rs"]

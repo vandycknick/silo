@@ -34,6 +34,226 @@ pub struct Scenario {
     pub forward: ForwardScenario,
     /// Test-only transport grants. Never qualifies a production backend.
     pub live: Option<LiveScenario>,
+    /// Modeled native pause control and guest workload freezer. Absent means the
+    /// mock carries no lifecycle evidence: guest freeze/thaw stay unimplemented,
+    /// the guest reports no lifecycle status and native pause is unsupported.
+    pub lifecycle: Option<LifecycleScenario>,
+}
+
+/// Explicitly modeled lifecycle evidence and scripted failures. Every script
+/// list is consumed in order, one entry per attempt; an exhausted list means
+/// the happy path with no delay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct LifecycleScenario {
+    /// Boot-observed bound generation driver, reported by the guest status.
+    pub generation_driver_ready: bool,
+    /// Guest freezer refusal (unsupported containment). `None` models the
+    /// admitted AgentPid1 workload layout.
+    pub freezer_unsupported: Option<String>,
+    /// Canonical workload roots reported by the guest freezer.
+    pub workload_roots: Vec<String>,
+    /// Native live provider inventory reported by native control.
+    pub providers: Vec<ProviderScenario>,
+    /// Native runtime memory tracking mode.
+    pub memory_tracking: MemoryTrackingScenario,
+    pub native_pause: Vec<NativePauseStep>,
+    pub native_cancel: Vec<NativeCancelStep>,
+    pub native_resume: Vec<NativeResumeStep>,
+    pub freeze: Vec<GuestFreezeStep>,
+    pub thaw: Vec<GuestThawStep>,
+}
+
+impl Default for LifecycleScenario {
+    fn default() -> Self {
+        Self {
+            generation_driver_ready: true,
+            freezer_unsupported: None,
+            workload_roots: vec!["/sys/fs/cgroup/silo-workloads".to_string()],
+            providers: ProviderScenario::standard(),
+            memory_tracking: MemoryTrackingScenario::Capture,
+            native_pause: Vec::new(),
+            native_cancel: Vec::new(),
+            native_resume: Vec::new(),
+            freeze: Vec::new(),
+            thaw: Vec::new(),
+        }
+    }
+}
+
+/// One live device as the native provider inventory reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderScenario {
+    /// Virtio device ID (block 2, console 3, rng 4, balloon 5, vsock 19,
+    /// fs 26, generation 0x5347).
+    pub device_id: u32,
+    pub configured_id: String,
+    #[serde(default)]
+    pub activation_fenced: Option<bool>,
+    /// Backing format of a block provider.
+    #[serde(default)]
+    pub block_backing: Option<BlockBackingScenario>,
+    /// A live device without a state provider: native inventory fails closed.
+    #[serde(default)]
+    pub missing_state_provider: bool,
+}
+
+impl ProviderScenario {
+    fn device(device_id: u32, configured_id: &str) -> Self {
+        Self {
+            device_id,
+            configured_id: configured_id.to_string(),
+            activation_fenced: Some(false),
+            block_backing: None,
+            missing_state_provider: false,
+        }
+    }
+
+    /// The ordinary Raw-rooted krun device set.
+    pub fn standard() -> Vec<Self> {
+        vec![
+            Self::device(3, "console"),
+            Self {
+                block_backing: Some(BlockBackingScenario::Raw),
+                ..Self::device(2, "root")
+            },
+            Self::device(19, "vsock"),
+            Self::device(4, "rng"),
+            Self::device(5, "balloon"),
+            Self::device(0x5347, "generation"),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockBackingScenario {
+    Raw,
+    Vmdk,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MemoryTrackingScenario {
+    Disabled,
+    #[default]
+    Capture,
+}
+
+/// One native pause attempt. `delayMs` is the barrier duration before the
+/// scripted result is observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativePauseStep {
+    #[serde(default)]
+    pub delay_ms: u64,
+    pub result: NativePauseResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativePauseResult {
+    /// Complete barrier: native Paused with a token.
+    Complete,
+    /// Barrier failure after admission: native failed Pausing, no token.
+    Fail,
+    /// Admission rejection: native stays Running.
+    Reject,
+    /// Native completes the barrier but the caller's reply is lost.
+    LoseReply,
+    /// The barrier never completes; native fails it at the deadline.
+    Hang,
+}
+
+/// One native pause cancellation (rollback) attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeCancelStep {
+    #[serde(default)]
+    pub delay_ms: u64,
+    pub result: NativeCancelResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeCancelResult {
+    /// Rollback reaches Running.
+    Complete,
+    /// Rollback fails: native FailedFenced.
+    Fail,
+}
+
+/// One native ClockOnly resume attempt (prepare, release, acknowledgement).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeResumeStep {
+    /// Release duration.
+    #[serde(default)]
+    pub delay_ms: u64,
+    pub result: NativeResumeResult,
+    /// Guest generation driver acknowledgement latency after release.
+    #[serde(default)]
+    pub clock_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeResumeResult {
+    /// Released and the ClockOnly request is acknowledged.
+    Complete,
+    /// ClockOnly preparation fails; native stays Paused with the same token.
+    PrepareFail,
+    /// Release fails: native FailedFenced.
+    ReleaseFail,
+    /// Released, but the caller's release reply is lost.
+    LoseReply,
+    /// Released, the guest driver reports a generation failure.
+    ClockFail,
+    /// Released, the guest driver never acknowledges before the deadline.
+    ClockTimeout,
+}
+
+/// One guest FreezeWorkloads attempt (a new epoch, not a same-input retry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuestFreezeStep {
+    #[serde(default)]
+    pub delay_ms: u64,
+    pub result: GuestFreezeResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GuestFreezeResult {
+    Frozen,
+    /// Freeze fails and the guest's own rollback succeeds (FREEZE_FAILED).
+    FreezeFailed,
+    /// Freeze fails and its rollback fails (FAULTED).
+    Faulted,
+    /// The freeze takes effect but the RPC response is lost.
+    DropResponse,
+    /// The freeze never completes before its deadline; then FREEZE_FAILED.
+    Hang,
+}
+
+/// One guest Thaw attempt (rollback or normal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuestThawStep {
+    #[serde(default)]
+    pub delay_ms: u64,
+    pub result: GuestThawResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GuestThawResult {
+    Thawed,
+    /// Thaw fails: guest FAULTED.
+    Faulted,
+    /// The thaw takes effect (workloads run) but the RPC response is lost.
+    DropResponse,
 }
 
 /// Behavior of `machine.start()`.
@@ -335,6 +555,56 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(Scenario::from_json(r#"{"bogus": true}"#).is_err());
+    }
+
+    #[test]
+    fn lifecycle_scenario_is_explicit_and_scripts_parse_in_order() {
+        assert_eq!(Scenario::default().lifecycle, None, "no implicit evidence");
+        let modeled = Scenario::from_json(r#"{"lifecycle": {}}"#).expect("parse");
+        let lifecycle = modeled.lifecycle.expect("modeled lifecycle");
+        assert_eq!(lifecycle, LifecycleScenario::default());
+        assert!(lifecycle.generation_driver_ready);
+        assert!(lifecycle
+            .providers
+            .iter()
+            .any(|provider| provider.device_id == 2
+                && provider.block_backing == Some(BlockBackingScenario::Raw)));
+        let scripted = Scenario::from_json(
+            r#"{"lifecycle": {
+                "generationDriverReady": false,
+                "memoryTracking": "disabled",
+                "nativePause": [{"result": "loseReply"}, {"delayMs": 5, "result": "fail"}],
+                "nativeCancel": [{"result": "fail"}],
+                "nativeResume": [{"result": "clockTimeout", "clockDelayMs": 3}],
+                "freeze": [{"result": "dropResponse"}],
+                "thaw": [{"delayMs": 1, "result": "faulted"}],
+                "providers": [{"deviceId": 26, "configuredId": "share", "missingStateProvider": true}]
+            }}"#,
+        )
+        .expect("parse")
+        .lifecycle
+        .expect("lifecycle");
+        assert!(!scripted.generation_driver_ready);
+        assert_eq!(scripted.memory_tracking, MemoryTrackingScenario::Disabled);
+        assert_eq!(
+            scripted
+                .native_pause
+                .iter()
+                .map(|step| step.result)
+                .collect::<Vec<_>>(),
+            [NativePauseResult::LoseReply, NativePauseResult::Fail]
+        );
+        assert_eq!(scripted.native_resume[0].clock_delay_ms, 3);
+        assert_eq!(scripted.freeze[0].result, GuestFreezeResult::DropResponse);
+        assert_eq!(scripted.thaw[0].result, GuestThawResult::Faulted);
+        assert!(scripted.providers[0].missing_state_provider);
+        for invalid in [
+            r#"{"lifecycle": {"nativePause": [{"result": "maybe"}]}}"#,
+            r#"{"lifecycle": {"freeze": [{"delayMs": 1}]}}"#,
+            r#"{"lifecycle": {"bogus": true}}"#,
+        ] {
+            assert!(Scenario::from_json(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

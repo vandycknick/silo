@@ -2,10 +2,12 @@
 compile_error!("silo-agent only supports Linux guests");
 
 mod clock;
+mod clock_profile;
 mod diagnostics;
 mod filesystem;
 mod forward;
 mod freezer;
+mod generation;
 mod guest_process;
 mod handoff;
 mod host;

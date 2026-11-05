@@ -27,11 +27,20 @@ type ChunkStream = Pin<Box<dyn Stream<Item = Result<ByteChunk, Status>> + Send +
 pub(crate) struct MockFilesystemService {
     root: PathBuf,
     scenario: FilesystemScenario,
+    admission: std::sync::Arc<crate::virt::backend::mock::freezer::GuestAdmission>,
 }
 
 impl MockFilesystemService {
-    pub(crate) fn new(root: PathBuf, scenario: FilesystemScenario) -> Self {
-        Self { root, scenario }
+    pub(crate) fn new(
+        root: PathBuf,
+        scenario: FilesystemScenario,
+        admission: std::sync::Arc<crate::virt::backend::mock::freezer::GuestAdmission>,
+    ) -> Self {
+        Self {
+            root,
+            scenario,
+            admission,
+        }
     }
 
     /// Map a guest path into the sandbox, rejecting traversal escapes and
@@ -190,6 +199,7 @@ impl GuestFilesystemService for MockFilesystemService {
         &self,
         request: Request<RemoveEntryRequest>,
     ) -> Result<Response<RemoveEntryResponse>, Status> {
+        self.admission.admit_mutation()?;
         let request = request.into_inner();
         let (guest_path, host_path) = self.resolve(request.path.as_deref())?;
         let metadata = tokio::fs::symlink_metadata(&host_path)
@@ -275,6 +285,7 @@ impl GuestFilesystemService for MockFilesystemService {
         &self,
         request: Request<Streaming<UploadFileRequest>>,
     ) -> Result<Response<UploadFileResponse>, Status> {
+        self.admission.admit_mutation()?;
         let mut input = request.into_inner();
         let header = match input.next().await {
             Some(Ok(UploadFileRequest {
@@ -425,6 +436,7 @@ impl GuestFilesystemService for MockFilesystemService {
         &self,
         request: Request<CreateDirectoryRequest>,
     ) -> Result<Response<CreateDirectoryResponse>, Status> {
+        self.admission.admit_mutation()?;
         let request = request.into_inner();
         let (guest_path, host_path) = self.resolve(request.path.as_deref())?;
 
