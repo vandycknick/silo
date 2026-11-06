@@ -4,6 +4,14 @@
 //! of a [`CommandKey`] and retains every command result for the backend's
 //! lifetime. A dropped caller never cancels accepted worker work: results keep
 //! arriving into the journal and a retry or `GetControl` observes them.
+//!
+//! Rights-bearing commands carry owned descriptor duplicates. The queued frame
+//! owns them until its first byte is sent with them, then closes them; a
+//! joined replay checks and closes its duplicates before it waits.
+//!
+//! Stop linearizes with mutator submission through [`LifecycleSlot`]: the
+//! fence and every enqueue take the client's state lock, so a mutator is
+//! either admitted before the fence or refused `Stopping` without effect.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -19,8 +27,9 @@ use crate::krun::worker::lifecycle_wire::{
     self, FrameBuffer, ParentFrame, WorkerFrame, PROTOCOL_VERSION,
 };
 use crate::virt::lifecycle::{
-    CommandKey, CommandReport, CommandSequence, CommandState, ControlObservation, LifecycleCommand,
-    LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse, LifecycleUncertainty,
+    CommandKey, CommandReport, CommandSequence, CommandState, ControlObservation, InvalidRequest,
+    LifecycleCommand, LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse,
+    LifecycleRights, LifecycleUncertainty, RightsKind,
 };
 
 /// Waiting for the worker's Hello before the first command.
@@ -58,8 +67,14 @@ struct Shared {
     binding: Binding,
     state: Mutex<State>,
     hello: watch::Sender<Hello>,
-    frames: mpsc::UnboundedSender<Vec<u8>>,
+    frames: mpsc::UnboundedSender<Outbound>,
     faults: mpsc::Sender<LifecycleFault>,
+}
+
+/// One encoded frame and the descriptors riding its first byte.
+struct Outbound {
+    bytes: Vec<u8>,
+    rights: Vec<OwnedFd>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +104,53 @@ enum Pending {
     Control(oneshot::Sender<Result<LifecycleResponse, LifecycleError>>),
 }
 
+/// A backend's lifecycle client and its permanent submission fence. Closing
+/// and installation share one lock, so a client installed after stop began
+/// never admits a mutator either.
+#[derive(Debug, Default)]
+pub(crate) struct LifecycleSlot {
+    state: Mutex<Slot>,
+}
+
+#[derive(Debug, Default)]
+struct Slot {
+    client: Option<LifecycleClient>,
+    closed: bool,
+}
+
+impl LifecycleSlot {
+    fn slot(&self) -> MutexGuard<'_, Slot> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn install(&self, client: LifecycleClient) {
+        let mut slot = self.slot();
+        if slot.closed {
+            client.close_admission();
+        }
+        slot.client = Some(client);
+    }
+
+    pub(crate) fn client(&self) -> Option<LifecycleClient> {
+        self.slot().client.clone()
+    }
+
+    /// Close mutator submission for good; observation and joins of commands
+    /// admitted earlier stay available. Synchronous: it returns only after
+    /// any concurrent enqueue has either finished or been refused.
+    pub(crate) fn close_admission(&self) {
+        let mut slot = self.slot();
+        slot.closed = true;
+        if let Some(client) = &slot.client {
+            client.close_admission();
+        }
+    }
+
+    pub(crate) fn closed(&self) -> bool {
+        self.slot().closed
+    }
+}
+
 fn lock(mutex: &Mutex<State>) -> MutexGuard<'_, State> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -102,7 +164,7 @@ impl LifecycleClient {
         let stream = std::os::unix::net::UnixStream::from(endpoint);
         stream.set_nonblocking(true)?;
         let (read, mut write) = UnixStream::from_std(stream)?.into_split();
-        let (frames, mut outbound) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (frames, mut outbound) = mpsc::unbounded_channel::<Outbound>();
         let (faults, fault_receiver) = mpsc::channel(2);
         let shared = Arc::new(Shared {
             binding,
@@ -113,8 +175,9 @@ impl LifecycleClient {
         });
         let writer = shared.clone();
         tokio::spawn(async move {
-            while let Some(bytes) = outbound.recv().await {
-                if let Err(error) = write.write_all(&bytes).await {
+            while let Some(frame) = outbound.recv().await {
+                let result = send_frame(&mut write, frame).await;
+                if let Err(error) = result {
                     writer.lose(
                         LifecycleUncertainty::Transport(error.to_string()),
                         LifecycleFault::Protocol(format!("lifecycle write failed: {error}")),
@@ -138,13 +201,15 @@ impl LifecycleClient {
     }
 
     /// Stop admitting new mutators; observation and joins stay available.
-    pub(crate) fn close_admission(&self) {
+    /// Only [`LifecycleSlot`] closes, so its fence also covers late installs.
+    fn close_admission(&self) {
         lock(&self.shared.state).admission_closed = true;
     }
 
     pub(crate) async fn lifecycle(
         &self,
         request: LifecycleRequest,
+        rights: LifecycleRights,
     ) -> Result<LifecycleResponse, LifecycleError> {
         request.validate().map_err(LifecycleError::Rejected)?;
         if request.machine_id != self.shared.binding.machine_id
@@ -152,13 +217,21 @@ impl LifecycleClient {
         {
             return Err(LifecycleError::Rejected(LifecycleRejection::WrongRun));
         }
+        // Supplied rights must be exactly the command's set with the declared
+        // identities. Absent rights are legal only for a joining replay.
+        if rights.kind() != RightsKind::None {
+            rights
+                .check(&request.command)
+                .map_err(LifecycleError::Rejected)?;
+        }
         match request.command.kind() {
             Some(kind) => {
                 let key = CommandKey {
                     request_id: request.request_id,
                     kind,
                 };
-                self.mutate(key, request.request_id, request.command).await
+                self.mutate(key, request.request_id, request.command, rights)
+                    .await
             }
             None => self.observe(request.request_id, request.command).await,
         }
@@ -169,14 +242,23 @@ impl LifecycleClient {
         key: CommandKey,
         request_id: uuid::Uuid,
         command: LifecycleCommand,
+        rights: LifecycleRights,
     ) -> Result<LifecycleResponse, LifecycleError> {
         let (mut report, wait_until) = match self.join(key, &command)? {
-            Some(joined) => joined,
+            Some(joined) => {
+                // A joined replay never resends: its identity-checked
+                // duplicates close now, not when this wait ends.
+                drop(rights);
+                joined
+            }
             None => {
                 self.ready().await?;
                 match self.join(key, &command)? {
-                    Some(joined) => joined,
-                    None => self.submit(key, request_id, command)?,
+                    Some(joined) => {
+                        drop(rights);
+                        joined
+                    }
+                    None => self.submit(key, request_id, command, rights)?,
                 }
             }
         };
@@ -191,6 +273,7 @@ impl LifecycleClient {
                         control,
                         command: Some(report),
                         inventory: None,
+                        capture: None,
                     })
                 }
                 Some(Err(error)) => return Err(error),
@@ -208,6 +291,7 @@ impl LifecycleClient {
                             control,
                             command: Some(report),
                             inventory: None,
+                            capture: None,
                         }),
                         Some(Err(error)) => Err(error),
                         None => Err(LifecycleError::Unknown(LifecycleUncertainty::Transport(
@@ -250,7 +334,13 @@ impl LifecycleClient {
         key: CommandKey,
         request_id: uuid::Uuid,
         command: LifecycleCommand,
+        rights: LifecycleRights,
     ) -> Result<(watch::Receiver<ReportSlot>, Instant), LifecycleError> {
+        if rights.kind() != command.rights() {
+            return Err(LifecycleError::Rejected(
+                LifecycleRejection::InvalidRequest(InvalidRequest::CaptureRights),
+            ));
+        }
         let mut state = lock(&self.shared.state);
         if state.lost.is_some() || state.admission_closed {
             return Err(LifecycleError::Rejected(LifecycleRejection::Stopping));
@@ -267,7 +357,11 @@ impl LifecycleClient {
         let ParentFrame::Command { command, .. } = frame;
         // Sequence allocation and enqueue share one critical section, so frames
         // reach the worker in strictly increasing order.
-        if self.shared.frames.send(bytes).is_err() {
+        let outbound = Outbound {
+            bytes,
+            rights: rights.into_descriptors(),
+        };
+        if self.shared.frames.send(outbound).is_err() {
             return Err(LifecycleError::Rejected(LifecycleRejection::Stopping));
         }
         let timeout = command.timeout().unwrap_or_default();
@@ -305,7 +399,11 @@ impl LifecycleClient {
             .map_err(|error| {
                 LifecycleError::Unknown(LifecycleUncertainty::Protocol(error.to_string()))
             })?;
-            if self.shared.frames.send(bytes).is_err() {
+            let outbound = Outbound {
+                bytes,
+                rights: Vec::new(),
+            };
+            if self.shared.frames.send(outbound).is_err() {
                 return Err(LifecycleError::Unknown(LifecycleUncertainty::WorkerLost));
             }
             let (sender, receiver) = oneshot::channel();
@@ -387,6 +485,34 @@ fn next_sequence(state: &mut State) -> Result<CommandSequence, LifecycleError> {
 
 fn protocol(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+/// Write one frame. Rights ride only its first byte; once that byte is sent
+/// the worker owns its received copies and ours close.
+async fn send_frame(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    outbound: Outbound,
+) -> std::io::Result<()> {
+    let Outbound { bytes, rights } = outbound;
+    let mut sent = 0;
+    if !rights.is_empty() {
+        let first = *bytes
+            .first()
+            .ok_or_else(|| protocol("empty lifecycle frame"))?;
+        let stream: &UnixStream = write.as_ref();
+        while sent == 0 {
+            stream.writable().await?;
+            match stream.try_io(Interest::WRITABLE, || {
+                lifecycle_wire::send_first_with_rights(stream.as_fd(), first, &rights)
+            }) {
+                Ok(count) => sent = count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    drop(rights);
+    write.write_all(&bytes[sent..]).await
 }
 
 impl Shared {
@@ -507,6 +633,7 @@ impl Shared {
                             control,
                             command: target,
                             inventory: Some(inventory),
+                            capture: None,
                         }));
                         Ok(())
                     }
@@ -518,6 +645,29 @@ impl Shared {
                     None => Err(protocol("lifecycle observation for an unknown sequence")),
                 }
             }
+            WorkerFrame::Capture {
+                sequence,
+                capture,
+                control,
+            } => match state.pending.remove(&sequence) {
+                Some(Pending::Control(sender)) => {
+                    let _ = sender.send(Ok(LifecycleResponse {
+                        control,
+                        command: None,
+                        inventory: None,
+                        capture: Some(capture),
+                    }));
+                    Ok(())
+                }
+                Some(pending @ Pending::Mutator(_)) => {
+                    state.pending.insert(sequence, pending);
+                    Err(protocol("lifecycle capture observation answered a mutator"))
+                }
+                None if sequence.get() <= state.last_sequence => Ok(()),
+                None => Err(protocol(
+                    "lifecycle capture observation for an unknown sequence",
+                )),
+            },
         }
     }
 
@@ -623,7 +773,9 @@ mod tests {
 
     use crate::krun::worker::lifecycle::Binding;
     use crate::krun::worker::lifecycle_wire::{self, ParentFrame, WorkerFrame};
-    use crate::virt::backend::lifecycle::{lifecycle_pair, LifecycleClient, LifecycleFault};
+    use crate::virt::backend::lifecycle::{
+        lifecycle_pair, LifecycleClient, LifecycleFault, LifecycleSlot,
+    };
     use crate::virt::lifecycle::*;
     use crate::virt::{BackendKind, VirtualMachine, VmConfig};
 
@@ -1316,15 +1468,30 @@ mod tests {
             Some(InventoryObservation::Unavailable { .. })
         ));
 
-        let vmdk = Machine::start(
-            r#"{"lifecycle": {"providers": [{"deviceId": 2, "configuredId": "lower", "blockBacking": "vmdk"}]}}"#,
+        // A read-only VMDK lower quiesces natively; a writable VMDK cannot.
+        let lower = Machine::start(
+            r#"{"lifecycle": {"providers": [{"deviceId": 2, "configuredId": "lower", "blockBacking": "vmdk", "readOnly": true}, {"deviceId": 2, "configuredId": "upper", "blockBacking": "raw"}]}}"#,
         )
         .await;
-        let Some(InventoryObservation::Observed { providers, .. }) = vmdk.control().await.inventory
+        let Some(InventoryObservation::Observed { providers, .. }) =
+            lower.control().await.inventory
         else {
             panic!("inventory must be observed");
         };
         assert_eq!(providers[0].block_backing, Some(BlockBacking::Vmdk));
+        assert_eq!(providers[0].block_read_only, Some(true));
+        assert_eq!(providers[1].block_read_only, Some(false));
+        paused(
+            &lower
+                .pause(Uuid::new_v4())
+                .await
+                .expect("read-only lower pauses"),
+        );
+
+        let vmdk = Machine::start(
+            r#"{"lifecycle": {"providers": [{"deviceId": 2, "configuredId": "lower", "blockBacking": "vmdk"}]}}"#,
+        )
+        .await;
         assert!(matches!(
             outcome(&vmdk.pause(Uuid::new_v4()).await.expect("report")),
             CommandOutcome::PauseFailed { failure } if failure.kind == NativeFailureKind::Unsupported
@@ -1369,7 +1536,7 @@ mod tests {
         crate::krun::worker::lifecycle::serve(
             child,
             bound,
-            ScenarioNative::new(scenario.lifecycle.clone()),
+            ScenarioNative::new(scenario.lifecycle.clone(), 1),
             Box::new(|_| {}),
         )
         .expect("serve");
@@ -1388,7 +1555,7 @@ mod tests {
         let waiting = {
             let client = client.clone();
             let request = request.clone();
-            tokio::spawn(async move { client.lifecycle(request).await })
+            tokio::spawn(async move { client.lifecycle(request, LifecycleRights::None).await })
         };
         // Wait for actual worker acceptance, then simulate an expired client
         // observation window without altering the native command's deadline.
@@ -1412,7 +1579,10 @@ mod tests {
             let state = crate::virt::backend::lifecycle::lock(&client.shared.state);
             state.keys.get(&key).expect("retained").wait_until
         };
-        let replay = client.lifecycle(request).await.expect("replay");
+        let replay = client
+            .lifecycle(request, LifecycleRights::None)
+            .await
+            .expect("replay");
         assert!(matches!(outcome(&replay), CommandOutcome::Paused { .. }));
         let state = crate::virt::backend::lifecycle::lock(&client.shared.state);
         assert_eq!(
@@ -1496,7 +1666,7 @@ mod tests {
         let waiting = {
             let client = client.clone();
             let request = request.clone();
-            tokio::spawn(async move { client.lifecycle(request).await })
+            tokio::spawn(async move { client.lifecycle(request, LifecycleRights::None).await })
         };
         // Read the command the worker would receive, then die without answering.
         let mut frames = lifecycle_wire::FrameBuffer::default();
@@ -1517,7 +1687,7 @@ mod tests {
             Err(LifecycleError::Unknown(LifecycleUncertainty::WorkerLost))
         ));
         assert!(matches!(
-            client.lifecycle(request).await,
+            client.lifecycle(request, LifecycleRights::None).await,
             Err(LifecycleError::Unknown(LifecycleUncertainty::WorkerLost))
         ));
     }
@@ -1533,7 +1703,7 @@ mod tests {
             crate::krun::worker::lifecycle::serve(
                 child,
                 binding(),
-                ScenarioNative::new(None),
+                ScenarioNative::new(None, 1),
                 Box::new(move |reason: &str| {
                     let _ = sender.send(reason.to_string());
                 }),
@@ -1574,5 +1744,1365 @@ mod tests {
                 .shutdown(std::net::Shutdown::Write)
                 .expect("monitor closes");
         });
+    }
+
+    // -------------------------------------------------------------- capture
+
+    /// Private staging with exclusively created, empty 0600 outputs and a pin.
+    /// The writers are the monitor's originals; it closes them after
+    /// PrepareCapture is admitted.
+    struct Staging {
+        /// execution, devices, ram, layout.
+        writers: Option<[std::fs::File; 4]>,
+        pin: std::fs::File,
+        outputs: CaptureOutputIdentities,
+        pin_identity: OutputIdentity,
+        directory: PathBuf,
+    }
+
+    fn create(path: &Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .expect("exclusive private output")
+    }
+
+    impl Staging {
+        fn new(machine: &Machine) -> Self {
+            Self::under(&machine.root)
+        }
+
+        fn under(root: &Path) -> Self {
+            let directory = root.join(format!("captures-{:x}", rand::random::<u64>()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .expect("staging");
+            let writers = [
+                "execution.state",
+                "devices.state",
+                "memory.ram",
+                "memory-layout.json",
+            ]
+            .map(|name| create(&directory.join(name)));
+            let pin = create(&directory.join("pin.lease"));
+            let id = |file: &std::fs::File| OutputIdentity::of(file).expect("identity");
+            Self {
+                outputs: CaptureOutputIdentities {
+                    execution: id(&writers[0]),
+                    devices: id(&writers[1]),
+                    ram: id(&writers[2]),
+                    layout: id(&writers[3]),
+                },
+                pin_identity: id(&pin),
+                writers: Some(writers),
+                pin,
+                directory,
+            }
+        }
+
+        fn identities(&self) -> (CaptureOutputIdentities, OutputIdentity) {
+            (self.outputs, self.pin_identity)
+        }
+
+        fn writer(&self, index: usize) -> &std::fs::File {
+            &self.writers.as_ref().expect("writers open")[index]
+        }
+
+        fn close_writers(&mut self) {
+            self.writers = None;
+        }
+
+        fn rights(&self) -> LifecycleRights {
+            let dup = |file: &std::fs::File| file.try_clone().expect("dup");
+            LifecycleRights::CaptureOutputs(CaptureOutputFiles {
+                execution: dup(self.writer(0)),
+                devices: dup(self.writer(1)),
+                ram: dup(self.writer(2)),
+                layout: dup(self.writer(3)),
+                pin: dup(&self.pin),
+            })
+        }
+
+        fn sealed(&self) -> LifecycleRights {
+            LifecycleRights::SealedMemory(SealedMemoryFiles {
+                ram: std::fs::File::open(self.directory.join("memory.ram")).expect("ram"),
+                layout: std::fs::File::open(self.directory.join("memory-layout.json"))
+                    .expect("layout"),
+            })
+        }
+    }
+
+    fn digests() -> CaptureDigests {
+        CaptureDigests {
+            silo_producer: Digest32([1; 32]),
+            profile: Digest32([2; 32]),
+            topology: Digest32([3; 32]),
+        }
+    }
+
+    fn prepare(
+        staging: &Staging,
+        operation: Uuid,
+        pause: CapturePauseSource,
+        resume_policy: CaptureResumePolicy,
+    ) -> LifecycleCommand {
+        let (outputs, pin) = staging.identities();
+        LifecycleCommand::PrepareCapture {
+            operation,
+            preparation: CapturePreparation {
+                outputs,
+                pin,
+                pause,
+                resume_policy,
+                binding: digests(),
+            },
+            timeout: BUDGET,
+        }
+    }
+
+    /// Open descriptors of this process that reference `identity`.
+    #[cfg(target_os = "linux")]
+    fn open_copies(identity: OutputIdentity) -> usize {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir("/proc/self/fd")
+            .expect("fd table")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+            .filter(|metadata| {
+                metadata.dev() == identity.device && metadata.ino() == identity.inode
+            })
+            .count()
+    }
+
+    impl Machine {
+        async fn rights(
+            &self,
+            request_id: Uuid,
+            command: LifecycleCommand,
+            rights: LifecycleRights,
+        ) -> Result<LifecycleResponse, LifecycleError> {
+            self.vm
+                .lifecycle_with_rights(self.request(request_id, command), rights)
+                .await
+        }
+
+        async fn stage(&self, operation: Uuid, command: LifecycleCommand) -> CommandOutcome {
+            outcome(&self.send(operation, command).await.expect("stage report"))
+        }
+
+        async fn capture(&self, operation: Uuid) -> CaptureObservation {
+            self.send(Uuid::new_v4(), LifecycleCommand::GetCapture { operation })
+                .await
+                .expect("capture observation")
+                .capture
+                .expect("capture facts")
+        }
+
+        /// Prepare, pause (acquired) and capture execution and full RAM.
+        async fn candidate(
+            &self,
+            staging: &Staging,
+            operation: Uuid,
+            policy: CaptureResumePolicy,
+        ) -> (NativePause, CommandOutcome) {
+            let prepared = self
+                .rights(
+                    operation,
+                    prepare(staging, operation, CapturePauseSource::Acquire, policy),
+                    staging.rights(),
+                )
+                .await
+                .expect("prepare");
+            assert!(matches!(
+                outcome(&prepared),
+                CommandOutcome::CapturePrepared { .. }
+            ));
+            let cut = match self
+                .stage(operation, pause(operation, PausePurpose::Capture))
+                .await
+            {
+                CommandOutcome::Paused { pause } => pause,
+                other => panic!("capture pause: {other:?}"),
+            };
+            assert_eq!(cut.owner, NativePauseOwner::Capture);
+            assert!(matches!(
+                self.stage(
+                    operation,
+                    LifecycleCommand::FlushCapture {
+                        operation,
+                        timeout: BUDGET
+                    }
+                )
+                .await,
+                CommandOutcome::CaptureFlushed { pause, ref attachments }
+                    if pause == cut && attachments.iter().any(|item| item.configured_id == "root")
+            ));
+            assert!(matches!(
+                self.stage(
+                    operation,
+                    LifecycleCommand::CaptureExecution {
+                        operation,
+                        timeout: BUDGET
+                    }
+                )
+                .await,
+                CommandOutcome::ExecutionCaptured { .. }
+            ));
+            let memory = self
+                .stage(
+                    operation,
+                    LifecycleCommand::CaptureMemory {
+                        operation,
+                        timeout: BUDGET,
+                    },
+                )
+                .await;
+            (cut, memory)
+        }
+    }
+
+    fn accept(staging: &Staging, operation: Uuid) -> LifecycleCommand {
+        let (outputs, _) = staging.identities();
+        LifecycleCommand::AcceptCapture {
+            operation,
+            ram: outputs.ram,
+            layout: outputs.layout,
+            stream: Digest32([9; 32]),
+            timeout: BUDGET,
+        }
+    }
+
+    fn continuation(operation: Uuid, continuation: CaptureContinuation) -> LifecycleCommand {
+        LifecycleCommand::ContinueCapture {
+            operation,
+            continuation,
+            timeout: BUDGET,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_capture_closes_every_writer_and_preserve_transfers_the_cut_to_user() {
+        let machine = Machine::start(r#"{"lifecycle": {}}"#).await;
+        let mut staging = Staging::new(&machine);
+        let (outputs, pin) = staging.identities();
+        let operation = Uuid::new_v4();
+        let prepared = machine
+            .rights(
+                operation,
+                prepare(
+                    &staging,
+                    operation,
+                    CapturePauseSource::Acquire,
+                    CaptureResumePolicy::Preserve,
+                ),
+                staging.rights(),
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(
+            outcome(&prepared),
+            CommandOutcome::CapturePrepared { outputs, pin }
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(outputs.ram),
+            2,
+            "the monitor's original and the worker's prepared copy"
+        );
+        // The monitor closes its writable transfer copies after admission.
+        staging.close_writers();
+        #[cfg(target_os = "linux")]
+        assert_eq!(open_copies(outputs.ram), 1, "only the worker holds RAM");
+
+        let cut = match machine
+            .stage(operation, pause(operation, PausePurpose::Capture))
+            .await
+        {
+            CommandOutcome::Paused { pause } => pause,
+            other => panic!("capture pause: {other:?}"),
+        };
+        assert_eq!(cut.owner, NativePauseOwner::Capture);
+        assert_eq!(
+            rejected(
+                machine
+                    .send(Uuid::new_v4(), resume(operation, cut.generation))
+                    .await
+            ),
+            LifecycleRejection::CaptureOwned,
+            "public Resume never consumes a capture-owned pause"
+        );
+        assert_eq!(
+            rejected(machine.send(Uuid::new_v4(), cancel(operation)).await),
+            LifecycleRejection::NotCancellable
+        );
+        assert!(matches!(
+            machine
+                .stage(
+                    operation,
+                    LifecycleCommand::FlushCapture {
+                        operation,
+                        timeout: BUDGET
+                    }
+                )
+                .await,
+            CommandOutcome::CaptureFlushed { pause, .. } if pause == cut
+        ));
+        let CommandOutcome::ExecutionCaptured {
+            binding,
+            execution,
+            devices,
+        } = machine
+            .stage(
+                operation,
+                LifecycleCommand::CaptureExecution {
+                    operation,
+                    timeout: BUDGET,
+                },
+            )
+            .await
+        else {
+            panic!("execution not captured");
+        };
+        assert_eq!(binding.capture, operation);
+        assert_eq!(binding.source_run, machine.run_id);
+        assert_eq!(binding.pause_generation, cut.generation);
+        assert_eq!(
+            binding.native_producer,
+            crate::virt::backend::mock::native::SCENARIO_PRODUCER
+        );
+        assert_eq!(execution.identity(), outputs.execution);
+        assert_eq!(devices.identity(), outputs.devices);
+        for (name, receipt) in [("execution.state", execution), ("devices.state", devices)] {
+            let length = std::fs::metadata(staging.directory.join(name))
+                .expect("output")
+                .len();
+            assert!(length > 0 && length == receipt.length, "{name}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(open_copies(outputs.execution), 0, "native closed execution");
+            assert_eq!(open_copies(outputs.ram), 1, "RAM still prepared");
+        }
+        let CommandOutcome::MemoryCaptured {
+            binding: ram_binding,
+            ram,
+            layout,
+            writers_closed,
+            ..
+        } = machine
+            .stage(
+                operation,
+                LifecycleCommand::CaptureMemory {
+                    operation,
+                    timeout: BUDGET,
+                },
+            )
+            .await
+        else {
+            panic!("memory not captured");
+        };
+        assert!(writers_closed);
+        assert_eq!(ram_binding, binding);
+        assert_eq!((ram.identity(), ram.length), (outputs.ram, 64 * 1024));
+        assert_eq!(layout.identity(), outputs.layout);
+        let layout_bytes =
+            std::fs::read(staging.directory.join("memory-layout.json")).expect("layout");
+        assert_eq!(layout_bytes.len() as u64, layout.length);
+        assert!(layout_bytes.starts_with(br#"{"architecture":"x86_64","kind":"ram-layout""#));
+        #[cfg(target_os = "linux")]
+        for identity in [
+            outputs.execution,
+            outputs.devices,
+            outputs.ram,
+            outputs.layout,
+        ] {
+            assert_eq!(open_copies(identity), 0, "no writer survives the candidate");
+        }
+        let observed = machine.capture(operation).await;
+        assert_eq!(observed.progress, CaptureProgress::CandidateComplete);
+        assert!(observed.outputs.all_closed());
+        assert_eq!(observed.pin, PinHolder::Capture);
+        assert_eq!(
+            observed.evidence,
+            CaptureNativeEvidence {
+                pause_completed: true,
+                flush_completed: true,
+                execution_sealed: true,
+                memory_sealed: true,
+            }
+        );
+        assert_eq!(observed.pause.cut, Some(cut));
+        assert_eq!(observed.pause.current, Some(cut));
+
+        // After the (monitor's) durable seal: accept the exact read-only pair.
+        let accepted = machine
+            .rights(operation, accept(&staging, operation), staging.sealed())
+            .await
+            .expect("accept");
+        assert!(matches!(
+            outcome(&accepted),
+            CommandOutcome::CaptureAccepted { .. }
+        ));
+        let preserved = machine
+            .stage(
+                operation,
+                continuation(operation, CaptureContinuation::Preserve),
+            )
+            .await;
+        let current = match preserved {
+            CommandOutcome::CapturePreserved { pause } => pause,
+            other => panic!("not preserved: {other:?}"),
+        };
+        assert_eq!(current.owner, NativePauseOwner::User);
+        assert_eq!(current.generation, cut.generation, "no extra generation");
+        assert_eq!(
+            machine.native().await,
+            NativeControl::Paused {
+                generation: cut.generation,
+                owner: NativePauseOwner::User
+            }
+        );
+        let observed = machine.capture(operation).await;
+        assert_eq!(observed.pause.cut, Some(cut), "historical cut is immutable");
+        assert_eq!(observed.pause.current, Some(current));
+        let released = machine
+            .stage(
+                Uuid::new_v4(),
+                LifecycleCommand::ReleaseCapture {
+                    operation,
+                    timeout: BUDGET,
+                },
+            )
+            .await;
+        assert_eq!(
+            released,
+            CommandOutcome::CaptureReleased {
+                baseline_retained: true
+            }
+        );
+        assert_eq!(machine.capture(operation).await.pin, PinHolder::Baseline);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(pin),
+            2,
+            "the source-baseline pin survives release"
+        );
+        // The preserved pause is ordinary user authority of the capture operation.
+        assert!(matches!(
+            outcome(
+                &machine
+                    .send(Uuid::new_v4(), resume(operation, current.generation))
+                    .await
+                    .expect("resume")
+            ),
+            CommandOutcome::Resumed { .. }
+        ));
+        assert_eq!(machine.native().await, NativeControl::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_policy_releases_the_cut_only_after_the_candidate_resolves() {
+        let machine = Machine::start(r#"{"lifecycle": {}}"#).await;
+        let staging = Staging::new(&machine);
+        let operation = Uuid::new_v4();
+        let (_, memory) = machine
+            .candidate(&staging, operation, CaptureResumePolicy::ResumeIfAcquired)
+            .await;
+        assert!(matches!(memory, CommandOutcome::MemoryCaptured { .. }));
+        assert_eq!(
+            rejected(
+                machine
+                    .send(
+                        operation,
+                        continuation(operation, CaptureContinuation::Resume)
+                    )
+                    .await
+            ),
+            LifecycleRejection::CaptureUnresolved
+        );
+        // Cancel before seal: abandon under the cancel request's own identity.
+        assert_eq!(
+            machine
+                .stage(
+                    Uuid::new_v4(),
+                    LifecycleCommand::AbandonCapture {
+                        operation,
+                        timeout: BUDGET
+                    }
+                )
+                .await,
+            CommandOutcome::CaptureAbandoned
+        );
+        assert_eq!(
+            rejected(
+                machine
+                    .rights(operation, accept(&staging, operation), staging.sealed())
+                    .await
+            ),
+            LifecycleRejection::CaptureStage,
+            "an abandoned candidate is never accepted"
+        );
+        assert!(matches!(
+            machine
+                .stage(
+                    Uuid::new_v4(),
+                    continuation(operation, CaptureContinuation::Resume)
+                )
+                .await,
+            CommandOutcome::Resumed { clock } if clock.flags == 3
+        ));
+        assert_eq!(machine.native().await, NativeControl::Running);
+        assert_eq!(
+            machine
+                .stage(
+                    Uuid::new_v4(),
+                    LifecycleCommand::ReleaseCapture {
+                        operation,
+                        timeout: BUDGET
+                    }
+                )
+                .await,
+            CommandOutcome::CaptureReleased {
+                baseline_retained: false
+            }
+        );
+        let observed = machine.capture(operation).await;
+        assert_eq!(observed.progress, CaptureProgress::Released);
+        assert_eq!(observed.pin, PinHolder::Released);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(staging.identities().1),
+            1,
+            "worker dropped the pin"
+        );
+        // A new user pause is admissible again once the capture resolved.
+        paused(&machine.pause(Uuid::new_v4()).await.expect("pause"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_ram_write_keeps_writers_native_until_abandonment() {
+        let machine =
+            Machine::start(r#"{"lifecycle": {"capture": {"memory": [{"result": "fail"}]}}}"#).await;
+        let staging = Staging::new(&machine);
+        let (outputs, _) = staging.identities();
+        let operation = Uuid::new_v4();
+        let (_, memory) = machine
+            .candidate(&staging, operation, CaptureResumePolicy::ResumeIfAcquired)
+            .await;
+        assert!(matches!(
+            memory,
+            CommandOutcome::CaptureFailed {
+                stage: CaptureStage::Memory,
+                ..
+            }
+        ));
+        let observed = machine.capture(operation).await;
+        assert_eq!(observed.outputs.ram, OutputHolder::Native);
+        assert_eq!(observed.outputs.layout, OutputHolder::Native);
+        assert!(!observed.evidence.memory_sealed);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(outputs.ram),
+            2,
+            "the native failure still owns the RAM writer (plus the test's original)"
+        );
+        assert_eq!(
+            machine
+                .stage(
+                    Uuid::new_v4(),
+                    LifecycleCommand::AbandonCapture {
+                        operation,
+                        timeout: BUDGET
+                    }
+                )
+                .await,
+            CommandOutcome::CaptureAbandoned
+        );
+        assert!(machine.capture(operation).await.outputs.all_closed());
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(outputs.ram),
+            1,
+            "only the test's original remains"
+        );
+        let _ = outputs;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn borrowed_user_pause_is_never_resumed_or_replaced_by_its_capture() {
+        let machine = Machine::start(r#"{"lifecycle": {}}"#).await;
+        let user = Uuid::new_v4();
+        let generation = paused(&machine.pause(user).await.expect("pause"));
+        let staging = Staging::new(&machine);
+        let operation = Uuid::new_v4();
+        let borrow = CapturePauseSource::Borrow {
+            operation: user,
+            generation,
+        };
+        assert_eq!(
+            rejected(
+                machine
+                    .rights(
+                        operation,
+                        prepare(
+                            &staging,
+                            operation,
+                            borrow,
+                            CaptureResumePolicy::ResumeIfAcquired
+                        ),
+                        staging.rights()
+                    )
+                    .await
+            ),
+            LifecycleRejection::InvalidRequest(InvalidRequest::CapturePolicy)
+        );
+        let operation = Uuid::new_v4();
+        machine
+            .rights(
+                operation,
+                prepare(&staging, operation, borrow, CaptureResumePolicy::Preserve),
+                staging.rights(),
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(
+            rejected(machine.send(Uuid::new_v4(), resume(user, generation)).await),
+            LifecycleRejection::CaptureActive,
+            "the borrowed pause is not resumable while its capture runs"
+        );
+        for command in [
+            LifecycleCommand::FlushCapture {
+                operation,
+                timeout: BUDGET,
+            },
+            LifecycleCommand::CaptureExecution {
+                operation,
+                timeout: BUDGET,
+            },
+            LifecycleCommand::CaptureMemory {
+                operation,
+                timeout: BUDGET,
+            },
+        ] {
+            assert!(!matches!(
+                machine.stage(operation, command).await,
+                CommandOutcome::CaptureFailed { .. }
+            ));
+        }
+        machine
+            .rights(operation, accept(&staging, operation), staging.sealed())
+            .await
+            .expect("accept");
+        assert_eq!(
+            rejected(
+                machine
+                    .send(
+                        Uuid::new_v4(),
+                        continuation(operation, CaptureContinuation::Resume)
+                    )
+                    .await
+            ),
+            LifecycleRejection::BorrowedPause
+        );
+        assert_eq!(
+            machine
+                .stage(
+                    Uuid::new_v4(),
+                    continuation(operation, CaptureContinuation::Preserve)
+                )
+                .await,
+            CommandOutcome::CapturePreserved {
+                pause: NativePause {
+                    generation,
+                    owner: NativePauseOwner::User
+                }
+            }
+        );
+        assert_eq!(
+            machine.native().await,
+            NativeControl::Paused {
+                generation,
+                owner: NativePauseOwner::User
+            },
+            "the original user token is untouched"
+        );
+        assert!(matches!(
+            outcome(
+                &machine
+                    .send(Uuid::new_v4(), resume(user, generation))
+                    .await
+                    .expect("resume")
+            ),
+            CommandOutcome::Resumed { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_refuses_unsafe_or_mismatched_descriptors_without_effect() {
+        use std::os::unix::fs::PermissionsExt;
+        let machine = Machine::start(r#"{"lifecycle": {}}"#).await;
+        let refuse = |problem: OutputProblem| LifecycleRejection::CaptureOutputs(problem);
+
+        let staging = Staging::new(&machine);
+        std::io::Write::write_all(&mut staging.writer(0), b"stale").expect("dirty");
+        let operation = Uuid::new_v4();
+        let command = prepare(
+            &staging,
+            operation,
+            CapturePauseSource::Acquire,
+            CaptureResumePolicy::Preserve,
+        );
+        assert_eq!(
+            rejected(machine.rights(operation, command, staging.rights()).await),
+            refuse(OutputProblem {
+                role: OutputRole::Execution,
+                problem: OutputDefect::NotEmpty
+            })
+        );
+
+        let staging = Staging::new(&machine);
+        std::fs::set_permissions(
+            staging.directory.join("memory.ram"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod");
+        let operation = Uuid::new_v4();
+        let command = prepare(
+            &staging,
+            operation,
+            CapturePauseSource::Acquire,
+            CaptureResumePolicy::Preserve,
+        );
+        assert_eq!(
+            rejected(machine.rights(operation, command, staging.rights()).await),
+            refuse(OutputProblem {
+                role: OutputRole::Ram,
+                problem: OutputDefect::Mode
+            })
+        );
+
+        let staging = Staging::new(&machine);
+        std::fs::hard_link(
+            staging.directory.join("memory-layout.json"),
+            staging.directory.join("alias"),
+        )
+        .expect("link");
+        let operation = Uuid::new_v4();
+        let command = prepare(
+            &staging,
+            operation,
+            CapturePauseSource::Acquire,
+            CaptureResumePolicy::Preserve,
+        );
+        assert_eq!(
+            rejected(machine.rights(operation, command, staging.rights()).await),
+            refuse(OutputProblem {
+                role: OutputRole::Layout,
+                problem: OutputDefect::Links
+            })
+        );
+
+        // The same inode in two roles.
+        let staging = Staging::new(&machine);
+        let operation = Uuid::new_v4();
+        let (mut outputs, pin) = staging.identities();
+        outputs.layout = outputs.ram;
+        let rights = LifecycleRights::CaptureOutputs(CaptureOutputFiles {
+            execution: staging.writer(0).try_clone().expect("dup"),
+            devices: staging.writer(1).try_clone().expect("dup"),
+            ram: staging.writer(2).try_clone().expect("dup"),
+            layout: staging.writer(2).try_clone().expect("dup"),
+            pin: staging.pin.try_clone().expect("dup"),
+        });
+        let command = LifecycleCommand::PrepareCapture {
+            operation,
+            preparation: CapturePreparation {
+                outputs,
+                pin,
+                pause: CapturePauseSource::Acquire,
+                resume_policy: CaptureResumePolicy::Preserve,
+                binding: digests(),
+            },
+            timeout: BUDGET,
+        };
+        assert_eq!(
+            rejected(machine.rights(operation, command, rights).await),
+            refuse(OutputProblem {
+                role: OutputRole::Layout,
+                problem: OutputDefect::Alias
+            })
+        );
+
+        // Declared identities differing from the actual descriptors, and a
+        // rights-bearing command without rights, never leave the client.
+        let staging = Staging::new(&machine);
+        let other = Staging::new(&machine);
+        let operation = Uuid::new_v4();
+        assert_eq!(
+            rejected(
+                machine
+                    .rights(
+                        operation,
+                        prepare(
+                            &staging,
+                            operation,
+                            CapturePauseSource::Acquire,
+                            CaptureResumePolicy::Preserve
+                        ),
+                        other.rights()
+                    )
+                    .await
+            ),
+            LifecycleRejection::InvalidRequest(InvalidRequest::CaptureRights)
+        );
+        assert_eq!(
+            rejected(
+                machine
+                    .send(
+                        operation,
+                        prepare(
+                            &staging,
+                            operation,
+                            CapturePauseSource::Acquire,
+                            CaptureResumePolicy::Preserve
+                        )
+                    )
+                    .await
+            ),
+            LifecycleRejection::InvalidRequest(InvalidRequest::CaptureRights)
+        );
+        assert_eq!(
+            rejected(
+                machine
+                    .send(
+                        Uuid::new_v4(),
+                        LifecycleCommand::FlushCapture {
+                            operation,
+                            timeout: BUDGET
+                        }
+                    )
+                    .await
+            ),
+            LifecycleRejection::InvalidRequest(InvalidRequest::CaptureRequestIdentity)
+        );
+        assert_eq!(machine.native().await, NativeControl::Running);
+        // Nothing was admitted: the same staging still prepares cleanly.
+        let prepared = machine
+            .rights(
+                operation,
+                prepare(
+                    &staging,
+                    operation,
+                    CapturePauseSource::Acquire,
+                    CaptureResumePolicy::Preserve,
+                ),
+                staging.rights(),
+            )
+            .await
+            .expect("prepare");
+        assert!(matches!(
+            outcome(&prepared),
+            CommandOutcome::CapturePrepared { .. }
+        ));
+        assert_eq!(
+            rejected(
+                machine
+                    .rights(
+                        Uuid::new_v4(),
+                        {
+                            let next = Uuid::new_v4();
+                            prepare(
+                                &other,
+                                next,
+                                CapturePauseSource::Acquire,
+                                CaptureResumePolicy::Preserve,
+                            )
+                        },
+                        other.rights()
+                    )
+                    .await
+            ),
+            LifecycleRejection::InvalidRequest(InvalidRequest::CaptureRequestIdentity)
+        );
+        let next = Uuid::new_v4();
+        assert_eq!(
+            rejected(
+                machine
+                    .rights(
+                        next,
+                        prepare(
+                            &other,
+                            next,
+                            CapturePauseSource::Acquire,
+                            CaptureResumePolicy::Preserve
+                        ),
+                        other.rights()
+                    )
+                    .await
+            ),
+            LifecycleRejection::CaptureActive,
+            "one unresolved capture per run"
+        );
+        assert_eq!(
+            rejected(machine.pause(Uuid::new_v4()).await),
+            LifecycleRejection::CaptureActive,
+            "no user pause while a capture is unresolved"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replayed_rights_join_the_retained_command_and_conflicts_are_refused() {
+        let machine = Machine::start(r#"{"lifecycle": {}}"#).await;
+        let staging = Staging::new(&machine);
+        let operation = Uuid::new_v4();
+        let command = prepare(
+            &staging,
+            operation,
+            CapturePauseSource::Acquire,
+            CaptureResumePolicy::ResumeIfAcquired,
+        );
+        let first = machine
+            .rights(operation, command.clone(), staging.rights())
+            .await
+            .expect("prepare");
+        // A replay with fresh duplicates joins; one without rights joins too.
+        let replay = machine
+            .rights(operation, command.clone(), staging.rights())
+            .await
+            .expect("replay");
+        assert_eq!(replay.command, first.command);
+        let bare = machine.send(operation, command).await.expect("bare replay");
+        assert_eq!(bare.command, first.command);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(staging.identities().0.ram),
+            2,
+            "replayed duplicates were closed, not retained"
+        );
+        let other = Staging::new(&machine);
+        assert_eq!(
+            rejected(
+                machine
+                    .rights(
+                        operation,
+                        prepare(
+                            &other,
+                            operation,
+                            CapturePauseSource::Acquire,
+                            CaptureResumePolicy::ResumeIfAcquired
+                        ),
+                        other.rights()
+                    )
+                    .await
+            ),
+            LifecycleRejection::RequestConflict
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_capture_pause_rolls_back_and_leaves_a_prepared_only_capture() {
+        let machine =
+            Machine::start(r#"{"lifecycle": {"nativePause": [{"result": "hang"}]}}"#).await;
+        let staging = Staging::new(&machine);
+        let operation = Uuid::new_v4();
+        machine
+            .rights(
+                operation,
+                prepare(
+                    &staging,
+                    operation,
+                    CapturePauseSource::Acquire,
+                    CaptureResumePolicy::Preserve,
+                ),
+                staging.rights(),
+            )
+            .await
+            .expect("prepare");
+        let pending = {
+            let vm = machine.vm.clone();
+            let request = machine.request(operation, pause(operation, PausePurpose::Capture));
+            tokio::spawn(async move { vm.lifecycle(request).await })
+        };
+        machine
+            .until(|control| matches!(control, NativeControl::Pausing { failed: false, .. }))
+            .await;
+        assert_eq!(
+            outcome(
+                &machine
+                    .send(Uuid::new_v4(), cancel(operation))
+                    .await
+                    .expect("cancel")
+            ),
+            CommandOutcome::CancelSettled {
+                settlement: CancelSettlement::RolledBack
+            }
+        );
+        assert_eq!(
+            outcome(&pending.await.expect("join").expect("pause report")),
+            CommandOutcome::PauseWithdrawn
+        );
+        let observed = machine.capture(operation).await;
+        assert_eq!(observed.progress, CaptureProgress::Prepared);
+        assert!(!observed.evidence.pause_completed);
+        assert_eq!(
+            machine
+                .stage(
+                    Uuid::new_v4(),
+                    LifecycleCommand::AbandonCapture {
+                        operation,
+                        timeout: BUDGET
+                    }
+                )
+                .await,
+            CommandOutcome::CaptureAbandoned
+        );
+        assert!(machine.capture(operation).await.outputs.all_closed());
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(staging.identities().0.ram),
+            1,
+            "prepared copy closed"
+        );
+        assert_eq!(
+            rejected(
+                machine
+                    .send(
+                        Uuid::new_v4(),
+                        continuation(operation, CaptureContinuation::Preserve)
+                    )
+                    .await
+            ),
+            LifecycleRejection::NoCurrentPause,
+            "no token exists to preserve"
+        );
+        assert_eq!(machine.native().await, NativeControl::Running);
+    }
+
+    // ------------------------------------------------------ stop and replays
+
+    /// A private scratch root for tests without a machine.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch() -> Scratch {
+        let root = Path::new("/tmp").join(format!("lc-{:x}", rand::random::<u64>()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        Scratch(root)
+    }
+
+    /// Read one parent frame as the worker end. A plain read never installs
+    /// descriptors riding the frame: the kernel discards them.
+    fn read_command(child: &mut std::os::unix::net::UnixStream) -> ParentFrame {
+        let mut frames = lifecycle_wire::FrameBuffer::default();
+        let mut chunk = [0_u8; 512];
+        loop {
+            let count = std::io::Read::read(child, &mut chunk).expect("read");
+            assert_ne!(count, 0, "the client closed the endpoint");
+            frames.extend(&chunk[..count]).expect("extend");
+            if let Some(frame) = frames.next::<ParentFrame>().expect("decode") {
+                return frame;
+            }
+        }
+    }
+
+    /// Poll a synchronous fact for a bounded time.
+    async fn eventually(what: &str, ready: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !ready() {
+            assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_fence_refuses_new_mutators_but_keeps_admitted_work_joins_and_observation() {
+        let machine = Machine::start(
+            r#"{"lifecycle": {"nativePause": [{"delayMs": 300, "result": "complete"}]}}"#,
+        )
+        .await;
+        let operation = Uuid::new_v4();
+        // Admitted before the fence: its native work and report continue.
+        let pending = {
+            let vm = machine.vm.clone();
+            let request = machine.request(operation, pause(operation, PausePurpose::Initial));
+            tokio::spawn(async move { vm.lifecycle(request).await })
+        };
+        machine
+            .until(|control| matches!(control, NativeControl::Pausing { .. }))
+            .await;
+        // The shutdown path holds here: the fence is closed, the worker lives.
+        machine.vm.close_lifecycle_admission();
+        let original = pending
+            .await
+            .expect("join")
+            .expect("pause admitted before the fence");
+        let generation = paused(&original);
+        let replay = machine.pause(operation).await.expect("replay joins");
+        assert_eq!(replay.command, original.command);
+
+        // No new mutator reaches the worker: neither a resume of the paused
+        // source nor a rights-bearing capture preparation.
+        assert_eq!(
+            rejected(
+                machine
+                    .send(Uuid::new_v4(), resume(operation, generation))
+                    .await
+            ),
+            LifecycleRejection::Stopping
+        );
+        let staging = Staging::new(&machine);
+        let capture = Uuid::new_v4();
+        assert_eq!(
+            rejected(
+                machine
+                    .rights(
+                        capture,
+                        prepare(
+                            &staging,
+                            capture,
+                            CapturePauseSource::Acquire,
+                            CaptureResumePolicy::ResumeIfAcquired
+                        ),
+                        staging.rights()
+                    )
+                    .await
+            ),
+            LifecycleRejection::Stopping
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_copies(staging.identities().0.ram),
+            1,
+            "refused duplicates are closed"
+        );
+        assert_eq!(
+            rejected(
+                machine
+                    .send(
+                        Uuid::new_v4(),
+                        LifecycleCommand::GetCapture { operation: capture }
+                    )
+                    .await
+            ),
+            LifecycleRejection::UnknownCapture,
+            "the refused preparation never reached the worker"
+        );
+        // Observation stays available and the source was never resumed.
+        assert_eq!(
+            machine.native().await,
+            NativeControl::Paused {
+                generation,
+                owner: NativePauseOwner::User
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_installed_after_the_stop_fence_admits_no_mutator() {
+        let slot = LifecycleSlot::default();
+        slot.close_admission();
+        let (parent, child) = lifecycle_pair().expect("pair");
+        let bound = binding();
+        let mut child = std::os::unix::net::UnixStream::from(child);
+        let (client, _faults) = LifecycleClient::start(parent, bound).expect("client");
+        slot.install(client);
+        assert!(slot.closed());
+        child.write_all(&hello(bound)).expect("hello");
+        let client = slot.client().expect("installed");
+        let request = |command| LifecycleRequest {
+            machine_id: bound.machine_id,
+            run_id: bound.run_id,
+            request_id: Uuid::new_v4(),
+            command,
+        };
+        let operation = Uuid::new_v4();
+        let mut initial = request(pause(operation, PausePurpose::Initial));
+        initial.request_id = operation;
+        assert_eq!(
+            rejected(client.lifecycle(initial, LifecycleRights::None).await),
+            LifecycleRejection::Stopping
+        );
+        // Observation is still sent, and it is the first frame the worker
+        // sees: the refused mutator never took a sequence or a frame.
+        let observing = {
+            let client = client.clone();
+            let observe = request(LifecycleCommand::GetControl { target: None });
+            tokio::spawn(async move { client.lifecycle(observe, LifecycleRights::None).await })
+        };
+        let frame = tokio::task::spawn_blocking(move || read_command(&mut child))
+            .await
+            .expect("reader");
+        let ParentFrame::Command {
+            sequence, command, ..
+        } = frame;
+        assert_eq!(sequence.get(), 1);
+        assert_eq!(command, LifecycleCommand::GetControl { target: None });
+        observing.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_observation_after_an_unreported_preparation_sees_its_effect() {
+        use crate::virt::backend::mock::native::ScenarioNative;
+        let scratch = scratch();
+        let staging = Staging::under(&scratch.0);
+        let (parent, child) = lifecycle_pair().expect("pair");
+        let bound = binding();
+        let scenario = Scenario::from_json(r#"{"lifecycle":{}}"#).expect("scenario");
+        crate::krun::worker::lifecycle::serve(
+            child,
+            bound,
+            ScenarioNative::new(scenario.lifecycle.clone(), 1),
+            Box::new(|_| {}),
+        )
+        .expect("serve");
+        let (client, _faults) = LifecycleClient::start(parent, bound).expect("client");
+        let request = |request_id, command| LifecycleRequest {
+            machine_id: bound.machine_id,
+            run_id: bound.run_id,
+            request_id,
+            command,
+        };
+        let observe =
+            |operation| request(Uuid::new_v4(), LifecycleCommand::GetCapture { operation });
+        // Absence is definitive only for a capture the worker never admitted.
+        assert_eq!(
+            rejected(
+                client
+                    .lifecycle(observe(Uuid::new_v4()), LifecycleRights::None)
+                    .await
+            ),
+            LifecycleRejection::UnknownCapture
+        );
+        let operation = Uuid::new_v4();
+        let preparing = {
+            let client = client.clone();
+            let command = request(
+                operation,
+                prepare(
+                    &staging,
+                    operation,
+                    CapturePauseSource::Acquire,
+                    CaptureResumePolicy::ResumeIfAcquired,
+                ),
+            );
+            let rights = staging.rights();
+            tokio::spawn(async move { client.lifecycle(command, rights).await })
+        };
+        // Observe as soon as the preparation is enqueued, before its report:
+        // the ordered stream makes the worker admit it first, so a monitor
+        // reconciling an unanswered preparation can never see it as absent.
+        eventually("the preparation is enqueued", || {
+            crate::virt::backend::lifecycle::lock(&client.shared.state).last_sequence == 2
+        })
+        .await;
+        let observed = client
+            .lifecycle(observe(operation), LifecycleRights::None)
+            .await
+            .expect("observation")
+            .capture
+            .expect("capture facts");
+        assert_eq!(observed.progress, CaptureProgress::Prepared);
+        assert!(matches!(
+            outcome(&preparing.await.expect("join").expect("prepared")),
+            CommandOutcome::CapturePrepared { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joined_rights_replay_closes_its_duplicates_before_awaiting_the_report() {
+        let scratch = scratch();
+        let staging = Staging::under(&scratch.0);
+        let ram = staging.identities().0.ram;
+        let (parent, child) = lifecycle_pair().expect("pair");
+        let bound = binding();
+        let mut child = std::os::unix::net::UnixStream::from(child);
+        let (client, _faults) = LifecycleClient::start(parent, bound).expect("client");
+        child.write_all(&hello(bound)).expect("hello");
+        let operation = Uuid::new_v4();
+        let request = LifecycleRequest {
+            machine_id: bound.machine_id,
+            run_id: bound.run_id,
+            request_id: operation,
+            command: prepare(
+                &staging,
+                operation,
+                CapturePauseSource::Acquire,
+                CaptureResumePolicy::ResumeIfAcquired,
+            ),
+        };
+        let send = |rights: LifecycleRights| {
+            let client = client.clone();
+            let request = request.clone();
+            tokio::spawn(async move { client.lifecycle(request, rights).await })
+        };
+        let original = send(staging.rights());
+        // The worker end receives the frame; the sent duplicates close.
+        let (mut child, frame) = tokio::task::spawn_blocking(move || {
+            let frame = read_command(&mut child);
+            (child, frame)
+        })
+        .await
+        .expect("reader");
+        let ParentFrame::Command { sequence, .. } = frame;
+        eventually("the sent duplicates are closed", || open_copies(ram) == 1).await;
+
+        // The worker has not reported: an identity-checked replay joins the
+        // retained command and must not hold its duplicates while it waits.
+        let replay = send(staging.rights());
+        eventually("the joined replay closed its duplicates", || {
+            open_copies(ram) == 1
+        })
+        .await;
+        assert!(
+            !original.is_finished() && !replay.is_finished(),
+            "both callers still await the report"
+        );
+
+        let (outputs, pin) = staging.identities();
+        let report = lifecycle_wire::encode(&WorkerFrame::Report {
+            report: CommandReport {
+                key: CommandKey {
+                    request_id: operation,
+                    kind: CommandKind::PrepareCapture,
+                },
+                sequence,
+                operation,
+                state: CommandState::Completed {
+                    outcome: CommandOutcome::CapturePrepared { outputs, pin },
+                },
+            },
+            control: ControlObservation::Observed {
+                control: NativeControl::Running,
+            },
+        })
+        .expect("report");
+        child.write_all(&report).expect("report");
+        let original = original.await.expect("join").expect("prepared");
+        let replay = replay.await.expect("join").expect("replayed");
+        assert!(matches!(
+            outcome(&original),
+            CommandOutcome::CapturePrepared { .. }
+        ));
+        assert_eq!(replay.command, original.command);
+        assert_eq!(open_copies(ram), 1);
+        assert_eq!(
+            crate::virt::backend::lifecycle::lock(&client.shared.state).last_sequence,
+            1,
+            "the replay never resent"
+        );
     }
 }

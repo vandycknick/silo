@@ -16,7 +16,7 @@ use vm_spec::live::{
 };
 
 pub(crate) const MAX_SCENARIO_BYTES: usize = 1024 * 1024;
-const DELIVERED: &[LiveOperation] = &[LiveOperation::Pause];
+const DELIVERED: &[LiveOperation] = &[LiveOperation::Pause, LiveOperation::Capture];
 
 #[derive(Debug, Parser)]
 #[command(name = "silo-vmm capabilities")]
@@ -403,6 +403,18 @@ fn compiled_build() -> BuildIdentity<'static> {
     }
 }
 
+/// The Silo producer bound into every captured execution state: this
+/// compiled monitor's qualification identity (libkrun revision, build
+/// inputs, native build facts), so restore admits only the exact producer.
+pub(crate) fn capture_producer() -> eyre::Result<[u8; 32]> {
+    let identity = compiled_build().qualification_identity()?;
+    let mut hash = Sha256::new();
+    hash.update(b"silo-capture-producer-v1\0");
+    hash.update((identity.len() as u64).to_be_bytes());
+    hash.update(identity.as_bytes());
+    Ok(hash.finalize().into())
+}
+
 struct Qualification<'a> {
     binding: &'a str,
     lane: LiveLane,
@@ -412,10 +424,10 @@ struct Qualification<'a> {
 
 // Supervisor-verified real CLI/guest pause, ClockOnly resume and paused stop.
 const QUALIFICATIONS: &[Qualification<'static>] = &[Qualification {
-    binding: "v2:native=0fa0aee416ebb566c0e3cfbc587d54af860c3928a8c268c97404627968a6f3d0:binding=3c986fc2e8e8dd765cce37c76c3a407812b98839389e0752da0370623abcb8a7:eligible=true",
+    binding: "v2:native=cee352b50faefbb8c823c2b0a54dd5dd8019760f4b9475227f9a593c21bf3a80:binding=0fdb83bfc5241b5adecce22fac28eb1be34efd3a2a4e055e547844f2b8aefdf9:eligible=true",
     lane: LiveLane::KvmX86_64,
     operations: &[LiveOperation::Pause],
-    evidence: "phase-13/pause-corrected-guest.xml; worker, coordinator and durable-manager gates",
+    evidence: "phase-14/pause-requalification.xml; worker, coordinator and durable-manager gates",
 }];
 
 fn qualification_matches(

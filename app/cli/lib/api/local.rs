@@ -127,6 +127,25 @@ impl LocalVmService {
         Ok(machine.inspect().await?)
     }
 
+    /// New capture requires exact Capture capability admission from read-only
+    /// evidence before writable initialization; libvm repeats it under locks.
+    pub(crate) async fn snapshot_live(
+        &mut self,
+        reference: &str,
+        mut options: libvm::LiveSnapshotOptions,
+    ) -> eyre::Result<libvm::LiveSnapshot> {
+        options.name = options
+            .name
+            .map(|name| silo_vm_control::stopped::alias(&name))
+            .transpose()?;
+        self.require_machine_live(reference, vm_spec::live::LiveOperation::Capture)
+            .await?;
+        let reference = MachineRef::parse(reference)?;
+        let observation = self.observe_machine_live(&reference).await?;
+        let machine = self.runtime().await?.get_machine(&reference).await?;
+        Ok(machine.snapshot_live(&observation, options).await?)
+    }
+
     pub(crate) async fn require_machine_live(
         &self,
         reference: &str,

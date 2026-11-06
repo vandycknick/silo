@@ -198,6 +198,8 @@ pub struct MachineData {
     pub prospective_live: Option<vm_spec::live::LiveHostReport>,
     /// Current exact-monitor authority, separate from historical Pause success.
     pub lifecycle: Option<crate::MachineLifecycle>,
+    /// Retained, unreleased live captures of this machine (any run).
+    pub captures: Vec<crate::MachineCapture>,
     /// Latest guest boot report observed by silo-vmm, when the guest registered one.
     pub boot_report: Option<MachineBootReport>,
     /// Latest guest provisioning report observed by silo-vmm, when the guest registered one.
@@ -243,6 +245,7 @@ impl MachineData {
             live: None,
             prospective_live: None,
             lifecycle: None,
+            captures: Vec::new(),
             boot_report: None,
             provision_report: None,
             started_at: None,
@@ -304,6 +307,7 @@ impl MachineData {
             live: None,
             prospective_live: None,
             lifecycle: None,
+            captures: Vec::new(),
             boot_report,
             provision_report,
             started_at: state.started_at,

@@ -1,5 +1,5 @@
-//! Current stopped-storage schema and RFC 8785 identity. Configuration is not a
-//! MachineConfig serialization: host identity and paths are projected by capture.
+//! Closed snapshot content schema and RFC 8785 identity. Capture provenance is
+//! stored separately, never salted into execution or storage content identity.
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -22,10 +22,36 @@ use crate::LibVmError;
 pub enum SnapshotKind {
     Snapshot,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "captureKind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum SnapshotCaptureKind {
-    StoppedStorage,
+    StoppedStorage { stop_outcome: StorageStopOutcome },
+    LiveExecution { execution: Box<SnapshotExecution> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotExecution {
+    pub memory: SnapshotStream,
+    pub layout: ObjectDigest,
+    pub execution: ObjectDigest,
+    pub devices: ObjectDigest,
+    pub compatibility_profile: SnapshotCompatibilityProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotCompatibilityProfile {
+    pub native_producer: String,
+    pub silo_producer: ObjectDigest,
+    pub profile: ObjectDigest,
+    pub topology: ObjectDigest,
+    pub ram_layout: ObjectDigest,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,14 +64,36 @@ pub enum SnapshotPurpose {
 pub struct SnapshotStream {
     pub stream: StreamId,
     pub map: ObjectDigest,
+    pub map_pages: Vec<ObjectDigest>,
     pub length: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotRoot {
+    pub profile: SnapshotRootProfile,
     pub stream: SnapshotStream,
     pub geometry: DiskGeometry,
     pub layout: RawLayout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum SnapshotRootProfile {
+    OpaqueRaw,
+    LinuxOverlay {
+        lower: SnapshotStream,
+        lower_geometry: DiskGeometry,
+        lower_filesystem_uuid: uuid::Uuid,
+        upper_uuid: uuid::Uuid,
+        ext4_profile: crate::store::models::storage::Ext4Profile,
+        overlay_profile: crate::store::models::storage::OverlayProfile,
+        temporary_directory: crate::store::models::storage::TemporaryDirectoryPolicy,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -63,11 +111,12 @@ pub struct SnapshotPlatformFile {
     pub object: ObjectDigest,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StoppedSnapshotRecord {
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRecord {
     pub schema: u32,
     pub kind: SnapshotKind,
-    pub capture_kind: SnapshotCaptureKind,
+    #[serde(flatten)]
+    pub capture: SnapshotCaptureKind,
     pub purpose: SnapshotPurpose,
     pub root: SnapshotRoot,
     pub disks: Vec<SnapshotDisk>,
@@ -75,17 +124,16 @@ pub struct StoppedSnapshotRecord {
     pub configuration: SnapshotConfiguration,
     pub boot: BootProfile,
     pub external_requirements: Vec<ExternalResourceRequirement>,
-    pub stop_outcome: StorageStopOutcome,
 }
 
 pub(crate) fn invalid(message: impl fmt::Display) -> LibVmError {
     LibVmError::InvalidStorageRecord {
-        record: "stopped-snapshot",
+        record: "snapshot",
         message: message.to_string(),
     }
 }
 
-impl StoppedSnapshotRecord {
+impl SnapshotRecord {
     pub fn validate(&self) -> Result<(), LibVmError> {
         self.validate_semantics()?;
         validate_numbers(&serde_json::to_value(self).map_err(invalid)?)
@@ -96,9 +144,68 @@ impl StoppedSnapshotRecord {
             return Err(invalid("unsupported snapshot schema"));
         }
         Resource::IncludedDisks
-            .check(self.disks.len() as u64)
+            .check(
+                self.disks.len() as u64
+                    + if matches!(self.root.profile, SnapshotRootProfile::LinuxOverlay { .. }) {
+                        2
+                    } else {
+                        1
+                    },
+            )
             .map_err(crate::storage::StorageError::from)?;
         validate_geometry(&self.root.stream, &self.root.geometry)?;
+        if let SnapshotRootProfile::LinuxOverlay {
+            lower,
+            lower_geometry,
+            lower_filesystem_uuid,
+            upper_uuid,
+            ..
+        } = &self.root.profile
+        {
+            validate_geometry(lower, lower_geometry)?;
+            if lower_filesystem_uuid.is_nil() || upper_uuid.is_nil() {
+                return Err(invalid("overlay filesystem identities must be nonnil"));
+            }
+        }
+        let mut logical = 0u64;
+        for stream in self.streams() {
+            logical = logical
+                .checked_add(stream.length)
+                .ok_or_else(|| invalid("snapshot closure length overflow"))?;
+            let expected_pages = stream
+                .length
+                .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
+                .div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
+            if stream.map_pages.len() as u64 != expected_pages {
+                return Err(invalid(
+                    "snapshot stream map page count contradicts its length",
+                ));
+            }
+        }
+        Resource::ArtifactStreamBytes
+            .check(logical)
+            .map_err(crate::storage::StorageError::from)?;
+        if let SnapshotCaptureKind::LiveExecution { execution } = &self.capture {
+            Resource::CapturedRamBytes
+                .check(execution.memory.length)
+                .map_err(crate::storage::StorageError::from)?;
+            if execution.memory.length == 0
+                || execution.compatibility_profile.native_producer.is_empty()
+                || execution.compatibility_profile.native_producer.len()
+                    > vm_spec::capture::MAX_NATIVE_PRODUCER_BYTES
+            {
+                return Err(invalid("invalid execution memory or compatibility profile"));
+            }
+            if self
+                .external_requirements
+                .iter()
+                .any(|resource| !resource.read_only)
+            {
+                return Err(invalid(
+                    "live execution cannot omit writable external resources",
+                ));
+            }
+        }
         self.boot.validate()?;
         self.configuration.spec.validate().map_err(invalid)?;
         if self
@@ -214,7 +321,18 @@ impl StoppedSnapshotRecord {
     }
 
     pub fn streams(&self) -> impl Iterator<Item = &SnapshotStream> {
-        std::iter::once(&self.root.stream).chain(self.disks.iter().map(|disk| &disk.content))
+        let lower = match &self.root.profile {
+            SnapshotRootProfile::LinuxOverlay { lower, .. } => Some(lower),
+            SnapshotRootProfile::OpaqueRaw => None,
+        };
+        let memory = match &self.capture {
+            SnapshotCaptureKind::LiveExecution { execution } => Some(&execution.memory),
+            SnapshotCaptureKind::StoppedStorage { .. } => None,
+        };
+        std::iter::once(&self.root.stream)
+            .chain(lower)
+            .chain(self.disks.iter().map(|disk| &disk.content))
+            .chain(memory)
     }
 
     #[cfg(test)]
@@ -233,6 +351,7 @@ impl StoppedSnapshotRecord {
         for stream in self.streams() {
             streams.insert(stream.stream);
             objects.insert(stream.map);
+            objects.extend(stream.map_pages.iter().copied());
         }
         if let BootProfile::LinuxDirect {
             binding:
@@ -250,6 +369,9 @@ impl StoppedSnapshotRecord {
             objects.extend(agent.iter().copied());
         }
         objects.extend(self.platform_files.iter().map(|file| file.object));
+        if let SnapshotCaptureKind::LiveExecution { execution } = &self.capture {
+            objects.extend([execution.layout, execution.execution, execution.devices]);
+        }
         (streams, objects)
     }
 }
@@ -287,21 +409,29 @@ fn validate_numbers(value: &Value) -> Result<(), LibVmError> {
     Ok(())
 }
 
-fn validate_configured_closure(record: &StoppedSnapshotRecord) -> Result<(), LibVmError> {
+fn validate_configured_closure(record: &SnapshotRecord) -> Result<(), LibVmError> {
     use crate::machine::stopped::ExternalResourceKey;
     use crate::store::models::storage::{PartitionTable, RootSelector};
+    let stopped = matches!(record.capture, SnapshotCaptureKind::StoppedStorage { .. });
     let BootProfile::LinuxDirect { root_selector, .. } = &record.boot else {
         return Err(invalid("unadmitted snapshot boot profile"));
     };
-    let selector_matches = match (&record.root.layout, root_selector) {
-        (RawLayout::WholeDisk, RootSelector::WholeDisk) => true,
+    let selector_matches = match (&record.root.profile, &record.root.layout, root_selector) {
         (
+            SnapshotRootProfile::LinuxOverlay { .. },
+            RawLayout::WholeDisk,
+            RootSelector::ManagedOverlay,
+        ) => true,
+        (SnapshotRootProfile::OpaqueRaw, RawLayout::WholeDisk, RootSelector::WholeDisk) => true,
+        (
+            SnapshotRootProfile::OpaqueRaw,
             RawLayout::Partitioned {
                 table: PartitionTable::Gpt,
             },
             RootSelector::GptPartition { guid },
         ) => !guid.is_nil(),
         (
+            SnapshotRootProfile::OpaqueRaw,
             RawLayout::Partitioned {
                 table: PartitionTable::Mbr,
             },
@@ -321,16 +451,37 @@ fn validate_configured_closure(record: &StoppedSnapshotRecord) -> Result<(), Lib
         .as_ref()
         .map(|storage| storage.disks.as_slice())
         .unwrap_or_default();
-    if !configured.is_empty() {
-        let root = &configured[0];
-        if root.role != DiskRole::Root
-            || root.read_only
-            || root.geometry != record.root.geometry
-            || root.block_id.as_str() != "silo-root"
-        {
-            return Err(invalid("snapshot root contradicts configured attachment"));
+    let root_count = match &record.root.profile {
+        SnapshotRootProfile::OpaqueRaw => {
+            if let Some(root) = configured.first() {
+                if root.role != DiskRole::Root
+                    || root.read_only
+                    || root.geometry != record.root.geometry
+                    || (stopped && root.block_id.as_str() != "silo-root")
+                {
+                    return Err(invalid("snapshot root contradicts configured attachment"));
+                }
+            }
+            1
         }
-    }
+        SnapshotRootProfile::LinuxOverlay { lower_geometry, .. } => {
+            if configured.len() < 2
+                || configured[0].role != DiskRole::RootLower
+                || !configured[0].read_only
+                || configured[0].geometry != *lower_geometry
+                || (stopped && configured[0].block_id.as_str() != "silo-root-lower")
+                || configured[1].role != DiskRole::RootUpper
+                || configured[1].read_only
+                || configured[1].geometry != record.root.geometry
+                || (stopped && configured[1].block_id.as_str() != "silo-root-upper")
+            {
+                return Err(invalid(
+                    "snapshot overlay contradicts configured attachments",
+                ));
+            }
+            2
+        }
+    };
     for disk in &record.disks {
         let configured = configured
             .get(disk.order as usize)
@@ -342,7 +493,7 @@ fn validate_configured_closure(record: &StoppedSnapshotRecord) -> Result<(), Lib
             return Err(invalid("included disk contradicts configured attachment"));
         }
     }
-    for (order, disk) in configured.iter().enumerate().skip(1) {
+    for (order, disk) in configured.iter().enumerate().skip(root_count) {
         let included = record
             .disks
             .iter()
@@ -353,7 +504,7 @@ fn validate_configured_closure(record: &StoppedSnapshotRecord) -> Result<(), Lib
         });
         if disk.role != DiskRole::Data
             || included == required
-            || disk.block_id.as_str() != format!("silo-data-{order}")
+            || (stopped && disk.block_id.as_str() != format!("silo-data-{order}"))
         {
             return Err(invalid("each configured Data disk requires exactly one included stream or external declaration"));
         }
@@ -457,6 +608,17 @@ fn canonical_value(value: &Value) -> Result<Vec<u8>, LibVmError> {
     Ok(bytes)
 }
 
+pub(crate) fn decode_identity_value(bytes: &[u8]) -> Result<Value, LibVmError> {
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let StrictValue(value) = StrictValue::deserialize(&mut decoder).map_err(invalid)?;
+    decoder.end().map_err(invalid)?;
+    validate_numbers(&value)?;
+    if canonical_value(&value)? != bytes {
+        return Err(invalid("identity metadata is not its canonical encoding"));
+    }
+    Ok(value)
+}
+
 // serde_json::Value normally accepts duplicate object properties. Reject them
 // before typed decoding, at every nesting level (including configured maps).
 struct StrictValue(Value);
@@ -514,8 +676,8 @@ pub(crate) mod tests {
     use crate::machine::stopped::SnapshotConfiguration;
     use crate::storage::identity::{ObjectDigest, StreamId};
     use crate::store::models::snapshot::{
-        canonical_value, SnapshotCaptureKind, SnapshotKind, SnapshotPurpose, SnapshotRoot,
-        SnapshotStream, StoppedSnapshotRecord, StrictValue,
+        canonical_value, SnapshotCaptureKind, SnapshotKind, SnapshotPurpose, SnapshotRecord,
+        SnapshotRoot, SnapshotStream, StrictValue,
     };
     use crate::store::models::storage::{
         BootBinding, BootProfile, DirectCommandLinePolicy, GuestArchitecture, LinuxPlatform,
@@ -528,16 +690,20 @@ pub(crate) mod tests {
         stream: StreamId,
         map: ObjectDigest,
         kernel: ObjectDigest,
-    ) -> StoppedSnapshotRecord {
-        StoppedSnapshotRecord {
+    ) -> SnapshotRecord {
+        SnapshotRecord {
             schema: 1,
             kind: SnapshotKind::Snapshot,
-            capture_kind: SnapshotCaptureKind::StoppedStorage,
+            capture: SnapshotCaptureKind::StoppedStorage {
+                stop_outcome: StorageStopOutcome::Unknown,
+            },
             purpose: SnapshotPurpose::Checkpoint,
             root: SnapshotRoot {
+                profile: crate::store::models::snapshot::SnapshotRootProfile::OpaqueRaw,
                 stream: SnapshotStream {
                     stream,
                     map,
+                    map_pages: vec![map],
                     length: 512,
                 },
                 geometry: vm_spec::DiskGeometry {
@@ -581,7 +747,6 @@ pub(crate) mod tests {
                 translation: Translation::None,
             },
             external_requirements: Vec::new(),
-            stop_outcome: StorageStopOutcome::Unknown,
         }
     }
 
@@ -637,7 +802,7 @@ pub(crate) mod tests {
             ObjectDigest::of_bytes(b"kernel"),
         );
         let bytes = record.canonical_bytes().unwrap();
-        assert_eq!(StoppedSnapshotRecord::decode(&bytes).unwrap(), record);
+        assert_eq!(SnapshotRecord::decode(&bytes).unwrap(), record);
         assert_ne!(
             record.id().unwrap().to_string(),
             ObjectDigest::of_bytes(&bytes).to_string()
@@ -646,7 +811,9 @@ pub(crate) mod tests {
         record.configuration.process.entrypoint = Some(Vec::new());
         assert_ne!(record.id().unwrap(), id);
         record.configuration.process.entrypoint = None;
-        record.stop_outcome = StorageStopOutcome::Clean;
+        record.capture = SnapshotCaptureKind::StoppedStorage {
+            stop_outcome: StorageStopOutcome::Clean,
+        };
         assert_ne!(record.id().unwrap(), id);
         assert_eq!(record.root.stream.stream, stream);
     }
@@ -671,19 +838,19 @@ pub(crate) mod tests {
         ] {
             let mut changed = value.clone();
             changed[field] = replacement;
-            assert!(StoppedSnapshotRecord::decode(&serde_json::to_vec(&changed).unwrap()).is_err());
+            assert!(SnapshotRecord::decode(&serde_json::to_vec(&changed).unwrap()).is_err());
         }
         for field in value.as_object().unwrap().keys() {
             let mut changed = value.clone();
             changed.as_object_mut().unwrap().remove(field);
             assert!(
-                StoppedSnapshotRecord::decode(&serde_json::to_vec(&changed).unwrap()).is_err(),
+                SnapshotRecord::decode(&serde_json::to_vec(&changed).unwrap()).is_err(),
                 "{field}"
             );
         }
         let mut changed = value;
         changed["configuration"]["spec"]["extra"] = serde_json::json!(true);
-        assert!(StoppedSnapshotRecord::decode(&serde_json::to_vec(&changed).unwrap()).is_err());
+        assert!(SnapshotRecord::decode(&serde_json::to_vec(&changed).unwrap()).is_err());
     }
 
     #[test]
@@ -738,6 +905,53 @@ pub(crate) mod tests {
         record.disks[0].writable = true;
         record.configuration.spec.storage.as_mut().unwrap().disks[1].path =
             "/source/data.raw".into();
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn checkpoint_live_identity_has_no_stop_or_capture_provenance_and_enforces_ram_limit() {
+        use crate::store::models::snapshot::{SnapshotCompatibilityProfile, SnapshotExecution};
+        let digest = ObjectDigest::of_bytes(b"content");
+        let stream = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let mut record = record(stream, digest, digest);
+        let mut memory = record.root.stream.clone();
+        memory.length = 1 << 40;
+        memory.map_pages = vec![digest; 32];
+        record.capture = SnapshotCaptureKind::LiveExecution {
+            execution: Box::new(SnapshotExecution {
+                memory,
+                layout: digest,
+                execution: digest,
+                devices: digest,
+                compatibility_profile: SnapshotCompatibilityProfile {
+                    native_producer: "producer".into(),
+                    silo_producer: digest,
+                    profile: digest,
+                    topology: digest,
+                    ram_layout: digest,
+                },
+            }),
+        };
+        let bytes = record.canonical_bytes().unwrap();
+        assert_eq!(SnapshotRecord::decode(&bytes).unwrap(), record);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["captureKind"], "live-execution");
+        for key in [
+            "stopOutcome",
+            "captureId",
+            "runId",
+            "pauseToken",
+            "evidenceDigest",
+            "createdAt",
+        ] {
+            assert!(value.get(key).is_none(), "{key}");
+        }
+        if let SnapshotCaptureKind::LiveExecution { execution } = &mut record.capture {
+            execution.memory.length += crate::storage::limits::CHUNK_SIZE as u64;
+            execution.memory.map_pages.push(digest);
+        }
         assert!(record.validate().is_err());
     }
 }

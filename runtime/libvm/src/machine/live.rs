@@ -69,6 +69,30 @@ impl MachineLiveObservation {
             .ok_or_else(|| protocol("status.vm.state is missing"))?;
         protocol::lifecycle::vm_state_from_wire(Some(state)).map_err(protocol)
     }
+
+    /// Hypervisor-free admission fixture: exact report plus wire state and
+    /// lifecycle, exactly as a monitor status carries them.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        report: LiveMachineReport,
+        state: vm_spec::lifecycle::VmLifecycleState,
+        lifecycle: vm_spec::lifecycle::LiveLifecycle,
+    ) -> Self {
+        let machine_id = report.machine_id.parse().expect("test machine identity");
+        Self {
+            machine_id,
+            status: protocol::v1::HostStatus {
+                vm: Some(protocol::v1::VmSnapshot {
+                    state: Some(protocol::v1::VmState::from(state) as i32),
+                    ..Default::default()
+                }),
+                lifecycle: Some(lifecycle.into()),
+                ..Default::default()
+            },
+            report,
+            pending_pause: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +257,9 @@ pub(crate) fn report_from_status(
     Ok(report)
 }
 
+/// Manager delivery: Pause and Capture are delivered; Restore, Fork and
+/// Incremental stay not-delivered even when a vector advertises them. The
+/// monitor vector remains the qualification authority.
 pub fn require_live_operation(
     observation: &MachineLiveObservation,
     operation: LiveOperation,
@@ -240,7 +267,11 @@ pub fn require_live_operation(
     let report = observation.report();
     let reason = match &report.live.get(operation).availability {
         LiveAvailability::Unsupported { reason } => reason.clone(),
-        LiveAvailability::Supported if operation == LiveOperation::Pause => return Ok(()),
+        LiveAvailability::Supported
+            if matches!(operation, LiveOperation::Pause | LiveOperation::Capture) =>
+        {
+            return Ok(())
+        }
         LiveAvailability::Supported => LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
     };
     Err(LibVmError::LiveOperationUnsupported {
@@ -263,24 +294,6 @@ impl Machine {
         observation: &MachineLiveObservation,
     ) -> Result<crate::MachineLifecycle, LibVmError> {
         self.pause_and_wait(observation).await
-    }
-
-    pub async fn capture(&self, observation: &MachineLiveObservation) -> Result<(), LibVmError> {
-        if observation.machine_id == self.machine_id()
-            && matches!(
-                self.runtime()
-                    .machine_storage_record(self.machine_id())
-                    .await?
-                    .root,
-                crate::MachineRoot::LinuxOverlay {
-                    lower: crate::OverlayLower::FlatExt4 { .. },
-                    ..
-                }
-            )
-        {
-            return Err(LibVmError::FlatOverlayPublicationUnsupported);
-        }
-        self.require_exact_live(observation, LiveOperation::Capture)
     }
 
     pub async fn fork_execution(
@@ -393,6 +406,10 @@ mod tests {
         };
         report.live.capture.availability = LiveAvailability::Supported;
         report.live.capture.native = true;
+        report.live.fork.availability = LiveAvailability::Supported;
+        report.live.fork.native = true;
+        report.live.restore.availability = LiveAvailability::Supported;
+        report.live.restore.native = true;
         let observed = bind_run(
             report.machine_id.parse().unwrap(),
             "machine",
@@ -400,13 +417,17 @@ mod tests {
             report,
         )
         .unwrap();
+        // Capture is delivered by the manager in Phase 14; the vector stays the
+        // qualification authority, so a Supported capture bit is admitted.
+        assert!(require_live_operation(&observed, LiveOperation::Capture).is_ok());
         for (operation, code, subject) in [
             (
                 LiveOperation::Pause,
                 LiveReasonCode::DeviceProfileRejected,
                 Some(LiveDeviceSubject::Virtiofs),
             ),
-            (LiveOperation::Capture, LiveReasonCode::NotDelivered, None),
+            (LiveOperation::Fork, LiveReasonCode::NotDelivered, None),
+            (LiveOperation::Restore, LiveReasonCode::NotDelivered, None),
         ] {
             match require_live_operation(&observed, operation).unwrap_err() {
                 LibVmError::LiveOperationUnsupported {

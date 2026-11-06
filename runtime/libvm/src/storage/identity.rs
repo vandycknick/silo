@@ -36,6 +36,9 @@ macro_rules! digest_type {
         pub struct $name([u8; 32]);
 
         impl $name {
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
             /// The validated lowercase hex filename, without the algorithm prefix.
             pub fn hex(&self) -> String {
                 use std::fmt::Write as _;

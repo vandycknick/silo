@@ -62,6 +62,8 @@ pub struct LifecycleScenario {
     pub native_resume: Vec<NativeResumeStep>,
     pub freeze: Vec<GuestFreezeStep>,
     pub thaw: Vec<GuestThawStep>,
+    /// Modeled native capture (execution, RAM, preserve).
+    pub capture: CaptureScenario,
 }
 
 impl Default for LifecycleScenario {
@@ -77,8 +79,67 @@ impl Default for LifecycleScenario {
             native_resume: Vec::new(),
             freeze: Vec::new(),
             thaw: Vec::new(),
+            capture: CaptureScenario::default(),
         }
     }
+}
+
+/// Modeled native capture. Scripts are consumed one entry per attempt; an
+/// exhausted list is the happy path with no delay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct CaptureScenario {
+    /// Guest RAM written by a full capture; a positive multiple of 4096.
+    pub ram_bytes: u64,
+    pub execution: Vec<NativeCaptureStep>,
+    pub memory: Vec<NativeCaptureStep>,
+    pub preserve: Vec<NativePreserveStep>,
+}
+
+impl Default for CaptureScenario {
+    fn default() -> Self {
+        Self {
+            ram_bytes: 64 * 1024,
+            execution: Vec::new(),
+            memory: Vec::new(),
+            preserve: Vec::new(),
+        }
+    }
+}
+
+/// One native execution or RAM capture attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeCaptureStep {
+    #[serde(default)]
+    pub delay_ms: u64,
+    pub result: NativeCaptureResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeCaptureResult {
+    Complete,
+    /// Execution: both outputs closed, capture failed. RAM: a partial write
+    /// whose files stay owned by the native failure until abandonment.
+    Fail,
+    /// Completes natively but the caller sees CallerTimeout.
+    LoseReply,
+}
+
+/// One native preserve (Capture → User ownership transfer) attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativePreserveStep {
+    pub result: NativePreserveResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativePreserveResult {
+    Complete,
+    /// Refused: the Capture-owned pause stays exactly as it was.
+    Fail,
 }
 
 /// One live device as the native provider inventory reports it.
@@ -94,6 +155,10 @@ pub struct ProviderScenario {
     /// Backing format of a block provider.
     #[serde(default)]
     pub block_backing: Option<BlockBackingScenario>,
+    /// Read-only block attachment. Native quiesces read-only VMDK lowers;
+    /// writable VMDK is refused.
+    #[serde(default)]
+    pub read_only: bool,
     /// A live device without a state provider: native inventory fails closed.
     #[serde(default)]
     pub missing_state_provider: bool,
@@ -106,6 +171,7 @@ impl ProviderScenario {
             configured_id: configured_id.to_string(),
             activation_fenced: Some(false),
             block_backing: None,
+            read_only: false,
             missing_state_provider: false,
         }
     }
@@ -598,10 +664,39 @@ mod tests {
         assert_eq!(scripted.freeze[0].result, GuestFreezeResult::DropResponse);
         assert_eq!(scripted.thaw[0].result, GuestThawResult::Faulted);
         assert!(scripted.providers[0].missing_state_provider);
+        assert_eq!(lifecycle.capture, CaptureScenario::default());
+        assert_eq!(lifecycle.capture.ram_bytes, 64 * 1024);
+        let capture = Scenario::from_json(
+            r#"{"lifecycle": {
+                "providers": [{"deviceId": 2, "configuredId": "lower", "blockBacking": "vmdk", "readOnly": true}],
+                "capture": {
+                    "ramBytes": 8192,
+                    "execution": [{"result": "loseReply"}],
+                    "memory": [{"delayMs": 2, "result": "fail"}],
+                    "preserve": [{"result": "fail"}]
+                }
+            }}"#,
+        )
+        .expect("parse")
+        .lifecycle
+        .expect("lifecycle");
+        assert!(capture.providers[0].read_only);
+        assert_eq!(capture.capture.ram_bytes, 8192);
+        assert_eq!(
+            capture.capture.execution[0].result,
+            NativeCaptureResult::LoseReply
+        );
+        assert_eq!(capture.capture.memory[0].delay_ms, 2);
+        assert_eq!(
+            capture.capture.preserve[0].result,
+            NativePreserveResult::Fail
+        );
         for invalid in [
             r#"{"lifecycle": {"nativePause": [{"result": "maybe"}]}}"#,
             r#"{"lifecycle": {"freeze": [{"delayMs": 1}]}}"#,
             r#"{"lifecycle": {"bogus": true}}"#,
+            r#"{"lifecycle": {"capture": {"memory": [{"result": "partial"}]}}}"#,
+            r#"{"lifecycle": {"capture": {"bogus": 1}}}"#,
         ] {
             assert!(Scenario::from_json(invalid).is_err(), "{invalid}");
         }

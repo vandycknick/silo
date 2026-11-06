@@ -975,9 +975,11 @@ def capabilities_cohort(args, _echo) -> dict:
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         require(value["live"][operation]["native"] is True, "Main has not qualified/flipped the exercised native lane")
         expected = ({"status": "supported"} if operation == "pause" else
-                    {"status": "unsupported", "reason": {"code": "not-delivered", "subject": None}})
+                    {"status": "unsupported", "reason": {
+                        "code": "lane-not-qualified" if operation == "capture" else "not-delivered",
+                        "subject": None}})
         require(value["live"][operation]["availability"] == expected,
-                "public delivery must match the independently qualified Phase 13 pause boundary")
+                "public capture stays unqualified until the combined live admission gates pass")
     return {"command": command, "elapsed_ns": time.monotonic_ns() - started,
         "exit_status": result.returncode, "monitor_sha256": digest(args.monitor),
         "actual_json": value, "guest_started": False}

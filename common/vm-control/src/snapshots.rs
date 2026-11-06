@@ -236,6 +236,11 @@ pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, Co
         } else {
             3
         }),
+        captures: v
+            .captures
+            .iter()
+            .map(crate::capture::machine_capture_to_wire)
+            .collect::<Result<_, _>>()?,
     })
 }
 pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, ConversionError> {
@@ -329,6 +334,14 @@ pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, C
         .prospective_live
         .map(crate::live::host_from_wire)
         .transpose()?;
+    if v.captures.len() > 4096 {
+        return Err(invalid("machine.captures", "too many retained captures"));
+    }
+    out.captures = v
+        .captures
+        .into_iter()
+        .map(crate::capture::machine_capture_from_wire)
+        .collect::<Result<_, _>>()?;
     if let Some(live) = &out.live {
         if !crate::live::same_machine_identity(&live.machine_id, &out.id)
             || Some(live.run_id.as_str())

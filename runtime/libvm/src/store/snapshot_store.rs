@@ -1,4 +1,4 @@
-//! Immutable stopped artifacts, shared image aliases, and independent retention.
+//! Immutable snapshot artifacts, shared image aliases, and independent retention.
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
@@ -14,8 +14,7 @@ use crate::storage::identity::{ObjectDigest, SnapshotId, StreamId};
 use crate::storage::limits::Resource;
 use crate::storage::locks::StorageLock;
 use crate::storage::pool::StoragePool;
-use crate::storage::stream::StreamMap;
-use crate::store::models::snapshot::{invalid, StoppedSnapshotRecord};
+use crate::store::models::snapshot::{invalid, SnapshotRecord, SnapshotStream};
 use crate::store::Store;
 use crate::LibVmError;
 
@@ -45,24 +44,117 @@ impl fmt::Display for SnapshotRef {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotCaptureKindName {
+    StoppedStorage,
+    LiveExecution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotCaptureProvenance {
+    pub capture_id: Uuid,
+    pub machine_id: Uuid,
+    pub run_id: Uuid,
+    pub evidence_digest: ObjectDigest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotInfo {
     pub id: SnapshotId,
     pub record_digest: ObjectDigest,
+    pub capture_kind: SnapshotCaptureKindName,
+    pub provenance: Vec<SnapshotCaptureProvenance>,
     pub retained: bool,
     pub aliases: Vec<String>,
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureReservationRequest {
+    pub machine_id: crate::store::models::MachineId,
+    pub run_id: Uuid,
+    pub capture_id: Uuid,
+    pub configuration: vm_spec::capture::CaptureConfiguration,
+    pub alias: Option<String>,
+    pub policy: vm_spec::lifecycle::CapturePolicy,
+    pub resume_policy: vm_spec::lifecycle::CaptureResumePolicy,
+    pub pause: vm_spec::capture::CapturePauseAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum CaptureState {
+    Reserved,
+    Sealed,
+    Published { snapshot: SnapshotId },
+    Released { snapshot: Option<SnapshotId> },
+    Abandoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum CaptureSourceOutcome {
+    Known {
+        record: vm_spec::capture::CaptureSourceRecord,
+    },
+    Unknown,
+    Observed {
+        continuation: vm_spec::capture::CaptureContinuation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureSpaceCharge {
+    pub device: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureRecord {
+    pub capture_id: Uuid,
+    pub machine_id: crate::store::models::MachineId,
+    pub run_id: Uuid,
+    pub launch_operation_id: Uuid,
+    pub alias: Option<String>,
+    pub request: CaptureReservationRequest,
+    pub plan: vm_spec::capture::CapturePlan,
+    pub state: CaptureState,
+    pub source_outcome: Option<CaptureSourceOutcome>,
+    pub configuration: crate::machine::stopped::SnapshotConfiguration,
+    pub storage: crate::MachineStorageRecord,
+    pub disk_charges: Vec<CaptureSpaceCharge>,
+    pub reservation_bytes: u64,
+    pub reservation_memory_bytes: u64,
+    pub candidate: Option<SnapshotId>,
+    pub captured_boot: Option<crate::BootProfile>,
+    pub source_inodes: Vec<(u64, u64)>,
+    pub evidence: Option<String>,
+}
+
+pub(crate) struct CaptureReservation {
+    pub record: CaptureRecord,
+    pub(crate) _lease: StorageLock,
+}
+
 #[derive(Clone)]
 pub struct SnapshotStore {
-    store: Arc<Store>,
+    pub(crate) store: Arc<Store>,
 }
 
 pub(crate) struct SnapshotConsumer {
     pub info: SnapshotInfo,
-    pub record: StoppedSnapshotRecord,
+    pub record: SnapshotRecord,
     pub operation_id: Uuid,
     pub lease: StorageLock,
     // A consumer outlives its collection handle and retains the same writable
@@ -194,10 +286,30 @@ impl SnapshotStore {
     /// operation OFD. All slow authentication is outside roots/transactions.
     pub(crate) async fn publish(
         &self,
-        record: &StoppedSnapshotRecord,
+        record: &SnapshotRecord,
         operation_id: Uuid,
         alias: Option<&str>,
     ) -> Result<SnapshotInfo, LibVmError> {
+        self.publish_authenticated(record, operation_id, alias, None)
+            .await
+    }
+
+    pub(crate) async fn publish_authenticated(
+        &self,
+        record: &SnapshotRecord,
+        operation_id: Uuid,
+        alias: Option<&str>,
+        inputs: Option<&crate::store::capture::VerifiedCapture>,
+    ) -> Result<SnapshotInfo, LibVmError> {
+        if matches!(
+            record.capture,
+            crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { .. }
+        ) != inputs.is_some()
+        {
+            return Err(invalid(
+                "execution publication requires its retained capture verification owner",
+            ));
+        }
         if let Some(name) = alias {
             validate_alias(name)?;
         }
@@ -207,6 +319,38 @@ impl SnapshotStore {
         let (streams, mut objects) = record.content_dependencies();
         objects.insert(digest);
         let pool = StoragePool::open(&self.store.images_dir)?;
+        let capture = if matches!(
+            record.capture,
+            crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { .. }
+        ) {
+            let capture = self
+                .capture_reservation(operation_id)
+                .await?
+                .ok_or_else(|| invalid("execution snapshot has no capture owner"))?;
+            let evidence = capture
+                .evidence
+                .as_deref()
+                .map(str::as_bytes)
+                .ok_or_else(|| invalid("execution snapshot has no authenticated seal"))?;
+            let digest = ObjectDigest::of_bytes(evidence);
+            require_operation_closure(
+                &self.store,
+                operation_id,
+                &BTreeSet::new(),
+                &BTreeSet::from([digest]),
+                None,
+            )
+            .await?;
+            pool.verify_object(&digest)?;
+            if pool.read_object(&digest, vm_spec::capture::MAX_CAPTURE_RECORD_BYTES as u64)?
+                != evidence
+            {
+                return Err(invalid("capture provenance bytes changed"));
+            }
+            Some((digest, evidence.to_vec()))
+        } else {
+            None
+        };
         // The record itself is new output, all other dependencies must already
         // be operation-pinned before opening their bytes.
         require_operation_closure(&self.store, operation_id, &streams, &objects, Some(digest))
@@ -228,11 +372,25 @@ impl SnapshotStore {
         ));
         drop(roots);
         // Before a possibly uncertain SQL commit, persist its exact result ID.
-        self.store
-            .preserve_snapshot_operation(operation_id, id)
+        if capture.is_some() {
+            self.update_capture(operation_id, move |capture| {
+                if capture.candidate.is_some_and(|candidate| candidate != id) {
+                    return Err(invalid("capture publication candidate changed"));
+                }
+                capture.candidate = Some(id);
+                Ok(())
+            })
             .await?;
+        } else {
+            self.store
+                .preserve_snapshot_operation(operation_id, id)
+                .await?;
+        }
         let _roots = pool.lock_roots_shared()?;
         recheck_closure(&fingerprints)?;
+        if let Some(inputs) = inputs {
+            inputs.recheck_registered(&self.store, operation_id)?;
+        }
         require_operation_closure(&self.store, operation_id, &streams, &objects, None).await?;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing =
@@ -284,13 +442,47 @@ impl SnapshotStore {
             sqlx::query("INSERT INTO image_alias(name,snapshot_id) VALUES(?1,?2) ON CONFLICT(name) DO NOTHING")
                 .bind(alias).bind(id.to_string()).execute(&mut *tx).await?;
         }
-        let info = catalog_info(&mut tx, id, digest).await?;
-        // The artifact commit also reconciles this candidate. The producer
-        // continues holding its OFD until its explicit completion call.
-        sqlx::query("UPDATE storage_operation SET state='staging',record_json=jsonb('{}') WHERE operation_id=?1 AND state='committing'")
-            .bind(operation_id.to_string()).execute(&mut *tx).await?;
+        if let Some((evidence_digest, evidence)) = capture {
+            let existing = sqlx::query("SELECT snapshot_id,evidence_digest,evidence_bytes FROM snapshot_capture_provenance WHERE capture_id=?1")
+                .bind(operation_id.to_string()).fetch_optional(&mut *tx).await?;
+            if let Some(existing) = existing {
+                if existing.try_get::<String, _>("snapshot_id")? != id.to_string()
+                    || existing.try_get::<String, _>("evidence_digest")?
+                        != evidence_digest.to_string()
+                    || existing.try_get::<Vec<u8>, _>("evidence_bytes")? != evidence
+                {
+                    return Err(invalid("immutable capture provenance contradiction"));
+                }
+            } else {
+                sqlx::query("INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes) VALUES(?1,?2,?3,?4)")
+                    .bind(operation_id.to_string()).bind(id.to_string()).bind(evidence_digest.to_string()).bind(evidence).execute(&mut *tx).await?;
+            }
+            let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+                .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
+            let mut capture = crate::store::capture::decode_record(&json)?;
+            if capture.candidate != Some(id) {
+                return Err(invalid("capture candidate changed before commit"));
+            }
+            capture.state = match capture.state {
+                CaptureState::Sealed => CaptureState::Published { snapshot: id },
+                CaptureState::Published { snapshot } if snapshot == id => capture.state,
+                CaptureState::Released {
+                    snapshot: Some(snapshot),
+                } if snapshot == id => capture.state,
+                _ => {
+                    return Err(invalid(
+                        "capture publication cannot regress its durable state",
+                    ))
+                }
+            };
+            crate::store::capture::write_record(&mut tx, &capture).await?;
+        } else {
+            sqlx::query("UPDATE storage_operation SET state='staging',record_json=jsonb('{}') WHERE operation_id=?1 AND kind='snapshot' AND state='committing'")
+                .bind(operation_id.to_string()).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
-        Ok(info)
+        drop(_roots);
+        self.inspect(&SnapshotRef::Id(id)).await
     }
 
     /// Register a fresh consumer and its exact closure atomically with resolving
@@ -313,7 +505,14 @@ impl SnapshotStore {
                 let _roots = pool.lock_roots()?;
                 let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
                 recheck_catalog(&mut tx, &reference, &observed, &bytes, &streams, &objects).await?;
-                let info = catalog_info(&mut tx, observed.id, observed.record_digest).await?;
+                let mut info = catalog_info(&mut tx, observed.id, observed.record_digest).await?;
+                info.provenance = observed.provenance.clone();
+                let mut pinned_objects = objects.clone();
+                pinned_objects.extend(
+                    info.provenance
+                        .iter()
+                        .map(|provenance| provenance.evidence_digest),
+                );
                 let lease = pool.lease(id)?;
                 Store::insert_stopped_operation(
                     &mut tx,
@@ -321,13 +520,16 @@ impl SnapshotStore {
                     "import",
                     &lease,
                     &streams.into_iter().collect::<Vec<_>>(),
-                    &objects.into_iter().collect::<Vec<_>>(),
+                    &pinned_objects.into_iter().collect::<Vec<_>>(),
                 )
                 .await?;
                 tx.commit().await?;
                 Ok::<_, LibVmError>((info, lease))
             })?;
             verify_closure(&pool, &record, Some(info.record_digest))?;
+            for provenance in &info.provenance {
+                pool.verify_object(&provenance.evidence_digest)?;
+            }
             Ok(SnapshotConsumer {
                 info,
                 record,
@@ -342,7 +544,7 @@ impl SnapshotStore {
     async fn load_observed(
         &self,
         reference: &SnapshotRef,
-    ) -> Result<(StoppedSnapshotRecord, SnapshotInfo), LibVmError> {
+    ) -> Result<(SnapshotRecord, SnapshotInfo), LibVmError> {
         let mut tx = self.store.pool.begin().await?;
         let facts = fetch_catalog(&mut tx, reference).await?;
         tx.commit().await?;
@@ -356,7 +558,7 @@ impl SnapshotStore {
 pub(crate) async fn observe_snapshot_record(
     config: &crate::RuntimeConfig,
     reference: &SnapshotRef,
-) -> Result<StoppedSnapshotRecord, LibVmError> {
+) -> Result<SnapshotRecord, LibVmError> {
     let home = config.resolve_home()?;
     let store = crate::store::observation::ObservationStore::open(&home.join("state.db")).await?;
     let record = store.snapshot_record(reference).await;
@@ -392,6 +594,8 @@ pub(crate) struct CatalogSnapshotFacts {
     aliases: Vec<String>,
     streams: Vec<String>,
     objects: Vec<String>,
+    provenance: Vec<(String, String, Vec<u8>)>,
+    capture_owned: bool,
 }
 
 pub(crate) async fn fetch_catalog(
@@ -399,7 +603,7 @@ pub(crate) async fn fetch_catalog(
     reference: &SnapshotRef,
 ) -> Result<CatalogSnapshotFacts, LibVmError> {
     let (id, alias) = reference_parts(reference)?;
-    let row = sqlx::query("SELECT id,record_digest,record_bytes,retained,created_at FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
+    let row = sqlx::query("SELECT id,record_digest,record_bytes,retained,created_at,EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) AS capture_owned FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
         .bind(id).bind(alias).fetch_optional(&mut *connection).await?
         .ok_or_else(|| invalid(format!("snapshot {reference} does not exist")))?;
     let id: String = row.try_get("id")?;
@@ -415,7 +619,8 @@ pub(crate) async fn fetch_catalog(
     .fetch_all(&mut *connection)
     .await?;
     let objects = sqlx::query_scalar("SELECT object_digest FROM snapshot_object_dependency WHERE snapshot_id=?1 ORDER BY object_digest")
-        .bind(&id).fetch_all(connection).await?;
+        .bind(&id).fetch_all(&mut *connection).await?;
+    let provenance = provenance_facts(connection, &id).await?;
     Ok(CatalogSnapshotFacts {
         id,
         digest: row.try_get("record_digest")?,
@@ -425,16 +630,18 @@ pub(crate) async fn fetch_catalog(
         aliases,
         streams,
         objects,
+        provenance,
+        capture_owned: row.try_get("capture_owned")?,
     })
 }
 
 /// Call only after the catalog read transaction has ended.
 pub(crate) fn authenticate_catalog(
     facts: CatalogSnapshotFacts,
-) -> Result<(StoppedSnapshotRecord, SnapshotInfo), LibVmError> {
+) -> Result<(SnapshotRecord, SnapshotInfo), LibVmError> {
     let id = facts.id.parse::<SnapshotId>().map_err(invalid)?;
     let digest = facts.digest.parse::<ObjectDigest>().map_err(invalid)?;
-    let record = StoppedSnapshotRecord::decode(&facts.bytes)?;
+    let record = SnapshotRecord::decode(&facts.bytes)?;
     if record.canonical_bytes()? != facts.bytes
         || crate::store::models::snapshot::snapshot_id(&facts.bytes) != id
         || ObjectDigest::of_bytes(&facts.bytes) != digest
@@ -459,14 +666,23 @@ pub(crate) fn authenticate_catalog(
     for alias in &facts.aliases {
         validate_alias(alias)?;
     }
-    if !matches!(facts.retained, 0 | 1) || (facts.retained == 0 && facts.aliases.is_empty()) {
+    if !matches!(facts.retained, 0 | 1)
+        || (facts.retained == 0 && facts.aliases.is_empty() && !facts.capture_owned)
+    {
         return Err(invalid("snapshot has no public retention root"));
+    }
+    let capture_kind = capture_kind(&record);
+    let provenance = authenticate_provenance(facts.provenance)?;
+    if capture_kind == SnapshotCaptureKindName::StoppedStorage && !provenance.is_empty() {
+        return Err(invalid("stopped snapshot has live capture provenance"));
     }
     Ok((
         record,
         SnapshotInfo {
             id,
             record_digest: digest,
+            capture_kind,
+            provenance,
             retained: facts.retained == 1,
             aliases: facts.aliases,
             created_at: facts.created_at,
@@ -479,7 +695,7 @@ async fn catalog_info(
     id: SnapshotId,
     digest: ObjectDigest,
 ) -> Result<SnapshotInfo, LibVmError> {
-    let row = sqlx::query("SELECT retained,created_at FROM storage_snapshot WHERE id=?1")
+    let row = sqlx::query("SELECT retained,created_at,json_extract(CAST(record_bytes AS TEXT),'$.captureKind') AS capture_kind,EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) AS capture_owned FROM storage_snapshot WHERE id=?1")
         .bind(id.to_string())
         .fetch_one(&mut *connection)
         .await?;
@@ -487,23 +703,83 @@ async fn catalog_info(
         "SELECT name FROM image_alias WHERE snapshot_id=?1 ORDER BY name",
     )
     .bind(id.to_string())
-    .fetch_all(connection)
+    .fetch_all(&mut *connection)
     .await?;
     for alias in &aliases {
         validate_alias(alias)?;
     }
     let retained: i64 = row.try_get("retained")?;
-    if !matches!(retained, 0 | 1) || (retained == 0 && aliases.is_empty()) {
+    if !matches!(retained, 0 | 1)
+        || (retained == 0 && aliases.is_empty() && !row.try_get::<bool, _>("capture_owned")?)
+    {
         return Err(invalid("snapshot has no public retention root"));
     }
     Ok(SnapshotInfo {
         id,
         record_digest: digest,
+        provenance: Vec::new(),
+        capture_kind: match row.try_get::<String, _>("capture_kind")?.as_str() {
+            "stopped-storage" => SnapshotCaptureKindName::StoppedStorage,
+            "live-execution" => SnapshotCaptureKindName::LiveExecution,
+            _ => return Err(invalid("invalid snapshot capture kind")),
+        },
         retained: retained == 1,
         aliases,
         created_at: row.try_get("created_at")?,
     })
 }
+async fn provenance_facts(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Vec<(String, String, Vec<u8>)>, LibVmError> {
+    let rows = sqlx::query("SELECT capture_id,evidence_digest,evidence_bytes FROM snapshot_capture_provenance WHERE snapshot_id=?1 ORDER BY capture_id")
+        .bind(id).fetch_all(connection).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("capture_id")?,
+                row.try_get("evidence_digest")?,
+                row.try_get("evidence_bytes")?,
+            ))
+        })
+        .collect()
+}
+
+fn authenticate_provenance(
+    facts: Vec<(String, String, Vec<u8>)>,
+) -> Result<Vec<SnapshotCaptureProvenance>, LibVmError> {
+    facts
+        .into_iter()
+        .map(|(capture, digest, bytes)| {
+            let evidence = vm_spec::capture::CaptureEvidence::decode(&bytes).map_err(invalid)?;
+            let digest: ObjectDigest = digest.parse().map_err(invalid)?;
+            if !evidence.is_sealed()
+                || evidence.capture_id.to_string() != capture
+                || ObjectDigest::of_bytes(&bytes) != digest
+            {
+                return Err(invalid("capture provenance identity contradiction"));
+            }
+            Ok(SnapshotCaptureProvenance {
+                capture_id: capture.parse().map_err(invalid)?,
+                machine_id: evidence.machine_id.to_string().parse().map_err(invalid)?,
+                run_id: evidence.run_id.to_string().parse().map_err(invalid)?,
+                evidence_digest: digest,
+            })
+        })
+        .collect()
+}
+
+fn capture_kind(record: &SnapshotRecord) -> SnapshotCaptureKindName {
+    match &record.capture {
+        crate::store::models::snapshot::SnapshotCaptureKind::StoppedStorage { .. } => {
+            SnapshotCaptureKindName::StoppedStorage
+        }
+        crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { .. } => {
+            SnapshotCaptureKindName::LiveExecution
+        }
+    }
+}
+
 async fn exact_catalog_dependencies(
     connection: &mut sqlx::SqliteConnection,
     id: SnapshotId,
@@ -592,7 +868,7 @@ async fn remove_unrooted(
     connection: &mut sqlx::SqliteConnection,
     id: &str,
 ) -> Result<(), LibVmError> {
-    sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1)")
+    sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1)")
         .bind(id).execute(connection).await?;
     Ok(())
 }
@@ -604,7 +880,7 @@ async fn require_operation_closure(
     pending: Option<ObjectDigest>,
 ) -> Result<(), LibVmError> {
     let mut tx = store.pool.begin().await?;
-    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='snapshot' AND state IN ('staging','committing'))")
+    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('snapshot','capture') AND state IN ('staging','committing'))")
         .bind(operation.to_string()).fetch_one(&mut *tx).await?;
     if !active {
         return Err(invalid("snapshot has no active retained operation"));
@@ -650,7 +926,7 @@ fn recheck_closure(fingerprints: &ClosureFingerprints) -> Result<(), LibVmError>
 
 fn verify_closure(
     pool: &StoragePool,
-    record: &StoppedSnapshotRecord,
+    record: &SnapshotRecord,
     digest: Option<ObjectDigest>,
 ) -> Result<ClosureFingerprints, LibVmError> {
     let bytes = record.canonical_bytes()?;
@@ -680,9 +956,16 @@ fn verify_closure(
     }
     let mut verified_streams = BTreeSet::new();
     for content in record.streams() {
-        let map = StreamMap::decode(
+        let root = crate::storage::map::StreamMapRoot::decode(
             &pool.read_object(&content.map, Resource::MetadataPageBytes.maximum())?,
         )?;
+        if root.pages != content.map_pages
+            || root.stream != content.stream
+            || root.length != content.length
+        {
+            return Err(invalid("snapshot map root contradicts content"));
+        }
+        let map = root.read_map(pool)?;
         if map.id() != content.stream
             || map.length() != content.length
             || (verified_streams.insert(content.stream)
@@ -741,12 +1024,56 @@ impl Drop for RecordInput {
     }
 }
 
+pub(crate) async fn publish_map(
+    pool: &StoragePool,
+    store: &Store,
+    operation: Uuid,
+    map: crate::storage::stream::StreamMap,
+) -> Result<SnapshotStream, LibVmError> {
+    let parent = OwnedDirectory::open_existing_root(
+        &store
+            .home_path()
+            .join("images/tmp")
+            .join(operation.to_string()),
+    )?
+    .ok_or_else(|| invalid("registered capture staging is missing"))?;
+    let name = format!("map-{}", Uuid::new_v4());
+    let stage = parent
+        .create_dir(&name)?
+        .ok_or_else(|| invalid("map staging collision"))?;
+    let mut map_pages = Vec::new();
+    for (index, page) in crate::storage::map::pages(&map).enumerate() {
+        let name = format!("page-{index}");
+        stage.write_file(&name, &page?)?;
+        let (object, roots) = pool.publish_object_for_catalog(&stage.path().join(&name))?;
+        store
+            .pin_published_storage_dependencies(operation, &[], &[object.digest])
+            .await?;
+        map_pages.push(object.digest);
+        drop(roots);
+    }
+    let root = crate::storage::map::StreamMapRoot::new(&map, map_pages.clone())?;
+    stage.write_file("record", &root.encode()?)?;
+    let (object, roots) = pool.publish_object_for_catalog(&stage.path().join("record"))?;
+    store
+        .pin_published_storage_dependencies(operation, &[map.id()], &[object.digest])
+        .await?;
+    drop(roots);
+    parent.remove_tree(&name)?;
+    parent.sync()?;
+    Ok(SnapshotStream {
+        stream: map.id(),
+        map: object.digest,
+        map_pages,
+        length: map.length(),
+    })
+}
 #[cfg(test)]
 mod tests {
     use crate::paths::LocalPaths;
     use crate::storage::identity::ObjectDigest;
     use crate::storage::pool::StoragePool;
-    use crate::store::models::snapshot::{tests::record, StoppedSnapshotRecord};
+    use crate::store::models::snapshot::{tests::record, SnapshotRecord};
     use crate::store::snapshot_store::{SnapshotRef, SnapshotStore};
     use crate::store::Store;
     use std::io::{BufRead, Write};
@@ -760,7 +1087,7 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         SnapshotStore,
-        StoppedSnapshotRecord,
+        SnapshotRecord,
         uuid::Uuid,
         crate::storage::locks::StorageLock,
     ) {
@@ -780,14 +1107,9 @@ mod tests {
             .await
             .unwrap();
         drop(roots);
-        let map_path = temp.path().join("map");
-        std::fs::write(&map_path, stream.map.canonical_bytes().unwrap()).unwrap();
-        let (map, roots) = pool.publish_object_for_catalog(&map_path).unwrap();
-        store
-            .pin_published_storage_dependencies(operation, &[], &[map.digest])
+        let map = crate::store::snapshot_store::publish_map(&pool, &store, operation, stream.map)
             .await
             .unwrap();
-        drop(roots);
         let kernel_path = temp.path().join("kernel");
         std::fs::write(&kernel_path, b"exact boot fixture").unwrap();
         let (kernel, roots) = pool.publish_object_for_catalog(&kernel_path).unwrap();
@@ -796,7 +1118,8 @@ mod tests {
             .await
             .unwrap();
         drop(roots);
-        let record = record(stream.id, map.digest, kernel.digest);
+        let mut record = record(stream.id, map.map, kernel.digest);
+        record.root.stream = map;
         (
             temp,
             SnapshotStore::from_store(Arc::new(store)),
@@ -1021,7 +1344,9 @@ mod tests {
             .await
             .unwrap();
         let mut changed = record.clone();
-        changed.stop_outcome = crate::StorageStopOutcome::Forced;
+        changed.capture = crate::store::models::snapshot::SnapshotCaptureKind::StoppedStorage {
+            stop_outcome: crate::StorageStopOutcome::Forced,
+        };
         let changed_id = changed.id().unwrap();
         assert!(snapshots
             .publish(&changed, operation, Some("stable"))
@@ -1063,7 +1388,10 @@ mod tests {
         let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
         let first = snapshots.publish(&record, operation, None).await.unwrap();
         let mut second_record = record.clone();
-        second_record.stop_outcome = crate::StorageStopOutcome::Forced;
+        second_record.capture =
+            crate::store::models::snapshot::SnapshotCaptureKind::StoppedStorage {
+                stop_outcome: crate::StorageStopOutcome::Forced,
+            };
         let second = snapshots
             .publish(&second_record, operation, None)
             .await

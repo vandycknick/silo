@@ -1,4 +1,6 @@
 pub(crate) mod cache_paths;
+pub(crate) mod capture;
+mod capture_native;
 mod catalog_guard;
 mod config_store;
 mod image_store;

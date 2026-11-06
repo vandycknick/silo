@@ -1,0 +1,1731 @@
+//! ADR 0021 full-capture contract shared by libvm (planner, verifier and
+//! publisher) and the monitor (sole writer of staging and evidence).
+//!
+//! ```text
+//!   libvm ── CapturePlan ──► monitor ── request.json (canonical plan bytes)
+//!                                     ├─ execution.state / devices.state
+//!                                     ├─ memory.ram / memory-layout.json
+//!                                     ├─ disks/<name>.raw (writable roles)
+//!                                     ├─ vm.capture.json        (seal or failed)
+//!                                     └─ vm.capture-source.json (continuation)
+//! ```
+//!
+//! The plan is an identity record: closed, strict and canonical. Evidence and
+//! continuation records are versioned by addition: unknown top-level fields
+//! are ignored, missing, duplicate or malformed known fields are rejected.
+use std::fmt;
+use std::num::NonZeroU64;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+
+use crate::lifecycle::{
+    CapturePolicy, CaptureResumePolicy, CurrentPause, Diagnostic, LiveFailure, LiveId, PauseOwner,
+    PauseToken, VmLifecycleState,
+};
+use crate::{BlockId, DiskFormat, DiskGeometry, DiskRole, GuestOs, Storage, VmSpec};
+
+/// Version of `request.json`, `vm.capture.json` and `vm.capture-source.json`.
+pub const CAPTURE_RECORD_VERSION: u32 = 1;
+/// Staging root below the machine data directory.
+pub const CAPTURES_DIRECTORY: &str = "captures";
+/// Writable disk captures below one capture directory.
+pub const CAPTURE_DISKS_DIRECTORY: &str = "disks";
+pub const CAPTURE_REQUEST_FILE: &str = "request.json";
+pub const CAPTURE_EXECUTION_FILE: &str = "execution.state";
+pub const CAPTURE_DEVICES_FILE: &str = "devices.state";
+pub const CAPTURE_RAM_FILE: &str = "memory.ram";
+pub const CAPTURE_LAYOUT_FILE: &str = "memory-layout.json";
+pub const CAPTURE_EVIDENCE_FILE: &str = "vm.capture.json";
+pub const CAPTURE_SOURCE_FILE: &str = "vm.capture-source.json";
+/// The only temporary names a reader may find next to the records. A
+/// temporary is never a record; it is left only by an interrupted write.
+pub const CAPTURE_EVIDENCE_TEMPORARY_FILE: &str = ".vm.capture.json.tmp";
+pub const CAPTURE_SOURCE_TEMPORARY_FILE: &str = ".vm.capture-source.json.tmp";
+/// Upper bound for one JSON control record (plan, evidence, continuation).
+pub const MAX_CAPTURE_RECORD_BYTES: usize = 1 << 20;
+/// ADR 0021 `Resource Limits`: staged state and evidence allowance.
+pub const CAPTURE_STATE_RESERVE_BYTES: u64 = 64 << 20;
+/// ADR 0021 `Resource Limits`: metadata charge of a qualified clone.
+pub const CAPTURE_CLONE_RESERVE_BYTES: u64 = 16 << 20;
+/// ADR 0021 `Resource Limits`: RAM per captured machine.
+pub const MAX_CAPTURE_RAM_BYTES: u64 = 1 << 40;
+/// ADR 0014 stream identity chunk.
+pub const STREAM_CHUNK_BYTES: u64 = 8 << 20;
+/// ADR 0014 total logical stream admission bound.
+pub const MAX_STREAM_BYTES: u64 = 4 << 40;
+/// Bound for libvm's opaque read-only input identities.
+pub const MAX_INPUT_IDENTITY_BYTES: usize = 256;
+/// Native execution ABI's maximum producer binding, including build inputs.
+pub const MAX_NATIVE_PRODUCER_BYTES: usize = 64 * 1024;
+
+const MIB: u64 = 1 << 20;
+
+/// Relative path of one capture directory below the machine data directory.
+pub fn capture_directory(capture_id: &LiveId) -> String {
+    format!("{CAPTURES_DIRECTORY}/{capture_id}")
+}
+
+fn invalid(message: impl Into<String>) -> String {
+    message.into()
+}
+
+/// A known optional field must still be present (as `null` when absent).
+fn required<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
+}
+
+/// `sha256:` followed by 64 lowercase hexadecimal characters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("sha256:")?;
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl FromStr for Sha256Digest {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let hex = value
+            .strip_prefix("sha256:")
+            .filter(|hex| hex.len() == 64)
+            .ok_or_else(|| invalid("digest must be sha256: and 64 lowercase hex characters"))?;
+        let mut bytes = [0u8; 32];
+        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let nibble = |byte: u8| match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                _ => Err(invalid("digest must use lowercase hexadecimal")),
+            };
+            bytes[index] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for Sha256Digest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Digest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Streaming ADR 0014 `stream` identity: 8 MiB decoded chunks, `zero` only
+/// for an entirely zero chunk, SHA-256 of `silo:stream:v1\n` followed by the
+/// RFC 8785 canonical map. Holds no map, so a 1 TiB stream costs O(1) memory.
+pub struct StreamIdentity {
+    hash: Sha256,
+    length: u64,
+    chunks: u64,
+    partial: bool,
+}
+
+impl Default for StreamIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamIdentity {
+    pub fn new() -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"silo:stream:v1\n");
+        hash.update(b"{\"chunkSize\":8388608,\"chunks\":[");
+        Self {
+            hash,
+            length: 0,
+            chunks: 0,
+            partial: false,
+        }
+    }
+
+    /// Feed the next decoded chunk. Every chunk but the last is exactly
+    /// [`STREAM_CHUNK_BYTES`]; empty chunks do not exist.
+    pub fn push_chunk(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let length = u64::try_from(bytes.len()).map_err(|_| invalid("chunk length overflow"))?;
+        let digest = if bytes.iter().all(|byte| *byte == 0) {
+            None
+        } else {
+            Some(Sha256Digest::of_bytes(bytes))
+        };
+        self.push_digest(length, digest)
+    }
+
+    /// Feed an already classified chunk: `None` for an entirely zero chunk,
+    /// otherwise the SHA-256 of its decoded bytes.
+    pub fn push_digest(&mut self, length: u64, digest: Option<Sha256Digest>) -> Result<(), String> {
+        if length == 0 || length > STREAM_CHUNK_BYTES || self.partial {
+            return Err(invalid(
+                "stream chunks are 1..=8 MiB and only the final chunk is short",
+            ));
+        }
+        let total = self
+            .length
+            .checked_add(length)
+            .filter(|total| *total <= MAX_STREAM_BYTES)
+            .ok_or_else(|| invalid("stream exceeds its admitted length"))?;
+        if self.chunks != 0 {
+            self.hash.update(b",");
+        }
+        match digest {
+            None => self.hash.update(b"\"zero\""),
+            Some(digest) => self.hash.update(format!("\"{digest}\"").as_bytes()),
+        }
+        self.length = total;
+        self.chunks += 1;
+        self.partial = length < STREAM_CHUNK_BYTES;
+        Ok(())
+    }
+
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub fn finish(mut self) -> Sha256Digest {
+        self.hash.update(
+            format!(
+                "],\"kind\":\"stream\",\"length\":{},\"schema\":1}}",
+                self.length
+            )
+            .as_bytes(),
+        );
+        Sha256Digest(self.hash.finalize().into())
+    }
+}
+
+/// Name of one writable disk capture: `disks/<name>.raw`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct CaptureDiskName(String);
+
+impl CaptureDiskName {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        Self::try_from(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn file_name(&self) -> String {
+        format!("{}.raw", self.0)
+    }
+}
+
+impl TryFrom<String> for CaptureDiskName {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let bytes = value.as_bytes();
+        let valid = (1..=32).contains(&bytes.len())
+            && bytes[0].is_ascii_lowercase()
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(invalid(
+                "capture disk name must be 1..=32 of [a-z0-9-], starting with a letter",
+            ))
+        }
+    }
+}
+
+impl From<CaptureDiskName> for String {
+    fn from(value: CaptureDiskName) -> Self {
+        value.0
+    }
+}
+
+/// One staged payload. Serialized as its fixed path relative to the capture
+/// directory, so a role can never name an arbitrary file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CaptureRole {
+    Execution,
+    Devices,
+    Ram,
+    Layout,
+    Disk(CaptureDiskName),
+}
+
+impl CaptureRole {
+    pub fn relative_path(&self) -> String {
+        match self {
+            Self::Execution => CAPTURE_EXECUTION_FILE.into(),
+            Self::Devices => CAPTURE_DEVICES_FILE.into(),
+            Self::Ram => CAPTURE_RAM_FILE.into(),
+            Self::Layout => CAPTURE_LAYOUT_FILE.into(),
+            Self::Disk(name) => format!("{CAPTURE_DISKS_DIRECTORY}/{}", name.file_name()),
+        }
+    }
+}
+
+impl FromStr for CaptureRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            CAPTURE_EXECUTION_FILE => Self::Execution,
+            CAPTURE_DEVICES_FILE => Self::Devices,
+            CAPTURE_RAM_FILE => Self::Ram,
+            CAPTURE_LAYOUT_FILE => Self::Layout,
+            other => {
+                let name = other
+                    .strip_prefix(CAPTURE_DISKS_DIRECTORY)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .and_then(|rest| rest.strip_suffix(".raw"))
+                    .ok_or_else(|| invalid(format!("unknown capture role {other:?}")))?;
+                Self::Disk(CaptureDiskName::new(name)?)
+            }
+        })
+    }
+}
+
+impl Serialize for CaptureRole {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.relative_path())
+    }
+}
+
+impl<'de> Deserialize<'de> for CaptureRole {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Path-free disk attachment identity, in attachment order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureAttachment {
+    pub block_id: BlockId,
+    pub role: DiskRole,
+    pub format: DiskFormat,
+    pub geometry: DiskGeometry,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureShare {
+    pub tag: String,
+    pub read_only: bool,
+}
+
+/// The machine configuration and attachment inventory a capture binds. It is
+/// the path-free projection of the launched `VmSpec`: host paths are never
+/// identity, so moving `SILO_HOME` does not change it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureConfiguration {
+    #[serde(deserialize_with = "required")]
+    pub guest_os: Option<GuestOs>,
+    pub cpus: u8,
+    pub memory_mib: u32,
+    pub nested_virtualization: bool,
+    pub rosetta: bool,
+    pub kernel_cmdline: Vec<String>,
+    pub vsock: bool,
+    pub attachments: Vec<CaptureAttachment>,
+    pub shares: Vec<CaptureShare>,
+}
+
+impl CaptureConfiguration {
+    /// Project exactly what the monitor launches: the same defaults apply on
+    /// both sides because both call this function on the same spec bytes.
+    pub fn from_spec(spec: &VmSpec) -> Result<Self, String> {
+        let hardware = spec.hardware.as_ref();
+        let configuration = Self {
+            guest_os: spec.guest.as_ref().and_then(|guest| guest.os),
+            cpus: hardware
+                .and_then(|hardware| hardware.cpus)
+                .unwrap_or(crate::DEFAULT_CPUS),
+            memory_mib: hardware
+                .and_then(|hardware| hardware.memory)
+                .unwrap_or(crate::DEFAULT_MEMORY_MIB),
+            nested_virtualization: hardware
+                .and_then(|hardware| hardware.nested_virtualization)
+                .unwrap_or(false),
+            rosetta: hardware
+                .and_then(|hardware| hardware.rosetta)
+                .unwrap_or(false),
+            kernel_cmdline: spec
+                .boot
+                .as_ref()
+                .and_then(|boot| boot.kernel.as_ref())
+                .map(|kernel| kernel.cmdline.clone())
+                .unwrap_or_default(),
+            vsock: crate::effective_vsock_enabled(spec.vsock.as_ref()),
+            attachments: spec
+                .storage
+                .as_ref()
+                .map(|storage| {
+                    storage
+                        .disks
+                        .iter()
+                        .map(|disk| CaptureAttachment {
+                            block_id: disk.block_id.clone(),
+                            role: disk.role,
+                            format: disk.format,
+                            geometry: disk.geometry,
+                            read_only: disk.read_only,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            shares: spec
+                .mounts
+                .iter()
+                .map(|mount| CaptureShare {
+                    tag: mount.tag.clone(),
+                    read_only: mount.read_only,
+                })
+                .collect(),
+        };
+        configuration.validate()?;
+        Ok(configuration)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cpus == 0 || self.memory_mib == 0 {
+            return Err(invalid("capture configuration needs vCPUs and memory"));
+        }
+        if self.kernel_cmdline.len() > 1024
+            || self
+                .kernel_cmdline
+                .iter()
+                .any(|argument| argument.len() > 4096 || argument.contains('\0'))
+        {
+            return Err(invalid(
+                "capture configuration kernel command line is unbounded",
+            ));
+        }
+        for attachment in &self.attachments {
+            crate::Disk::validate_attachment(
+                attachment.role,
+                attachment.format,
+                attachment.geometry,
+                &attachment.block_id,
+                attachment.read_only,
+            )?;
+        }
+        Storage::validate_attachment_sequence(
+            self.attachments
+                .iter()
+                .map(|attachment| (attachment.role, &attachment.block_id)),
+        )?;
+        if self.shares.len() > 64
+            || self.shares.iter().enumerate().any(|(index, share)| {
+                share.tag.is_empty()
+                    || share.tag.len() > crate::VIRTIOFS_TAG_MAX_BYTES
+                    || share.tag.contains('\0')
+                    || self.shares[..index]
+                        .iter()
+                        .any(|other| other.tag == share.tag)
+            })
+        {
+            return Err(invalid("capture configuration shares are invalid"));
+        }
+        Ok(())
+    }
+
+    /// Canonical JSON: fixed field order, no whitespace, closed schema.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    /// `sha256("silo:capture-configuration:v1\n" || canonical bytes)`.
+    pub fn digest(&self) -> Result<Sha256Digest, String> {
+        let mut hash = Sha256::new();
+        hash.update(b"silo:capture-configuration:v1\n");
+        hash.update(self.canonical_bytes()?);
+        Ok(Sha256Digest(hash.finalize().into()))
+    }
+
+    pub fn ram_bytes(&self) -> u64 {
+        u64::from(self.memory_mib) * MIB
+    }
+}
+
+/// How the capture obtains its cut. A borrowed user pause stays user-owned
+/// and requires `preserve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind",
+    deny_unknown_fields
+)]
+pub enum CapturePauseAuthority {
+    Acquire,
+    Borrow {
+        pause_operation_id: LiveId,
+        token: PauseToken,
+    },
+}
+
+/// Monitor clone/copy contract chosen by libvm's reservation. `Clone` was
+/// reserved at the 16 MiB metadata charge: a clone failure fails the capture
+/// rather than overrunning the reservation with a copy. `Copy` was reserved
+/// at allocated bytes and uses clone when available, else a sparse copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureDiskCopy {
+    Clone,
+    Copy,
+}
+
+/// One included writable attachment, sealed into `disks/<name>.raw`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureDiskPlan {
+    pub name: CaptureDiskName,
+    pub attachment_index: u32,
+    pub block_id: BlockId,
+    pub length: u64,
+    pub copy: CaptureDiskCopy,
+}
+
+/// One read-only attachment (flat lower, read-only data), bound by libvm's
+/// immutable content identity and never copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureReadOnlyInput {
+    pub attachment_index: u32,
+    pub block_id: BlockId,
+    pub identity: String,
+}
+
+/// The run's inherited launch storage lease the capture is bound to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureLaunchLease {
+    pub operation_id: LiveId,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureReservation {
+    /// libvm's durable capture storage operation (charges and input pins).
+    pub storage_operation_id: LiveId,
+    pub launch_lease: CaptureLaunchLease,
+    /// Reserved staging bytes before freeze (ADR 0021 formula, at least).
+    pub staging_bytes: u64,
+}
+
+/// The complete immutable capture plan. `request.json` is exactly
+/// [`CapturePlan::canonical_bytes`]; the capture ID is the Capture request
+/// and operation ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapturePlan {
+    pub version: u32,
+    pub machine_id: LiveId,
+    pub run_id: LiveId,
+    pub capture_id: LiveId,
+    pub configuration: CaptureConfiguration,
+    pub configuration_digest: Sha256Digest,
+    pub policy: CapturePolicy,
+    pub resume_policy: CaptureResumePolicy,
+    pub pause: CapturePauseAuthority,
+    pub ram_bytes: u64,
+    pub disks: Vec<CaptureDiskPlan>,
+    pub read_only_inputs: Vec<CaptureReadOnlyInput>,
+    pub reservation: CaptureReservation,
+}
+
+impl CapturePlan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != CAPTURE_RECORD_VERSION {
+            return Err(invalid("unsupported capture plan version"));
+        }
+        self.configuration.validate()?;
+        if self.configuration.digest()? != self.configuration_digest {
+            return Err(invalid(
+                "capture plan configuration digest does not match its configuration",
+            ));
+        }
+        if let CapturePauseAuthority::Borrow { token, .. } = &self.pause {
+            if self.resume_policy != CaptureResumePolicy::Preserve {
+                return Err(invalid(
+                    "a capture that borrows a user pause must preserve it",
+                ));
+            }
+            if token.owner != PauseOwner::User
+                || token.machine_id != self.machine_id
+                || token.run_id != self.run_id
+            {
+                return Err(invalid(
+                    "a borrowed pause must be this run's user-owned token",
+                ));
+            }
+        }
+        if self.ram_bytes != self.configuration.ram_bytes()
+            || self.ram_bytes == 0
+            || self.ram_bytes > MAX_CAPTURE_RAM_BYTES
+        {
+            return Err(invalid(
+                "capture RAM bytes must equal configured memory and stay within 1 TiB",
+            ));
+        }
+        let mut disks = self.disks.iter();
+        let mut inputs = self.read_only_inputs.iter();
+        let mut names: Vec<&CaptureDiskName> = Vec::with_capacity(self.disks.len());
+        let mut minimum = self
+            .ram_bytes
+            .checked_add(CAPTURE_STATE_RESERVE_BYTES)
+            .ok_or_else(|| invalid("capture reservation overflow"))?;
+        let mut stream_bytes = self.ram_bytes;
+        for (index, attachment) in self.configuration.attachments.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| invalid("attachment index overflow"))?;
+            if attachment.read_only {
+                let input = inputs
+                    .next()
+                    .ok_or_else(|| invalid("read-only attachment lacks its input identity"))?;
+                if input.attachment_index != index
+                    || input.block_id != attachment.block_id
+                    || input.identity.is_empty()
+                    || input.identity.len() > MAX_INPUT_IDENTITY_BYTES
+                    || !input.identity.bytes().all(|byte| byte.is_ascii_graphic())
+                {
+                    return Err(invalid(
+                        "read-only inputs must name every read-only attachment in order",
+                    ));
+                }
+                continue;
+            }
+            let disk = disks
+                .next()
+                .ok_or_else(|| invalid("writable attachment lacks its capture role"))?;
+            if disk.attachment_index != index
+                || disk.block_id != attachment.block_id
+                || disk.length != attachment.geometry.length
+                || attachment.format != DiskFormat::Raw
+            {
+                return Err(invalid(
+                    "capture disks must name every writable raw attachment in order",
+                ));
+            }
+            if names.contains(&&disk.name) {
+                return Err(invalid("capture disk names must be unique"));
+            }
+            names.push(&disk.name);
+            let charge = match disk.copy {
+                CaptureDiskCopy::Clone => CAPTURE_CLONE_RESERVE_BYTES,
+                // Allocation is measured by the reservation; the logical
+                // length is only an upper bound, so it is not required here.
+                CaptureDiskCopy::Copy => 0,
+            };
+            minimum = minimum
+                .checked_add(charge)
+                .ok_or_else(|| invalid("capture reservation overflow"))?;
+            stream_bytes = stream_bytes
+                .checked_add(disk.length)
+                .ok_or_else(|| invalid("capture stream overflow"))?;
+        }
+        if disks.next().is_some() || inputs.next().is_some() {
+            return Err(invalid("capture plan names roles for absent attachments"));
+        }
+        if stream_bytes > MAX_STREAM_BYTES {
+            return Err(invalid("capture closure exceeds 4 TiB of logical streams"));
+        }
+        if self.reservation.staging_bytes < minimum || self.reservation.launch_lease.inode == 0 {
+            return Err(invalid(
+                "capture reservation is below the staging minimum or lacks its launch lease",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exact `request.json` bytes.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    /// Strict closed decoding of `request.json`: canonical bytes only.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let plan = Self::parse_canonical(bytes)?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Closed canonical syntax only. Semantic validity is checked separately
+    /// so the monitor can answer an invalid plan with a typed rejection.
+    pub fn parse_canonical(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_CAPTURE_RECORD_BYTES {
+            return Err(invalid("capture plan exceeds its bound"));
+        }
+        let plan: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if plan.canonical_bytes()? != bytes {
+            return Err(invalid("capture plan bytes are not canonical"));
+        }
+        Ok(plan)
+    }
+
+    pub fn directory(&self) -> String {
+        capture_directory(&self.capture_id)
+    }
+
+    /// The exact closed payload inventory of a coherent capture, in canonical
+    /// order: execution, devices, RAM, layout, then disks in attachment order.
+    pub fn roles(&self) -> Vec<CaptureRole> {
+        let mut roles = vec![
+            CaptureRole::Execution,
+            CaptureRole::Devices,
+            CaptureRole::Ram,
+            CaptureRole::Layout,
+        ];
+        roles.extend(
+            self.disks
+                .iter()
+                .map(|disk| CaptureRole::Disk(disk.name.clone())),
+        );
+        roles
+    }
+}
+
+/// Native execution/RAM binding, needed to authenticate the RAM image for
+/// a later restore. Every 32-byte field is carried as a `sha256:` spelling of
+/// the native bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureStateBinding {
+    pub native_producer: String,
+    pub silo_producer: Sha256Digest,
+    pub profile: Sha256Digest,
+    pub topology: Sha256Digest,
+    pub ram_layout: Sha256Digest,
+    pub source_run: LiveId,
+    pub pause_generation: NonZeroU64,
+    pub capture: LiveId,
+}
+
+/// RAM layout and geometry of `memory.ram`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureMemoryEvidence {
+    pub packed_length: u64,
+    pub page_granule: u32,
+    pub regions: u32,
+    /// ADR 0014 canonical stream identity of `memory.ram`.
+    pub ram_stream: Sha256Digest,
+    pub binding: CaptureStateBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureInventoryEntry {
+    pub role: CaptureRole,
+    pub length: u64,
+    pub sha256: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureRecordOutcome {
+    Coherent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapturePauseDisposition {
+    Acquired,
+    Borrowed,
+}
+
+/// `vm.capture.json`, version 1. A coherent record is the seal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureEvidence {
+    pub version: u32,
+    pub machine_id: LiveId,
+    pub run_id: LiveId,
+    pub capture_id: LiveId,
+    /// The cut token (historical); absent only when no pause was established.
+    #[serde(deserialize_with = "required")]
+    pub pause_token: Option<PauseToken>,
+    #[serde(deserialize_with = "required")]
+    pub pause_disposition: Option<CapturePauseDisposition>,
+    #[serde(deserialize_with = "required")]
+    pub freeze_epoch: Option<NonZeroU64>,
+    pub configuration_digest: Sha256Digest,
+    /// SHA-256 of the exact `request.json` bytes.
+    pub request_digest: Sha256Digest,
+    #[serde(deserialize_with = "required")]
+    pub memory: Option<CaptureMemoryEvidence>,
+    pub inventory: Vec<CaptureInventoryEntry>,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+    pub capture_outcome: CaptureRecordOutcome,
+    #[serde(deserialize_with = "required")]
+    pub error: Option<Diagnostic>,
+    pub workloads_frozen: bool,
+    pub vcpus_paused: bool,
+    pub devices_quiesced: bool,
+    pub host_writers_drained: bool,
+    pub host_flush_completed: bool,
+    pub disk_copies_sealed: bool,
+    pub memory_state_sealed: bool,
+}
+
+impl CaptureEvidence {
+    pub fn facts(&self) -> [bool; 7] {
+        [
+            self.workloads_frozen,
+            self.vcpus_paused,
+            self.devices_quiesced,
+            self.host_writers_drained,
+            self.host_flush_completed,
+            self.disk_copies_sealed,
+            self.memory_state_sealed,
+        ]
+    }
+
+    /// Additive decoding: unknown top-level fields are ignored, every known
+    /// field is mandatory (an explicit `null` for absent options) and a
+    /// duplicate key is rejected.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_CAPTURE_RECORD_BYTES {
+            return Err(invalid("capture evidence exceeds its bound"));
+        }
+        let evidence: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.capture_outcome == CaptureRecordOutcome::Coherent && self.validate().is_ok()
+    }
+
+    /// Internal consistency. A coherent record needs all seven facts, a cut
+    /// token, RAM geometry and a complete inventory; a failed record needs an
+    /// error. A failed record is never a seal.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != CAPTURE_RECORD_VERSION {
+            return Err(invalid("unsupported capture evidence version"));
+        }
+        if let Some(token) = &self.pause_token {
+            if token.machine_id != self.machine_id || token.run_id != self.run_id {
+                return Err(invalid("capture evidence token belongs to another run"));
+            }
+        }
+        if self.pause_token.is_some() != self.pause_disposition.is_some() {
+            return Err(invalid(
+                "capture pause token and disposition travel together",
+            ));
+        }
+        if self.completed_at_unix_ms < self.started_at_unix_ms {
+            return Err(invalid("capture completed before it started"));
+        }
+        match self.capture_outcome {
+            CaptureRecordOutcome::Failed => {
+                if self.error.is_none() {
+                    return Err(invalid("a failed capture record carries its error"));
+                }
+                Ok(())
+            }
+            CaptureRecordOutcome::Coherent => {
+                if self.error.is_some() || self.facts().contains(&false) {
+                    return Err(invalid(
+                        "a coherent capture has no error and all seven facts true",
+                    ));
+                }
+                let (Some(token), Some(disposition), Some(_), Some(memory)) = (
+                    &self.pause_token,
+                    self.pause_disposition,
+                    self.freeze_epoch,
+                    &self.memory,
+                ) else {
+                    return Err(invalid(
+                        "a coherent capture binds its pause, freeze and RAM geometry",
+                    ));
+                };
+                let expected_owner = match disposition {
+                    CapturePauseDisposition::Acquired => PauseOwner::Capture {
+                        operation_id: self.capture_id.clone(),
+                    },
+                    CapturePauseDisposition::Borrowed => PauseOwner::User,
+                };
+                if token.owner != expected_owner
+                    || memory.binding.pause_generation != token.generation
+                    || memory.binding.capture != self.capture_id
+                    || memory.binding.source_run != self.run_id
+                    || memory.binding.native_producer.is_empty()
+                    || memory.binding.native_producer.len() > MAX_NATIVE_PRODUCER_BYTES
+                {
+                    return Err(invalid("capture binding does not match its cut"));
+                }
+                if !memory.page_granule.is_power_of_two()
+                    || memory.page_granule < 4096
+                    || memory.regions == 0
+                    || memory.packed_length == 0
+                    || memory.packed_length > MAX_CAPTURE_RAM_BYTES
+                    || memory.packed_length % u64::from(memory.page_granule) != 0
+                {
+                    return Err(invalid("capture RAM geometry is invalid"));
+                }
+                let mut state_bytes = 0u64;
+                for (index, entry) in self.inventory.iter().enumerate() {
+                    if self.inventory[..index]
+                        .iter()
+                        .any(|other| other.role == entry.role)
+                    {
+                        return Err(invalid("capture inventory repeats a role"));
+                    }
+                    match &entry.role {
+                        CaptureRole::Ram if entry.length != memory.packed_length => {
+                            return Err(invalid("RAM length differs from its layout"));
+                        }
+                        CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout => {
+                            if entry.length == 0 {
+                                return Err(invalid("captured state files are nonempty"));
+                            }
+                            state_bytes = state_bytes
+                                .checked_add(entry.length)
+                                .ok_or_else(|| invalid("state length overflow"))?;
+                        }
+                        _ => {}
+                    }
+                }
+                if state_bytes > CAPTURE_STATE_RESERVE_BYTES {
+                    return Err(invalid("captured state exceeds its reserve"));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Correlate a record with the exact plan and `request.json` bytes it
+    /// claims. For a coherent record the inventory must be exactly the plan's
+    /// closed role set, in order, with the planned disk lengths.
+    pub fn validate_against_plan(
+        &self,
+        plan: &CapturePlan,
+        request_digest: &Sha256Digest,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if self.machine_id != plan.machine_id
+            || self.run_id != plan.run_id
+            || self.capture_id != plan.capture_id
+            || self.configuration_digest != plan.configuration_digest
+            || &self.request_digest != request_digest
+        {
+            return Err(invalid("capture evidence belongs to another plan"));
+        }
+        if self.capture_outcome == CaptureRecordOutcome::Failed {
+            return Ok(());
+        }
+        let expected_disposition = match &plan.pause {
+            CapturePauseAuthority::Acquire => CapturePauseDisposition::Acquired,
+            CapturePauseAuthority::Borrow { token, .. } => {
+                if self.pause_token.as_ref() != Some(token) {
+                    return Err(invalid("borrowed capture did not keep the user token"));
+                }
+                CapturePauseDisposition::Borrowed
+            }
+        };
+        if self.pause_disposition != Some(expected_disposition) {
+            return Err(invalid("capture pause disposition differs from its plan"));
+        }
+        let roles = plan.roles();
+        if roles.len() != self.inventory.len()
+            || roles
+                .iter()
+                .zip(&self.inventory)
+                .any(|(role, entry)| role != &entry.role)
+        {
+            return Err(invalid("capture inventory differs from the plan's roles"));
+        }
+        for disk in &plan.disks {
+            let role = CaptureRole::Disk(disk.name.clone());
+            if !self
+                .inventory
+                .iter()
+                .any(|entry| entry.role == role && entry.length == disk.length)
+            {
+                return Err(invalid("sealed disk length differs from its attachment"));
+            }
+        }
+        if self
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.packed_length > plan.ram_bytes)
+        {
+            return Err(invalid("captured RAM exceeds the planned memory"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureSourceOutcome {
+    Resumed,
+    Preserved,
+    ResumeFailed,
+}
+
+/// `vm.capture-source.json`, version 1: the source continuation outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureSourceRecord {
+    pub version: u32,
+    pub machine_id: LiveId,
+    pub run_id: LiveId,
+    pub capture_id: LiveId,
+    /// The cut token named by `vm.capture.json`.
+    pub pause_token: PauseToken,
+    pub source_outcome: CaptureSourceOutcome,
+    #[serde(deserialize_with = "required")]
+    pub error: Option<Diagnostic>,
+    /// For `preserved`: the user-owned authority established by preservation.
+    #[serde(deserialize_with = "required")]
+    pub current_pause: Option<PauseToken>,
+    pub completed_at_unix_ms: u64,
+}
+
+impl CaptureSourceRecord {
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_CAPTURE_RECORD_BYTES {
+            return Err(invalid("capture source record exceeds its bound"));
+        }
+        let record: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != CAPTURE_RECORD_VERSION {
+            return Err(invalid("unsupported capture source record version"));
+        }
+        let same_run =
+            |token: &PauseToken| token.machine_id == self.machine_id && token.run_id == self.run_id;
+        if !same_run(&self.pause_token) {
+            return Err(invalid("capture source token belongs to another run"));
+        }
+        match (self.source_outcome, &self.error, &self.current_pause) {
+            (CaptureSourceOutcome::Resumed, None, None) => Ok(()),
+            (CaptureSourceOutcome::Preserved, None, Some(current))
+                if current.owner == PauseOwner::User
+                    && same_run(current)
+                    && current.generation >= self.pause_token.generation =>
+            {
+                Ok(())
+            }
+            (CaptureSourceOutcome::ResumeFailed, Some(_), _) => Ok(()),
+            _ => Err(invalid(
+                "capture source outcome, error and current pause are inconsistent",
+            )),
+        }
+    }
+
+    /// Correlate with the coherent or failed record of the same capture.
+    pub fn validate_against(&self, evidence: &CaptureEvidence) -> Result<(), String> {
+        self.validate()?;
+        if self.machine_id != evidence.machine_id
+            || self.run_id != evidence.run_id
+            || self.capture_id != evidence.capture_id
+            || evidence.pause_token.as_ref() != Some(&self.pause_token)
+        {
+            return Err(invalid("capture source record belongs to another capture"));
+        }
+        Ok(())
+    }
+}
+
+/// Wire success of a Capture: `succeeded` and sealed are the same event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureSealed {
+    pub capture_id: LiveId,
+    /// SHA-256 of the exact durable `vm.capture.json` bytes.
+    pub evidence_sha256: Sha256Digest,
+    /// Historical cut token; never current Resume authority by itself.
+    pub cut_token: PauseToken,
+}
+
+/// Source continuation, independent of the capture outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    tag = "status",
+    deny_unknown_fields
+)]
+pub enum CaptureContinuation {
+    /// Continuation has not finished (or not started).
+    Pending,
+    /// No pause was ever established: the source never left its state.
+    Unchanged,
+    Resumed {
+        consumed_token: PauseToken,
+        thawed_epoch: NonZeroU64,
+    },
+    /// The source stays paused under user authority (transferred or borrowed).
+    Preserved { preserved: CurrentPause },
+    ResumeFailed {
+        failure: LiveFailure,
+        /// Paused, Error, or stopping when stop preempted the continuation.
+        state: VmLifecycleState,
+    },
+}
+
+impl CaptureContinuation {
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Preserved { preserved } if preserved.token.owner != PauseOwner::User => {
+                Err(invalid("a preserved source is user-owned"))
+            }
+            Self::ResumeFailed { failure, .. } => failure.validate(),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureReleaseDisposition {
+    /// libvm durably published the sealed closure.
+    Published,
+    /// libvm abandoned the result (failed, cancelled or refused).
+    Abandoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    tag = "status",
+    deny_unknown_fields
+)]
+pub enum CaptureReleaseState {
+    Retained,
+    Released {
+        disposition: CaptureReleaseDisposition,
+        /// The live source still maps the accepted staging RAM as its
+        /// dirty-tracking baseline; staging must not be removed.
+        baseline_retained: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureEvidenceReference {
+    pub outcome: CaptureRecordOutcome,
+    pub sha256: Sha256Digest,
+}
+
+/// Capture-specific facts in `GetOperation` for a capture operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureObservation {
+    pub continuation: CaptureContinuation,
+    pub release: CaptureReleaseState,
+    /// Present once a durable `vm.capture.json` (coherent or failed) exists.
+    #[serde(deserialize_with = "required")]
+    pub evidence: Option<CaptureEvidenceReference>,
+    /// Present once a durable `vm.capture-source.json` exists.
+    #[serde(deserialize_with = "required")]
+    pub source_record_sha256: Option<Sha256Digest>,
+}
+
+impl CaptureObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        self.continuation.validate()
+    }
+}
+
+/// Successful ReleaseCapture; repeated release returns the same value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureReleased {
+    pub operation_id: LiveId,
+    pub disposition: CaptureReleaseDisposition,
+    pub baseline_retained: bool,
+    pub state: VmLifecycleState,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::capture::*;
+    use crate::lifecycle::{LiveFailureCode, LiveStage};
+    use crate::{Disk, Hardware, Mount};
+
+    fn id(value: &str) -> LiveId {
+        LiveId::parse(value).unwrap()
+    }
+
+    fn machine() -> LiveId {
+        id("11111111-1111-4111-8111-111111111111")
+    }
+
+    fn run() -> LiveId {
+        id("22222222-2222-4222-8222-222222222222")
+    }
+
+    fn capture() -> LiveId {
+        id("33333333-3333-4333-8333-333333333333")
+    }
+
+    fn spec() -> VmSpec {
+        VmSpec {
+            hardware: Some(Hardware {
+                cpus: Some(2),
+                memory: Some(1024),
+                nested_virtualization: None,
+                rosetta: None,
+            }),
+            storage: Some(Storage {
+                disks: vec![
+                    Disk {
+                        path: "lower.vmdk".into(),
+                        role: DiskRole::RootLower,
+                        format: DiskFormat::Vmdk,
+                        geometry: DiskGeometry {
+                            length: 1 << 30,
+                            logical_sector_size: 512,
+                        },
+                        block_id: BlockId::new("silo-root-lower").unwrap(),
+                        read_only: true,
+                    },
+                    Disk {
+                        path: "upper.raw".into(),
+                        role: DiskRole::RootUpper,
+                        format: DiskFormat::Raw,
+                        geometry: DiskGeometry {
+                            length: 1 << 30,
+                            logical_sector_size: 512,
+                        },
+                        block_id: BlockId::new("silo-root-upper").unwrap(),
+                        read_only: false,
+                    },
+                    Disk {
+                        path: "/abs/data.raw".into(),
+                        role: DiskRole::Data,
+                        format: DiskFormat::Raw,
+                        geometry: DiskGeometry {
+                            length: 1 << 20,
+                            logical_sector_size: 512,
+                        },
+                        block_id: BlockId::new("data0").unwrap(),
+                        read_only: false,
+                    },
+                ],
+            }),
+            ..VmSpec::current()
+        }
+    }
+
+    fn user_token(generation: u64) -> PauseToken {
+        PauseToken {
+            machine_id: machine(),
+            run_id: run(),
+            generation: NonZeroU64::new(generation).unwrap(),
+            owner: PauseOwner::User,
+        }
+    }
+
+    fn plan() -> CapturePlan {
+        let configuration = CaptureConfiguration::from_spec(&spec()).unwrap();
+        CapturePlan {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: machine(),
+            run_id: run(),
+            capture_id: capture(),
+            configuration_digest: configuration.digest().unwrap(),
+            ram_bytes: configuration.ram_bytes(),
+            configuration,
+            policy: CapturePolicy::Full,
+            resume_policy: CaptureResumePolicy::ResumeIfAcquired,
+            pause: CapturePauseAuthority::Acquire,
+            disks: vec![
+                CaptureDiskPlan {
+                    name: CaptureDiskName::new("root-upper").unwrap(),
+                    attachment_index: 1,
+                    block_id: BlockId::new("silo-root-upper").unwrap(),
+                    length: 1 << 30,
+                    copy: CaptureDiskCopy::Copy,
+                },
+                CaptureDiskPlan {
+                    name: CaptureDiskName::new("data0").unwrap(),
+                    attachment_index: 2,
+                    block_id: BlockId::new("data0").unwrap(),
+                    length: 1 << 20,
+                    copy: CaptureDiskCopy::Clone,
+                },
+            ],
+            read_only_inputs: vec![CaptureReadOnlyInput {
+                attachment_index: 0,
+                block_id: BlockId::new("silo-root-lower").unwrap(),
+                identity: format!("sha256:{}", "ab".repeat(32)),
+            }],
+            reservation: CaptureReservation {
+                storage_operation_id: id("44444444-4444-4444-8444-444444444444"),
+                launch_lease: CaptureLaunchLease {
+                    operation_id: id("55555555-5555-4555-8555-555555555555"),
+                    device: 7,
+                    inode: 9,
+                },
+                staging_bytes: (1 << 30) + (64 << 20) + (16 << 20),
+            },
+        }
+    }
+
+    fn evidence(plan: &CapturePlan) -> CaptureEvidence {
+        let token = PauseToken {
+            owner: PauseOwner::Capture {
+                operation_id: capture(),
+            },
+            ..user_token(3)
+        };
+        let digest = Sha256Digest::of_bytes(b"x");
+        CaptureEvidence {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: machine(),
+            run_id: run(),
+            capture_id: capture(),
+            pause_token: Some(token),
+            pause_disposition: Some(CapturePauseDisposition::Acquired),
+            freeze_epoch: NonZeroU64::new(4),
+            configuration_digest: plan.configuration_digest,
+            request_digest: Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap()),
+            memory: Some(CaptureMemoryEvidence {
+                packed_length: 1 << 30,
+                page_granule: 4096,
+                regions: 1,
+                ram_stream: digest,
+                binding: CaptureStateBinding {
+                    native_producer: "libkrun".into(),
+                    silo_producer: digest,
+                    profile: digest,
+                    topology: digest,
+                    ram_layout: digest,
+                    source_run: run(),
+                    pause_generation: NonZeroU64::new(3).unwrap(),
+                    capture: capture(),
+                },
+            }),
+            inventory: plan
+                .roles()
+                .into_iter()
+                .map(|role| CaptureInventoryEntry {
+                    length: match &role {
+                        CaptureRole::Ram => 1 << 30,
+                        CaptureRole::Disk(name) => {
+                            plan.disks
+                                .iter()
+                                .find(|disk| &disk.name == name)
+                                .unwrap()
+                                .length
+                        }
+                        _ => 100,
+                    },
+                    role,
+                    sha256: digest,
+                })
+                .collect(),
+            started_at_unix_ms: 10,
+            completed_at_unix_ms: 20,
+            capture_outcome: CaptureRecordOutcome::Coherent,
+            error: None,
+            workloads_frozen: true,
+            vcpus_paused: true,
+            devices_quiesced: true,
+            host_writers_drained: true,
+            host_flush_completed: true,
+            disk_copies_sealed: true,
+            memory_state_sealed: true,
+        }
+    }
+
+    #[test]
+    fn digest_spelling_is_strict() {
+        let digest = Sha256Digest::of_bytes(b"abc");
+        assert_eq!(
+            digest.to_string(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(digest.to_string().parse::<Sha256Digest>().unwrap(), digest);
+        for bad in [
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned(),
+            format!("sha256:{}", "AB".repeat(32)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("sha256:{}", "gg".repeat(32)),
+        ] {
+            assert!(bad.parse::<Sha256Digest>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn stream_identity_matches_the_canonical_adr0014_map() {
+        let mut stream = StreamIdentity::new();
+        let mut first = vec![0u8; STREAM_CHUNK_BYTES as usize];
+        stream.push_chunk(&first).unwrap();
+        first[17] = 1;
+        stream.push_chunk(&first).unwrap();
+        stream.push_chunk(&[0, 0, 7]).unwrap();
+        assert!(
+            stream.push_chunk(&[1]).is_err(),
+            "nothing follows a short chunk"
+        );
+        let canonical = format!(
+            "silo:stream:v1\n{{\"chunkSize\":8388608,\"chunks\":[\"zero\",\"{}\",\"{}\"],\"kind\":\"stream\",\"length\":{},\"schema\":1}}",
+            Sha256Digest::of_bytes(&first),
+            Sha256Digest::of_bytes(&[0, 0, 7]),
+            2 * STREAM_CHUNK_BYTES + 3
+        );
+        assert_eq!(
+            stream.finish(),
+            Sha256Digest::of_bytes(canonical.as_bytes())
+        );
+
+        let empty = StreamIdentity::new().finish();
+        assert_eq!(
+            empty,
+            Sha256Digest::of_bytes(
+                b"silo:stream:v1\n{\"chunkSize\":8388608,\"chunks\":[],\"kind\":\"stream\",\"length\":0,\"schema\":1}"
+            )
+        );
+        assert!(StreamIdentity::new().push_chunk(&[]).is_err());
+    }
+
+    #[test]
+    fn roles_are_fixed_relative_paths() {
+        for role in plan().roles() {
+            let text = serde_json::to_string(&role).unwrap();
+            assert_eq!(serde_json::from_str::<CaptureRole>(&text).unwrap(), role);
+        }
+        assert_eq!(
+            CaptureRole::Disk(CaptureDiskName::new("root").unwrap()).relative_path(),
+            "disks/root.raw"
+        );
+        for bad in [
+            "\"request.json\"",
+            "\"vm.capture.json\"",
+            "\"disks/../x.raw\"",
+            "\"disks/Root.raw\"",
+            "\"disks/root.img\"",
+            "\"/memory.ram\"",
+        ] {
+            assert!(serde_json::from_str::<CaptureRole>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn configuration_is_path_free_and_digest_stable() {
+        let mut moved = spec();
+        if let Some(storage) = moved.storage.as_mut() {
+            for disk in &mut storage.disks {
+                disk.path = format!("/elsewhere/{}", disk.path.display()).into();
+            }
+        }
+        let original = CaptureConfiguration::from_spec(&spec()).unwrap();
+        assert_eq!(CaptureConfiguration::from_spec(&moved).unwrap(), original);
+        assert_eq!(original.digest().unwrap(), original.digest().unwrap());
+        let mut resized = spec();
+        resized.hardware.as_mut().unwrap().memory = Some(2048);
+        assert_ne!(
+            CaptureConfiguration::from_spec(&resized)
+                .unwrap()
+                .digest()
+                .unwrap(),
+            original.digest().unwrap()
+        );
+        let mut shared = spec();
+        shared.mounts.push(Mount {
+            source: "/a".into(),
+            tag: "share".into(),
+            read_only: true,
+        });
+        assert_ne!(
+            CaptureConfiguration::from_spec(&shared).unwrap(),
+            original,
+            "a share is part of the attachment inventory"
+        );
+        let defaults = CaptureConfiguration::from_spec(&VmSpec::current()).unwrap();
+        assert_eq!(defaults.cpus, crate::DEFAULT_CPUS);
+        assert_eq!(defaults.memory_mib, crate::DEFAULT_MEMORY_MIB);
+    }
+
+    #[test]
+    fn plan_round_trips_canonically_and_rejects_noncanonical_bytes() {
+        let plan = plan();
+        plan.validate().unwrap();
+        let bytes = plan.canonical_bytes().unwrap();
+        assert_eq!(CapturePlan::decode(&bytes).unwrap(), plan);
+        let mut spaced = b" ".to_vec();
+        spaced.extend_from_slice(&bytes);
+        assert!(CapturePlan::decode(&spaced).is_err());
+        let text = String::from_utf8(bytes).unwrap();
+        let unknown = text.replacen('{', "{\"extra\":1,", 1);
+        assert!(CapturePlan::decode(unknown.as_bytes()).is_err());
+        let duplicate = text.replacen('{', "{\"version\":1,", 1);
+        assert!(CapturePlan::decode(duplicate.as_bytes()).is_err());
+        assert_eq!(plan.directory(), format!("captures/{}", capture()));
+    }
+
+    #[test]
+    fn evidence_preserves_native_producer_through_its_abi_bound() {
+        let mut record = evidence(&plan());
+        for length in [
+            8239,
+            MAX_NATIVE_PRODUCER_BYTES,
+            MAX_NATIVE_PRODUCER_BYTES + 1,
+        ] {
+            record.memory.as_mut().unwrap().binding.native_producer = "p".repeat(length);
+            assert_eq!(
+                record.validate().is_ok(),
+                length <= MAX_NATIVE_PRODUCER_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn plan_rejects_every_inconsistent_binding() {
+        type PlanMutation = Box<dyn Fn(&mut CapturePlan)>;
+        let mutations: Vec<PlanMutation> = vec![
+            Box::new(|plan| plan.version = 2),
+            Box::new(|plan| plan.configuration_digest = Sha256Digest::of_bytes(b"other")),
+            Box::new(|plan| plan.ram_bytes += 4096),
+            Box::new(|plan| plan.disks.swap(0, 1)),
+            Box::new(|plan| {
+                plan.disks.pop();
+            }),
+            Box::new(|plan| plan.disks[1].name = plan.disks[0].name.clone()),
+            Box::new(|plan| plan.disks[0].length -= 512),
+            Box::new(|plan| plan.disks[0].attachment_index = 0),
+            Box::new(|plan| plan.read_only_inputs.clear()),
+            Box::new(|plan| plan.read_only_inputs[0].identity.clear()),
+            Box::new(|plan| plan.reservation.staging_bytes = 1),
+            Box::new(|plan| plan.reservation.launch_lease.inode = 0),
+            Box::new(|plan| {
+                plan.pause = CapturePauseAuthority::Borrow {
+                    pause_operation_id: capture(),
+                    token: user_token(1),
+                }
+            }),
+            Box::new(|plan| {
+                plan.resume_policy = CaptureResumePolicy::Preserve;
+                plan.pause = CapturePauseAuthority::Borrow {
+                    pause_operation_id: capture(),
+                    token: PauseToken {
+                        owner: PauseOwner::Capture {
+                            operation_id: capture(),
+                        },
+                        ..user_token(1)
+                    },
+                }
+            }),
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut plan = plan();
+            mutate(&mut plan);
+            assert!(plan.validate().is_err(), "mutation {index}");
+        }
+        let mut borrowed = plan();
+        borrowed.resume_policy = CaptureResumePolicy::Preserve;
+        borrowed.pause = CapturePauseAuthority::Borrow {
+            pause_operation_id: capture(),
+            token: user_token(1),
+        };
+        borrowed.validate().unwrap();
+    }
+
+    #[test]
+    fn coherent_evidence_requires_every_fact_and_the_exact_inventory() {
+        let plan = plan();
+        let request = Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap());
+        let sealed = evidence(&plan);
+        sealed.validate_against_plan(&plan, &request).unwrap();
+        assert!(sealed.is_sealed());
+        let bytes = sealed.canonical_bytes().unwrap();
+        assert_eq!(CaptureEvidence::decode(&bytes).unwrap(), sealed);
+
+        for fact in 0..7 {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let name = [
+                "workloadsFrozen",
+                "vcpusPaused",
+                "devicesQuiesced",
+                "hostWritersDrained",
+                "hostFlushCompleted",
+                "diskCopiesSealed",
+                "memoryStateSealed",
+            ][fact];
+            value[name] = serde_json::Value::Bool(false);
+            assert!(CaptureEvidence::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+            value.as_object_mut().unwrap().remove(name);
+            assert!(CaptureEvidence::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+            value[name] = serde_json::Value::from("true");
+            assert!(CaptureEvidence::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        let additive = text.replacen('{', "{\"futureField\":{\"x\":1},", 1);
+        assert_eq!(
+            CaptureEvidence::decode(additive.as_bytes()).unwrap(),
+            sealed
+        );
+        let duplicate = text.replacen('{', "{\"vcpusPaused\":true,", 1);
+        assert!(CaptureEvidence::decode(duplicate.as_bytes()).is_err());
+
+        let mut missing_disk = sealed.clone();
+        missing_disk.inventory.pop();
+        assert!(missing_disk.validate_against_plan(&plan, &request).is_err());
+        let mut reordered = sealed.clone();
+        reordered.inventory.swap(0, 1);
+        assert!(reordered.validate_against_plan(&plan, &request).is_err());
+        let mut wrong_ram = sealed.clone();
+        wrong_ram.inventory[2].length -= 4096;
+        assert!(wrong_ram.validate().is_err());
+        let mut foreign = sealed.clone();
+        foreign.request_digest = Sha256Digest::of_bytes(b"other");
+        assert!(foreign.validate_against_plan(&plan, &request).is_err());
+        let mut wrong_owner = sealed.clone();
+        wrong_owner.pause_token.as_mut().unwrap().owner = PauseOwner::User;
+        assert!(wrong_owner.validate().is_err());
+        let mut errored = sealed.clone();
+        errored.error = Some(Diagnostic::new("x"));
+        assert!(errored.validate().is_err());
+    }
+
+    #[test]
+    fn failed_evidence_is_diagnostic_never_a_seal() {
+        let plan = plan();
+        let mut failed = evidence(&plan);
+        failed.capture_outcome = CaptureRecordOutcome::Failed;
+        failed.disk_copies_sealed = false;
+        failed.memory = None;
+        failed.inventory.clear();
+        assert!(failed.validate().is_err(), "failed needs an error");
+        failed.error = Some(Diagnostic::new("disk copy failed: ENOSPC"));
+        failed.validate().unwrap();
+        assert!(!failed.is_sealed());
+        let mut all_true = evidence(&plan);
+        all_true.capture_outcome = CaptureRecordOutcome::Failed;
+        all_true.error = Some(Diagnostic::new("cancelled"));
+        assert!(!all_true.is_sealed(), "facts never promote a failed record");
+    }
+
+    #[test]
+    fn source_record_outcomes_are_consistent() {
+        let plan = plan();
+        let sealed = evidence(&plan);
+        let cut = sealed.pause_token.clone().unwrap();
+        let resumed = CaptureSourceRecord {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: machine(),
+            run_id: run(),
+            capture_id: capture(),
+            pause_token: cut.clone(),
+            source_outcome: CaptureSourceOutcome::Resumed,
+            error: None,
+            current_pause: None,
+            completed_at_unix_ms: 30,
+        };
+        resumed.validate_against(&sealed).unwrap();
+        let bytes = resumed.canonical_bytes().unwrap();
+        assert_eq!(CaptureSourceRecord::decode(&bytes).unwrap(), resumed);
+        let preserved = CaptureSourceRecord {
+            source_outcome: CaptureSourceOutcome::Preserved,
+            current_pause: Some(user_token(3)),
+            ..resumed.clone()
+        };
+        preserved.validate().unwrap();
+        let wrong = CaptureSourceRecord {
+            current_pause: Some(user_token(2)),
+            ..preserved.clone()
+        };
+        assert!(
+            wrong.validate().is_err(),
+            "preserved cannot be older than the cut"
+        );
+        let failed = CaptureSourceRecord {
+            source_outcome: CaptureSourceOutcome::ResumeFailed,
+            error: None,
+            ..resumed.clone()
+        };
+        assert!(failed.validate().is_err());
+        let mut foreign = resumed.clone();
+        foreign.pause_token.generation = NonZeroU64::new(9).unwrap();
+        assert!(foreign.validate_against(&sealed).is_err());
+    }
+
+    #[test]
+    fn continuation_wire_shapes_are_closed() {
+        let preserved = CaptureContinuation::Preserved {
+            preserved: CurrentPause {
+                token: user_token(3),
+                operation_id: capture(),
+                freeze_epoch: NonZeroU64::new(4).unwrap(),
+            },
+        };
+        preserved.validate().unwrap();
+        let text = serde_json::to_string(&preserved).unwrap();
+        assert!(text.contains("\"status\":\"preserved\""));
+        assert_eq!(
+            serde_json::from_str::<CaptureContinuation>(&text).unwrap(),
+            preserved
+        );
+        let failed = CaptureContinuation::ResumeFailed {
+            failure: LiveFailure::new(LiveFailureCode::ThawFailed, LiveStage::ResumeThaw, "x"),
+            state: VmLifecycleState::Error,
+        };
+        assert!(failed.is_terminal());
+        assert!(!CaptureContinuation::Pending.is_terminal());
+    }
+}

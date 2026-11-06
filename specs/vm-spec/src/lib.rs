@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod lifecycle;
 pub mod live;
 
@@ -16,6 +17,12 @@ pub const DEFAULT_VSOCK_MUX_FILENAME: &str = "vsock.sock";
 
 /// Maximum virtio-fs tag size supported by the virtualization backends.
 pub const VIRTIOFS_TAG_MAX_BYTES: usize = 36;
+
+/// vCPU count launched when the spec leaves it unset.
+pub const DEFAULT_CPUS: u8 = 1;
+
+/// Guest memory in MiB launched when the spec leaves it unset.
+pub const DEFAULT_MEMORY_MIB: u32 = 512;
 
 const GENERATED_MOUNT_TAG_PREFIX: &str = "silo-mount-";
 

@@ -6,6 +6,7 @@ pub mod identity;
 pub mod identity_file;
 pub mod limits;
 pub mod locks;
+pub mod map;
 pub mod pool;
 pub mod stream;
 pub mod vmdk;
@@ -22,6 +23,12 @@ pub enum StorageError {
     Bound(#[from] limits::BoundViolation),
     #[error(transparent)]
     FileDescriptorBudget(#[from] limits::FileDescriptorBudgetError),
+    #[error("capture {resource} budget requires {required} bytes, available {available} bytes")]
+    CaptureBudget {
+        resource: &'static str,
+        required: u64,
+        available: u64,
+    },
     #[error("invalid owned storage path: {0}")]
     InvalidPath(String),
     #[error("stream map has {actual} chunks, expected {expected} for its length")]

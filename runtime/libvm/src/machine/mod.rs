@@ -7,6 +7,7 @@ mod inspect;
 mod lifecycle;
 mod lifecycle_options;
 pub(crate) mod live;
+pub(crate) mod live_capture;
 pub(crate) mod live_operations;
 mod logs;
 mod memory;
@@ -45,6 +46,10 @@ pub use lifecycle_options::{
     MachineStopOptions, MachineWaitOptions, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use live::{require_live_operation, LiveObservationReader, MachineLiveObservation};
+pub use live_capture::{
+    LiveCaptureSource, LiveCaptureSummary, LiveSnapshot, LiveSnapshotOptions, MachineCapture,
+    MachineCaptureStage,
+};
 pub use logs::{
     MachineLogChunk, MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream,
 };

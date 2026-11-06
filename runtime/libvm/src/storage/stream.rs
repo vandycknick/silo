@@ -18,7 +18,6 @@ use nix::sys::stat::Mode;
 use nix::unistd::{lseek, Whence};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use sha2::{Digest, Sha256};
 
 use crate::storage::identity::{ObjectDigest, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
@@ -96,11 +95,21 @@ impl StreamMap {
     }
 
     pub fn id(&self) -> StreamId {
-        let mut digest = CanonicalHash(Sha256::new());
-        digest.0.update(b"silo:stream:v1\n");
-        // CanonicalHash writes only into SHA-256 and cannot return an I/O error.
-        let _ = self.write_canonical(&mut digest);
-        StreamId::from_sha256(digest.0.finalize().into())
+        let mut identity = vm_spec::capture::StreamIdentity::new();
+        let mut remaining = self.length;
+        for chunk in &self.chunks {
+            let digest = match chunk {
+                Chunk::Zero => None,
+                Chunk::Data(digest) => Some(vm_spec::capture::Sha256Digest::from_bytes(
+                    *digest.as_bytes(),
+                )),
+            };
+            // StreamMap::new and every scanner enforce the same chunk count,
+            // final-chunk length and 4 TiB bound, so this feed cannot fail.
+            let _ = identity.push_digest(remaining.min(CHUNK_SIZE as u64), digest);
+            remaining = remaining.saturating_sub(CHUNK_SIZE as u64);
+        }
+        StreamId::from_sha256(*identity.finish().as_bytes())
     }
 
     /// RFC 8785 serialization for this closed schema, not a general JSON encoder.
@@ -175,19 +184,6 @@ pub struct StreamScan {
     pub stats: StreamStats,
     /// Independent completed-output scan for streaming copies.
     pub verification_stats: Option<StreamStats>,
-}
-
-struct CanonicalHash(Sha256);
-
-impl Write for CanonicalHash {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Reuses one fixed 8 MiB allocation across chunks and successive streams.

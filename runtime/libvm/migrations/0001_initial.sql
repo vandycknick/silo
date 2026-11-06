@@ -265,7 +265,7 @@ CREATE TABLE machine_storage (
 CREATE TABLE storage_operation (
     operation_id TEXT PRIMARY KEY NOT NULL,
     schema INTEGER NOT NULL CHECK (schema = 1),
-    kind TEXT NOT NULL CHECK (kind IN ('import', 'convert', 'snapshot', 'fork', 'relocate', 'update-boot-assets', 'launch')),
+    kind TEXT NOT NULL CHECK (kind IN ('import', 'convert', 'snapshot', 'capture', 'fork', 'relocate', 'update-boot-assets', 'launch')),
     state TEXT NOT NULL CHECK (state IN ('prepared', 'staging', 'committing', 'cleaning', 'committed', 'aborted')),
     machine_id TEXT,
     run_id TEXT,
@@ -343,7 +343,7 @@ BEGIN SELECT RAISE(ABORT, 'layer occurrence set is immutable'); END;
 CREATE TRIGGER layer_occurrence_immutable BEFORE UPDATE ON layer_occurrence
 BEGIN SELECT RAISE(ABORT, 'layer occurrence is immutable'); END;
 
--- Current immutable stopped-storage artifacts. Names are image: aliases;
+-- Immutable storage and execution artifacts. Names are image: aliases;
 -- explicit retention is independent of every alias.
 CREATE TABLE storage_snapshot (
     id TEXT PRIMARY KEY NOT NULL,
@@ -376,3 +376,14 @@ CREATE TRIGGER snapshot_stream_dependency_immutable BEFORE UPDATE ON snapshot_st
 BEGIN SELECT RAISE(ABORT, 'snapshot stream dependency is immutable'); END;
 CREATE TRIGGER snapshot_object_dependency_immutable BEFORE UPDATE ON snapshot_object_dependency
 BEGIN SELECT RAISE(ABORT, 'snapshot object dependency is immutable'); END;
+
+-- Provenance is authenticated independently, never mixed into snapshot identity.
+CREATE TABLE snapshot_capture_provenance (
+    capture_id TEXT PRIMARY KEY NOT NULL,
+    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
+    evidence_digest TEXT NOT NULL,
+    evidence_bytes BLOB NOT NULL
+);
+CREATE INDEX snapshot_capture_provenance_reverse_idx ON snapshot_capture_provenance(evidence_digest, snapshot_id);
+CREATE TRIGGER snapshot_capture_provenance_immutable BEFORE UPDATE ON snapshot_capture_provenance
+BEGIN SELECT RAISE(ABORT, 'capture provenance is immutable'); END;

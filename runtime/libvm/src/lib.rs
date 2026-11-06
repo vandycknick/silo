@@ -31,7 +31,10 @@ pub use crate::machine::{
     ExternalResourceMapping, ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions,
     RestoreOptions, SnapshotConfiguration, SnapshotOptions,
 };
-pub use crate::machine::{require_live_operation, LiveObservationReader, MachineLiveObservation};
+pub use crate::machine::{
+    require_live_operation, LiveCaptureSource, LiveCaptureSummary, LiveObservationReader,
+    LiveSnapshot, LiveSnapshotOptions, MachineCapture, MachineCaptureStage, MachineLiveObservation,
+};
 pub use crate::runtime::{
     require_host_live_operation, LiveCapabilityQuery, ResolvedBackendSelection,
 };
@@ -44,7 +47,9 @@ pub use crate::store::models::storage::{
     StorageOperationKind, StorageOperationRecord, StorageOperationState, StorageProfile,
     StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
 };
-pub use crate::store::snapshot_store::{SnapshotInfo, SnapshotRef, SnapshotStore};
+pub use crate::store::snapshot_store::{
+    SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo, SnapshotRef, SnapshotStore,
+};
 pub use vm_spec::{live, BlockId, DiskFormat};
 pub mod policy_secrets;
 pub use crate::image::{

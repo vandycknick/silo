@@ -189,6 +189,9 @@ reconnection observes the same operation and current pause authority, rather
 than creating another pause. Historical success does not authorize a consumed
 token. A new `CancelOperation` is rejected while `Paused`; cancellation is
 the recovery exit from an unfinished or failed `Pausing`.
+Manager journal and authority updates acquire the SQLite writer reservation
+before reading current state, so concurrent checkpoint publication cannot
+invalidate a deferred read-to-write upgrade.
 
 The monitor drains new session, mutation and forward-connection setup before
 freezing the workload. Existing streams remain attached. The worker's dedicated
@@ -211,6 +214,34 @@ status receipt observed after native release, then exact guest Thaw and readines
 before reporting `Running`. A lost Thaw acknowledgement requires
 a new freeze and native pause, with a new token; failed recovery stays fenced.
 Operation deadlines are never extended by parked freshness or transport retries.
+
+## Live Capture Ownership
+
+`live/capture.rs` coordinates workload freeze, native pause and provider drain,
+disk flush/copy, execution/device state and RAM sealing. The worker receives
+owned output descriptors over its lifecycle socket. Capture staging is private
+(`0700` directories, `0600` files); the write-once `vm.capture.json` publishes
+the seven cut facts only after the outputs are sealed and synchronized.
+
+libvm reserves staging space before freeze. Admission validates the held source
+identities and lengths, not a second allocation sample while the guest can still
+write. Before sealing, the monitor checks actual staged allocation against that
+reservation. Exceeding it fails capture with `staging-budget-exceeded` and applies
+the recorded continuation policy. This accounting is not a filesystem quota.
+
+A running source acquires capture-owned pause authority. `resume-if-acquired`
+continues that source; `preserve` transfers authority to the user. Capturing an
+already user-paused source requires `preserve` and borrows its exact token,
+never resumes it. Cancellation before sealing abandons the cut and applies
+the continuation policy; cancellation after sealing cannot discard the cut.
+`vm.capture-source.json` records continuation separately from capture success.
+
+libvm verifies the sealed closure and native envelope bindings before publishing
+a `live-execution` snapshot. Publication serializes concurrent consumers and
+retains independent pool RAM, dependency roots and native baseline leases.
+Reconciliation can publish a durable cut even when source continuation is
+unknown; uncertainty does not authorize releasing a live owner's storage.
+Terminal staging reclamation preserves the capture evidence separately.
 
 ## Exit Runner
 

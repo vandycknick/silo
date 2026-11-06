@@ -73,6 +73,25 @@ pub(crate) async fn ensure_cache_paths_unreferenced(
     candidates: &[PathBuf],
     home: &Path,
 ) -> Result<(), LibVmError> {
+    ensure_paths_unreferenced(connection, candidates, home, false).await
+}
+
+/// Capture staging is below a retained machine's intrinsic directory, but every
+/// explicitly configured resource (including shares of that directory) still pins it.
+pub(crate) async fn ensure_capture_paths_unreferenced(
+    connection: &mut sqlx::SqliteConnection,
+    candidates: &[PathBuf],
+    home: &Path,
+) -> Result<(), LibVmError> {
+    ensure_paths_unreferenced(connection, candidates, home, true).await
+}
+
+async fn ensure_paths_unreferenced(
+    connection: &mut sqlx::SqliteConnection,
+    candidates: &[PathBuf],
+    home: &Path,
+    capture_staging: bool,
+) -> Result<(), LibVmError> {
     if candidates.is_empty() {
         return Ok(());
     }
@@ -86,7 +105,10 @@ pub(crate) async fn ensure_cache_paths_unreferenced(
             .await?;
     for row in machines {
         let DbMachineConfig(config) = DbMachineConfig::from_row_in(&row, home)?;
-        for (path, directory) in dependencies(&config) {
+        for (path, directory) in dependencies(&config)
+            .into_iter()
+            .skip(usize::from(capture_staging))
+        {
             let absolute = if path.is_absolute() {
                 path.to_path_buf()
             } else {

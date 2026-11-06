@@ -807,6 +807,7 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
                 .capture_execution(w::LiveCaptureRequest {
                     machine: request().machine,
                     name: None,
+                    resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
                 })
                 .await
                 .unwrap_err(),

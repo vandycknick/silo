@@ -66,11 +66,35 @@ impl w::machine_service_server::MachineService for Service {
     async fn capture_execution(
         &self,
         r: Request<w::LiveCaptureRequest>,
-    ) -> Result<Response<()>, Status> {
-        let reference = reference(r.into_inner().machine)?;
+    ) -> Result<Response<w::LiveSnapshotInfo>, Status> {
+        let value = r.get_ref().clone();
+        let reference = reference(value.machine)?;
+        let options = libvm::LiveSnapshotOptions {
+            name: value
+                .name
+                .map(|name| silo_vm_control::stopped::alias(&name))
+                .transpose()
+                .map_err(conversion)?,
+            resume_policy: silo_vm_control::capture::resume_policy_from_wire(value.resume_policy)
+                .map_err(conversion)?,
+        };
+        // Capability refusal precedes every lock, reservation and journal row.
         self.require_machine_live(&reference, vm_spec::live::LiveOperation::Capture)
             .await?;
-        Ok(Response::new(()))
+        let observation = self.observe_machine_live(&reference).await?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let snapshot = state
+                    .machine(&reference)
+                    .await?
+                    .snapshot_live(&observation, options)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::capture::live_snapshot_to_wire(&snapshot).map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(result))
     }
 
     async fn fork_execution(&self, r: Request<w::LiveForkRequest>) -> Result<Response<()>, Status> {

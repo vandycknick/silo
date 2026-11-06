@@ -87,12 +87,16 @@ pub(crate) fn project_machine_state(
 impl Machine {
     /// Submit a caller-chosen identity through the durable manager journal.
     /// Exact retries recover the original response, not a replacement command.
+    /// A NEW Capture is only created by [`Machine::submit_capture`], which
+    /// registers its reservation and plan first; raw input can only replay it.
     pub async fn live_command(
         &self,
         observation: &MachineLiveObservation,
         command: LiveCommand,
     ) -> Result<LiveCommandResult, LibVmError> {
-        command.validate().map_err(protocol)?;
+        if let LiveCommand::Capture(capture) = &command {
+            capture.validate_plan().map_err(protocol)?;
+        }
         if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
             return Err(LibVmError::LiveObservation {
                 reference: self.id(),
@@ -132,6 +136,11 @@ impl Machine {
                 return Ok(result.clone());
             }
         } else {
+            if matches!(command, LiveCommand::Capture(_)) {
+                return Err(protocol(
+                    "a new capture must be reserved and journaled through submit_capture",
+                ));
+            }
             require_new_command(observation, &command)?;
         }
         let prepared = {
@@ -156,19 +165,30 @@ impl Machine {
         if let Some(result) = prepared.result {
             return Ok(result);
         }
+        self.send_prepared(prepared.intent).await
+    }
+
+    /// Send an already durable intent and persist its exact result. No
+    /// transaction or machine lock spans the monitor round trip.
+    pub(crate) async fn send_prepared(
+        &self,
+        intent: LiveCommandIntent,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        let runtime = self.runtime();
+        let store = runtime.native_store()?;
         let result = runtime
             .supervisor()
             .client(self.machine_id())
-            .lifecycle(prepared.intent.command.clone())
+            .lifecycle(intent.command.clone())
             .await
             .map_err(|error| {
                 protocol(format!(
                     "lifecycle outcome uncertain; original request {} retained: {error}",
-                    prepared.intent.command.envelope().request_id
+                    intent.command.envelope().request_id
                 ))
             })?;
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-        save_result(runtime, &store, &config, &prepared.intent, &result).await?;
+        save_result(runtime, &store, &config, &intent, &result).await?;
         Ok(result)
     }
 
@@ -313,6 +333,9 @@ impl Machine {
                     OperationOutcome::Failed { failure } => {
                         return Err(protocol(failure.to_string()))
                     }
+                    OperationOutcome::CaptureSealed { .. } => {
+                        return Err(protocol("pause operation returned a capture seal"))
+                    }
                     OperationOutcome::InProgress => {}
                 },
                 result => return Err(result_error(&result)),
@@ -348,12 +371,17 @@ impl Machine {
             .map(|record| record.intent.command))
     }
 
-    /// Reconcile only retained identities against this generation. This never
-    /// creates a replacement Pause or applies a manager-loss resume policy.
+    /// Reconcile only retained identities against this generation, then
+    /// advance this machine's retained captures (publish valid seals, settle
+    /// continuation facts). This never creates a replacement Pause or Capture
+    /// and never applies a manager-loss resume policy.
     pub async fn reconcile_live(&self) -> Result<MachineLifecycle, LibVmError> {
         let runtime = self.runtime();
-        let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-        reconcile(runtime, &config).await?;
+        {
+            let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            reconcile(runtime, &config).await?;
+        }
+        crate::machine::live_capture::reconcile_captures(runtime, Some(self.machine_id())).await?;
         projection(&self.observe_live().await?)
     }
 }
@@ -367,20 +395,20 @@ fn fenced_failure(observation: &MachineLiveObservation) -> Result<bool, LibVmErr
             .is_some_and(|activity| activity.stage == LiveStage::PauseFailed))
 }
 
+/// Only NEW Pause and Capture are capability gated. Releasing, observing,
+/// cancelling or resuming retained authority never depends on a fresh vector.
 fn require_new_command(
     observation: &MachineLiveObservation,
     command: &LiveCommand,
 ) -> Result<(), LibVmError> {
     match command {
         LiveCommand::Pause(_) => require_live_operation(observation, LiveOperation::Pause),
-        LiveCommand::Capture(_) | LiveCommand::ReleaseCapture(_) => {
-            require_live_operation(observation, LiveOperation::Capture)
-        }
+        LiveCommand::Capture(_) => require_live_operation(observation, LiveOperation::Capture),
         _ => Ok(()),
     }
 }
 
-fn result_error(result: &LiveCommandResult) -> LibVmError {
+pub(crate) fn result_error(result: &LiveCommandResult) -> LibVmError {
     protocol(
         result
             .rejection()
@@ -389,7 +417,7 @@ fn result_error(result: &LiveCommandResult) -> LibVmError {
     )
 }
 
-fn require_same_observation(
+pub(crate) fn require_same_observation(
     expected: &MachineLiveObservation,
     fresh: &MachineLiveObservation,
 ) -> Result<(), LibVmError> {

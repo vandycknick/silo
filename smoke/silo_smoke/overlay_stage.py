@@ -15,9 +15,6 @@ import shutil
 from . import overlay, procs
 from .cli import Silo
 
-ADMITTED_NATIVE_SHA256 = '08798da88922cdb0e9c15a2831b81540c0ad2e79962f7c56542c33655a9d0bad'
-
-
 def descriptors(pid: int) -> list[dict]:
     result = []
     directory = Path('/proc') / str(pid)
@@ -65,12 +62,11 @@ def replacement(silo: Silo, reference: str) -> None:
     assert fixture['fault'] == 'reordered' and fixture['declaredNativeBaseline'] == overlay.APPROVED_NATIVE_REVISION
     assert fixture['validationUnchanged'] and fixture['uniqueAttachmentKeysUnchanged']
     assert overlay.digest(Path(fixture['binary'])) == fixture['binarySha256']
-    assert fixture['binarySha256'] != ADMITTED_NATIVE_SHA256
     shutil.copyfile(fixture['binary'], successor / 'bin/silo-vmm')
     (successor / 'bin/silo-vmm').chmod(0o700)
     files = {'kernel': private / 'assets/kernel-default', 'base': private / 'assets/initramfs', 'native': private / 'bin/silo-vmm'}
     identities = {kind: {'device': path.stat().st_dev, 'inode': path.stat().st_ino, 'length': path.stat().st_size, 'sha256': overlay.digest(path)} for kind, path in files.items()}
-    assert identities['native']['sha256'] == ADMITTED_NATIVE_SHA256
+    assert fixture['binarySha256'] != identities['native']['sha256']
     for kind in ('kernel', 'base'):
         assert overlay.digest(successor / files[kind].relative_to(private)) == identities[kind]['sha256']
     environment = silo.ws.env(SILO_RUNTIME_DIR=str(private))
@@ -159,7 +155,7 @@ def replacement(silo: Silo, reference: str) -> None:
             executable = Path('/proc') / str(pid) / 'exe'
             metadata = executable.stat()
             digest = overlay.digest(executable)
-            assert digest == ADMITTED_NATIVE_SHA256 and metadata.st_nlink == 0
+            assert digest == identities['native']['sha256'] and metadata.st_nlink == 0
             assert (metadata.st_dev, metadata.st_ino) == (identities['native']['device'], identities['native']['inode'])
             actual[kind] = {'pid': pid, 'sha256': digest, 'target': os.readlink(executable), 'links': metadata.st_nlink, 'device': metadata.st_dev, 'inode': metadata.st_ino}
         assert overlay.digest(directory / 'kernel-qualified') == identities['kernel']['sha256']

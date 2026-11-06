@@ -350,6 +350,20 @@ impl Store {
             let candidate = candidate?;
             let _roots = pool.lock_roots()?;
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let name = candidate
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| LibVmError::InvalidStorageRecord {
+                    record: "capture-workspace",
+                    message: "workspace name is not UTF-8".into(),
+                })?;
+            let retained_capture: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='capture')")
+                .bind(name).fetch_one(&mut *tx).await?;
+            if retained_capture {
+                tx.commit().await?;
+                continue;
+            }
             crate::store::ensure_cache_paths_unreferenced(
                 &mut tx,
                 &[candidate.path().to_path_buf()],

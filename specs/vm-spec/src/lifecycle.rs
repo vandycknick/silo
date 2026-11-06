@@ -7,6 +7,10 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
+use crate::capture::{
+    CaptureObservation, CapturePlan, CaptureRecordOutcome, CaptureReleaseDisposition,
+    CaptureReleased, CaptureSealed,
+};
 use crate::live::LiveOperationUnsupported;
 
 /// Upper bound for one diagnostic carried by a lifecycle result.
@@ -179,6 +183,8 @@ lifecycle_enum!(CaptureResumePolicy {
 lifecycle_enum!(
     /// Internal coordinator stage. Every stage except `PauseFailed` is active
     /// work; `PauseFailed` is a failed `Pausing` awaiting cancel or stop.
+    /// Capture stages appear only while `Capturing`; its continuation reuses
+    /// the resume and recovery stages.
     LiveStage {
         MonitorDrain => "monitor-drain",
         GuestFreeze => "guest-freeze",
@@ -195,6 +201,18 @@ lifecycle_enum!(
         RecoveryFreeze => "recovery-freeze",
         RecoveryPause => "recovery-pause",
         Admission => "admission",
+        CapturePrepare => "capture-prepare",
+        CaptureFlush => "capture-flush",
+        CaptureDisks => "capture-disks",
+        CaptureExecution => "capture-execution",
+        CaptureMemory => "capture-memory",
+        CaptureVerify => "capture-verify",
+        CaptureSeal => "capture-seal",
+        CaptureAccept => "capture-accept",
+        CaptureAbandon => "capture-abandon",
+        CapturePreserve => "capture-preserve",
+        CaptureSourceRecord => "capture-source-record",
+        CaptureRelease => "capture-release",
     }
 );
 
@@ -219,6 +237,20 @@ lifecycle_enum!(LiveFailureCode {
     WorkerLost => "worker-lost",
     Stopped => "stopped",
     DeadlineExceeded => "deadline-exceeded",
+    StagingFailed => "staging-failed",
+    DiskFlushFailed => "disk-flush-failed",
+    DiskCopyFailed => "disk-copy-failed",
+    ExecutionCaptureFailed => "execution-capture-failed",
+    MemoryCaptureFailed => "memory-capture-failed",
+    CaptureVerificationFailed => "capture-verification-failed",
+    SealFailed => "seal-failed",
+    SealUncertain => "seal-uncertain",
+    BaselineAcceptFailed => "baseline-accept-failed",
+    PreserveFailed => "preserve-failed",
+    AbandonFailed => "abandon-failed",
+    SourceRecordFailed => "source-record-failed",
+    ReleaseFailed => "release-failed",
+    StagingBudgetExceeded => "staging-budget-exceeded",
 });
 
 lifecycle_enum!(LiveRejectionCode {
@@ -232,6 +264,9 @@ lifecycle_enum!(LiveRejectionCode {
     Unsupported => "unsupported",
     WrongTarget => "wrong-target",
     MonitorStopping => "monitor-stopping",
+    InvalidPlan => "invalid-plan",
+    ConfigurationMismatch => "configuration-mismatch",
+    ContinuationPending => "continuation-pending",
 });
 
 lifecycle_enum!(GuestLifecycleState {
@@ -415,11 +450,15 @@ impl fmt::Display for LiveFailure {
     }
 }
 
+/// Original terminal outcome of an operation, immutable once terminal. A
+/// capture's `capture-sealed` is its success: succeeded and sealed are one
+/// event; source continuation is reported separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "status", deny_unknown_fields)]
 pub enum OperationOutcome {
     InProgress,
     Succeeded { pause: PauseEstablished },
+    CaptureSealed { capture: CaptureSealed },
     Failed { failure: LiveFailure },
 }
 
@@ -435,7 +474,9 @@ impl LiveOperationRecord {
     pub fn status(&self) -> OperationStatus {
         match self.outcome {
             OperationOutcome::InProgress => OperationStatus::InProgress,
-            OperationOutcome::Succeeded { .. } => OperationStatus::Succeeded,
+            OperationOutcome::Succeeded { .. } | OperationOutcome::CaptureSealed { .. } => {
+                OperationStatus::Succeeded
+            }
             OperationOutcome::Failed { .. } => OperationStatus::Failed,
         }
     }
@@ -449,12 +490,19 @@ impl LiveOperationRecord {
                 }
                 pause.guest.validate()
             }
+            OperationOutcome::CaptureSealed { capture } => {
+                if self.kind != OperationKind::Capture || capture.capture_id != self.operation_id {
+                    return Err("only its own capture operation succeeds with a seal".into());
+                }
+                Ok(())
+            }
             OperationOutcome::Failed { failure } => failure.validate(),
         }
     }
 }
 
-/// Active or failed-Pausing detail, present only in `Pausing`.
+/// Active work, present exactly in `Pausing` (including failed Pausing) and
+/// `Capturing` (including post-seal continuation).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LiveActivity {
@@ -474,14 +522,24 @@ pub struct LiveLifecycle {
 }
 
 impl LiveLifecycle {
-    /// Presence rules: current pause iff Paused, activity iff Pausing,
-    /// error iff Error.
+    /// Presence rules: current pause iff Paused, activity iff Pausing or
+    /// Capturing, error iff Error.
     pub fn validate_for(&self, state: VmLifecycleState) -> Result<(), String> {
         if self.current_pause.is_some() != (state == VmLifecycleState::Paused) {
             return Err("current pause is present exactly while paused".into());
         }
-        if self.activity.is_some() != (state == VmLifecycleState::Pausing) {
-            return Err("lifecycle activity is present exactly while pausing".into());
+        let active = matches!(
+            state,
+            VmLifecycleState::Pausing | VmLifecycleState::Capturing
+        );
+        if self.activity.is_some() != active {
+            return Err("lifecycle activity is present exactly while pausing or capturing".into());
+        }
+        if let Some(activity) = &self.activity {
+            let capture = activity.command == LiveCommandKind::Capture;
+            if capture != (state == VmLifecycleState::Capturing) {
+                return Err("capture activity is present exactly while capturing".into());
+            }
         }
         if self.error.is_some() != (state == VmLifecycleState::Error) {
             return Err("lifecycle error is present exactly in the error state".into());
@@ -505,6 +563,12 @@ pub enum LiveRejectionReason {
     },
     WrongTarget,
     MonitorStopping,
+    /// The capture plan is malformed or does not bind this run.
+    InvalidPlan,
+    /// The plan's configuration and attachment inventory is not the launch.
+    ConfigurationMismatch,
+    /// ReleaseCapture before the capture's source continuation is terminal.
+    ContinuationPending,
 }
 
 impl LiveRejectionReason {
@@ -520,6 +584,9 @@ impl LiveRejectionReason {
             Self::Unsupported { .. } => LiveRejectionCode::Unsupported,
             Self::WrongTarget => LiveRejectionCode::WrongTarget,
             Self::MonitorStopping => LiveRejectionCode::MonitorStopping,
+            Self::InvalidPlan => LiveRejectionCode::InvalidPlan,
+            Self::ConfigurationMismatch => LiveRejectionCode::ConfigurationMismatch,
+            Self::ContinuationPending => LiveRejectionCode::ContinuationPending,
         }
     }
 }
@@ -596,20 +663,37 @@ pub struct CancelOperationCommand {
     pub operation_id: LiveId,
 }
 
+/// Capture with its complete immutable plan. The plan binds the same
+/// machine, run and capture ID (= request ID); semantic plan validation is a
+/// typed `invalid-plan` rejection, journaled like every other result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaptureCommand {
     pub envelope: LiveCommandEnvelope,
-    pub expected_configuration_digest: String,
-    pub policy: CapturePolicy,
-    pub resume_policy: CaptureResumePolicy,
+    pub plan: CapturePlan,
 }
 
+impl CaptureCommand {
+    /// Plan validity plus its correlation with this exact envelope.
+    pub fn validate_plan(&self) -> Result<(), String> {
+        self.plan.validate()?;
+        if self.plan.machine_id != self.envelope.machine_id
+            || self.plan.run_id != self.envelope.run_id
+            || self.plan.capture_id != self.envelope.request_id
+        {
+            return Err("capture plan must bind the envelope machine, run and request ID".into());
+        }
+        Ok(())
+    }
+}
+
+/// Release after libvm published or abandoned the result. Idempotent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseCaptureCommand {
     pub envelope: LiveCommandEnvelope,
     pub operation_id: LiveId,
+    pub disposition: CaptureReleaseDisposition,
 }
 
 /// One complete typed live request. Equality is the replay/conflict oracle.
@@ -620,7 +704,7 @@ pub enum LiveCommand {
     Resume(ResumeCommand),
     GetOperation(GetOperationCommand),
     CancelOperation(CancelOperationCommand),
-    Capture(CaptureCommand),
+    Capture(Box<CaptureCommand>),
     ReleaseCapture(ReleaseCaptureCommand),
 }
 
@@ -657,24 +741,6 @@ impl LiveCommand {
             Self::CancelOperation(_) => LiveCommandKind::CancelOperation,
             Self::Capture(_) => LiveCommandKind::Capture,
             Self::ReleaseCapture(_) => LiveCommandKind::ReleaseCapture,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        match self {
-            Self::Capture(command) => {
-                let digest = &command.expected_configuration_digest;
-                if digest.is_empty()
-                    || digest.len() > 256
-                    || !digest.bytes().all(|byte| byte.is_ascii_graphic())
-                {
-                    return Err(
-                        "expected configuration digest must be 1..256 printable ASCII bytes".into(),
-                    );
-                }
-                Ok(())
-            }
-            _ => Ok(()),
         }
     }
 }
@@ -768,6 +834,34 @@ pub struct OperationObservation {
     pub state: VmLifecycleState,
     pub current_pause: Option<CurrentPause>,
     pub activity: Option<LiveActivity>,
+    /// Present exactly for a capture operation.
+    pub capture: Option<CaptureObservation>,
+}
+
+impl OperationObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        self.operation.validate()?;
+        if self.capture.is_some() != (self.operation.kind == OperationKind::Capture) {
+            return Err("capture facts are present exactly for a capture operation".into());
+        }
+        if let Some(capture) = &self.capture {
+            capture.validate()?;
+            let sealed = matches!(
+                self.operation.outcome,
+                OperationOutcome::CaptureSealed { .. }
+            );
+            let coherent = capture
+                .evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.outcome == CaptureRecordOutcome::Coherent);
+            if sealed != coherent {
+                return Err(
+                    "a capture succeeds exactly when its coherent record is durable".into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 // Observations are the normal result; boxing adds an allocation to every status query.
@@ -806,8 +900,17 @@ pub enum CancelOperationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseFailed {
+    pub cause: LiveFailure,
+    pub state: VmLifecycleState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "outcome", deny_unknown_fields)]
 pub enum ReleaseCaptureOutcome {
+    Released { released: CaptureReleased },
+    Failed { failed: ReleaseFailed },
     Rejected { rejection: LiveRejection },
 }
 
@@ -873,7 +976,7 @@ impl LiveCommandResult {
         match self {
             Self::Resume(ResumeOutcome::Failed { failed }) => failed.validate(),
             Self::GetOperation(GetOperationOutcome::Observation { observation }) => {
-                observation.operation.validate()
+                observation.validate()
             }
             Self::CancelOperation(CancelOperationOutcome::Completed { completed }) => {
                 completed.operation.validate()
@@ -881,6 +984,9 @@ impl LiveCommandResult {
             Self::CancelOperation(CancelOperationOutcome::Failed { failed }) => {
                 failed.cause.validate()?;
                 failed.operation.validate()
+            }
+            Self::ReleaseCapture(ReleaseCaptureOutcome::Failed { failed }) => {
+                failed.cause.validate()
             }
             _ => Ok(()),
         }

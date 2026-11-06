@@ -47,8 +47,9 @@ pub struct Control {
     handle: std::sync::Arc<libkrun::VmmHandle>,
 }
 
-// The worker lifecycle server consumes pause, cancel, ClockOnly resume and
-// observation; capture and restore controls remain unused until their phases.
+// The worker lifecycle server consumes pause, cancel, ClockOnly resume,
+// capture, preserve and observation; restore controls remain unused until
+// restore is delivered.
 #[allow(dead_code)]
 impl Control {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

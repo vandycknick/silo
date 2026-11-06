@@ -722,7 +722,10 @@ fn session_identity(state: &State, now: Instant) -> Option<ReadyAgentIdentity> {
         return Some(ready);
     }
     let held = state.held_identity.as_ref()?;
-    if !matches!(state.vm_state, VmState::Pausing | VmState::Paused) {
+    if !matches!(
+        state.vm_state,
+        VmState::Pausing | VmState::Paused | VmState::Capturing
+    ) {
         return None;
     }
     match identity_from_state(state) {

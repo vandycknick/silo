@@ -602,7 +602,7 @@ impl Store {
                     let machine_objects=crate::store::cache_paths::retained_machine_objects(&mut tx).await?;
                     let mut orphaned=Vec::new();
                     for digest in batch {
-                        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1)").bind(digest.to_string()).fetch_one(&mut *tx).await?;
+                        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_capture_provenance WHERE evidence_digest=?1)").bind(digest.to_string()).fetch_one(&mut *tx).await?;
                         if !retained && !machine_objects.contains(&digest) {orphaned.push(digest);}
                     }
                     let candidates=orphaned.iter().map(|digest|pool.object_path(digest)).collect::<Vec<_>>();

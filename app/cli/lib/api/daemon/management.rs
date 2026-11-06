@@ -86,20 +86,25 @@ impl DaemonVmService {
         )?)
     }
 
-    pub(crate) async fn capture_execution(
+    pub(crate) async fn snapshot_live(
         &self,
         value: &str,
-        name: Option<&str>,
-    ) -> eyre::Result<()> {
-        self.machines
-            .clone()
-            .capture_execution(w::LiveCaptureRequest {
-                machine: Some(reference(value)?),
-                name: name.map(str::to_owned),
-            })
-            .await
-            .map_err(native_status)?;
-        Ok(())
+        options: libvm::LiveSnapshotOptions,
+    ) -> eyre::Result<libvm::LiveSnapshot> {
+        Ok(silo_vm_control::capture::live_snapshot_from_wire(
+            self.machines
+                .clone()
+                .capture_execution(w::LiveCaptureRequest {
+                    machine: Some(reference(value)?),
+                    name: options.name,
+                    resume_policy: silo_vm_control::capture::resume_policy_to_wire(
+                        options.resume_policy,
+                    ),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
     }
 
     pub(crate) async fn fork_execution(&self, value: &str, name: &str) -> eyre::Result<()> {

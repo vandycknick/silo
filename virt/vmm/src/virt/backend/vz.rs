@@ -141,6 +141,7 @@ impl VirtBackend for VzBackend {
     async fn lifecycle(
         &self,
         _request: crate::virt::lifecycle::LifecycleRequest,
+        _rights: crate::virt::lifecycle::LifecycleRights,
     ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
     {
         // Virtualization.framework exposes no native pause authority here.

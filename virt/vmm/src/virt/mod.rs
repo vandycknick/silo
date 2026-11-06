@@ -30,6 +30,7 @@ mod stream;
 #[cfg(all(test, feature = "mock-backend"))]
 pub(crate) use backend::mock::test_storage_launch;
 pub use backend::BackendKind;
+pub(crate) use backend::CaptureSource;
 pub use backend::HostMemoryReclaimReport;
 pub(crate) use backend::StorageFinalization;
 pub(crate) use capacity::VsockLease;
