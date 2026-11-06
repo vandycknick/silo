@@ -28,14 +28,16 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::virt::backend::lifecycle::{launch_binding, LifecycleClient, LifecycleFault};
+use crate::virt::backend::lifecycle::{
+    launch_binding, LifecycleClient, LifecycleFault, LifecycleSlot,
+};
 use crate::virt::backend::{BackendKind, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::{validate_common, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::exit::StartupStage;
 use crate::virt::lifecycle::{
-    LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse,
+    LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse, LifecycleRights,
 };
 use crate::virt::machine::VirtualMachine;
 use crate::virt::stream::{SerialDevice, SyntheticPortAllocator, VsockListener, VsockStream};
@@ -63,7 +65,7 @@ pub(crate) struct MockBackend {
     source_ports: SyntheticPortAllocator,
     /// The modeled native owner behind the in-process lifecycle worker.
     native: native::ScenarioNative,
-    lifecycle: Mutex<Option<LifecycleClient>>,
+    lifecycle: LifecycleSlot,
     /// A duplicate of the worker endpoint, used only to end the modeled
     /// worker when the machine stops or crashes.
     worker_endpoint: Arc<Mutex<Option<std::os::fd::OwnedFd>>>,
@@ -84,7 +86,11 @@ impl MockBackend {
             .storage_launch()
             .map(|launch| (launch.machine_id.clone(), launch.run_id.clone()));
         let guest = Arc::new(guest::MockGuest::new(scenario.clone(), guest_root, launch));
-        let native = native::ScenarioNative::new(scenario.lifecycle.clone());
+        let cpus = config
+            .cpus()
+            .and_then(|cpus| u8::try_from(cpus).ok())
+            .unwrap_or(1);
+        let native = native::ScenarioNative::new(scenario.lifecycle.clone(), cpus);
         let (shutdown, _) = watch::channel(false);
 
         tracing::warn!(
@@ -103,7 +109,7 @@ impl MockBackend {
             started_once: Mutex::new(false),
             source_ports: SyntheticPortAllocator::new(),
             native,
-            lifecycle: Mutex::new(None),
+            lifecycle: LifecycleSlot::default(),
             worker_endpoint: Arc::new(Mutex::new(None)),
         })
     }
@@ -137,10 +143,7 @@ impl MockBackend {
             }),
         )?;
         let (client, mut faults) = LifecycleClient::start(parent, binding)?;
-        *self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(client);
+        self.lifecycle.install(client);
         tokio::spawn(async move {
             // The monitor-side owner forces a worker that violates the protocol.
             if let Some(LifecycleFault::Protocol(message)) = faults.recv().await {
@@ -151,10 +154,7 @@ impl MockBackend {
     }
 
     fn lifecycle_client(&self) -> Option<LifecycleClient> {
-        self.lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.lifecycle.client()
     }
 
     fn cached_exit(&self) -> Option<VmExit> {
@@ -302,9 +302,7 @@ impl VirtBackend for MockBackend {
     async fn stop(&self) -> Result<(), VirtError> {
         // Stop never resumes a paused machine: it closes lifecycle admission
         // and ends the modeled worker with its native owner.
-        if let Some(client) = self.lifecycle_client() {
-            client.close_admission();
-        }
+        self.lifecycle.close_admission();
         let _ = self.running.lock().await.take();
         self.shutdown.send_replace(true);
         self.cache_exit(VmExit::stopped(StartupStage::Started));
@@ -312,18 +310,47 @@ impl VirtBackend for MockBackend {
         Ok(())
     }
 
+    /// The scenario backend retains no launch descriptors; it opens its
+    /// configured disk files read-only (std opens are close-on-exec) for the
+    /// capture's disk seal.
+    async fn capture_sources(&self) -> Result<Vec<crate::virt::backend::CaptureSource>, VirtError> {
+        if self.cached_exit().is_some() {
+            return Err(VirtError::NotRunning {
+                name: self.config.name().to_string(),
+            });
+        }
+        self.config
+            .disks()
+            .iter()
+            .enumerate()
+            .map(|(index, disk)| {
+                Ok(crate::virt::backend::CaptureSource {
+                    disk_index: u32::try_from(index)
+                        .map_err(|_| VirtError::Backend("disk index overflow".into()))?,
+                    file: std::fs::File::open(&disk.path)?,
+                    writable: !disk.read_only,
+                })
+            })
+            .collect()
+    }
+
     async fn lifecycle(
         &self,
         request: LifecycleRequest,
+        rights: LifecycleRights,
     ) -> Result<LifecycleResponse, LifecycleError> {
         request.validate().map_err(LifecycleError::Rejected)?;
         match self.lifecycle_client() {
-            Some(client) => client.lifecycle(request).await,
-            None if self.cached_exit().is_some() => {
+            Some(client) => client.lifecycle(request, rights).await,
+            None if self.cached_exit().is_some() || self.lifecycle.closed() => {
                 Err(LifecycleError::Rejected(LifecycleRejection::Stopping))
             }
             None => Err(LifecycleError::Rejected(LifecycleRejection::NotReady)),
         }
+    }
+
+    fn close_lifecycle_admission(&self) {
+        self.lifecycle.close_admission();
     }
 
     async fn wait(&self) -> Result<VmExit, VirtError> {

@@ -149,7 +149,7 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
                 live[operation.as_str()]["availability"]["reason"]["code"],
                 if backend == "vz" {
                     "backend-excluded"
-                } else if operation == LiveOperation::Pause {
+                } else if matches!(operation, LiveOperation::Pause | LiveOperation::Capture) {
                     "lane-not-qualified"
                 } else {
                     "not-delivered"
@@ -212,7 +212,7 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
             assert!(
                 error.contains(if backend == "vz" {
                     "backend-excluded"
-                } else if operation == "pause" {
+                } else if matches!(operation, "pause" | "capture") {
                     "lane-not-qualified"
                 } else {
                     "not-delivered"

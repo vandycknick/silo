@@ -158,6 +158,21 @@ impl PreparedAttachments {
             .collect()
     }
 
+    /// Duplicates of every retained attachment for a live capture's disk
+    /// seal. The capture only reads them; identity is the retained inode.
+    pub(crate) fn capture_sources(&self) -> io::Result<Vec<crate::virt::backend::CaptureSource>> {
+        self.attachments
+            .iter()
+            .map(|attachment| {
+                Ok(crate::virt::backend::CaptureSource {
+                    disk_index: attachment.disk_index,
+                    file: attachment.file.try_clone()?,
+                    writable: attachment.writable,
+                })
+            })
+            .collect()
+    }
+
     /// Caller has reaped every native owner. Every handle is explicitly closed,
     /// including after a failed sync; first errors are sticky, later ones logged.
     pub(crate) fn finish(self, guest_completed: bool) -> StorageFinalization {

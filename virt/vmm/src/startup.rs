@@ -570,6 +570,24 @@ pub async fn init(
     };
     let host_live = backend_selection.host_report()?;
     let machine_live = backend_selection.machine_vector(host_live.live, &machine_config.config);
+    // The run's capture identity: the same path-free configuration projection
+    // libvm computes from this spec, bound to the inherited launch lease.
+    let capture_context = machine_config.config.storage_launch().and_then(|launch| {
+        crate::capabilities::capture_producer()
+            .map_err(|error| error.to_string())
+            .and_then(|producer| {
+                crate::live::coordinator::capture::CaptureContext::new(
+                    runtime.dir().to_path_buf(),
+                    &spec,
+                    launch,
+                    producer,
+                    host_live.backend,
+                    host_live.lane,
+                )
+            })
+            .map_err(|error| tracing::warn!(%error, "live capture cannot bind plans for this run"))
+            .ok()
+    });
     let store = Arc::new(InstanceStore::new(
         machine_uuid.hyphenated().to_string(),
         name.to_string(),
@@ -591,6 +609,7 @@ pub async fn init(
         machine.clone(),
         live_gate.clone(),
         crate::live::coordinator::LiveTimeouts::default(),
+        capture_context,
     )
     .map_err(eyre::Report::msg)?;
     let forwards = crate::forward::ForwardTable::prepare_machine(

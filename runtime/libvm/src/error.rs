@@ -18,6 +18,10 @@ pub enum LibVmError {
     LiveProtocol { message: String },
     #[error("live observation for {reference} failed: {message}")]
     LiveObservation { reference: String, message: String },
+    /// A retained capture produced no admissible checkpoint or is still owned
+    /// by its run. The capture identity, reservation and staging are retained.
+    #[error("live capture {capture_id}: {message}")]
+    LiveCapture { capture_id: String, message: String },
 
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
@@ -318,6 +322,7 @@ impl LibVmError {
             Self::LiveDiscovery { .. } => "LiveDiscovery",
             Self::LiveProtocol { .. } => "LiveProtocol",
             Self::LiveObservation { .. } => "LiveObservation",
+            Self::LiveCapture { .. } => "LiveCapture",
             Self::Storage(_) => "Storage",
             Self::OverlayBootQualification(_) => "OverlayBootQualification",
             Self::OverlayBackendUnsupported { .. } => "OverlayBackendUnsupported",

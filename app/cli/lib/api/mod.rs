@@ -80,18 +80,14 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn capture_execution(
+    pub(crate) async fn snapshot_live(
         &mut self,
         reference: &str,
-        name: Option<&str>,
-    ) -> eyre::Result<()> {
+        options: libvm::LiveSnapshotOptions,
+    ) -> eyre::Result<libvm::LiveSnapshot> {
         match self {
-            Self::Local(service) => {
-                service
-                    .require_machine_live(reference, vm_spec::live::LiveOperation::Capture)
-                    .await
-            }
-            Self::Daemon(service) => service.capture_execution(reference, name).await,
+            Self::Local(service) => service.snapshot_live(reference, options).await,
+            Self::Daemon(service) => service.snapshot_live(reference, options).await,
         }
     }
 

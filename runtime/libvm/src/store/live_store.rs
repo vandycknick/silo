@@ -80,7 +80,9 @@ impl Store {
         request_id: Uuid,
         intent: &LiveCommandIntent,
     ) -> Result<RetainedLiveCommand, LibVmError> {
-        intent.command.validate().map_err(invalid)?;
+        if let LiveCommand::Capture(capture) = &intent.command {
+            capture.validate_plan().map_err(invalid)?;
+        }
         let envelope = intent.command.envelope();
         if envelope.machine_id.as_str() != Uuid::from(machine_id).to_string()
             || envelope.run_id.as_str() != run_id.to_string()
@@ -94,11 +96,15 @@ impl Store {
         }
         intent.report.validate().map_err(invalid)?;
         let input = serde_json::to_string(intent).map_err(|error| invalid(error.to_string()))?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let state = sqlx::query_as::<_, DbMachineState>(
             "SELECT machine_id, status, json(state_json) AS state_json FROM machine_state WHERE machine_id = ?1",
         ).bind(machine_id.to_string()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| invalid("live command has no machine state"))?.0;
+        #[cfg(test)]
+        if let Some(hook) = &self.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::Preparing)?;
+        }
         if state.run_id.as_deref() != Some(run_id.to_string().as_str()) || state.vmm_pid.is_none() {
             return Err(invalid("live command run is no longer current"));
         }
@@ -186,10 +192,14 @@ impl Store {
         result: &LiveCommandResult,
         projection: Option<(&MachineLifecycle, &MachineState)>,
     ) -> Result<bool, LibVmError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Option<Option<String>> = sqlx::query_scalar("SELECT json(result_json) FROM live_command WHERE machine_id=?1 AND run_id=?2 AND request_id=?3 AND monitor_id=?4")
             .bind(machine_id.to_string()).bind(run_id.to_string()).bind(request_id.to_string()).bind(monitor_id)
             .fetch_optional(&mut *tx).await?;
+        #[cfg(test)]
+        if let Some(hook) = &self.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::Preparing)?;
+        }
         match existing {
             None => return Err(invalid("live response has no matching durable intent")),
             Some(Some(json)) => {
@@ -263,7 +273,11 @@ impl Store {
         projection: &MachineLifecycle,
         next: &MachineState,
     ) -> Result<bool, LibVmError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        #[cfg(test)]
+        if let Some(hook) = &self.layer_hook {
+            hook.hit(crate::store::layer_store::tests::WorkerPoint::Preparing)?;
+        }
         let applied = Self::write_live_projection(&mut tx, machine_id, projection, next).await?;
         tx.commit().await?;
         Ok(applied)
@@ -472,6 +486,109 @@ mod tests {
             Uuid::parse_str(intent.command.envelope().run_id.as_str()).unwrap(),
             Uuid::parse_str(intent.command.envelope().request_id.as_str()).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn live_writes_reserve_the_writer_before_reading_current_authority() {
+        use crate::store::layer_store::tests::{WorkerHook, WorkerPoint};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Write {
+            Intent,
+            Result,
+            Projection,
+        }
+        for write in [Write::Intent, Write::Result, Write::Projection] {
+            let (_dir, mut store, state, intent) = fixture().await;
+            let (run, request) = identities(&intent);
+            if !matches!(write, Write::Intent) {
+                store
+                    .prepare_live_command(state.machine_id, run, request, &intent)
+                    .await
+                    .unwrap();
+            }
+            let current = paused(&intent, 1);
+            let next =
+                crate::machine::live_operations::project_machine_state(state.clone(), &current);
+            let mut contender = store.pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA busy_timeout=0")
+                .execute(&mut *contender)
+                .await
+                .unwrap();
+            let (hook, mut entered, release) = WorkerHook::new(WorkerPoint::Preparing, false);
+            store.layer_hook = Some(hook);
+            let worker = store.clone();
+            let worker_intent = intent.clone();
+            let worker_current = current.clone();
+            let worker_next = next.clone();
+            let machine = state.machine_id;
+            let handle = tokio::runtime::Handle::current();
+            let operation = tokio::task::spawn_blocking(move || {
+                handle.block_on(async move {
+                    match write {
+                        Write::Intent => worker
+                            .prepare_live_command(machine, run, request, &worker_intent)
+                            .await
+                            .map(|_| ()),
+                        Write::Result => worker
+                            .complete_live_command(
+                                machine,
+                                run,
+                                request,
+                                &worker_intent.report.monitor_id,
+                                &receipt(&worker_intent),
+                                None,
+                            )
+                            .await
+                            .map(|_| ()),
+                        Write::Projection => worker
+                            .save_live_projection(machine, &worker_current, &worker_next)
+                            .await
+                            .map(|_| ()),
+                    }
+                })
+            });
+            entered.recv().await.unwrap();
+            let competing_write = sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *contender)
+                .await;
+            // Always release the worker, including when exercising the old
+            // deferred transaction, which incorrectly lets this writer in.
+            release.send(()).unwrap();
+            let completed = operation.await.unwrap();
+            if competing_write.is_ok() {
+                sqlx::query("ROLLBACK")
+                    .execute(&mut *contender)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                matches!(&competing_write, Err(sqlx::Error::Database(error))
+                    if error.code().as_deref() == Some("5")),
+                "{write:?} failed to exclude a concurrent catalog writer: {competing_write:?}"
+            );
+            completed.unwrap();
+            let retained = store
+                .live_command_record(machine, run, request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.intent, intent);
+            match write {
+                Write::Intent => assert_eq!(retained.result, None),
+                Write::Result => assert_eq!(retained.result, Some(receipt(&intent))),
+                Write::Projection => {
+                    assert_eq!(
+                        store
+                            .live_projection(machine, &run.to_string())
+                            .await
+                            .unwrap(),
+                        Some(current)
+                    );
+                    assert_eq!(store.machine_state(machine).await.unwrap(), Some(next));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -737,6 +854,7 @@ mod tests {
                 state: VmLifecycleState::Paused,
                 current_pause: original.lifecycle.current_pause.clone(),
                 activity: None,
+                capture: None,
             },
         });
         let next = crate::machine::live_operations::project_machine_state(state.clone(), &original);

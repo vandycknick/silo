@@ -4,14 +4,14 @@ mod mux;
 mod owner;
 
 use crate::krun::Mount as KrunMount;
-use crate::virt::backend::lifecycle::LifecycleClient;
+use crate::virt::backend::lifecycle::{LifecycleClient, LifecycleSlot};
 use crate::virt::backend::{HostMemoryReclaimReport, StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
 use crate::virt::config::{validate_common, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::exit::StartupStage;
 use crate::virt::lifecycle::{
-    LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse,
+    LifecycleError, LifecycleRejection, LifecycleRequest, LifecycleResponse, LifecycleRights,
 };
 use crate::virt::stream::{
     KrunVsockSession, PendingUnixVsock, SerialDevice, VsockListener, VsockStream,
@@ -52,8 +52,9 @@ pub(crate) struct KrunBackend {
     attachments: Arc<Mutex<Option<crate::virt::backend::storage::PreparedAttachments>>>,
     storage_finalization: watch::Sender<Option<crate::virt::backend::StorageFinalization>>,
     storage_finalization_started: std::sync::atomic::AtomicBool,
-    /// The run's lifecycle client, present from worker spawn onward.
-    lifecycle: Arc<Mutex<Option<LifecycleClient>>>,
+    /// The run's lifecycle client, present from worker spawn onward, and the
+    /// stop fence on its mutator submission.
+    lifecycle: Arc<LifecycleSlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -243,15 +244,12 @@ impl KrunBackend {
             attachments: Arc::new(Mutex::new(None)),
             storage_finalization: watch::Sender::new(None),
             storage_finalization_started: std::sync::atomic::AtomicBool::new(false),
-            lifecycle: Arc::new(Mutex::new(None)),
+            lifecycle: Arc::new(LifecycleSlot::default()),
         })
     }
 
     fn lifecycle_client(&self) -> Option<LifecycleClient> {
-        self.lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.lifecycle.client()
     }
 
     async fn completion(&self) -> Result<VmExit, VirtError> {
@@ -328,7 +326,7 @@ impl VirtBackend for KrunBackend {
                 let (parent_lifecycle, child_lifecycle) =
                     crate::virt::backend::lifecycle::lifecycle_pair()?;
                 let (client, lifecycle_faults) = LifecycleClient::start(parent_lifecycle, binding)?;
-                *lifecycle.lock().unwrap_or_else(PoisonError::into_inner) = Some(client);
+                lifecycle.install(client);
                 let (mux, task, child_mux) =
                     mux::KrunVsockMux::pair(registry.clone(), session.clone(), &[])?;
                 *running_mux.lock().await = Some(mux.clone());
@@ -385,9 +383,7 @@ impl VirtBackend for KrunBackend {
         self.stop.cancel();
         // Stop never resumes: it only closes lifecycle admission; the owner
         // terminates the worker and the endpoint reports the loss.
-        if let Some(client) = self.lifecycle_client() {
-            client.close_admission();
-        }
+        self.lifecycle.close_admission();
         if self.attempt.reserve() {
             self.session.shutdown();
             self.vsock_registry.fence_session(&self.session);
@@ -497,14 +493,28 @@ impl VirtBackend for KrunBackend {
         Some(self.host_memory_reclaim.subscribe())
     }
 
+    async fn capture_sources(&self) -> Result<Vec<crate::virt::backend::CaptureSource>, VirtError> {
+        let attachments = self
+            .attachments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(prepared) = attachments.as_ref() else {
+            return Err(VirtError::NotRunning {
+                name: self.config.name().to_string(),
+            });
+        };
+        Ok(prepared.capture_sources()?)
+    }
+
     async fn lifecycle(
         &self,
         request: LifecycleRequest,
+        rights: LifecycleRights,
     ) -> Result<LifecycleResponse, LifecycleError> {
         request.validate().map_err(LifecycleError::Rejected)?;
         match self.lifecycle_client() {
-            Some(client) => client.lifecycle(request).await,
-            None if self.stop.is_cancelled() => {
+            Some(client) => client.lifecycle(request, rights).await,
+            None if self.stop.is_cancelled() || self.lifecycle.closed() => {
                 Err(LifecycleError::Rejected(LifecycleRejection::Stopping))
             }
             None => Err(LifecycleError::Rejected(LifecycleRejection::NotReady)),
@@ -521,6 +531,10 @@ impl VirtBackend for KrunBackend {
                 VirtError::Backend("krun serial console already attached".to_string())
             })?;
         Ok(SerialDevice::from_pty_files(read, write)?)
+    }
+
+    fn close_lifecycle_admission(&self) {
+        self.lifecycle.close_admission();
     }
 }
 

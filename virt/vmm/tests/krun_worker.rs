@@ -997,11 +997,22 @@ fn worker_lease_continues_the_ofd_until_process_exit_without_unrelated_leaks() {
     );
     let unrelated_pid = unrelated.0.as_ref().unwrap().id();
     for entry in std::fs::read_dir(format!("/proc/{unrelated_pid}/fd")).unwrap() {
-        let metadata = std::fs::metadata(entry.unwrap().path()).unwrap();
+        let path = entry.unwrap().path();
+        let metadata = std::fs::metadata(&path).unwrap();
         assert_ne!(
             (metadata.dev(), metadata.ino()),
             (identity.dev(), identity.ino()),
-            "unrelated exec inherited storage lease"
+            "unrelated exec inherited storage lease: descriptor={}, target={:?}, fdinfo={:?}",
+            path.display(),
+            std::fs::read_link(&path),
+            std::fs::read_to_string(
+                path.parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("fdinfo")
+                    .join(path.file_name().unwrap())
+            )
         );
     }
     let inherited = std::fs::metadata(format!("/proc/{pid}/fd/8")).unwrap();

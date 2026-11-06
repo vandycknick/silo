@@ -3,6 +3,7 @@
 use std::num::NonZeroU64;
 
 use crate::v1 as wire;
+use vm_spec::capture;
 use vm_spec::lifecycle as domain;
 
 fn required<T>(value: Option<T>, field: &str) -> Result<T, String> {
@@ -32,12 +33,15 @@ where
 
 macro_rules! wire_enum {
     ($domain:ident <=> $wire:ident { $($variant:ident = $wire_variant:ident),+ $(,)? }) => {
-        impl From<domain::$domain> for wire::$wire {
-            fn from(value: domain::$domain) -> Self {
-                match value { $(domain::$domain::$variant => Self::$wire_variant),+ }
+        wire_enum!(domain::$domain <=> $wire { $($variant = $wire_variant),+ });
+    };
+    ($module:ident :: $domain:ident <=> $wire:ident { $($variant:ident = $wire_variant:ident),+ $(,)? }) => {
+        impl From<$module::$domain> for wire::$wire {
+            fn from(value: $module::$domain) -> Self {
+                match value { $($module::$domain::$variant => Self::$wire_variant),+ }
             }
         }
-        impl TryFrom<wire::$wire> for domain::$domain {
+        impl TryFrom<wire::$wire> for $module::$domain {
             type Error = String;
             fn try_from(value: wire::$wire) -> Result<Self, String> {
                 match value {
@@ -81,10 +85,13 @@ wire_enum!(OperationStatus <=> OperationStatus {
     Succeeded = Succeeded,
     Failed = Failed,
 });
-wire_enum!(CapturePolicy <=> CapturePolicy { Full = Full, Incremental = Incremental });
-wire_enum!(CaptureResumePolicy <=> CaptureResumePolicy {
-    ResumeIfAcquired = ResumeIfAcquired,
-    Preserve = Preserve,
+wire_enum!(capture::CaptureReleaseDisposition <=> CaptureReleaseDisposition {
+    Published = Published,
+    Abandoned = Abandoned,
+});
+wire_enum!(capture::CaptureRecordOutcome <=> CaptureRecordOutcome {
+    Coherent = Coherent,
+    Failed = Failed,
 });
 wire_enum!(LiveStage <=> LiveStage {
     MonitorDrain = MonitorDrain,
@@ -102,6 +109,18 @@ wire_enum!(LiveStage <=> LiveStage {
     RecoveryFreeze = RecoveryFreeze,
     RecoveryPause = RecoveryPause,
     Admission = Admission,
+    CapturePrepare = CapturePrepare,
+    CaptureFlush = CaptureFlush,
+    CaptureDisks = CaptureDisks,
+    CaptureExecution = CaptureExecution,
+    CaptureMemory = CaptureMemory,
+    CaptureVerify = CaptureVerify,
+    CaptureSeal = CaptureSeal,
+    CaptureAccept = CaptureAccept,
+    CaptureAbandon = CaptureAbandon,
+    CapturePreserve = CapturePreserve,
+    CaptureSourceRecord = CaptureSourceRecord,
+    CaptureRelease = CaptureRelease,
 });
 wire_enum!(LiveFailureCode <=> LiveFailureCode {
     DrainTimedOut = DrainTimedOut,
@@ -124,6 +143,20 @@ wire_enum!(LiveFailureCode <=> LiveFailureCode {
     WorkerLost = WorkerLost,
     Stopped = Stopped,
     DeadlineExceeded = DeadlineExceeded,
+    StagingFailed = StagingFailed,
+    DiskFlushFailed = DiskFlushFailed,
+    DiskCopyFailed = DiskCopyFailed,
+    ExecutionCaptureFailed = ExecutionCaptureFailed,
+    MemoryCaptureFailed = MemoryCaptureFailed,
+    CaptureVerificationFailed = CaptureVerificationFailed,
+    SealFailed = SealFailed,
+    SealUncertain = SealUncertain,
+    BaselineAcceptFailed = BaselineAcceptFailed,
+    PreserveFailed = PreserveFailed,
+    AbandonFailed = AbandonFailed,
+    SourceRecordFailed = SourceRecordFailed,
+    ReleaseFailed = ReleaseFailed,
+    StagingBudgetExceeded = StagingBudgetExceeded,
 });
 wire_enum!(LiveRejectionCode <=> LiveRejectionCode {
     WrongMachine = WrongMachine,
@@ -136,6 +169,9 @@ wire_enum!(LiveRejectionCode <=> LiveRejectionCode {
     Unsupported = Unsupported,
     WrongTarget = WrongTarget,
     MonitorStopping = MonitorStopping,
+    InvalidPlan = InvalidPlan,
+    ConfigurationMismatch = ConfigurationMismatch,
+    ContinuationPending = ContinuationPending,
 });
 wire_enum!(GuestLifecycleState <=> GuestLifecycleState {
     Running = Running,
@@ -326,6 +362,32 @@ impl TryFrom<wire::LiveFailure> for domain::LiveFailure {
     }
 }
 
+fn digest(value: Option<String>, field: &str) -> Result<capture::Sha256Digest, String> {
+    required(value, field)?
+        .parse()
+        .map_err(|error| format!("{field}: {error}"))
+}
+
+impl From<capture::CaptureSealed> for wire::CaptureSealed {
+    fn from(value: capture::CaptureSealed) -> Self {
+        Self {
+            capture_id: Some(value.capture_id.into()),
+            evidence_sha256: Some(value.evidence_sha256.to_string()),
+            cut_token: Some(value.cut_token.into()),
+        }
+    }
+}
+impl TryFrom<wire::CaptureSealed> for capture::CaptureSealed {
+    type Error = String;
+    fn try_from(value: wire::CaptureSealed) -> Result<Self, Self::Error> {
+        Ok(Self {
+            capture_id: id(value.capture_id, "capture.captureId")?,
+            evidence_sha256: digest(value.evidence_sha256, "capture.evidenceSha256")?,
+            cut_token: required(value.cut_token, "capture.cutToken")?.try_into()?,
+        })
+    }
+}
+
 impl From<domain::LiveOperationRecord> for wire::LiveOperationRecord {
     fn from(value: domain::LiveOperationRecord) -> Self {
         use wire::live_operation_record::Result as WireResult;
@@ -338,6 +400,9 @@ impl From<domain::LiveOperationRecord> for wire::LiveOperationRecord {
                 domain::OperationOutcome::InProgress => None,
                 domain::OperationOutcome::Succeeded { pause } => {
                     Some(WireResult::Pause(pause.into()))
+                }
+                domain::OperationOutcome::CaptureSealed { capture } => {
+                    Some(WireResult::Capture(capture.into()))
                 }
                 domain::OperationOutcome::Failed { failure } => {
                     Some(WireResult::Failure(failure.into()))
@@ -357,6 +422,11 @@ impl TryFrom<wire::LiveOperationRecord> for domain::LiveOperationRecord {
             (domain::OperationStatus::Succeeded, Some(WireResult::Pause(pause))) => {
                 domain::OperationOutcome::Succeeded {
                     pause: pause.try_into()?,
+                }
+            }
+            (domain::OperationStatus::Succeeded, Some(WireResult::Capture(capture))) => {
+                domain::OperationOutcome::CaptureSealed {
+                    capture: capture.try_into()?,
                 }
             }
             (domain::OperationStatus::Failed, Some(WireResult::Failure(failure))) => {
@@ -471,6 +541,9 @@ impl TryFrom<wire::LiveRejection> for domain::LiveRejection {
             (Code::ForeignToken, None) => Reason::ForeignToken,
             (Code::WrongTarget, None) => Reason::WrongTarget,
             (Code::MonitorStopping, None) => Reason::MonitorStopping,
+            (Code::InvalidPlan, None) => Reason::InvalidPlan,
+            (Code::ConfigurationMismatch, None) => Reason::ConfigurationMismatch,
+            (Code::ContinuationPending, None) => Reason::ContinuationPending,
         };
         let rejection = Self {
             reason,
@@ -576,33 +649,25 @@ impl TryFrom<wire::CancelOperationRequest> for domain::CancelOperationCommand {
     }
 }
 
-impl From<domain::CaptureCommand> for wire::CaptureRequest {
-    fn from(value: domain::CaptureCommand) -> Self {
-        Self {
+impl TryFrom<domain::CaptureCommand> for wire::CaptureRequest {
+    type Error = String;
+    fn try_from(value: domain::CaptureCommand) -> Result<Self, Self::Error> {
+        Ok(Self {
+            plan: Some(value.plan.canonical_bytes()?),
             envelope: Some(value.envelope.into()),
-            expected_configuration_digest: Some(value.expected_configuration_digest),
-            policy: number(wire::CapturePolicy::from(value.policy)),
-            resume_policy: number(wire::CaptureResumePolicy::from(value.resume_policy)),
-        }
+        })
     }
 }
 impl TryFrom<wire::CaptureRequest> for domain::CaptureCommand {
     type Error = String;
     fn try_from(value: wire::CaptureRequest) -> Result<Self, Self::Error> {
-        let command = Self {
+        // Canonical closed syntax only: semantic plan validity is the monitor's
+        // journaled `invalid-plan` rejection, not a transport error.
+        Ok(Self {
             envelope: envelope(value.envelope)?,
-            expected_configuration_digest: required(
-                value.expected_configuration_digest,
-                "expectedConfigurationDigest",
-            )?,
-            policy: read_enum::<wire::CapturePolicy, _>(value.policy, "policy")?,
-            resume_policy: read_enum::<wire::CaptureResumePolicy, _>(
-                value.resume_policy,
-                "resumePolicy",
-            )?,
-        };
-        domain::LiveCommand::Capture(command.clone()).validate()?;
-        Ok(command)
+            plan: capture::CapturePlan::parse_canonical(&required(value.plan, "plan")?)
+                .map_err(|error| format!("plan: {error}"))?,
+        })
     }
 }
 
@@ -611,6 +676,7 @@ impl From<domain::ReleaseCaptureCommand> for wire::ReleaseCaptureRequest {
         Self {
             envelope: Some(value.envelope.into()),
             operation_id: Some(value.operation_id.into()),
+            disposition: number(wire::CaptureReleaseDisposition::from(value.disposition)),
         }
     }
 }
@@ -620,6 +686,10 @@ impl TryFrom<wire::ReleaseCaptureRequest> for domain::ReleaseCaptureCommand {
         Ok(Self {
             envelope: envelope(value.envelope)?,
             operation_id: id(value.operation_id, "operationId")?,
+            disposition: read_enum::<wire::CaptureReleaseDisposition, _>(
+                value.disposition,
+                "disposition",
+            )?,
         })
     }
 }
@@ -744,6 +814,138 @@ impl TryFrom<wire::ResumeResponse> for domain::ResumeOutcome {
     }
 }
 
+impl From<capture::CaptureContinuation> for wire::CaptureContinuation {
+    fn from(value: capture::CaptureContinuation) -> Self {
+        use wire::capture_continuation::Status;
+        Self {
+            status: Some(match value {
+                capture::CaptureContinuation::Pending => Status::Pending(()),
+                capture::CaptureContinuation::Unchanged => Status::Unchanged(()),
+                capture::CaptureContinuation::Resumed {
+                    consumed_token,
+                    thawed_epoch,
+                } => Status::Resumed(wire::ResumeCompleted {
+                    consumed_token: Some(consumed_token.into()),
+                    thawed_epoch: Some(thawed_epoch.get()),
+                }),
+                capture::CaptureContinuation::Preserved { preserved } => {
+                    Status::Preserved(preserved.into())
+                }
+                capture::CaptureContinuation::ResumeFailed { failure, state } => {
+                    Status::ResumeFailed(wire::CaptureResumeFailed {
+                        failure: Some(failure.into()),
+                        state: number(wire::VmState::from(state)),
+                    })
+                }
+            }),
+        }
+    }
+}
+impl TryFrom<wire::CaptureContinuation> for capture::CaptureContinuation {
+    type Error = String;
+    fn try_from(value: wire::CaptureContinuation) -> Result<Self, Self::Error> {
+        use wire::capture_continuation::Status;
+        let continuation = match required(value.status, "continuation.status")? {
+            Status::Pending(()) => Self::Pending,
+            Status::Unchanged(()) => Self::Unchanged,
+            Status::Resumed(resumed) => Self::Resumed {
+                consumed_token: required(resumed.consumed_token, "continuation.consumedToken")?
+                    .try_into()?,
+                thawed_epoch: nonzero(resumed.thawed_epoch, "continuation.thawedEpoch")?,
+            },
+            Status::Preserved(preserved) => Self::Preserved {
+                preserved: preserved.try_into()?,
+            },
+            Status::ResumeFailed(failed) => Self::ResumeFailed {
+                failure: required(failed.failure, "continuation.failure")?.try_into()?,
+                state: read_enum::<wire::VmState, _>(failed.state, "continuation.state")?,
+            },
+        };
+        continuation.validate()?;
+        Ok(continuation)
+    }
+}
+
+impl From<capture::CaptureReleaseState> for wire::CaptureReleaseState {
+    fn from(value: capture::CaptureReleaseState) -> Self {
+        use wire::capture_release_state::Status;
+        Self {
+            status: Some(match value {
+                capture::CaptureReleaseState::Retained => Status::Retained(()),
+                capture::CaptureReleaseState::Released {
+                    disposition,
+                    baseline_retained,
+                } => Status::Released(wire::CaptureReleasedState {
+                    disposition: number(wire::CaptureReleaseDisposition::from(disposition)),
+                    baseline_retained: Some(baseline_retained),
+                }),
+            }),
+        }
+    }
+}
+impl TryFrom<wire::CaptureReleaseState> for capture::CaptureReleaseState {
+    type Error = String;
+    fn try_from(value: wire::CaptureReleaseState) -> Result<Self, Self::Error> {
+        use wire::capture_release_state::Status;
+        Ok(match required(value.status, "release.status")? {
+            Status::Retained(()) => Self::Retained,
+            Status::Released(released) => Self::Released {
+                disposition: read_enum::<wire::CaptureReleaseDisposition, _>(
+                    released.disposition,
+                    "release.disposition",
+                )?,
+                baseline_retained: required(
+                    released.baseline_retained,
+                    "release.baselineRetained",
+                )?,
+            },
+        })
+    }
+}
+
+impl From<capture::CaptureObservation> for wire::CaptureObservation {
+    fn from(value: capture::CaptureObservation) -> Self {
+        Self {
+            continuation: Some(value.continuation.into()),
+            release: Some(value.release.into()),
+            evidence: value
+                .evidence
+                .map(|evidence| wire::CaptureEvidenceReference {
+                    outcome: number(wire::CaptureRecordOutcome::from(evidence.outcome)),
+                    sha256: Some(evidence.sha256.to_string()),
+                }),
+            source_record_sha256: value.source_record_sha256.map(|digest| digest.to_string()),
+        }
+    }
+}
+impl TryFrom<wire::CaptureObservation> for capture::CaptureObservation {
+    type Error = String;
+    fn try_from(value: wire::CaptureObservation) -> Result<Self, Self::Error> {
+        let observation = Self {
+            continuation: required(value.continuation, "capture.continuation")?.try_into()?,
+            release: required(value.release, "capture.release")?.try_into()?,
+            evidence: value
+                .evidence
+                .map(|evidence| {
+                    Ok::<_, String>(capture::CaptureEvidenceReference {
+                        outcome: read_enum::<wire::CaptureRecordOutcome, _>(
+                            evidence.outcome,
+                            "evidence.outcome",
+                        )?,
+                        sha256: digest(evidence.sha256, "evidence.sha256")?,
+                    })
+                })
+                .transpose()?,
+            source_record_sha256: value
+                .source_record_sha256
+                .map(|value| digest(Some(value), "capture.sourceRecordSha256"))
+                .transpose()?,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+}
+
 impl From<domain::OperationObservation> for wire::OperationObservation {
     fn from(value: domain::OperationObservation) -> Self {
         Self {
@@ -751,6 +953,7 @@ impl From<domain::OperationObservation> for wire::OperationObservation {
             state: number(wire::VmState::from(value.state)),
             current_pause: value.current_pause.map(Into::into),
             activity: value.activity.map(Into::into),
+            capture: value.capture.map(Into::into),
         }
     }
 }
@@ -762,7 +965,9 @@ impl TryFrom<wire::OperationObservation> for domain::OperationObservation {
             state: read_enum::<wire::VmState, _>(value.state, "observation.state")?,
             current_pause: value.current_pause.map(TryInto::try_into).transpose()?,
             activity: value.activity.map(TryInto::try_into).transpose()?,
+            capture: value.capture.map(TryInto::try_into).transpose()?,
         };
+        observation.validate()?;
         domain::LiveLifecycle {
             current_pause: observation.current_pause.clone(),
             activity: observation.activity.clone(),
@@ -868,6 +1073,22 @@ impl TryFrom<domain::ReleaseCaptureOutcome> for wire::ReleaseCaptureResponse {
         use wire::release_capture_response::Outcome;
         Ok(Self {
             outcome: Some(match value {
+                domain::ReleaseCaptureOutcome::Released { released } => {
+                    Outcome::Released(wire::CaptureReleased {
+                        operation_id: Some(released.operation_id.into()),
+                        disposition: number(wire::CaptureReleaseDisposition::from(
+                            released.disposition,
+                        )),
+                        baseline_retained: Some(released.baseline_retained),
+                        state: number(wire::VmState::from(released.state)),
+                    })
+                }
+                domain::ReleaseCaptureOutcome::Failed { failed } => {
+                    Outcome::Failed(wire::ReleaseFailed {
+                        cause: Some(failed.cause.into()),
+                        state: number(wire::VmState::from(failed.state)),
+                    })
+                }
                 domain::ReleaseCaptureOutcome::Rejected { rejection } => {
                     Outcome::Rejected(rejection.try_into()?)
                 }
@@ -880,6 +1101,26 @@ impl TryFrom<wire::ReleaseCaptureResponse> for domain::ReleaseCaptureOutcome {
     fn try_from(value: wire::ReleaseCaptureResponse) -> Result<Self, Self::Error> {
         use wire::release_capture_response::Outcome;
         Ok(match required(value.outcome, "outcome")? {
+            Outcome::Released(released) => Self::Released {
+                released: capture::CaptureReleased {
+                    operation_id: id(released.operation_id, "released.operationId")?,
+                    disposition: read_enum::<wire::CaptureReleaseDisposition, _>(
+                        released.disposition,
+                        "released.disposition",
+                    )?,
+                    baseline_retained: required(
+                        released.baseline_retained,
+                        "released.baselineRetained",
+                    )?,
+                    state: read_enum::<wire::VmState, _>(released.state, "released.state")?,
+                },
+            },
+            Outcome::Failed(failed) => Self::Failed {
+                failed: domain::ReleaseFailed {
+                    cause: required(failed.cause, "failed.cause")?.try_into()?,
+                    state: read_enum::<wire::VmState, _>(failed.state, "failed.state")?,
+                },
+            },
             Outcome::Rejected(rejection) => Self::Rejected {
                 rejection: rejection.try_into()?,
             },
@@ -989,13 +1230,179 @@ mod tests {
         nil.envelope.as_mut().unwrap().run_id = Some("00000000-0000-0000-0000-000000000000".into());
         assert!(domain::ResumeCommand::try_from(nil).is_err());
         assert!(domain::PauseCommand::try_from(wire::PauseRequest { envelope: None }).is_err());
-        let capture = wire::CaptureRequest {
+        assert!(domain::CaptureCommand::try_from(wire::CaptureRequest {
             envelope: Some(envelope().into()),
-            expected_configuration_digest: Some(String::new()),
-            policy: Some(wire::CapturePolicy::Full as i32),
-            resume_policy: Some(wire::CaptureResumePolicy::Preserve as i32),
+            plan: None,
+        })
+        .is_err());
+        assert!(domain::CaptureCommand::try_from(wire::CaptureRequest {
+            envelope: Some(envelope().into()),
+            plan: Some(b"{}".to_vec()),
+        })
+        .is_err());
+
+        let capture = domain::CaptureCommand {
+            envelope: envelope(),
+            plan: plan(),
         };
-        assert!(domain::CaptureCommand::try_from(capture).is_err());
+        let encoded = wire::CaptureRequest::try_from(capture.clone()).unwrap();
+        assert_eq!(
+            encoded.plan.as_deref(),
+            Some(capture.plan.canonical_bytes().unwrap().as_slice()),
+            "the plan travels as the exact request.json bytes"
+        );
+        assert_eq!(
+            domain::CaptureCommand::try_from(encoded.clone()).unwrap(),
+            capture
+        );
+        let mut spaced = encoded.clone();
+        spaced.plan.as_mut().unwrap().push(b' ');
+        assert!(domain::CaptureCommand::try_from(spaced).is_err());
+        // Semantic validity is a typed monitor rejection, not a decode error.
+        let mut invalid = capture.clone();
+        invalid.plan.ram_bytes = 1;
+        assert!(domain::CaptureCommand::try_from(
+            wire::CaptureRequest::try_from(invalid.clone()).unwrap()
+        )
+        .is_ok());
+        assert!(invalid.validate_plan().is_err());
+
+        let release = domain::ReleaseCaptureCommand {
+            envelope: envelope(),
+            operation_id: id(3),
+            disposition: vm_spec::capture::CaptureReleaseDisposition::Published,
+        };
+        let encoded = wire::ReleaseCaptureRequest::from(release.clone());
+        assert_eq!(
+            domain::ReleaseCaptureCommand::try_from(encoded.clone()).unwrap(),
+            release
+        );
+        let mut unspecified = encoded;
+        unspecified.disposition = Some(wire::CaptureReleaseDisposition::Unspecified as i32);
+        assert!(domain::ReleaseCaptureCommand::try_from(unspecified).is_err());
+    }
+
+    fn plan() -> vm_spec::capture::CapturePlan {
+        use vm_spec::capture::*;
+        let configuration = CaptureConfiguration::from_spec(&vm_spec::VmSpec::current()).unwrap();
+        CapturePlan {
+            version: CAPTURE_RECORD_VERSION,
+            machine_id: id(1),
+            run_id: id(2),
+            capture_id: id(3),
+            configuration_digest: configuration.digest().unwrap(),
+            ram_bytes: configuration.ram_bytes(),
+            configuration,
+            policy: domain::CapturePolicy::Full,
+            resume_policy: domain::CaptureResumePolicy::ResumeIfAcquired,
+            pause: CapturePauseAuthority::Acquire,
+            disks: Vec::new(),
+            read_only_inputs: Vec::new(),
+            reservation: CaptureReservation {
+                storage_operation_id: id(4),
+                launch_lease: CaptureLaunchLease {
+                    operation_id: id(5),
+                    device: 1,
+                    inode: 2,
+                },
+                staging_bytes: 1 << 40,
+            },
+        }
+    }
+
+    #[test]
+    fn capture_results_roundtrip_with_separate_continuation() {
+        use vm_spec::capture::*;
+        let cut = domain::PauseToken {
+            owner: domain::PauseOwner::Capture {
+                operation_id: id(3),
+            },
+            ..token(2)
+        };
+        let observation = domain::OperationObservation {
+            operation: domain::LiveOperationRecord {
+                operation_id: id(3),
+                kind: domain::OperationKind::Capture,
+                outcome: domain::OperationOutcome::CaptureSealed {
+                    capture: CaptureSealed {
+                        capture_id: id(3),
+                        evidence_sha256: Sha256Digest::of_bytes(b"evidence"),
+                        cut_token: cut,
+                    },
+                },
+            },
+            state: domain::VmLifecycleState::Capturing,
+            current_pause: None,
+            activity: Some(domain::LiveActivity {
+                operation_id: id(3),
+                request_id: id(3),
+                command: domain::LiveCommandKind::Capture,
+                stage: domain::LiveStage::ResumeThaw,
+            }),
+            capture: Some(CaptureObservation {
+                continuation: CaptureContinuation::Pending,
+                release: CaptureReleaseState::Retained,
+                evidence: Some(CaptureEvidenceReference {
+                    outcome: CaptureRecordOutcome::Coherent,
+                    sha256: Sha256Digest::of_bytes(b"evidence"),
+                }),
+                source_record_sha256: None,
+            }),
+        };
+        let encoded = wire::OperationObservation::from(observation.clone());
+        assert_eq!(
+            domain::OperationObservation::try_from(encoded.clone()).unwrap(),
+            observation
+        );
+        let mut failed_record = encoded.clone();
+        failed_record
+            .capture
+            .as_mut()
+            .unwrap()
+            .evidence
+            .as_mut()
+            .unwrap()
+            .outcome = Some(wire::CaptureRecordOutcome::Failed as i32);
+        assert!(
+            domain::OperationObservation::try_from(failed_record).is_err(),
+            "a sealed capture needs its coherent record"
+        );
+        let mut missing = encoded;
+        missing.capture = None;
+        assert!(domain::OperationObservation::try_from(missing).is_err());
+
+        let mut preserved = observation.clone();
+        preserved.state = domain::VmLifecycleState::Paused;
+        preserved.activity = None;
+        let current = domain::CurrentPause {
+            token: token(2),
+            operation_id: id(3),
+            freeze_epoch: NonZeroU64::new(1).unwrap(),
+        };
+        preserved.current_pause = Some(current.clone());
+        preserved.capture.as_mut().unwrap().continuation =
+            CaptureContinuation::Preserved { preserved: current };
+        assert_eq!(
+            domain::OperationObservation::try_from(wire::OperationObservation::from(
+                preserved.clone()
+            ))
+            .unwrap(),
+            preserved
+        );
+
+        let released = domain::ReleaseCaptureOutcome::Released {
+            released: CaptureReleased {
+                operation_id: id(3),
+                disposition: CaptureReleaseDisposition::Published,
+                baseline_retained: true,
+                state: domain::VmLifecycleState::Running,
+            },
+        };
+        let encoded = wire::ReleaseCaptureResponse::try_from(released.clone()).unwrap();
+        assert_eq!(
+            domain::ReleaseCaptureOutcome::try_from(encoded).unwrap(),
+            released
+        );
     }
 
     #[test]

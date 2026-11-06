@@ -1,18 +1,24 @@
-//! One run-owned coordinator for ADR 0021 Pause/Resume/Cancel. It owns the
-//! public state projection and ordering; the guest owns workload freeze/thaw
-//! and the worker owns native pause authority. States are published only from
-//! positive barriers, never from transport success.
+//! One run-owned coordinator for ADR 0021 Pause/Resume/Cancel and Capture.
+//! It owns the public state projection and ordering; the guest owns workload
+//! freeze/thaw and the worker owns native pause and capture authority. States
+//! are published only from positive barriers, never from transport success.
 //!
 //! ```text
 //!  Running ─Pause─► Pausing[drain → freeze(e) → native pause] ─token─► Paused
 //!     ▲                 │ freeze fails: rollback thaw + readiness ─► Running | Error
 //!     │                 │ native fails: Pausing[pause-failed] ─Cancel─► rollback ─► thaw ─► Running | Error
-//!     │                                                                          
+//!     │
 //!  Paused ─Resume─► Pausing[native ClockOnly → handshake → thaw(e) → readiness] ─► Running
 //!                       │ thaw lost: freeze(e+1) → native pause ─► Paused (new token) | Error
+//!
+//!  Running|Paused ─Capture─► Capturing[see `capture`] ─► Running | Paused | Error
 //! ```
 //!
-//! Stop seals the gate and the journal: no later continuation can publish.
+//! Stop closes native mutator submission, then seals the gate and the
+//! journal: no later native mutator is enqueued and no continuation publishes.
+#[path = "capture.rs"]
+pub(crate) mod capture;
+
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -38,7 +44,7 @@ use vm_spec::live::{
 
 use crate::live::gate::{DrainError, LiveGate};
 use crate::live::journal::{
-    rejected, AdmissionView, Admitted, Answer, Journal, NativeEligibility, Phase, ResultReceiver,
+    AdmissionView, Admitted, Answer, Eligibility, Journal, Phase, ResultReceiver,
 };
 use crate::state::{InstanceStore, LiveSnapshot, LiveTransition, ReadyAgentIdentity, StoreError};
 use crate::virt::lifecycle::{
@@ -116,6 +122,8 @@ pub(crate) struct LiveCoordinator {
     gate: Arc<LiveGate>,
     stop: CancellationToken,
     timeouts: LiveTimeouts,
+    /// Present when this run can bind capture plans.
+    capture: Option<Arc<crate::live::coordinator::capture::CaptureContext>>,
 }
 
 /// Why a guest call produced no positive acknowledgement.
@@ -124,6 +132,22 @@ enum GuestError {
     Refused(LiveFailure),
     /// No definitive answer before the stage deadline.
     Unknown(LiveFailure),
+    Stopped,
+}
+
+/// Outcome of continuing a natively released source to Running.
+enum Continued {
+    Running,
+    /// The thaw was lost and recovery established NEW user authority; it is
+    /// not yet published.
+    Recovered {
+        current: CurrentPause,
+        cause: LiveFailure,
+    },
+    Failed {
+        cause: LiveFailure,
+        recovery: Option<LiveFailure>,
+    },
     Stopped,
 }
 
@@ -204,21 +228,40 @@ pub(crate) fn guest_observation(
 }
 
 /// Native provider inventory admission: every live device must be a
-/// classified virtio provider and every block provider Raw-backed.
+/// classified virtio provider, every block provider Raw-backed or a
+/// read-only VMDK (the flat lower, captured by identity). A capture
+/// additionally refuses the devices ADR 0021 names, before any freeze.
 pub(crate) fn inventory_rejection(
     control: &ControlObservation,
     inventory: Option<&InventoryObservation>,
-) -> Option<&'static str> {
-    if !matches!(
-        control,
-        ControlObservation::Observed {
-            control: NativeControl::Running
-        }
-    ) {
-        return Some("native-control-not-running");
+    capture: bool,
+) -> Option<LiveDeviceSubject> {
+    let profile = |profile: &str| {
+        Some(LiveDeviceSubject::GuestProfile {
+            profile: profile.to_string(),
+        })
+    };
+    let expected = if capture {
+        // A capture runs on a Running source or borrows an exact user pause.
+        matches!(
+            control,
+            ControlObservation::Observed {
+                control: NativeControl::Running | NativeControl::Paused { .. }
+            }
+        )
+    } else {
+        matches!(
+            control,
+            ControlObservation::Observed {
+                control: NativeControl::Running
+            }
+        )
+    };
+    if !expected {
+        return profile("native-control-not-running");
     }
     let Some(InventoryObservation::Observed { providers, .. }) = inventory else {
-        return Some("native-provider-inventory-unavailable");
+        return profile("native-provider-inventory-unavailable");
     };
     for provider in providers {
         match &provider.device {
@@ -226,13 +269,32 @@ pub(crate) fn inventory_rejection(
             | ProviderDevice::Virtio {
                 kind: VirtioKind::Other,
                 ..
-            } => return Some("native-provider-unrecognized"),
+            } => return profile("native-provider-unrecognized"),
             ProviderDevice::Virtio {
                 kind: VirtioKind::Block,
                 ..
-            } if provider.block_backing != Some(BlockBacking::Raw) => {
-                return Some("native-block-backing-unsupported");
+            } => {
+                let admitted = match provider.block_backing {
+                    Some(BlockBacking::Raw) => true,
+                    Some(BlockBacking::Vmdk) => provider.block_read_only == Some(true),
+                    None => false,
+                };
+                if !admitted {
+                    return profile("native-block-backing-unsupported");
+                }
             }
+            ProviderDevice::Virtio {
+                kind: VirtioKind::Fs,
+                ..
+            } if capture => return Some(LiveDeviceSubject::Virtiofs),
+            ProviderDevice::Virtio {
+                kind: VirtioKind::Gpu,
+                ..
+            } if capture => return Some(LiveDeviceSubject::Gpu),
+            ProviderDevice::Virtio {
+                kind: VirtioKind::Input,
+                ..
+            } if capture => return profile("native-input-device"),
             ProviderDevice::Virtio { .. } => {}
         }
     }
@@ -247,6 +309,7 @@ impl LiveCoordinator {
         machine: VirtualMachine,
         gate: Arc<LiveGate>,
         timeouts: LiveTimeouts,
+        capture: Option<crate::live::coordinator::capture::CaptureContext>,
     ) -> Result<Arc<Self>, String> {
         let machine_id = LiveId::parse(&machine_uuid.hyphenated().to_string())?;
         let run_id = LiveId::parse(&run_uuid.hyphenated().to_string())?;
@@ -263,11 +326,18 @@ impl LiveCoordinator {
             gate,
             stop: CancellationToken::new(),
             timeouts,
+            capture: capture.map(Arc::new),
         }))
     }
 
     pub(crate) fn gate(&self) -> &Arc<LiveGate> {
         &self.gate
+    }
+
+    /// The exact binding a test plan must carry for this run.
+    #[cfg(test)]
+    pub(crate) fn capture_binding_for_tests(&self) -> Option<crate::live::journal::CaptureBinding> {
+        self.capture.as_ref().map(|context| context.binding())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -276,8 +346,14 @@ impl LiveCoordinator {
     }
 
     /// Seal admission and every continuation, then report how to stop.
+    ///
+    /// The native submission fence closes first and under the journal lock,
+    /// before any await of the shutdown path: a mutator the worker admits was
+    /// enqueued before stop began, and one refused by the fence observes
+    /// `stopped` as soon as it takes this lock.
     pub(crate) fn begin_stop(&self) -> StopMode {
         let mut inner = self.lock();
+        self.machine.close_lifecycle_admission();
         inner.journal.stopped = true;
         self.stop.cancel();
         self.gate.seal();
@@ -299,30 +375,36 @@ impl LiveCoordinator {
         self: &Arc<Self>,
         command: LiveCommand,
     ) -> Result<LiveCommandResult, LiveError> {
-        if let Err(message) = command.validate() {
-            return Ok(rejected(
-                command.kind(),
-                LiveRejectionReason::InvalidState,
-                self.store.live_snapshot()?.state,
-                message,
-            ));
-        }
-        let mut native = NativeEligibility::Unchecked;
+        let mut eligibility = Eligibility::Unchecked;
         loop {
-            let admitted = self.admit(&command, native.clone())?;
+            let admitted = self.admit(&command, eligibility.clone())?;
             match admitted {
                 Admitted::Answer(Answer::Ready(result)) => return Ok(result),
-                Admitted::Answer(Answer::Wait(receiver)) | Admitted::CancelJoined { receiver } => {
+                Admitted::Answer(Answer::Wait(receiver)) | Admitted::Joined { receiver } => {
                     return wait(receiver).await
                 }
                 Admitted::CheckNative => {
-                    native = self.check_native(&command.envelope().request_id).await?;
+                    eligibility = self.check_native(&command.envelope().request_id).await?;
+                }
+                Admitted::CheckCapture => {
+                    let LiveCommand::Capture(capture) = &command else {
+                        return Err(LiveError::Abandoned);
+                    };
+                    eligibility = self.check_capture(&capture.plan).await?;
                 }
                 Admitted::Pause { operation } => {
                     let coordinator = self.clone();
                     tokio::spawn(async move { coordinator.run_pause(operation).await });
                     // The receipt is the journaled answer for this request.
-                    native = NativeEligibility::Eligible;
+                    eligibility = Eligibility::Eligible;
+                }
+                Admitted::Capture {
+                    operation,
+                    borrowed,
+                } => {
+                    let coordinator = self.clone();
+                    tokio::spawn(async move { coordinator.run_capture(operation, borrowed).await });
+                    eligibility = Eligibility::Eligible;
                 }
                 Admitted::Resume {
                     request,
@@ -350,38 +432,61 @@ impl LiveCoordinator {
                     );
                     return wait(receiver).await;
                 }
+                Admitted::Release {
+                    request,
+                    operation,
+                    disposition,
+                    receiver,
+                } => {
+                    let coordinator = self.clone();
+                    tokio::spawn(async move {
+                        coordinator
+                            .run_release(request, operation, disposition)
+                            .await
+                    });
+                    return wait(receiver).await;
+                }
             }
         }
     }
 
     fn admission_view(&self, snapshot: &LiveSnapshot) -> AdmissionView {
-        let unsupported = |operation: LiveOperation, capability: &LiveCapability| {
-            let reason = match &capability.availability {
-                LiveAvailability::Unsupported { reason } => reason.clone(),
-                // Capture is never delivered here, even if a scenario
-                // advertises support.
-                LiveAvailability::Supported => {
-                    LiveUnsupportedReason::new(LiveReasonCode::NotDelivered)
-                }
-            };
-            LiveOperationUnsupported {
+        let unsupported =
+            |operation: LiveOperation, reason: LiveUnsupportedReason| LiveOperationUnsupported {
                 operation,
                 backend: snapshot.backend,
                 lane: snapshot.lane,
                 reason,
-            }
-        };
-        let pause = match &snapshot.live.pause.availability {
+            };
+        let availability = |operation: LiveOperation, capability: &LiveCapability| match &capability
+            .availability
+        {
             LiveAvailability::Supported => Ok(()),
-            LiveAvailability::Unsupported { .. } => {
-                Err(unsupported(LiveOperation::Pause, &snapshot.live.pause))
-            }
+            LiveAvailability::Unsupported { reason } => Err(unsupported(operation, reason.clone())),
+        };
+        let capture = match (
+            &self.capture,
+            availability(LiveOperation::Capture, &snapshot.live.capture),
+        ) {
+            (Some(_), capture) => capture,
+            // A run that cannot bind a plan (no managed launch lease or no
+            // valid configuration projection) never delivers capture.
+            (None, _) => Err(unsupported(
+                LiveOperation::Capture,
+                LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
+            )),
         };
         AdmissionView {
             state: snapshot.state,
             lifecycle: snapshot.lifecycle.clone(),
-            pause,
-            capture: unsupported(LiveOperation::Capture, &snapshot.live.capture),
+            pause: availability(LiveOperation::Pause, &snapshot.live.pause),
+            capture,
+            // Phase 14 delivers full capture only.
+            incremental: unsupported(
+                LiveOperation::Incremental,
+                LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
+            ),
+            capture_binding: self.capture.as_ref().map(|context| context.binding()),
             guest_ready: snapshot.ready_identity.is_some() && snapshot.guest_rejection.is_none(),
         }
     }
@@ -389,12 +494,12 @@ impl LiveCoordinator {
     fn admit(
         &self,
         command: &LiveCommand,
-        native: NativeEligibility,
+        eligibility: Eligibility,
     ) -> Result<Admitted, LiveError> {
         let mut inner = self.lock();
         let snapshot = self.store.live_snapshot()?;
         let view = self.admission_view(&snapshot);
-        let admitted = inner.journal.admit(command, &view, native);
+        let admitted = inner.journal.admit(command, &view, eligibility);
         match &admitted {
             Admitted::Pause { operation } => {
                 // Close synchronously with acceptance: nothing slips between.
@@ -415,6 +520,32 @@ impl LiveCoordinator {
                     "pausing",
                 )?;
                 tracing::info!(operation = %operation, "live pause admitted; fences closed");
+            }
+            Admitted::Capture {
+                operation,
+                borrowed,
+            } => {
+                // A running source is fenced synchronously with acceptance; a
+                // borrowed user pause is already fenced, frozen and parked.
+                if borrowed.is_none() {
+                    self.gate.close();
+                    inner.held = snapshot.ready_identity.clone();
+                }
+                let activity = activity(
+                    operation,
+                    operation,
+                    LiveCommandKind::Capture,
+                    LiveStage::CapturePrepare,
+                );
+                self.publish(
+                    &inner,
+                    VmLifecycleState::Capturing,
+                    Some(activity),
+                    None,
+                    false,
+                    "capturing",
+                )?;
+                tracing::info!(operation = %operation, borrowed = borrowed.is_some(), "live capture admitted");
             }
             Admitted::Resume {
                 request, current, ..
@@ -462,7 +593,8 @@ impl LiveCoordinator {
     }
 
     /// Publish a projection under the coordinator lock. Returns false once
-    /// stop has taken over. Only Pausing/Paused may carry the parked interval.
+    /// stop has taken over. Only Pausing/Paused/Capturing may carry the
+    /// held identity and the parked interval.
     fn publish(
         &self,
         inner: &Inner,
@@ -475,7 +607,10 @@ impl LiveCoordinator {
         if inner.journal.stopped {
             return Ok(false);
         }
-        let holding = matches!(state, VmLifecycleState::Pausing | VmLifecycleState::Paused);
+        let holding = matches!(
+            state,
+            VmLifecycleState::Pausing | VmLifecycleState::Paused | VmLifecycleState::Capturing
+        );
         let current_pause = (state == VmLifecycleState::Paused)
             .then(|| inner.journal.current.clone())
             .flatten();
@@ -493,6 +628,8 @@ impl LiveCoordinator {
         })
     }
 
+    /// Active stage projection: Capturing for capture work (including its
+    /// source continuation), Pausing for every other lifecycle command.
     fn publish_stage(
         &self,
         operation: &LiveId,
@@ -503,9 +640,14 @@ impl LiveCoordinator {
     ) {
         let inner = self.lock();
         let activity = activity(operation, request, command, stage);
+        let state = if command == LiveCommandKind::Capture {
+            VmLifecycleState::Capturing
+        } else {
+            VmLifecycleState::Pausing
+        };
         if let Err(error) = self.publish(
             &inner,
-            VmLifecycleState::Pausing,
+            state,
             Some(activity),
             None,
             readiness_probe,
@@ -515,16 +657,11 @@ impl LiveCoordinator {
         }
     }
 
-    async fn check_native(&self, request: &LiveId) -> Result<NativeEligibility, LiveError> {
-        let snapshot = self.store.live_snapshot()?;
-        let reject = |profile: &'static str| {
-            NativeEligibility::Rejected(LiveOperationUnsupported {
-                operation: LiveOperation::Pause,
-                backend: snapshot.backend,
-                lane: snapshot.lane,
-                reason: LiveUnsupportedReason::device(LiveDeviceSubject::GuestProfile {
-                    profile: profile.to_string(),
-                }),
+    /// Native provider inventory of the exact run, observed outside the lock.
+    async fn native_inventory(&self, request: &LiveId, capture: bool) -> Option<LiveDeviceSubject> {
+        let profile = |profile: &str| {
+            Some(LiveDeviceSubject::GuestProfile {
+                profile: profile.to_string(),
             })
         };
         let response = tokio::select! {
@@ -534,21 +671,44 @@ impl LiveCoordinator {
                 request_id: wire_uuid(request),
                 command: LifecycleCommand::GetControl { target: None },
             }) => response,
-            () = self.stop.cancelled() => return Ok(reject("native-control-not-running")),
+            () = self.stop.cancelled() => return profile("native-control-not-running"),
         };
-        Ok(match response {
+        match response {
             Ok(response) => {
-                match inventory_rejection(&response.control, response.inventory.as_ref()) {
-                    None => NativeEligibility::Eligible,
-                    Some(profile) => reject(profile),
-                }
+                inventory_rejection(&response.control, response.inventory.as_ref(), capture)
             }
-            Err(LifecycleError::Unsupported { .. }) => reject("native-lifecycle-unsupported"),
+            Err(LifecycleError::Unsupported { .. }) => profile("native-lifecycle-unsupported"),
             Err(error) => {
-                tracing::warn!(%error, "native lifecycle control unavailable for pause admission");
-                reject("native-lifecycle-unavailable")
+                tracing::warn!(%error, "native lifecycle control unavailable for live admission");
+                profile("native-lifecycle-unavailable")
             }
-        })
+        }
+    }
+
+    fn device_rejection(
+        &self,
+        operation: LiveOperation,
+        subject: LiveDeviceSubject,
+    ) -> Result<Eligibility, LiveError> {
+        let snapshot = self.store.live_snapshot()?;
+        Ok(Eligibility::Rejected(
+            LiveRejectionReason::Unsupported {
+                unsupported: LiveOperationUnsupported {
+                    operation,
+                    backend: snapshot.backend,
+                    lane: snapshot.lane,
+                    reason: LiveUnsupportedReason::device(subject.clone()),
+                },
+            },
+            format!("{operation} rejected before freeze: device {subject}"),
+        ))
+    }
+
+    async fn check_native(&self, request: &LiveId) -> Result<Eligibility, LiveError> {
+        match self.native_inventory(request, false).await {
+            None => Ok(Eligibility::Eligible),
+            Some(subject) => self.device_rejection(LiveOperation::Pause, subject),
+        }
     }
 
     // ---------------------------------------------------------------- pause
@@ -1272,63 +1432,88 @@ impl LiveCoordinator {
                 return self.resume_error(&request, &requested, cause, None);
             }
         }
+        match self
+            .continue_released(
+                &operation,
+                &request,
+                LiveCommandKind::Resume,
+                &request,
+                &identity,
+                current.freeze_epoch,
+                generation,
+            )
+            .await
+        {
+            Continued::Running => self.resume_running(&request, &requested, current.freeze_epoch),
+            Continued::Recovered { current, cause } => {
+                self.resume_recovered(&request, &requested, current, cause)
+            }
+            Continued::Failed { cause, recovery } => {
+                self.resume_error(&request, &requested, cause, recovery)
+            }
+            Continued::Stopped => self.resume_stopped(&request, &requested),
+        }
+    }
+
+    /// After a positive native release of the exact pause of `operation`:
+    /// same-identity transport re-handshake, exact Thaw of `epoch`, then
+    /// readiness. A lost thaw re-freezes at the next epoch and establishes a
+    /// NEW native pause (request `recovery_request`); nothing is published
+    /// here, so the caller owns the final transition.
+    #[allow(clippy::too_many_arguments)]
+    async fn continue_released(
+        &self,
+        operation: &LiveId,
+        request: &LiveId,
+        command: LiveCommandKind,
+        recovery_request: &LiveId,
+        identity: &ReadyAgentIdentity,
+        epoch: NonZeroU64,
+        consumed: NativePauseGeneration,
+    ) -> Continued {
         // Only receipts observed after confirmed native release can prove
         // the source agent transport has re-handshaken.
         let released = Instant::now();
-
-        // Transport re-handshake: same identity, receipt after release.
         self.publish_stage(
-            &operation,
-            &request,
-            LiveCommandKind::Resume,
+            operation,
+            request,
+            command,
             LiveStage::ResumeHandshake,
             false,
         );
-        match self.await_handshake(released, &identity).await {
+        match self.await_handshake(released, identity).await {
             Ok(()) => {}
-            Err(GuestError::Stopped) => return self.resume_stopped(&request, &requested),
+            Err(GuestError::Stopped) => return Continued::Stopped,
             Err(GuestError::Refused(cause) | GuestError::Unknown(cause)) => {
-                return self.resume_error(&request, &requested, cause, None)
+                return Continued::Failed {
+                    cause,
+                    recovery: None,
+                }
             }
         }
 
-        self.publish_stage(
-            &operation,
-            &request,
-            LiveCommandKind::Resume,
-            LiveStage::ResumeThaw,
-            false,
-        );
-        let reference = self.freeze_ref(&operation, current.freeze_epoch);
+        self.publish_stage(operation, request, command, LiveStage::ResumeThaw, false);
+        let reference = self.freeze_ref(operation, epoch);
         let deadline = tokio::time::Instant::now() + self.timeouts.guest_stage;
         match self
-            .guest_thaw(
-                &identity,
-                &reference,
-                false,
-                LiveStage::ResumeThaw,
-                deadline,
-            )
+            .guest_thaw(identity, &reference, false, LiveStage::ResumeThaw, deadline)
             .await
         {
             Ok(_) => {
                 let thawed_at = Instant::now();
-                self.publish_stage(
-                    &operation,
-                    &request,
-                    LiveCommandKind::Resume,
-                    LiveStage::Readiness,
-                    true,
-                );
-                match self.await_readiness(thawed_at, &identity).await {
-                    Ok(()) => self.resume_running(&request, &requested, current.freeze_epoch),
-                    Err(GuestError::Stopped) => self.resume_stopped(&request, &requested),
+                self.publish_stage(operation, request, command, LiveStage::Readiness, true);
+                match self.await_readiness(thawed_at, identity).await {
+                    Ok(()) => Continued::Running,
+                    Err(GuestError::Stopped) => Continued::Stopped,
                     Err(GuestError::Refused(cause) | GuestError::Unknown(cause)) => {
-                        self.resume_error(&request, &requested, cause, None)
+                        Continued::Failed {
+                            cause,
+                            recovery: None,
+                        }
                     }
                 }
             }
-            Err(GuestError::Stopped) => self.resume_stopped(&request, &requested),
+            Err(GuestError::Stopped) => Continued::Stopped,
             Err(GuestError::Refused(cause) | GuestError::Unknown(cause)) => {
                 let lost = failure(
                     LiveFailureCode::ThawUnacknowledged,
@@ -1340,29 +1525,37 @@ impl LiveCoordinator {
                         .to_string(),
                 );
                 self.recover_lost_thaw(
-                    &request, &requested, &operation, &identity, generation, lost,
+                    operation,
+                    request,
+                    command,
+                    recovery_request,
+                    identity,
+                    consumed,
+                    lost,
                 )
-                .await;
+                .await
             }
         }
     }
 
     /// Lost thaw: exact next-epoch freeze, then a NEW native pause; only then
-    /// recovered Paused with new authority. Anything else is fenced Error.
+    /// recovered authority. Anything else is fenced Error.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_lost_thaw(
         &self,
-        request: &LiveId,
-        requested: &PauseToken,
         operation: &LiveId,
+        request: &LiveId,
+        command: LiveCommandKind,
+        recovery_request: &LiveId,
         identity: &ReadyAgentIdentity,
         consumed: NativePauseGeneration,
         cause: LiveFailure,
-    ) {
+    ) -> Continued {
         tracing::warn!(request = %request, cause = %cause, "thaw acknowledgement lost; re-freezing");
         self.publish_stage(
             operation,
             request,
-            LiveCommandKind::Resume,
+            command,
             LiveStage::RecoveryFreeze,
             false,
         );
@@ -1378,7 +1571,10 @@ impl LiveCoordinator {
                 LiveStage::RecoveryFreeze,
                 "freeze epoch exhausted",
             );
-            return self.resume_error(request, requested, cause, Some(recovery));
+            return Continued::Failed {
+                cause,
+                recovery: Some(recovery),
+            };
         };
         let reference = self.freeze_ref(operation, epoch);
         let (frozen, clock_profile) = match self
@@ -1386,25 +1582,22 @@ impl LiveCoordinator {
             .await
         {
             Ok(frozen) => frozen,
-            Err(GuestError::Stopped) => return self.resume_stopped(request, requested),
+            Err(GuestError::Stopped) => return Continued::Stopped,
             Err(GuestError::Refused(error) | GuestError::Unknown(error)) => {
                 let recovery = LiveFailure {
                     code: LiveFailureCode::RecoveryFreezeFailed,
                     ..error
                 };
-                return self.resume_error(request, requested, cause, Some(recovery));
+                return Continued::Failed {
+                    cause,
+                    recovery: Some(recovery),
+                };
             }
         };
-        self.publish_stage(
-            operation,
-            request,
-            LiveCommandKind::Resume,
-            LiveStage::RecoveryPause,
-            false,
-        );
+        self.publish_stage(operation, request, command, LiveStage::RecoveryPause, false);
         let result = self
             .native(self.native_request(
-                request,
+                recovery_request,
                 LifecycleCommand::Pause {
                     operation: wire_uuid(operation),
                     purpose: PausePurpose::Recovery { consumed },
@@ -1418,69 +1611,90 @@ impl LiveCoordinator {
                 if native.generation.get() > consumed.get() =>
             {
                 let Some(generation) = NonZeroU64::new(native.generation.get()) else {
-                    return;
+                    return Continued::Failed {
+                        cause,
+                        recovery: Some(failure(
+                            LiveFailureCode::RecoveryPauseFailed,
+                            LiveStage::RecoveryPause,
+                            "recovery pause reported a zero generation",
+                        )),
+                    };
                 };
-                let mut inner = self.lock();
+                let inner = self.lock();
                 let token = PauseToken {
                     machine_id: inner.journal.machine_id().clone(),
                     run_id: inner.journal.run_id().clone(),
                     generation,
                     owner: PauseOwner::User,
                 };
-                let recovered = CurrentPause {
-                    token,
-                    operation_id: operation.clone(),
-                    freeze_epoch: epoch,
-                };
-                inner.journal.current = Some(recovered.clone());
-                inner.parked = true;
-                let published = matches!(
-                    self.publish(
-                        &inner,
-                        VmLifecycleState::Paused,
-                        None,
-                        None,
-                        false,
-                        "paused after lost-thaw recovery"
-                    ),
-                    Ok(true)
-                );
-                let result = if published {
-                    tracing::info!(request = %request, generation = generation.get(), epoch = epoch.get(), observed = ?frozen.observed_frozen_roots, "recovered paused with new authority");
-                    ResumeFailed {
-                        cause,
-                        state: VmLifecycleState::Paused,
-                        current_pause: Some(recovered),
-                        recovery_failure: None,
-                        requested_token: requested.clone(),
-                    }
-                } else {
-                    inner.journal.current = None;
-                    stopped_resume(requested)
-                };
-                inner.journal.complete(
-                    request,
-                    LiveCommandResult::Resume(ResumeOutcome::Failed { failed: result }),
-                );
+                tracing::info!(request = %request, generation = generation.get(), epoch = epoch.get(), observed = ?frozen.observed_frozen_roots, "recovered paused with new authority");
+                Continued::Recovered {
+                    current: CurrentPause {
+                        token,
+                        operation_id: operation.clone(),
+                        freeze_epoch: epoch,
+                    },
+                    cause,
+                }
             }
-            Ok(outcome) => {
-                let recovery = failure(
+            Ok(outcome) => Continued::Failed {
+                cause,
+                recovery: Some(failure(
                     LiveFailureCode::RecoveryPauseFailed,
                     LiveStage::RecoveryPause,
                     format!("recovery native pause did not establish new authority: {outcome:?}"),
-                );
-                self.resume_error(request, requested, cause, Some(recovery));
-            }
-            Err(NativeError::Stopped) => self.resume_stopped(request, requested),
-            Err(error) => {
-                let recovery = failure(
+                )),
+            },
+            Err(NativeError::Stopped) => Continued::Stopped,
+            Err(error) => Continued::Failed {
+                cause,
+                recovery: Some(failure(
                     error.code(LiveFailureCode::RecoveryPauseFailed),
                     LiveStage::RecoveryPause,
                     error.describe(),
-                );
-                self.resume_error(request, requested, cause, Some(recovery));
-            }
+                )),
+            },
         }
+    }
+
+    /// Lost-thaw recovery established NEW user authority: publish Paused.
+    fn resume_recovered(
+        &self,
+        request: &LiveId,
+        requested: &PauseToken,
+        recovered: CurrentPause,
+        cause: LiveFailure,
+    ) {
+        let mut inner = self.lock();
+        inner.journal.current = Some(recovered.clone());
+        inner.parked = true;
+        let published = matches!(
+            self.publish(
+                &inner,
+                VmLifecycleState::Paused,
+                None,
+                None,
+                false,
+                "paused after lost-thaw recovery"
+            ),
+            Ok(true)
+        );
+        let result = if published {
+            ResumeFailed {
+                cause,
+                state: VmLifecycleState::Paused,
+                current_pause: Some(recovered),
+                recovery_failure: None,
+                requested_token: requested.clone(),
+            }
+        } else {
+            inner.journal.current = None;
+            stopped_resume(requested)
+        };
+        inner.journal.complete(
+            request,
+            LiveCommandResult::Resume(ResumeOutcome::Failed { failed: result }),
+        );
     }
 
     fn resume_running(&self, request: &LiveId, requested: &PauseToken, epoch: NonZeroU64) {
@@ -2056,13 +2270,26 @@ impl LiveCoordinator {
         }
     }
 
+    /// A `Stopping` refusal after stop began is the stop fence itself, not a
+    /// native failure. `begin_stop` closes the fence under the journal lock,
+    /// so a fenced refusal always observes `stopped` here.
+    fn native_rejection(&self, rejection: LifecycleRejection) -> NativeError {
+        if rejection == LifecycleRejection::Stopping && self.lock().journal.stopped {
+            NativeError::Stopped
+        } else {
+            NativeError::Rejected(rejection)
+        }
+    }
+
     /// One native command to a terminal outcome. `Accepted` and transport
     /// uncertainty re-issue the identical request, which joins the retained
-    /// worker command: never a second native effect.
+    /// worker command: never a second native effect. Stop is polled first,
+    /// and `begin_stop`'s submission fence refuses any enqueue after it.
     async fn native(&self, request: LifecycleRequest) -> Result<CommandOutcome, NativeError> {
         let mut transport_failures = 0;
         loop {
             let response = tokio::select! {
+                biased;
                 () = self.stop.cancelled() => return Err(NativeError::Stopped),
                 response = self.machine.lifecycle(request.clone()) => response,
             };
@@ -2077,7 +2304,7 @@ impl LiveCoordinator {
                     }
                 },
                 Err(LifecycleError::Rejected(rejection)) => {
-                    return Err(NativeError::Rejected(rejection))
+                    return Err(self.native_rejection(rejection))
                 }
                 Err(LifecycleError::Unsupported { backend }) => {
                     return Err(NativeError::Unsupported(backend.to_string()))

@@ -725,6 +725,9 @@ impl Machine {
         if runtime.machine_config(self.machine_id()).await?.is_none() {
             return Ok(());
         }
+        // Publish every valid seal and settle ended captures before any data
+        // deletion; staging lives below the machine data directory.
+        crate::machine::live_capture::reconcile_captures(runtime, Some(self.machine_id())).await?;
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
         let storage = runtime.machine_storage_record(config.id).await?;
@@ -760,6 +763,20 @@ impl Machine {
                     current,
                 });
             }
+        }
+        let retained = match runtime.optional_native_store() {
+            Some(store) => {
+                crate::SnapshotStore::from_store(std::sync::Arc::new(store))
+                    .machine_capture_retained(config.id)
+                    .await?
+            }
+            None => false,
+        };
+        if retained {
+            return Err(LibVmError::MachinePreparationFailed {
+                reference: config.name.clone(),
+                message: "a live capture of this machine is unreconciled or its staging is still leased; reconcile captures before removal".into(),
+            });
         }
 
         runtime.cleanup_machine_resources_locked(&config).await?;

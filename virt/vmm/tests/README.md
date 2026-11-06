@@ -28,10 +28,11 @@ KVM x86_64 also supports native capture, restore, fork and incremental; those
 four primitives remain unsupported and pending on KVM arm64 and HVF arm64.
 Excluded lanes support none of the five primitives. Public pause is delivered
 with an immutable Linux KVM x86_64 qualification record bound to the verified
-native/build identity. Capture, restore, fork and incremental remain
-not-delivered. Tests distinguish native support, public delivery, host admission
-and qualification; none may substitute for another. These Cargo tests do not
-qualify runtime execution on KVM arm64 or HVF.
+native/build identity. Capture is delivered but remains `lane-not-qualified`
+until the combined capture/restore/fork admission gates pass. Restore, fork and
+incremental remain `not-delivered`. Tests distinguish native support, public
+delivery, host admission and qualification; none substitutes for another.
+These Cargo tests do not qualify runtime execution on KVM arm64 or HVF.
 
 To query the actual monitor, build its binary (not only the unit-test harness)
 in the repository development shell with the configured libkrun dependency
@@ -47,8 +48,10 @@ Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
 set. The krun query performs read-only host discovery, not a VM run. Its
 `native: true` fields follow the lane matrix above and do not grant public
 support or runtime qualification. Only the exact compiled qualification admits
-public pause; capture, restore, fork and incremental remain `not-delivered`.
-Mutable qualification grants cannot change any of these results.
+public pause. Capture requires the isolated Phase 14 test candidate until the
+combined admission milestone; production capture remains `lane-not-qualified`.
+Restore, fork and incremental remain `not-delivered`. Mutable qualification
+grants cannot change any of these results.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust

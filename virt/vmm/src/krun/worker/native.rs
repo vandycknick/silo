@@ -1,45 +1,75 @@
 //! The libkrun native lifecycle authority behind the worker lifecycle socket.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::time::Instant;
 
 use libkrun::control::{ControlFailure, ControlState, OperationId, PauseOwner, PauseToken};
 use libkrun::live::{
-    GenerationKind, GenerationObservation, GenerationTicket, LiveError, StoppedOwner, TrackingMode,
+    BaselineImage, CaptureId, CaptureStatus, CaptureTicket, CompletedCapture,
+    ExecutionCaptureReceipt, ExecutionOutputs, GenerationKind, GenerationObservation,
+    GenerationTicket, LiveError, MemoryCaptureRequest, MemoryOutputs, RamImageAuthentication,
+    StateBinding, StoppedOwner, TrackingMode,
 };
+use sha2::Digest;
+use uuid::Uuid;
 
 use crate::krun::engine::Control;
-use crate::krun::worker::lifecycle::{GenerationPoll, NativeLifecycle, NativeState};
+use crate::krun::worker::lifecycle::{
+    ExecutionCapture, GenerationPoll, MemoryCapture, NativeCaptureStatus, NativeLifecycle,
+    NativeState,
+};
 use crate::virt::lifecycle::{
-    BlockBacking, GenerationFailureKind, InventoryObservation, MemoryTracking, NativeFailure,
-    NativeFailureKind, NativeOperation, NativePauseOwner, NativeProvider, ObservedClockProfile,
-    ProviderDevice, VirtioKind,
+    BlockBacking, CaptureStage, CaptureStateBinding, Digest32, FlushedAttachment,
+    GenerationFailureKind, InventoryObservation, MemoryTracking, NativeFailure, NativeFailureKind,
+    NativeOperation, NativePauseGeneration, NativePauseOwner, NativeProvider, ObservedClockProfile,
+    OutputIdentity, OutputReceipt, ProviderDevice, VirtioKind,
 };
 
 pub(crate) struct KrunNative {
     control: Control,
-    /// Backing format of every block attachment the worker built, by block ID.
-    block_backings: HashMap<String, BlockBacking>,
+    /// Backing format and read-only attachment of every block the worker
+    /// built, by block ID.
+    blocks: HashMap<String, (BlockBacking, bool)>,
+    /// Launch raw disk handles and the launch storage lease.
+    protected: Vec<OutputIdentity>,
 }
 
 impl KrunNative {
     pub(crate) fn new(control: Control, config: &crate::krun::KrunConfig) -> Self {
-        let block_backings = config
+        let blocks = config
             .disks
             .iter()
             .map(|disk| {
                 (
                     disk.block_id.as_str().to_string(),
-                    match disk.format {
-                        vm_spec::DiskFormat::Raw => BlockBacking::Raw,
-                        vm_spec::DiskFormat::Vmdk => BlockBacking::Vmdk,
-                    },
+                    (
+                        match disk.format {
+                            vm_spec::DiskFormat::Raw => BlockBacking::Raw,
+                            vm_spec::DiskFormat::Vmdk => BlockBacking::Vmdk,
+                        },
+                        disk.read_only,
+                    ),
                 )
             })
             .collect();
+        let context = &config.storage_context;
+        let protected = context
+            .raw_handles
+            .iter()
+            .map(|handle| OutputIdentity {
+                device: handle.device,
+                inode: handle.inode,
+            })
+            .chain(std::iter::once(OutputIdentity {
+                device: context.storage_lease.file_device,
+                inode: context.storage_lease.file_inode,
+            }))
+            .collect();
         Self {
             control,
-            block_backings,
+            blocks,
+            protected,
         }
     }
 }
@@ -47,9 +77,11 @@ impl KrunNative {
 impl NativeLifecycle for KrunNative {
     type Token = PauseToken;
     type Ticket = GenerationTicket;
+    type Capture = CaptureTicket;
 
     fn pause(
         &self,
+        owner: NativePauseOwner,
         operation: NativeOperation,
         profile_operation: NativeOperation,
         clock_profile: Option<ObservedClockProfile>,
@@ -67,8 +99,12 @@ impl NativeLifecycle for KrunNative {
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let _ = (profile_operation, clock_profile);
+        let owner = match owner {
+            NativePauseOwner::User => PauseOwner::User,
+            NativePauseOwner::Capture => PauseOwner::Capture,
+        };
         self.control
-            .pause(PauseOwner::User, OperationId(operation.get()), deadline)
+            .pause(owner, OperationId(operation.get()), deadline)
             .map_err(control_failure)
     }
 
@@ -183,14 +219,11 @@ impl NativeLifecycle for KrunNative {
             .iter()
             .map(|provider| {
                 let device = provider_device(&provider.attachment.device_type.to_string());
-                let block_backing = match device {
+                let block = match device {
                     ProviderDevice::Virtio {
                         kind: VirtioKind::Block,
                         ..
-                    } => self
-                        .block_backings
-                        .get(&provider.attachment.configured_id)
-                        .copied(),
+                    } => self.blocks.get(&provider.attachment.configured_id).copied(),
                     _ => None,
                 };
                 NativeProvider {
@@ -199,7 +232,8 @@ impl NativeLifecycle for KrunNative {
                     address: provider.attachment.address,
                     irq: provider.attachment.irq,
                     activation_fenced: provider.activation_fenced,
-                    block_backing,
+                    block_backing: block.map(|(backing, _)| backing),
+                    block_read_only: block.map(|(_, read_only)| read_only),
                 }
             })
             .collect();
@@ -222,6 +256,290 @@ impl NativeLifecycle for KrunNative {
             PauseOwner::Capture => NativePauseOwner::Capture,
         }
     }
+
+    fn protected_identities(&self) -> Vec<OutputIdentity> {
+        self.protected.clone()
+    }
+
+    fn native_producer(&self) -> Result<String, NativeFailure> {
+        libkrun::capabilities::compiled_live_build()
+            .execution_producer()
+            .map_err(|error| NativeFailure::with_detail(NativeFailureKind::Unsupported, error))
+    }
+
+    fn ram_layout_digest(&self, deadline: Instant) -> Result<Digest32, NativeFailure> {
+        let layout = self.control.ram_layout(deadline).map_err(live_failure)?;
+        Ok(Digest32(
+            sha2::Sha256::digest(layout.canonical_bytes()).into(),
+        ))
+    }
+
+    fn flush_capture(
+        &self,
+        token: &PauseToken,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<Vec<FlushedAttachment>, NativeFailure> {
+        let receipt = self
+            .control
+            .flush_writable_disks(token, OperationId(operation.get()), deadline)
+            .map_err(live_failure)?;
+        if receipt.pause != *token {
+            return Err(NativeFailure::with_detail(
+                NativeFailureKind::InvalidToken,
+                "flush receipt names another pause",
+            ));
+        }
+        Ok(receipt
+            .attachments
+            .into_iter()
+            .map(|attachment| FlushedAttachment {
+                configured_id: attachment.configured_id,
+                address: attachment.address,
+                irq: attachment.irq,
+            })
+            .collect())
+    }
+
+    fn capture_execution(
+        &self,
+        token: &PauseToken,
+        binding: &CaptureStateBinding,
+        execution: File,
+        devices: File,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<ExecutionCapture<CaptureTicket>, NativeFailure> {
+        let native = state_binding(binding);
+        let receipt = self
+            .control
+            .capture_execution(
+                token,
+                native.clone(),
+                ExecutionOutputs { execution, devices },
+                OperationId(operation.get()),
+                deadline,
+            )
+            .map_err(live_failure)?;
+        execution_capture(&receipt, &native)
+    }
+
+    fn capture_memory(
+        &self,
+        capture: &CaptureTicket,
+        ram: File,
+        layout: File,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<MemoryCapture, NativeFailure> {
+        let completed = self
+            .control
+            .capture_memory(
+                capture,
+                MemoryCaptureRequest {
+                    baseline: None,
+                    full_at_dirty_percent: 0,
+                },
+                MemoryOutputs { ram, layout },
+                OperationId(operation.get()),
+                deadline,
+            )
+            .map_err(live_failure)?;
+        memory_capture(&completed)
+    }
+
+    fn capture_status(
+        &self,
+        capture: Uuid,
+        deadline: Instant,
+    ) -> Result<NativeCaptureStatus<CaptureTicket>, NativeFailure> {
+        let status = self
+            .control
+            .capture_status(CaptureId::new(*capture.as_bytes()), deadline)
+            .map_err(live_failure)?;
+        // Every arm extracts resource-free facts; a failed status's error,
+        // which can own RAM output files, is dropped right here.
+        Ok(match status {
+            CaptureStatus::ExecutionPending(ticket) => {
+                NativeCaptureStatus::ExecutionPending(ticket)
+            }
+            CaptureStatus::ExecutionComplete(receipt) => {
+                let native = receipt.execution.binding.clone();
+                NativeCaptureStatus::ExecutionComplete(execution_capture(&receipt, &native)?)
+            }
+            CaptureStatus::MemoryPending(ticket) => NativeCaptureStatus::MemoryPending(ticket),
+            CaptureStatus::CandidateComplete(completed) => NativeCaptureStatus::CandidateComplete {
+                ticket: completed.ticket.clone(),
+                memory: memory_capture(&completed)?,
+            },
+            CaptureStatus::Accepted { ticket, baseline } => NativeCaptureStatus::Accepted {
+                ticket,
+                memory_generation: baseline.memory_generation(),
+            },
+            CaptureStatus::Abandoned(ticket) => NativeCaptureStatus::Abandoned(ticket),
+            CaptureStatus::Failed {
+                ticket,
+                stage,
+                cause,
+            } => NativeCaptureStatus::Failed {
+                ticket,
+                stage: match stage {
+                    libkrun::live::CaptureStage::Execution => CaptureStage::Execution,
+                    libkrun::live::CaptureStage::Memory => CaptureStage::Memory,
+                    libkrun::live::CaptureStage::Accept => CaptureStage::Accept,
+                },
+                failure: live_failure(cause),
+            },
+            CaptureStatus::Released => NativeCaptureStatus::Released,
+        })
+    }
+
+    fn accept_capture(
+        &self,
+        capture: &CaptureTicket,
+        binding: &CaptureStateBinding,
+        ram: File,
+        layout: File,
+        stream: Digest32,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<u64, NativeFailure> {
+        let baseline = self
+            .control
+            .accept_baseline(
+                capture,
+                BaselineImage {
+                    ram,
+                    layout,
+                    authentication: RamImageAuthentication {
+                        state: state_binding(binding),
+                        stream: stream.0,
+                    },
+                },
+                OperationId(operation.get()),
+                deadline,
+            )
+            .map_err(live_failure)?;
+        Ok(baseline.memory_generation())
+    }
+
+    fn abandon_capture(
+        &self,
+        capture: &CaptureTicket,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        self.control
+            .abandon_capture(capture, OperationId(operation.get()), deadline)
+            .map_err(live_failure)
+    }
+
+    fn release_capture(
+        &self,
+        capture: Uuid,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        self.control
+            .release_capture(
+                CaptureId::new(*capture.as_bytes()),
+                OperationId(operation.get()),
+                deadline,
+            )
+            .map_err(live_failure)
+    }
+
+    fn preserve_pause(
+        &self,
+        token: PauseToken,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<PauseToken, NativeFailure> {
+        self.control
+            .preserve_pause(token, OperationId(operation.get()), deadline)
+            .map_err(live_failure)
+    }
+}
+
+fn state_binding(binding: &CaptureStateBinding) -> StateBinding {
+    StateBinding {
+        native_producer: binding.native_producer.clone(),
+        silo_producer: binding.silo_producer.0,
+        profile: binding.profile.0,
+        topology: binding.topology.0,
+        ram_layout: binding.ram_layout.0,
+        source_run: *binding.source_run.as_bytes(),
+        pause_generation: binding.pause_generation.get(),
+        capture: *binding.capture.as_bytes(),
+    }
+}
+
+fn capture_binding(native: &StateBinding) -> Result<CaptureStateBinding, NativeFailure> {
+    let pause_generation =
+        NativePauseGeneration::new(native.pause_generation).ok_or_else(|| {
+            NativeFailure::with_detail(NativeFailureKind::Unexpected, "binding generation zero")
+        })?;
+    Ok(CaptureStateBinding {
+        native_producer: native.native_producer.clone(),
+        silo_producer: Digest32(native.silo_producer),
+        profile: Digest32(native.profile),
+        topology: Digest32(native.topology),
+        ram_layout: Digest32(native.ram_layout),
+        source_run: Uuid::from_bytes(native.source_run),
+        capture: Uuid::from_bytes(native.capture),
+        pause_generation,
+    })
+}
+
+/// Both receipts must carry the exact binding the capture was submitted with.
+fn execution_capture(
+    receipt: &ExecutionCaptureReceipt,
+    binding: &StateBinding,
+) -> Result<ExecutionCapture<CaptureTicket>, NativeFailure> {
+    if receipt.execution.binding != *binding
+        || receipt.devices.binding != *binding
+        || receipt.execution.role != libkrun::live::OutputRole::Execution
+        || receipt.devices.role != libkrun::live::OutputRole::Devices
+    {
+        return Err(NativeFailure::with_detail(
+            NativeFailureKind::Unexpected,
+            "native execution receipt differs from the submitted binding",
+        ));
+    }
+    let output = |receipt: &libkrun::live::OutputReceipt| OutputReceipt {
+        device: receipt.device,
+        inode: receipt.inode,
+        length: receipt.length,
+    };
+    Ok(ExecutionCapture {
+        ticket: receipt.ticket.clone(),
+        execution: output(&receipt.execution),
+        devices: output(&receipt.devices),
+    })
+}
+
+fn memory_capture(completed: &CompletedCapture) -> Result<MemoryCapture, NativeFailure> {
+    if completed.ram.mode() != libkrun::live::RamCaptureMode::Full {
+        return Err(NativeFailure::with_detail(
+            NativeFailureKind::Unexpected,
+            "native RAM candidate is not a full capture",
+        ));
+    }
+    let [ram, layout] = completed
+        .ram
+        .output_identities()
+        .map(|(device, inode, length)| OutputReceipt {
+            device,
+            inode,
+            length,
+        });
+    Ok(MemoryCapture {
+        binding: Box::new(capture_binding(completed.ram.binding())?),
+        ram,
+        layout,
+        memory_generation: completed.memory_generation,
+        writers_closed: completed.ram.writers_closed(),
+    })
 }
 
 /// libkrun exposes the device type only through its display form

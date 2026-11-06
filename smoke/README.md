@@ -83,6 +83,45 @@ The image-owned-init negative gate rejects before allocating a live command.
 Cargo test. Only the supervisor-verified immutable build/lane qualification
 grants public pause. Runtime files or environment variables cannot grant it.
 
+### Full live capture (Phase 14)
+
+`tests/test_capture.py` requires an isolated test-only capture candidate.
+Production capture remains `lane-not-qualified`; no runtime file grants it.
+Build with `python -m silo_smoke.capture_candidate --destination PATH --runtime
+STAGED_RUNTIME` through `uv run --project smoke` with `PYTHONPATH=smoke`.
+The destination must be outside the repository and staged runtime, with matching
+Cargo ancestor depth and build environment. The builder checks native/build
+identity equality and leaves the production stage unchanged.
+
+Point `SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR` at the candidate's `bin`
+and `runtime` directories, then run:
+
+```sh
+uv run --project smoke pytest smoke/tests/test_capture.py smoke/tests/test_capture_multidisk.py smoke/tests/test_capture_lifecycle.py -m slow --keep
+```
+
+The root-family gates exercise raw and flat-overlay matched disk/RAM cuts,
+source continuation, acquired and borrowed pause authority, sealed-file
+immutability, independent retained RAM, and retention through source/alias
+removal, home relocation and GC. Unsupported readonly virtiofs must be refused
+before staging or freezing. The child-only syscall tracer holds real capture
+durability boundaries for manager/monitor/worker death, including pool-file sync,
+pool publication and catalog commit. The catalog boundary is an actual WAL sync
+after the candidate identity becomes visible, before capture provenance commits.
+Pre-seal cancellation waits for the monitor's exact request-admission event
+before releasing the held syscall; it verifies acquired-resume, acquired-preserve
+and borrowed-pause policies. Post-seal cancellation preserves the known seal.
+These are process-crash tests, not physical power-loss simulation. Retain failed
+workspaces; archive evidence before pruning completed generated payloads.
+
+The lifecycle cases hold real boundaries across manager death, stop and
+post-seal cancellation. Missing continuation evidence remains pending while
+the exact run lives and becomes unknown after it ends. Holding the worker's
+vsock muxer exercises genuine continuation deadlines without injected errors
+or changed timeouts. The failure oracle checks the coherent published seal,
+Error fences and the source's durable workload counter, not survival of an
+exec session whose readiness has been invalidated.
+
 ### Restored guest activation (Phase 12)
 
 `silo_smoke/guest_restored.py` joins the standalone `native-live-api` owner
@@ -1002,9 +1041,13 @@ held boundary's release and checked injected return (if any). Lifecycle tracing
 and pidfd/EXITKILL cleanup remain active. `boundary-trace.json` retains syscall
 entry counts and the last 32 boundary candidates even on cancellation, so a
 timeout does not lose all selection evidence. `boundary-lifecycle.jsonl` records
-resume-time ESRCH as a lost stop awaiting an actual terminal wait, never as
-exit proof; a missing checked injected return still fails the gate. These are
-process/syscall evidence, not a power-loss simulation. The controller's
+ESRCH from any stop inspection or resume, including disappearing `/proc` status
+or memory, as a lost stop awaiting an actual terminal wait, never as exit proof.
+Only a kernel exec event can account for collapsed former TIDs without a
+terminal wait. Neither path supplies a missing checked injected return. Host-only
+regressions in `test_native_live_api.StoppedTraceLifecycleTests` schedule real
+SIGKILL between a stop and ptrace inspection, without replacing syscall or wait
+results. These are process/syscall evidence, not a power-loss simulation. The controller's
 240-second deadline and helper's
 60-second boundary wait are unchanged; missing ptrace permission is an unresolved
 gate.
@@ -1130,9 +1173,10 @@ namespace (`unshare --user --map-root-user --mount`). Its bounded tmpfs
 exercises actual ENOSPC; do not substitute host disk exhaustion or `/dev/full`.
 Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`,
 only after the exercised native lane's support declarations have been approved.
-The qualified Phase 13 build reports public pause supported; capture, restore,
-fork and incremental remain `not-delivered`. Standalone native proofs grant no
-additional public capability.
+The Phase 14 implementation delivers capture without production qualification:
+capture reports `lane-not-qualified`; restore, fork and incremental remain
+`not-delivered`. The public pause qualification is revision-bound. Standalone
+native proofs grant no additional public capability.
 
 `api-report.json`, per-process logs, captured manifests and input identities
 are the evidence. Ordinary successful cohorts require acknowledged native
@@ -1146,3 +1190,44 @@ the failure cohort checks writer closure after that resolution, without
 mistaking retained failure ownership for a completed candidate.
 Remove successful bulk RAM/disk outputs only after preserving their evidence
 and confirming that every owner and retained consumer has terminated.
+
+## Capture-side multiple writable disk gates
+
+After Main stages the explicitly isolated Phase 14 candidate, run:
+
+```sh
+make smoke SMOKE_ARGS='tests/test_capture_multidisk.py -m slow --keep'
+```
+
+The eight cases cover raw and flat roots, each with two additional real
+managed-writable ext4 disks installed before first launch under the existing
+stopped-fixture lifecycle-lock convention. Ordinary `--disk` remains external;
+this is fixture construction, not a new ownership-import API. The guest mounts
+only its original source devices. It races ordered direct numbered writes,
+dirty shared page-cache pages and unsynchronized metadata churn against capture.
+Independent readers compare the exact pinned RAM GPAs with sealed disk files,
+require an observed unsynced cache difference and ext4 journal/recovery feature
+bits, and never mount, fsck or replay a sealed disk. Recovery bits establish the
+mounted dirty-journal state, not a claim about which journal transactions need
+replay. Later source writes overwrite the same numbered/cache offsets on both
+disks while hashes and inode identities establish independent immutable copies.
+
+Six failure cases inject a checked `ENOSPC` syscall return into the second Data
+copy after the other included disks copied successfully. This faults actual
+FICLONE or destination writes, not fsync or a fabricated success. They require
+a producer-written failed record, no new snapshot or capture provenance,
+policy-correct source continuation (acquired resume, acquired preserve and
+borrowed user pause), unchanged run/boot/reseed identity and final staging
+retirement. This is injected syscall-error evidence, not physical exhaustion or
+power-loss evidence.
+
+`capture-copy.json` records actual successful copy syscall returns.
+`capture-multidisk-copy.log` retains those observations alongside the monitor's
+actual Clone/SparseCopy method and planned logical lengths. Successful FICLONE
+returns zero; its logical length is never reported as physical transferred
+bytes. Host filesystem/device/mount options are observed with `findmnt` in
+`stopped-host-mount.log`. `SILO_SMOKE_CAPTURE_FS` may require an exact filesystem
+type; durable `TMPDIR` selects the workspace parent. An image filesystem or a
+directory name never establishes a host storage lane. These tests do not grant
+production qualification or establish the APFS/non-reflink matrix, restored
+children, sibling divergence, restore-time journal ordering or recapture.

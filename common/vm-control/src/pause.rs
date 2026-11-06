@@ -57,7 +57,19 @@ enumeration!(
         Readiness,
         RecoveryFreeze,
         RecoveryPause,
-        Admission
+        Admission,
+        CapturePrepare,
+        CaptureFlush,
+        CaptureDisks,
+        CaptureExecution,
+        CaptureMemory,
+        CaptureVerify,
+        CaptureSeal,
+        CaptureAccept,
+        CaptureAbandon,
+        CapturePreserve,
+        CaptureSourceRecord,
+        CaptureRelease
     ]
 );
 enumeration!(
@@ -99,7 +111,21 @@ enumeration!(
         RecoveryPauseFailed,
         WorkerLost,
         Stopped,
-        DeadlineExceeded
+        DeadlineExceeded,
+        StagingFailed,
+        DiskFlushFailed,
+        DiskCopyFailed,
+        ExecutionCaptureFailed,
+        MemoryCaptureFailed,
+        CaptureVerificationFailed,
+        SealFailed,
+        SealUncertain,
+        BaselineAcceptFailed,
+        PreserveFailed,
+        AbandonFailed,
+        SourceRecordFailed,
+        ReleaseFailed,
+        StagingBudgetExceeded
     ]
 );
 enumeration!(
@@ -276,6 +302,13 @@ fn operation_to(value: &d::LiveOperationRecord) -> w::LiveOperationRecord {
                     capture_eligible: pause.capture_eligible,
                 })
             }
+            d::OperationOutcome::CaptureSealed { capture } => {
+                w::live_operation_record::Outcome::CaptureSealed(w::CaptureSealed {
+                    capture_id: capture.capture_id.to_string(),
+                    evidence_sha256: capture.evidence_sha256.to_string(),
+                    cut_token: Some(token_to(&capture.cut_token)),
+                })
+            }
         }),
     }
 }
@@ -298,6 +331,17 @@ fn operation_from(
                     capture_eligible: value.capture_eligible,
                 },
             },
+            w::live_operation_record::Outcome::CaptureSealed(value) => {
+                d::OperationOutcome::CaptureSealed {
+                    capture: vm_spec::capture::CaptureSealed {
+                        capture_id: id(value.capture_id)?,
+                        evidence_sha256: value.evidence_sha256.parse().map_err(|_| {
+                            invalid("operation.evidence_sha256", "invalid SHA-256 digest")
+                        })?,
+                        cut_token: token_from(required(value.cut_token, "operation.cut_token")?)?,
+                    },
+                }
+            }
         },
     };
     result

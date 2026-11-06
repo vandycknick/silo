@@ -320,7 +320,7 @@ type MachineServiceClient interface {
 	SetMachineSecret(ctx context.Context, in *SetMachineSecretRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	ResumeMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
-	CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*LiveSnapshotInfo, error)
 	ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ForkStopped(ctx context.Context, in *StoppedForkRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	SnapshotStopped(ctx context.Context, in *CreateStorageSnapshotRequest, opts ...grpc.CallOption) (*StorageSnapshotInfo, error)
@@ -541,9 +541,9 @@ func (c *machineServiceClient) ResumeMachine(ctx context.Context, in *LiveMachin
 	return out, nil
 }
 
-func (c *machineServiceClient) CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *machineServiceClient) CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*LiveSnapshotInfo, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(LiveSnapshotInfo)
 	err := c.cc.Invoke(ctx, MachineService_CaptureExecution_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -603,7 +603,7 @@ type MachineServiceServer interface {
 	SetMachineSecret(context.Context, *SetMachineSecretRequest) (*emptypb.Empty, error)
 	PauseMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error)
 	ResumeMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error)
-	CaptureExecution(context.Context, *LiveCaptureRequest) (*emptypb.Empty, error)
+	CaptureExecution(context.Context, *LiveCaptureRequest) (*LiveSnapshotInfo, error)
 	ForkExecution(context.Context, *LiveForkRequest) (*emptypb.Empty, error)
 	ForkStopped(context.Context, *StoppedForkRequest) (*MachineSnapshot, error)
 	SnapshotStopped(context.Context, *CreateStorageSnapshotRequest) (*StorageSnapshotInfo, error)
@@ -671,7 +671,7 @@ func (UnimplementedMachineServiceServer) PauseMachine(context.Context, *LiveMach
 func (UnimplementedMachineServiceServer) ResumeMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResumeMachine not implemented")
 }
-func (UnimplementedMachineServiceServer) CaptureExecution(context.Context, *LiveCaptureRequest) (*emptypb.Empty, error) {
+func (UnimplementedMachineServiceServer) CaptureExecution(context.Context, *LiveCaptureRequest) (*LiveSnapshotInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method CaptureExecution not implemented")
 }
 func (UnimplementedMachineServiceServer) ForkExecution(context.Context, *LiveForkRequest) (*emptypb.Empty, error) {

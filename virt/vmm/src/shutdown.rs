@@ -76,8 +76,9 @@ pub async fn run(
         }
     };
 
-    // Seal live admission and continuations before publishing Stopping so no
-    // late pause/resume/cancel step can reopen fences or publish a state.
+    // Seal live admission, native mutator submission and continuations before
+    // any await, so no late pause/resume/capture step can reach the worker,
+    // reopen fences or publish a state.
     let stop_mode = ctx.live.begin_stop();
     handles.mark_stopping().await;
     match trigger {

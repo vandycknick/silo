@@ -101,12 +101,29 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
         None
     }
 
+    /// Owned duplicates of the run's retained disk attachments, the held
+    /// sources a live capture clones or copies without re-resolving any
+    /// pathname. Backends without retained attachments cannot capture.
+    async fn capture_sources(&self) -> Result<Vec<CaptureSource>, VirtError> {
+        Err(VirtError::Backend(
+            "this backend retains no capture sources".into(),
+        ))
+    }
+
     /// The finite native lifecycle seam. Backends without a native pause
     /// authority refuse every request, including observation, as Unsupported.
+    /// `rights` is the command's fixed descriptor set (`None` for most).
     async fn lifecycle(
         &self,
         request: crate::virt::lifecycle::LifecycleRequest,
+        rights: crate::virt::lifecycle::LifecycleRights,
     ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>;
+
+    /// Permanently close native mutator submission, synchronously: once this
+    /// returns no new lifecycle mutator can reach the worker, while
+    /// observation and replays of already admitted commands stay available.
+    /// Backends without a native lifecycle seam have nothing to close.
+    fn close_lifecycle_admission(&self) {}
 }
 
 /// Independently observed host storage facts, never inferred from exit status.
@@ -115,6 +132,14 @@ pub struct StorageFinalization {
     pub host_writes_flushed: bool,
     pub attachments_closed: bool,
     pub error: Option<String>,
+}
+
+/// One retained disk attachment, duplicated for a capture's disk seal.
+#[derive(Debug)]
+pub(crate) struct CaptureSource {
+    pub(crate) disk_index: u32,
+    pub(crate) file: std::fs::File,
+    pub(crate) writable: bool,
 }
 
 /// A single launch attempt, including failures before a VM exists.

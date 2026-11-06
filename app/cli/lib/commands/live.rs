@@ -38,7 +38,7 @@ impl Resume {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Create and manage immutable stopped-storage checkpoints", after_help = EXACT_BYTES_WARNING)]
+#[command(about = "Create and manage immutable stopped-storage and live execution checkpoints", after_help = EXACT_BYTES_WARNING)]
 pub struct Snapshot {
     #[command(subcommand)]
     command: SnapshotCommand,
@@ -46,7 +46,7 @@ pub struct Snapshot {
 
 #[derive(Debug, Subcommand)]
 enum SnapshotCommand {
-    /// Capture a stopped opaque raw machine, or explicitly request live execution capture.
+    /// Capture a stopped machine's storage, or explicitly request a live execution capture.
     Create {
         #[arg(value_name = "VM")]
         machine: String,
@@ -56,6 +56,10 @@ enum SnapshotCommand {
         /// Request live execution capture, never fall back to stopped storage.
         #[arg(long, conflicts_with = "external_requirements")]
         live: bool,
+        /// Keep the source paused after a live capture (user-owned pause). Required when
+        /// the source is already paused; without it a running source is resumed.
+        #[arg(long, requires = "live")]
+        preserve: bool,
         /// Omit external resources and record required mappings for a later restore.
         #[arg(long)]
         external_requirements: bool,
@@ -85,13 +89,33 @@ impl Snapshot {
                 machine,
                 name,
                 live: true,
+                preserve,
                 ..
-            } => api.capture_execution(&machine, name.as_deref()).await,
+            } => {
+                let resume_policy = if preserve {
+                    vm_spec::lifecycle::CaptureResumePolicy::Preserve
+                } else {
+                    vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired
+                };
+                let snapshot = api
+                    .snapshot_live(
+                        &machine,
+                        libvm::LiveSnapshotOptions {
+                            name,
+                            resume_policy,
+                        },
+                    )
+                    .await?;
+                crate::ui::warn(EXACT_BYTES_WARNING);
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                Ok(())
+            }
             SnapshotCommand::Create {
                 machine,
                 name,
                 live: false,
                 external_requirements,
+                ..
             } => {
                 let external_resources = if external_requirements {
                     libvm::ExternalResourcePolicy::RequireMappings

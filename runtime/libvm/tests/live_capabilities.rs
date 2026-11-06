@@ -559,7 +559,10 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
                 async move {
                     match operation {
                         LiveOperation::Pause => machine.pause(&observed).await.map(|_| ()),
-                        LiveOperation::Capture => machine.capture(&observed).await,
+                        LiveOperation::Capture => machine
+                            .snapshot_live(&observed, capture_options())
+                            .await
+                            .map(|_| ()),
                         LiveOperation::Fork => {
                             machine
                                 .fork_execution(&observed, Some("unallocated-child"))
@@ -618,30 +621,17 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
 }
 
 #[tokio::test]
-async fn live_capabilities_positive_mock_cannot_execute_undelivered_capture_or_fork() {
+async fn live_capabilities_positive_mock_cannot_execute_undelivered_fork() {
     let fixture = Fixture::new(&pause_scenario(Default::default())).await;
     let observation = LiveObservationReader::open(&fixture.config)
         .expect("reader")
         .observe(&fixture.reference())
         .await
         .expect("observe positive scenario");
-    assert_eq!(
-        observation.report().live.capture.availability,
-        LiveAvailability::Supported
-    );
     let before = snapshot(&fixture.home);
     let before_catalog = live_catalog::snapshot(&fixture.home).await;
-    unsupported(
-        fixture
-            .machine
-            .capture(&observation)
-            .await
-            .expect_err("capture not delivered"),
-        LiveOperation::Capture,
-        LiveBackend::Mock,
-        LiveReasonCode::NotDelivered,
-        None,
-    );
+    // Capture is delivered in Phase 14; Fork remains not-delivered even when
+    // a positive scenario advertises it.
     unsupported(
         fixture
             .machine
@@ -662,6 +652,13 @@ fn pause_scenario(lifecycle: test_utils::LifecycleScenario) -> Scenario {
     Scenario {
         lifecycle: Some(lifecycle),
         ..scenario(None, false)
+    }
+}
+
+fn capture_options() -> libvm::LiveSnapshotOptions {
+    libvm::LiveSnapshotOptions {
+        name: None,
+        resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
     }
 }
 
@@ -1707,7 +1704,10 @@ async fn live_capabilities_wrong_machine_evidence_fails_before_unsupported_reaso
     let before_run = snapshot(&fixture.run_root);
     for result in [
         other.pause(&observation).await.map(|_| ()),
-        other.capture(&observation).await,
+        other
+            .snapshot_live(&observation, capture_options())
+            .await
+            .map(|_| ()),
         other
             .fork_execution(&observation, Some("unallocated"))
             .await,

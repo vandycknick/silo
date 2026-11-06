@@ -1,5 +1,7 @@
 //! Durable closure pins are independent of machine rows and close-only OFD leases.
 //! Registration is short; slow readers retain the returned lease outside roots.
+use std::io::Read;
+
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -181,7 +183,7 @@ struct StoppedCommitCandidate {
     directory: Option<CandidateDirectory>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CandidateDirectory {
     device: String,
@@ -300,26 +302,268 @@ impl MachineCleanup {
     }
 }
 
+/// Text evidence is outside both the source machine and the disposable staging
+/// namespace. The owner file is linked last, before cleanup authorization.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CaptureCleanupOwner {
+    schema: u32,
+    record: crate::store::snapshot_store::CaptureRecord,
+    parent: Option<CandidateDirectory>,
+    directory: Option<CandidateDirectory>,
+}
+
+struct CaptureCleanup {
+    tree: MachineCleanup,
+    archive: crate::paths::OwnedDirectory,
+    owner: CaptureCleanupOwner,
+    saved: bool,
+}
+
+fn recorded_directory(
+    directory: &crate::paths::OwnedDirectory,
+) -> Result<CandidateDirectory, LibVmError> {
+    let (device, inode) = directory_identity(directory)?;
+    Ok(CandidateDirectory {
+        device: device.to_string(),
+        inode: inode.to_string(),
+    })
+}
+
+fn read_cleanup_text(
+    directory: &crate::paths::OwnedDirectory,
+    name: &str,
+    maximum: u64,
+) -> Result<Option<Vec<u8>>, LibVmError> {
+    let Some(file) = directory.open_file(name)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(maximum + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum {
+        return Err(invalid(format!(
+            "capture diagnostic {name} exceeds its bound"
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn capture_cleanup_parent(
+    home: &crate::paths::OwnedDirectory,
+    machine: MachineId,
+) -> Result<Option<crate::paths::OwnedDirectory>, LibVmError> {
+    if let Some(machines) = home.open_dir("machines")? {
+        if let Some(machine) = machines.open_dir(&machine.to_string())? {
+            return machine.open_dir(vm_spec::capture::CAPTURES_DIRECTORY);
+        }
+    }
+    Ok(None)
+}
+
+impl CaptureCleanup {
+    fn prepare(
+        store: &Store,
+        record: &crate::store::snapshot_store::CaptureRecord,
+        cleaning: bool,
+    ) -> Result<Self, LibVmError> {
+        let home = crate::paths::OwnedDirectory::open_existing_root(&store.home)?
+            .ok_or_else(|| invalid("capture catalog home disappeared"))?;
+        let archive = home
+            .ensure_dir("capture-evidence")?
+            .ensure_dir(&record.capture_id.to_string())?;
+        let parent = capture_cleanup_parent(&home, record.machine_id)?;
+        let source_name = record.capture_id.to_string();
+        let quarantine_name = format!(".retiring-{}", record.capture_id);
+        let source = parent
+            .as_ref()
+            .map(|p| p.open_dir(&source_name))
+            .transpose()?
+            .flatten();
+        let quarantine = parent
+            .as_ref()
+            .map(|p| p.open_dir(&quarantine_name))
+            .transpose()?
+            .flatten();
+        if source.is_some() && quarantine.is_some() {
+            return Err(invalid("both capture staging names are occupied"));
+        }
+        if !cleaning && quarantine.is_some() {
+            return Err(invalid("unowned capture cleanup quarantine"));
+        }
+        let saved = read_cleanup_text(
+            &archive,
+            "owner.json",
+            crate::storage::limits::Resource::MetadataPageBytes.maximum() * 2,
+        )?;
+        let owner = match &saved {
+            Some(bytes) => {
+                let owner: CaptureCleanupOwner = serde_json::from_slice(bytes).map_err(invalid)?;
+                // Release/source observation can advance before the cleaning
+                // fence commits. They cannot change staging ownership or its
+                // immutable plan, and must not strand an already saved archive.
+                if owner.schema != 1
+                    || owner.record.capture_id != record.capture_id
+                    || owner.record.machine_id != record.machine_id
+                    || owner.record.run_id != record.run_id
+                    || owner.record.launch_operation_id != record.launch_operation_id
+                    || owner.record.plan != record.plan
+                    || owner.record.candidate != record.candidate
+                    || owner.record.evidence != record.evidence
+                {
+                    return Err(invalid(
+                        "capture cleanup authority contradicts terminal record",
+                    ));
+                }
+                owner
+            }
+            None if cleaning => {
+                return Err(invalid("capture cleanup has no durable evidence owner"))
+            }
+            None => CaptureCleanupOwner {
+                schema: 1,
+                record: record.clone(),
+                parent: parent.as_ref().map(recorded_directory).transpose()?,
+                directory: source.as_ref().map(recorded_directory).transpose()?,
+            },
+        };
+        if parent.as_ref().map(recorded_directory).transpose()? != owner.parent {
+            return Err(invalid("capture staging parent was replaced"));
+        }
+        for directory in source.iter().chain(quarantine.iter()) {
+            if Some(recorded_directory(directory)?) != owner.directory {
+                return Err(invalid("capture staging directory was replaced"));
+            }
+        }
+        let expected = owner
+            .directory
+            .as_ref()
+            .map(|directory| {
+                Ok::<_, LibVmError>((
+                    directory.device.parse::<u64>().map_err(invalid)?,
+                    directory.inode.parse::<u64>().map_err(invalid)?,
+                ))
+            })
+            .transpose()?
+            .unwrap_or((0, 0));
+        Ok(Self {
+            tree: MachineCleanup {
+                parent,
+                source_name,
+                quarantine_name,
+                expected,
+                #[cfg(test)]
+                hook: store.layer_hook.clone(),
+            },
+            archive,
+            owner,
+            saved: saved.is_some(),
+        })
+    }
+
+    fn paths(&self, home: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let parent = crate::paths::machine_data_dir_in(home, self.owner.record.machine_id)
+            .join(vm_spec::capture::CAPTURES_DIRECTORY);
+        vec![
+            parent.join(&self.tree.source_name),
+            parent.join(&self.tree.quarantine_name),
+        ]
+    }
+
+    /// Preserve exact diagnostic bytes, including malformed failure records.
+    /// Oversized or unsafe evidence fails closed without deleting bulk data.
+    fn preserve_evidence(&self) -> Result<(), LibVmError> {
+        if self.saved {
+            return self.archive.sync();
+        }
+        if let Some(parent) = &self.tree.parent {
+            if let Some(source) = parent.open_dir(&self.tree.source_name)? {
+                if directory_identity(&source)? != self.tree.expected {
+                    return Err(invalid("capture staging changed before evidence retention"));
+                }
+                for name in [
+                    "request.json",
+                    "vm.capture.json",
+                    "vm.capture-source.json",
+                    "memory-layout.json",
+                ] {
+                    if let Some(bytes) = read_cleanup_text(
+                        &source,
+                        name,
+                        crate::storage::limits::Resource::MetadataPageBytes.maximum(),
+                    )? {
+                        self.archive.write_file(name, &bytes)?;
+                    }
+                }
+            } else if self.owner.directory.is_some() {
+                return Err(invalid(
+                    "capture staging disappeared before evidence retention",
+                ));
+            }
+        }
+        let bytes = serde_json::to_vec(&self.owner).map_err(invalid)?;
+        if bytes.len() as u64 > crate::storage::limits::Resource::MetadataPageBytes.maximum() * 2 {
+            return Err(invalid("capture cleanup owner exceeds its bound"));
+        }
+        let temporary = format!(".owner-{}", Uuid::new_v4());
+        self.archive.write_file(&temporary, &bytes)?;
+        crate::storage::pool::rename_component_no_replace(
+            &self.archive,
+            &temporary,
+            &self.archive,
+            "owner.json",
+        )?;
+        self.archive.sync()?;
+        Ok(())
+    }
+
+    fn recheck_absence(&self, home: &std::path::Path) -> Result<(), LibVmError> {
+        let home = crate::paths::OwnedDirectory::open_existing_root(home)?
+            .ok_or_else(|| invalid("capture catalog home disappeared"))?;
+        let parent = capture_cleanup_parent(&home, self.owner.record.machine_id)?;
+        if parent.as_ref().map(recorded_directory).transpose()? != self.owner.parent {
+            return Err(invalid("capture staging parent changed during cleanup"));
+        }
+        self.tree.recheck_absence()
+    }
+}
+
 impl Store {
     pub(crate) async fn check_cleaning_dependencies(
         &self,
         connection: &mut sqlx::SqliteConnection,
         paths: &crate::store::cache_paths::ConfigurationPaths,
     ) -> Result<(), LibVmError> {
-        let rows = sqlx::query("SELECT operation_id,json(record_json) AS record_json FROM storage_operation WHERE state='cleaning'")
+        let rows = sqlx::query("SELECT operation_id,kind,json(record_json) AS record_json FROM storage_operation WHERE state='cleaning'")
             .fetch_all(connection).await?;
         for row in rows {
             let operation: Uuid = row
                 .try_get::<String, _>("operation_id")?
                 .parse()
                 .map_err(invalid)?;
-            let candidate = commit_candidate(&row.try_get::<String, _>("record_json")?)?;
-            let machine = candidate
-                .candidate_machine_id
-                .ok_or_else(|| invalid("cleanup root has no machine candidate"))?;
-            let source = paths.machines.join(machine.to_string());
-            let quarantine = paths.machines.join(format!(".retiring-{operation}"));
-            for (resource, directory) in &paths.resources {
+            let capture_staging = row.try_get::<String, _>("kind")? == "capture";
+            let (source, quarantine) = if capture_staging {
+                let capture = crate::store::capture::decode_record(
+                    &row.try_get::<String, _>("record_json")?,
+                )?;
+                let parent = paths
+                    .machines
+                    .join(capture.machine_id.to_string())
+                    .join(vm_spec::capture::CAPTURES_DIRECTORY);
+                (
+                    parent.join(operation.to_string()),
+                    parent.join(format!(".retiring-{operation}")),
+                )
+            } else {
+                let candidate = commit_candidate(&row.try_get::<String, _>("record_json")?)?;
+                let machine = candidate
+                    .candidate_machine_id
+                    .ok_or_else(|| invalid("cleanup root has no machine candidate"))?;
+                (
+                    paths.machines.join(machine.to_string()),
+                    paths.machines.join(format!(".retiring-{operation}")),
+                )
+            };
+            for (resource, directory) in paths.resources.iter().skip(usize::from(capture_staging)) {
                 if [&source, &quarantine].iter().any(|candidate| {
                     resource.starts_with(candidate)
                         || (*directory && candidate.starts_with(resource))
@@ -550,7 +794,7 @@ impl Store {
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','fork','import') AND state='staging')")
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','capture','fork','import') AND state='staging')")
             .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
         if !active {
             return Err(invalid(
@@ -600,6 +844,114 @@ impl Store {
                     validate_lease_identity(&row, &_lease)?;
                     let kind: String = row.try_get("kind")?;
                     let state: String = row.try_get("state")?;
+                    if kind == "capture" {
+                        let capture = crate::store::capture::decode_record(
+                            &row.try_get::<String, _>("record_json")?,
+                        )?;
+                        if !matches!(
+                            capture.state,
+                            crate::store::snapshot_store::CaptureState::Released { .. }
+                                | crate::store::snapshot_store::CaptureState::Abandoned
+                        ) {
+                            tx.commit().await?;
+                            continue;
+                        }
+                        let Some(launch_lease) =
+                            pool.try_exclusive_lease(capture.launch_operation_id)?
+                        else {
+                            report.deferred.push(
+                                crate::store::models::CacheCleanupDeferral::ActiveLease {
+                                    operation_id: capture.launch_operation_id,
+                                },
+                            );
+                            tx.commit().await?;
+                            continue;
+                        };
+                        if launch_lease.file_identity()?
+                            != (
+                                capture.plan.reservation.launch_lease.device,
+                                capture.plan.reservation.launch_lease.inode,
+                            )
+                        {
+                            return Err(invalid("capture generation lease was replaced"));
+                        }
+                        // Keep both exclusive OFDs across evidence I/O and deletion.
+                        // The terminal row remains the durable charge/pin owner.
+                        tx.commit().await?;
+                        drop(_roots);
+                        let cleanup = CaptureCleanup::prepare(self, &capture, state == "cleaning")?;
+                        cleanup.preserve_evidence()?;
+                        let _roots = pool.lock_roots()?;
+                        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                        let current = sqlx::query("SELECT state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+                            .bind(&cursor).fetch_one(&mut *tx).await?;
+                        validate_lease_identity(&current, &_lease)?;
+                        if crate::store::capture::decode_record(
+                            &current.try_get::<String, _>("record_json")?,
+                        )? != capture
+                        {
+                            return Err(invalid("terminal capture changed before cleanup"));
+                        }
+                        crate::store::cache_paths::ensure_capture_paths_unreferenced(
+                            &mut tx,
+                            &cleanup.paths(&self.home),
+                            &self.home,
+                        )
+                        .await?;
+                        sqlx::query("UPDATE storage_operation SET state='cleaning' WHERE operation_id=?1 AND kind='capture'")
+                            .bind(&cursor).execute(&mut *tx).await?;
+                        tx.commit().await?;
+                        #[cfg(test)]
+                        if let Some(hook) = &self.layer_hook {
+                            hook.hit(
+                                crate::store::layer_store::tests::WorkerPoint::CandidateAuthorized,
+                            )?;
+                        }
+                        cleanup.tree.detach()?;
+                        drop(_roots);
+                        #[cfg(test)]
+                        if let Some(hook) = &self.layer_hook {
+                            hook.hit(
+                                crate::store::layer_store::tests::WorkerPoint::CandidateDetached,
+                            )?;
+                        }
+                        cleanup.tree.remove(&self.home)?;
+                        #[cfg(test)]
+                        if let Some(hook) = &self.layer_hook {
+                            hook.hit(
+                                crate::store::layer_store::tests::WorkerPoint::CandidateRemoved,
+                            )?;
+                        }
+                        let _roots = pool.lock_roots()?;
+                        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                        let current = sqlx::query("SELECT state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+                            .bind(&cursor).fetch_one(&mut *tx).await?;
+                        validate_lease_identity(&current, &_lease)?;
+                        if current.try_get::<String, _>("state")? != "cleaning"
+                            || crate::store::capture::decode_record(
+                                &current.try_get::<String, _>("record_json")?,
+                            )? != capture
+                        {
+                            return Err(invalid("terminal capture changed during cleanup"));
+                        }
+                        crate::store::cache_paths::ensure_capture_paths_unreferenced(
+                            &mut tx,
+                            &cleanup.paths(&self.home),
+                            &self.home,
+                        )
+                        .await?;
+                        cleanup.recheck_absence(&self.home)?;
+                        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+                            .bind(&cursor)
+                            .execute(&mut *tx)
+                            .await?;
+                        if let Some(snapshot) = capture.candidate {
+                            sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1)")
+                                .bind(snapshot.to_string()).execute(&mut *tx).await?;
+                        }
+                        tx.commit().await?;
+                        continue;
+                    }
                     let mut removed_machine = None;
                     if matches!(state.as_str(), "committing" | "cleaning") {
                         let candidate =
@@ -951,6 +1303,36 @@ impl Store {
                     "launch" => {
                         decode(&row)?;
                     }
+                    "capture" => {
+                        let capture = crate::store::capture::decode_record(
+                            &row.try_get::<String, _>("record_json")?,
+                        )?;
+                        if capture.capture_id != id
+                            || row.try_get::<String, _>("machine_id")?
+                                != capture.machine_id.to_string()
+                            || row.try_get::<String, _>("run_id")? != capture.run_id.to_string()
+                            || row.try_get::<i64, _>("storage_generation")?
+                                != i64::try_from(capture.storage.storage_generation)
+                                    .map_err(invalid)?
+                            || !matches!(
+                                state.as_str(),
+                                "staging" | "committed" | "aborted" | "cleaning"
+                            )
+                        {
+                            return Err(invalid(
+                                "capture indexed identity contradicts retained plan",
+                            ));
+                        }
+                        if state == "cleaning"
+                            && !matches!(
+                                capture.state,
+                                crate::store::snapshot_store::CaptureState::Released { .. }
+                                    | crate::store::snapshot_store::CaptureState::Abandoned
+                            )
+                        {
+                            return Err(invalid("nonterminal capture has cleanup authority"));
+                        }
+                    }
                     "convert" | "snapshot" | "fork" | "import"
                         if matches!(state.as_str(), "staging" | "committed") =>
                     {
@@ -1004,7 +1386,10 @@ pub(crate) async fn insert_stream(
 mod tests {
     use crate::paths::LocalPaths;
     use crate::storage::pool::StoragePool;
-    use crate::store::operation_store::{validate_lease_identity, validate_lease_metadata};
+    use crate::store::operation_store::{
+        directory_identity, read_cleanup_text, validate_lease_identity, validate_lease_metadata,
+        MachineCleanup,
+    };
     use crate::store::Store;
 
     #[tokio::test]
@@ -1062,5 +1447,105 @@ mod tests {
         assert!(pinned);
         assert!(pool.verify_object(&object.digest).is_ok());
         drop((replacement_exclusive, original));
+    }
+
+    #[test]
+    fn capture_cleanup_diagnostic_read_is_bounded_exact_and_no_follow() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory =
+            crate::paths::OwnedDirectory::open_root(&temp.path().join("evidence")).unwrap();
+        let malformed = b"{failed capture diagnostic, not valid JSON\n";
+        directory.write_file("vm.capture.json", malformed).unwrap();
+        assert_eq!(
+            read_cleanup_text(&directory, "vm.capture.json", malformed.len() as u64).unwrap(),
+            Some(malformed.to_vec())
+        );
+        assert!(
+            read_cleanup_text(&directory, "vm.capture.json", malformed.len() as u64 - 1).is_err()
+        );
+        assert!(read_cleanup_text(&directory, "missing.json", 16)
+            .unwrap()
+            .is_none());
+        std::os::unix::fs::symlink(
+            directory.path().join("vm.capture.json"),
+            directory.path().join("vm.capture-source.json"),
+        )
+        .unwrap();
+        assert!(read_cleanup_text(&directory, "vm.capture-source.json", 1024).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("vm.capture.json")).unwrap(),
+            malformed
+        );
+    }
+
+    #[test]
+    fn capture_cleanup_resumes_after_detach_and_removes_only_owned_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent =
+            crate::paths::OwnedDirectory::open_root(&temp.path().join("captures")).unwrap();
+        let source = parent.ensure_dir("capture").unwrap();
+        source
+            .write_file("memory.ram", b"disposable staging RAM")
+            .unwrap();
+        let persistent = parent.ensure_dir("another-capture").unwrap();
+        persistent
+            .write_file("memory.ram", b"live baseline")
+            .unwrap();
+        let expected = directory_identity(&source).unwrap();
+        let make_cleanup = || MachineCleanup {
+            parent: Some(parent.try_clone().unwrap()),
+            source_name: "capture".into(),
+            quarantine_name: ".retiring-capture".into(),
+            expected,
+            hook: None,
+        };
+        make_cleanup().detach().unwrap();
+        assert!(!source.path().exists());
+        assert!(parent.path().join(".retiring-capture/memory.ram").exists());
+        let restarted = make_cleanup();
+        restarted.detach().unwrap();
+        restarted.remove(temp.path()).unwrap();
+        restarted.recheck_absence().unwrap();
+        // Repeating removal after a crash between parent fsync and SQL retirement
+        // is safe, but does not remove any other capture's baseline.
+        restarted.remove(temp.path()).unwrap();
+        assert_eq!(
+            std::fs::read(persistent.path().join("memory.ram")).unwrap(),
+            b"live baseline"
+        );
+    }
+
+    #[test]
+    fn capture_cleanup_refuses_replacement_and_reoccupied_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent =
+            crate::paths::OwnedDirectory::open_root(&temp.path().join("captures")).unwrap();
+        let source = parent.ensure_dir("capture").unwrap();
+        source.write_file("memory.ram", b"original").unwrap();
+        let cleanup = MachineCleanup {
+            parent: Some(parent.try_clone().unwrap()),
+            source_name: "capture".into(),
+            quarantine_name: ".retiring-capture".into(),
+            expected: directory_identity(&source).unwrap(),
+            hook: None,
+        };
+        std::fs::rename(source.path(), parent.path().join("saved-original")).unwrap();
+        let replacement = parent.ensure_dir("capture").unwrap();
+        replacement
+            .write_file("memory.ram", b"replacement must survive")
+            .unwrap();
+        assert!(cleanup.detach().is_err());
+        assert_eq!(
+            std::fs::read(replacement.path().join("memory.ram")).unwrap(),
+            b"replacement must survive"
+        );
+        parent.remove_open_tree("capture", &replacement).unwrap();
+        std::fs::rename(parent.path().join("saved-original"), source.path()).unwrap();
+        cleanup.detach().unwrap();
+        let reoccupied = parent.ensure_dir("capture").unwrap();
+        assert!(cleanup.detach().is_err());
+        cleanup.remove(temp.path()).unwrap();
+        assert!(cleanup.recheck_absence().is_err());
+        assert!(reoccupied.path().exists());
     }
 }

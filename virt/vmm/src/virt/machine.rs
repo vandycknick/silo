@@ -205,15 +205,46 @@ impl VirtualMachine {
         self.inner.backend.try_wait().await
     }
 
+    /// Owned duplicates of the retained disk attachments for a live
+    /// capture's disk seal; never a pathname re-resolution.
+    pub(crate) async fn capture_sources(
+        &self,
+    ) -> Result<Vec<crate::virt::CaptureSource>, VirtError> {
+        self.inner.backend.capture_sources().await
+    }
+
     /// The finite native lifecycle seam (pause, ClockOnly resume, cancel,
-    /// observation). Dropping the returned future never cancels accepted
-    /// native work; an identical retry joins it.
+    /// capture stages, observation). Dropping the returned future never
+    /// cancels accepted native work; an identical retry joins it.
     pub async fn lifecycle(
         &self,
         request: crate::virt::lifecycle::LifecycleRequest,
     ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
     {
-        self.inner.backend.lifecycle(request).await
+        self.inner
+            .backend
+            .lifecycle(request, crate::virt::lifecycle::LifecycleRights::None)
+            .await
+    }
+
+    /// A rights-bearing lifecycle command (`PrepareCapture`, `AcceptCapture`).
+    /// `rights` are owned duplicates; a replay that joins the retained command
+    /// checks and closes them without resending.
+    pub async fn lifecycle_with_rights(
+        &self,
+        request: crate::virt::lifecycle::LifecycleRequest,
+        rights: crate::virt::lifecycle::LifecycleRights,
+    ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
+    {
+        self.inner.backend.lifecycle(request, rights).await
+    }
+
+    /// The synchronous stop fence on native mutator submission: once this
+    /// returns, a lifecycle mutator either was enqueued before it or is
+    /// refused `Stopping` without effect. Observation and replays of admitted
+    /// commands stay available.
+    pub(crate) fn close_lifecycle_admission(&self) {
+        self.inner.backend.close_lifecycle_admission();
     }
 
     /// Finish checked attachment cleanup after every native owner is terminal.
@@ -401,6 +432,7 @@ mod tests {
         async fn lifecycle(
             &self,
             _request: crate::virt::lifecycle::LifecycleRequest,
+            _rights: crate::virt::lifecycle::LifecycleRights,
         ) -> Result<crate::virt::lifecycle::LifecycleResponse, crate::virt::lifecycle::LifecycleError>
         {
             Err(crate::virt::lifecycle::LifecycleError::Unsupported { backend: "test" })

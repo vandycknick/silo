@@ -171,7 +171,7 @@ impl ObservationStore {
     pub(crate) async fn snapshot_record(
         &self,
         reference: &crate::store::snapshot_store::SnapshotRef,
-    ) -> Result<crate::store::models::snapshot::StoppedSnapshotRecord, LibVmError> {
+    ) -> Result<crate::store::models::snapshot::SnapshotRecord, LibVmError> {
         let mut transaction = self.pool.begin().await?;
         let facts =
             crate::store::snapshot_store::fetch_catalog(&mut transaction, reference).await?;

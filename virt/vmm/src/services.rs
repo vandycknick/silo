@@ -256,7 +256,7 @@ impl VmMonitorService for MonitorService {
         self.live_command(
             request.into_inner(),
             &self.finite_capacity,
-            LiveCommand::Capture,
+            |command| LiveCommand::Capture(Box::new(command)),
             |result| match result {
                 LiveCommandResult::Capture(outcome) => encode(outcome),
                 _ => None,
@@ -271,7 +271,7 @@ impl VmMonitorService for MonitorService {
     ) -> Result<Response<ReleaseCaptureResponse>, Status> {
         self.live_command(
             request.into_inner(),
-            &self.finite_capacity,
+            &self.waiter_capacity,
             LiveCommand::ReleaseCapture,
             |result| match result {
                 LiveCommandResult::ReleaseCapture(outcome) => encode(outcome),
@@ -1293,6 +1293,7 @@ mod tests {
             virtual_machine,
             crate::live::gate::LiveGate::new(),
             crate::live::coordinator::LiveTimeouts::default(),
+            None,
         )
         .expect("coordinator")
     }
@@ -1433,12 +1434,55 @@ mod tests {
             LiveRejectionCode::OperationNotFound
         );
 
-        let capture = client
+        // A malformed (non-canonical) plan is a transport refusal, never a
+        // journaled request.
+        let malformed = client
             .capture(CaptureRequest {
                 envelope: Some(envelope(&run)),
-                expected_configuration_digest: Some("sha256:abc".into()),
-                policy: Some(protocol::v1::CapturePolicy::Full as i32),
-                resume_policy: Some(protocol::v1::CaptureResumePolicy::Preserve as i32),
+                plan: Some(b"{}".to_vec()),
+            })
+            .await;
+        assert!(malformed.is_err());
+
+        let capture_envelope = envelope(&run);
+        let plan = {
+            use vm_spec::capture::{
+                CaptureConfiguration, CaptureLaunchLease, CapturePauseAuthority, CapturePlan,
+                CaptureReservation, CAPTURE_RECORD_VERSION,
+            };
+            let id = |value: Option<&String>| {
+                vm_spec::lifecycle::LiveId::parse(value.expect("identity")).expect("canonical")
+            };
+            let configuration =
+                CaptureConfiguration::from_spec(&vm_spec::VmSpec::current()).expect("projection");
+            CapturePlan {
+                version: CAPTURE_RECORD_VERSION,
+                machine_id: id(capture_envelope.machine_id.as_ref()),
+                run_id: id(capture_envelope.run_id.as_ref()),
+                capture_id: id(capture_envelope.request_id.as_ref()),
+                configuration_digest: configuration.digest().expect("digest"),
+                ram_bytes: configuration.ram_bytes(),
+                configuration,
+                policy: vm_spec::lifecycle::CapturePolicy::Full,
+                resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
+                pause: CapturePauseAuthority::Acquire,
+                disks: Vec::new(),
+                read_only_inputs: Vec::new(),
+                reservation: CaptureReservation {
+                    storage_operation_id: id(Some(&uuid::Uuid::new_v4().to_string())),
+                    launch_lease: CaptureLaunchLease {
+                        operation_id: id(Some(&uuid::Uuid::new_v4().to_string())),
+                        device: 1,
+                        inode: 1,
+                    },
+                    staging_bytes: 1 << 40,
+                },
+            }
+        };
+        let capture = client
+            .capture(CaptureRequest {
+                envelope: Some(capture_envelope),
+                plan: Some(plan.canonical_bytes().expect("canonical plan")),
             })
             .await
             .unwrap()
@@ -1451,12 +1495,16 @@ mod tests {
             .release_capture(ReleaseCaptureRequest {
                 envelope: Some(envelope(&run)),
                 operation_id: Some(uuid::Uuid::new_v4().to_string()),
+                disposition: Some(protocol::v1::CaptureReleaseDisposition::Published as i32),
             })
             .await
             .unwrap()
             .into_inner();
         let ReleaseCaptureOutcome::Rejected { rejection } =
-            ReleaseCaptureOutcome::try_from(release).unwrap();
+            ReleaseCaptureOutcome::try_from(release).unwrap()
+        else {
+            panic!("release on an unsupported machine is refused");
+        };
         assert_eq!(rejection.reason.code(), LiveRejectionCode::Unsupported);
 
         drop(client);

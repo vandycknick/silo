@@ -144,15 +144,35 @@ pub fn info_to_wire(value: &SnapshotInfo) -> Result<w::StorageSnapshotInfo, Conv
         retained: Some(value.retained),
         aliases: value.aliases.clone(),
         created_at: Some(value.created_at),
-        capture_kind: w::StorageCaptureKind::StoppedStorage as i32,
+        capture_kind: match value.capture_kind {
+            libvm::SnapshotCaptureKindName::StoppedStorage => w::StorageCaptureKind::StoppedStorage,
+            libvm::SnapshotCaptureKindName::LiveExecution => w::StorageCaptureKind::LiveExecution,
+        } as i32,
+        provenance: value
+            .provenance
+            .iter()
+            .map(|provenance| w::SnapshotCaptureProvenance {
+                capture_id: provenance.capture_id.to_string(),
+                machine_id: provenance.machine_id.to_string(),
+                run_id: provenance.run_id.to_string(),
+                evidence_digest: provenance.evidence_digest.to_string(),
+            })
+            .collect(),
     };
     info_from_wire(result.clone())?;
     Ok(result)
 }
 pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, ConversionError> {
-    if value.capture_kind != w::StorageCaptureKind::StoppedStorage as i32 {
-        return Err(invalid("snapshot.capture_kind", "expected stopped-storage"));
-    }
+    let capture_kind = match w::StorageCaptureKind::try_from(value.capture_kind) {
+        Ok(w::StorageCaptureKind::StoppedStorage) => libvm::SnapshotCaptureKindName::StoppedStorage,
+        Ok(w::StorageCaptureKind::LiveExecution) => libvm::SnapshotCaptureKindName::LiveExecution,
+        _ => {
+            return Err(invalid(
+                "snapshot.capture_kind",
+                "expected stopped-storage or live-execution",
+            ))
+        }
+    };
     if value.aliases.len() > 4096 {
         return Err(invalid("snapshot.aliases", "too many aliases"));
     }
@@ -166,6 +186,37 @@ pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, Con
     if !(0..=9_007_199_254_740_991).contains(&created_at) {
         return Err(invalid("snapshot.created_at", "invalid timestamp"));
     }
+    // Provenance is evidence of live captures only; a stopped snapshot has none.
+    if value.provenance.len() > 4096
+        || (capture_kind == libvm::SnapshotCaptureKindName::StoppedStorage
+            && !value.provenance.is_empty())
+    {
+        return Err(invalid(
+            "snapshot.provenance",
+            "unexpected capture provenance",
+        ));
+    }
+    let provenance = value
+        .provenance
+        .into_iter()
+        .map(|provenance| {
+            let uuid = |field: &'static str, value: &str| {
+                crate::validate_uuid(value, field)?;
+                uuid::Uuid::parse_str(value).map_err(|_| invalid(field, "invalid UUID"))
+            };
+            Ok(libvm::SnapshotCaptureProvenance {
+                capture_id: uuid("snapshot.provenance.capture_id", &provenance.capture_id)?,
+                machine_id: uuid("snapshot.provenance.machine_id", &provenance.machine_id)?,
+                run_id: uuid("snapshot.provenance.run_id", &provenance.run_id)?,
+                evidence_digest: provenance.evidence_digest.parse().map_err(|_| {
+                    invalid(
+                        "snapshot.provenance.evidence_digest",
+                        "invalid object digest",
+                    )
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, ConversionError>>()?;
     Ok(SnapshotInfo {
         id: value
             .id
@@ -175,6 +226,8 @@ pub fn info_from_wire(value: w::StorageSnapshotInfo) -> Result<SnapshotInfo, Con
             .record_digest
             .parse()
             .map_err(|_| invalid("snapshot.record_digest", "invalid object digest"))?,
+        capture_kind,
+        provenance,
         retained: required(value.retained, "snapshot.retained")?,
         aliases: value.aliases,
         created_at,
@@ -268,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_info_rejects_observation_or_execution_shaped_success() {
+    fn storage_info_rejects_observation_shaped_success_and_foreign_provenance() {
         let mut wire = w::StorageSnapshotInfo {
             id: format!("sha256:{}", "a".repeat(64)),
             record_digest: format!("sha256:{}", "b".repeat(64)),
@@ -276,11 +329,38 @@ mod tests {
             aliases: vec!["checkpoint".into()],
             created_at: Some(1),
             capture_kind: w::StorageCaptureKind::StoppedStorage as i32,
+            provenance: vec![],
         };
         assert!(info_from_wire(wire.clone()).is_ok());
         wire.capture_kind = 0;
         assert!(info_from_wire(wire.clone()).is_err());
+        let provenance = w::SnapshotCaptureProvenance {
+            capture_id: "00000000-0000-4000-8000-000000000001".into(),
+            machine_id: "00000000-0000-4000-8000-000000000002".into(),
+            run_id: "00000000-0000-4000-8000-000000000003".into(),
+            evidence_digest: format!("sha256:{}", "c".repeat(64)),
+        };
+        wire.capture_kind = w::StorageCaptureKind::LiveExecution as i32;
+        wire.provenance = vec![provenance.clone()];
+        let live = info_from_wire(wire.clone()).unwrap();
+        assert_eq!(
+            live.capture_kind,
+            libvm::SnapshotCaptureKindName::LiveExecution
+        );
+        assert_eq!(
+            crate::stopped::info_to_wire(&live).unwrap(),
+            wire,
+            "live execution info round-trips exactly"
+        );
+        let mut malformed = wire.clone();
+        malformed.provenance[0].run_id = "not-a-uuid".into();
+        assert!(info_from_wire(malformed).is_err());
         wire.capture_kind = w::StorageCaptureKind::StoppedStorage as i32;
+        assert!(
+            info_from_wire(wire.clone()).is_err(),
+            "stopped snapshots carry no capture provenance"
+        );
+        wire.provenance.clear();
         wire.retained = None;
         assert!(info_from_wire(wire.clone()).is_err());
         wire.retained = Some(true);

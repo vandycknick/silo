@@ -153,7 +153,7 @@ impl Runtime {
         crate::runtime::config::validate_db_config(&stored)?;
         let observation_store = crate::store::observation::ObservationStore::existing(&store);
         let paths = LocalPaths::from_roots(roots);
-        Self::from_store_resolved(
+        let runtime = Self::from_store_resolved(
             paths,
             Arc::new(store),
             config.networking,
@@ -162,7 +162,14 @@ impl Runtime {
             live_query,
             Some(Arc::new(observation_store)),
         )
-        .await
+        .await?;
+        // Capture-aware recovery: a crash after a durable seal must still
+        // publish, and an ended unsealed attempt is abandoned. Captures of a
+        // live run stay owned by it. Uncertainty is retained, never fatal.
+        if let Err(error) = crate::machine::live_capture::reconcile_captures(&runtime, None).await {
+            tracing::warn!(%error, "live capture recovery retained uncertainty");
+        }
+        Ok(runtime)
     }
 
     /// Opens the default local runtime from the process environment.
@@ -265,6 +272,12 @@ impl Runtime {
         self.store.native_store().ok_or_else(|| {
             crate::machine::root_storage::invalid("stopped storage requires a native catalog")
         })
+    }
+
+    /// The native catalog when this runtime has one. A non-native test catalog
+    /// cannot hold live captures, so capture reconciliation has nothing to do.
+    pub(crate) fn optional_native_store(&self) -> Option<Store> {
+        self.store.native_store()
     }
 
     pub(crate) fn captured_boot_context<'a>(
@@ -2520,6 +2533,7 @@ impl Runtime {
                     .map(crate::machine::MachineRunId::from_raw)
             })
             .flatten();
+        let machine_id = config.id;
         let mut data = MachineData::from_models_with_status(
             config,
             rootfs,
@@ -2532,6 +2546,10 @@ impl Runtime {
         data.storage = storage;
         data.live = live;
         data.lifecycle = lifecycle;
+        match crate::machine::live_capture::machine_captures(self, machine_id).await {
+            Ok(captures) => data.captures = captures,
+            Err(error) => issues.push(MachineIssue::new(MachineIssueComponent::Lifecycle, error)),
+        }
         if !runtime_status.is_active() && observation == MachineObservation::Observed {
             match self.live_capabilities().await {
                 Ok(report) => data.prospective_live = Some(report),

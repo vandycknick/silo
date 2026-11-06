@@ -98,6 +98,15 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = "invalid live capability protocol evidence".into();
             tonic::Code::DataLoss
         }
+        E::LiveCapture {
+            capture_id,
+            message,
+        } => {
+            d.kind = 4;
+            d.reference = Some(capture_id.clone());
+            d.safe_message = message.clone();
+            tonic::Code::FailedPrecondition
+        }
         E::MachineAlreadyRunning { reference } => {
             d.kind = 4;
             d.code = 1;
@@ -309,6 +318,12 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             "LiveProtocol" if v.code() == tonic::Code::DataLoss && d.kind == 8 => E::LiveProtocol {
                 message: d.safe_message,
             },
+            "LiveCapture" if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
+                E::LiveCapture {
+                    capture_id: required(d.reference, "error.reference")?,
+                    message: d.safe_message,
+                }
+            }
             "MachineNotFound" => E::MachineNotFound {
                 reference: required(d.reference, "error.reference")?,
             },

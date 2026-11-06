@@ -520,6 +520,16 @@ impl StoragePool {
         .ok_or_else(|| StorageError::InvalidPath("fresh operation lease is busy".into()))
     }
 
+    /// Rejoin a registered operation without creating or replacing its lease.
+    pub(crate) fn existing_lease(&self, operation: Uuid) -> Result<StorageLock, StorageError> {
+        locks::acquire_existing(
+            &self.leases,
+            &format!("{operation}.lease"),
+            FlockArg::LockSharedNonblock,
+        )?
+        .ok_or_else(|| StorageError::InvalidPath("registered operation is being retired".into()))
+    }
+
     /// Never wait for a lease while holding root coordination.
     pub fn try_exclusive_lease(
         &self,

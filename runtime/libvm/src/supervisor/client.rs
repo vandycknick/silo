@@ -89,7 +89,9 @@ impl VmmClient {
         command: vm_spec::lifecycle::LiveCommand,
     ) -> Result<vm_spec::lifecycle::LiveCommandResult, VmmClientError> {
         use vm_spec::lifecycle::{LiveCommand as C, LiveCommandResult as R};
-        command.validate().map_err(VmmClientError::Protocol)?;
+        if let C::Capture(capture) = &command {
+            capture.validate_plan().map_err(VmmClientError::Protocol)?;
+        }
         let mut client = monitor_client(self.channel().await?);
         let result = match command {
             C::Pause(command) => R::Pause(
@@ -139,7 +141,8 @@ impl VmmClient {
             C::Capture(command) => R::Capture(
                 client
                     .capture(timed_request(
-                        protocol::v1::CaptureRequest::from(command),
+                        protocol::v1::CaptureRequest::try_from(*command)
+                            .map_err(VmmClientError::Protocol)?,
                         RPC_TIMEOUT,
                     ))
                     .await

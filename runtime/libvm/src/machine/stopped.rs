@@ -13,10 +13,11 @@ use crate::runtime::boot_assets::{capture_boot, preflight_captured_boot, BootSel
 use crate::storage::locks::StorageLock;
 use crate::storage::pool::StoragePool;
 use crate::store::models::snapshot::{
-    SnapshotCaptureKind, SnapshotDisk, SnapshotKind, SnapshotPurpose, SnapshotRoot, SnapshotStream,
-    StoppedSnapshotRecord,
+    SnapshotCaptureKind, SnapshotDisk, SnapshotKind, SnapshotPurpose, SnapshotRecord, SnapshotRoot,
+    SnapshotStream,
 };
 use crate::store::models::{MachineConfig, MachineId};
+use crate::store::snapshot_store::publish_map;
 use crate::store::{MachineStore, Store};
 use crate::{
     BootBinding, BootProfile, DiskStorage, LibVmError, Machine, MachineAgent, MachineGuestConfig,
@@ -102,7 +103,7 @@ pub struct SnapshotConfiguration {
 }
 
 impl SnapshotConfiguration {
-    fn capture(config: &MachineConfig) -> Result<Self, LibVmError> {
+    pub(crate) fn capture(config: &MachineConfig) -> Result<Self, LibVmError> {
         let mut spec = config.spec.clone();
         // Paths identify configured selection only until capture. The retained
         // bundle is the child's boot authority, not a source-private pathname.
@@ -838,12 +839,15 @@ async fn snapshot_owned(
             geometry,
         });
     }
-    let record = StoppedSnapshotRecord {
+    let record = SnapshotRecord {
         schema: 1,
         kind: SnapshotKind::Snapshot,
-        capture_kind: SnapshotCaptureKind::StoppedStorage,
+        capture: SnapshotCaptureKind::StoppedStorage {
+            stop_outcome: source.storage.stop_outcome,
+        },
         purpose: SnapshotPurpose::Checkpoint,
         root: SnapshotRoot {
+            profile: crate::store::models::snapshot::SnapshotRootProfile::OpaqueRaw,
             stream: root_content,
             geometry: *geometry,
             layout: layout.clone(),
@@ -853,7 +857,6 @@ async fn snapshot_owned(
         configuration,
         boot,
         external_requirements: requirements,
-        stop_outcome: source.storage.stop_outcome,
     };
     let snapshots = SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
     let info = snapshots
@@ -879,38 +882,6 @@ async fn publish_private_stream(
     publish_map(pool, store, operation, stream.map).await
 }
 
-async fn publish_map(
-    pool: &StoragePool,
-    store: &Store,
-    operation: Uuid,
-    map: crate::storage::stream::StreamMap,
-) -> Result<SnapshotStream, LibVmError> {
-    let parent = OwnedDirectory::open_existing_root(
-        &store
-            .home_path()
-            .join("images/tmp")
-            .join(operation.to_string()),
-    )?
-    .ok_or_else(|| invalid("registered capture staging is missing"))?;
-    let name = format!("map-{}", Uuid::new_v4());
-    let stage = parent
-        .create_dir(&name)?
-        .ok_or_else(|| invalid("map staging collision"))?;
-    stage.write_file("record", &map.canonical_bytes()?)?;
-    let (object, roots) = pool.publish_object_for_catalog(&stage.path().join("record"))?;
-    store
-        .pin_published_storage_dependencies(operation, &[map.id()], &[object.digest])
-        .await?;
-    drop(roots);
-    parent.remove_tree(&name)?;
-    parent.sync()?;
-    Ok(SnapshotStream {
-        stream: map.id(),
-        map: object.digest,
-        length: map.length(),
-    })
-}
-
 fn reset_child_storage(storage: &mut MachineStorageRecord) {
     storage.storage_generation = 0;
     storage.ownership_epoch = 0;
@@ -925,9 +896,17 @@ fn reset_child_storage(storage: &mut MachineStorageRecord) {
     }
 }
 
-fn storage_from_snapshot(
-    record: &StoppedSnapshotRecord,
-) -> Result<MachineStorageRecord, LibVmError> {
+fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord, LibVmError> {
+    if matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+        return Err(LibVmError::LiveOperationUnsupported {
+            operation: vm_spec::live::LiveOperation::Restore,
+            backend: vm_spec::live::LiveBackend::Krun,
+            lane: vm_spec::live::LiveLane::NotApplicable,
+            reason: vm_spec::live::LiveUnsupportedReason::new(
+                vm_spec::live::LiveReasonCode::NotDelivered,
+            ),
+        });
+    }
     let mut storage = MachineStorageRecord {
         schema: 1,
         root: MachineRoot::OpaqueRaw {
