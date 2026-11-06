@@ -176,16 +176,6 @@ impl LocalVmService {
         Ok(())
     }
 
-    pub(crate) async fn restore_execution(
-        &self,
-        _checkpoint: &str,
-        _name: Option<&str>,
-    ) -> eyre::Result<()> {
-        let report = self.live_capabilities().await?;
-        libvm::require_host_live_operation(&report, vm_spec::live::LiveOperation::Restore)?;
-        Ok(())
-    }
-
     async fn preflight_stopped(
         &self,
         reference: &MachineRef,
@@ -766,6 +756,13 @@ fn canonical_host_path(path: &std::path::Path) -> eyre::Result<std::path::PathBu
 }
 
 fn canonical_socket_path(path: &std::path::Path) -> eyre::Result<std::path::PathBuf> {
+    // Bare socket names belong to the machine runtime, not the client's CWD.
+    if path
+        .file_name()
+        .is_some_and(|name| name == path.as_os_str())
+    {
+        return Ok(path.to_path_buf());
+    }
     let path = crate::machine_defaults::resolve_host_path(path)?;
     // Listening sockets need not exist yet. Resolve the existing ancestor without
     // losing the intended leaf, while keeping daemon CWD out of path interpretation.
@@ -941,6 +938,22 @@ mod tests {
     }
 
     #[test]
+    fn normalization_preserves_machine_relative_socket_names() {
+        let mut update = libvm::MachineUpdate::new();
+        update.forwards = Some(vec![libvm::Forward::new(
+            libvm::ForwardEndpoint::host(libvm::ForwardAddress::unix("svc.sock")),
+            libvm::ForwardEndpoint::guest(libvm::ForwardAddress::tcp(
+                "127.0.0.1:7301".parse().unwrap(),
+            )),
+        )]);
+        crate::api::local::normalize_update(&mut update).unwrap();
+        assert_eq!(
+            update.forwards.unwrap()[0].listen,
+            libvm::ForwardEndpoint::host(libvm::ForwardAddress::unix("svc.sock"))
+        );
+    }
+
+    #[test]
     fn updates_resolve_relative_host_paths_before_backend_selection() {
         let temp = tempfile::tempdir_in(".").unwrap();
         let agent = temp.path().join("agent");
@@ -1017,6 +1030,8 @@ mod tests {
                     RestoreOptions {
                         name: Some(name.into()),
                         external_resources: ExternalResourcePolicy::Reject,
+                        activation_hook: None,
+                        resources: Default::default(),
                     },
                 )
                 .await

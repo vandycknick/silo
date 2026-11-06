@@ -575,30 +575,23 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
             );
             unsupported(error, operation, LiveBackend::Mock, reason, subject.clone());
         }
-        let artifact = fixture.temp.path().join("unreadable-checkpoint");
-        // The artifact does not exist: capability precedence must win over I/O.
-        let restore_reason = if reason == LiveReasonCode::DeviceProfileRejected {
-            LiveReasonCode::NotDelivered
+        if reason == LiveReasonCode::DeviceProfileRejected {
+            // Artifact restore has no dependency on this running machine's
+            // rejected topology. Host support is a separate admission scope.
+            libvm::require_host_live_operation(&host, LiveOperation::Restore).unwrap();
         } else {
-            reason
-        };
-        let runtime = fixture.runtime.clone();
-        let checkpoint = artifact.clone();
-        let error = bounded_refusal(
-            async move {
-                runtime
-                    .restore_execution(&host, &checkpoint, Some("unallocated-restore"))
-                    .await
-            },
-            DEADLINE,
-        );
-        unsupported(
-            error,
-            LiveOperation::Restore,
-            LiveBackend::Mock,
-            restore_reason,
-            None,
-        );
+            let error = bounded_refusal(
+                async move { libvm::require_host_live_operation(&host, LiveOperation::Restore) },
+                DEADLINE,
+            );
+            unsupported(
+                error,
+                LiveOperation::Restore,
+                LiveBackend::Mock,
+                reason,
+                None,
+            );
+        }
         assert_eq!(
             snapshot(&fixture.home),
             before_home,
@@ -614,7 +607,6 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
             before_catalog,
             "strict operation changed logical catalog/schema"
         );
-        assert!(!artifact.exists());
         drop(_operation_lock);
         fixture.stop().await;
     }

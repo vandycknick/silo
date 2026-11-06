@@ -40,20 +40,23 @@ use uuid::Uuid;
 
 use crate::krun::worker::lifecycle_wire::{self, ParentFrame, WorkerFrame, PROTOCOL_VERSION};
 use crate::virt::lifecycle::{
-    CancelSettlement, CancelStage, CaptureContinuation, CaptureDigests, CaptureNativeEvidence,
-    CaptureObservation, CaptureOutputHolders, CaptureOutputIdentities, CapturePauseObservation,
-    CapturePauseOrigin, CapturePauseSource, CapturePreparation, CaptureProgress,
-    CaptureResumePolicy, CaptureStage, CaptureStateBinding, ClockOnlyReceipt, CommandKey,
-    CommandKind, CommandOutcome, CommandReport, CommandSequence, CommandState, ControlObservation,
-    Digest32, FlushedAttachment, GenerationFailureKind, InventoryObservation, LifecycleCommand,
-    LifecycleRejection, LifecycleRequest, LifecycleRights, NativeControl, NativeFailure,
-    NativeFailureKind, NativeOperation, NativePause, NativePauseGeneration, NativePauseOwner,
-    ObservedClockProfile, OutputDefect, OutputHolder, OutputIdentity, OutputProblem, OutputReceipt,
-    OutputRole, PausePurpose, PinHolder, ResumeStage,
+    ActivationExposure, ActivationStage, CancelSettlement, CancelStage, CaptureContinuation,
+    CaptureDigests, CaptureNativeEvidence, CaptureObservation, CaptureOutputHolders,
+    CaptureOutputIdentities, CapturePauseObservation, CapturePauseOrigin, CapturePauseSource,
+    CapturePreparation, CaptureProgress, CaptureResumePolicy, CaptureStage, CaptureStateBinding,
+    ClockOnlyReceipt, CommandKey, CommandKind, CommandOutcome, CommandReport, CommandSequence,
+    CommandState, ControlObservation, Digest32, FlushedAttachment, FreshGenerationReceipt,
+    GenerationFailureKind, InventoryObservation, LifecycleCommand, LifecycleRejection,
+    LifecycleRequest, LifecycleRights, NativeControl, NativeFailure, NativeFailureKind,
+    NativeOperation, NativePause, NativePauseGeneration, NativePauseOwner, ObservedClockProfile,
+    OutputDefect, OutputHolder, OutputIdentity, OutputProblem, OutputReceipt, OutputRole,
+    PausePurpose, PinHolder, ResumeStage,
 };
 
 /// Native ClockOnly generation requests carry SYNC_CLOCK | CLOCK_ONLY.
 pub(crate) const CLOCK_ONLY_FLAGS: u32 = 1 | 2;
+/// Native FreshIdentity generation requests carry SYNC_CLOCK alone.
+pub(crate) const FRESH_IDENTITY_FLAGS: u32 = 1;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const OBSERVATION_BUDGET: Duration = Duration::from_secs(1);
@@ -126,12 +129,34 @@ pub(crate) enum NativeCaptureStatus<C> {
     Released,
 }
 
+/// The published native generation request of one FreshIdentity ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FreshRequest {
+    pub(crate) sequence: u64,
+    pub(crate) identity: [u8; 16],
+    pub(crate) flags: u32,
+}
+
+/// Native activation exposure as the native owner reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeExposure {
+    /// The exposure commit happened: every provider opened together.
+    pub(crate) released: bool,
+    /// Native sealed its exposure gate after a failed release.
+    pub(crate) failed: bool,
+    /// Every activation provider reports an effective fence.
+    pub(crate) providers_fenced: bool,
+}
+
 /// The blocking native lifecycle authority. The real worker implements it over
 /// libkrun; the scenario backend implements a modeled native owner.
 pub(crate) trait NativeLifecycle: Send + Sync + 'static {
     type Token: Clone + Send + 'static;
     type Ticket: Send + 'static;
     type Capture: Clone + Send + 'static;
+    /// The retained restore authority of a prepared restored machine. A
+    /// backend that never restores uses an uninhabited type.
+    type Restore: Clone + Send + 'static;
 
     fn pause(
         &self,
@@ -239,6 +264,43 @@ pub(crate) trait NativeLifecycle: Send + Sync + 'static {
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<Self::Token, NativeFailure>;
+    /// Install one host-CSPRNG FreshIdentity generation under the exact
+    /// retained restore token. The vCPUs stay parked.
+    fn prepare_fresh(
+        &self,
+        restore: &Self::Restore,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(Self::Ticket, FreshRequest), NativeFailure>;
+    /// Release the prepared vCPUs with that exact ticket; fences stay closed.
+    fn resume_restored(
+        &self,
+        restore: &Self::Restore,
+        ticket: &Self::Ticket,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure>;
+    /// The single native exposure commit for the acknowledged ticket.
+    fn release_activation(
+        &self,
+        restore: &Self::Restore,
+        ticket: &Self::Ticket,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure>;
+    /// Observe the native exposure of the restored machine.
+    fn activation_exposure(
+        &self,
+        restore: &Self::Restore,
+        deadline: Instant,
+    ) -> Result<NativeExposure, NativeFailure>;
+    /// Park released, unexposed vCPUs behind a new native pause.
+    fn park_restored(
+        &self,
+        restore: &Self::Restore,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<Self::Token, NativeFailure>;
 }
 
 /// Exact launch identity bound by the Hello frame.
@@ -248,17 +310,26 @@ pub(crate) struct Binding {
     pub(crate) run_id: Uuid,
 }
 
+/// The native restore token of a prepared restored machine and the activation
+/// identity the monitor must name. Retained only inside the worker.
+pub(crate) struct RestoreAuthority<R> {
+    pub(crate) activation: Uuid,
+    pub(crate) token: R,
+}
+
 /// Called once when control is lost: EOF, protocol violation or write failure.
 pub(crate) type FatalHandler = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Start serving one connected lifecycle endpoint. Never blocks the caller,
-/// so it is safe from the native pre-run callback.
+/// so it is safe from the native pre-run callback. The returned owner is the
+/// run's single journal; dropping it leaves the serving thread unaffected.
 pub(crate) fn serve<N: NativeLifecycle>(
     endpoint: OwnedFd,
     binding: Binding,
     native: N,
+    restore: Option<RestoreAuthority<N::Restore>>,
     on_fatal: FatalHandler,
-) -> std::io::Result<()> {
+) -> std::io::Result<Arc<Shared<N>>> {
     let socket = UnixStream::from(endpoint);
     socket.set_nonblocking(false)?;
     let writer = socket.try_clone()?;
@@ -267,12 +338,18 @@ pub(crate) fn serve<N: NativeLifecycle>(
         native,
         binding,
         journal: Mutex::new(Journal::default()),
+        restore: Mutex::new(restore.map(|authority| RestoreSlot {
+            activation: authority.activation,
+            token: authority.token,
+            phase: RestorePhase::Prepared,
+        })),
         settled: Condvar::new(),
         writer: Mutex::new(writer),
         light: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
         on_fatal,
     });
+    let served = shared.clone();
     std::thread::Builder::new()
         .name("krun-lifecycle".to_string())
         .spawn(move || {
@@ -286,19 +363,87 @@ pub(crate) fn serve<N: NativeLifecycle>(
                     shared.fatal(&error.to_string());
                 }
             }
-        })
-        .map(drop)
+        })?;
+    Ok(served)
 }
 
-struct Shared<N: NativeLifecycle> {
+type NativeRestoreSlot<N> = RestoreSlot<
+    <N as NativeLifecycle>::Token,
+    <N as NativeLifecycle>::Restore,
+    <N as NativeLifecycle>::Ticket,
+>;
+
+/// The worker's retained lifecycle owner: journal, restore slot and native.
+pub(crate) struct Shared<N: NativeLifecycle> {
     native: N,
     binding: Binding,
     journal: Mutex<Journal<N::Token, N::Capture>>,
+    /// Locked only after (or without) the journal: journal → restore.
+    restore: Mutex<Option<NativeRestoreSlot<N>>>,
     settled: Condvar,
     writer: Mutex<UnixStream>,
     light: AtomicUsize,
     failed: AtomicBool,
     on_fatal: FatalHandler,
+}
+
+/// The run's single restore activation, from prepared construction to the
+/// exposure commit or a stop-only failure.
+///
+/// ```text
+///  Prepared ─ActivateGeneration─► Generating ─ack─► Acknowledged ─Release─► Releasing ─► Exposed
+///                                     │ no ack            │                    │ sealed/unknown
+///                                     ▼                   ▼                    ▼
+///                     Failed{cpus_released} ──Park──► Parking ──► Parked     Sealed | Uncertain
+/// ```
+struct RestoreSlot<T, R, K> {
+    activation: Uuid,
+    token: R,
+    phase: RestorePhase<T, K>,
+}
+
+enum RestorePhase<T, K> {
+    /// Constructed and parked by native restore; no guest instruction ran.
+    Prepared,
+    Generating,
+    /// FreshIdentity acknowledged; every activation fence still effective.
+    Acknowledged {
+        ticket: K,
+    },
+    Releasing,
+    /// Exposure committed: the machine is an ordinary running machine.
+    Exposed,
+    /// No exposure; the vCPUs may (`cpus_released`) have executed.
+    Failed {
+        cpus_released: bool,
+    },
+    /// Native sealed exposure after a failed release; only stop remains.
+    Sealed,
+    /// Exposure could not be established either way; only stop remains.
+    Uncertain,
+    Parking,
+    /// Privately re-parked; the retained token is never public Resume
+    /// authority and is released only by stop.
+    Parked {
+        _token: T,
+    },
+}
+
+impl<T, K> RestorePhase<T, K> {
+    fn exposed(&self) -> bool {
+        matches!(self, Self::Exposed)
+    }
+
+    fn parkable(&self) -> bool {
+        matches!(
+            self,
+            Self::Acknowledged { .. }
+                | Self::Failed {
+                    cpus_released: true
+                }
+                | Self::Sealed
+        )
+    }
 }
 
 struct Journal<T, C> {
@@ -340,6 +485,85 @@ impl<T, C> Default for Journal<T, C> {
 }
 
 impl<T, C> Journal<T, C> {
+    /// Public mutators remain fenced until the restore exposure commit.
+    fn admit_live<R, K>(
+        &self,
+        key: CommandKey,
+        restore: Option<&RestoreSlot<T, R, K>>,
+    ) -> Result<(), LifecycleRejection> {
+        if self.commands.contains_key(&key) {
+            return Err(LifecycleRejection::RequestConflict);
+        }
+        if restore.is_some_and(|slot| !slot.phase.exposed()) {
+            return Err(LifecycleRejection::RestoreActive);
+        }
+        Ok(())
+    }
+
+    /// Activation admission is journal-only; it never calls a native owner.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_activation<R: Clone, K>(
+        &mut self,
+        restore: Option<&mut RestoreSlot<T, R, K>>,
+        sequence: CommandSequence,
+        key: CommandKey,
+        command: LifecycleCommand,
+        activation: Uuid,
+        timeout: Duration,
+    ) -> Result<Activation<R, K>, LifecycleRejection> {
+        if self.commands.contains_key(&key) {
+            return Err(LifecycleRejection::RequestConflict);
+        }
+        if self.mutator.is_some() || self.canceller.is_some() {
+            return Err(LifecycleRejection::Busy);
+        }
+        let slot = restore.ok_or(LifecycleRejection::NoRestore)?;
+        if slot.activation != activation {
+            return Err(LifecycleRejection::WrongRun);
+        }
+        let deadline = Instant::now() + timeout;
+        let admission = match (key.kind, &slot.phase) {
+            (CommandKind::ActivateGeneration, RestorePhase::Prepared) => {
+                slot.phase = RestorePhase::Generating;
+                Activation::Generation {
+                    restore: slot.token.clone(),
+                    deadline,
+                }
+            }
+            (CommandKind::ReleaseActivation, RestorePhase::Acknowledged { .. }) => {
+                match std::mem::replace(&mut slot.phase, RestorePhase::Releasing) {
+                    RestorePhase::Acknowledged { ticket } => Activation::Release {
+                        restore: slot.token.clone(),
+                        ticket,
+                        deadline,
+                    },
+                    other => {
+                        slot.phase = other;
+                        return Err(LifecycleRejection::ActivationStage);
+                    }
+                }
+            }
+            (CommandKind::ParkActivation, phase) if phase.parkable() => {
+                slot.phase = RestorePhase::Parking;
+                Activation::Park {
+                    restore: slot.token.clone(),
+                    deadline,
+                }
+            }
+            _ => return Err(LifecycleRejection::ActivationStage),
+        };
+        self.mutator = Some(sequence);
+        self.admit_command(
+            key,
+            Entry {
+                sequence,
+                command,
+                state: CommandState::Accepted,
+            },
+        );
+        Ok(admission)
+    }
+
     fn unresolved_capture(&self) -> bool {
         self.captures
             .values()
@@ -419,6 +643,131 @@ impl<T, C> Journal<T, C> {
         apply_status(record, status);
         self.advance();
         true
+    }
+}
+
+/// Why the candidate-only IRQ probe was not admitted. Nothing native ran.
+#[cfg(all(
+    feature = "restore-irq-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeRefusal {
+    /// Source construction never runs on a restored machine.
+    Restored,
+    /// Source construction needs the run's published User pause.
+    NotPaused,
+    /// A lifecycle mutator or cancel is in flight, or a capture is unresolved.
+    Busy,
+    /// Guest commands need a running machine whose restore, if any, is exposed.
+    NotRunning,
+    /// Native operation identities are exhausted for this run.
+    Exhausted,
+}
+
+/// Probe admission is journal-only and allocates nothing but a native
+/// operation; it never records a lifecycle command or touches a capture.
+#[cfg(all(
+    feature = "restore-irq-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+impl<T: Clone, C> Journal<T, C> {
+    fn probe_idle(&self) -> Result<(), ProbeRefusal> {
+        if self.mutator.is_some() || self.canceller.is_some() || self.unresolved_capture() {
+            return Err(ProbeRefusal::Busy);
+        }
+        Ok(())
+    }
+
+    /// The published, capture-free pause a source fixture may be built under.
+    /// The caller still requires native User ownership of the token.
+    fn probe_source_pause(&self, restored: bool) -> Result<T, ProbeRefusal> {
+        if restored {
+            return Err(ProbeRefusal::Restored);
+        }
+        self.probe_idle()?;
+        match self.slot.as_ref() {
+            Some(PauseSlot {
+                capture: None,
+                phase:
+                    PausePhase::Paused {
+                        token,
+                        published: true,
+                        ..
+                    },
+                ..
+            }) => Ok(token.clone()),
+            _ => Err(ProbeRefusal::NotPaused),
+        }
+    }
+
+    /// A guest command word may only be written into a running machine that
+    /// no pause, capture or unexposed restore owns.
+    fn probe_running(&self, exposed: bool) -> Result<(), ProbeRefusal> {
+        self.probe_idle()?;
+        if !exposed
+            || self
+                .slot
+                .as_ref()
+                .is_some_and(|slot| !slot.phase.settled_running())
+        {
+            return Err(ProbeRefusal::NotRunning);
+        }
+        Ok(())
+    }
+
+    fn probe_operation(&mut self) -> Result<NativeOperation, ProbeRefusal> {
+        next_native(self).map_err(|_| ProbeRefusal::Exhausted)
+    }
+}
+
+/// Candidate-only IRQ probe access. Source construction and guest commands
+/// run under the journal lock, so no Resume, capture or activation can be
+/// admitted until the bounded native call returns. Observation is read-only
+/// and runs outside it.
+#[cfg(all(
+    feature = "restore-irq-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+impl<N: NativeLifecycle> Shared<N> {
+    pub(crate) fn probe_source<R>(
+        &self,
+        call: impl FnOnce(&N, &N::Token, NativeOperation) -> R,
+    ) -> Result<R, ProbeRefusal> {
+        let mut journal = lock(&self.journal);
+        let restored = lock(&self.restore).is_some();
+        let token = journal.probe_source_pause(restored)?;
+        if self.native.token_owner(&token) != NativePauseOwner::User {
+            return Err(ProbeRefusal::NotPaused);
+        }
+        let operation = journal.probe_operation()?;
+        Ok(call(&self.native, &token, operation))
+    }
+
+    pub(crate) fn probe_running<R>(
+        &self,
+        call: impl FnOnce(&N, NativeOperation) -> R,
+    ) -> Result<R, ProbeRefusal> {
+        let mut journal = lock(&self.journal);
+        // Exposed is terminal for a restored run, so the restore lock is not
+        // held across the native call.
+        let exposed = lock(&self.restore)
+            .as_ref()
+            .is_none_or(|slot| slot.phase.exposed());
+        journal.probe_running(exposed)?;
+        let operation = journal.probe_operation()?;
+        Ok(call(&self.native, operation))
+    }
+
+    pub(crate) fn probe_observe<R>(
+        &self,
+        call: impl FnOnce(&N, NativeOperation) -> R,
+    ) -> Result<R, ProbeRefusal> {
+        let operation = lock(&self.journal).probe_operation()?;
+        Ok(call(&self.native, operation))
     }
 }
 
@@ -634,6 +983,23 @@ enum Admission<T, C> {
     },
 }
 
+/// One admitted activation stage with the authority it consumes.
+enum Activation<R, K> {
+    Generation {
+        restore: R,
+        deadline: Instant,
+    },
+    Release {
+        restore: R,
+        ticket: K,
+        deadline: Instant,
+    },
+    Park {
+        restore: R,
+        deadline: Instant,
+    },
+}
+
 enum CancelStart<T> {
     Pending {
         pause: NativeOperation,
@@ -759,6 +1125,30 @@ impl<N: NativeLifecycle> Shared<N> {
                 operation,
                 Mutation::Cancel { operation, timeout },
             ),
+            LifecycleCommand::ActivateGeneration {
+                activation,
+                timeout,
+            }
+            | LifecycleCommand::ReleaseActivation {
+                activation,
+                timeout,
+            }
+            | LifecycleCommand::ParkActivation {
+                activation,
+                timeout,
+            } => {
+                let Some(kind) = command.kind() else {
+                    return Err(crate::krun::worker::wire::invalid(
+                        "lifecycle activation command without identity",
+                    ));
+                };
+                let key = CommandKey { request_id, kind };
+                match self.admit_activation(sequence, key, command, activation, timeout) {
+                    Ok(admission) => self.spawn_activation(sequence, key, activation, admission),
+                    Err(rejection) => self.reject(sequence, rejection),
+                }
+                return Ok(());
+            }
             capture => {
                 let (Some(kind), Some(operation)) = (capture.kind(), capture.operation()) else {
                     return Err(crate::krun::worker::wire::invalid(
@@ -811,10 +1201,7 @@ impl<N: NativeLifecycle> Shared<N> {
         mutation: Mutation,
     ) -> Result<Admitted<N::Token, N::Capture>, LifecycleRejection> {
         let mut journal = lock(&self.journal);
-        if journal.commands.contains_key(&key) {
-            // The backend joins identical retries; a repeated key is a conflict.
-            return Err(LifecycleRejection::RequestConflict);
-        }
+        journal.admit_live(key, lock(&self.restore).as_ref())?;
         let now = Instant::now();
         let admitted = match mutation {
             Mutation::Pause {
@@ -1015,9 +1402,7 @@ impl<N: NativeLifecycle> Shared<N> {
         rights: LifecycleRights,
     ) -> Result<Admitted<N::Token, N::Capture>, LifecycleRejection> {
         let mut journal = lock(&self.journal);
-        if journal.commands.contains_key(&key) {
-            return Err(LifecycleRejection::RequestConflict);
-        }
+        journal.admit_live(key, lock(&self.restore).as_ref())?;
         if journal.mutator.is_some() || journal.canceller.is_some() {
             return Err(LifecycleRejection::Busy);
         }
@@ -1404,6 +1789,302 @@ impl<N: NativeLifecycle> Shared<N> {
             },
         );
         Ok(admitted)
+    }
+
+    /// Activation stage admission; serialized with every other mutator.
+    fn admit_activation(
+        &self,
+        sequence: CommandSequence,
+        key: CommandKey,
+        command: LifecycleCommand,
+        activation: Uuid,
+        timeout: Duration,
+    ) -> Result<Activation<N::Restore, N::Ticket>, LifecycleRejection> {
+        lock(&self.journal).admit_activation(
+            lock(&self.restore).as_mut(),
+            sequence,
+            key,
+            command,
+            activation,
+            timeout,
+        )
+    }
+
+    fn spawn_activation(
+        self: &Arc<Self>,
+        sequence: CommandSequence,
+        key: CommandKey,
+        activation: Uuid,
+        admission: Activation<N::Restore, N::Ticket>,
+    ) {
+        let shared = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("krun-lifecycle-activation".to_string())
+            .spawn(move || {
+                let control = shared.control(Observe::Native);
+                shared.send(&WorkerFrame::Report {
+                    report: CommandReport {
+                        key,
+                        sequence,
+                        operation: activation,
+                        state: CommandState::Accepted,
+                    },
+                    control,
+                });
+                let outcome = match admission {
+                    Activation::Generation { restore, deadline } => {
+                        shared.run_generation(restore, deadline)
+                    }
+                    Activation::Release {
+                        restore,
+                        ticket,
+                        deadline,
+                    } => shared.run_release_activation(restore, ticket, deadline),
+                    Activation::Park { restore, deadline } => shared.run_park(restore, deadline),
+                };
+                shared.complete(key, sequence, activation, outcome);
+            });
+        if let Err(error) = spawned {
+            // Admitted activation work that cannot run would strand the
+            // restore authority mid-stage: losing control is terminal.
+            self.fatal(&format!("cannot start activation command: {error}"));
+        }
+    }
+
+    fn set_restore_phase(&self, phase: RestorePhase<N::Token, N::Ticket>) {
+        if let Some(slot) = lock(&self.restore).as_mut() {
+            slot.phase = phase;
+        }
+    }
+
+    /// Whether the restored vCPUs may have executed: anything but a positive
+    /// native RestorePrepared observation counts as released.
+    fn cpus_released(&self) -> bool {
+        !matches!(
+            self.native
+                .control_state(Instant::now() + OBSERVATION_BUDGET),
+            Ok(NativeState::RestorePrepared)
+        )
+    }
+
+    /// A generation-stage failure never attempted exposure: every activation
+    /// fence is still effective. Only park (if vCPUs ran) or stop remains.
+    fn fail_generation(
+        &self,
+        stage: ActivationStage,
+        failure: NativeFailure,
+        cpus_released: bool,
+    ) -> CommandOutcome {
+        self.set_restore_phase(RestorePhase::Failed { cpus_released });
+        CommandOutcome::ActivationFailed {
+            stage,
+            failure,
+            cpus_released,
+            exposure: ActivationExposure::Fenced,
+        }
+    }
+
+    /// FreshIdentity under the restore token, vCPU release, then the exact
+    /// acknowledgement within the one absolute `deadline`.
+    fn run_generation(&self, restore: N::Restore, deadline: Instant) -> CommandOutcome {
+        let prepared = self
+            .native_operation()
+            .and_then(|operation| self.native.prepare_fresh(&restore, operation, deadline));
+        let (ticket, request) = match prepared {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                return self.fail_generation(
+                    ActivationStage::PrepareGeneration,
+                    failure,
+                    self.cpus_released(),
+                )
+            }
+        };
+        if request.sequence == 0
+            || request.flags != FRESH_IDENTITY_FLAGS
+            || request.identity == [0; 16]
+        {
+            return self.fail_generation(
+                ActivationStage::PrepareGeneration,
+                NativeFailure::with_detail(
+                    NativeFailureKind::Unexpected,
+                    format!(
+                        "native generation request is not a fresh identity (flags {:#x})",
+                        request.flags
+                    ),
+                ),
+                self.cpus_released(),
+            );
+        }
+        let submitted = Instant::now();
+        let release = self.native_operation().and_then(|operation| {
+            self.native
+                .resume_restored(&restore, &ticket, operation, deadline)
+        });
+        if let Err(failure) = release {
+            return self.fail_generation(
+                ActivationStage::ReleaseCpus,
+                failure,
+                self.cpus_released(),
+            );
+        }
+        loop {
+            let poll = if Instant::now() >= deadline {
+                Ok(GenerationPoll::Failed(GenerationFailureKind::Deadline))
+            } else {
+                self.native.poll_generation(&ticket, deadline)
+            };
+            match poll {
+                Ok(GenerationPoll::Acknowledged { completed_at }) => {
+                    if completed_at < submitted || completed_at > deadline {
+                        return self.fail_generation(
+                            ActivationStage::Acknowledgement,
+                            NativeFailure::new(NativeFailureKind::Generation(
+                                GenerationFailureKind::Deadline,
+                            )),
+                            true,
+                        );
+                    }
+                    let elapsed = completed_at.saturating_duration_since(submitted);
+                    let acknowledged_within = Duration::from_millis(
+                        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    );
+                    self.set_restore_phase(RestorePhase::Acknowledged { ticket });
+                    return CommandOutcome::GenerationAcknowledged {
+                        generation: FreshGenerationReceipt {
+                            sequence: request.sequence,
+                            identity: Uuid::from_bytes(request.identity),
+                            flags: request.flags,
+                            acknowledged_within,
+                        },
+                    };
+                }
+                Ok(GenerationPoll::Failed(kind)) => {
+                    return self.fail_generation(
+                        ActivationStage::Acknowledgement,
+                        NativeFailure::new(NativeFailureKind::Generation(kind)),
+                        true,
+                    )
+                }
+                Ok(GenerationPoll::Pending) => {}
+                Err(_) if Instant::now() < deadline => {}
+                Err(failure) => {
+                    return self.fail_generation(ActivationStage::Acknowledgement, failure, true)
+                }
+            }
+            std::thread::sleep(CLOCK_POLL_INTERVAL);
+        }
+    }
+
+    /// One native exposure observation, classified. A transport failure is
+    /// never a closed-fence receipt.
+    fn observe_exposure(&self, restore: &N::Restore) -> Option<ActivationExposure> {
+        match self
+            .native
+            .activation_exposure(restore, Instant::now() + OBSERVATION_BUDGET)
+        {
+            Ok(exposure) if exposure.released => Some(ActivationExposure::Committed),
+            Ok(exposure) if exposure.failed && exposure.providers_fenced => {
+                Some(ActivationExposure::Sealed)
+            }
+            Ok(exposure) if !exposure.failed && exposure.providers_fenced => {
+                Some(ActivationExposure::Fenced)
+            }
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    /// The single exposure commit. A failed or lost reply is reconciled from
+    /// native observation; it is never retried here and never assumed closed.
+    fn run_release_activation(
+        &self,
+        restore: N::Restore,
+        ticket: N::Ticket,
+        deadline: Instant,
+    ) -> CommandOutcome {
+        let result = self.native_operation().and_then(|operation| {
+            self.native
+                .release_activation(&restore, &ticket, operation, deadline)
+        });
+        let failure = match result {
+            Ok(()) => {
+                self.set_restore_phase(RestorePhase::Exposed);
+                return CommandOutcome::ActivationReleased;
+            }
+            Err(failure) => failure,
+        };
+        let limit = deadline.max(Instant::now()) + RECONCILE_GRACE;
+        loop {
+            match self.observe_exposure(&restore) {
+                Some(ActivationExposure::Committed) => {
+                    self.set_restore_phase(RestorePhase::Exposed);
+                    return CommandOutcome::ActivationReleased;
+                }
+                Some(ActivationExposure::Sealed) => {
+                    self.set_restore_phase(RestorePhase::Sealed);
+                    return CommandOutcome::ActivationFailed {
+                        stage: ActivationStage::Exposure,
+                        failure,
+                        cpus_released: true,
+                        exposure: ActivationExposure::Sealed,
+                    };
+                }
+                // Fenced-but-unsettled release: native may still commit
+                // before its absolute deadline. Keep observing.
+                Some(ActivationExposure::Fenced | ActivationExposure::Uncertain) | None
+                    if Instant::now() < limit => {}
+                _ => {
+                    self.set_restore_phase(RestorePhase::Uncertain);
+                    return CommandOutcome::ActivationFailed {
+                        stage: ActivationStage::Exposure,
+                        failure,
+                        cpus_released: true,
+                        exposure: ActivationExposure::Uncertain,
+                    };
+                }
+            }
+            std::thread::sleep(RECONCILE_INTERVAL);
+        }
+    }
+
+    /// Re-park released, unexposed vCPUs behind a private native pause.
+    fn run_park(&self, restore: N::Restore, deadline: Instant) -> CommandOutcome {
+        let parked = self
+            .native_operation()
+            .and_then(|operation| self.native.park_restored(&restore, operation, deadline))
+            .and_then(|token| {
+                NativePauseGeneration::new(self.native.token_generation(&token))
+                    .map(|generation| (token, generation))
+                    .ok_or_else(|| {
+                        NativeFailure::with_detail(
+                            NativeFailureKind::Unexpected,
+                            "native park reported a zero pause generation",
+                        )
+                    })
+            });
+        match parked {
+            Ok((token, generation)) => {
+                let pause = NativePause {
+                    generation,
+                    owner: self.native.token_owner(&token),
+                };
+                self.set_restore_phase(RestorePhase::Parked { _token: token });
+                CommandOutcome::ActivationParked { pause }
+            }
+            Err(failure) => {
+                self.set_restore_phase(RestorePhase::Failed {
+                    cpus_released: true,
+                });
+                CommandOutcome::ActivationFailed {
+                    stage: ActivationStage::Park,
+                    failure,
+                    cpus_released: true,
+                    exposure: self
+                        .observe_exposure(&restore)
+                        .unwrap_or(ActivationExposure::Uncertain),
+                }
+            }
+        }
     }
 
     /// The exact pause a capture stage runs under.
@@ -3077,14 +3758,15 @@ mod tests {
     use uuid::Uuid;
 
     use crate::krun::worker::lifecycle::{
-        CaptureRecord, Entry, Journal, MemoryCapture, NativeCaptureStatus, PreparedOutputs,
+        Activation, CaptureRecord, Entry, Journal, MemoryCapture, NativeCaptureStatus,
+        PreparedOutputs, RestorePhase, RestoreSlot,
     };
     use crate::virt::lifecycle::{
         CaptureDigests, CaptureOutputHolders, CaptureOutputIdentities, CapturePauseOrigin,
         CapturePauseSource, CapturePreparation, CaptureProgress, CaptureResumePolicy,
         CaptureStateBinding, CommandKey, CommandOutcome, CommandSequence, CommandState, Digest32,
-        LifecycleCommand, NativePause, NativePauseGeneration, NativePauseOwner, OutputHolder,
-        OutputIdentity, OutputReceipt, PinHolder,
+        LifecycleCommand, LifecycleRejection, NativePause, NativePauseGeneration, NativePauseOwner,
+        OutputHolder, OutputIdentity, OutputReceipt, PinHolder,
     };
 
     const TICKET: u32 = 7;
@@ -3116,7 +3798,7 @@ mod tests {
 
     /// A capture whose full-RAM write is still pending natively after its
     /// stage command reported: only an observation or a command changes it.
-    fn memory_pending(journal: &mut Journal<(), u32>, capture: Uuid) -> CaptureStateBinding {
+    fn memory_pending<T>(journal: &mut Journal<T, u32>, capture: Uuid) -> CaptureStateBinding {
         let identity = |inode| OutputIdentity { device: 1, inode };
         let binding = binding(capture);
         journal.captures.insert(
@@ -3306,5 +3988,474 @@ mod tests {
             progress(&journal, capture),
             CaptureProgress::CandidateComplete
         );
+    }
+
+    fn activation_command(
+        activation: Uuid,
+        kind: crate::virt::lifecycle::CommandKind,
+    ) -> LifecycleCommand {
+        use crate::virt::lifecycle::CommandKind;
+        let timeout = std::time::Duration::from_secs(5);
+        match kind {
+            CommandKind::ActivateGeneration => LifecycleCommand::ActivateGeneration {
+                activation,
+                timeout,
+            },
+            CommandKind::ReleaseActivation => LifecycleCommand::ReleaseActivation {
+                activation,
+                timeout,
+            },
+            CommandKind::ParkActivation => LifecycleCommand::ParkActivation {
+                activation,
+                timeout,
+            },
+            _ => panic!("not an activation command"),
+        }
+    }
+
+    fn admit_activation(
+        journal: &mut Journal<u32, u32>,
+        slot: Option<&mut RestoreSlot<u32, u32, u32>>,
+        activation: Uuid,
+        kind: crate::virt::lifecycle::CommandKind,
+        request_id: Uuid,
+        sequence: u64,
+    ) -> Result<Activation<u32, u32>, LifecycleRejection> {
+        journal.admit_activation(
+            slot,
+            CommandSequence::new(sequence).unwrap(),
+            CommandKey { request_id, kind },
+            activation_command(activation, kind),
+            activation,
+            std::time::Duration::from_secs(5),
+        )
+    }
+
+    #[test]
+    fn restore_activation_journal_requires_exact_authority_and_serializes_mutators() {
+        use crate::virt::lifecycle::CommandKind;
+        let mut journal = Journal::<u32, u32>::default();
+        let activation = Uuid::new_v4();
+        let mut slot = RestoreSlot {
+            activation,
+            token: 17,
+            phase: RestorePhase::Prepared,
+        };
+        let request = Uuid::new_v4();
+        assert!(matches!(
+            admit_activation(
+                &mut journal,
+                None,
+                activation,
+                CommandKind::ActivateGeneration,
+                request,
+                1
+            ),
+            Err(LifecycleRejection::NoRestore)
+        ));
+        assert!(matches!(
+            admit_activation(
+                &mut journal,
+                Some(&mut slot),
+                Uuid::new_v4(),
+                CommandKind::ActivateGeneration,
+                request,
+                2
+            ),
+            Err(LifecycleRejection::WrongRun)
+        ));
+        assert!(matches!(
+            admit_activation(
+                &mut journal,
+                Some(&mut slot),
+                activation,
+                CommandKind::ReleaseActivation,
+                request,
+                3
+            ),
+            Err(LifecycleRejection::ActivationStage)
+        ));
+        assert!(journal.commands.is_empty());
+        assert!(matches!(slot.phase, RestorePhase::Prepared));
+        assert!(matches!(
+            admit_activation(
+                &mut journal,
+                Some(&mut slot),
+                activation,
+                CommandKind::ActivateGeneration,
+                request,
+                4
+            ),
+            Ok(Activation::Generation { restore: 17, .. })
+        ));
+        assert!(matches!(slot.phase, RestorePhase::Generating));
+        let key = CommandKey {
+            request_id: request,
+            kind: CommandKind::ActivateGeneration,
+        };
+        assert!(matches!(
+            journal.admit_live(key, Some(&slot)),
+            Err(LifecycleRejection::RequestConflict)
+        ));
+        for timeout in [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(4),
+        ] {
+            assert!(
+                matches!(
+                    journal.admit_activation(
+                        Some(&mut slot),
+                        CommandSequence::new(5).unwrap(),
+                        key,
+                        LifecycleCommand::ActivateGeneration {
+                            activation,
+                            timeout
+                        },
+                        activation,
+                        timeout,
+                    ),
+                    Err(LifecycleRejection::RequestConflict)
+                ),
+                "wire retries are joined by the backend, never executed twice by the worker"
+            );
+        }
+        assert!(matches!(
+            admit_activation(
+                &mut journal,
+                Some(&mut slot),
+                activation,
+                CommandKind::ParkActivation,
+                Uuid::new_v4(),
+                6
+            ),
+            Err(LifecycleRejection::Busy)
+        ));
+        journal.complete_command(
+            key,
+            CommandSequence::new(4).unwrap(),
+            &CommandOutcome::GenerationAcknowledged {
+                generation: crate::virt::lifecycle::FreshGenerationReceipt {
+                    sequence: 1,
+                    identity: Uuid::new_v4(),
+                    flags: 1,
+                    acknowledged_within: std::time::Duration::from_millis(1),
+                },
+            },
+        );
+        slot.phase = RestorePhase::Acknowledged { ticket: 23 };
+        assert!(matches!(
+            admit_activation(
+                &mut journal,
+                Some(&mut slot),
+                activation,
+                CommandKind::ReleaseActivation,
+                Uuid::new_v4(),
+                7
+            ),
+            Ok(Activation::Release {
+                restore: 17,
+                ticket: 23,
+                ..
+            })
+        ));
+        assert!(matches!(slot.phase, RestorePhase::Releasing));
+    }
+
+    #[test]
+    fn restore_activation_gates_public_mutators_and_failed_states_are_stop_only() {
+        use crate::virt::lifecycle::CommandKind;
+        for phase in [
+            RestorePhase::Prepared,
+            RestorePhase::Generating,
+            RestorePhase::Acknowledged { ticket: 2 },
+            RestorePhase::Releasing,
+            RestorePhase::Failed {
+                cpus_released: false,
+            },
+            RestorePhase::Failed {
+                cpus_released: true,
+            },
+            RestorePhase::Sealed,
+            RestorePhase::Uncertain,
+            RestorePhase::Parking,
+            RestorePhase::Parked { _token: 1 },
+        ] {
+            let journal = Journal::<u32, u32>::default();
+            let slot = RestoreSlot {
+                activation: Uuid::new_v4(),
+                token: 17,
+                phase,
+            };
+            for kind in [
+                CommandKind::Pause,
+                CommandKind::Resume,
+                CommandKind::CancelPause,
+                CommandKind::PrepareCapture,
+            ] {
+                assert_eq!(
+                    journal.admit_live(
+                        CommandKey {
+                            request_id: Uuid::new_v4(),
+                            kind
+                        },
+                        Some(&slot)
+                    ),
+                    Err(LifecycleRejection::RestoreActive)
+                );
+            }
+        }
+        let mut journal = Journal::<u32, u32>::default();
+        let mut slot = RestoreSlot {
+            activation: Uuid::new_v4(),
+            token: 17,
+            phase: RestorePhase::Exposed,
+        };
+        assert!(journal
+            .admit_live(
+                CommandKey {
+                    request_id: Uuid::new_v4(),
+                    kind: CommandKind::Pause
+                },
+                Some(&slot)
+            )
+            .is_ok());
+        for phase in [
+            RestorePhase::Failed {
+                cpus_released: false,
+            },
+            RestorePhase::Uncertain,
+            RestorePhase::Parked { _token: 3 },
+            RestorePhase::Exposed,
+        ] {
+            slot.phase = phase;
+            let activation = slot.activation;
+            for kind in [
+                CommandKind::ActivateGeneration,
+                CommandKind::ReleaseActivation,
+                CommandKind::ParkActivation,
+            ] {
+                assert!(matches!(
+                    admit_activation(
+                        &mut journal,
+                        Some(&mut slot),
+                        activation,
+                        kind,
+                        Uuid::new_v4(),
+                        1
+                    ),
+                    Err(LifecycleRejection::ActivationStage)
+                ));
+            }
+            assert!(journal.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn restore_activation_parking_never_grants_public_resume_authority() {
+        use crate::virt::lifecycle::CommandKind;
+        for phase in [
+            RestorePhase::Acknowledged { ticket: 23 },
+            RestorePhase::Failed {
+                cpus_released: true,
+            },
+            RestorePhase::Sealed,
+        ] {
+            let mut journal = Journal::<u32, u32>::default();
+            let activation = Uuid::new_v4();
+            let mut slot = RestoreSlot {
+                activation,
+                token: 17,
+                phase,
+            };
+            let request = Uuid::new_v4();
+            assert!(matches!(
+                admit_activation(
+                    &mut journal,
+                    Some(&mut slot),
+                    activation,
+                    CommandKind::ParkActivation,
+                    request,
+                    1
+                ),
+                Ok(Activation::Park { restore: 17, .. })
+            ));
+            assert!(matches!(slot.phase, RestorePhase::Parking));
+            let pause = NativePause {
+                generation: generation(),
+                owner: NativePauseOwner::User,
+            };
+            journal.complete_command(
+                CommandKey {
+                    request_id: request,
+                    kind: CommandKind::ParkActivation,
+                },
+                CommandSequence::new(1).unwrap(),
+                &CommandOutcome::ActivationParked { pause },
+            );
+            slot.phase = RestorePhase::Parked { _token: 29 };
+            assert!(
+                journal.slot.is_none(),
+                "private activation parking never publishes a pause"
+            );
+            assert_eq!(
+                journal.admit_live(
+                    CommandKey {
+                        request_id: Uuid::new_v4(),
+                        kind: CommandKind::Resume
+                    },
+                    Some(&slot)
+                ),
+                Err(LifecycleRejection::RestoreActive)
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    fn pause_slot(
+        capture: Option<CaptureResumePolicy>,
+        phase: crate::krun::worker::lifecycle::PausePhase<u32>,
+    ) -> crate::krun::worker::lifecycle::PauseSlot<u32> {
+        crate::krun::worker::lifecycle::PauseSlot {
+            operation: Uuid::new_v4(),
+            native: crate::virt::lifecycle::NativeOperation::new(1).expect("nonzero"),
+            capture,
+            phase,
+        }
+    }
+
+    #[cfg(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn irq_probe_source_construction_needs_the_published_capture_free_pause_of_a_source_run() {
+        use crate::krun::worker::lifecycle::{PausePhase, ProbeRefusal};
+        let paused = |published| PausePhase::Paused {
+            token: 41,
+            generation: generation(),
+            published,
+        };
+        let mut journal = Journal::<u32, u32>::default();
+        assert_eq!(
+            journal.probe_source_pause(false),
+            Err(ProbeRefusal::NotPaused)
+        );
+        for phase in [
+            PausePhase::Pending { cancel: false },
+            PausePhase::Failed,
+            PausePhase::Fenced,
+            PausePhase::Releasing,
+            PausePhase::RolledBack,
+            PausePhase::Consumed {
+                generation: generation(),
+                by_resume: true,
+            },
+            paused(false),
+        ] {
+            journal.slot = Some(pause_slot(None, phase));
+            assert_eq!(
+                journal.probe_source_pause(false),
+                Err(ProbeRefusal::NotPaused)
+            );
+        }
+        journal.slot = Some(pause_slot(
+            Some(CaptureResumePolicy::Preserve),
+            paused(true),
+        ));
+        assert_eq!(
+            journal.probe_source_pause(false),
+            Err(ProbeRefusal::NotPaused),
+            "a capture-owned pause is never source construction authority"
+        );
+        journal.slot = Some(pause_slot(None, paused(true)));
+        assert_eq!(journal.probe_source_pause(false), Ok(41));
+        assert_eq!(
+            journal.probe_source_pause(true),
+            Err(ProbeRefusal::Restored),
+            "a restored run never reseeds source state, even while paused"
+        );
+        journal.mutator = CommandSequence::new(3);
+        assert_eq!(journal.probe_source_pause(false), Err(ProbeRefusal::Busy));
+        journal.mutator = None;
+        journal.canceller = CommandSequence::new(4);
+        assert_eq!(journal.probe_source_pause(false), Err(ProbeRefusal::Busy));
+        journal.canceller = None;
+        let capture = Uuid::new_v4();
+        memory_pending(&mut journal, capture);
+        assert_eq!(journal.probe_source_pause(false), Err(ProbeRefusal::Busy));
+        assert_eq!(
+            journal.last_native, 0,
+            "refusals allocate no native operation"
+        );
+    }
+
+    #[cfg(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn irq_probe_guest_commands_need_a_running_exposed_idle_machine() {
+        use crate::krun::worker::lifecycle::{PausePhase, ProbeRefusal};
+        let mut journal = Journal::<u32, u32>::default();
+        assert_eq!(journal.probe_running(true), Ok(()));
+        assert_eq!(
+            journal.probe_running(false),
+            Err(ProbeRefusal::NotRunning),
+            "an unexposed restore owns its parked or releasing vCPUs"
+        );
+        for phase in [
+            PausePhase::Pending { cancel: false },
+            PausePhase::Failed,
+            PausePhase::Fenced,
+            PausePhase::Releasing,
+            PausePhase::Paused {
+                token: 5,
+                generation: generation(),
+                published: true,
+            },
+        ] {
+            journal.slot = Some(pause_slot(None, phase));
+            assert_eq!(journal.probe_running(true), Err(ProbeRefusal::NotRunning));
+        }
+        for phase in [
+            PausePhase::NoEffect,
+            PausePhase::RolledBack,
+            PausePhase::Consumed {
+                generation: generation(),
+                by_resume: true,
+            },
+        ] {
+            journal.slot = Some(pause_slot(None, phase));
+            assert_eq!(journal.probe_running(true), Ok(()));
+        }
+        journal.mutator = CommandSequence::new(9);
+        assert_eq!(journal.probe_running(true), Err(ProbeRefusal::Busy));
+        journal.mutator = None;
+        memory_pending(&mut journal, Uuid::new_v4());
+        assert_eq!(journal.probe_running(true), Err(ProbeRefusal::Busy));
+    }
+
+    #[cfg(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn irq_probe_operations_share_the_strictly_increasing_native_sequence() {
+        use crate::krun::worker::lifecycle::{next_native, ProbeRefusal};
+        let mut journal = Journal::<u32, u32>::default();
+        let first = journal.probe_operation().expect("first");
+        let lifecycle = next_native(&mut journal).expect("lifecycle");
+        let second = journal.probe_operation().expect("second");
+        assert!(first < lifecycle && lifecycle < second);
+        journal.last_native = u64::MAX;
+        assert_eq!(journal.probe_operation(), Err(ProbeRefusal::Exhausted));
+        assert_eq!(journal.last_native, u64::MAX);
     }
 }

@@ -72,6 +72,9 @@ pub(crate) struct ForwardEntry {
     total_permit: Mutex<Option<OwnedSemaphorePermit>>,
     session_permit: Mutex<Option<OwnedSemaphorePermit>>,
     task: Mutex<Option<OwnedTask>>,
+    /// Restore: the guest listener Activate bound for one agent instance.
+    /// That instance owns it for its lifetime; it is never re-registered.
+    activation: Mutex<Option<(crate::state::ReadyAgentIdentity, Address)>>,
 }
 
 pub(crate) struct ForwardTable {
@@ -120,6 +123,45 @@ impl ForwardTable {
         park_timeout: Duration,
         gate: Arc<crate::live::gate::LiveGate>,
     ) -> eyre::Result<Arc<Self>> {
+        Self::prepare(
+            forwards,
+            runtime_dir,
+            mux_filename,
+            park_timeout,
+            gate,
+            true,
+        )
+        .await
+    }
+
+    /// A restored machine: no host listener is bound until Activate succeeded
+    /// ([`Self::bind_deferred`]), and none accepts before [`Self::activate`].
+    pub(crate) async fn prepare_restored_machine(
+        forwards: &[Forward],
+        runtime_dir: &Path,
+        mux_filename: Option<&str>,
+        park_timeout: Duration,
+        gate: Arc<crate::live::gate::LiveGate>,
+    ) -> eyre::Result<Arc<Self>> {
+        Self::prepare(
+            forwards,
+            runtime_dir,
+            mux_filename,
+            park_timeout,
+            gate,
+            false,
+        )
+        .await
+    }
+
+    async fn prepare(
+        forwards: &[Forward],
+        runtime_dir: &Path,
+        mux_filename: Option<&str>,
+        park_timeout: Duration,
+        gate: Arc<crate::live::gate::LiveGate>,
+        bind_host: bool,
+    ) -> eyre::Result<Arc<Self>> {
         validate_forward_set(forwards, runtime_dir, mux_filename)
             .map_err(|error| eyre::eyre!("validate machine-scoped forwards: {error}"))?;
         if forwards.len() > MAX_FORWARDS {
@@ -150,7 +192,7 @@ impl ForwardTable {
         });
         for spec in forwards {
             let entry = table
-                .build_entry(spec.clone(), ForwardScope::Machine, None, None)
+                .build_entry(spec.clone(), ForwardScope::Machine, None, None, bind_host)
                 .await
                 .map_err(|error| eyre::eyre!(error.to_string()))?;
             table
@@ -168,6 +210,7 @@ impl ForwardTable {
         scope: ForwardScope,
         total_permit: Option<OwnedSemaphorePermit>,
         session_permit: Option<OwnedSemaphorePermit>,
+        bind_host: bool,
     ) -> Result<Arc<ForwardEntry>, OpenError> {
         let shape = spec
             .validate()
@@ -186,7 +229,7 @@ impl ForwardTable {
             None
         };
         let listener = match shape {
-            ForwardShape::InboundAgent | ForwardShape::InboundVsock => {
+            ForwardShape::InboundAgent | ForwardShape::InboundVsock if bind_host => {
                 let forward_spec::Endpoint::Host(address) = &spec.listen else {
                     return Err(OpenError::Invalid(
                         "validated inbound forward has no host listener".to_string(),
@@ -198,6 +241,7 @@ impl ForwardTable {
                         .map_err(|error| bind_error(&name, &spec.listen, error))?,
                 )
             }
+            ForwardShape::InboundAgent | ForwardShape::InboundVsock => None,
             ForwardShape::OutboundAgent | ForwardShape::OutboundVsock => None,
         };
         let bound = listener.as_ref().map(OwnedHostListener::bound_endpoint);
@@ -246,6 +290,7 @@ impl ForwardTable {
             total_permit: Mutex::new(total_permit),
             session_permit: Mutex::new(session_permit),
             task: Mutex::new(None),
+            activation: Mutex::new(None),
         }))
     }
 
@@ -303,6 +348,123 @@ impl ForwardTable {
         }
     }
 
+    /// Guest-side listeners of the machine-scoped agent forwards, named for
+    /// restore Activate with this run's fresh tokens.
+    pub(crate) fn activation_listeners(&self) -> Vec<protocol::v1::ActivationListener> {
+        self.entries()
+            .into_iter()
+            .filter_map(|entry| {
+                let (requested, token) = entry.activation_request()?;
+                Some(protocol::v1::ActivationListener {
+                    name: entry.name.clone(),
+                    registration: Some(protocol::v1::ListenRequest {
+                        listen: requested.to_string(),
+                        token: token.as_bytes().to_vec().into(),
+                        unix_mode: entry.spec.mode.map(forward_spec::UnixMode::get),
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    /// Adopt the guest listeners an exact Activate reply bound for the
+    /// destination agent `identity`: one per activation listener, each at its
+    /// requested address. All or nothing; nothing is served yet.
+    pub(crate) fn stage_activation_listeners(
+        &self,
+        identity: &crate::state::ReadyAgentIdentity,
+        bounds: &[protocol::v1::ActivationListenerBound],
+    ) -> eyre::Result<()> {
+        let owned = self
+            .entries()
+            .into_iter()
+            .filter_map(|entry| {
+                let requested = entry.activation_request()?.0.clone();
+                Some((entry, requested))
+            })
+            .collect::<Vec<_>>();
+        eyre::ensure!(
+            bounds.len() == owned.len(),
+            "Activate bound {} guest listeners for {} requested",
+            bounds.len(),
+            owned.len()
+        );
+        let mut staged = Vec::with_capacity(owned.len());
+        for (entry, requested) in owned {
+            let mut matching = bounds.iter().filter(|bound| bound.name == entry.name);
+            let (Some(bound), None) = (matching.next(), matching.next()) else {
+                return Err(eyre::eyre!(
+                    "Activate did not bind guest listener {} exactly once",
+                    entry.name
+                ));
+            };
+            let address = bound
+                .bound
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("Activate listener {} has no address", entry.name))?
+                .address
+                .parse::<Address>()
+                .map_err(|error| {
+                    eyre::eyre!("Activate listener {} address: {error}", entry.name)
+                })?;
+            agent::validate_bound(&requested, &address)?;
+            staged.push((entry, address));
+        }
+        for (entry, address) in staged {
+            *entry
+                .activation
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some((identity.clone(), address));
+        }
+        Ok(())
+    }
+
+    /// Bind every machine-scoped inbound host listener a restored table
+    /// deferred. Accept loops start only in [`Self::activate`]; on failure
+    /// every listener this call bound is closed and its socket file unlinked.
+    pub(crate) async fn bind_deferred(&self) -> eyre::Result<Vec<String>> {
+        let _operation = self.operation.lock().await;
+        let mut bound: Vec<Arc<ForwardEntry>> = Vec::new();
+        for entry in self.entries() {
+            let forward_spec::Endpoint::Host(address) = &entry.spec.listen else {
+                continue;
+            };
+            if entry.scope != ForwardScope::Machine
+                || !matches!(
+                    entry.shape,
+                    ForwardShape::InboundAgent | ForwardShape::InboundVsock
+                )
+                || entry
+                    .listener
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some()
+            {
+                continue;
+            }
+            match OwnedHostListener::bind(address, entry.spec.mode, &self.runtime_dir).await {
+                Ok(listener) => {
+                    let endpoint = listener.bound_endpoint();
+                    *entry
+                        .listener
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(listener);
+                    entry
+                        .status
+                        .send_modify(|snapshot| snapshot.bound = Some(endpoint));
+                    bound.push(entry);
+                }
+                Err(error) => {
+                    for entry in &bound {
+                        entry.release_deferred_listener();
+                    }
+                    return Err(eyre::eyre!("bind restored forward {}: {error}", entry.name));
+                }
+            }
+        }
+        Ok(bound.iter().map(|entry| entry.name.clone()).collect())
+    }
+
     pub(crate) fn mark_stopping(&self) {
         self.running.store(false, Ordering::Release);
     }
@@ -322,6 +484,11 @@ impl ForwardTable {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
+            if matches!(entry.guest_half, GuestHalf::Vsock(_)) {
+                // A deferred bind left the raw guest half unknown until now.
+                entry.set_availability(GuestHalfAvailability::Available(None));
+                entry.set_state(ForwardState::Active, None);
+            }
             entry.spawn(inbound::serve(
                 listener,
                 entry.clone(),
@@ -404,7 +571,13 @@ impl ForwardTable {
                 ))
             })?;
         let entry = self
-            .build_entry(spec, ForwardScope::Session, Some(total), Some(session))
+            .build_entry(
+                spec,
+                ForwardScope::Session,
+                Some(total),
+                Some(session),
+                true,
+            )
             .await?;
         let machine = self
             .machine
@@ -797,6 +970,41 @@ impl ForwardEntry {
         }
     }
 
+    /// The guest listen address and token restore Activate registers for
+    /// this entry: machine-scoped agent forwards with a guest listener.
+    fn activation_request(&self) -> Option<(&Address, Token)> {
+        let forward_spec::Endpoint::Guest(requested) = &self.spec.listen else {
+            return None;
+        };
+        if self.scope != ForwardScope::Machine || self.shape != ForwardShape::OutboundAgent {
+            return None;
+        }
+        Some((requested, self.token?))
+    }
+
+    /// The Activate-bound guest listener, while `identity` is its owner.
+    pub(crate) fn activation_bound(
+        &self,
+        identity: &crate::state::ReadyAgentIdentity,
+    ) -> Option<Address> {
+        self.activation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(owner, _)| owner == identity)
+            .map(|(_, address)| address.clone())
+    }
+
+    /// Close a deferred host listener before it ever accepted; dropping it
+    /// unlinks an owned Unix socket file.
+    fn release_deferred_listener(&self) {
+        self.listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.status.send_modify(|snapshot| snapshot.bound = None);
+    }
+
     fn apply_availability(&self, availability: GuestHalfAvailability) {
         match availability {
             GuestHalfAvailability::Unknown => self.set_state(ForwardState::Pending, None),
@@ -935,7 +1143,7 @@ mod tests {
                 "host:tcp:1".parse().unwrap(),
             );
             let entry = table
-                .build_entry(spec, ForwardScope::Session, None, None)
+                .build_entry(spec, ForwardScope::Session, None, None, true)
                 .await
                 .unwrap();
             let socket = tokio::net::UnixListener::bind(&path).unwrap();
@@ -978,5 +1186,185 @@ mod tests {
             entry.snapshot().bound,
             Some(forward_spec::Endpoint::Vsock(5000))
         );
+    }
+
+    #[tokio::test]
+    async fn restored_host_listeners_bind_only_after_activate_and_close_on_failure() {
+        let root =
+            std::path::Path::new("/tmp").join(format!("fd-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&root).unwrap();
+        let conflict = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = conflict.local_addr().unwrap().port();
+        let forwards = [
+            forward_spec::Forward::new(
+                "host:unix:first.sock".parse().unwrap(),
+                "guest:tcp:80".parse().unwrap(),
+            ),
+            forward_spec::Forward::new(
+                format!("host:tcp:127.0.0.1:{port}").parse().unwrap(),
+                "guest:tcp:81".parse().unwrap(),
+            ),
+        ];
+        let table = ForwardTable::prepare_restored_machine(
+            &forwards,
+            &root,
+            None,
+            crate::forward::inbound::PARK_TIMEOUT,
+            crate::live::gate::LiveGate::new(),
+        )
+        .await
+        .unwrap();
+        // Construction binds nothing: the address is still free for Activate.
+        assert!(!root.join("first.sock").exists());
+        assert!(table
+            .entries()
+            .iter()
+            .all(|entry| entry.snapshot().bound.is_none()));
+
+        let error = table.bind_deferred().await.unwrap_err();
+        assert!(
+            error.to_string().contains("bind restored forward"),
+            "{error}"
+        );
+        assert!(
+            !root.join("first.sock").exists(),
+            "a failed bind leaves no socket file behind"
+        );
+        assert!(table
+            .entries()
+            .iter()
+            .all(|entry| entry.snapshot().bound.is_none()
+                && entry.listener.lock().unwrap().is_none()));
+
+        drop(conflict);
+        let bound = table.bind_deferred().await.unwrap();
+        assert_eq!(bound.len(), 2);
+        assert!(root.join("first.sock").exists());
+        for entry in table.entries() {
+            assert!(entry.snapshot().bound.is_some());
+            // Bound, never accepting: no serve task exists before activate.
+            assert!(entry.task.lock().unwrap().is_none());
+        }
+        // Idempotent: an already bound listener is never rebound.
+        assert!(table.bind_deferred().await.unwrap().is_empty());
+        table.shutdown().await.unwrap();
+        assert!(!root.join("first.sock").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn activate_bound_guest_listeners_are_adopted_exactly_or_not_at_all() {
+        use protocol::v1::{ActivationListenerBound, ListenerBound};
+
+        let forwards = [
+            forward_spec::Forward::new(
+                "guest:tcp:8080".parse().unwrap(),
+                "host:tcp:127.0.0.1:5432".parse().unwrap(),
+            ),
+            forward_spec::Forward::new(
+                "guest:tcp:0".parse().unwrap(),
+                "host:tcp:127.0.0.1:5433".parse().unwrap(),
+            ),
+        ];
+        let table = ForwardTable::prepare_restored_machine(
+            &forwards,
+            std::path::Path::new("/unused"),
+            None,
+            crate::forward::inbound::PARK_TIMEOUT,
+            crate::live::gate::LiveGate::new(),
+        )
+        .await
+        .unwrap();
+        let requests = table.activation_listeners();
+        assert_eq!(requests.len(), 2);
+        let tokens = requests
+            .iter()
+            .map(|request| request.registration.as_ref().unwrap().token.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tokens.len(), 2, "every listener has its own fresh token");
+        let actual = |listen: &str| match listen.parse::<forward_spec::Address>().unwrap() {
+            forward_spec::Address::Tcp(mut address) => {
+                if address.port() == 0 {
+                    address.set_port(40_000);
+                }
+                forward_spec::Address::Tcp(address)
+            }
+            other => other,
+        };
+        let bound = |name: &str, address: String| ActivationListenerBound {
+            name: name.into(),
+            bound: Some(ListenerBound { address }),
+        };
+        let exact = requests
+            .iter()
+            .map(|request| {
+                let listen = &request.registration.as_ref().unwrap().listen;
+                bound(&request.name, actual(listen).to_string())
+            })
+            .collect::<Vec<_>>();
+        let identity = crate::state::ReadyAgentIdentity {
+            instance_id: uuid::Uuid::new_v4(),
+            boot_id: uuid::Uuid::new_v4(),
+        };
+        let unstaged = |table: &ForwardTable| {
+            table
+                .entries()
+                .iter()
+                .all(|entry| entry.activation_bound(&identity).is_none())
+        };
+
+        let mut missing = exact.clone();
+        missing.pop();
+        let mut duplicate = exact.clone();
+        duplicate[1].name = duplicate[0].name.clone();
+        let mut unknown = exact.clone();
+        unknown[1].name = "guest:tcp:9999".into();
+        let mut moved = exact.clone();
+        moved[0].bound = Some(ListenerBound {
+            address: "tcp:127.0.0.1:8081".into(),
+        });
+        let mut ephemeral_zero = exact.clone();
+        ephemeral_zero[1].bound = Some(ListenerBound {
+            address: "tcp:127.0.0.1:0".into(),
+        });
+        let mut unaddressed = exact.clone();
+        unaddressed[0].bound = None;
+        let mut extra = exact.clone();
+        extra.push(bound("guest:tcp:7070", "tcp:127.0.0.1:7070".into()));
+        for (index, reply) in [
+            missing,
+            duplicate,
+            unknown,
+            moved,
+            ephemeral_zero,
+            unaddressed,
+            extra,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                table.stage_activation_listeners(&identity, reply).is_err(),
+                "case {index} was adopted"
+            );
+            assert!(unstaged(&table), "case {index} left a partial adoption");
+        }
+
+        table.stage_activation_listeners(&identity, &exact).unwrap();
+        for (entry, reply) in table.entries().iter().zip(&exact) {
+            assert_eq!(entry.name, reply.name);
+            assert_eq!(
+                entry
+                    .activation_bound(&identity)
+                    .map(|address| address.to_string()),
+                reply.bound.as_ref().map(|bound| bound.address.clone())
+            );
+            // A replaced agent instance never inherits the Activate listener.
+            let replaced = crate::state::ReadyAgentIdentity {
+                instance_id: uuid::Uuid::new_v4(),
+                ..identity.clone()
+            };
+            assert!(entry.activation_bound(&replaced).is_none());
+        }
     }
 }

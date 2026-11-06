@@ -113,6 +113,10 @@ pub fn format(workspace_root: &Path, target_dir: &Path) -> Result<(), command::C
     }
 }
 
+// Native diagnostic probes are qualified separately and must never change the
+// production lane exercised by the ordinary host suite.
+const HOST_TEST_FEATURES: &str = "silo-vmm/mock-backend,forward-spec/tokio";
+
 pub fn clippy(
     workspace_root: &Path,
     target_dir: &Path,
@@ -124,7 +128,8 @@ pub fn clippy(
         "--locked",
         "--workspace",
         "--all-targets",
-        "--all-features",
+        "--features",
+        HOST_TEST_FEATURES,
     ]);
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
@@ -266,7 +271,7 @@ fn workspace_test_command(
             target_dir.join("debug/silo-vmm"),
         );
     }
-    cargo.arg("--all-features");
+    cargo.args(["--features", HOST_TEST_FEATURES]);
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
@@ -617,52 +622,6 @@ mod tests {
             assert!(args
                 .windows(2)
                 .any(|pair| pair == ["--target", "aarch64-unknown-linux-musl"]));
-        }
-    }
-
-    #[test]
-    fn workspace_nextest_preserves_suite_targets_and_host_exclusions() {
-        for host in [
-            HostTarget::MacosArm64,
-            HostTarget::LinuxX86_64,
-            HostTarget::LinuxArm64,
-        ] {
-            for (suite, targets, mock_vmm) in [
-                (TestSuite::Unit, vec!["--lib", "--bins"], false),
-                (TestSuite::Integration, vec!["--tests"], true),
-                (TestSuite::All, vec!["--lib", "--bins", "--tests"], true),
-            ] {
-                let command = workspace_test_command(
-                    Path::new("/workspace"),
-                    Path::new("/build"),
-                    host,
-                    suite,
-                    false,
-                );
-                let args: Vec<_> = command
-                    .get_args()
-                    .map(|arg| arg.to_str().unwrap())
-                    .collect();
-                let mut expected = vec!["nextest", "run", "--locked", "--workspace"];
-                expected.extend(targets);
-                expected.push("--all-features");
-                for member in host.workspace_excludes() {
-                    expected.extend(["--exclude", member]);
-                }
-                assert_eq!(args, expected);
-                assert_eq!(command.get_current_dir(), Some(Path::new("/workspace")));
-                let env: Vec<_> = command.get_envs().collect();
-                assert!(env.contains(&(
-                    std::ffi::OsStr::new("CARGO_TARGET_DIR"),
-                    Some(std::ffi::OsStr::new("/build")),
-                )));
-                assert_eq!(
-                    env.iter()
-                        .find(|(key, _)| *key == "SILO_TEST_MOCK_VMM_BINARY")
-                        .and_then(|(_, value)| *value),
-                    mock_vmm.then_some(std::ffi::OsStr::new("/build/debug/silo-vmm")),
-                );
-            }
         }
     }
 

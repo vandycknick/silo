@@ -177,6 +177,24 @@ pub(crate) async fn supervise_listener(
             }
             continue;
         };
+        if let Some(address) = entry.activation_bound(&identity) {
+            // Restore Activate registered this listener for exactly this agent
+            // instance, which owns it until replaced: never re-register it.
+            let owner = GuestHalfAvailability::Available(Some(identity.clone()));
+            if entry.activate_guest_listener(&identity, address) {
+                let current = tokio::select! {
+                    _ = entry.shutdown.cancelled() => return,
+                    changed = availability.wait_for(|current| *current != owner) => changed.is_ok(),
+                };
+                entry.end_guest_listener();
+                if !current {
+                    return;
+                }
+            } else if entry.shutdown.is_cancelled() {
+                return;
+            }
+            continue;
+        }
         let mut backoff = ReconnectBackoff::new();
         loop {
             entry.set_state(ForwardState::Pending, None);
@@ -297,7 +315,7 @@ async fn listen_once(
     }
 }
 
-fn validate_bound(
+pub(crate) fn validate_bound(
     requested: &forward_spec::Address,
     actual: &forward_spec::Address,
 ) -> eyre::Result<()> {

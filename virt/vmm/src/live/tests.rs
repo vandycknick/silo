@@ -1132,6 +1132,11 @@ async fn live_capture_seals_exact_evidence_then_resumes_the_source() {
         .validate_against_plan(&plan, &Sha256Digest::of_bytes(&request_bytes))
         .unwrap();
     assert!(evidence.is_sealed());
+    assert_eq!(
+        evidence.freeze_operation_id.as_ref(),
+        Some(&request),
+        "an acquired cut freezes under the capture operation"
+    );
     assert_eq!(evidence.pause_token.as_ref(), Some(&seal.cut_token));
     assert_eq!(
         seal.cut_token.owner,
@@ -1308,6 +1313,18 @@ async fn live_capture_borrowing_a_user_pause_never_resumes_it() {
     let current = observation.current_pause.clone().unwrap();
     assert_eq!(current.token, token, "the user pause is unchanged");
     assert_eq!(current.operation_id, pause, "and still owned by its pause");
+    let record = CaptureEvidence::decode(
+        &std::fs::read(harness.capture_dir(&request).join(CAPTURE_EVIDENCE_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert!(record.is_sealed());
+    assert_eq!(
+        record.freeze_operation_id.as_ref(),
+        Some(&pause),
+        "a borrowed cut keeps the user pause's frozen operation, never the capture request"
+    );
+    assert_ne!(record.freeze_operation_id.as_ref(), Some(&request));
+    assert_eq!(record.freeze_epoch, Some(current.freeze_epoch));
     let ResumeOutcome::Resumed { .. } = harness.resume(&pause, token).await else {
         panic!("the user resumes their own pause");
     };

@@ -1,6 +1,7 @@
 //! The only owner allowed to signal, wait for, or reap a krun worker.
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
@@ -31,6 +32,8 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_EXECUTABLE: &str = "/proc/self/exe";
 // The child-side mapper and the worker's adoption table name one role.
 const _: () = assert!(inherit::LIFECYCLE_CHILD_FD == crate::krun::worker::fds::LIFECYCLE_FD);
+const _: () = assert!(inherit::MAX_LOWER_FDS == crate::krun::worker::fds::MAX_LOWER_FDS);
+const _: () = assert!(inherit::FIRST_LOWER_CHILD_FD == crate::krun::worker::fds::FIRST_LOWER_FD);
 
 /// Published lifecycle of one worker generation. `Reaped` means the child is
 /// gone but the owner is still draining channels; `Exited` is terminal.
@@ -38,6 +41,7 @@ const _: () = assert!(inherit::LIFECYCLE_CHILD_FD == crate::krun::worker::fds::L
 pub(crate) enum Phase {
     #[default]
     Starting,
+    Prepared,
     Started,
     Reaped,
     Exited(VmExit),
@@ -47,7 +51,7 @@ impl Phase {
     pub(crate) fn exit(&self) -> Option<&VmExit> {
         match self {
             Self::Exited(exit) => Some(exit),
-            Self::Starting | Self::Started | Self::Reaped => None,
+            Self::Starting | Self::Prepared | Self::Started | Self::Reaped => None,
         }
     }
 }
@@ -75,15 +79,16 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((inherit::normalize(read)?, inherit::normalize(write)?))
 }
 
-/// Spawn `krun` with fixed roles 3..6, optional mux 7, the generation lease
-/// at 8, the complete checked Raw backing table at 9+ and the lifecycle
-/// endpoint at 32. The parent's copy of the child endpoint closes here.
+/// Spawn the exact normal-worker table, including inherited restore objects
+/// at 25..=28 and lower descriptors/extents at 33+ when restoring.
 fn spawn(
     console: OwnedFd,
     mux: OwnedFd,
     lease: &OwnedFd,
     raw_handles: &[OwnedFd],
     lifecycle: OwnedFd,
+    restore_objects: &[File],
+    restore_lowers: &[File],
 ) -> io::Result<Spawned> {
     let console = inherit::normalize(console)?;
     let mux = inherit::normalize(mux)?;
@@ -104,6 +109,7 @@ fn spawn(
     command
         .arg0(WORKER_NAME)
         .env_remove("_VM_STORAGE_LEASES")
+        .env_remove("_VM_RESTORE_OBJECTS")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
@@ -113,8 +119,15 @@ fn spawn(
             "Raw descriptor table exceeds the total disk bound",
         ));
     }
-    let mut mapping = [(0, 0); 23];
-    mapping[..7].copy_from_slice(&[
+    if !(restore_objects.is_empty() || restore_objects.len() == 4)
+        || restore_lowers.len() > inherit::MAX_LOWER_FDS
+        || (restore_objects.is_empty() && !restore_lowers.is_empty())
+    {
+        return Err(wire::invalid("invalid restore descriptor table"));
+    }
+    let mut mapping =
+        Vec::with_capacity(7 + raw_handles.len() + restore_objects.len() + restore_lowers.len());
+    mapping.extend_from_slice(&[
         (config.as_raw_fd(), 3),
         (events.as_raw_fd(), 4),
         (watchdog.as_raw_fd(), 5),
@@ -127,9 +140,21 @@ fn spawn(
         ),
     ]);
     for (index, fd) in raw_handles.iter().enumerate() {
-        mapping[7 + index] = (fd.as_raw_fd(), 9 + index as i32);
+        mapping.push((fd.as_raw_fd(), 9 + index as i32));
     }
-    inherit::install(command.as_std_mut(), &mapping[..7 + raw_handles.len()])?;
+    mapping.extend(
+        restore_objects
+            .iter()
+            .zip(crate::krun::worker::fds::RESTORE_STATE_FDS)
+            .map(|(file, role)| (file.as_raw_fd(), role)),
+    );
+    mapping.extend(restore_lowers.iter().enumerate().map(|(index, file)| {
+        (
+            file.as_raw_fd(),
+            inherit::FIRST_LOWER_CHILD_FD + index as i32,
+        )
+    }));
+    inherit::install(command.as_std_mut(), &mapping)?;
     let child = command.spawn()?;
     Ok(Spawned {
         child,
@@ -233,13 +258,28 @@ impl Owner {
             Ok(frame) => frame,
             Err(error) => return VmExit::failed(StartupStage::Spawned, error.to_string()),
         };
+        let (restore_objects, restore_lowers) = match vm_config.restore() {
+            Some(restore) => match restore.files.duplicates() {
+                Ok(files) => files,
+                Err(error) => return VmExit::failed(StartupStage::Spawned, error.to_string()),
+            },
+            None => (Vec::new(), Vec::new()),
+        };
         let Spawned {
             mut child,
             config: mut config_pipe,
             mut events,
             diagnostics,
             _keepalive,
-        } = match spawn(console, mux, &launch.lease, &raw_handles, lifecycle) {
+        } = match spawn(
+            console,
+            mux,
+            &launch.lease,
+            &raw_handles,
+            lifecycle,
+            &restore_objects,
+            &restore_lowers,
+        ) {
             Ok(spawned) => spawned,
             Err(error) => {
                 return VmExit::failed(StartupStage::Spawned, format!("spawn krun worker: {error}"))
@@ -248,6 +288,8 @@ impl Owner {
         // Only the child keeps checked duplicates. Parent proof handles remain
         // owned by PreparedAttachments through post-reap finalization.
         drop(raw_handles);
+        drop(restore_objects);
+        drop(restore_lowers);
         let publication = child
             .id()
             .ok_or_else(|| io::Error::other("spawned worker has no process identity"))
@@ -341,9 +383,16 @@ impl Owner {
                 event = event_rx.recv(), if events_open && !stopping => {
                     let error = match event {
                         Some(Ok(Event::StartupStage { stage: next })) if valid_stage(stage, next) && !started => { stage = next; None }
-                        Some(Ok(Event::BackendStarted {})) if stage == StartupStage::Build && !started => {
-                            started = true; stage = StartupStage::Started;
-                            self.state.send_replace(Phase::Started); None
+                        Some(Ok(event @ (Event::BackendStarted {} | Event::RestorePrepared {}))) if !started => {
+                            match handoff_phase(stage, vm_config.restore().is_some(), &event) {
+                                Some(phase) => {
+                                    started = true;
+                                    stage = StartupStage::Started;
+                                    self.state.send_replace(phase);
+                                    None
+                                }
+                                None => Some("invalid worker startup handoff".to_string()),
+                            }
                         }
                         Some(Ok(Event::StartupFailed { stage: observed, diagnostic })) if observed == stage => Some(diagnostic),
                         Some(Ok(Event::HostMemoryReclaim { status })) if stage == StartupStage::Build || started => {
@@ -500,6 +549,14 @@ fn worker_outcome(
     }
 }
 
+fn handoff_phase(stage: StartupStage, restoring: bool, event: &Event) -> Option<Phase> {
+    match (stage, restoring, event) {
+        (StartupStage::Build, true, Event::RestorePrepared {}) => Some(Phase::Prepared),
+        (StartupStage::Build, false, Event::BackendStarted {}) => Some(Phase::Started),
+        _ => None,
+    }
+}
+
 fn valid_stage(current: StartupStage, next: StartupStage) -> bool {
     matches!(
         (current, next),
@@ -513,6 +570,41 @@ mod tests {
     use crate::virt::backend::krun::owner::{valid_stage, worker_outcome, Tail, DIAGNOSTIC_LIMIT};
     use crate::virt::exit::{ForceReason, ProcessExit, StartupStage, VmOutcome};
 
+    #[test]
+    fn restore_prepared_and_cold_started_handoffs_cannot_be_interchanged() {
+        use crate::krun::worker::wire::Event;
+        use crate::virt::backend::krun::owner::{handoff_phase, Phase};
+        assert!(matches!(
+            handoff_phase(StartupStage::Build, true, &Event::RestorePrepared {}),
+            Some(Phase::Prepared)
+        ));
+        assert!(matches!(
+            handoff_phase(StartupStage::Build, false, &Event::BackendStarted {}),
+            Some(Phase::Started)
+        ));
+        assert!(handoff_phase(StartupStage::Build, false, &Event::RestorePrepared {}).is_none());
+        assert!(handoff_phase(StartupStage::Build, true, &Event::BackendStarted {}).is_none());
+        assert!(handoff_phase(
+            StartupStage::Build,
+            true,
+            &Event::StartupStage {
+                stage: StartupStage::Build
+            }
+        )
+        .is_none());
+        for stage in [
+            StartupStage::Spawned,
+            StartupStage::Admission,
+            StartupStage::Started,
+        ] {
+            assert!(handoff_phase(stage, true, &Event::RestorePrepared {}).is_none());
+            assert!(handoff_phase(stage, false, &Event::BackendStarted {}).is_none());
+        }
+        assert!(
+            Phase::Prepared.exit().is_none(),
+            "prepared is a live, non-running worker"
+        );
+    }
     fn process(code: Option<i32>, signal: Option<i32>) -> ProcessExit {
         ProcessExit {
             pid: 123,

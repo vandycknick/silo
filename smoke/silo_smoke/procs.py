@@ -41,7 +41,10 @@ def free_port() -> int:
 
 def query(db: Path, sql: str) -> list[tuple[str, ...]]:
     try:
-        result = subprocess.run(["sqlite3", "-readonly", "-separator", "\x1f", str(db), sql], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(
+            ["sqlite3", "-readonly", "-cmd", ".timeout 5000", "-separator", "\x1f", str(db), sql],
+            capture_output=True, text=True, timeout=15,
+        )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise SmokeAssertion(f"Cannot query {db}: {error}") from error
     if result.returncode:

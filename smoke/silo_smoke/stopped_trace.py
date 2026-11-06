@@ -2,10 +2,14 @@
 
 Normal gates pause one real syscall thread while all other threads continue.
 Negative gates inject one explicitly recorded errno at an owned copy/publication
-boundary, never a success or replacement bytes. Linux x86_64 only. EXITKILL and
-pidfd cleanup fence owned descendants. A held boundary owns one observed stop,
-not the TID's later exit stops; losing it never discharges an injected return
-or proves terminal exit. None of this simulates power loss.
+boundary, never a success or replacement bytes. Restore activation gates hold
+one native thread after the monitor logged the real preceding event. The Thaw
+reply gate identifies response bytes regardless of which native thread forwards
+them; `observeNetEgress` records native NIC sends.
+Linux x86_64 only. EXITKILL and pidfd cleanup fence owned descendants. A held
+boundary owns one observed stop, not the TID's later exit stops; losing it never
+discharges an injected return or proves terminal exit. None of this simulates
+power loss.
 """
 from __future__ import annotations
 from collections import Counter, deque
@@ -16,13 +20,111 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import sqlite3
 import stat
+import struct
 import sys
 import time
 
 from .shutdown_trace import Registers, SyscallInfo
+
+
+def protobuf_fields(data: bytes) -> dict[int, list[int | bytes]]:
+    """Decode only protobuf wire values, without generated smoke dependencies."""
+    offset = 0
+
+    def varint() -> int:
+        nonlocal offset
+        value = 0
+        for shift in range(0, 70, 7):
+            if offset == len(data):
+                raise ValueError("truncated protobuf varint")
+            byte = data[offset]
+            offset += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+        raise ValueError("oversized protobuf varint")
+
+    fields = {}
+    while offset < len(data):
+        key = varint()
+        field, wire = key >> 3, key & 7
+        if not field:
+            raise ValueError("zero protobuf field")
+        if wire == 0:
+            value = varint()
+        elif wire in (1, 2, 5):
+            length = varint() if wire == 2 else (8 if wire == 1 else 4)
+            if length > len(data) - offset:
+                raise ValueError("truncated protobuf field")
+            value = data[offset:offset + length]
+            offset += length
+        else:
+            raise ValueError("unsupported protobuf wire type")
+        fields.setdefault(field, []).append(value)
+    return fields
+
+
+def thaw_reply(data: bytes, activation: str) -> dict | None:
+    """Find a complete unary THAWED response in actual HTTP/2 DATA frames.
+
+    Input begins at the first native write after THAW_SENDING, including the
+    optional Unix mux CONNECT reply on a fresh guest channel. Reassemble short
+    socket writes and DATA fragmentation; CONNECT/SETTINGS/HEADERS/WINDOW_UPDATE
+    alone never prove thaw. common.proto defines THAWED=7 and activation_id=10.
+    """
+    streams: dict[int, bytes] = {}
+    offset = 0
+    if data.startswith(b"O"):
+        connected = re.match(rb"OK [0-9]+\n", data)
+        if connected is None:
+            return None
+        offset = connected.end()
+    while len(data) - offset >= 9:
+        length = int.from_bytes(data[offset:offset + 3], "big")
+        kind, flags = data[offset + 3:offset + 5]
+        stream = int.from_bytes(data[offset + 5:offset + 9], "big") & 0x7fffffff
+        offset += 9
+        if length > len(data) - offset:
+            return None
+        payload = data[offset:offset + length]
+        offset += length
+        if kind != 0 or not stream:
+            continue
+        if flags & 8:
+            if not payload or payload[0] >= len(payload):
+                return None
+            payload = payload[1:len(payload) - payload[0]]
+        message = streams.get(stream, b"") + payload
+        streams[stream] = message
+        if len(message) < 5 or message[0] != 0:
+            continue
+        size = int.from_bytes(message[1:5], "big")
+        if len(message) != size + 5:
+            continue
+        try:
+            response = protobuf_fields(message[5:])
+            if set(response) != {1} or len(response[1]) != 1 or not isinstance(response[1][0], bytes):
+                continue
+            status = protobuf_fields(response[1][0])
+            if status.get(1) != [7] or status.get(10) != [activation.encode()]:
+                continue
+            # A successful restore Thaw carries the original freeze reference
+            # and the activated destination identity, not an empty status.
+            reference = protobuf_fields(status[2][0])
+            if not all(reference.get(field) for field in (1, 2, 3, 4)):
+                continue
+            machine, run = status[8][0].decode(), status[9][0].decode()
+            if not machine or not run or status.get(6):
+                continue
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+            continue
+        return {"state": "thawed", "activation": activation, "machine": machine,
+                "run": run, "stream": stream, "grpcMessageHex": message.hex()}
+    return None
 
 
 def main() -> None:
@@ -99,14 +201,66 @@ def main() -> None:
         "capture-pool-directory-sync": {74, 75},
         "capture-catalog-commit": {74, 75},
         "capture-guest-transport": {265},
+        # Restore activation holds require a real preceding monitor event;
+        # the reply boundary additionally requires the actual THAWED payload.
+        "restore-vcpu-run": {16},
+        "restore-guest-transport": set(),
+        "restore-transport-reply": {1, 20, 44, 46},
     }[boundary]
     if observe_copies:
         candidates = candidates | {1, 16, 18, 20}
+    restore_boundary = boundary.startswith("restore-")
+    after_log = request.get("afterLog")
+    assert not restore_boundary or after_log is not None, "restore holds require an afterLog gate"
+    after_log_seen = False
+    reply_activation = None
+    reply_bytes = {}
+    reply_pending = {}
+    # Every frame the native NIC hands to netd crosses one send-family syscall
+    # on the virtio-net worker's datagram socket: the host side of the fence.
+    observe_net = request.get("observeNetEgress", False)
+    net_egress = []
 
     def save_copies() -> None:
         if observe_copies:
             (evidence / "capture-copy.json").write_text(
                 json.dumps(list(copy_totals.values()), indent=2) + "\n")
+        if observe_net:
+            (evidence / "net-egress.json").write_text(json.dumps(net_egress, indent=2) + "\n")
+
+    def logged_gate() -> bool:
+        nonlocal after_log_seen
+        nonlocal reply_activation
+        if not after_log_seen:
+            # Logs that existed before the operation (a source, an earlier
+            # child) can never satisfy a gate for this traced restore.
+            ignored = {Path(path) for path in after_log.get("ignore", [])}
+            for path in sorted(Path(after_log["directory"]).glob(after_log["glob"])):
+                if path in ignored:
+                    continue
+                try:
+                    text = path.read_text(errors="replace")
+                except FileNotFoundError:
+                    continue
+                if any(after_log["needle"] in line for line in text.splitlines()):
+                    after_log_seen = True
+                    if boundary == "restore-transport-reply":
+                        line = next(line for line in text.splitlines() if after_log["needle"] in line)
+                        activation = re.search(r"\bactivation=([0-9a-f-]{36})\b", line)
+                        assert activation is not None, f"Thaw gate lacks activation identity: {line}"
+                        reply_activation = activation.group(1)
+                    lifecycle("after-log-observed", 0, path=str(path), needle=after_log["needle"])
+                    break
+        return after_log_seen
+
+    def socket_fd(tid: int, fd: int) -> bool:
+        try:
+            return os.readlink(f"/proc/{tid}/fd/{fd}").startswith("socket:")
+        except FileNotFoundError:
+            tracee_status(tid)
+            return False
+        except OSError:
+            return False
 
     def publication_capture() -> Path | None:
         for seal_path in sorted((Path(request["target"]).parent / "captures").glob("*/vm.capture.json")):
@@ -164,6 +318,26 @@ def main() -> None:
         except FileNotFoundError as error:
             raise ProcessLookupError(errno.ESRCH, f"stopped tracee memory disappeared: tid {tid}") from error
 
+    def send_bytes(tid: int, syscall: int, arguments) -> bytes:
+        """Read the stopped syscall's real buffers; never modify guest bytes."""
+        with Path(f"/proc/{tid}/mem").open("rb", buffering=0) as memory:
+            def load(address: int, size: int) -> bytes:
+                assert 0 <= size <= 1024 * 1024, "oversized reply trace buffer"
+                memory.seek(address)
+                data = memory.read(size)
+                assert len(data) == size, "short stopped syscall buffer"
+                return data
+
+            address, length = int(arguments[2]), int(arguments[3])
+            if syscall in (1, 44):
+                return load(address, length)
+            if syscall == 46:
+                header = load(address, 56)  # Linux x86_64 msghdr
+                address, length = struct.unpack_from("=QQ", header, 16)
+            assert length <= 1024, "oversized reply iovec"
+            vectors = load(address, length * 16)
+            return b"".join(load(base, size) for base, size in struct.iter_unpack("=QQ", vectors))
+
     def handle_stop(tid: int, status: int) -> None:
         nonlocal held, matched, publication_seen
         event = status >> 16
@@ -200,6 +374,26 @@ def main() -> None:
         if tid not in configured:
             ptrace(0x4200, tid, 0, options)
             configured.add(tid)
+        if restore_boundary and event == 0 and stopped == signal.SIGSTOP:
+            detach = evidence / "restore-manager-detach.json"
+            if detach.is_file():
+                selected = json.loads(detach.read_text())["pid"]
+                manager = json.loads((evidence / "restore-manager-process.json").read_text())["pid"]
+                assert selected == manager, "only the restore driver-owned manager may detach"
+                if group == selected:
+                    # A normal delivery stop starts the group stop; subsequent
+                    # SIGSTOP group-stops detach its other threads as well.
+                    # Keep the pidfd owner for cleanup, but retire ptrace state
+                    # only after a successful DETACH. The driver owns waitpid.
+                    assert tid != held and tid not in pending_injection
+                    ptrace(17, tid, 0, signal.SIGSTOP)  # PTRACE_DETACH
+                    lifecycle("restore-manager-detached", tid, group=group, status=status)
+                    stopped_status.pop(tid)
+                    tracked.discard(tid)
+                    configured.discard(tid)
+                    groups.pop(tid)
+                    awaiting_terminal.pop(tid, None)
+                    return
         if event in (1, 2, 3):
             child = ctypes.c_ulong()
             ptrace(0x4201, tid, 0, ctypes.byref(child))
@@ -234,6 +428,21 @@ def main() -> None:
                 else:
                     code = str(-result)
                     total["errors"][code] = total["errors"].get(code, 0) + 1
+            if info.op == 2 and tid in reply_pending:
+                key, payload = reply_pending.pop(tid)
+                returned = ctypes.c_longlong(info.data[0]).value
+                if returned > 0:
+                    reply_bytes[key] = reply_bytes.get(key, b"") + payload[:returned]
+                    assert len(reply_bytes[key]) <= 1024 * 1024, "Thaw reply trace exceeded bound"
+            if (info.op == 1 and observe_net and int(info.data[0]) in (1, 20, 44, 46, 307)
+                    and thread_name(tid).startswith("virtio-net")
+                    and socket_fd(tid, int(info.data[1]))):
+                observation = {"monotonicNs": time.monotonic_ns(), "realtimeNs": time.time_ns(),
+                               "pid": group, "tid": tid, "syscall": int(info.data[0]),
+                               "fd": int(info.data[1]), "argument": int(info.data[2])}
+                net_egress.append(observation)
+                with (evidence / "net-egress.jsonl").open("a") as output:
+                    output.write(json.dumps(observation) + "\n")
             if info.op == 1 and not matched:
                 syscall = int(info.data[0])
                 syscall_counts[syscall] += 1
@@ -251,6 +460,43 @@ def main() -> None:
                         held_record.write_text(json.dumps(receipt) + "\n")
                         held_record.replace(evidence / "boundary-held.json")
                         return
+                if restore_boundary:
+                    reply = None
+                    if boundary == "restore-vcpu-run":
+                        # KVM_RUN = _IO(0xAE, 0x80): the vCPU's next guest entry.
+                        selected = (syscall == 16 and int(info.data[2]) == 0xAE80
+                                    and thread_name(tid).startswith("fc_vcpu") and logged_gate())
+                    elif boundary == "restore-guest-transport":
+                        selected = thread_name(tid) == "vsock muxer" and logged_gate()
+                    else:
+                        # Guest TX is forwarded by the virtio event owner, or
+                        # by the muxer when draining pending_tx. Match bytes,
+                        # not the writer's thread name or the first socket send.
+                        selected = False
+                        if (syscall in candidates and thread_name(group) == "krun"
+                                and logged_gate() and socket_fd(tid, int(info.data[1]))):
+                            key = (group, os.readlink(f"/proc/{tid}/fd/{int(info.data[1])}"))
+                            payload = send_bytes(tid, syscall, info.data)
+                            reply = thaw_reply(reply_bytes.get(key, b"") + payload, reply_activation)
+                            selected = reply is not None
+                            if not selected:
+                                reply_pending[tid] = (key, payload)
+                    if not selected:
+                        resume(24, tid)
+                        return
+                    assert request.get("errno") is None, "restore activation holds never inject a result"
+                    receipt = {"pid": group, "tid": tid, "syscall": syscall, "thread": thread_name(tid),
+                               "arguments": [int(value) for value in info.data[1:4]],
+                               "injectedReturn": False, "afterLog": after_log["needle"],
+                               "monotonicNs": time.monotonic_ns(), "realtimeNs": time.time_ns()}
+                    if reply is not None:
+                        receipt["thawReply"] = reply
+                    held, matched = tid, True
+                    save_copies()
+                    held_record = evidence / "boundary-held.json.tmp"
+                    held_record.write_text(json.dumps(receipt) + "\n")
+                    held_record.replace(evidence / "boundary-held.json")
+                    return
                 if syscall not in candidates:
                     resume(24, tid)
                     return
@@ -373,7 +619,7 @@ def main() -> None:
         deliver = stopped if stopped not in (signal.SIGTRAP, signal.SIGSTOP, signal.SIGTRAP | 0x80) else 0
         # After the required boundary/checked injected return, retain
         # lifecycle tracing and EXITKILL without stopping every syscall.
-        resume(24 if event != 6 and (not matched or tid in pending_injection) else 7, tid, deliver)
+        resume(24 if event != 6 and (not matched or observe_net or tid in pending_injection) else 7, tid, deliver)
 
     def cancelled(_signal, _frame) -> None:
         raise InterruptedError("owned stopped boundary controller cancelled")
@@ -383,7 +629,7 @@ def main() -> None:
         while True:
             assert time.monotonic() < deadline, f"actual operation exceeded 240s: {tracked}; lost stops: {awaiting_terminal}"
             if held is not None and Path(request["release"]).is_file():
-                resume(24 if held in pending_injection else 7, held)
+                resume(24 if observe_net or held in pending_injection else 7, held)
             try:
                 tid, status = os.waitpid(-1, os.WNOHANG | 0x40000000)
             except ChildProcessError:

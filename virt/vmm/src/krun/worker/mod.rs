@@ -3,9 +3,16 @@
 #[cfg(target_os = "macos")]
 mod admission;
 pub(crate) mod fds;
+#[cfg(all(
+    feature = "restore-irq-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+mod irq_probe;
 pub(crate) mod lifecycle;
 pub(crate) mod lifecycle_wire;
 mod native;
+pub(crate) mod restore;
 pub(crate) mod wire;
 
 use std::io;
@@ -41,7 +48,8 @@ pub(crate) fn main() -> eyre::Result<()> {
         storage_lease,
         raw_handles,
         lifecycle: lifecycle_endpoint,
-        state_files: _,
+        state_files,
+        lowers,
         standalone: _,
     } = fds::Bootstrap::adopt_fixed()?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -79,6 +87,32 @@ pub(crate) fn main() -> eyre::Result<()> {
         admission::check_hvf()?;
         stage = StartupStage::Build;
         emit(&events, &Event::StartupStage { stage })?;
+        let request = config.restore.take();
+        let state_files = match (request, state_files) {
+            (None, None) => None,
+            (Some(request), Some(state)) => Some((request, state)),
+            _ => {
+                return Err(wire::invalid(
+                    "restore descriptor roles do not match the worker config",
+                )
+                .into())
+            }
+        };
+        if let Some((request, state)) = state_files {
+            return restore::run(restore::Launch {
+                config: &config,
+                request,
+                state,
+                lowers,
+                raw_handles: &raw_handles,
+                console: &console,
+                mux,
+                lifecycle: lifecycle_endpoint,
+                binding,
+                events: &events,
+                stage: &mut stage,
+            });
+        }
         engine::run_process(
             &config,
             Resources {
@@ -109,10 +143,11 @@ pub(crate) fn main() -> eyre::Result<()> {
                 }
                 // Serving starts a thread and returns: native dispatch must run
                 // before any blocking native lifecycle call can complete.
-                lifecycle::serve(
+                let served = lifecycle::serve(
                     lifecycle_endpoint,
                     binding,
                     native::KrunNative::new(control.clone(), &config),
+                    None,
                     Box::new(|reason: &str| {
                         eprintln!("krun lifecycle control lost: {reason}");
                         // nix exposes no immediate _exit. A worker that lost its
@@ -120,6 +155,7 @@ pub(crate) fn main() -> eyre::Result<()> {
                         unsafe { nix::libc::_exit(124) }
                     }),
                 )?;
+                serve_diagnostics(served, binding)?;
                 start_status_reporter(events.clone(), control)?;
                 emit(&events, &Event::BackendStarted {})?;
                 stage = StartupStage::Started;
@@ -158,6 +194,31 @@ fn lifecycle_binding(config: &crate::krun::KrunConfig) -> io::Result<lifecycle::
         machine_id: parse(&config.storage_context.machine_id)?,
         run_id: parse(&config.storage_context.run_id)?,
     })
+}
+
+/// A `restore-irq-probe` candidate exposes the run's IRQ witness transport
+/// over the lifecycle owner; every other build releases the owner untouched.
+fn serve_diagnostics(
+    served: Arc<lifecycle::Shared<native::KrunNative>>,
+    binding: lifecycle::Binding,
+) -> io::Result<()> {
+    #[cfg(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    {
+        irq_probe::serve(served, binding)
+    }
+    #[cfg(not(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    {
+        drop((served, binding));
+        Ok(())
+    }
 }
 
 fn bind_raw_handles(config: &mut crate::krun::KrunConfig, handles: &[OwnedFd]) -> io::Result<()> {

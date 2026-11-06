@@ -401,6 +401,7 @@ pub fn require_host_live_operation(
     report.validate().map_err(protocol)?;
     let reason = match &report.live.get(operation).availability {
         LiveAvailability::Unsupported { reason } => reason.clone(),
+        LiveAvailability::Supported if operation == LiveOperation::Restore => return Ok(()),
         LiveAvailability::Supported => LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
     };
     Err(LibVmError::LiveOperationUnsupported {

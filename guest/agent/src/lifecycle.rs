@@ -35,6 +35,7 @@ pub(crate) struct RuntimeContext {
     idle: Notify,
     pub(crate) lifecycle: watch::Sender<v1::GuestLifecycleStatus>,
     retirement: watch::Sender<u64>,
+    ssh_trusted_ca: Mutex<Option<russh::keys::PublicKey>>,
 }
 
 pub(crate) struct MutationLease {
@@ -104,7 +105,12 @@ impl RuntimeContext {
             idle: Notify::new(),
             lifecycle,
             retirement,
+            ssh_trusted_ca: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn ssh_trusted_ca(&self) -> MutexGuard<'_, Option<russh::keys::PublicKey>> {
+        lock(&self.ssh_trusted_ca)
     }
 
     #[cfg(test)]
@@ -508,6 +514,9 @@ impl Lifecycle {
             owner.busy = true;
             owner.freeze = Some((request.clone(), completion.clone()));
             owner.thaw = None;
+            // Replay belongs to the previous cut. A newly admitted freeze can
+            // itself be captured and activated into another destination.
+            owner.activation = None;
             self.publish(State::Freezing, &reference, false, None, None);
             let lifecycle = self.clone();
             tokio::spawn(async move {
@@ -708,6 +717,13 @@ impl Lifecycle {
         let deadline = deadline(request.deadline_ms, 30000)?;
         // Validate pure input before admitting any side effects.
         let (network, shutdown) = validate_activation(&request)?;
+        crate::provision::ssh::parse_ca(
+            request
+                .ssh_trusted_ca
+                .as_deref()
+                .ok_or_else(|| Status::invalid_argument("destination SSH CA trust is required"))?,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         crate::forward::listen::validate_activation_listeners(&request.listeners)?;
         let receiver = {
             let mut owner = lock(&self.coordinator);
@@ -809,6 +825,13 @@ impl Lifecycle {
             reference.run_id = identity.run_id.clone();
             self.publish(State::Activating, &reference, true, None, None);
             self.runtime.drain_sessions(deadline).await?;
+            let ca = crate::provision::ssh::replace_trust(
+                request.ssh_trusted_ca.as_deref().ok_or_else(|| {
+                    Status::invalid_argument("destination SSH CA trust is required")
+                })?,
+            )
+            .map_err(internal)?;
+            *self.runtime.ssh_trusted_ca() = Some(ca);
             crate::clock::activate_realtime(request.host_time.as_ref()).map_err(internal)?;
             if let (Some(applied), Some(network)) = (retained.as_ref(), network.as_ref()) {
                 let replacement = crate::provision::network::activate_network(applied, network)

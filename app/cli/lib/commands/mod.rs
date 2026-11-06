@@ -67,7 +67,7 @@ impl Command {
             Self::Pause(_) | Self::Resume(_) | Self::System(_) => Admission::Owned,
             Self::Snapshot(command) if command.is_live() => Admission::Owned,
             Self::Fork(command) if command.live => Admission::Owned,
-            Self::Restore(command) if command.execution => Admission::Owned,
+            Self::Restore(_) => Admission::Owned,
             _ => Admission::Ready,
         }
     }

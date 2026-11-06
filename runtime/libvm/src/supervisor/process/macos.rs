@@ -1,6 +1,8 @@
 use std::io;
 
-use crate::supervisor::process::pid_exists;
+use nix::sys::signal::Signal;
+
+use crate::supervisor::process::{pid_exists, signal_pid};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessIdentity {
@@ -40,5 +42,22 @@ impl ProcessIdentity {
             return Ok(false);
         };
         Ok(current.matches_started_at(self.started_at))
+    }
+
+    /// Darwin has no pidfd: the birth identity is checked before the numeric
+    /// signal; `false` means the recorded process already exited.
+    pub(crate) fn signal(&self, signal: Signal) -> io::Result<bool> {
+        if !self.is_alive()? {
+            return Ok(false);
+        }
+        signal_pid(self.pid, signal)
+    }
+
+    /// Signals the process group this recorded process leads.
+    pub(crate) fn signal_process_group(&self, signal: Signal) -> io::Result<bool> {
+        if !self.is_alive()? {
+            return Ok(false);
+        }
+        signal_pid(-self.pid, signal)
     }
 }

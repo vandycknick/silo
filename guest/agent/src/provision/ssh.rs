@@ -27,24 +27,53 @@ pub(crate) fn prepare(config: &AgentSshConfig) -> eyre::Result<()> {
     prepare_at(config, Path::new("/"))
 }
 
-fn prepare_at(config: &AgentSshConfig, root: &Path) -> eyre::Result<()> {
-    if config
-        .trusted_ca
-        .as_deref()
-        .is_some_and(|ca| ca.trim().contains(['\n', '\r']))
-    {
-        eyre::bail!("SSH CA trust must contain exactly one public key line");
+pub(crate) fn parse_ca(value: &str) -> eyre::Result<PublicKey> {
+    if value.trim().contains(['\n', '\r']) || value.len() > 1024 {
+        eyre::bail!("SSH CA trust must contain exactly one bounded public key line");
     }
-    let ca = PublicKey::from_openssh(
-        config
-            .trusted_ca
-            .as_deref()
-            .ok_or_else(|| eyre::eyre!("missing mandatory SSH CA trust; recreate this machine"))?,
-    )
-    .context("parse SSH CA trust")?;
+    let ca = PublicKey::from_openssh(value).context("parse SSH CA trust")?;
     if ca.algorithm() != russh::keys::ssh_key::Algorithm::Ed25519 {
         eyre::bail!("SSH CA trust must be Ed25519");
     }
+    Ok(ca)
+}
+
+pub(crate) fn replace_trust(value: &str) -> eyre::Result<PublicKey> {
+    replace_trust_at(value, Path::new(CA))
+}
+
+fn replace_trust_at(value: &str, path: &Path) -> eyre::Result<PublicKey> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let ca = parse_ca(value)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre::eyre!("SSH CA has no parent"))?;
+    let temporary = parent.join(format!(".silo-ca-{}", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&temporary)?;
+    let result = (|| -> eyre::Result<()> {
+        writeln!(file, "{}", ca.to_openssh()?)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(ca)
+}
+
+fn prepare_at(config: &AgentSshConfig, root: &Path) -> eyre::Result<()> {
+    let ca =
+        parse_ca(config.trusted_ca.as_deref().ok_or_else(|| {
+            eyre::eyre!("missing mandatory SSH CA trust; recreate this machine")
+        })?)?;
     let line = ca.to_openssh()?;
     let ca_path = root.join(&CA[1..]);
     let host_path = root.join(&HOST_KEY[1..]);
@@ -101,6 +130,34 @@ mod tests {
     use crate::provision::ssh::{prepare_at, verify_at, CONFIG, HOST_KEY};
     use agent_spec::AgentSshConfig;
     use russh::keys::ssh_key::{private::Ed25519Keypair, PrivateKey};
+    #[test]
+    fn activation_replaces_ca_without_modifying_trust_on_invalid_input() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ca.pub");
+        let source = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let destination = PrivateKey::from(Ed25519Keypair::from_seed(&[2; 32]));
+        let source_line = source.public_key().to_openssh().unwrap();
+        std::fs::write(&path, &source_line).unwrap();
+        let held_source = std::fs::File::open(&path).unwrap();
+        for invalid in ["", "ssh-ed25519 broken", "key\nsecond"] {
+            assert!(crate::provision::ssh::replace_trust_at(invalid, &path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source_line);
+        }
+        let new_key = crate::provision::ssh::replace_trust_at(
+            &destination.public_key().to_openssh().unwrap(),
+            &path,
+        )
+        .unwrap();
+        assert_eq!(new_key.key_data(), destination.public_key().key_data());
+        let persisted =
+            russh::keys::PublicKey::from_openssh(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted.key_data(), destination.public_key().key_data());
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            held_source.metadata().unwrap().ino(),
+            std::fs::metadata(&path).unwrap().ino()
+        );
+    }
     #[test]
     fn trust_is_mandatory_idempotent_and_userdata_changes_are_fatal() {
         let root = tempfile::tempdir().unwrap();

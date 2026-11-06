@@ -8,6 +8,7 @@ mod error;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host;
 mod network;
+pub(crate) mod restore;
 mod rosetta;
 mod status;
 pub(crate) mod storage_holder;

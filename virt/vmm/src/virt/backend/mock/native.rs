@@ -28,8 +28,8 @@ use test_utils::{
 use uuid::Uuid;
 
 use crate::krun::worker::lifecycle::{
-    ExecutionCapture, GenerationPoll, MemoryCapture, NativeCaptureStatus, NativeLifecycle,
-    NativeState, CLOCK_ONLY_FLAGS,
+    ExecutionCapture, FreshRequest, GenerationPoll, MemoryCapture, NativeCaptureStatus,
+    NativeExposure, NativeLifecycle, NativeState, CLOCK_ONLY_FLAGS,
 };
 use crate::virt::lifecycle::{
     BlockBacking, CaptureStage, CaptureStateBinding, Digest32, FlushedAttachment,
@@ -522,6 +522,9 @@ impl NativeLifecycle for ScenarioNative {
     type Token = ScenarioToken;
     type Ticket = ScenarioTicket;
     type Capture = ScenarioCapture;
+    // The scenario backend never launches a restore: no restore authority
+    // can exist, so no restore behavior is modeled or invented.
+    type Restore = std::convert::Infallible;
 
     fn pause(
         &self,
@@ -1200,6 +1203,52 @@ impl NativeLifecycle for ScenarioNative {
         };
         model.control = NativeState::Paused(preserved.clone());
         Ok(preserved)
+    }
+
+    fn prepare_fresh(
+        &self,
+        restore: &std::convert::Infallible,
+        _operation: NativeOperation,
+        _deadline: Instant,
+    ) -> Result<(ScenarioTicket, FreshRequest), NativeFailure> {
+        match *restore {}
+    }
+
+    fn resume_restored(
+        &self,
+        restore: &std::convert::Infallible,
+        _ticket: &ScenarioTicket,
+        _operation: NativeOperation,
+        _deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        match *restore {}
+    }
+
+    fn release_activation(
+        &self,
+        restore: &std::convert::Infallible,
+        _ticket: &ScenarioTicket,
+        _operation: NativeOperation,
+        _deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        match *restore {}
+    }
+
+    fn activation_exposure(
+        &self,
+        restore: &std::convert::Infallible,
+        _deadline: Instant,
+    ) -> Result<NativeExposure, NativeFailure> {
+        match *restore {}
+    }
+
+    fn park_restored(
+        &self,
+        restore: &std::convert::Infallible,
+        _operation: NativeOperation,
+        _deadline: Instant,
+    ) -> Result<ScenarioToken, NativeFailure> {
+        match *restore {}
     }
 }
 

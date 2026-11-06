@@ -149,7 +149,10 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
                 live[operation.as_str()]["availability"]["reason"]["code"],
                 if backend == "vz" {
                     "backend-excluded"
-                } else if matches!(operation, LiveOperation::Pause | LiveOperation::Capture) {
+                } else if matches!(
+                    operation,
+                    LiveOperation::Pause | LiveOperation::Capture | LiveOperation::Restore
+                ) {
                     "lane-not-qualified"
                 } else {
                     "not-delivered"
@@ -192,8 +195,7 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
             (
                 vec![
                     "restore",
-                    checkpoint.to_str().expect("UTF-8 path"),
-                    "--execution",
+                    "image:checkpoint",
                     "--name",
                     "unallocated-restore",
                 ],
@@ -212,7 +214,7 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
             assert!(
                 error.contains(if backend == "vz" {
                     "backend-excluded"
-                } else if matches!(operation, "pause" | "capture") {
+                } else if matches!(operation, "pause" | "capture" | "restore") {
                     "lane-not-qualified"
                 } else {
                     "not-delivered"

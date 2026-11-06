@@ -13,7 +13,7 @@
 //!
 //! | 8  | generation lease: shared-flock regular file       |
 //! | 9+ | Raw backing handles, in manifest order (max 16)   |
-//! | 25 | restore RAM, read-only regular file (standalone only) |
+//! | 25 | restore RAM, read-only regular file (standalone or restore launch) |
 //! | 26 | restore layout, read-only regular file              |
 //! | 27 | restore execution, read-only regular file           |
 //! | 28 | restore devices, read-only regular file             |
@@ -21,8 +21,11 @@
 //! | 30 | console input: connected stream socket (standalone only)     |
 //! | 31 | console output: connected stream socket (standalone only)    |
 //! | 32 | lifecycle: connected stream socket (normal worker only)      |
+//! | 33+| restore lowers: per read-only VMDK lower, its descriptor then its extents |
 //!
-//! The optional mux hole stays closed; no other descriptor may be open.
+//! The optional mux hole stays closed; no other descriptor may be open. A
+//! normal launch is a restore launch exactly when the state roles are open;
+//! the config read afterwards must agree.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -40,11 +43,15 @@ pub(crate) const MUX_FD: RawFd = 7;
 pub(crate) const STORAGE_LEASE_FD: RawFd = 8;
 pub(crate) const FIRST_RAW_FD: RawFd = 9;
 const MAX_RAW_HANDLES: usize = 16;
-const MAX_INHERITED_FDS: usize = 14 + MAX_RAW_HANDLES;
 pub(crate) const RESTORE_STATE_FDS: [RawFd; 4] = [25, 26, 27, 28];
 pub(crate) const STANDALONE_ENDPOINT_FDS: [RawFd; 3] = [29, 30, 31];
-/// The normal worker's monitor lifecycle endpoint; above every other role.
+/// The normal worker's monitor lifecycle endpoint.
 pub(crate) const LIFECYCLE_FD: RawFd = 32;
+/// First restore lower role; the table is contiguous and holeless.
+pub(crate) const FIRST_LOWER_FD: RawFd = 33;
+/// Every lower contributes its descriptor; extents share one bound.
+pub(crate) const MAX_LOWER_FDS: usize =
+    MAX_RAW_HANDLES + vm_spec::restore::MAX_RESTORE_LOWER_EXTENTS;
 
 #[allow(dead_code)] // Consumed only by the explicit standalone API entry.
 pub(crate) struct StandaloneEndpoints {
@@ -54,7 +61,6 @@ pub(crate) struct StandaloneEndpoints {
 }
 
 /// State objects are not disk attachments and never enter `raw_handles`.
-#[allow(dead_code)] // Normal worker launch never adopts state roles.
 pub(crate) struct RestoreStateFiles {
     pub(crate) ram: std::fs::File,
     pub(crate) layout: std::fs::File,
@@ -72,9 +78,10 @@ pub(crate) struct Bootstrap {
     pub(crate) raw_handles: Vec<OwnedFd>,
     /// Required by the normal worker; never present for the standalone entry.
     pub(crate) lifecycle: Option<OwnedFd>,
-    #[allow(dead_code)] // Only the explicit standalone entry consumes these roles.
     pub(crate) state_files: Option<RestoreStateFiles>,
-    #[allow(dead_code)]
+    /// Restore lower roles in table order (normal restore launch only).
+    pub(crate) lowers: Vec<std::fs::File>,
+    #[allow(dead_code)] // Only the explicit standalone entry consumes these roles.
     pub(crate) standalone: Option<StandaloneEndpoints>,
 }
 
@@ -90,13 +97,27 @@ enum Role {
     State { maximum: u64 },
     Network,
     Lifecycle,
+    Lower,
 }
 
 impl Bootstrap {
-    /// Adopt the fixed descriptor table. The mux is optional; whether it must be
-    /// present is decided by the config, which is read afterwards.
+    /// Adopt the fixed descriptor table. The mux and the restore roles are
+    /// optional; whether they must be present is decided by the config, which
+    /// is read afterwards.
     pub(crate) fn adopt_fixed() -> io::Result<Self> {
-        Self::adopt_fixed_mode(false, false)
+        let restore = RESTORE_STATE_FDS
+            .iter()
+            .map(|&raw| descriptor_open(raw))
+            .collect::<io::Result<Vec<_>>>()?;
+        let restore = match (
+            restore.iter().all(|open| *open),
+            restore.iter().any(|open| *open),
+        ) {
+            (true, _) => true,
+            (false, false) => false,
+            (false, true) => return Err(invalid("restore state table is incomplete")),
+        };
+        Self::adopt_fixed_mode(restore, false)
     }
 
     /// Explicit proof entry only; normal worker launch never admits these roles.
@@ -107,25 +128,22 @@ impl Bootstrap {
 
     fn adopt_fixed_mode(restore: bool, standalone: bool) -> io::Result<Self> {
         let mux = descriptor_open(MUX_FD)?.then_some(MUX_FD);
-        let mut raw_handles = [0; MAX_RAW_HANDLES];
-        let mut raw_count = 0;
-        let mut hole = false;
-        for raw in FIRST_RAW_FD..FIRST_RAW_FD + MAX_RAW_HANDLES as RawFd {
-            if descriptor_open(raw)? {
-                if hole {
-                    return Err(invalid("Raw descriptor table contains a hole"));
-                }
-                raw_handles[raw_count] = raw;
-                raw_count += 1;
-            } else {
-                hole = true;
-            }
-        }
-        let raw_handles = &raw_handles[..raw_count];
+        let raw_handles = contiguous(
+            FIRST_RAW_FD,
+            MAX_RAW_HANDLES,
+            "Raw descriptor table contains a hole",
+        )?;
+        let lowers = if restore && !standalone {
+            contiguous(
+                FIRST_LOWER_FD,
+                MAX_LOWER_FDS,
+                "restore lower descriptor table contains a hole",
+            )?
+        } else {
+            Vec::new()
+        };
         let lifecycle = (!standalone).then_some(LIFECYCLE_FD);
-        let mut allowed = [0; MAX_INHERITED_FDS];
-        let mut count = 0;
-        for raw in [
+        let allowed: Vec<RawFd> = [
             CONFIG_FD,
             EVENTS_FD,
             WATCHDOG_FD,
@@ -142,11 +160,10 @@ impl Bootstrap {
                 .then_some(STANDALONE_ENDPOINT_FDS)
                 .into_iter()
                 .flatten(),
-        ) {
-            allowed[count] = raw;
-            count += 1;
-        }
-        ensure_exact_descriptors(&allowed[..count])?;
+        )
+        .chain(lowers.iter().copied())
+        .collect();
+        ensure_exact_descriptors(&allowed)?;
         Self::adopt_with_state(
             CONFIG_FD,
             EVENTS_FD,
@@ -154,10 +171,11 @@ impl Bootstrap {
             CONSOLE_FD,
             mux,
             STORAGE_LEASE_FD,
-            raw_handles,
+            &raw_handles,
             lifecycle,
             restore.then_some(RESTORE_STATE_FDS),
             standalone.then_some(STANDALONE_ENDPOINT_FDS),
+            &lowers,
         )
     }
 
@@ -183,6 +201,7 @@ impl Bootstrap {
             None,
             None,
             None,
+            &[],
         )
     }
 
@@ -198,9 +217,13 @@ impl Bootstrap {
         lifecycle: Option<RawFd>,
         state: Option<[RawFd; 4]>,
         standalone: Option<[RawFd; 3]>,
+        lowers: &[RawFd],
     ) -> io::Result<Self> {
         if raw_handles.len() > MAX_RAW_HANDLES {
             return Err(invalid("too many inherited Raw backing handles"));
+        }
+        if lowers.len() > MAX_LOWER_FDS || (!lowers.is_empty() && state.is_none()) {
+            return Err(invalid("restore lower table is unbounded or orphaned"));
         }
         let roles = [
             (config, Role::Config),
@@ -208,11 +231,12 @@ impl Bootstrap {
             (watchdog, Role::Watchdog),
             (console, Role::Console),
         ];
-        let mut identities = [((0_u64, 0_u64), false); MAX_INHERITED_FDS];
+        // (identity, role class); only Raw-Raw and Lower-Lower may alias:
+        // repeated read-only extents are one immutable object.
+        let mut identities: Vec<((u64, u64), u8)> = Vec::new();
         #[cfg(target_os = "macos")]
         let mut pipes = [None; 3];
-        let mut numbers = [-1; MAX_INHERITED_FDS];
-        let mut count = 0;
+        let mut numbers: Vec<RawFd> = Vec::new();
         for (raw, role) in roles
             .into_iter()
             .chain(mux.map(|raw| (raw, Role::Mux)))
@@ -238,8 +262,9 @@ impl Bootstrap {
                     (output, Role::Mux),
                 ]
             }))
+            .chain(lowers.iter().map(|&raw| (raw, Role::Lower)))
         {
-            if raw < 3 || numbers[..count].contains(&raw) {
+            if raw < 3 || numbers.contains(&raw) {
                 return Err(invalid("invalid or duplicated bootstrap descriptor"));
             }
             // nix's fcntl API requires an already-valid AsFd. Probe the untrusted
@@ -252,8 +277,13 @@ impl Bootstrap {
             let fd = unsafe { BorrowedFd::borrow_raw(raw) };
             let stat = fstat(fd)?;
             let identity = (stat.st_dev as u64, stat.st_ino as u64);
-            if identities[..count].iter().any(|&(prior, prior_raw)| {
-                prior == identity && !(prior_raw && matches!(role, Role::Raw))
+            let class = match role {
+                Role::Raw => 1,
+                Role::Lower => 2,
+                _ => 0,
+            };
+            if identities.iter().any(|&(prior, prior_class)| {
+                prior == identity && (class == 0 || prior_class != class)
             }) {
                 return Err(invalid("bootstrap roles alias the same resource"));
             }
@@ -272,7 +302,7 @@ impl Bootstrap {
             let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
             let access = flags & OFlag::O_ACCMODE;
             #[cfg(target_os = "linux")]
-            if matches!(role, Role::State { .. })
+            if matches!(role, Role::State { .. } | Role::Lower)
                 && flags.intersects(OFlag::O_PATH | OFlag::O_DIRECT)
             {
                 return Err(invalid("state roles require readable buffered descriptors"));
@@ -313,15 +343,19 @@ impl Bootstrap {
                         && !flags.contains(OFlag::O_APPEND)
                         && stat.st_size > 0
                         && (stat.st_size as u64) <= maximum => {}
+                Role::Lower
+                    if kind == SFlag::S_IFREG
+                        && access == OFlag::O_RDONLY
+                        && !flags.contains(OFlag::O_APPEND)
+                        && stat.st_size > 0 => {}
                 _ => return Err(invalid("bootstrap descriptor has wrong type or access")),
             }
-            numbers[count] = raw;
-            identities[count] = (identity, matches!(role, Role::Raw));
-            count += 1;
+            numbers.push(raw);
+            identities.push((identity, class));
         }
         // No descriptor has been adopted yet, so a validation error never closes
         // an unowned or duplicate resource. Every validated descriptor is unique.
-        for raw in &numbers[..count] {
+        for raw in &numbers {
             let fd = unsafe { BorrowedFd::borrow_raw(*raw) };
             let flags = FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD)?);
             fcntl(fd, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))?;
@@ -346,6 +380,10 @@ impl Bootstrap {
                     execution: std::fs::File::from_raw_fd(execution),
                     devices: std::fs::File::from_raw_fd(devices),
                 }),
+                lowers: lowers
+                    .iter()
+                    .map(|&raw| std::fs::File::from_raw_fd(raw))
+                    .collect(),
                 standalone: standalone.map(|[network, input, output]| StandaloneEndpoints {
                     network: OwnedFd::from_raw_fd(network),
                     console_input: OwnedFd::from_raw_fd(input),
@@ -367,6 +405,24 @@ fn descriptor_open(raw: RawFd) -> io::Result<bool> {
     } else {
         Err(error)
     }
+}
+
+/// The open prefix of a holeless role table starting at `first`.
+fn contiguous(first: RawFd, maximum: usize, label: &'static str) -> io::Result<Vec<RawFd>> {
+    let mut open = Vec::new();
+    let mut hole = false;
+    for offset in 0..maximum {
+        let raw = first + offset as RawFd;
+        if descriptor_open(raw)? {
+            if hole {
+                return Err(invalid(label));
+            }
+            open.push(raw);
+        } else {
+            hole = true;
+        }
+    }
+    Ok(open)
 }
 
 fn validate_lease_metadata(fd: BorrowedFd<'_>) -> io::Result<()> {
@@ -658,6 +714,7 @@ mod tests {
                 None,
                 Some(state),
                 None,
+                &[],
             )
             .is_err());
             for file in &files {
@@ -736,6 +793,7 @@ mod tests {
             None,
             Some(files.map(IntoRawFd::into_raw_fd)),
             None,
+            &[],
         )
         .unwrap();
         assert!(adopted.raw_handles.is_empty());
@@ -796,6 +854,7 @@ mod tests {
                 Some(lifecycle),
                 None,
                 None,
+                &[],
             )
             .is_err());
             // Validation failure never adopts or closes a caller descriptor.
@@ -839,6 +898,7 @@ mod tests {
             Some(child.into_raw_fd()),
             None,
             None,
+            &[],
         )
         .unwrap();
         let endpoint = adopted.lifecycle.as_ref().expect("lifecycle endpoint");

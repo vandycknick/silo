@@ -24,8 +24,12 @@ test = false
 
 [features]
 # Compiles the in-process mock virtualization backend for tests. Never enabled
-# in release builds; test runs use --all-features.
+# in release builds; host test and clippy runs select it explicitly.
 mock-backend = ["dep:test-utils"]
+# Candidate-only native IRQ witness transport for the restore IRQ acceptance
+# gate (Linux x86_64). Never a default or production feature: native
+# device-probe builds carry a diagnostic identity and grant no qualification.
+restore-irq-probe = ["libkrun/native-device-probe"]
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }

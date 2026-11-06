@@ -345,6 +345,15 @@ impl SnapshotStore {
             nested_virtualization: Some(record.plan.configuration.nested_virtualization),
             rosetta: Some(record.plan.configuration.rosetta),
         });
+        if let Some(kernel) = record
+            .configuration
+            .spec
+            .boot
+            .as_mut()
+            .and_then(|boot| boot.kernel.as_mut())
+        {
+            kernel.cmdline = record.plan.configuration.kernel_cmdline.clone();
+        }
         let mut available_disks =
             BTreeMap::from([(machine_stat.st_dev as u64, available_disk(&machine)?)]);
         if machine_stat.st_dev != images_stat.st_dev {
@@ -1248,7 +1257,7 @@ fn available_disk(directory: &OwnedDirectory) -> Result<u64, LibVmError> {
         .ok_or_else(|| invalid("filesystem free-space overflow"))
 }
 
-fn available_memory() -> Result<u64, LibVmError> {
+pub(crate) fn available_memory() -> Result<u64, LibVmError> {
     #[cfg(target_os = "linux")]
     {
         let mut text = String::new();
@@ -2108,6 +2117,7 @@ mod tests {
             }),
             pause_disposition: Some(CapturePauseDisposition::Acquired),
             freeze_epoch: NonZeroU64::new(1),
+            freeze_operation_id: Some(record.plan.capture_id.clone()),
             configuration_digest: record.plan.configuration_digest,
             request_digest: Sha256Digest::of_bytes(&request),
             memory: Some(CaptureMemoryEvidence {
@@ -2181,6 +2191,145 @@ mod tests {
             .machine_capture_retained(fixture.config.id)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn restore_consumer_uses_authenticated_local_seal_without_source_request_paths() {
+        let fixture = fixture_with_external_data(true).await;
+        let (directory, _) = seal(&fixture);
+        let result = fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let mut consumer = fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(result.id))
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(vm_spec::capture::CAPTURE_REQUEST_FILE),
+        )
+        .unwrap();
+        let evidence = fixture
+            .snapshots
+            .restore_evidence(&consumer, &pool)
+            .unwrap();
+        assert_eq!(
+            evidence.freeze_operation_id.as_ref(),
+            Some(&fixture.reservation.record.plan.capture_id)
+        );
+        assert_eq!(
+            consumer
+                .record
+                .configuration
+                .spec
+                .storage
+                .as_ref()
+                .unwrap()
+                .disks[1]
+                .block_id
+                .as_str(),
+            "external-data-serial"
+        );
+        let saved = consumer.record.configuration.spec.clone();
+        consumer
+            .record
+            .configuration
+            .spec
+            .hardware
+            .as_mut()
+            .unwrap()
+            .cpus = Some(7);
+        assert!(fixture
+            .snapshots
+            .restore_evidence(&consumer, &pool)
+            .unwrap_err()
+            .to_string()
+            .contains("captured configuration"));
+        consumer.record.configuration.spec = saved;
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &mut consumer.record.capture
+        else {
+            panic!("execution checkpoint");
+        };
+        execution
+            .compatibility_profile
+            .native_producer
+            .push_str("-different");
+        assert!(fixture
+            .snapshots
+            .restore_evidence(&consumer, &pool)
+            .unwrap_err()
+            .to_string()
+            .contains("native producer"));
+        consumer.info.provenance.clear();
+        assert!(fixture
+            .snapshots
+            .restore_evidence(&consumer, &pool)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_corrupt_closure_retires_failed_verification_consumer_roots() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let result = fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let record =
+            crate::store::observation::ObservationStore::existing(&fixture.snapshots.store)
+                .snapshot_record(&SnapshotRef::Id(result.id))
+                .await
+                .unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            record.capture
+        else {
+            panic!("execution checkpoint");
+        };
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        let path = pool.object_path(&execution.devices);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(
+            &path,
+            b"corrupt native state, never submitted to native code",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(result.id))
+            .await
+            .is_err());
+        let imports: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM storage_operation WHERE kind='import'")
+                .fetch_one(&fixture.snapshots.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            imports, 0,
+            "failed byte authentication leaked an operation root"
+        );
+        let reservations: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM restore_memory_reservation")
+                .fetch_one(&fixture.snapshots.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(reservations, 0);
     }
 
     #[tokio::test]

@@ -501,42 +501,63 @@ impl SnapshotStore {
         tokio::task::spawn_blocking(move || {
             let pool = StoragePool::open(&store.images_dir)?;
             let id = Uuid::new_v4();
-            let (info, lease) = runtime.block_on(async {
-                let _roots = pool.lock_roots()?;
-                let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                recheck_catalog(&mut tx, &reference, &observed, &bytes, &streams, &objects).await?;
-                let mut info = catalog_info(&mut tx, observed.id, observed.record_digest).await?;
-                info.provenance = observed.provenance.clone();
-                let mut pinned_objects = objects.clone();
-                pinned_objects.extend(
-                    info.provenance
-                        .iter()
-                        .map(|provenance| provenance.evidence_digest),
-                );
-                let lease = pool.lease(id)?;
-                Store::insert_stopped_operation(
-                    &mut tx,
-                    id,
-                    "import",
-                    &lease,
-                    &streams.into_iter().collect::<Vec<_>>(),
-                    &pinned_objects.into_iter().collect::<Vec<_>>(),
-                )
-                .await?;
-                tx.commit().await?;
-                Ok::<_, LibVmError>((info, lease))
-            })?;
-            verify_closure(&pool, &record, Some(info.record_digest))?;
-            for provenance in &info.provenance {
-                pool.verify_object(&provenance.evidence_digest)?;
+            let result: Result<SnapshotConsumer, LibVmError> = (|| {
+                let (info, lease) = runtime.block_on(async {
+                    let _roots = pool.lock_roots()?;
+                    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                    recheck_catalog(&mut tx, &reference, &observed, &bytes, &streams, &objects)
+                        .await?;
+                    let mut info =
+                        catalog_info(&mut tx, observed.id, observed.record_digest).await?;
+                    info.provenance = observed.provenance.clone();
+                    let mut pinned_objects = objects.clone();
+                    pinned_objects.extend(
+                        info.provenance
+                            .iter()
+                            .map(|provenance| provenance.evidence_digest),
+                    );
+                    let lease = pool.lease(id)?;
+                    Store::insert_stopped_operation(
+                        &mut tx,
+                        id,
+                        "import",
+                        &lease,
+                        &streams.into_iter().collect::<Vec<_>>(),
+                        &pinned_objects.into_iter().collect::<Vec<_>>(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok::<_, LibVmError>((info, lease))
+                })?;
+                verify_closure(&pool, &record, Some(info.record_digest))?;
+                for provenance in &info.provenance {
+                    pool.verify_object(&provenance.evidence_digest)?;
+                }
+                Ok(SnapshotConsumer {
+                    info,
+                    record,
+                    operation_id: id,
+                    lease,
+                    _store: store.clone(),
+                })
+            })();
+            match result {
+                Ok(consumer) => Ok(consumer),
+                Err(primary) => {
+                    // The failed reader's lease has closed. Settle its exact
+                    // journal outcome through existing recovery, including an
+                    // uncertain registration COMMIT, rather than leaking pins.
+                    if let Err(cleanup) =
+                        runtime.block_on(store.retire_abandoned_storage_operations(&pool))
+                    {
+                        return Err(LibVmError::MachineStartCleanupFailed {
+                            primary: primary.to_string(),
+                            cleanup: cleanup.to_string(),
+                        });
+                    }
+                    Err(primary)
+                }
             }
-            Ok(SnapshotConsumer {
-                info,
-                record,
-                operation_id: id,
-                lease,
-                _store: store,
-            })
         })
         .await?
     }

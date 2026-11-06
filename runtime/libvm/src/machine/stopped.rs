@@ -81,10 +81,70 @@ pub struct SnapshotOptions {
     pub name: Option<String>,
     pub external_resources: ExternalResourcePolicy,
 }
+
+/// Fraction of configured RAM reserved for this child's private writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct PrivateWriteAllowance(u8);
+
+impl Default for PrivateWriteAllowance {
+    fn default() -> Self {
+        Self(25)
+    }
+}
+
+impl TryFrom<u32> for PrivateWriteAllowance {
+    type Error = LibVmError;
+
+    fn try_from(percent: u32) -> Result<Self, Self::Error> {
+        if percent > 100 {
+            return Err(invalid(
+                "private-write allowance must be between 0 and 100 percent",
+            ));
+        }
+        Ok(Self(percent as u8))
+    }
+}
+
+impl From<PrivateWriteAllowance> for u32 {
+    fn from(value: PrivateWriteAllowance) -> Self {
+        u32::from(value.0)
+    }
+}
+
+impl PrivateWriteAllowance {
+    pub(crate) fn reservation(self, bytes: u64, granule: u64) -> Result<u64, LibVmError> {
+        if granule == 0 || !granule.is_power_of_two() {
+            return Err(invalid("invalid native RAM granule"));
+        }
+        // Widen before multiplication so even the largest input cannot wrap.
+        let bytes = (u128::from(bytes) * u128::from(self.0)).div_ceil(100);
+        let rounded = bytes.div_ceil(u128::from(granule)) * u128::from(granule);
+        u64::try_from(rounded).map_err(|_| invalid("restore private-write reservation overflow"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreMemoryPolicy {
+    #[default]
+    Reserved,
+    AllowOvercommit,
+}
+
+/// Per-child admission intent, retained for the lifetime of the restore run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreResourcePolicy {
+    pub private_write_allowance: PrivateWriteAllowance,
+    pub memory: RestoreMemoryPolicy,
+}
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
     pub name: Option<String>,
     pub external_resources: ExternalResourcePolicy,
+    pub activation_hook: Option<vm_spec::restore::RestoreHook>,
+    pub resources: RestoreResourcePolicy,
 }
 
 /// Configured semantics only. Host identity, run state and secret scopes are absent.
@@ -188,7 +248,18 @@ pub async fn preflight_restore_snapshot(
     reference: &SnapshotRef,
     policy: &ExternalResourcePolicy,
 ) -> Result<(), LibVmError> {
+    if !crate::LiveObservationReader::open(config)?.catalog_exists()? {
+        crate::require_host_live_operation(
+            &crate::LiveCapabilityQuery::open(config)?
+                .host_report()
+                .await?,
+            vm_spec::live::LiveOperation::Restore,
+        )?;
+    }
     let record = crate::store::snapshot_store::observe_snapshot_record(config, reference).await?;
+    if matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+        return crate::machine::restore::preflight_execution(config, &record, policy).await;
+    }
     check_policy(&record.external_requirements, policy)?;
     let storage = storage_from_snapshot(&record)?;
     preflight_boot(
@@ -981,6 +1052,19 @@ async fn restore_owned(
     let preview = crate::store::observation::ObservationStore::existing(&store)
         .snapshot_record(&reference)
         .await?;
+    if matches!(preview.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+        return crate::machine::restore::restore_owned(runtime, reference, options, preview).await;
+    }
+    if options.activation_hook.is_some() {
+        return Err(invalid(
+            "activation hooks require a live execution checkpoint",
+        ));
+    }
+    if options.resources != RestoreResourcePolicy::default() {
+        return Err(invalid(
+            "restore resource policies require a live execution checkpoint",
+        ));
+    }
     check_policy(&preview.external_requirements, &options.external_resources)?;
     runtime.preflight_captured_lane(&storage_from_snapshot(&preview)?)?;
     let _names = runtime.lock_machine_names().await?;
@@ -1043,7 +1127,7 @@ async fn restore_owned(
     Ok(Machine::new(runtime, config.id))
 }
 
-struct OperationStaging {
+pub(crate) struct OperationStaging {
     parent: OwnedDirectory,
     name: String,
     _paths: crate::storage::pool::OperationPaths,
@@ -1051,7 +1135,11 @@ struct OperationStaging {
 }
 
 impl OperationStaging {
-    fn new(pool: &StoragePool, operation: Uuid, lease: &StorageLock) -> Result<Self, LibVmError> {
+    pub(crate) fn new(
+        pool: &StoragePool,
+        operation: Uuid,
+        lease: &StorageLock,
+    ) -> Result<Self, LibVmError> {
         let paths = pool.create_operation_with_lease(operation, lease.duplicate()?)?;
         let parent = paths
             .temporary
@@ -1065,6 +1153,11 @@ impl OperationStaging {
             _paths: paths,
             cleaned: false,
         })
+    }
+    pub(crate) fn directory(&self) -> Result<OwnedDirectory, LibVmError> {
+        self.parent
+            .open_dir(&self.name)?
+            .ok_or_else(|| invalid("operation staging disappeared"))
     }
 
     fn cleanup(&mut self) -> Result<(), LibVmError> {
@@ -1085,12 +1178,12 @@ impl Drop for OperationStaging {
     }
 }
 
-struct AuthenticatedStream {
-    file: File,
-    map: crate::storage::stream::StreamMap,
+pub(crate) struct AuthenticatedStream {
+    pub(crate) file: File,
+    pub(crate) map: crate::storage::stream::StreamMap,
 }
 
-fn open_immutable_stream(
+pub(crate) fn open_immutable_stream(
     pool: &StoragePool,
     stream: &crate::storage::identity::StreamId,
     length: u64,

@@ -50,7 +50,6 @@ service RuntimeService {
  rpc ParseResource(ParseResourceRequest) returns (Size);
  rpc NormalizePolicy(NormalizePolicyRequest) returns (PolicyDocument);
  rpc CheckPolicySecrets(CheckPolicySecretsRequest) returns (PolicySecretsResult);
- rpc RestoreExecution(LiveRestoreRequest) returns (google.protobuf.Empty);
  rpc RestoreSnapshot(RestoreStorageSnapshotRequest) returns (MachineSnapshot);
  rpc InspectStorageSnapshot(StorageSnapshotRef) returns (StorageSnapshotInfo);
  rpc ListStorageSnapshots(google.protobuf.Empty) returns (StorageSnapshotList);
@@ -250,7 +249,6 @@ enum MachineCaptureStage { MACHINE_CAPTURE_STAGE_UNSPECIFIED = 0; MACHINE_CAPTUR
 // UNSPECIFIED until the continuation is recorded.
 message MachineCapture { string capture_id = 1; string run_id = 2; CaptureResumePolicy resume_policy = 3; CapturePauseDisposition pause = 4; MachineCaptureStage stage = 5; optional string snapshot_id = 6; CaptureSourceOutcome source_outcome = 7; string staging = 8; }
 message LiveForkRequest { MachineRef machine = 1; optional string name = 2; }
-message LiveRestoreRequest { bytes checkpoint = 1; optional string name = 2; }
 // Stopped artifacts are distinct from MachineSnapshot, the observational read model.
 message StorageSnapshotRef { oneof reference { string id = 1; string image_alias = 2; } }
 message ExternalResourceKey { oneof resource { uint32 disk_order = 1; string share_tag = 2; } }
@@ -261,7 +259,11 @@ message StoppedForkRequest { MachineRef machine = 1; optional string name = 2; E
 // Creation records external requirements, never destination host mappings.
 // external_resources accepts only reject or require_mappings on this RPC.
 message CreateStorageSnapshotRequest { MachineRef machine = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
-message RestoreStorageSnapshotRequest { StorageSnapshotRef snapshot = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; }
+message RestoreActivationHook { repeated string argv = 1; repeated EnvironmentPair environment = 2; string working_directory = 3; optional uint32 timeout_ms = 4; }
+// Absence of resources selects the safe defaults (25% private writes, no overcommit).
+enum RestoreMemoryPolicy { RESTORE_MEMORY_POLICY_UNSPECIFIED = 0; RESTORE_MEMORY_POLICY_RESERVED = 1; RESTORE_MEMORY_POLICY_ALLOW_OVERCOMMIT = 2; }
+message RestoreResourcePolicy { uint32 private_write_percent = 1; RestoreMemoryPolicy memory = 2; }
+message RestoreStorageSnapshotRequest { StorageSnapshotRef snapshot = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; RestoreActivationHook activation_hook = 4; RestoreResourcePolicy resources = 5; }
 enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_KIND_STOPPED_STORAGE = 1; STORAGE_CAPTURE_KIND_LIVE_EXECUTION = 2; }
 // Capture provenance is catalog metadata outside snapshot identity.
 message SnapshotCaptureProvenance { string capture_id = 1; string machine_id = 2; string run_id = 3; string evidence_digest = 4; }

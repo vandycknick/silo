@@ -28,6 +28,10 @@ pub(crate) struct VmmStartRequest {
     pub(crate) asset_directory: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_budget_ms: Option<u64>,
+    /// ADR 0018 restore inputs: descriptor-only, capability-gated. Present
+    /// only on a restore launch; never a cold-start modifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore: Option<vm_spec::restore::RestoreRequest>,
 }
 
 /// Explicit virtualization backend selection carried in the start request.
@@ -241,7 +245,52 @@ fn validate_start_request(
     {
         return Err(invalid_data("assetDirectory must be an absolute path"));
     }
+    if let Some(restore) = &request.restore {
+        restore.validate().map_err(invalid_data)?;
+        if request.startup_command.is_some() {
+            return Err(invalid_data(
+                "a restore launch continues the captured workload; it has no startup command",
+            ));
+        }
+        if request
+            .virt_backend
+            .as_ref()
+            .is_some_and(|backend| backend.kind != "krun")
+        {
+            return Err(invalid_data("restore requires the krun backend"));
+        }
+        if restore.evidence.machine_id.as_str() == request.machine_id
+            || restore.evidence.run_id.as_str() == request.machine_run_id
+        {
+            return Err(invalid_data(
+                "a restore launch needs a new machine and run identity",
+            ));
+        }
+        destination_ssh_ca(restore.ssh_trusted_ca.as_deref())?;
+    }
     Ok(request)
+}
+
+/// The guest's bound on one OpenSSH public key line.
+const MAX_SSH_CA_BYTES: usize = 1024;
+
+/// The destination's public SSH CA a restore launch hands the guest in
+/// Activate: one OpenSSH Ed25519 public key line, admitted by the same rule
+/// the guest applies. Only pre-allocation inspection may omit it.
+pub(crate) fn destination_ssh_ca(value: Option<&str>) -> io::Result<&str> {
+    let value =
+        value.ok_or_else(|| invalid_data("a restore launch requires restore.sshTrustedCa"))?;
+    if value.len() > MAX_SSH_CA_BYTES || value.trim().contains(['\n', '\r']) {
+        return Err(invalid_data(
+            "restore.sshTrustedCa must be one OpenSSH public key line of at most 1024 bytes",
+        ));
+    }
+    let key = russh::keys::PublicKey::from_openssh(value)
+        .map_err(|error| invalid_data(format!("restore.sshTrustedCa: {error}")))?;
+    if key.algorithm() != russh::keys::ssh_key::Algorithm::Ed25519 {
+        return Err(invalid_data("restore.sshTrustedCa must be an Ed25519 key"));
+    }
+    Ok(value)
 }
 
 impl VmmStartRequest {
@@ -352,8 +401,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::start_request::{
-        decode_start_request, RosettaIntentRequest, StartRequestPipe, VMM_START_REQUEST_MAX_BYTES,
-        VMM_START_REQUEST_VERSION,
+        decode_start_request, destination_ssh_ca, RosettaIntentRequest, StartRequestPipe,
+        VMM_START_REQUEST_MAX_BYTES, VMM_START_REQUEST_VERSION,
     };
 
     #[tokio::test]
@@ -761,5 +810,29 @@ mod tests {
         let mut bytes = serde_json::to_vec(&wrong).unwrap();
         bytes.push(b'\n');
         assert!(decode_start_request(&bytes, &machine, &run).is_err());
+    }
+
+    #[test]
+    fn restore_launch_admits_only_one_destination_ed25519_ca_line() {
+        let private = russh::keys::PrivateKey::from(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]),
+        );
+        let ed25519 = private.public_key().to_openssh().unwrap();
+        assert_eq!(destination_ssh_ca(Some(&ed25519)).unwrap(), ed25519);
+        // Only pre-allocation inspection may omit it; a launch never does.
+        assert!(destination_ssh_ca(None).is_err());
+        for invalid in [
+            String::new(),
+            "not a key".to_string(),
+            format!("{ed25519}\n{ed25519}"),
+            format!("{ed25519} {}", "c".repeat(1024)),
+            // A private key is never trust.
+            private
+                .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        ] {
+            assert!(destination_ssh_ca(Some(&invalid)).is_err(), "{invalid:?}");
+        }
     }
 }

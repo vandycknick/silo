@@ -24,6 +24,8 @@ pub(crate) struct VmmStartRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     asset_directory: Option<std::path::PathBuf>,
     startup_budget_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore: Option<vm_spec::restore::RestoreRequest>,
 }
 
 /// Explicit virtualization backend selection.
@@ -94,6 +96,7 @@ impl VmmStartRequest {
             rosetta_intent: None,
             asset_directory: None,
             startup_budget_ms,
+            restore: None,
         }
     }
 
@@ -115,6 +118,14 @@ impl VmmStartRequest {
         self
     }
 
+    pub(crate) fn with_restore(
+        mut self,
+        restore: Option<vm_spec::restore::RestoreRequest>,
+    ) -> Self {
+        self.restore = restore;
+        self
+    }
+
     pub(crate) fn with_startup_budget(mut self, budget: std::time::Duration) -> Self {
         self.startup_budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
         self
@@ -131,6 +142,17 @@ pub(crate) fn encode_start_request(request: &VmmStartRequest) -> io::Result<Vec<
                 .validate_binding(&request.machine_id, &request.machine_run_id)
         })
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if let Some(restore) = &request.restore {
+        restore
+            .validate()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        if request.startup_command.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "restore cannot replay a startup command",
+            ));
+        }
+    }
     let mut encoded = serde_json::to_vec(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     encoded.push(b'\n');

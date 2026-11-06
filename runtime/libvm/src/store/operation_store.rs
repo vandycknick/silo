@@ -24,6 +24,7 @@ pub(crate) struct RetainedStorageOperation {
     pub storage: MachineStorageRecord,
     pub disks: Vec<vm_spec::Disk>,
     pub external_resources: Vec<crate::ExternalResource>,
+    pub restore: Option<crate::store::restore::RestoreIntent>,
 }
 
 pub(crate) struct LaunchStorageLease {
@@ -70,6 +71,35 @@ fn validate_record(record: &RetainedStorageOperation) -> Result<(), LibVmError> 
     {
         return Err(invalid("invalid exact generation identity"));
     }
+    if let Some(restore) = &record.restore {
+        restore.validate()?;
+        if record.storage.snapshot != Some(restore.checkpoint)
+            || (record.admitted
+                && (restore.request.ssh_trusted_ca.is_none()
+                    || restore.network_attachment != restore.request.network.is_some()))
+        {
+            return Err(invalid(
+                "restore generation provenance or activation binding is incomplete",
+            ));
+        }
+        if record.disks.len() != restore.request.configuration.attachments.len()
+            || record
+                .disks
+                .iter()
+                .zip(&restore.request.configuration.attachments)
+                .any(|(disk, attachment)| {
+                    disk.block_id != attachment.block_id
+                        || disk.role != attachment.role
+                        || disk.format != attachment.format
+                        || disk.geometry != attachment.geometry
+                        || disk.read_only != attachment.read_only
+                })
+        {
+            return Err(invalid(
+                "restore generation attachments differ from the captured configuration",
+            ));
+        }
+    }
     for resource in &record.external_resources {
         let path = match resource {
             crate::ExternalResource::Disk { path, .. } => path,
@@ -81,7 +111,7 @@ fn validate_record(record: &RetainedStorageOperation) -> Result<(), LibVmError> 
     }
     Ok(())
 }
-fn encode(record: &RetainedStorageOperation) -> Result<String, LibVmError> {
+pub(crate) fn encode(record: &RetainedStorageOperation) -> Result<String, LibVmError> {
     validate_record(record)?;
     let json = serde_json::to_string(record).map_err(|error| invalid(error.to_string()))?;
     crate::storage::limits::Resource::MetadataPageBytes
@@ -737,7 +767,41 @@ impl Store {
             .fetch_one(&mut **tx)
             .await?;
             MachineStorageRecord::decode(&json)?.validate_for_machine(machine.into())?;
-            return Ok(None);
+            let construction: Option<String> = sqlx::query_scalar("SELECT json(construction_json) FROM restore_memory_reservation WHERE operation_id=?1 AND construction_json IS NOT NULL")
+                .bind(operation.to_string()).fetch_optional(&mut **tx).await?;
+            let construction = construction
+                .as_deref()
+                .map(serde_json::from_str::<crate::store::restore::RestoreConstruction>)
+                .transpose()
+                .map_err(invalid)?;
+            let launched: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE kind='launch' AND machine_id=?1)")
+                .bind(machine.to_string()).fetch_one(&mut **tx).await?;
+            let runtime = sqlx::query_as::<_, crate::store::row::DbMachineState>("SELECT machine_id,status,json(state_json) AS state_json FROM machine_state WHERE machine_id=?1")
+                .bind(machine.to_string()).fetch_optional(&mut **tx).await?;
+            let never_submitted = config.image_ref == "execution-restore"
+                && !launched
+                && construction.as_ref().is_some_and(|construction| {
+                    runtime
+                        .as_ref()
+                        .is_some_and(|crate::store::row::DbMachineState(state)| {
+                            state.status == crate::store::models::MachineRuntimeState::Restoring
+                                && state.vmm_pid.is_none()
+                                && state
+                                    .run_id
+                                    .as_deref()
+                                    .and_then(|run| Uuid::parse_str(run).ok())
+                                    == Some(construction.run_id)
+                        })
+                });
+            if !never_submitted {
+                return Ok(None);
+            }
+            // Generation registration always precedes submission. Retire a
+            // never-submitted child through the existing cleanup quarantine.
+            sqlx::query("DELETE FROM machine_config WHERE id=?1")
+                .bind(machine.to_string())
+                .execute(&mut **tx)
+                .await?;
         }
         let quarantine_path = parent_path.join(&quarantine_name);
         crate::store::ensure_cache_paths_unreferenced(tx, &[path, quarantine_path], &self.home)
@@ -1047,6 +1111,7 @@ impl Store {
                 tx.commit().await?;
             }
         }
+        self.reconcile_restore_budget().await?;
         Ok(report)
     }
 
@@ -1056,6 +1121,7 @@ impl Store {
         run_id: Uuid,
         storage: &MachineStorageRecord,
         spec: &vm_spec::VmSpec,
+        restore: Option<&crate::store::restore::RestoreIntent>,
     ) -> Result<LaunchStorageLease, LibVmError> {
         storage.validate_for_machine(machine_id.into())?;
         preflight_launch_storage(storage, spec, &self.images_dir)?;
@@ -1086,6 +1152,7 @@ impl Store {
                 .map(|storage| storage.disks.clone())
                 .unwrap_or_default(),
             external_resources,
+            restore: restore.cloned(),
         };
         let json = encode(&record)?;
         let generation = i64::try_from(record.storage_generation)
@@ -1141,6 +1208,27 @@ impl Store {
             .bind(object.to_string())
             .execute(&mut *tx)
             .await?;
+        }
+        if let Some(restore) = restore {
+            restore.validate()?;
+            let consumer: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='import')")
+                .bind(restore.consumer_operation.to_string()).fetch_one(&mut *tx).await?;
+            if !consumer {
+                return Err(invalid(
+                    "restore verification consumer disappeared before generation handoff",
+                ));
+            }
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2")
+                .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2")
+                .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            let reservation = sqlx::query("UPDATE restore_memory_reservation SET operation_id=?1 WHERE operation_id=?2 AND construction_json IS NOT NULL")
+                .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            if reservation.rows_affected() != 1 {
+                return Err(invalid(
+                    "restore generation handoff lost its exact construction budget owner",
+                ));
+            }
         }
         tx.commit().await?;
         Ok(LaunchStorageLease { record, lease })
@@ -1249,6 +1337,8 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        drop(_roots);
+        self.reconcile_restore_budget().await?;
         Ok(true)
     }
 

@@ -102,6 +102,15 @@ exclusive-lease reconciliation before recording the terminal failure. A bounded
 timeout retains the operation pins and reports incomplete cleanup; it never
 converts a still-owned generation into reusable storage.
 
+Startup and failed-start cleanup identify the monitor only through the exact
+run's durable holder record: machine, run, operation and process birth identity.
+On Linux the authenticated pidfd carries later signals; the emergency
+process-group kill uses it on Linux 6.9 or newer and otherwise falls back to a
+leader-checked numeric group signal. A pidfile number, another run's holder or
+a reused PID never authorizes a signal. Without an authenticated monitor, the
+closed startup pipes cancel a pre-holder monitor and cleanup still waits on
+holder/lease evidence alone.
+
 Machine-owned directories are derived from the current catalog home and typed
 machine ID, not persisted absolute directory authority. Moving an entire
 current-format stopped home therefore changes the owned path without prefix
@@ -331,11 +340,12 @@ treated as a confirmed rollback.
 `Machine::fork_stopped(ForkOptions)` creates a new **stopped** machine from an
 opaque raw root or an admitted development flat-overlay root.
 `Machine::snapshot_stopped(SnapshotOptions)` captures an immutable opaque-raw
-checkpoint; `Runtime::restore_snapshot(SnapshotRef, RestoreOptions)` restores it
-to a new **stopped** machine. None of these APIs stops or starts a source, replays
-a journal, repairs a filesystem, resizes captured bytes, or rewrites guest UUIDs,
-machine IDs or keys. The source's actual reconciled Clean/Forced/Unknown outcome
-is retained; synchronizing files now cannot certify an earlier clean shutdown.
+checkpoint. `Runtime::restore_snapshot(SnapshotRef, RestoreOptions)` dispatches
+by the checkpoint's capture kind: stopped storage produces a new **stopped**
+machine, while a live checkpoint continues execution through paused construction
+and fenced activation. Neither path stops a source, replays a journal, repairs
+a filesystem or resizes captured bytes. A stopped source's reconciled
+Clean/Forced/Unknown outcome remains unchanged by synchronizing files now.
 
 All managed writable Data disks are included and become independent private
 files with fresh host disk IDs. Read-only and pinned boot dependencies remain
@@ -372,13 +382,88 @@ for exact reconciliation, not speculative rollback.
 Checkpoints preserve credentials, guest keys, dirty journals and deleted-data
 remnants exactly. They are not automatically generalized or safe public
 templates. Prepare a separate private fork explicitly before publishing prepared
-bytes. Execution operations remain separate: `fork_execution`,
-`restore_execution` and explicit CLI live intent retain the not-delivered refusal.
+bytes. `fork_execution` remains separately capability-gated.
 
-Flat-overlay roots are development artifacts, not publishable/snapshot images.
-Capture refuses them with `FlatOverlayPublicationUnsupported`; live capability
-bits remain unsupported. This profile is removed rather than migrated when its
-replacement is admitted. Existing state still requires an explicit user wipe.
+### Execution restore
+
+`silo restore <checkpoint> [--name CHILD]` accepts an `image:` reference or a
+checkpoint alias and uses the same typed API locally and through the daemon.
+Live restore first checks the selected host capability without initializing a
+writable runtime. A leased verification consumer authenticates the complete
+closure and locally recorded capture seal. The exact selected monitor executable
+then inspects inherited state/lower descriptors and the real host profile before
+any child directory, private disk or network reservation is created.
+
+Raw roots and writable Data disks become isolated private copies. Flat-overlay
+lowers remain read-only VMDK devices with an explicitly retained descriptor/extent
+closure; the generated descriptor is moved into the child without changing its
+inode. Source device IDs, order, format, access and geometry are preserved.
+The pinned kernel, base initramfs and agent remain retained; a destination
+composite initramfs is generated for provenance only, never loaded by restore.
+No cold boot, replacement assets, filesystem repair or resize is a fallback.
+
+The generation journal transaction pins every verification dependency before
+retiring the consumer and retains the exact checkpoint/run/activation intent,
+native inspection result, inspected executable digest and resource charges.
+Destination network bindings and a fresh child public SSH CA are persisted
+before submission. Source private CA material and external secret scopes are
+not copied. An optional bounded activation hook is selected with
+`RestoreOptions::activation_hook` or `--activation-hook` JSON containing
+`argv`, `environment`, `workingDirectory` and `timeoutMs` (at most 30,000).
+Stopped snapshots reject activation hooks rather than ignoring them.
+
+Memory admission reserves the immutable RAM baseline once per device/inode and
+private writes per child (25% by default), rounded up to the captured native
+granule, plus a separate page-table/native-state allowance. Select a per-child
+integer allowance from 0 through 100% with `RestoreOptions::resources` /
+`PrivateWriteAllowance::try_from(percent)` or `--private-write-percent PERCENT`.
+Zero explicitly reserves no private writes, not zero baseline or overhead.
+`RestoreMemoryPolicy::AllowOvercommit` / `--memory-overcommit` explicitly opts
+this restore into memory overcommit; the default is `Reserved` (no overcommit).
+The exact allowance and memory policy are retained and validated in the journal
+and shared ledger, including across reconciliation. Actual memory overcommit is
+also reported in the manager log. Nondefault resource policies, like activation
+hooks, require a live execution checkpoint.
+
+Full private-copy/provenance disk peaks are reserved even when a clone may
+succeed. Explicit memory overcommit never bypasses disk, descriptor, closure
+authentication or compatibility checks. Memory and disk reservations are
+serialized across runtime homes under one authenticated user's private
+`/tmp/silo-restore-budget-<euid>` ledger (`/private/tmp` on macOS). This is not
+cross-user or host-global authority. There is no fixed concurrent-restore limit,
+and admission never implicitly overcommits. Charges survive caller loss.
+Each ledger record is published by private staging, file fsync, atomic rename
+and directory fsync, after its SQL owner is committed. Readers see only complete
+old/new charges; abandoned `.atomic-write` staging is non-authoritative and is
+reclaimed under the admission lock. Malformed authoritative records still
+refuse admission. An interrupted construction-completion update conservatively
+retains the old disk peak until the owning home reconciles its committed charge.
+Construction disk peaks are released only after the exact run's durable Running
+receipt; shared-baseline and private-write charges remain until existing
+operation/lifecycle reconciliation proves holder and lease retirement.
+
+`restorePrepared` is not success. The manager waits for `started` only after
+fresh-generation acknowledgement, destination activation/thaw and final fence
+release. Failure uses the existing exact-generation stop/reap and holder/lease
+reconciliation, retaining uncertain ownership rather than launching again.
+An execution-restore child cannot be cold-started with `silo start`; retry the
+checkpoint with a fresh restore run. Inspection exposes `Restoring`, `Activating`
+and `ActivationFailed` without declaring readiness.
+
+After launch-request handoff, the restore manager waits for startup outside the
+machine mutation lock, while retaining its lifetime lock and storage lease.
+Normal stop can therefore signal the exact monitor during activation; final
+storage retirement still waits for all owners, including a suspended manager,
+to release their leases. Startup retains its original absolute deadline and
+owns its acknowledgement pipe until completion or cancellation. Before readiness
+or failed-start cleanup, the manager reacquires the mutation lock and
+reauthenticates the published run; a concurrent stop or replacement run cannot be
+overwritten by a late startup result.
+
+Production restore qualification remains lane-gated until the combined Phase 16
+milestone. Stopped snapshots still reject development flat-overlay publication;
+live capture/restore preserves its admitted read-only VMDK representation.
+Existing state still requires an explicit user wipe.
 
 
 The initial stream hash of a private root describes its creation bytes only.

@@ -26,6 +26,7 @@ pub const ENV_MACHINE_LOG_DIR: &str = "_VM_MACHINE_LOG_DIR";
 pub const ENV_MACHINE_LOCK: &str = "_VM_MACHINE_LOCK";
 pub const ENV_NETD_EXIT: &str = "_VM_NETD_EXIT";
 pub const ENV_STORAGE_LEASES: &str = "_VM_STORAGE_LEASES";
+pub const ENV_RESTORE_OBJECTS: &str = "_VM_RESTORE_OBJECTS";
 
 #[derive(Debug)]
 pub struct InheritedPipeFds {
@@ -35,6 +36,9 @@ pub struct InheritedPipeFds {
     pub machine_lock: Option<RawFd>,
     pub netd_exit: Option<RawFd>,
     pub storage_lease: Option<RawFd>,
+    /// Restore objects then each lower's descriptor and extents, in request
+    /// order. Validated read-only regular files, CLOEXEC from entry on.
+    pub restore: Vec<RawFd>,
 }
 
 impl InheritedPipeFds {
@@ -46,6 +50,9 @@ impl InheritedPipeFds {
             machine_lock: parse_env_fd(ENV_MACHINE_LOCK)?,
             netd_exit: parse_env_fd(ENV_NETD_EXIT)?,
             storage_lease: Some(parse_storage_lease_env()?),
+            restore: crate::restore::inputs::parse_env(
+                std::env::var_os(ENV_RESTORE_OBJECTS).as_deref(),
+            )?,
         };
         let mut seen = std::collections::BTreeSet::new();
         for fd in [
@@ -58,6 +65,7 @@ impl InheritedPipeFds {
         ]
         .into_iter()
         .flatten()
+        .chain(fds.restore.iter().copied())
         {
             eyre::ensure!(
                 fd > 2 && seen.insert(fd),
@@ -65,10 +73,24 @@ impl InheritedPipeFds {
             );
         }
         fds.validate_set()?;
-        for fd in fds.descriptors().into_iter().flatten() {
+        crate::restore::inputs::validate_inherited(
+            &fds.restore,
+            &fds.descriptors().into_iter().flatten().collect::<Vec<_>>(),
+        )?;
+        for fd in fds
+            .descriptors()
+            .into_iter()
+            .flatten()
+            .chain(fds.restore.iter().copied())
+        {
             set_cloexec(fd, true)?;
         }
         Ok(fds)
+    }
+
+    /// The inherited restore descriptor numbers, taken once.
+    pub fn take_restore(&mut self) -> Vec<RawFd> {
+        std::mem::take(&mut self.restore)
     }
 
     pub fn require_for_daemon(self) -> eyre::Result<Self> {
@@ -159,6 +181,7 @@ impl InheritedPipeFds {
     pub fn configure_reexec(&self, command: &mut std::process::Command) -> io::Result<()> {
         use std::os::unix::process::CommandExt;
         let descriptors = self.descriptors();
+        let restore = self.restore.clone();
         let mut ceiling =
             nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?
                 .0
@@ -200,7 +223,11 @@ impl InheritedPipeFds {
                         return Err(io::Error::last_os_error());
                     }
                 }
-                for raw in descriptors.into_iter().flatten() {
+                for raw in descriptors
+                    .into_iter()
+                    .flatten()
+                    .chain(restore.iter().copied())
+                {
                     let fd = BorrowedFd::borrow_raw(raw);
                     let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD)
                         .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
@@ -459,6 +486,8 @@ pub(crate) struct InitInputs<'a> {
     pub(crate) network_args: &'a [String],
     pub(crate) agent_enabled: bool,
     pub(crate) serial_file: File,
+    /// Inherited restore descriptor numbers, validated at entry, not adopted.
+    pub(crate) restore_fds: Vec<RawFd>,
 }
 
 pub(crate) struct InitResult {
@@ -468,6 +497,9 @@ pub(crate) struct InitResult {
     pub(crate) startup_deadline: tokio::time::Instant,
     pub(crate) startup_cancel: CancellationToken,
     pub(crate) require_guest_ready: bool,
+    /// A restored machine is prepared, parked and fenced: services run this
+    /// before anything is exposed or `started` is reported.
+    pub(crate) activation: Option<crate::restore::activation::Activation>,
 }
 
 pub async fn init(
@@ -484,19 +516,24 @@ pub async fn init(
         agent_enabled,
         serial_file,
         primary_machine,
+        restore_fds,
     } = inputs;
     let machine_uuid = crate::start_request::parse_uuid("machine ID", machine_id)?;
     let run_uuid = crate::start_request::parse_uuid("machine run ID", machine_run_id)?;
     let storage_lease = start_request.storage_lease()?;
-    let start_request = tokio::select! {
+    let mut start_request = tokio::select! {
         biased;
         () = startup_cancel.cancelled() => return Err(eyre::eyre!("startup cancelled before launch request")),
         result = start_request.read(machine_id, machine_run_id) => result?,
     };
+    eyre::ensure!(
+        start_request.restore.is_some() || restore_fds.is_empty(),
+        "inherited restore descriptors require a restore start request"
+    );
     let startup_deadline = tokio::time::Instant::now()
         + std::time::Duration::from_millis(start_request.effective_startup_budget_ms());
     let shutdown_state = Arc::new(
-        crate::guest::shutdown::ShutdownState::new(start_request.storage_shutdown)
+        crate::guest::shutdown::ShutdownState::new(start_request.storage_shutdown.clone())
             .map_err(eyre::Report::msg)?,
     );
     let spec = load_spec(runtime)?;
@@ -511,6 +548,18 @@ pub async fn init(
     let backend_selection =
         crate::capabilities::ResolvedSelection::from_start(start_request.virt_backend.as_ref())?;
     let selected_backend = backend_selection.backend_kind()?;
+    if let Some(restore) = &start_request.restore {
+        validate_restore_destination(
+            RestoreDestination {
+                configuration: &restore.configuration,
+                network: restore.network.as_ref(),
+            },
+            &spec,
+            &network,
+            selected_backend,
+            guest_services_enabled,
+        )?;
+    }
     let rosetta_intent = resolve_rosetta_intent(
         &spec,
         selected_backend,
@@ -535,13 +584,15 @@ pub async fn init(
     secure_machine_dir(runtime.runtime_dir())?;
     remove_stale_socket(runtime.socket())?;
 
-    let prepared_vsock = vm_spec::effective_vsock_filename(spec.vsock.as_ref())
+    let vsock_filename = vm_spec::effective_vsock_filename(spec.vsock.as_ref());
+    // A restored machine binds its public vsock surface only after Activate.
+    let prepared_vsock = vsock_filename
+        .filter(|_| start_request.restore.is_none())
         .map(|filename| {
             crate::vsock::PreparedVsockSurface::prepare(runtime.runtime_dir(), filename)
         })
         .transpose()?;
-    let mux_filename =
-        vm_spec::effective_vsock_filename(spec.vsock.as_ref()).and_then(|path| path.to_str());
+    let mux_filename = vsock_filename.and_then(|path| path.to_str());
     let mut machine_config = vm_spec_machine_config(VmSpecInputs {
         name,
         id: machine_id,
@@ -562,13 +613,38 @@ pub async fn init(
             binding: start_request.storage_lease,
             lease: storage_lease,
         });
+    let host_live = backend_selection.host_report()?;
+    // Adopt the inherited state objects only once every destination check
+    // passed; a refusal adopts nothing and no guest instruction runs.
+    let activation = match start_request.restore.take() {
+        Some(request) => {
+            require_restore_capability(&host_live)?;
+            let activation = crate::restore::activation::Activation::new(
+                request.clone(),
+                machine_uuid,
+                run_uuid,
+                &start_request.storage_shutdown,
+                vsock_filename.map(Path::to_path_buf),
+            )?;
+            let files = crate::restore::inputs::adopt(restore_fds, &request)
+                .map_err(|error| eyre::eyre!("adopt inherited restore descriptors: {error}"))?;
+            machine_config.config =
+                machine_config
+                    .config
+                    .with_restore(crate::virt::RestoreLaunch {
+                        request,
+                        files: Arc::new(files),
+                    });
+            Some(activation)
+        }
+        None => None,
+    };
     #[cfg(feature = "mock-backend")]
     let machine_config = {
         let mut machine_config = machine_config;
         backend_selection.configure_mock(&mut machine_config.config);
         machine_config
     };
-    let host_live = backend_selection.host_report()?;
     let machine_live = backend_selection.machine_vector(host_live.live, &machine_config.config);
     // The run's capture identity: the same path-free configuration projection
     // libvm computes from this spec, bound to the inherited launch lease.
@@ -602,6 +678,11 @@ pub async fn init(
     let (machine, park_timeout) = create_virtual_machine(selected_backend, machine_config.config)?;
     primary_machine.set(machine.clone(), shutdown_state.clone())?;
     let live_gate = crate::live::gate::LiveGate::new();
+    if activation.is_some() {
+        // Host admission is closed from the first moment of a restore: no
+        // service, listener or session is admitted before the exposure commit.
+        live_gate.close();
+    }
     let live = crate::live::coordinator::LiveCoordinator::new(
         machine_uuid,
         run_uuid,
@@ -612,14 +693,25 @@ pub async fn init(
         capture_context,
     )
     .map_err(eyre::Report::msg)?;
-    let forwards = crate::forward::ForwardTable::prepare_machine(
-        &spec.forwards,
-        runtime.runtime_dir(),
-        mux_filename,
-        park_timeout,
-        live_gate,
-    )
-    .await?;
+    let forwards = if activation.is_some() {
+        crate::forward::ForwardTable::prepare_restored_machine(
+            &spec.forwards,
+            runtime.runtime_dir(),
+            mux_filename,
+            park_timeout,
+            live_gate,
+        )
+        .await?
+    } else {
+        crate::forward::ForwardTable::prepare_machine(
+            &spec.forwards,
+            runtime.runtime_dir(),
+            mux_filename,
+            park_timeout,
+            live_gate,
+        )
+        .await?
+    };
     if !guest_services_enabled {
         forwards.set_agent_availability(crate::forward::GuestHalfAvailability::Unsupported);
     }
@@ -635,7 +727,11 @@ pub async fn init(
         }
     }
 
-    store.set_vm_state(VmState::Starting, "vm starting")?;
+    if activation.is_some() {
+        store.set_vm_state(VmState::Restoring, "vm restoring")?;
+    } else {
+        store.set_vm_state(VmState::Starting, "vm starting")?;
+    }
     let registration = tokio::select! {
         biased;
         () = startup_cancel.cancelled() => Err(eyre::eyre!("forward registration cancelled")),
@@ -660,6 +756,33 @@ pub async fn init(
     }
     if let Err(error) = machine.ensure_alive().await {
         return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
+    }
+    if let Some(activation) = activation {
+        // The backend returned at the native prepared barrier: installed,
+        // parked and fenced. Nothing is exposed until activation commits.
+        tracing::info!(activation = %activation.activation_id(), "restore prepared");
+        publish_host_memory_reclaim(&machine, &store);
+        return Ok(InitResult {
+            context: DaemonContext {
+                machine_id: machine_uuid,
+                machine_run_id: run_uuid,
+                guest_services_enabled,
+                machine,
+                serial_console,
+                store,
+                forwards,
+                stop_requested: CancellationToken::new(),
+                shutdown: CancellationToken::new(),
+                shutdown_state,
+                live,
+            },
+            startup_command: None,
+            vsock_surface: None,
+            startup_deadline,
+            startup_cancel,
+            require_guest_ready: false,
+            activation: Some(activation),
+        });
     }
     let vsock_surface = match prepared_vsock {
         Some(prepared) => {
@@ -712,6 +835,7 @@ pub async fn init(
             rosetta_intent,
             crate::virt::RosettaIntent::KrunCaptured { .. }
         ),
+        activation: None,
     })
 }
 
@@ -832,6 +956,64 @@ fn load_spec(runtime: &RuntimeContext) -> eyre::Result<VmSpec> {
         .wrap_err_with(|| format!("read vm spec at {}", runtime.config().display()))?;
     serde_json::from_str(&raw)
         .map_err(|err| eyre::eyre!("parse vm spec at {}: {}", runtime.config().display(), err))
+}
+
+/// What a restore request pins about the destination launch.
+struct RestoreDestination<'a> {
+    configuration: &'a vm_spec::capture::CaptureConfiguration,
+    network: Option<&'a vm_spec::restore::RestoreNetwork>,
+}
+
+/// A restore continues the captured machine: the destination launch keeps
+/// every captured execution pin, attaches the network the request
+/// authorizes (and only that one) and runs the agent that activates it.
+fn validate_restore_destination(
+    destination: RestoreDestination<'_>,
+    spec: &VmSpec,
+    network: &RuntimeNetwork,
+    backend: crate::virt::BackendKind,
+    agent_enabled: bool,
+) -> eyre::Result<()> {
+    eyre::ensure!(
+        backend == crate::virt::BackendKind::Krun,
+        "restore requires the krun backend"
+    );
+    eyre::ensure!(agent_enabled, "restore activation requires the guest agent");
+    let configuration =
+        vm_spec::capture::CaptureConfiguration::from_spec(spec).map_err(eyre::Report::msg)?;
+    eyre::ensure!(
+        &configuration == destination.configuration,
+        "destination launch changed the captured execution configuration"
+    );
+    match (network, destination.network) {
+        (RuntimeNetwork::None, None) => Ok(()),
+        (RuntimeNetwork::UnixDatagram { mac, .. }, Some(authorized))
+            if mac.eq_ignore_ascii_case(&authorized.mac) =>
+        {
+            Ok(())
+        }
+        (RuntimeNetwork::UnixDatagram { .. }, Some(_)) => Err(eyre::eyre!(
+            "restore destination network MAC differs from the attached network"
+        )),
+        _ => Err(eyre::eyre!(
+            "restore destination network must be attached exactly when the request authorizes it"
+        )),
+    }
+}
+
+/// Same admission the manager applied before allocation, re-evaluated by
+/// the executable actually running the restore.
+fn require_restore_capability(report: &vm_spec::live::LiveHostReport) -> eyre::Result<()> {
+    match &report
+        .live
+        .get(vm_spec::live::LiveOperation::Restore)
+        .availability
+    {
+        vm_spec::live::LiveAvailability::Supported => Ok(()),
+        vm_spec::live::LiveAvailability::Unsupported { reason } => Err(eyre::eyre!(
+            "restore is unsupported on this host: {reason:?}"
+        )),
+    }
 }
 
 fn parse_network_args(values: &[String]) -> eyre::Result<RuntimeNetwork> {
@@ -989,6 +1171,7 @@ mod tests {
                     network_args: &[],
                     agent_enabled: false,
                     serial_file: std::fs::File::open("/dev/null").expect("null"),
+                    restore_fds: Vec::new(),
                 },
                 &mut request,
                 tokio_util::sync::CancellationToken::new(),
@@ -1155,6 +1338,7 @@ mod tests {
                 network_args: &network,
                 agent_enabled: false,
                 serial_file,
+                restore_fds: Vec::new(),
             },
             &mut start_request,
             tokio_util::sync::CancellationToken::new(),
@@ -1181,7 +1365,8 @@ mod tests {
             "machineId": uuid::Uuid::new_v4().to_string(),
             "machineRunId": run_id,
         }));
-        let mismatch_error = init_error_for_start_request(mismatch, &machine_id, &run_id).await;
+        let mismatch_error =
+            init_error_for_start_request(mismatch, &machine_id, &run_id, Vec::new()).await;
         assert!(mismatch_error.contains("machineId does not match --id"));
         assert!(!mismatch_error.contains("read vm spec"));
 
@@ -1201,24 +1386,159 @@ mod tests {
         let mut exact = base.clone();
         exact["startupCommand"]["process"]["environment"][0]["value"] =
             serde_json::json!("x".repeat(VMM_START_REQUEST_MAX_BYTES - base_len));
-        let exact_error =
-            init_error_for_start_request(encode_start_request(exact), &machine_id, &run_id).await;
+        let exact_error = init_error_for_start_request(
+            encode_start_request(exact),
+            &machine_id,
+            &run_id,
+            Vec::new(),
+        )
+        .await;
         assert!(exact_error.contains("read vm spec"));
 
         let mut oversized = base;
         oversized["startupCommand"]["process"]["environment"][0]["value"] =
             serde_json::json!("x".repeat(VMM_START_REQUEST_MAX_BYTES - base_len + 1));
-        let oversized_error =
-            init_error_for_start_request(encode_start_request(oversized), &machine_id, &run_id)
-                .await;
+        let oversized_error = init_error_for_start_request(
+            encode_start_request(oversized),
+            &machine_id,
+            &run_id,
+            Vec::new(),
+        )
+        .await;
         assert!(oversized_error.contains("exceeds 16777216 bytes"));
         assert!(!oversized_error.contains("read vm spec"));
+    }
+
+    #[tokio::test]
+    async fn inherited_restore_descriptors_need_a_restore_request_before_vm_spec() {
+        use crate::start_request::VMM_START_REQUEST_VERSION;
+
+        let machine_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let idle = encode_start_request(serde_json::json!({
+            "version": VMM_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+        }));
+        // Numbers only: nothing is adopted, so no descriptor is touched.
+        let error = init_error_for_start_request(idle, &machine_id, &run_id, vec![900]).await;
+        assert!(
+            error.contains("inherited restore descriptors require a restore start request"),
+            "{error}"
+        );
+        assert!(!error.contains("read vm spec"), "{error}");
+    }
+
+    #[test]
+    fn restore_destination_keeps_captured_pins_and_authorized_network_only() {
+        use crate::startup::{validate_restore_destination, RestoreDestination};
+        use crate::virt::BackendKind;
+
+        let spec = vm_spec::VmSpec::current();
+        let pins = vm_spec::capture::CaptureConfiguration::from_spec(&spec).unwrap();
+        let authorized = vm_spec::restore::RestoreNetwork {
+            mac: "52:54:00:12:34:56".into(),
+            ipv4: "10.0.0.2".parse().unwrap(),
+            prefix_length: 24,
+            gateway: "10.0.0.1".parse().unwrap(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+        };
+        let attached = |mac: &str| RuntimeNetwork::UnixDatagram {
+            path: PathBuf::from("/run/netd.sock"),
+            mac: mac.into(),
+        };
+        let check = |pins: &vm_spec::capture::CaptureConfiguration,
+                     network: Option<&vm_spec::restore::RestoreNetwork>,
+                     runtime: &RuntimeNetwork,
+                     backend: BackendKind,
+                     agent: bool| {
+            validate_restore_destination(
+                RestoreDestination {
+                    configuration: pins,
+                    network,
+                },
+                &spec,
+                runtime,
+                backend,
+                agent,
+            )
+        };
+
+        check(&pins, None, &RuntimeNetwork::None, BackendKind::Krun, true).unwrap();
+        check(
+            &pins,
+            Some(&authorized),
+            &attached("52:54:00:12:34:56"),
+            BackendKind::Krun,
+            true,
+        )
+        .unwrap();
+        check(
+            &pins,
+            Some(&authorized),
+            &attached("52:54:00:12:34:56".to_uppercase().as_str()),
+            BackendKind::Krun,
+            true,
+        )
+        .unwrap();
+
+        let refusals = [
+            check(&pins, None, &RuntimeNetwork::None, BackendKind::Vz, true),
+            check(&pins, None, &RuntimeNetwork::None, BackendKind::Krun, false),
+            check(
+                &pins,
+                Some(&authorized),
+                &attached("52:54:00:12:34:57"),
+                BackendKind::Krun,
+                true,
+            ),
+            // Attached but not authorized, and authorized but not attached.
+            check(
+                &pins,
+                None,
+                &attached("52:54:00:12:34:56"),
+                BackendKind::Krun,
+                true,
+            ),
+            check(
+                &pins,
+                Some(&authorized),
+                &RuntimeNetwork::None,
+                BackendKind::Krun,
+                true,
+            ),
+            check(
+                &vm_spec::capture::CaptureConfiguration {
+                    cpus: pins.cpus.wrapping_add(1),
+                    ..pins.clone()
+                },
+                None,
+                &RuntimeNetwork::None,
+                BackendKind::Krun,
+                true,
+            ),
+            check(
+                &vm_spec::capture::CaptureConfiguration {
+                    memory_mib: pins.memory_mib + 1,
+                    ..pins.clone()
+                },
+                None,
+                &RuntimeNetwork::None,
+                BackendKind::Krun,
+                true,
+            ),
+        ];
+        for (index, refusal) in refusals.into_iter().enumerate() {
+            assert!(refusal.is_err(), "case {index} was admitted");
+        }
     }
 
     async fn init_error_for_start_request(
         encoded: Vec<u8>,
         machine_id: &str,
         run_id: &str,
+        restore_fds: Vec<std::os::fd::RawFd>,
     ) -> String {
         use crate::context::RuntimeContext;
         use crate::start_request::StartRequestPipe;
@@ -1281,6 +1601,7 @@ mod tests {
                 network_args: &network,
                 agent_enabled: false,
                 serial_file,
+                restore_fds,
             },
             &mut start_request,
             tokio_util::sync::CancellationToken::new(),
@@ -1328,6 +1649,7 @@ mod tests {
             machine_lock: None,
             netd_exit: None,
             storage_lease: None,
+            restore: Vec::new(),
         };
         let mut child = std::process::Command::new("/bin/sh");
         child.arg("-c").arg(format!(
@@ -1363,6 +1685,7 @@ mod tests {
             machine_lock: None,
             netd_exit: Some(fd),
             storage_lease: None,
+            restore: Vec::new(),
         };
         let lease = inherited
             .take_netd_exit()
@@ -1416,6 +1739,7 @@ mod tests {
             machine_lock: None,
             netd_exit: None,
             storage_lease: None,
+            restore: Vec::new(),
         };
         let script = format!(
             "IFS= read -r line <&{}; printf 'received:%s\\n' \"$line\" >&{}",
@@ -1644,6 +1968,7 @@ mod tests {
             machine_lock: Some(duplicate.as_raw_fd()),
             netd_exit: None,
             storage_lease: Some(lease.as_raw_fd()),
+            restore: Vec::new(),
         };
         assert!(
             inherited.validate_set().is_err(),

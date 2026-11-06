@@ -13,6 +13,7 @@ pub(crate) mod models;
 mod network_store;
 pub(crate) mod observation;
 pub(crate) mod operation_store;
+pub(crate) mod restore;
 mod row;
 pub(crate) mod snapshot_store;
 #[path = "store.rs"]

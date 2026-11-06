@@ -243,6 +243,51 @@ Reconciliation can publish a durable cut even when source continuation is
 unknown; uncertainty does not authorize releasing a live owner's storage.
 Terminal staging reclamation preserves the capture evidence separately.
 
+## Execution Restore Ownership
+
+Restore verifies the retained checkpoint closure and native compatibility before
+allocating a child. The worker reconstructs private RAM mappings and disk
+attachments from held descriptors, starts paused, and keeps network and vsock
+providers fenced. Activation requires the exact fresh VM-generation
+acknowledgement, destination guest identity and SSH CA, listener preparation,
+and exact Thaw acknowledgement before native exposure commits.
+
+Pre-allocation inspection requires all four state descriptors, including RAM,
+to be read-only buffered regular files with their declared identities and sizes.
+It uses the same descriptor admission checks as launch, before native compatibility
+inspection, so inspection cannot approve writable RAM that launch would reject.
+
+All fallible preparation precedes the shared native exposure commit. Its
+deadline is bounded by the original startup deadline. After confirmed exposure,
+the monitor publishes `Running` and reports startup directly, without entering
+cold-start readiness checks or running a cold-start command. Lost release or
+startup-report evidence is terminal uncertainty, not proof that the child stayed
+fenced; cleanup retains ownership until the child is positively reaped.
+
+Before exposure, an activation failure permits only inspection and stop when
+the child is positively parked and fenced. Otherwise the child is reaped.
+Neither path silently falls back to cold boot.
+
+Activation observes the backend's retained terminal result alongside the guest
+protocol sequence. Worker death terminates activation without waiting for the
+startup deadline; cleanup still retains the normal backend reap owner. Manager
+death before startup acknowledgement cancels startup rather than authorizing
+an independently running child.
+
+Inspection may observe the same live run while the restore manager holds the
+mutation lock. It authenticates the monitor status against that run and does
+not write the observation back to the catalog. Terminal reconciliation still
+requires exclusion from concurrent machine mutation.
+
+After handing the restore request to the monitor, the manager releases mutation
+authority while waiting for startup. It retains its lifetime and storage leases,
+then reacquires mutation authority and authenticates the same run before
+publishing readiness or cleaning up failure. Concurrent stop can terminate the
+child without manager progress; final storage retirement also waits for the
+manager's lease to close. A replaced or stopping run supersedes the startup waiter.
+New live commands reject inadmissible lifecycle states before acquiring mutation
+authority; exact request replays retain their existing durable semantics.
+
 ## Exit Runner
 
 When `--exit-command` is given, `main()` forks an idle runner immediately after

@@ -8,13 +8,12 @@ import json
 import os
 from pathlib import Path
 import selectors
-import shutil
 import signal
 import subprocess
 
 import pytest
 
-from silo_smoke import images, overlay, procs, shutdown, stopped
+from silo_smoke import image_cache, images, overlay, procs, shutdown, stopped
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
@@ -24,13 +23,16 @@ pytestmark = pytest.mark.linux_only
 
 
 @pytest.fixture
-def stopped_silo(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.FixtureRequest) -> Generator[Silo, None, None]:
+def stopped_silo(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_caches: dict[str, Path], request: pytest.FixtureRequest) -> Generator[Silo, None, None]:
     supplied = os.environ.get("SILO_SMOKE_STOPPED_DIR")
     parent = Path(supplied) if supplied else None
     if parent is not None:
         assert parent.is_absolute() and parent.is_dir(), "SILO_SMOKE_STOPPED_DIR must name an existing mounted writable directory"
     workspace = Workspace(config, registry.ca_path, parent=parent, runtime_parent=Path("/tmp") if parent is not None else None)
     try:
+        seeded = image_cache.seed(overlay_image_caches["stopped"], workspace.silo_home)
+        assert len(seeded) == 1, seeded
+        workspace.record("image-cache", f"seeded session-prepared stopped image: {sorted(seeded)}\n")
         yield Silo(workspace)
     finally:
         # Pytest records call failure before fixture teardown. Keep all evidence
@@ -237,7 +239,7 @@ def test_stopped_host_ext4_fork_requires_actual_mount(stopped_silo: Silo, stoppe
 def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo, stopped_image: str, custom_boot: bool) -> None:
     silo = stopped_silo
     private_runtime = silo.ws.root / "private-runtime"
-    shutil.copytree(silo.ws.config.runtime_dir, private_runtime)
+    overlay.copy_runtime(silo.ws.config.runtime_dir, private_runtime)
     silo.ws.config = replace(silo.ws.config, runtime_dir=private_runtime)
     userdata = silo.ws.root / "userdata"
     userdata.write_text("#!/bin/sh\nprintf 'captured-host\\n' >/etc/hostname\n")
@@ -478,3 +480,18 @@ def test_stopped_fork_real_syscall_failure_never_publishes_partial_child(stopped
     retried = stopped.backing(silo, "retry-complete", "retry-complete")
     stopped.same_content(baseline, retried)
     stopped.independent(baseline, retried)
+
+
+def test_stopped_prepared_image_catalog_has_no_extra_retention_roots(stopped_silo: Silo, stopped_image: str) -> None:
+    home = stopped_silo.ws.silo_home
+    assert not (home / "machines").exists()
+    assert not (home / "images/locks").exists()
+    assert not (home / "images/tmp").exists()
+    assert procs.query(home / "state.db", "SELECT requested_reference FROM image_ref") == [(stopped_image,)]
+    for table in ("machine_config", "storage_operation", "storage_snapshot", "storage_operation_stream", "storage_operation_object", "storage_operation_layer"):
+        assert procs.query(home / "state.db", f"SELECT COUNT(*) FROM {table}") == [("0",)], table
+    paths = procs.query(home / "state.db", "SELECT rootfs_path FROM image_rootfs_artifact")
+    assert len(paths) == 1
+    root = Path(paths[0][0])
+    assert root.is_relative_to(home / "images/streams/sha256") and root.is_file()
+    assert stopped_silo.ls() == []

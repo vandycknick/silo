@@ -16,7 +16,13 @@ use vm_spec::live::{
 };
 
 pub(crate) const MAX_SCENARIO_BYTES: usize = 1024 * 1024;
-const DELIVERED: &[LiveOperation] = &[LiveOperation::Pause, LiveOperation::Capture];
+/// Implemented end to end in this build. Delivery alone never supports an
+/// operation: the lane still needs its qualification grant.
+const DELIVERED: &[LiveOperation] = &[
+    LiveOperation::Pause,
+    LiveOperation::Capture,
+    LiveOperation::Restore,
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "silo-vmm capabilities")]
@@ -424,10 +430,10 @@ struct Qualification<'a> {
 
 // Supervisor-verified real CLI/guest pause, ClockOnly resume and paused stop.
 const QUALIFICATIONS: &[Qualification<'static>] = &[Qualification {
-    binding: "v2:native=cee352b50faefbb8c823c2b0a54dd5dd8019760f4b9475227f9a593c21bf3a80:binding=0fdb83bfc5241b5adecce22fac28eb1be34efd3a2a4e055e547844f2b8aefdf9:eligible=true",
+    binding: "v2:native=a1ac21c2a3c03ee599502de856b1a9744da7e63eb9196138f6d954df7f47f097:binding=1cdbd73fa146ff3b286421633254582aab2f216d176c2d779b758edb4351a3fa:eligible=true",
     lane: LiveLane::KvmX86_64,
     operations: &[LiveOperation::Pause],
-    evidence: "phase-14/pause-requalification.xml; worker, coordinator and durable-manager gates",
+    evidence: "phase-15/pause-requalification.xml; worker, coordinator and durable-manager gates",
 }];
 
 fn qualification_matches(

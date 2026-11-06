@@ -47,9 +47,8 @@ pub struct Control {
     handle: std::sync::Arc<libkrun::VmmHandle>,
 }
 
-// The worker lifecycle server consumes pause, cancel, ClockOnly resume,
-// capture, preserve and observation; restore controls remain unused until
-// restore is delivered.
+// The worker consumes every control except stop, the generation snapshot and
+// the baseline query, which only the standalone native witness drives.
 #[allow(dead_code)]
 impl Control {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -262,6 +261,21 @@ impl Control {
     ) -> Result<(), LiveError> {
         self.handle
             .set_capture_profile(profile, operation, deadline)
+    }
+
+    /// Candidate-only native IRQ witness access; never part of a normal build.
+    #[cfg(all(
+        feature = "restore-irq-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub fn irq_probe(
+        &self,
+        request: libkrun::live::irq_probe::ProbeRequest,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<libkrun::live::irq_probe::ProbeObservation, LiveError> {
+        self.handle.irq_probe(request, operation, deadline)
     }
 }
 
@@ -497,7 +511,7 @@ pub fn run_process(
                             ),
                         };
                         NetDevice::new_managed_unixgram_fd(
-                            "net0",
+                            vm_spec::restore::RESTORE_NETWORK_ID,
                             fd,
                             &net.mac,
                             COMPAT_NET_FEATURES,
@@ -505,15 +519,18 @@ pub fn run_process(
                         )
                     }
                     Network::Unixstream(net) => NetDevice::new_unixstream_path(
-                        "net0",
+                        vm_spec::restore::RESTORE_NETWORK_ID,
                         path_str(&net.peer_path, "network peer")?,
                         &net.mac,
                         COMPAT_NET_FEATURES,
                         NetFlags::empty(),
                     ),
-                    Network::Tap(net) => {
-                        NetDevice::new_tap("net0", &net.name, &net.mac, COMPAT_NET_FEATURES)
-                    }
+                    Network::Tap(net) => NetDevice::new_tap(
+                        vm_spec::restore::RESTORE_NETWORK_ID,
+                        &net.name,
+                        &net.mac,
+                        COMPAT_NET_FEATURES,
+                    ),
                 }
                 .map_err(|source| libkrun_error("create network device", source))?;
                 devices.add(device);
@@ -567,7 +584,6 @@ pub fn run_process(
 
 /// A restore construction failure retains the native failed owner, rather than
 /// flattening it into the cold-build error's diagnostic.
-#[allow(dead_code)]
 pub enum RestoreProcessError<'a> {
     Build(RestoreBuildFailure<'a>),
     Handle {
@@ -588,7 +604,6 @@ pub enum RestoreProcessError<'a> {
 /// before dispatch; move controls to another thread before making blocking calls.
 /// The process owner retains leases and console bindings through actual reap,
 /// including errors. A build failure must retain/settle its native failed owner.
-#[allow(dead_code)]
 pub fn run_restore_process<'a>(
     inputs: RestoreInputs,
     resources: RestoreResources,
@@ -710,7 +725,7 @@ fn rosetta_device(config: &crate::krun::RosettaLaunchConfig) -> Result<RosettaFs
         .map_err(|source| libkrun_error("create Rosetta filesystem", source))
 }
 
-const GUEST_CID: u64 = 3;
+pub(crate) const GUEST_CID: u64 = 3;
 
 fn protect_stream_socket(device: &mut VsockDevice, fd: BorrowedFd<'_>) -> Result<(), Error> {
     if nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::SockType)
@@ -738,7 +753,7 @@ fn external_kernel_format() -> KernelFormat {
     }
 }
 
-fn disk_format(format: vm_spec::DiskFormat) -> DiskFormat {
+pub(crate) fn disk_format(format: vm_spec::DiskFormat) -> DiskFormat {
     match format {
         vm_spec::DiskFormat::Raw => DiskFormat::Raw,
         vm_spec::DiskFormat::Vmdk => DiskFormat::Vmdk,

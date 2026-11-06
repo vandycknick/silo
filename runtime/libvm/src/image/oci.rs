@@ -35,17 +35,13 @@ pub(crate) fn storage_error(error: crate::storage::StorageError) -> LibVmError {
 }
 
 pub(crate) fn verify_cached_image(
-    image: &OciImageRecord,
+    image: &mut OciImageRecord,
     images_dir: &Path,
 ) -> Result<crate::storage::identity_file::SourceFingerprint, LibVmError> {
-    let artifact = &image.artifact;
-    let before = crate::storage::identity_file::SourceFingerprint::new(&std::fs::symlink_metadata(
-        &artifact.rootfs_path,
-    )?);
-    let expected = images_dir
-        .join("streams/sha256")
-        .join(artifact.stream_id.hex());
-    if artifact.rootfs_path != expected
+    let artifact = &mut image.artifact;
+    let slot = Path::new("images/streams/sha256").join(artifact.stream_id.hex());
+    if !artifact.rootfs_path.is_absolute()
+        || !artifact.rootfs_path.ends_with(&slot)
         || artifact.conversion_abi != CONVERSION_ABI
         || artifact.manifest_digest != image.manifest.digest
         || artifact.config_digest != image.config.digest
@@ -53,6 +49,14 @@ pub(crate) fn verify_cached_image(
     {
         return Err(LibVmError::StateDecode { field: "image.cache", message: "image artifact does not match its catalog identity, conversion profile, or owned stream path".into() });
     }
+    // The stored absolute spelling is provenance, not pool location authority.
+    // Resolve the verified stream identity under the current Home after relocation.
+    artifact.rootfs_path = images_dir
+        .join("streams/sha256")
+        .join(artifact.stream_id.hex());
+    let before = crate::storage::identity_file::SourceFingerprint::new(&std::fs::symlink_metadata(
+        &artifact.rootfs_path,
+    )?);
     let pool = crate::storage::pool::StoragePool::open_existing(images_dir)
         .map_err(storage_error)?
         .ok_or_else(|| LibVmError::StateDecode {

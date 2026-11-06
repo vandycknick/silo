@@ -676,6 +676,7 @@ class Cohort:
             disks.append(path)
         role = SessionRole(label, str(uuid.uuid4()), str(uuid.uuid4()), network)
         session = self.create(label, disks, role, restore=cut.directory)
+        guest_lifecycle.ssh_material(session.directory)
         record: dict = {"pid": session.process.pid, "role": {"machine_id": role.machine_id, "run_id": role.run_id,
                                                               "network": network.__dict__}}
         record["prepared"] = self.prepared(session, cut.directory)
@@ -713,6 +714,7 @@ class Cohort:
                             "gateway": identity.gateway, "dns_servers": [identity.gateway], "dns_search": []}
                 if network else None,
                 "listeners": listeners, "hook": hook, "host_time": None,
+                "ssh_trusted_ca": (self.evidence / child.role.label / "ca.pub").read_text().strip(),
                 "shutdown_manifest_json": json.dumps(cut.manifest, separators=(",", ":")), "deadline_ms": 30000}
 
     def probe_hook(self, cut: Cut) -> dict:

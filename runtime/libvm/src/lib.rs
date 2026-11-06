@@ -29,7 +29,8 @@ pub use crate::error::LibVmError;
 pub use crate::machine::{
     preflight_restore_snapshot, preflight_stopped, validate_new_machine_name, ExternalResourceKey,
     ExternalResourceMapping, ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions,
-    RestoreOptions, SnapshotConfiguration, SnapshotOptions,
+    PrivateWriteAllowance, RestoreMemoryPolicy, RestoreOptions, RestoreResourcePolicy,
+    SnapshotConfiguration, SnapshotOptions,
 };
 pub use crate::machine::{
     require_live_operation, LiveCaptureSource, LiveCaptureSummary, LiveObservationReader,
@@ -50,6 +51,7 @@ pub use crate::store::models::storage::{
 pub use crate::store::snapshot_store::{
     SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo, SnapshotRef, SnapshotStore,
 };
+pub use vm_spec::restore::{RestoreEnvironmentVariable, RestoreHook};
 pub use vm_spec::{live, BlockId, DiskFormat};
 pub mod policy_secrets;
 pub use crate::image::{

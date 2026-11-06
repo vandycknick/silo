@@ -16,16 +16,6 @@ impl w::runtime_service_server::RuntimeService for Service {
     type ResolveImageStream = Stream<w::ResolveImageEvent>;
     type PullImageStream = Stream<w::ImageProgress>;
 
-    async fn restore_execution(
-        &self,
-        _: Request<w::LiveRestoreRequest>,
-    ) -> Result<Response<()>, Status> {
-        let report = self.live_capabilities().await?;
-        libvm::require_host_live_operation(&report, vm_spec::live::LiveOperation::Restore)
-            .map_err(native)?;
-        Ok(Response::new(()))
-    }
-
     async fn restore_snapshot(
         &self,
         r: Request<w::RestoreStorageSnapshotRequest>,
@@ -41,6 +31,13 @@ impl w::runtime_service_server::RuntimeService for Service {
                 crate::daemon::control::required(value.external_resources)?,
             )
             .map_err(conversion)?,
+            activation_hook: value
+                .activation_hook
+                .map(silo_vm_control::stopped::hook_from_wire)
+                .transpose()
+                .map_err(conversion)?,
+            resources: silo_vm_control::stopped::restore_resources_from_wire(value.resources)
+                .map_err(conversion)?,
         };
         libvm::preflight_restore_snapshot(&self.config, &reference, &options.external_resources)
             .await

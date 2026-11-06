@@ -1448,7 +1448,6 @@ const (
 	RuntimeService_ParseResource_FullMethodName            = "/silo.daemon.v1.RuntimeService/ParseResource"
 	RuntimeService_NormalizePolicy_FullMethodName          = "/silo.daemon.v1.RuntimeService/NormalizePolicy"
 	RuntimeService_CheckPolicySecrets_FullMethodName       = "/silo.daemon.v1.RuntimeService/CheckPolicySecrets"
-	RuntimeService_RestoreExecution_FullMethodName         = "/silo.daemon.v1.RuntimeService/RestoreExecution"
 	RuntimeService_RestoreSnapshot_FullMethodName          = "/silo.daemon.v1.RuntimeService/RestoreSnapshot"
 	RuntimeService_InspectStorageSnapshot_FullMethodName   = "/silo.daemon.v1.RuntimeService/InspectStorageSnapshot"
 	RuntimeService_ListStorageSnapshots_FullMethodName     = "/silo.daemon.v1.RuntimeService/ListStorageSnapshots"
@@ -1466,7 +1465,6 @@ type RuntimeServiceClient interface {
 	ParseResource(ctx context.Context, in *ParseResourceRequest, opts ...grpc.CallOption) (*Size, error)
 	NormalizePolicy(ctx context.Context, in *NormalizePolicyRequest, opts ...grpc.CallOption) (*PolicyDocument, error)
 	CheckPolicySecrets(ctx context.Context, in *CheckPolicySecretsRequest, opts ...grpc.CallOption) (*PolicySecretsResult, error)
-	RestoreExecution(ctx context.Context, in *LiveRestoreRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RestoreSnapshot(ctx context.Context, in *RestoreStorageSnapshotRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	InspectStorageSnapshot(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*StorageSnapshotInfo, error)
 	ListStorageSnapshots(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StorageSnapshotList, error)
@@ -1560,16 +1558,6 @@ func (c *runtimeServiceClient) CheckPolicySecrets(ctx context.Context, in *Check
 	return out, nil
 }
 
-func (c *runtimeServiceClient) RestoreExecution(ctx context.Context, in *LiveRestoreRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
-	err := c.cc.Invoke(ctx, RuntimeService_RestoreExecution_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *runtimeServiceClient) RestoreSnapshot(ctx context.Context, in *RestoreStorageSnapshotRequest, opts ...grpc.CallOption) (*MachineSnapshot, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MachineSnapshot)
@@ -1630,7 +1618,6 @@ type RuntimeServiceServer interface {
 	ParseResource(context.Context, *ParseResourceRequest) (*Size, error)
 	NormalizePolicy(context.Context, *NormalizePolicyRequest) (*PolicyDocument, error)
 	CheckPolicySecrets(context.Context, *CheckPolicySecretsRequest) (*PolicySecretsResult, error)
-	RestoreExecution(context.Context, *LiveRestoreRequest) (*emptypb.Empty, error)
 	RestoreSnapshot(context.Context, *RestoreStorageSnapshotRequest) (*MachineSnapshot, error)
 	InspectStorageSnapshot(context.Context, *StorageSnapshotRef) (*StorageSnapshotInfo, error)
 	ListStorageSnapshots(context.Context, *emptypb.Empty) (*StorageSnapshotList, error)
@@ -1663,9 +1650,6 @@ func (UnimplementedRuntimeServiceServer) NormalizePolicy(context.Context, *Norma
 }
 func (UnimplementedRuntimeServiceServer) CheckPolicySecrets(context.Context, *CheckPolicySecretsRequest) (*PolicySecretsResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckPolicySecrets not implemented")
-}
-func (UnimplementedRuntimeServiceServer) RestoreExecution(context.Context, *LiveRestoreRequest) (*emptypb.Empty, error) {
-	return nil, status.Error(codes.Unimplemented, "method RestoreExecution not implemented")
 }
 func (UnimplementedRuntimeServiceServer) RestoreSnapshot(context.Context, *RestoreStorageSnapshotRequest) (*MachineSnapshot, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
@@ -1797,24 +1781,6 @@ func _RuntimeService_CheckPolicySecrets_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
-func _RuntimeService_RestoreExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(LiveRestoreRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RuntimeServiceServer).RestoreExecution(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: RuntimeService_RestoreExecution_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RuntimeServiceServer).RestoreExecution(ctx, req.(*LiveRestoreRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _RuntimeService_RestoreSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RestoreStorageSnapshotRequest)
 	if err := dec(in); err != nil {
@@ -1927,10 +1893,6 @@ var RuntimeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckPolicySecrets",
 			Handler:    _RuntimeService_CheckPolicySecrets_Handler,
-		},
-		{
-			MethodName: "RestoreExecution",
-			Handler:    _RuntimeService_RestoreExecution_Handler,
 		},
 		{
 			MethodName: "RestoreSnapshot",

@@ -1,10 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nix::{
-    errno::Errno,
-    sys::signal::{kill, Signal},
-    unistd::Pid,
-};
+use nix::sys::signal::Signal;
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
@@ -15,9 +11,7 @@ use crate::machine::{
     MachineStart, MachineStartOptions, MachineStopOptions, MachineWaitOptions,
 };
 use crate::runtime::core::{
-    interrupt_monitor, kill_monitor_process_group, monitor_identity as monitor_identity_for_pid,
-    read_exit_for_reconciliation, read_monitor_pid, reconcile_root_disk_size,
-    wait_for_monitor_stop, VmmRunIdentity,
+    read_exit_for_reconciliation, reconcile_root_disk_size, wait_for_monitor_stop, VmmRunIdentity,
 };
 use crate::runtime::Runtime;
 use crate::store::models::{MachineConfig, MachineRuntimeState};
@@ -25,7 +19,7 @@ use crate::supervisor::exit_status;
 use crate::supervisor::process::ProcessIdentity;
 use crate::supervisor::VmmLaunch;
 use crate::LibVmError;
-use protocol::shutdown::{CurrentExitRecord, ExitOutcome};
+use protocol::shutdown::{CurrentExitRecord, ExitOutcome, StorageHolderRole};
 
 const WAIT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -38,7 +32,7 @@ struct WaitTarget {
 }
 
 #[derive(Clone, Copy)]
-enum FailedStartState {
+pub(crate) enum FailedStartState {
     Stopped,
     Error,
 }
@@ -69,6 +63,11 @@ impl Machine {
         let (config, run_id) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
+            if config.image_ref == "execution-restore" {
+                return Err(crate::machine::root_storage::invalid(
+                    "an execution-restore child cannot cold boot; retry the retained checkpoint under a new restore run",
+                ));
+            }
             let storage = runtime.validate_machine_storage_for_launch(&config).await?;
             let qualification = runtime.qualify_machine_root(&config, &storage)?;
             let _node_state = crate::node_state::acquire(&config).await?;
@@ -268,6 +267,7 @@ impl Machine {
                     file_inode,
                 },
                 storage_shutdown: &launch_inputs.storage_shutdown,
+                restore: None,
             };
             if let Err(error) = runtime
                 .mark_launch_storage_admitted(storage_lease.operation_id())
@@ -284,7 +284,8 @@ impl Machine {
                 )
                 .await);
             }
-            if let Err(err) = supervisor.spawn(&launch).await {
+            let startup = async { supervisor.spawn(&launch).await?.wait().await };
+            if let Err(err) = startup.await {
                 return Err(finish_failed_start(
                     runtime,
                     &config,
@@ -297,22 +298,12 @@ impl Machine {
                 .await);
             }
 
-            let pid = match read_monitor_pid(&pid_path) {
-                Ok(pid) => pid,
-                Err(err) => {
-                    return Err(finish_failed_start(
-                        runtime,
-                        &config,
-                        &run_id,
-                        Some(FailedStartState::Error),
-                        None,
-                        storage_lease,
-                        err.into(),
-                    )
-                    .await);
-                }
-            };
-            let monitor = match monitor_identity_for_pid(pid, &pid_path, &config.name) {
+            let monitor = match started_run_monitor(
+                runtime,
+                &config,
+                &run_id,
+                storage_lease.operation_id(),
+            ) {
                 Ok(monitor) => monitor,
                 Err(err) => {
                     return Err(finish_failed_start(
@@ -327,6 +318,7 @@ impl Machine {
                     .await);
                 }
             };
+            let pid = monitor.pid();
             let Some(started_at) = monitor.started_at() else {
                 return Err(finish_failed_start(
                     runtime,
@@ -337,10 +329,7 @@ impl Machine {
                     storage_lease,
                     LibVmError::MonitorConnection {
                         reference: config.name.clone(),
-                        message: format!(
-                            "silo-vmm pid {pid} from {} has no stable process generation",
-                            pid_path.display()
-                        ),
+                        message: format!("silo-vmm pid {pid} has no stable process generation"),
                     },
                 )
                 .await);
@@ -443,7 +432,7 @@ impl Machine {
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
                     };
-                    if !interrupt_monitor(&identity)? {
+                    if !identity.signal(Signal::SIGINT)? {
                         runtime.mark_machine_stopped(config.id, None).await?;
                         runtime.cleanup_machine_resources_locked(&config).await?;
                         return runtime.machine_inspect_data(config).await;
@@ -641,7 +630,7 @@ impl Machine {
                 return Ok(machine_exit(machine, generation, false, exit_status));
             };
             let stop_deadline = Instant::now() + options.wait_options().timeout_value();
-            if !kill_monitor_process_group(&identity)? {
+            if !identity.signal_process_group(Signal::SIGKILL)? {
                 runtime.mark_machine_stopped(config.id, None).await?;
                 runtime.cleanup_machine_resources_locked(&config).await?;
                 let exit_status = read_exit_for_reconciliation(
@@ -797,7 +786,7 @@ impl Machine {
     }
 }
 
-async fn finish_failed_start(
+pub(crate) async fn finish_failed_start(
     runtime: &Runtime,
     config: &MachineConfig,
     run_id: &str,
@@ -809,31 +798,29 @@ async fn finish_failed_start(
     let primary_message = primary.to_string();
     let mut cleanup_errors = Vec::new();
 
-    let discovered_monitor = if monitor.is_none() {
-        match read_monitor_pid(&runtime.machine_paths(config.id).vmm_pid_path()) {
-            Ok(pid) => match ProcessIdentity::for_pid(pid) {
-                Ok(identity) => identity,
+    // Only the run-bound holder authorizes a signal. Without it, closed startup
+    // pipes cancel a pre-holder monitor and lease reconciliation below waits.
+    let discovered_monitor = match monitor {
+        Some(_) => Ok(None),
+        None => run_monitor_identity(runtime, config, run_id, storage_lease.operation_id()),
+    };
+    let monitor_stopped = match discovered_monitor {
+        Ok(discovered) => match monitor.or(discovered.as_ref()) {
+            Some(monitor) => match stop_failed_start_monitor(monitor, &config.name).await {
+                Ok(()) => true,
                 Err(err) => {
-                    cleanup_errors.push(format!("inspect silo-vmm for cleanup: {err}"));
-                    None
+                    cleanup_errors.push(format!("terminate silo-vmm: {err}"));
+                    false
                 }
             },
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    let monitor_stopped = match monitor.or(discovered_monitor.as_ref()) {
-        Some(monitor) => match stop_failed_start_monitor(monitor, &config.name).await {
-            Ok(()) => true,
-            Err(err) => {
-                cleanup_errors.push(format!("terminate silo-vmm: {err}"));
-                false
-            }
+            None => true,
         },
-        None => true,
+        Err(err) => {
+            cleanup_errors.push(format!("authenticate silo-vmm for cleanup: {err}"));
+            false
+        }
     };
-    if monitor_stopped {
+    if monitor_stopped && config.image_ref != "execution-restore" {
         if let Err(err) = runtime.reconcile_machine_network(config, false).await {
             cleanup_errors.push(format!("reconcile prepared network: {err}"));
         }
@@ -888,7 +875,18 @@ async fn finish_failed_start(
             }
         }
     }
-    if terminal_transitioned && config.retention == crate::MachineRetention::Ephemeral {
+    if terminal_transitioned && config.image_ref == "execution-restore" {
+        // Monitor death does not certify terminal worker/mapping ownership.
+        // Keep the destination reservation until holder/lease reconciliation
+        // above has positively retired this exact restore generation.
+        if let Err(err) = runtime.reconcile_machine_network(config, false).await {
+            cleanup_errors.push(format!("reconcile restored network: {err}"));
+        }
+    }
+    if terminal_transitioned
+        && (config.retention == crate::MachineRetention::Ephemeral
+            || config.image_ref == "execution-restore")
+    {
         if let Err(error) = crate::ssh_ca::delete_scope(runtime.secret_store(), config.id) {
             tracing::error!(machine = %config.id, %error, "delete ephemeral machine secret scope");
             cleanup_errors.push(format!("delete ephemeral machine secret scope: {error}"));
@@ -921,25 +919,79 @@ async fn stop_failed_start_monitor(
 ) -> Result<(), LibVmError> {
     // Let silo-vmm stop/reap its worker and finalize the generation first. The
     // process-group kill below is only the emergency fallback for a stuck owner.
-    if interrupt_monitor(monitor)?
+    if monitor.signal(Signal::SIGINT)?
         && wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(75))
             .await
             .is_ok()
     {
         return Ok(());
     }
-    if kill_monitor_process_group(monitor)? {
+    if monitor.signal_process_group(Signal::SIGKILL)? || monitor.signal(Signal::SIGKILL)? {
         return wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await;
     }
-    if !monitor.is_alive()? {
-        return Ok(());
+    Ok(())
+}
+
+/// Resolves the exact monitor of `run_id` from its durable storage holder.
+///
+/// The pidfile is an unauthenticated number: an earlier generation may have
+/// left it, or its process may have exited and the number been reused. The
+/// monitor publishes this run-, operation- and birth-bound holder before any
+/// worker exists. `None` means no live process carries that identity; a holder
+/// of another run names another generation and never authorizes a signal.
+fn run_monitor_identity(
+    runtime: &Runtime,
+    config: &MachineConfig,
+    run_id: &str,
+    operation_id: Uuid,
+) -> Result<Option<ProcessIdentity>, LibVmError> {
+    let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
+    let Some(record) = crate::supervisor::storage_holder::read(&path)? else {
+        return Ok(None);
+    };
+    if record.machine_id != Uuid::from(config.id).to_string()
+        || record.run_id != run_id
+        || record.operation_id != operation_id.to_string()
+    {
+        return Ok(None);
     }
-    match kill(Pid::from_raw(monitor.pid()), Some(Signal::SIGKILL)) {
-        Ok(()) | Err(Errno::ESRCH) => {
-            wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await
+    let invalid = |message: &str| LibVmError::InvalidStorageRecord {
+        record: "storage-holder",
+        message: message.to_string(),
+    };
+    let holder = record
+        .holders
+        .iter()
+        .find(|holder| holder.role == StorageHolderRole::Monitor)
+        .ok_or_else(|| invalid("holder record has no monitor"))?;
+    let pid = i32::try_from(holder.pid).map_err(|_| invalid("invalid monitor holder pid"))?;
+    let started_at = i64::try_from(holder.started_at)
+        .map_err(|_| invalid("invalid monitor holder start identity"))?;
+    let Some(identity) = ProcessIdentity::for_pid(pid)? else {
+        return Ok(None);
+    };
+    // Another birth identity at the recorded number is a reused PID.
+    if !identity.matches_started_at(Some(started_at)) {
+        return Ok(None);
+    }
+    Ok(Some(identity))
+}
+
+/// The monitor that reported startup must still be this run's holder process.
+pub(crate) fn started_run_monitor(
+    runtime: &Runtime,
+    config: &MachineConfig,
+    run_id: &str,
+    operation_id: Uuid,
+) -> Result<ProcessIdentity, LibVmError> {
+    run_monitor_identity(runtime, config, run_id, operation_id)?.ok_or_else(|| {
+        LibVmError::MonitorConnection {
+            reference: config.name.clone(),
+            message: format!(
+                "silo-vmm reported startup but no live process matches run {run_id}'s storage holder"
+            ),
         }
-        Err(err) => Err(std::io::Error::other(err.to_string()).into()),
-    }
+    })
 }
 
 impl Machine {
@@ -1152,10 +1204,28 @@ fn unix_time(timestamp: i64) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::lifecycle::stop_failed_start_monitor;
+    use crate::machine::lifecycle::{
+        finish_failed_start, stop_failed_start_monitor, FailedStartState,
+    };
+    use crate::runtime::Runtime;
+    use crate::store::models::{MachineConfig, MachineRuntimeState};
+    use crate::store::operation_store::LaunchStorageLease;
+    use crate::store::{MachineStore, Store};
     use crate::supervisor::process::ProcessIdentity;
+    use crate::LibVmError;
+    use protocol::shutdown::{StorageHolder, StorageHolderRecord, StorageHolderRole};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    const MONITOR_HOLDER_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_HOLDER";
+    const MONITOR_MACHINE_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_MACHINE";
+    const MONITOR_RUN_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_RUN";
+    const MONITOR_OPERATION_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_OPERATION";
+    const MONITOR_WORKER_ENV: &str = "SILO_LIBVM_FAILED_START_MONITOR_WORKER";
 
     struct Child(std::process::Child);
     impl Drop for Child {
@@ -1165,11 +1235,331 @@ mod tests {
         }
     }
 
+    async fn admitted_start(
+        temp: &tempfile::TempDir,
+    ) -> (Runtime, MachineConfig, String, LaunchStorageLease) {
+        let (runtime, config, storage) =
+            crate::runtime::core::tests::shutdown_storage_fixture(temp).await;
+        let run = uuid::Uuid::new_v4();
+        let run_id = run.to_string();
+        let lease = runtime
+            .register_launch_storage(&config, run, &storage)
+            .await
+            .unwrap();
+        runtime
+            .request_machine_start(&config, &run_id)
+            .await
+            .unwrap();
+        runtime
+            .mark_launch_storage_admitted(lease.operation_id())
+            .await
+            .unwrap();
+        (runtime, config, run_id, lease)
+    }
+
+    /// Keeps the shared lease OFD open across exec in the spawned process.
+    fn inherit_lease(command: &mut Command, lease: &LaunchStorageLease) -> OwnedFd {
+        let descriptor = lease.lock().duplicate_inheritable().unwrap();
+        let raw = descriptor.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                nix::fcntl::fcntl(
+                    BorrowedFd::borrow_raw(raw),
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+                Ok(())
+            });
+        }
+        descriptor
+    }
+
+    fn write_holder(
+        runtime: &Runtime,
+        config: &MachineConfig,
+        run_id: &str,
+        lease: &LaunchStorageLease,
+        holders: Vec<StorageHolder>,
+    ) {
+        let record = StorageHolderRecord {
+            schema_version: 1,
+            machine_id: uuid::Uuid::from(config.id).to_string(),
+            run_id: run_id.to_string(),
+            operation_id: lease.operation_id().to_string(),
+            holders,
+        };
+        let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
+        std::fs::write(&path, record.encode().unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A real process outside the launch, standing where a reused PID points.
+    fn unrelated_process() -> Child {
+        Child(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("unrelated process"),
+        )
+    }
+
+    fn write_stale_pidfile(runtime: &Runtime, config: &MachineConfig, pid: u32) {
+        std::fs::write(
+            runtime.machine_paths(config.id).vmm_pid_path(),
+            format!("{pid}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Cleanup waits for every signaled target to exit, so a process that is
+    /// still unreaped afterwards was never signaled by it.
+    fn assert_untouched(mut unrelated: Child) {
+        assert!(
+            unrelated.0.try_wait().unwrap().is_none(),
+            "failed-start cleanup signaled a process named only by stale pid evidence"
+        );
+        unrelated.0.kill().unwrap();
+        assert_eq!(
+            unrelated.0.wait().unwrap().signal(),
+            Some(nix::libc::SIGKILL)
+        );
+    }
+
+    fn rejected_start(config: &MachineConfig) -> LibVmError {
+        LibVmError::MachinePreparationFailed {
+            reference: config.name.clone(),
+            message: "rejected ELF".into(),
+        }
+    }
+
+    fn assert_rejected_start(error: &LibVmError) {
+        assert!(
+            matches!(error, LibVmError::MachinePreparationFailed { message, .. } if message == "rejected ELF"),
+            "cleanup must return the unchanged primary failure, got {error}"
+        );
+    }
+
+    async fn assert_retired(runtime: &Runtime, config: &MachineConfig, state: MachineRuntimeState) {
+        assert_eq!(
+            runtime.machine_state(config.id).await.unwrap().status,
+            state
+        );
+        let store = Store::open(&runtime.local_paths().state_db_path())
+            .await
+            .unwrap();
+        assert!(store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    fn wait_ready(stdout: std::process::ChildStdout) -> std::process::ChildStdout {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).expect("read monitor stdout");
+            assert!(bytes > 0, "monitor exited before reporting readiness");
+            if line.trim() == "SILO_READY" {
+                return reader.into_inner();
+            }
+        }
+    }
+
+    /// Re-executes this test binary as a monitor of the admitted run. It holds
+    /// the inherited lease, optionally starts a lease-holding worker that exits
+    /// when the monitor's pipe closes, and publishes its own run-bound holder
+    /// before reporting readiness, in the order silo-vmm uses.
+    fn spawn_holder_monitor(
+        runtime: &Runtime,
+        config: &MachineConfig,
+        run_id: &str,
+        lease: &LaunchStorageLease,
+        with_worker: bool,
+    ) -> Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "machine::lifecycle::tests::failed_start_monitor_child_process",
+                "--nocapture",
+            ])
+            .env(
+                MONITOR_HOLDER_ENV,
+                runtime.machine_paths(config.id).vmm_storage_holder_path(),
+            )
+            .env(MONITOR_MACHINE_ENV, uuid::Uuid::from(config.id).to_string())
+            .env(MONITOR_RUN_ENV, run_id)
+            .env(MONITOR_OPERATION_ENV, lease.operation_id().to_string())
+            .process_group(0)
+            .stdout(Stdio::piped());
+        if with_worker {
+            command.env(MONITOR_WORKER_ENV, "1");
+        }
+        let descriptor = inherit_lease(&mut command, lease);
+        let mut monitor = Child(command.spawn().unwrap());
+        drop(descriptor);
+        monitor.0.stdout = Some(wait_ready(monitor.0.stdout.take().unwrap()));
+        monitor
+    }
+
+    #[test]
+    fn failed_start_monitor_child_process() {
+        let Some(holder_path) = std::env::var_os(MONITOR_HOLDER_ENV) else {
+            return;
+        };
+        let binding = |name: &str| std::env::var(name).expect("monitor run binding");
+        let holder = |role, pid: u32| StorageHolder {
+            role,
+            pid,
+            started_at: utils::process::start_time(pid as i32)
+                .unwrap()
+                .and_then(|started| u64::try_from(started).ok())
+                .unwrap(),
+        };
+        let mut holders = vec![holder(StorageHolderRole::Monitor, std::process::id())];
+        // Like a krun worker's watchdog, EOF on the monitor-held pipe ends it.
+        let worker = std::env::var_os(MONITOR_WORKER_ENV).map(|_| {
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("worker")
+        });
+        if let Some(worker) = &worker {
+            holders.push(holder(StorageHolderRole::KrunWorker, worker.id()));
+        }
+        let record = StorageHolderRecord {
+            schema_version: 1,
+            machine_id: binding(MONITOR_MACHINE_ENV),
+            run_id: binding(MONITOR_RUN_ENV),
+            operation_id: binding(MONITOR_OPERATION_ENV),
+            holders,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(holder_path)
+            .unwrap();
+        file.write_all(&record.encode().unwrap()).unwrap();
+        file.sync_all().unwrap();
+        println!("SILO_READY");
+        std::io::stdout().flush().unwrap();
+        let _worker = worker;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// Exercises the restore wait/lock boundary with a re-executed monitor
+    /// holding the launch lease, without needing a hypervisor.
+    #[tokio::test]
+    async fn restore_startup_wait_releases_mutation_lock_and_rejects_superseded_run() {
+        for disposition in [
+            MachineRuntimeState::Stopping,
+            MachineRuntimeState::Running,
+            MachineRuntimeState::ActivationFailed,
+        ] {
+            let replacement = disposition == MachineRuntimeState::Running;
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+            let mut monitor = spawn_holder_monitor(&runtime, &config, &run_id, &lease, true);
+            let identity = ProcessIdentity::for_pid(monitor.0.id() as i32)
+                .unwrap()
+                .unwrap();
+            let started = identity.started_at().unwrap();
+            runtime
+                .mark_machine_monitor_ready(config.id, run_id.clone(), identity.pid(), started)
+                .await
+                .unwrap();
+            let pending = crate::supervisor::launch::PendingStartup::new(
+                monitor.0.stdout.take().unwrap().into(),
+                std::time::Instant::now() + Duration::from_secs(10),
+                runtime.machine_paths(config.id).vm_trace_log_path(),
+            );
+            let (lock, _) = runtime.lock_machine_config(config.id).await.unwrap();
+            let wait = crate::machine::restore::await_restored_start(
+                &runtime,
+                config.id,
+                uuid::Uuid::parse_str(&run_id).unwrap(),
+                lock,
+                pending,
+            );
+            let interrupt = async {
+                let (_lock, _) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    runtime.lock_machine_config(config.id),
+                )
+                .await
+                .expect("stop must acquire mutation lock before startup completes")
+                .unwrap();
+                if disposition != MachineRuntimeState::Stopping {
+                    let mut state = runtime.machine_state(config.id).await.unwrap();
+                    state.status = disposition;
+                    if replacement {
+                        state.run_id = Some(uuid::Uuid::new_v4().to_string());
+                    }
+                    runtime
+                        .native_store()
+                        .unwrap()
+                        .save_machine_state(&state)
+                        .await
+                        .unwrap();
+                } else {
+                    runtime
+                        .request_machine_stop(
+                            config.id,
+                            &crate::runtime::core::VmmRunIdentity {
+                                pid: identity.pid(),
+                                started_at: Some(started),
+                                run_id: Some(run_id.clone()),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                assert!(identity.signal(nix::sys::signal::Signal::SIGINT).unwrap());
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(wait, interrupt)
+            })
+            .await
+            .expect("monitor death must unblock startup without its original deadline");
+            if replacement {
+                assert!(matches!(
+                    result,
+                    Err(LibVmError::MachineStaleGeneration { .. })
+                ));
+            } else if disposition == MachineRuntimeState::ActivationFailed {
+                let Ok((_lock, _, startup)) = result else {
+                    panic!("exact failed activation must retain cleanup authority");
+                };
+                assert!(startup.is_err());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    runtime.machine_state(config.id).await.unwrap().status,
+                    MachineRuntimeState::Stopping,
+                );
+            }
+            assert_eq!(monitor.0.wait().unwrap().signal(), Some(nix::libc::SIGINT));
+            // Stop admission must not retire the manager's construction roots.
+            let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir()).unwrap();
+            assert!(pool
+                .try_exclusive_lease(lease.operation_id())
+                .unwrap()
+                .is_none());
+        }
+    }
+
     /// Generic OS signal mechanics, not a substitute for a silo-vmm/VM test.
     #[tokio::test]
     async fn failed_start_cleanup_interrupts_before_emergency_group_kill() {
         let mut child = Child(
-            std::process::Command::new("/bin/sleep")
+            Command::new("/bin/sleep")
                 .arg("30")
                 .process_group(0)
                 .spawn()
@@ -1199,54 +1589,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_start_waits_for_registered_holder_and_lease_before_recording_terminal_state() {
-        use crate::machine::lifecycle::{finish_failed_start, FailedStartState};
-        use crate::store::{MachineStore, Store};
-        use protocol::shutdown::{StorageHolder, StorageHolderRecord, StorageHolderRole};
-        use std::os::fd::{AsRawFd, BorrowedFd};
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        let (runtime, config, storage) =
-            crate::runtime::core::tests::shutdown_storage_fixture(&temp).await;
-        let run = uuid::Uuid::new_v4();
-        let run_id = run.to_string();
-        let lease = runtime
-            .register_launch_storage(&config, run, &storage)
+    async fn failed_start_cleanup_never_signals_unrelated_process_from_stale_pid_evidence() {
+        // Monitor died before publishing its holder, or published one whose
+        // number now belongs to a process with another birth identity.
+        for reused_holder in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+            let unrelated = unrelated_process();
+            write_stale_pidfile(&runtime, &config, unrelated.0.id());
+            if reused_holder {
+                let reused = ProcessIdentity::for_pid(unrelated.0.id() as i32)
+                    .unwrap()
+                    .unwrap();
+                let original_birth = u64::try_from(reused.started_at().unwrap())
+                    .unwrap()
+                    .checked_sub(1)
+                    .unwrap();
+                write_holder(
+                    &runtime,
+                    &config,
+                    &run_id,
+                    &lease,
+                    vec![StorageHolder {
+                        role: StorageHolderRole::Monitor,
+                        pid: unrelated.0.id(),
+                        started_at: original_birth,
+                    }],
+                );
+            }
+            let error = tokio::time::timeout(
+                Duration::from_secs(10),
+                finish_failed_start(
+                    &runtime,
+                    &config,
+                    &run_id,
+                    Some(FailedStartState::Stopped),
+                    None,
+                    lease,
+                    rejected_start(&config),
+                ),
+            )
             .await
-            .unwrap();
-        runtime
-            .request_machine_start(&config, &run_id)
-            .await
-            .unwrap();
-        runtime
-            .mark_launch_storage_admitted(lease.operation_id())
-            .await
-            .unwrap();
-        let descriptor = lease.lock().duplicate_inheritable().unwrap();
-        let raw = descriptor.as_raw_fd();
-        let mut command = std::process::Command::new("/bin/sleep");
-        command.arg("30").process_group(0);
-        unsafe {
-            command.pre_exec(move || {
-                nix::fcntl::fcntl(
-                    BorrowedFd::borrow_raw(raw),
-                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-                )
-                .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
-                Ok(())
-            });
+            .expect("bounded cleanup");
+            assert_rejected_start(&error);
+            assert_untouched(unrelated);
+            assert_retired(&runtime, &config, MachineRuntimeState::Stopped).await;
         }
+    }
+
+    #[tokio::test]
+    async fn failed_start_cleanup_interrupts_exact_holder_monitor_not_stale_pidfile_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let unrelated = unrelated_process();
+        write_stale_pidfile(&runtime, &config, unrelated.0.id());
+        let mut monitor = spawn_holder_monitor(&runtime, &config, &run_id, &lease, false);
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            finish_failed_start(
+                &runtime,
+                &config,
+                &run_id,
+                Some(FailedStartState::Error),
+                None,
+                lease,
+                rejected_start(&config),
+            ),
+        )
+        .await
+        .expect("bounded cleanup");
+        assert_rejected_start(&error);
+        assert_eq!(
+            monitor.0.wait().unwrap().signal(),
+            Some(nix::libc::SIGINT),
+            "the authenticated monitor receives the cooperative interrupt"
+        );
+        assert_untouched(unrelated);
+        assert_retired(&runtime, &config, MachineRuntimeState::Error).await;
+    }
+
+    #[tokio::test]
+    async fn failed_start_after_monitor_death_retires_only_after_genuine_worker_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let unrelated = unrelated_process();
+        write_stale_pidfile(&runtime, &config, unrelated.0.id());
+        let mut monitor = spawn_holder_monitor(&runtime, &config, &run_id, &lease, true);
+        let record = crate::supervisor::storage_holder::read(
+            &runtime.machine_paths(config.id).vmm_storage_holder_path(),
+        )
+        .unwrap()
+        .unwrap();
+        let worker = record
+            .holders
+            .iter()
+            .find(|holder| holder.role == StorageHolderRole::KrunWorker)
+            .unwrap();
+        let worker = ProcessIdentity::for_pid(worker.pid as i32)
+            .unwrap()
+            .expect("published worker is live");
+        // Abrupt monitor death before readiness; its worker still holds the lease.
+        monitor.0.kill().unwrap();
+        monitor.0.wait().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            finish_failed_start(
+                &runtime,
+                &config,
+                &run_id,
+                Some(FailedStartState::Error),
+                None,
+                lease,
+                rejected_start(&config),
+            ),
+        )
+        .await
+        .expect("bounded cleanup");
+        assert_rejected_start(&error);
+        assert!(
+            !worker.is_alive().unwrap(),
+            "retirement requires the genuine worker to have exited"
+        );
+        assert_untouched(unrelated);
+        assert_retired(&runtime, &config, MachineRuntimeState::Error).await;
+    }
+
+    #[tokio::test]
+    async fn failed_start_waits_for_registered_holder_and_lease_before_recording_terminal_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, run_id, lease) = admitted_start(&temp).await;
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let descriptor = inherit_lease(&mut command, &lease);
         let mut worker = Child(command.spawn().unwrap());
         drop(descriptor);
         let identity = ProcessIdentity::for_pid(worker.0.id() as i32)
             .unwrap()
             .unwrap();
-        let holder = StorageHolderRecord {
-            schema_version: 1,
-            machine_id: uuid::Uuid::from(config.id).to_string(),
-            run_id: run_id.clone(),
-            operation_id: lease.operation_id().to_string(),
-            holders: vec![
+        write_holder(
+            &runtime,
+            &config,
+            &run_id,
+            &lease,
+            vec![
                 StorageHolder {
                     role: StorageHolderRole::Monitor,
                     pid: i32::MAX as u32,
@@ -1258,14 +1743,7 @@ mod tests {
                     started_at: u64::try_from(identity.started_at().unwrap()).unwrap(),
                 },
             ],
-        };
-        let path = runtime.machine_paths(config.id).vmm_storage_holder_path();
-        std::fs::write(&path, holder.encode().unwrap()).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let primary = crate::LibVmError::MachinePreparationFailed {
-            reference: config.name.clone(),
-            message: "rejected ELF".into(),
-        };
+        );
         let cleanup = finish_failed_start(
             &runtime,
             &config,
@@ -1273,7 +1751,7 @@ mod tests {
             Some(FailedStartState::Stopped),
             None,
             lease,
-            primary,
+            rejected_start(&config),
         );
         tokio::pin!(cleanup);
         assert!(
@@ -1284,28 +1762,15 @@ mod tests {
         );
         assert_eq!(
             runtime.machine_state(config.id).await.unwrap().status,
-            crate::store::models::MachineRuntimeState::Starting
+            MachineRuntimeState::Starting
         );
         worker.0.kill().unwrap();
         worker.0.wait().unwrap();
         let error = tokio::time::timeout(Duration::from_secs(2), cleanup)
             .await
             .unwrap();
-        assert!(
-            matches!(error, crate::LibVmError::MachinePreparationFailed { message, .. } if message == "rejected ELF")
-        );
-        assert_eq!(
-            runtime.machine_state(config.id).await.unwrap().status,
-            crate::store::models::MachineRuntimeState::Stopped
-        );
-        let store = Store::open(&runtime.local_paths().state_db_path())
-            .await
-            .unwrap();
-        assert!(store
-            .launch_storage_operations(config.id)
-            .await
-            .unwrap()
-            .is_empty());
+        assert_rejected_start(&error);
+        assert_retired(&runtime, &config, MachineRuntimeState::Stopped).await;
         assert_eq!(
             runtime
                 .machine_storage_record(config.id)

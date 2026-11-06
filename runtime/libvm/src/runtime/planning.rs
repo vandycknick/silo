@@ -102,13 +102,13 @@ impl ReadOnlyRuntime {
             .candidates(reference)
             .map_err(|error| image_error(reference, error))?
         {
-            if let Some(image) = store
+            if let Some(mut image) = store
                 .cached_oci_image(&candidate.to_string(), platform)
                 .await?
             {
                 let images = self.home.join("images");
                 return tokio::task::spawn_blocking(move || {
-                    verify_cached_image(&image, &images)?;
+                    verify_cached_image(&mut image, &images)?;
                     Ok(Some(cached_resolved_oci_image(
                         &image,
                         candidate.to_string(),

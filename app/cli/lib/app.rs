@@ -78,8 +78,8 @@ mod tests {
         assert!(Cli::try_parse_from(["silo", "snapshot", "list"]).is_ok());
         assert!(Cli::try_parse_from(["silo", "snapshot", "remove", "image:checkpoint"]).is_ok());
         assert!(Cli::try_parse_from(["silo", "image", "remove", "image:checkpoint"]).is_ok());
-        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint", "--execution"]).is_ok());
-        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint", "--execution"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "restore", "checkpoint"]).is_ok());
     }
 
     #[test]
@@ -89,7 +89,7 @@ mod tests {
             vec!["silo", "pause", "vm"],
             vec!["silo", "snapshot", "create", "vm", "--live"],
             vec!["silo", "fork", "vm", "--name", "child", "--live"],
-            vec!["silo", "restore", "checkpoint", "--execution"],
+            vec!["silo", "restore", "checkpoint"],
             vec!["silo", "system", "info"],
         ] {
             assert_eq!(
@@ -109,7 +109,6 @@ mod tests {
             vec!["silo", "snapshot", "create", "vm"],
             vec!["silo", "snapshot", "remove", "image:checkpoint"],
             vec!["silo", "image", "remove", "image:checkpoint"],
-            vec!["silo", "restore", "image:checkpoint", "--name", "child"],
         ] {
             assert_eq!(
                 Cli::try_parse_from(args)
@@ -337,6 +336,30 @@ mod tests {
             assert!(help.contains("catalog-owned secret-scope recovery"));
             assert!(help.contains("with_secret_store"));
             assert!(help.contains("secret-provider path remains supported"));
+        }
+    }
+
+    #[test]
+    fn restore_activation_hook_cli_uses_the_strict_bounded_shared_type() {
+        let valid =
+            r#"{"argv":["/bin/false"],"environment":[],"workingDirectory":"/","timeoutMs":30000}"#;
+        assert!(
+            Cli::try_parse_from(["silo", "restore", "checkpoint", "--activation-hook", valid])
+                .is_ok()
+        );
+        for invalid in [
+            r#"{"argv":[],"environment":[],"workingDirectory":"/","timeoutMs":30000}"#,
+            r#"{"argv":["/bin/false"],"environment":[],"workingDirectory":"/","timeoutMs":30001}"#,
+            r#"{"argv":["/bin/false"],"environment":[],"workingDirectory":"/","timeoutMs":30000,"unknown":true}"#,
+        ] {
+            assert!(Cli::try_parse_from([
+                "silo",
+                "restore",
+                "checkpoint",
+                "--activation-hook",
+                invalid
+            ])
+            .is_err());
         }
     }
 }

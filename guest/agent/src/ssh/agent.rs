@@ -268,7 +268,15 @@ impl Handler for NativeSshHandler {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        if !valid_certificate(certificate, &self.auth.ca, user, now) {
+        let destination_ca = self
+            .lifecycle
+            .as_ref()
+            .map(|runtime| runtime.ssh_trusted_ca());
+        let ca = destination_ca
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .unwrap_or(&self.auth.ca);
+        if !valid_certificate(certificate, ca, user, now) {
             return Ok(Auth::reject());
         }
         let Some(account) = self.auth.users.get(user) else {
@@ -1933,6 +1941,9 @@ pub(crate) mod tests {
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
+            let lifecycle = crate::lifecycle::RuntimeContext::for_tests();
+            lifecycle.set_boot_ready(true);
+            let server_lifecycle = lifecycle.clone();
             let server = tokio::spawn(async move {
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
@@ -1946,7 +1957,7 @@ pub(crate) mod tests {
                         channels: HashMap::new(),
                         runtime: tokio::runtime::Handle::current(),
                         _writer: None,
-                        lifecycle: None,
+                        lifecycle: Some(server_lifecycle.clone()),
                         retirement: None,
                     };
                     let config = config.clone();
@@ -2047,7 +2058,9 @@ pub(crate) mod tests {
             let mut client = russh::client::connect(
                 Arc::new(Default::default()),
                 address,
-                Client { key: host_public },
+                Client {
+                    key: host_public.clone(),
+                },
             )
             .await
             .unwrap();
@@ -2056,6 +2069,33 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .success());
+            let destination = PrivateKey::from(Ed25519Keypair::from_seed(&[9; 32]));
+            *lifecycle.ssh_trusted_ca() = Some(destination.public_key().clone());
+            for (authority, accepted) in [(&ca, false), (&destination, true)] {
+                let (key, cert) = certificate(authority, &user, now - 60, now + 300, false, false);
+                let mut connection = russh::client::connect(
+                    Arc::new(Default::default()),
+                    address,
+                    Client {
+                        key: host_public.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    connection
+                        .authenticate_openssh_cert(&user, key, cert)
+                        .await
+                        .unwrap()
+                        .success(),
+                    accepted,
+                    "new connections must accept only the destination authority after activation",
+                );
+                connection
+                    .disconnect(russh::Disconnect::ByApplication, "done", "en")
+                    .await
+                    .unwrap();
+            }
             server.abort();
         })
         .await

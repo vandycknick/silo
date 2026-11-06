@@ -1537,6 +1537,7 @@ mod tests {
             child,
             bound,
             ScenarioNative::new(scenario.lifecycle.clone(), 1),
+            None,
             Box::new(|_| {}),
         )
         .expect("serve");
@@ -1704,6 +1705,7 @@ mod tests {
                 child,
                 binding(),
                 ScenarioNative::new(None, 1),
+                None,
                 Box::new(move |reason: &str| {
                     let _ = sender.send(reason.to_string());
                 }),
@@ -2965,6 +2967,7 @@ mod tests {
             child,
             bound,
             ScenarioNative::new(scenario.lifecycle.clone(), 1),
+            None,
             Box::new(|_| {}),
         )
         .expect("serve");

@@ -50,10 +50,95 @@ pub(crate) struct VmmLaunch<'a> {
     pub(crate) storage_lease: &'a crate::storage::locks::StorageLock,
     pub(crate) storage_lease_binding: protocol::shutdown::StorageLeaseBinding,
     pub(crate) storage_shutdown: &'a protocol::shutdown::StorageShutdownContext,
+    pub(crate) restore: Option<&'a RestoreLaunch>,
+}
+
+/// Authenticated, leased inputs retained by the construction owner until the
+/// monitor's final startup outcome or actual failed-start cleanup.
+pub(crate) struct RestoreLaunch {
+    pub(crate) request: vm_spec::restore::RestoreRequest,
+    pub(crate) objects: [std::fs::File; 4],
+    pub(crate) executable: std::fs::File,
+    pub(crate) executable_identity: crate::storage::identity_file::SourceFingerprint,
+    pub(crate) lowers: Vec<std::fs::File>,
+}
+
+impl RestoreLaunch {
+    fn transfer_descriptors(&self) -> io::Result<Vec<Option<i32>>> {
+        self.request
+            .validate()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        let lower_count: usize = self
+            .request
+            .lowers
+            .iter()
+            .map(|lower| 1 + lower.extents.len())
+            .sum();
+        if self.lowers.len() != lower_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "restore lower descriptor set is incomplete",
+            ));
+        }
+        let expected = self.request.objects.iter().map(|object| object.fd).chain(
+            self.request.lowers.iter().flat_map(|lower| {
+                std::iter::once(lower.descriptor.fd)
+                    .chain(lower.extents.iter().map(|extent| extent.fd))
+            }),
+        );
+        let mut descriptors = Vec::with_capacity(4 + lower_count + 6);
+        for (file, expected) in self.objects.iter().chain(&self.lowers).zip(expected) {
+            let flags =
+                nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_GETFD).map_err(io::Error::from)?;
+            if file.as_raw_fd() != expected || flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits() == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "restore transfer descriptor changed or lost CLOEXEC",
+                ));
+            }
+            let mut reader = file;
+            std::io::Seek::rewind(&mut reader)?;
+            descriptors.push(Some(expected));
+        }
+        Ok(descriptors)
+    }
+}
+
+/// Owns the startup acknowledgement after the child has received its request.
+/// Dropping this handle closes the parent pipe; it never extends the launch
+/// deadline or detaches another task from the construction owner.
+#[must_use = "startup must be awaited or cancelled by closing its pipe"]
+pub(crate) struct PendingStartup {
+    syncpipe: OwnedFd,
+    deadline: Instant,
+    trace_path: std::path::PathBuf,
+}
+
+impl PendingStartup {
+    pub(crate) fn new(
+        syncpipe: OwnedFd,
+        deadline: Instant,
+        trace_path: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            syncpipe,
+            deadline,
+            trace_path,
+        }
+    }
+
+    pub(crate) async fn wait(self) -> Result<(), LibVmError> {
+        wait_for_start(
+            self.syncpipe,
+            &self.trace_path,
+            self.deadline.saturating_duration_since(Instant::now()),
+        )
+        .await
+    }
 }
 
 impl VmSupervisor {
-    pub(crate) async fn spawn(&self, launch: &VmmLaunch<'_>) -> Result<(), LibVmError> {
+    pub(crate) async fn spawn(&self, launch: &VmmLaunch<'_>) -> Result<PendingStartup, LibVmError> {
         let startup_budget = startup_budget(launch);
         let startup_deadline = Instant::now() + startup_budget;
         let (start_read, start_write) = launch_pipe()?;
@@ -61,13 +146,38 @@ impl VmSupervisor {
         let machine_log_dir = launch.machine_log_dir.duplicate_inheritable()?;
         let machine_lock = launch.machine_lock.duplicate_inheritable()?;
         let storage_lease = launch.storage_lease.duplicate_inheritable()?;
+        // fork duplicates these already-owned transfer handles into the child.
+        // Keep their exact inspected/journalled numbers and parent CLOEXEC.
+        let restore_request = launch.restore.map(|restore| restore.request.clone());
+        let restore_descriptors = launch
+            .restore
+            .map(RestoreLaunch::transfer_descriptors)
+            .transpose()?;
 
         let mut command = monitor_command(
             self.executable(),
             launch
-                .qualification
-                .map(|qualification| qualification.native_executable_fd()),
+                .restore
+                .map(|restore| std::os::fd::AsFd::as_fd(&restore.executable))
+                .or_else(|| {
+                    launch
+                        .qualification
+                        .map(|qualification| qualification.native_executable_fd())
+                }),
         )?;
+        if let Some(descriptors) = &restore_descriptors {
+            let encoded = serde_json::to_string(descriptors).map_err(io::Error::other)?;
+            if encoded.len() > 16 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "restore descriptor environment exceeds 16 KiB",
+                )
+                .into());
+            }
+            command.env("_VM_RESTORE_OBJECTS", encoded);
+        } else {
+            command.env_remove("_VM_RESTORE_OBJECTS");
+        }
         command
             .arg("--id")
             .arg(uuid::Uuid::from(launch.machine_id).to_string())
@@ -116,17 +226,20 @@ impl VmSupervisor {
         } else {
             command.env_remove("_VM_NETD_EXIT");
         }
-        install_child_inheritance(
-            &mut command,
-            [
-                Some(start_read.as_raw_fd()),
-                Some(sync_write.as_raw_fd()),
-                Some(machine_log_dir.as_raw_fd()),
-                Some(machine_lock.as_raw_fd()),
-                Some(storage_lease.as_raw_fd()),
-                launch.network.exit_writer().map(AsRawFd::as_raw_fd),
-            ],
-        )?;
+        let base_descriptors = [
+            Some(start_read.as_raw_fd()),
+            Some(sync_write.as_raw_fd()),
+            Some(machine_log_dir.as_raw_fd()),
+            Some(machine_lock.as_raw_fd()),
+            Some(storage_lease.as_raw_fd()),
+            launch.network.exit_writer().map(AsRawFd::as_raw_fd),
+        ];
+        if let Some(mut descriptors) = restore_descriptors {
+            descriptors.extend(base_descriptors);
+            install_child_inheritance(&mut command, descriptors)?;
+        } else {
+            install_child_inheritance(&mut command, base_descriptors)?;
+        }
 
         command
             .stdin(Stdio::null())
@@ -134,6 +247,16 @@ impl VmSupervisor {
             .stderr(Stdio::null());
         if let Some(qualification) = launch.qualification {
             qualification.recheck_native_executable()?;
+        }
+        if let Some(restore) = launch.restore {
+            if crate::storage::identity_file::SourceFingerprint::new(
+                &restore.executable.metadata()?,
+            ) != restore.executable_identity
+            {
+                return Err(
+                    io::Error::other("inspected restore executable changed before launch").into(),
+                );
+            }
         }
         let child = command.spawn()?;
 
@@ -155,13 +278,13 @@ impl VmSupervisor {
         .with_rosetta_intent(launch.rosetta_intent)
         .with_asset_directory(launch.asset_directory.clone())
         .with_startup_budget(startup_deadline.saturating_duration_since(Instant::now()));
+        let start_request = start_request.with_restore(restore_request);
         handoff_start_request(start_write, &start_request, VMM_START_REQUEST_TIMEOUT).await?;
-        wait_for_start(
+        Ok(PendingStartup::new(
             sync_read,
-            launch.trace_log,
-            startup_deadline.saturating_duration_since(Instant::now()),
-        )
-        .await
+            startup_deadline,
+            launch.trace_log.to_path_buf(),
+        ))
     }
 }
 
@@ -180,17 +303,16 @@ fn monitor_command(executable: &Path, qualified: Option<BorrowedFd<'_>>) -> io::
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = descriptor;
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "qualified native executable FD launch requires Linux",
-                ))
+                Ok(Command::new(format!("/dev/fd/{}", descriptor.as_raw_fd())))
             }
         }
     }
 }
 
 fn startup_budget(launch: &VmmLaunch<'_>) -> Duration {
+    if launch.restore.is_some() {
+        return Duration::from_secs(90);
+    }
     let translated = matches!(
         launch.rosetta_intent,
         crate::supervisor::start_request::VmmRosettaIntent::Enabled {}
@@ -252,7 +374,6 @@ async fn wait_for_start(
     trace_path: &Path,
     deadline_duration: Duration,
 ) -> Result<(), LibVmError> {
-    let trace_path = trace_path.to_path_buf();
     let result = tokio::time::timeout(deadline_duration, read_syncpipe(syncpipe))
         .await
         .map_err(|_| {
@@ -402,7 +523,10 @@ fn normalize_launch_fd(fd: OwnedFd) -> io::Result<OwnedFd> {
     Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) })
 }
 
-fn install_child_inheritance(command: &mut Command, allowed: [Option<i32>; 6]) -> io::Result<()> {
+pub(crate) fn install_child_inheritance(
+    command: &mut Command,
+    allowed: impl AsRef<[Option<i32>]> + Send + Sync + 'static,
+) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let ceiling = {
         let mut ceiling =
@@ -460,7 +584,7 @@ fn install_child_inheritance(command: &mut Command, allowed: [Option<i32>; 6]) -
                     return Err(io::Error::last_os_error());
                 }
             }
-            for raw in allowed.into_iter().flatten() {
+            for raw in allowed.as_ref().iter().copied().flatten() {
                 let fd = BorrowedFd::borrow_raw(raw);
                 let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD)
                     .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
@@ -528,8 +652,59 @@ mod tests {
 
     use crate::supervisor::launch::{
         append_exit_command_args, handoff_start_request, install_child_inheritance, launch_pipe,
-        read_syncpipe, StartupResult,
+        read_syncpipe, PendingStartup, StartupResult,
     };
+
+    #[tokio::test]
+    async fn pending_startup_preserves_original_deadline_and_closes_pipe_on_timeout() {
+        let (reader, writer) = private_pipe();
+        let pending = PendingStartup::new(
+            reader,
+            std::time::Instant::now() - Duration::from_secs(1),
+            "/startup-trace".into(),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), pending.wait())
+            .await
+            .expect("an expired handoff deadline must not start a new budget")
+            .expect_err("pending startup must time out");
+        assert!(matches!(error, crate::LibVmError::Io(error)
+            if error.kind() == std::io::ErrorKind::TimedOut));
+        assert_eq!(
+            nix::unistd::write(&writer, b"started\n"),
+            Err(nix::errno::Errno::EPIPE)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_startup_cancellation_closes_owned_pipe() {
+        let (reader, writer) = private_pipe();
+        let pending = PendingStartup::new(
+            reader,
+            std::time::Instant::now() + Duration::from_secs(30),
+            "/startup-trace".into(),
+        );
+        let waiter = tokio::spawn(pending.wait());
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            nix::unistd::write(&writer, b"started\n"),
+            Err(nix::errno::Errno::EPIPE)
+        );
+    }
+
+    #[test]
+    fn dropping_pending_startup_before_wait_closes_owned_pipe() {
+        let (reader, writer) = private_pipe();
+        drop(PendingStartup::new(
+            reader,
+            std::time::Instant::now() + Duration::from_secs(30),
+            "/startup-trace".into(),
+        ));
+        assert_eq!(
+            nix::unistd::write(&writer, b"started\n"),
+            Err(nix::errno::Errno::EPIPE)
+        );
+    }
 
     /// A pipe no concurrently spawned test child can inherit. Tests that observe a
     /// pipe closing (EOF, EPIPE) fail at random if some child holds an end open.

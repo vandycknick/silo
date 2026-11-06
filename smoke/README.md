@@ -93,6 +93,12 @@ The destination must be outside the repository and staged runtime, with matching
 Cargo ancestor depth and build environment. The builder checks native/build
 identity equality and leaves the production stage unchanged.
 
+Phase 15 restore gates use the same builder with `--restore`. It requires
+production capture and restore to be delivered but still `lane-not-qualified`,
+then admits only pause, capture and restore in the copied compilation.
+Fork and incremental admission remain unchanged. This is test isolation,
+not production qualification; use the resulting private CLI and runtime together.
+
 Point `SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR` at the candidate's `bin`
 and `runtime` directories, then run:
 
@@ -121,6 +127,114 @@ vsock muxer exercises genuine continuation deadlines without injected errors
 or changed timeouts. The failure oracle checks the coherent published seal,
 Error fences and the source's durable workload counter, not survival of an
 exec session whose readiness has been invalidated.
+
+### Execution restore and retained closure (Phase 15)
+
+`tests/test_restore.py` drives actual `silo snapshot create --live` followed by
+`silo restore image:<checkpoint> --name <child>`, with automatic execution-kind
+dispatch and no cold-boot recovery fallback:
+
+```sh
+uv run --project smoke pytest smoke/tests/test_restore.py -m slow -k 'not pending_hardware_irq' --keep
+```
+
+The raw and flat-overlay cases cover acquired and borrowed freeze authority,
+fresh machine/run/generation identity and reseeding, unchanged boot ID, sibling
+disk isolation, exact captured kernel/initramfs/agent objects, source removal,
+home relocation, GC, recapture and generation-lease release after owned processes
+are reaped. The detached `restore_execution.c` daemon is independent of the
+source exec session. Its guest-local read protocol exposes sustained register
+sentinels (GPR, x87, SSE, and YMM when genuinely enabled), a parked SIMD worker,
+timer progress and pending timerfd/signalfd events. An independent host reader
+reads the pinned RAM page and sealed disk log; every record at the boundary and
+the exact first resumed append must be consecutive, not just a later larger value.
+The timerfd/signal events are kernel-event witnesses, not hardware IRQ proof.
+
+Corruption cases alter real captured RAM, disks, state/layout/maps, boot assets
+and provenance. Compatibility cases use the public native execution codec to
+alter a real CPU/profile/producer/XSAVE envelope, then rebuild the object digests,
+canonical checkpoint identity, dependency edges and authenticated local seal.
+Only the precise native refusal subject satisfies those cases. Producer refusal
+is intentionally checked before device decoding; its original device binding is
+retained explicitly. All rejections require no child/catalog/budget leak.
+Verification consumers may leave an unlocked stable lease inode by pool design;
+unsupported selected-backend refusal may not acquire even that consumer.
+The helper `native-live-api` must be staged with the selected candidate.
+Foreign-lane compatibility still requires a real foreign-lane checkpoint, not a
+synthetic mixed-architecture envelope.
+
+The genuine hardware IRQ case uses a separate `capture_candidate --restore
+--irq-probe` runtime and is **not** a production-lane qualification:
+
+```sh
+uv run --project smoke pytest smoke/tests/test_restore.py -m slow -k pending_hardware_irq --keep
+```
+
+It requires the exact candidate-bound `assets/restore-irq-witness` manifest and
+immutable assembly inputs staged by that builder. Four virtual CPUs retain
+ordinary Linux on CPUs 0/1, with the source-only privileged AP2 witness and a
+never-started AP3 in explicitly reserved memory. The compile-gated native probe
+only constructs AP2 during a user pause; restored initialization must refuse.
+The test captures a real vector-224 LAPIC IRR with IF=0, independently decodes
+the sealed execution envelope and reads its guest RAM publication, then restores
+through the normal CLI activation path. Only the restored AP2's own guest STI
+releases the pending interrupt. Exactly one interrupt and EOI, sustained progress,
+preserved GPR/x87/SSE/YMM state, empty IRR/ISR on recapture and independent source
+delivery are required. No host IRQ injection or post-restore CPU reseeding is
+used. Normal builds have no probe endpoint; select the non-probe suite separately.
+
+### Restore activation lifecycle (Phase 15)
+
+`tests/test_restore_lifecycle.py` uses the same `--restore` candidate and
+selection. Its VM cases are `slow`; the host-only oracle cases are not:
+
+```sh
+uv run --project smoke pytest smoke/tests/test_restore_lifecycle.py -m slow --keep
+```
+
+Each case boots a one-vCPU `--network private` source with the
+`restore-network` witness (`virt/vmm/tests/guest/restore_network.c`): a
+keepalive TCP stream and an unconnected UDP sender (sequence plus fresh
+getrandom UUID) to real host peers through netd's host-loopback NAT, a forward
+target listener and a durable progress record. A preserving live checkpoint is
+restored with the real `silo restore`. The workspace selects netd's own packet
+capture (`networking.drivers.netd.pcap`); the child's capture and trace log are
+followed from creation so destroyed children keep their evidence.
+The capture is nanosecond classic pcap with `LINKTYPE_ETHERNET=1`, recorded
+at netd's vfkit datagram connection in both directions, before ingress switch
+filtering and after successful egress writes. Original Ethernet headers,
+including ARP and IPv6 frames, are retained; MAC addresses are never inferred
+from configuration. The old stack-level `LINKTYPE_RAW=101` capture stripped
+ingress MACs and observed egress before Ethernet headers were added, so it
+cannot satisfy this oracle and is rejected. Capture write failures terminate
+the attachment and are reported on close rather than silently losing evidence.
+
+Order evidence is the child monitor's `restore ...` trace events (listed in
+`silo_smoke/restore_lifecycle.py`). Wire evidence is netd's capture and, under
+`stopped_trace` with `observeNetEgress`, every native `virtio-net` send toward
+netd. The positive case requires no frame before `restore exposure committing`,
+only the reserved destination MAC/IPv4 (no source MAC, IPv4, ARP or
+MAC-derived IPv6), host delivery, Running only after the native commit, the
+same restored process, rebound machine forward, no reopened TCP stream, exec
+session or session forward, and divergent UUIDs for equal sequences once the
+source resumes. Failure cases hold real native threads only after the event
+preceding the action: the sole `fc_vcpu` at its next `KVM_RUN` (missing or late
+generation ACK), the `vsock muxer` (undelivered Activate, crashes) or the native
+socket write carrying the actual guest THAWED gRPC response (lost Thaw ACK,
+refrozen or reaped). That reply is matched to the logged activation ID, with
+HTTP/2 DATA and short-write reassembly, not to a thread name or an unrelated
+socket write: Unix proxy replies can be forwarded by the virtio event owner.
+The held receipt retains the response bytes proving guest thaw before delivery.
+Listener conflicts and failing activation hooks need no hold. Failed startup
+never publishes Running or sends traffic past the fence. Manager death cancels
+startup and requires positive child reaping, including after an uncertain Thaw.
+Worker death is observed during activation rather than at the startup deadline.
+The stop-only gate suspends the live manager so it cannot clean up the parked
+`activation-failed` child before inspection: resume, start and pause are refused,
+listeners remain closed, and normal stop must reap it. The tracer explicitly
+detaches only that manager before SIGSTOP; monitor/worker tracing remains active.
+These cases require monitor events and `--activation-hook`; without them they
+fail, never skip.
 
 ### Restored guest activation (Phase 12)
 
@@ -239,6 +353,38 @@ Capacity checks obtain the same two independent guest statvfs projections with
 one `stat` invocation, still comparing each fresh post-effect metrics frame
 against both real filesystems. Stopped byte/inode oracles, full logical hashing,
 copy/replay order, fresh boots and exact-boot closure checks are unchanged.
+
+The Phase 14 default baseline,
+`.tmp/plan/evidence/phase-14/default-journal-complete.xml`, contains 106 testcase
+rows totaling 983.640 seconds (suite wall time 983.983 seconds). The suite header
+reports 115 tests, so use the actual testcase rows for per-case comparisons.
+Overlay cases contribute 423.935 seconds and stopped-storage cases 292.336
+seconds, together 72.8% of the recorded case time. These totals identify the
+dominant controllers, not a measurement of any individual setup operation.
+
+Those two modules now seed each unopened private Home from a session-local
+image-only cache prepared from that session's exact OCI bytes. Preparation
+creates stopped, never booted machines through the staged CLI, then uses the
+existing sanitized SQLite backup and reflink-aware immutable pool copier.
+Overlay and stopped references have separate catalogs, so no extra image
+reference can pin the OCI closure during stopped-storage collection checks.
+Each case still creates its
+own machines, writable disks, runtime namespace, catalog and locks; no
+previously booted root or machine/operation/network row is carried over. The
+cache is not reused across pytest sessions. Invalid OCI variants still take
+their original acquisition/materialization paths, and acquisition/cache tests
+outside these two modules retain fresh, unseeded Homes.
+
+The two exact-boot snapshot cases contribute 88.861 seconds and the retained
+stage-replacement case 16.181 seconds to that baseline. Their private runtime
+trees now use reflinks when the destination filesystem supports them, falling
+back to ordinary copying otherwise. Copies still dereference staged symlinks,
+preserve file modes/timestamps/xattrs and allocate private inodes, never
+hardlinks. Replacing, modifying or unlinking either private tree cannot modify
+the original stage or its sibling. All boot-byte hashes, held-FD/unlink oracles,
+fresh boots, shutdown ownership and existing readiness/deadline checks remain.
+No Phase 15 speed result is claimed until the complete default selection is
+rerun with the same qualified inputs.
 
 Phase 12 measured 199 `info` invocations taking 101.91 seconds in the six
 stopped fork/replay and exact-boot snapshot cases. Identity-only path and SQL
@@ -1008,7 +1154,10 @@ shared mapping is not independent private storage.
 `stopped.py` uses a separate bounded SHA-256/raw reader and records device,
 inode, mode, logical length and allocation independently from the production
 StreamHasher. Logical SQL/schema snapshots use independent read-only sqlite3
-processes; WAL/SHM physical bytes are deliberately not compared. Rejection gates
+processes; WAL/SHM physical bytes are deliberately not compared. Catalog reads
+allow SQLite to wait up to five seconds for a concurrent writer, within the
+existing 15-second subprocess limit; persistent contention still fails.
+Rejection gates
 compare the complete logical catalog and owned persistent/runtime inventories.
 `stopped-refusal-delta.log` retains changed table rows and file entries before
 assertion/teardown, including both values. Lifecycle status and error fields
@@ -1173,10 +1322,10 @@ namespace (`unshare --user --map-root-user --mount`). Its bounded tmpfs
 exercises actual ENOSPC; do not substitute host disk exhaustion or `/dev/full`.
 Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`,
 only after the exercised native lane's support declarations have been approved.
-The Phase 14 implementation delivers capture without production qualification:
-capture reports `lane-not-qualified`; restore, fork and incremental remain
-`not-delivered`. The public pause qualification is revision-bound. Standalone
-native proofs grant no additional public capability.
+Phase 15 delivers capture and restore without production qualification:
+both report `lane-not-qualified`; fork and incremental remain `not-delivered`.
+The public pause qualification is revision-bound. Standalone native proofs
+grant no additional public capability.
 
 `api-report.json`, per-process logs, captured manifests and input identities
 are the evidence. Ordinary successful cohorts require acknowledged native

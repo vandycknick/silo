@@ -54,8 +54,8 @@ def replacement(silo: Silo, reference: str) -> None:
     private = root / 'private-stage'
     successor = root / 'next-stage'
     retired = root / 'unlinked-stage'
-    shutil.copytree(silo.ws.config.runtime_dir, private, symlinks=False)
-    shutil.copytree(private, successor, symlinks=False)
+    overlay.copy_runtime(silo.ws.config.runtime_dir, private)
+    overlay.copy_runtime(private, successor)
     fixture_root = os.environ.get('SILO_SMOKE_FAULT_MONITORS')
     assert fixture_root, 'build fresh COPY-only reordered fixture first'
     fixture = json.loads((Path(fixture_root) / 'reordered/fault-manifest.json').read_text())

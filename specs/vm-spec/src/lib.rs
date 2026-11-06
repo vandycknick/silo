@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod lifecycle;
 pub mod live;
+pub mod restore;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

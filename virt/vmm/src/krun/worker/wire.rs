@@ -16,6 +16,10 @@ pub(crate) enum Event {
         stage: StartupStage,
     },
     BackendStarted {},
+    /// A restore launch is constructed and parked behind its native restore
+    /// barrier with every activation fence effective, and the lifecycle
+    /// endpoint serves. No guest instruction has run. Never BackendStarted.
+    RestorePrepared {},
     StartupFailed {
         stage: StartupStage,
         diagnostic: String,
@@ -148,6 +152,31 @@ mod tests {
                 .collect(),
         };
         config
+    }
+
+    #[test]
+    fn restore_config_round_trip_does_not_require_or_fall_back_to_a_kernel() {
+        let request = crate::krun::worker::restore::tests::request();
+        let config = managed(crate::krun::worker::restore::tests::config(request));
+        assert!(config.kernel.is_none());
+        let bytes = encode_config(&config).expect("encode restore without cold boot assets");
+        assert_eq!(
+            read_config(&mut bytes.as_slice()).expect("decode restore"),
+            config
+        );
+        let mut invalid = config.clone();
+        invalid.restore.as_mut().unwrap().start_paused = false;
+        assert!(encode_config(&invalid).is_err());
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        assert!(read_config(&mut bytes.as_slice()).is_err());
+        let cold = crate::krun::KrunConfig {
+            restore: None,
+            ..config
+        };
+        assert!(
+            encode_config(&cold).is_err(),
+            "missing restore never becomes an implicit cold boot"
+        );
     }
 
     #[test]

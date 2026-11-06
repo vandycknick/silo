@@ -58,6 +58,9 @@ pub(crate) struct StartupGate {
     pub(crate) require_guest_ready: bool,
     pub(crate) deadline: tokio::time::Instant,
     pub(crate) cancelled: CancellationToken,
+    /// A restored machine: activated after the control-only guest service
+    /// is up and before anything is exposed or `started` is reported.
+    pub(crate) activation: Option<crate::restore::activation::Activation>,
 }
 
 #[derive(Clone)]
@@ -437,6 +440,7 @@ pub async fn start_services(
         require_guest_ready,
         deadline: startup_deadline,
         cancelled: startup_cancel,
+        activation,
     } = startup;
     ctx.machine.ensure_alive().await?;
     let path = runtime.socket().to_path_buf();
@@ -618,6 +622,87 @@ pub async fn start_services(
     } else {
         None
     };
+    if let Some(activation) = activation {
+        let activation_id = activation.activation_id();
+        let activated = tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(startup_deadline) => Err(eyre::eyre!(
+                "restore activation exceeded the original startup deadline"
+            )),
+            result = activation.run(ctx, runtime.runtime_dir(), &startup_cancel, startup_deadline) => result,
+        };
+        match activated {
+            Ok(crate::restore::activation::Activated::Running(surface)) => {
+                // Native exposure is irreversible. Cold-start admission checks
+                // cannot veto this committed activation; reporting loss instead
+                // returns terminal uncertainty for the retained owner to reap.
+                if let Some(exec_log) = &exec_log {
+                    exec_log.generation(
+                        &ctx.machine_id.hyphenated().to_string(),
+                        &ctx.machine_run_id.hyphenated().to_string(),
+                        "started",
+                    );
+                }
+                if let Err(error) = sync_reporter.report_started() {
+                    cleanup_failed_service_start(
+                        &server_shutdown,
+                        &mut control_socket,
+                        &mut guest_monitor,
+                        &mut None,
+                    )
+                    .await;
+                    return Err(eyre::eyre!(
+                        "restore exposure committed but startup reporting was lost: {error}"
+                    ));
+                }
+                tracing::info!(activation = %activation_id, "restore activation started");
+                return Ok(ServiceHandles {
+                    control_socket,
+                    guest_monitor,
+                    health,
+                    server_shutdown,
+                    startup_command: None,
+                    vsock_surface: surface,
+                    forwards: Some(ctx.forwards.clone()),
+                });
+            }
+            Ok(crate::restore::activation::Activated::Failed(message)) => {
+                // Positively parked and fenced: the monitor stays up for
+                // inspection and stop only, and the manager learns why.
+                if let Err(error) = sync_reporter.report_failed(&message) {
+                    cleanup_failed_service_start(
+                        &server_shutdown,
+                        &mut control_socket,
+                        &mut guest_monitor,
+                        &mut None,
+                    )
+                    .await;
+                    return Err(eyre::eyre!(
+                        "{message}; reporting the activation failure failed: {error}"
+                    ));
+                }
+                return Ok(ServiceHandles {
+                    control_socket,
+                    guest_monitor,
+                    health,
+                    server_shutdown,
+                    startup_command: None,
+                    vsock_surface: None,
+                    forwards: Some(ctx.forwards.clone()),
+                });
+            }
+            Err(error) => {
+                cleanup_failed_service_start(
+                    &server_shutdown,
+                    &mut control_socket,
+                    &mut guest_monitor,
+                    &mut None,
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    }
     if require_guest_ready {
         if let Err(error) =
             wait_for_required_guest_ready(ctx, startup_deadline, &startup_cancel).await

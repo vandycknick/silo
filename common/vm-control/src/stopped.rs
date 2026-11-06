@@ -136,6 +136,90 @@ pub fn policy_from_wire(
         }
     }
 }
+pub fn hook_to_wire(
+    value: &libvm::RestoreHook,
+) -> Result<w::RestoreActivationHook, ConversionError> {
+    value.validate().map_err(|_| {
+        invalid(
+            "activation_hook",
+            "invalid command, environment, directory or timeout",
+        )
+    })?;
+    Ok(w::RestoreActivationHook {
+        argv: value.argv.clone(),
+        environment: value
+            .environment
+            .iter()
+            .map(|variable| w::EnvironmentPair {
+                name: variable.name.clone(),
+                value: variable.value.clone(),
+            })
+            .collect(),
+        working_directory: value.working_directory.clone(),
+        timeout_ms: Some(value.timeout_ms),
+    })
+}
+
+pub fn hook_from_wire(
+    value: w::RestoreActivationHook,
+) -> Result<libvm::RestoreHook, ConversionError> {
+    let hook = libvm::RestoreHook {
+        argv: value.argv,
+        environment: value
+            .environment
+            .into_iter()
+            .map(|variable| libvm::RestoreEnvironmentVariable {
+                name: variable.name,
+                value: variable.value,
+            })
+            .collect(),
+        working_directory: value.working_directory,
+        timeout_ms: required(value.timeout_ms, "activation_hook.timeout_ms")?,
+    };
+    hook.validate().map_err(|_| {
+        invalid(
+            "activation_hook",
+            "invalid command, environment, directory or timeout",
+        )
+    })?;
+    Ok(hook)
+}
+
+pub fn restore_resources_to_wire(value: libvm::RestoreResourcePolicy) -> w::RestoreResourcePolicy {
+    w::RestoreResourcePolicy {
+        private_write_percent: value.private_write_allowance.into(),
+        memory: match value.memory {
+            libvm::RestoreMemoryPolicy::Reserved => w::RestoreMemoryPolicy::Reserved,
+            libvm::RestoreMemoryPolicy::AllowOvercommit => w::RestoreMemoryPolicy::AllowOvercommit,
+        } as i32,
+    }
+}
+
+pub fn restore_resources_from_wire(
+    value: Option<w::RestoreResourcePolicy>,
+) -> Result<libvm::RestoreResourcePolicy, ConversionError> {
+    let Some(value) = value else {
+        return Ok(libvm::RestoreResourcePolicy::default());
+    };
+    Ok(libvm::RestoreResourcePolicy {
+        private_write_allowance: libvm::PrivateWriteAllowance::try_from(
+            value.private_write_percent,
+        )
+        .map_err(|_| invalid("resources.private_write_percent", "expected 0..=100"))?,
+        memory: match w::RestoreMemoryPolicy::try_from(value.memory) {
+            Ok(w::RestoreMemoryPolicy::Reserved) => libvm::RestoreMemoryPolicy::Reserved,
+            Ok(w::RestoreMemoryPolicy::AllowOvercommit) => {
+                libvm::RestoreMemoryPolicy::AllowOvercommit
+            }
+            _ => {
+                return Err(invalid(
+                    "resources.memory",
+                    "expected an explicit restore memory policy",
+                ))
+            }
+        },
+    })
+}
 
 pub fn info_to_wire(value: &SnapshotInfo) -> Result<w::StorageSnapshotInfo, ConversionError> {
     let result = w::StorageSnapshotInfo {
@@ -393,5 +477,58 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn restore_hook_wire_roundtrip_preserves_exact_guest_argv_and_requires_bounded_timeout() {
+        let hook = libvm::RestoreHook {
+            argv: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+            environment: vec![libvm::RestoreEnvironmentVariable {
+                name: "RESTORED".into(),
+                value: "yes".into(),
+            }],
+            working_directory: "/".into(),
+            timeout_ms: 30_000,
+        };
+        let wire = crate::stopped::hook_to_wire(&hook).unwrap();
+        assert_eq!(crate::stopped::hook_from_wire(wire.clone()).unwrap(), hook);
+        let mut missing = wire.clone();
+        missing.timeout_ms = None;
+        assert!(crate::stopped::hook_from_wire(missing).is_err());
+        let mut oversized = wire;
+        oversized.timeout_ms = Some(30_001);
+        assert!(crate::stopped::hook_from_wire(oversized).is_err());
+    }
+
+    #[test]
+    fn restore_resource_wire_defaults_require_explicit_valid_policy_when_present() {
+        use crate::stopped::{restore_resources_from_wire, restore_resources_to_wire};
+        assert_eq!(
+            restore_resources_from_wire(None).unwrap(),
+            libvm::RestoreResourcePolicy::default()
+        );
+        for percent in [0, 25, 33, 100] {
+            for memory in [
+                libvm::RestoreMemoryPolicy::Reserved,
+                libvm::RestoreMemoryPolicy::AllowOvercommit,
+            ] {
+                let policy = libvm::RestoreResourcePolicy {
+                    private_write_allowance: libvm::PrivateWriteAllowance::try_from(percent)
+                        .unwrap(),
+                    memory,
+                };
+                assert_eq!(
+                    restore_resources_from_wire(Some(restore_resources_to_wire(policy))).unwrap(),
+                    policy
+                );
+            }
+        }
+        for (percent, memory) in [(101, 1), (u32::MAX, 2), (25, 0), (25, 3), (25, -1)] {
+            assert!(restore_resources_from_wire(Some(w::RestoreResourcePolicy {
+                private_write_percent: percent,
+                memory,
+            }))
+            .is_err());
+        }
     }
 }

@@ -118,6 +118,30 @@ pub enum LifecycleCommand {
     },
     /// Observe one capture; never waits on native mutators.
     GetCapture { operation: Uuid },
+    /// Restore activation: install one host-CSPRNG FreshIdentity generation
+    /// under the worker's retained restore token, release the prepared vCPUs
+    /// and require the exact acknowledgement before `timeout`. Native
+    /// activation fences stay effective.
+    ActivateGeneration {
+        activation: Uuid,
+        #[serde(with = "millis")]
+        timeout: Duration,
+    },
+    /// Commit native activation exposure with the acknowledged FreshIdentity
+    /// ticket: every provider opens together, or none does.
+    ReleaseActivation {
+        activation: Uuid,
+        #[serde(with = "millis")]
+        timeout: Duration,
+    },
+    /// Re-park the released vCPUs of a failed, unexposed activation. The
+    /// resulting native pause stays private to the worker: it never becomes
+    /// public Resume authority.
+    ParkActivation {
+        activation: Uuid,
+        #[serde(with = "millis")]
+        timeout: Duration,
+    },
 }
 
 impl LifecycleCommand {
@@ -135,6 +159,9 @@ impl LifecycleCommand {
             Self::AbandonCapture { .. } => Some(CommandKind::AbandonCapture),
             Self::ContinueCapture { .. } => Some(CommandKind::ContinueCapture),
             Self::ReleaseCapture { .. } => Some(CommandKind::ReleaseCapture),
+            Self::ActivateGeneration { .. } => Some(CommandKind::ActivateGeneration),
+            Self::ReleaseActivation { .. } => Some(CommandKind::ReleaseActivation),
+            Self::ParkActivation { .. } => Some(CommandKind::ParkActivation),
             Self::GetControl { .. } | Self::GetCapture { .. } => None,
         }
     }
@@ -153,6 +180,9 @@ impl LifecycleCommand {
             | Self::ContinueCapture { operation, .. }
             | Self::ReleaseCapture { operation, .. }
             | Self::GetCapture { operation } => Some(*operation),
+            Self::ActivateGeneration { activation, .. }
+            | Self::ReleaseActivation { activation, .. }
+            | Self::ParkActivation { activation, .. } => Some(*activation),
             Self::GetControl { .. } => None,
         }
     }
@@ -169,7 +199,10 @@ impl LifecycleCommand {
             | Self::AcceptCapture { timeout, .. }
             | Self::AbandonCapture { timeout, .. }
             | Self::ContinueCapture { timeout, .. }
-            | Self::ReleaseCapture { timeout, .. } => Some(*timeout),
+            | Self::ReleaseCapture { timeout, .. }
+            | Self::ActivateGeneration { timeout, .. }
+            | Self::ReleaseActivation { timeout, .. }
+            | Self::ParkActivation { timeout, .. } => Some(*timeout),
             Self::GetControl { .. } | Self::GetCapture { .. } => None,
         }
     }
@@ -197,6 +230,17 @@ impl LifecycleCommand {
                     purpose: PausePurpose::Capture,
                     ..
                 }
+        )
+    }
+
+    /// Activation stages exist once per restore activation and therefore use
+    /// the activation identity as their request identity.
+    fn activation_stage(&self) -> bool {
+        matches!(
+            self,
+            Self::ActivateGeneration { .. }
+                | Self::ReleaseActivation { .. }
+                | Self::ParkActivation { .. }
         )
     }
 }
@@ -636,6 +680,9 @@ pub enum CommandKind {
     AbandonCapture,
     ContinueCapture,
     ReleaseCapture,
+    ActivateGeneration,
+    ReleaseActivation,
+    ParkActivation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -908,6 +955,66 @@ pub enum CommandOutcome {
         stage: CaptureStage,
         failure: NativeFailure,
     },
+    /// The exact FreshIdentity request was acknowledged by the guest driver
+    /// after the prepared vCPUs were released. Fences remain effective.
+    GenerationAcknowledged {
+        generation: FreshGenerationReceipt,
+    },
+    /// The native activation exposure committed: every provider opened.
+    ActivationReleased,
+    /// Released vCPUs are positively parked again behind a private pause.
+    ActivationParked {
+        pause: NativePause,
+    },
+    /// No activation stage advanced. `cpus_released` reports whether the
+    /// restored vCPUs may have executed; `exposure` is the reconciled native
+    /// fence state, never inferred from a transport failure.
+    ActivationFailed {
+        stage: ActivationStage,
+        failure: NativeFailure,
+        cpus_released: bool,
+        exposure: ActivationExposure,
+    },
+}
+
+/// The acknowledged fresh VM generation request. The native ticket stays in
+/// the worker; these are correlation facts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshGenerationReceipt {
+    pub sequence: u64,
+    /// The 128-bit identity drawn from the host CSPRNG.
+    pub identity: Uuid,
+    /// Always the native SYNC_CLOCK flag alone (fresh identity).
+    pub flags: u32,
+    /// From vCPU release submission to the guest driver's acknowledgement.
+    #[serde(with = "millis")]
+    pub acknowledged_within: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationStage {
+    PrepareGeneration,
+    ReleaseCpus,
+    Acknowledgement,
+    Exposure,
+    Park,
+}
+
+/// Reconciled native activation exposure after a failed activation stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationExposure {
+    /// No release was attempted; every provider fence is effective.
+    Fenced,
+    /// Native refused or failed the release and sealed its exposure gate:
+    /// no provider was ever exposed. Only stop remains.
+    Sealed,
+    /// The release committed despite the failed reply.
+    Committed,
+    /// Neither closure nor commit could be established.
+    Uncertain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1252,6 +1359,12 @@ pub enum LifecycleRejection {
     BorrowedPause,
     #[error("capture descriptor refused: {0}")]
     CaptureOutputs(OutputProblem),
+    #[error("this run has no restore activation")]
+    NoRestore,
+    #[error("the restored machine's activation is unreleased")]
+    RestoreActive,
+    #[error("command is not legal at the activation's current stage")]
+    ActivationStage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -1310,6 +1423,8 @@ pub enum InvalidRequest {
     CapturePolicy,
     #[error("capture binding digests must be nonzero")]
     CaptureBinding,
+    #[error("an activation stage must use its activation as request identity")]
+    ActivationRequestIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1367,6 +1482,9 @@ impl LifecycleRequest {
         }
         if self.command.capture_stage() && self.command.operation() != Some(self.request_id) {
             return invalid(InvalidRequest::CaptureRequestIdentity);
+        }
+        if self.command.activation_stage() && self.command.operation() != Some(self.request_id) {
+            return invalid(InvalidRequest::ActivationRequestIdentity);
         }
         if let LifecycleCommand::PrepareCapture { preparation, .. } = &self.command {
             if let CapturePauseSource::Borrow { operation, .. } = preparation.pause {

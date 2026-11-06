@@ -224,6 +224,12 @@ pub(crate) fn create_backend(
     kind: BackendKind,
     config: VmConfig,
 ) -> Result<Arc<dyn VirtBackend>, VirtError> {
+    if config.restore().is_some() && kind != BackendKind::Krun {
+        return Err(VirtError::InvalidConfig {
+            name: config.name().to_string(),
+            reason: "execution restore requires the krun backend".to_string(),
+        });
+    }
     storage::publish_holders(&config, None)?;
     match kind {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
