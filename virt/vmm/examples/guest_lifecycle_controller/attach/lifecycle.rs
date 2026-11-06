@@ -136,6 +136,7 @@ pub(crate) struct ActivateRequest {
     pub(crate) hook: Option<ActivationHook>,
     pub(crate) host_time: Option<HostTime>,
     pub(crate) shutdown_manifest_json: String,
+    pub(crate) ssh_trusted_ca: String,
     #[serde(default)]
     pub(crate) deadline_ms: Option<u32>,
 }
@@ -157,6 +158,7 @@ impl ActivateRequest {
             freeze_ref: Some((&self.freeze_ref).into()),
             destination_machine_id: self.destination_machine_id.clone(),
             destination_run_id: self.destination_run_id.clone(),
+            ssh_trusted_ca: Some(self.ssh_trusted_ca.clone()),
             network: self.network.as_ref().map(|network| v1::ActivationNetwork {
                 mac: network.mac.clone(),
                 ipv4: network.ipv4.clone(),
@@ -651,6 +653,7 @@ mod tests {
                 "working_directory":"/","timeout_ms":5000},
         "host_time":null,
         "shutdown_manifest_json":"{\"version\":1}",
+        "ssh_trusted_ca":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "deadline_ms":30000}"#;
 
     #[test]

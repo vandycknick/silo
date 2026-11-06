@@ -790,6 +790,10 @@ pub struct CaptureEvidence {
     pub pause_disposition: Option<CapturePauseDisposition>,
     #[serde(deserialize_with = "required")]
     pub freeze_epoch: Option<NonZeroU64>,
+    /// The original guest freeze operation, which differs from this capture
+    /// when borrowing a user-owned pause. Retained for source-free restore.
+    #[serde(deserialize_with = "required")]
+    pub freeze_operation_id: Option<LiveId>,
     pub configuration_digest: Sha256Digest,
     /// SHA-256 of the exact `request.json` bytes.
     pub request_digest: Sha256Digest,
@@ -876,11 +880,12 @@ impl CaptureEvidence {
                         "a coherent capture has no error and all seven facts true",
                     ));
                 }
-                let (Some(token), Some(disposition), Some(_), Some(memory)) = (
+                let (Some(token), Some(disposition), Some(_), Some(memory), Some(freeze_operation)) = (
                     &self.pause_token,
                     self.pause_disposition,
                     self.freeze_epoch,
                     &self.memory,
+                    &self.freeze_operation_id,
                 ) else {
                     return Err(invalid(
                         "a coherent capture binds its pause, freeze and RAM geometry",
@@ -893,6 +898,8 @@ impl CaptureEvidence {
                     CapturePauseDisposition::Borrowed => PauseOwner::User,
                 };
                 if token.owner != expected_owner
+                    || (disposition == CapturePauseDisposition::Acquired
+                        && freeze_operation != &self.capture_id)
                     || memory.binding.pause_generation != token.generation
                     || memory.binding.capture != self.capture_id
                     || memory.binding.source_run != self.run_id
@@ -963,8 +970,13 @@ impl CaptureEvidence {
         }
         let expected_disposition = match &plan.pause {
             CapturePauseAuthority::Acquire => CapturePauseDisposition::Acquired,
-            CapturePauseAuthority::Borrow { token, .. } => {
-                if self.pause_token.as_ref() != Some(token) {
+            CapturePauseAuthority::Borrow {
+                token,
+                pause_operation_id,
+            } => {
+                if self.pause_token.as_ref() != Some(token)
+                    || self.freeze_operation_id.as_ref() != Some(pause_operation_id)
+                {
                     return Err(invalid("borrowed capture did not keep the user token"));
                 }
                 CapturePauseDisposition::Borrowed
@@ -1341,6 +1353,7 @@ mod tests {
             pause_token: Some(token),
             pause_disposition: Some(CapturePauseDisposition::Acquired),
             freeze_epoch: NonZeroU64::new(4),
+            freeze_operation_id: Some(capture()),
             configuration_digest: plan.configuration_digest,
             request_digest: Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap()),
             memory: Some(CaptureMemoryEvidence {
@@ -1703,6 +1716,173 @@ mod tests {
         let mut foreign = resumed.clone();
         foreign.pause_token.generation = NonZeroU64::new(9).unwrap();
         assert!(foreign.validate_against(&sealed).is_err());
+    }
+
+    #[test]
+    fn borrowed_seal_retains_the_original_freeze_operation_for_restore() {
+        let mut plan = plan();
+        let original_pause = id("44444444-4444-4444-8444-444444444444");
+        plan.pause = CapturePauseAuthority::Borrow {
+            pause_operation_id: original_pause.clone(),
+            token: user_token(3),
+        };
+        plan.resume_policy = CaptureResumePolicy::Preserve;
+        let mut seal = evidence(&plan);
+        seal.pause_token = Some(user_token(3));
+        seal.pause_disposition = Some(CapturePauseDisposition::Borrowed);
+        seal.freeze_operation_id = Some(original_pause.clone());
+        let request_digest = Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap());
+        seal.validate_against_plan(&plan, &request_digest).unwrap();
+        let retained = CaptureEvidence::decode(&seal.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(retained.freeze_operation_id, Some(original_pause));
+        seal.freeze_operation_id = Some(capture());
+        assert!(seal.validate_against_plan(&plan, &request_digest).is_err());
+        seal.freeze_operation_id = None;
+        assert!(!seal.is_sealed());
+    }
+
+    fn restore_request() -> crate::restore::RestoreRequest {
+        use crate::restore::{
+            RestoreDescriptor, RestoreExtent, RestoreLower, RestoreObject, RestoreObjectRole,
+            RestoreRequest,
+        };
+        let plan = plan();
+        let evidence = evidence(&plan);
+        let objects = RestoreObjectRole::ALL.map(|role| {
+            let index = RestoreObjectRole::ALL
+                .iter()
+                .position(|value| *value == role)
+                .unwrap();
+            let entry = evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == role.capture_role())
+                .unwrap();
+            RestoreObject {
+                role,
+                fd: 3 + index as i32,
+                file_device: 1,
+                file_inode: 1 + index as u64,
+                length: entry.length,
+                sha256: entry.sha256,
+            }
+        });
+        RestoreRequest {
+            version: 1,
+            checkpoint: Sha256Digest::of_bytes(b"checkpoint"),
+            activation_id: id("44444444-4444-4444-8444-444444444444"),
+            freeze_operation_id: capture(),
+            start_paused: true,
+            configuration: plan.configuration.clone(),
+            evidence,
+            objects,
+            ssh_trusted_ca: None,
+            lowers: vec![RestoreLower {
+                block_id: BlockId::new("silo-root-lower").unwrap(),
+                descriptor: RestoreDescriptor {
+                    fd: 7,
+                    file_device: 1,
+                    file_inode: 7,
+                    length: 512,
+                },
+                extents: vec![RestoreExtent {
+                    path: "/pool/lower".into(),
+                    fd: 8,
+                    file_device: 1,
+                    file_inode: 8,
+                    length: 1 << 30,
+                }],
+            }],
+            network: None,
+            hook: None,
+        }
+    }
+
+    #[test]
+    fn restore_inputs_reject_cross_role_aliases_and_cut_substitution() {
+        let request = restore_request();
+        request.validate().unwrap();
+        let mut wrong = request.clone();
+        wrong.objects[1].fd = wrong.objects[0].fd;
+        assert!(wrong.validate().is_err());
+        let mut wrong = request.clone();
+        wrong.lowers[0].extents[0].file_inode = wrong.objects[0].file_inode;
+        assert!(wrong.validate().is_err());
+        let mut wrong = request.clone();
+        wrong.objects[2].sha256 = Sha256Digest::of_bytes(b"other execution");
+        assert!(wrong.validate().is_err());
+        let mut wrong = request.clone();
+        wrong.start_paused = false;
+        assert!(wrong.validate().is_err());
+        let mut wrong = request.clone();
+        wrong.freeze_operation_id = request.activation_id.clone();
+        assert!(wrong.validate().is_err());
+        let mut wrong = request;
+        wrong.lowers.clear();
+        assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn inspection_requires_complete_exact_devices_without_imposing_envelope_order() {
+        use crate::restore::{
+            RestoreAdmittedDevice, RestoreDeviceKind as Kind, RestoreInspectionReport,
+            RestoreInspectionRequest,
+        };
+        let request = RestoreInspectionRequest {
+            version: 1,
+            restore: restore_request(),
+            network: false,
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let binding = &request.restore.evidence.memory.as_ref().unwrap().binding;
+        let report = RestoreInspectionReport {
+            version: 1,
+            request: Sha256Digest::of_bytes(&bytes),
+            checkpoint: request.restore.checkpoint,
+            native_producer: binding.native_producer.clone(),
+            silo_producer: binding.silo_producer,
+            lane: crate::live::LiveLane::KvmX86_64,
+            cpu_count: u32::from(request.restore.configuration.cpus),
+            ram_bytes: request.restore.configuration.ram_bytes(),
+            devices: [
+                ("hvc0", Kind::Console),
+                ("silo-root-lower", Kind::Block),
+                ("silo-root-upper", Kind::Block),
+                ("data0", Kind::Block),
+                ("vsock", Kind::Vsock),
+                ("rng", Kind::Rng),
+                ("balloon", Kind::Balloon),
+                ("silo-vmgenid", Kind::Generation),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, kind))| RestoreAdmittedDevice {
+                configured_id: id.into(),
+                kind,
+                address: 0x1000 + index as u64 * 0x1000,
+                irq: 32 + index as u32,
+            })
+            .collect(),
+        };
+        report.validate_against(&bytes, &request).unwrap();
+        let mut reordered = report.clone();
+        reordered.devices.reverse();
+        reordered.validate_against(&bytes, &request).unwrap();
+        let mut wrong = report.clone();
+        wrong.devices.pop();
+        assert!(wrong.validate_against(&bytes, &request).is_err());
+        let mut wrong = report.clone();
+        wrong.devices[0].kind = Kind::Network;
+        assert!(wrong.validate_against(&bytes, &request).is_err());
+        let mut wrong = report.clone();
+        wrong.devices[3].configured_id = "other-data".into();
+        assert!(wrong.validate_against(&bytes, &request).is_err());
+        let mut wrong = report.clone();
+        wrong.devices[1].irq = wrong.devices[0].irq;
+        assert!(wrong.validate_against(&bytes, &request).is_err());
+        let mut wrong = report;
+        wrong.request = Sha256Digest::of_bytes(b"another inspection");
+        assert!(wrong.validate_against(&bytes, &request).is_err());
     }
 
     #[test]

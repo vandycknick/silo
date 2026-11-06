@@ -418,6 +418,10 @@ impl InstanceStore {
             let changed_at = SystemTime::now();
             state.vm_state = transition.state.into();
             state.vm_changed_at = changed_at;
+            // A restored run first becomes Running here, never via Starting.
+            if transition.state == VmLifecycleState::Running && state.running_since.is_none() {
+                state.running_since = Some(changed_at);
+            }
             state.vm_message = Some(truncate(transition.message, protocol::MAX_DIAGNOSTIC_BYTES));
             state.live_lifecycle = transition.lifecycle;
             state.held_identity = transition.held_identity;

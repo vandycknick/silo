@@ -675,6 +675,12 @@ impl LiveCoordinator {
         };
         match response {
             Ok(response) => {
+                if let Some(InventoryObservation::Unavailable { failure }) = &response.inventory {
+                    tracing::warn!(
+                        ?failure,
+                        "native provider inventory unavailable for live admission"
+                    );
+                }
                 inventory_rejection(&response.control, response.inventory.as_ref(), capture)
             }
             Err(LifecycleError::Unsupported { .. }) => profile("native-lifecycle-unsupported"),

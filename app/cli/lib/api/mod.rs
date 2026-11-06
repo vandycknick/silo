@@ -102,17 +102,6 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn restore_execution(
-        &mut self,
-        checkpoint: &str,
-        name: Option<&str>,
-    ) -> eyre::Result<()> {
-        match self {
-            Self::Local(service) => service.restore_execution(checkpoint, name).await,
-            Self::Daemon(service) => service.restore_execution(checkpoint, name).await,
-        }
-    }
-
     pub(crate) async fn fork_stopped(
         &mut self,
         reference: &str,
@@ -140,7 +129,11 @@ impl AppApi {
         reference: &str,
         options: libvm::RestoreOptions,
     ) -> eyre::Result<MachineData> {
-        let reference: libvm::SnapshotRef = reference.parse()?;
+        let reference: libvm::SnapshotRef = if reference.starts_with("image:") {
+            reference.parse()?
+        } else {
+            format!("image:{reference}").parse()?
+        };
         match self {
             Self::Local(service) => service.restore_snapshot(reference, options).await,
             Self::Daemon(service) => service.restore_snapshot(reference, options).await,

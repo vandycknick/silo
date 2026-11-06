@@ -825,9 +825,16 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
         (
             LiveOperation::Restore,
             runtime
-                .restore_execution(w::LiveRestoreRequest {
-                    checkpoint: b"/must/not/be/opened".to_vec(),
+                .restore_snapshot(w::RestoreStorageSnapshotRequest {
+                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(
+                        &libvm::SnapshotRef::Image("checkpoint".into()),
+                    )),
                     name: Some("child".into()),
+                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+                        &libvm::ExternalResourcePolicy::Reject,
+                    )),
+                    activation_hook: None,
+                    resources: None,
                 })
                 .await
                 .unwrap_err(),
@@ -979,6 +986,8 @@ async fn malformed_stopped_contracts_fail_before_native_initialization() {
                     )),
                     name: Some(name.into()),
                     external_resources: reject(),
+                    activation_hook: None,
+                    resources: None,
                 }))
                 .await
                 .unwrap_err()
@@ -1169,4 +1178,36 @@ async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters()
     cleanup.0 = None;
     shutdown.cancel();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn restore_resource_policy_is_validated_before_daemon_native_initialization() {
+    use w::runtime_service_server::RuntimeService;
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let service = Service(owner.clone());
+    for (percent, memory) in [(101, 1), (u32::MAX, 2), (25, 0), (25, 999), (25, -1)] {
+        let error = service
+            .restore_snapshot(Request::new(w::RestoreStorageSnapshotRequest {
+                snapshot: Some(silo_vm_control::stopped::reference_to_wire(
+                    &"image:checkpoint".parse().unwrap(),
+                )),
+                name: Some("child".into()),
+                external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+                    &libvm::ExternalResourcePolicy::Reject,
+                )),
+                activation_hook: None,
+                resources: Some(w::RestoreResourcePolicy {
+                    private_write_percent: percent,
+                    memory,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.components.get().is_none());
+    assert_eq!(owner.capacity.available_permits(), 64);
+    assert!(!owner.host.home().join("state.db").exists());
 }

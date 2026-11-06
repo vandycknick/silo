@@ -243,24 +243,24 @@ x86_64 KVM. The immutable boot-admission entry records exactly:
 | --- | --- |
 | Kernel | Linux `7.2.2`, SHA256 `ec6fee8b1885a71e78306fea384f4ff6687fd151b6f279c23117785027748f33` |
 | Reusable base initramfs | SHA256 `632d14f7ea50ee018a5e7a78f50a27fbdac2bb163589ec56e2e928b36e7015b8` |
-| Actual monitor and worker executable | SHA256 `d47535a0b3da982e39949a89e3334d17b5dea5a154f26ae49398c584238f11cf` |
+| Actual monitor and worker executable | SHA256 `14d5c9eb301ef042acd7d1961bb8a6d4eb8a87c407783d14779d1c982cb08307` |
 | Actual resolved Kconfig | SHA256 `f3dab6adffce7cadde5ce693f9403ce88d66ab9f4ec503f7860ce9020cb142e6` |
-| Native source revision | `2264754b29b8d8c1f00bedcb94887d13dbe1c886` |
+| Native source revision | `2606116528aaddbb5e87aeb045abed80456a822c` |
 | Guest / host lane | `amd64` / Linux `x86_64`, KVM |
 | Profiles | `linux-flat-overlay-v1`, `silo-upper-ext4-v1`, `silo-overlay-v1` |
 | Rendering / attachment | `linux-overlayfs-mountinfo-v1` / `krun-virtio-blk-v1` |
 
-Phase 14 refreshed this exact executable tuple after readonly VMDK capture
-provider integration and preseal staging-budget enforcement. The controlled boot passed in
-`.tmp/plan/evidence/phase-14/overlay-budget-qualification.xml`; its observed tuple and
+Phase 15 refreshed this executable tuple after restore activation, retained
+provider ownership, and read-only inspection admission corrections. The controlled boot passed in
+`.tmp/plan/evidence/phase-15/overlay-inspector-requalification.xml`; its observed tuple and
 guest proof are retained alongside that report. This boot qualification does
 not grant public capture, restore or fork admission.
 
 Retained candidate evidence:
-`.tmp/plan/evidence/phase-14/budget-overlay-candidate-proof.log` and
-`.tmp/plan/evidence/phase-14/budget-overlay-candidate-tuple.log`.
+`.tmp/plan/evidence/phase-15/overlay-inspector-proof.log` and
+`.tmp/plan/evidence/phase-15/overlay-inspector-tuple.json`.
 The tuple records native build identity
-`v2:path:clean:2264754b29b8d8c1f00bedcb94887d13dbe1c886:content=ce1e1a0557d5c600587257f06dd288efebb6b1ff33ff634907d58c1ef920a37b:inputs=e555935ef5ed0cf4cfa1e3c4ee7f3a5c6607989ae0aa3892b4a48c1597442d2f`.
+`v2:path:clean:2606116528aaddbb5e87aeb045abed80456a822c:content=21a00aec6ce92e89eb74366fb510bfc306b045056c1e62f22646458136668927:inputs=cfda901013b8b21ddc4f7e9fe14f5cde5f2ec4955a39c1dafa748b1678c645a6`.
 Main independently extracted the exact tested kernel's embedded IKCONFIG and
 verified byte equality with the supplied resolved `.config`, binding the
 configuration to the executable rather than trusting its pathname. The

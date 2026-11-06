@@ -257,6 +257,12 @@ impl Run {
             }),
             pause_token: token,
             freeze_epoch: self.freeze_epoch,
+            freeze_operation_id: self.freeze_epoch.map(|_| {
+                self.borrowed.as_ref().map_or_else(
+                    || self.operation.clone(),
+                    |current| current.operation_id.clone(),
+                )
+            }),
             configuration_digest: self.plan.configuration_digest,
             request_digest,
             memory: match outcome {

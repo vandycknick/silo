@@ -386,7 +386,8 @@ A capture runs in this order; each step completes before the next begins:
 ### Evidence
 
 `vm.capture.json` (version 1) carries: schema version, `machineId`, `runId`,
-`captureId`, the pause token, the digest of the machine configuration and
+`captureId`, the pause token, the original guest `freezeOperationId` and
+`freezeEpoch`, the digest of the machine configuration and
 attachment inventory at capture time, the RAM layout and geometry, the exact
 inventory of staged output roles with sizes and SHA-256 digests, capture
 timestamps, `captureOutcome` (`coherent` or `failed`), an error string or
@@ -395,6 +396,12 @@ null, and these booleans: `workloadsFrozen`, `vcpusPaused`, `devicesQuiesced`,
 `memoryStateSealed`. Each boolean records a positively observed fact. A false,
 missing or malformed field cannot yield `coherent`. The record is versioned by
 addition only.
+
+A coherent seal retains the original guest freeze reference for restore after
+source deletion. An acquired pause uses the capture ID as `freezeOperationId`;
+a borrowed user pause retains its original pause operation ID, not the new
+capture ID. Restore authenticates this reference from the seal and does not
+depend on the source's request file.
 
 ### Incremental capture
 
@@ -468,6 +475,24 @@ reserves the baseline once; the default maximum fan-out of one fork call is
 16. Memory overcommit beyond this reservation requires an explicit per-call
 flag and is reported as such. Refusal happens before the source is frozen.
 
+Execution restore exposes that per-child allowance as an integer percentage
+from 0 through 100 (`RestoreOptions::resources.private_write_allowance`, CLI
+`--private-write-percent`, default 25). It rounds the selected fraction upward
+to the native RAM granule without truncating fractional bytes. Zero explicitly
+reserves no private writes; the baseline and page-table/native-state charge
+remain mandatory. `RestoreMemoryPolicy::AllowOvercommit` / CLI
+`--memory-overcommit` is an explicit per-restore opt-in, off by default, and
+never bypasses disk, descriptor, closure or compatibility admission. Selected
+policy is durable intent, validated with its charge throughout reconciliation.
+
+The same-euid cross-home restore ledger publishes only complete records:
+private staging, file fsync, atomic rename, then directory fsync. SQL ownership
+commits before initial publication or construction-peak reduction. Interrupted
+updates therefore retain the complete conservative old charge or the complete
+new charge; interrupted initial staging is never an authoritative inventory
+entry. Admission reclaims abandoned staging under its serialization lock, but
+still refuses malformed authoritative records.
+
 ### Reclaim
 
 Silo's macOS free-page reclaim patch operates on live mappings. For restored
@@ -538,13 +563,14 @@ retry under a new run ID.
    The worker waits for that acknowledgement with a bounded deadline.
 4. The monitor connects to the agent over the recreated vsock transport
    (through the fence's admitted control service) and sends `Activate`: the
-   new machine and run identity, the destination network configuration, the
-   guest-side listeners for the machine-scoped forwards the monitor will
-   open, and the selected activation hook if any. The agent rotates its
-   runtime instance identity, applies the network configuration to the
-   captured interface (located by its stable index, not by its replaced
-   MAC), flushes neighbor caches, registers the named guest listeners and
-   runs the hook. It acknowledges with its new identity.
+   new machine and run identity, the destination network configuration and
+   public SSH CA, the guest-side listeners for the machine-scoped forwards
+   the monitor will open, and the selected activation hook if any. The agent
+   rotates its runtime instance identity, drains inherited sessions, replaces
+   the source SSH CA for both native SSH and OpenSSH, applies the network
+   configuration to the captured interface (located by its stable index, not
+   by its replaced MAC), flushes neighbor caches, registers the named guest
+   listeners and runs the hook. It acknowledges with its new identity.
 5. The monitor, still fenced, binds every host listener for the
    machine-scoped forwards it authorized and the machine's public endpoints,
    without accepting a connection on any of them. A bind failure is an
@@ -628,7 +654,7 @@ this timer exception changes neither kernel builds nor the support matrix.
 
 Fork is one capture followed by N restores. libvm performs the capture, pins
 the sealed RAM file and disk cut under a recoverable operation root, then
-restores each child with bounded concurrency. A local fork may use [ADR 0014](0014-layered-oci-image-storage.md)'s
+restores each child subject to the admitted resource budgets. A local fork may use [ADR 0014](0014-layered-oci-image-storage.md)'s
 qualified clone and copy identity rules without computing durable chunk
 identities first; a named checkpoint is not required, an operation root is.
 
@@ -978,9 +1004,10 @@ RAM may contain old paths and handles; they are not capabilities. Destination
 netd rejects traffic for the source's addresses; forwards and publications
 require destination authorization; secrets require destination authorization.
 
-Against resource exhaustion, libvm bounds N, bounds concurrent restores,
-reserves staging and memory per the accounting rules, and refuses before the
-freeze when the budget cannot admit the batch. The source's immutable RAM file
+Against resource exhaustion, libvm bounds N, reserves staging and memory per
+the accounting rules, and refuses before the freeze when the budget cannot
+admit the batch. There is no fixed concurrent-restore count limit. The source's
+immutable RAM file
 and sealed disks are held by content leases and read-only descriptors for the
 lifetime of every mapping; publication never modifies a same-digest object in
 place. Hostile same-UID writes to a mapped baseline remain outside the trusted
@@ -1015,7 +1042,6 @@ machine, who paused it.
 | --- | --- |
 | RAM per captured machine | [ADR 0014](0014-layered-oci-image-storage.md)'s per-stream limits apply; 1 TiB logical. |
 | Children per fork call | 16 by default; higher with an explicit flag, still within budget. |
-| Concurrent restores per host | 4 by default. |
 | Private-write reservation per child | 25 percent of machine RAM by default; per-machine configurable. |
 | Memory overcommit | Off by default; explicit per-call opt-in. |
 | Capture staging | Reserved before freeze by libvm: the machine's RAM size, plus for each writable disk its allocated bytes when the host lacks a qualified clone contract and 16 MiB of metadata when it has one, plus 64 MiB for state and evidence files. |

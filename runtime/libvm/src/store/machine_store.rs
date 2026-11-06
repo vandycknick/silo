@@ -45,8 +45,9 @@ impl MachineStore for Store {
         let spec = spec.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            runtime
-                .block_on(store.register_launch_storage_inner(machine_id, run_id, &storage, &spec))
+            runtime.block_on(
+                store.register_launch_storage_inner(machine_id, run_id, &storage, &spec, None),
+            )
         })
         .await?
     }

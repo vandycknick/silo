@@ -141,14 +141,18 @@ impl Machine {
                     "a new capture must be reserved and journaled through submit_capture",
                 ));
             }
-            require_new_command(observation, &command)?;
+            if let Some(rejection) = require_new_command(observation, &command)? {
+                return Ok(rejection);
+            }
         }
         let prepared = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
             require_same_observation(observation, &fresh)?;
             if existing.is_none() {
-                require_new_command(&fresh, &command)?;
+                if let Some(rejection) = require_new_command(&fresh, &command)? {
+                    return Ok(rejection);
+                }
             }
             let intent =
                 existing
@@ -400,12 +404,23 @@ fn fenced_failure(observation: &MachineLiveObservation) -> Result<bool, LibVmErr
 fn require_new_command(
     observation: &MachineLiveObservation,
     command: &LiveCommand,
-) -> Result<(), LibVmError> {
+) -> Result<Option<LiveCommandResult>, LibVmError> {
     match command {
-        LiveCommand::Pause(_) => require_live_operation(observation, LiveOperation::Pause),
-        LiveCommand::Capture(_) => require_live_operation(observation, LiveOperation::Capture),
-        _ => Ok(()),
+        LiveCommand::Pause(_) => require_live_operation(observation, LiveOperation::Pause)?,
+        LiveCommand::Capture(_) => require_live_operation(observation, LiveOperation::Capture)?,
+        _ => {}
     }
+    let state = observation.state()?;
+    Ok((!state.admits(command.kind())).then(|| {
+        LiveCommandResult::rejected(
+            command.kind(),
+            vm_spec::lifecycle::LiveRejection::new(
+                vm_spec::lifecycle::LiveRejectionReason::InvalidState,
+                state,
+                "command is not admitted in the observed lifecycle state",
+            ),
+        )
+    }))
 }
 
 pub(crate) fn result_error(result: &LiveCommandResult) -> LibVmError {

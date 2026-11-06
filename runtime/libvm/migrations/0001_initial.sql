@@ -276,6 +276,12 @@ CREATE TABLE storage_operation (
     CHECK (kind != 'launch' OR (machine_id IS NOT NULL AND run_id IS NOT NULL AND storage_generation IS NOT NULL AND storage_generation >= 0))
 );
 CREATE INDEX storage_operation_machine_idx ON storage_operation(machine_id);
+CREATE TABLE restore_memory_reservation (
+    operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    budget_id TEXT UNIQUE NOT NULL,
+    charge_json BLOB NOT NULL,
+    construction_json BLOB
+);
 CREATE TABLE storage_operation_stream (
     operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     stream_id TEXT NOT NULL,

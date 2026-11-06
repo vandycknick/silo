@@ -26,6 +26,21 @@ impl PartialEq for StorageLaunch {
 
 impl Eq for StorageLaunch {}
 
+/// Descriptor-owned inputs of one execution-checkpoint restore.
+#[derive(Debug, Clone)]
+pub(crate) struct RestoreLaunch {
+    pub(crate) request: vm_spec::restore::RestoreRequest,
+    pub(crate) files: Arc<crate::restore::inputs::RestoreFiles>,
+}
+
+impl PartialEq for RestoreLaunch {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request && Arc::ptr_eq(&self.files, &other.files)
+    }
+}
+
+impl Eq for RestoreLaunch {}
+
 /// Opaque, persistable machine identity.
 ///
 /// Backends that mint hardware identities (Virtualization.framework's generic
@@ -176,6 +191,7 @@ pub struct VmConfig {
     vz: VzOptions,
     mock: MockOptions,
     storage_launch: Option<StorageLaunch>,
+    restore: Option<RestoreLaunch>,
 }
 
 impl VmConfig {
@@ -206,6 +222,15 @@ impl VmConfig {
 
     pub fn with_storage_launch(mut self, launch: StorageLaunch) -> Self {
         self.storage_launch = Some(launch);
+        self
+    }
+
+    pub(crate) fn restore(&self) -> Option<&RestoreLaunch> {
+        self.restore.as_ref()
+    }
+
+    pub(crate) fn with_restore(mut self, launch: RestoreLaunch) -> Self {
+        self.restore = Some(launch);
         self
     }
 
@@ -393,7 +418,7 @@ pub(crate) fn validate_common(config: &VmConfig) -> Result<(), VirtError> {
     if config.base_directory.as_os_str().is_empty() {
         return Err(invalid("base directory must not be empty".to_string()));
     }
-    if config.kernel_path.is_none() {
+    if config.kernel_path.is_none() && config.restore.is_none() {
         return Err(invalid("a kernel image is required".to_string()));
     }
     if config.cpus == Some(0) {

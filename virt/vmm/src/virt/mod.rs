@@ -34,11 +34,11 @@ pub(crate) use backend::CaptureSource;
 pub use backend::HostMemoryReclaimReport;
 pub(crate) use backend::StorageFinalization;
 pub(crate) use capacity::VsockLease;
-pub(crate) use config::StorageLaunch;
 pub use config::{
     KrunOptions, MachineIdentifier, MockOptions, NetworkMode, RosettaIntent, RosettaProfile,
     SharedDirectory, VmConfig, VmConfigBuilder, VzOptions,
 };
+pub(crate) use config::{RestoreLaunch, StorageLaunch};
 pub use error::VirtError;
 pub use exit::VmExit;
 pub use machine::VirtualMachine;

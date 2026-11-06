@@ -16,6 +16,7 @@ mod name_generator;
 mod node_status;
 mod process;
 mod reference;
+pub(crate) mod restore;
 pub(crate) mod root_disk;
 pub(crate) mod root_storage;
 mod secrets;
@@ -80,8 +81,9 @@ pub use start::{
 };
 pub use stopped::{
     preflight_restore_snapshot, preflight_stopped, ExternalResourceKey, ExternalResourceMapping,
-    ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions, RestoreOptions,
-    SnapshotConfiguration, SnapshotOptions,
+    ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions, PrivateWriteAllowance,
+    RestoreMemoryPolicy, RestoreOptions, RestoreResourcePolicy, SnapshotConfiguration,
+    SnapshotOptions,
 };
 pub use streams::{
     FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,

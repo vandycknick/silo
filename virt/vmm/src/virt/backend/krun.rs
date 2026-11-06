@@ -366,7 +366,7 @@ impl VirtBackend for KrunBackend {
                         "worker stopped before startup handoff".to_string()
                     })));
                 }
-                owner::Phase::Started => {
+                owner::Phase::Prepared | owner::Phase::Started => {
                     guard.disarm();
                     return Ok(());
                 }
@@ -623,17 +623,27 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
             }
         }
     }
+    if config.restore().is_some() {
+        crate::krun::validate_config(&engine_config(config)?).map_err(|error| {
+            VirtError::InvalidConfig {
+                name: config.name().to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
 
     Ok(())
 }
 
 fn prepare(config: &VmConfig) -> Result<(), VirtError> {
-    let kernel = config
-        .kernel_path()
-        .ok_or_else(|| VirtError::Backend("validated kernel missing".to_string()))?;
-    ensure_path_exists(config, kernel, "kernel image")?;
-    if let Some(initramfs) = config.initramfs_path() {
-        ensure_path_exists(config, initramfs, "initramfs")?;
+    if config.restore().is_none() {
+        let kernel = config
+            .kernel_path()
+            .ok_or_else(|| VirtError::Backend("validated kernel missing".to_string()))?;
+        ensure_path_exists(config, kernel, "kernel image")?;
+        if let Some(initramfs) = config.initramfs_path() {
+            ensure_path_exists(config, initramfs, "initramfs")?;
+        }
     }
     for (index, disk) in config.disks().iter().enumerate() {
         ensure_path_exists(config, &disk.path, &format!("disk #{index}"))?;
@@ -696,6 +706,7 @@ fn engine_config(config: &VmConfig) -> Result<crate::krun::KrunConfig, VirtError
         stdio_console: true,
         balloon: true,
         rosetta: config.krun().prepared_rosetta.clone(),
+        restore: config.restore().map(|launch| launch.request.clone()),
     })
 }
 
@@ -795,6 +806,40 @@ mod tests {
             "silo-vmm-resolved-krun-{}-{timestamp}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn restore_backend_projects_the_exact_request_without_opening_provenance_boot_assets() {
+        use crate::virt::backend::krun::{engine_config, prepare};
+        let directory = test_dir();
+        fs::create_dir(&directory).unwrap();
+        let restore = crate::krun::worker::restore::tests::launch(&directory);
+        let expected = restore.request.clone();
+        let builder = VmConfig::builder("restore")
+            .vm_id("destination")
+            .base_directory(&directory)
+            .cpus(1)
+            .memory(128);
+        let descriptor_only = builder.clone().build().with_restore(restore.clone());
+        validate(&descriptor_only).expect("restore requires no cold kernel");
+        prepare(&descriptor_only).unwrap();
+        let config = builder
+            .kernel("/missing/provenance-only/kernel")
+            .initramfs("/missing/provenance-only/initramfs")
+            .build()
+            .with_restore(restore);
+        validate(&config).unwrap();
+        prepare(&config).expect("restore does not open a cold kernel or provenance initramfs");
+        assert_eq!(
+            engine_config(&config).unwrap().restore.as_ref(),
+            Some(&expected)
+        );
+        #[cfg(feature = "mock-backend")]
+        assert!(
+            crate::virt::backend::create_backend(crate::virt::BackendKind::Mock, config).is_err(),
+            "mock backend must not simulate a production restore"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

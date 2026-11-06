@@ -119,22 +119,6 @@ impl DaemonVmService {
         Ok(())
     }
 
-    pub(crate) async fn restore_execution(
-        &self,
-        checkpoint: &str,
-        name: Option<&str>,
-    ) -> eyre::Result<()> {
-        self.runtime
-            .clone()
-            .restore_execution(w::LiveRestoreRequest {
-                checkpoint: checkpoint.as_bytes().to_vec(),
-                name: name.map(str::to_owned),
-            })
-            .await
-            .map_err(native_status)?;
-        Ok(())
-    }
-
     pub(crate) async fn fork_stopped(
         &self,
         value: &str,
@@ -190,6 +174,14 @@ impl DaemonVmService {
                     name: options.name,
                     external_resources: Some(silo_vm_control::stopped::policy_to_wire(
                         &options.external_resources,
+                    )),
+                    activation_hook: options
+                        .activation_hook
+                        .as_ref()
+                        .map(silo_vm_control::stopped::hook_to_wire)
+                        .transpose()?,
+                    resources: Some(silo_vm_control::stopped::restore_resources_to_wire(
+                        options.resources,
                     )),
                 })
                 .await

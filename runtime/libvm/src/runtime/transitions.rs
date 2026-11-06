@@ -130,7 +130,14 @@ fn monitor_ready(
     started_at: i64,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    require_state(state.status, MachineRuntimeState::Starting, "MonitorReady")?;
+    if !matches!(
+        state.status,
+        MachineRuntimeState::Restoring
+            | MachineRuntimeState::Activating
+            | MachineRuntimeState::Running
+    ) {
+        require_state(state.status, MachineRuntimeState::Starting, "MonitorReady")?;
+    }
     require_run_id(&state, Some(run_id.as_str()))?;
 
     Ok(replace_runtime(
@@ -175,7 +182,14 @@ fn start_failed(
     error: Option<String>,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
-    require_state(state.status, MachineRuntimeState::Starting, "StartFailed")?;
+    if !matches!(
+        state.status,
+        MachineRuntimeState::Restoring
+            | MachineRuntimeState::Activating
+            | MachineRuntimeState::ActivationFailed
+    ) {
+        require_state(state.status, MachineRuntimeState::Starting, "StartFailed")?;
+    }
     require_run_id(&state, Some(run_id.as_str()))?;
 
     let status = match failure {
@@ -534,6 +548,29 @@ mod tests {
             assert_eq!(next.run_id, None);
             assert_eq!(next.last_error.as_deref(), Some("boom"));
         }
+    }
+
+    #[test]
+    fn observed_activation_failure_cleanup_requires_its_exact_run() {
+        let mut failed = state(MachineRuntimeState::ActivationFailed);
+        failed.vmm_pid = Some(123);
+        failed.started_at = Some(42);
+        failed.run_id = Some("restore-run".into());
+        let event = |run: &str| Event::StartFailed {
+            run_id: run.into(),
+            failure: StartFailure::Error,
+            error: Some("activation refused".into()),
+        };
+        assert_eq!(
+            reduce(failed.clone(), event("replaced-run"), NOW).unwrap_err(),
+            TransitionError::StaleGeneration
+        );
+        let terminal = reduce(failed, event("restore-run"), NOW).unwrap();
+        assert_eq!(terminal.status, MachineRuntimeState::Error);
+        assert_eq!(terminal.vmm_pid, None);
+        assert_eq!(terminal.started_at, None);
+        assert_eq!(terminal.run_id, None);
+        assert_eq!(terminal.last_error.as_deref(), Some("activation refused"));
     }
 
     #[test]

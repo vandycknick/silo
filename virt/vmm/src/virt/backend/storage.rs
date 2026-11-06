@@ -124,6 +124,24 @@ impl PreparedAttachments {
                     "non-Raw writable attachment is unsupported",
                 ));
             }
+            if !raw {
+                if let Some(restore) = config.restore() {
+                    let descriptor = restore
+                        .files
+                        .lower_descriptor(&restore.request, disk.block_id.as_str())
+                        .ok_or_else(|| {
+                            io::Error::other("restore VMDK lacks its inherited descriptor")
+                        })?;
+                    if crate::restore::inputs::identity(descriptor)?
+                        != (metadata.dev(), metadata.ino())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "restore lower descriptor differs from the retained attachment",
+                        ));
+                    }
+                }
+            }
             if raw {
                 prepared.raw_bindings.push(RawHandleBinding {
                     disk_index: index as u32,
@@ -327,6 +345,111 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn restore_vmdk_descriptor_must_match_the_actual_retained_config_path() {
+        use crate::restore::inputs::LowerFiles;
+        use vm_spec::capture::CaptureAttachment;
+        use vm_spec::restore::{RestoreDescriptor, RestoreExtent, RestoreLower};
+        let fixture = Fixture::new();
+        let descriptor_path = fixture.directory.join("lower.vmdk");
+        let extent_path = fixture.directory.join("lower.extent");
+        std::fs::write(&extent_path, [0x5a; 4096]).unwrap();
+        std::fs::write(&descriptor_path, format!(
+            "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\nRW 8 FLAT \"{}\" 0\n", extent_path.display()
+        )).unwrap();
+        let descriptor = File::open(&descriptor_path).unwrap();
+        let extent = File::open(&extent_path).unwrap();
+        let metadata = descriptor.metadata().unwrap();
+        let extent_metadata = extent.metadata().unwrap();
+        let disk = vm_spec::Disk {
+            path: descriptor_path.clone(),
+            block_id: vm_spec::BlockId::new("silo-root-lower").unwrap(),
+            role: vm_spec::DiskRole::RootLower,
+            format: vm_spec::DiskFormat::Vmdk,
+            geometry: vm_spec::DiskGeometry {
+                length: 4096,
+                logical_sector_size: 512,
+            },
+            read_only: true,
+        };
+        let mut restore = crate::krun::worker::restore::tests::launch(&fixture.directory);
+        restore.request.lowers.push(RestoreLower {
+            block_id: disk.block_id.clone(),
+            descriptor: RestoreDescriptor {
+                fd: descriptor.as_raw_fd(),
+                file_device: metadata.dev(),
+                file_inode: metadata.ino(),
+                length: metadata.len(),
+            },
+            extents: vec![RestoreExtent {
+                path: extent_path.to_str().unwrap().to_string(),
+                fd: extent.as_raw_fd(),
+                file_device: extent_metadata.dev(),
+                file_inode: extent_metadata.ino(),
+                length: extent_metadata.len(),
+            }],
+        });
+        Arc::get_mut(&mut restore.files)
+            .unwrap()
+            .lowers
+            .push(LowerFiles {
+                descriptor,
+                extents: vec![extent],
+            });
+        let mut disks = vec![disk];
+        disks.extend(fixture.config.disks().iter().cloned());
+        disks[1].role = vm_spec::DiskRole::RootUpper;
+        disks[1].block_id = vm_spec::BlockId::new("silo-root-upper").unwrap();
+        disks[1].geometry.length = 64 << 20;
+        OpenOptions::new()
+            .write(true)
+            .open(&disks[1].path)
+            .unwrap()
+            .set_len(disks[1].geometry.length)
+            .unwrap();
+        restore.request.configuration.attachments = disks
+            .iter()
+            .map(|disk| CaptureAttachment {
+                block_id: disk.block_id.clone(),
+                role: disk.role,
+                format: disk.format,
+                geometry: disk.geometry,
+                read_only: disk.read_only,
+            })
+            .collect();
+        restore.request.evidence.configuration_digest =
+            restore.request.configuration.digest().unwrap();
+        restore.request.validate().unwrap();
+        let mut builder = VmConfig::builder("restore").base_directory(&fixture.directory);
+        for disk in disks {
+            builder = builder.disk(disk);
+        }
+        let config = builder
+            .build()
+            .with_storage_launch(fixture.config.storage_launch().unwrap().clone())
+            .with_restore(restore);
+        let prepared = PreparedAttachments::open(&config).expect("same descriptor inode");
+        assert_eq!(
+            prepared.worker_handles().unwrap().len(),
+            3,
+            "VMDK never enters the Raw table"
+        );
+        std::fs::rename(&descriptor_path, fixture.directory.join("retained.vmdk")).unwrap();
+        std::fs::write(&descriptor_path, b"different descriptor inode").unwrap();
+        let error = PreparedAttachments::open(&config)
+            .err()
+            .expect("reject redirected descriptor");
+        assert!(error
+            .to_string()
+            .contains("differs from the retained attachment"));
+        let sources = prepared.capture_sources().unwrap();
+        assert_eq!(
+            sources[0].file.metadata().unwrap().ino(),
+            metadata.ino(),
+            "retained attachment stays the admitted lower inode"
+        );
     }
 
     #[cfg(target_os = "linux")]

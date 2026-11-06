@@ -29,7 +29,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -61,6 +60,7 @@ type VirtualNetwork struct {
 	publications  *publication.Table
 	ipPool        *tap.IPPool
 	captureFile   *os.File
+	capture       *ethernetCapture
 	closeOnce     sync.Once
 	closed        atomic.Bool
 	closeErr      error
@@ -102,15 +102,15 @@ func New(ctx context.Context, networkConfig *config.NetworkConfig, captureFile *
 	tapEndpoint.Connect(networkSwitch)
 	networkSwitch.Connect(tapEndpoint)
 
-	var endpoint stack.LinkEndpoint = tapEndpoint
+	var capture *ethernetCapture
 	if captureFile != nil {
-		endpoint, err = sniffer.NewWithWriter(tapEndpoint, captureFile, math.MaxUint32)
+		capture, err = newEthernetCapture(captureFile)
 		if err != nil {
-			return nil, fmt.Errorf("cannot create sniffer: %w", err)
+			return nil, fmt.Errorf("cannot create Ethernet capture: %w", err)
 		}
 	}
 
-	stack, err := createStack(configuration, endpoint)
+	stack, err := createStack(configuration, tapEndpoint)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create network stack: %w", err)
 	}
@@ -121,7 +121,7 @@ func New(ctx context.Context, networkConfig *config.NetworkConfig, captureFile *
 		return nil, fmt.Errorf("cannot add network services: %w", err)
 	}
 
-	return &VirtualNetwork{configuration: configuration, stack: stack, networkSwitch: networkSwitch, services: services, publications: publications, ipPool: ipPool, captureFile: captureFile}, nil
+	return &VirtualNetwork{configuration: configuration, stack: stack, networkSwitch: networkSwitch, services: services, publications: publications, ipPool: ipPool, captureFile: captureFile, capture: capture}, nil
 }
 
 func upstreamConfiguration(configuration *config.NetworkConfig) *types.Configuration {
@@ -173,6 +173,9 @@ func (n *VirtualNetwork) Run(ctx context.Context, conn net.Conn) error {
 	}
 	if conn == nil {
 		return errors.New("vfkit connection is nil")
+	}
+	if n.capture != nil {
+		conn = &captureConn{Conn: conn, capture: n.capture}
 	}
 	n.attached.Store(true)
 	defer n.attached.Store(false)
@@ -227,7 +230,9 @@ func (n *VirtualNetwork) Close() error {
 			n.stack.Close()
 		}
 		if n.captureFile != nil {
-			n.closeErr = errors.Join(n.closeErr, logfile.SyncClose(n.captureFile))
+			n.capture.mu.Lock()
+			n.closeErr = errors.Join(n.closeErr, n.capture.err, logfile.SyncClose(n.captureFile))
+			n.capture.mu.Unlock()
 		}
 	})
 	return n.closeErr

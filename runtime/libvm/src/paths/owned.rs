@@ -19,6 +19,13 @@ pub(crate) struct OwnedDirectory {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicWritePhase {
+    Staged,
+    Synced,
+    Published,
+}
+
 impl OwnedDirectory {
     pub(crate) fn fd(&self) -> &OwnedFd {
         &self.fd
@@ -238,6 +245,56 @@ impl OwnedDirectory {
             &verified_child.fd,
             &path,
         )
+    }
+
+    /// Publishes a complete private file. Interrupted writes remain only in
+    /// `.atomic-write`, which callers must exclude from authoritative inventories.
+    /// The caller serializes publishers and any abandoned-staging cleanup.
+    pub(crate) fn write_file_atomic(&self, name: &str, contents: &[u8]) -> Result<(), LibVmError> {
+        self.write_file_atomic_with(name, contents, |_| {})
+    }
+
+    pub(crate) fn write_file_atomic_with(
+        &self,
+        name: &str,
+        contents: &[u8],
+        mut checkpoint: impl FnMut(AtomicWritePhase),
+    ) -> Result<(), LibVmError> {
+        if !is_single_component(name) || name == ".atomic-write" {
+            return Err(invalid(&self.path.join(name), "invalid publication name"));
+        }
+        // Refuse non-private/non-regular existing entries before replacement.
+        let _existing = self.open_file(name)?;
+        let staging = self.ensure_dir(".atomic-write")?;
+        let temporary = uuid::Uuid::new_v4().to_string();
+        let path = staging.path.join(&temporary);
+        let fd = openat(
+            staging.fd(),
+            temporary.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|error| invalid(&path, error))?;
+        let result = (|| {
+            fchmod(&fd, PRIVATE_FILE_MODE).map_err(|error| invalid(&path, error))?;
+            validate_file(&fd, &path)?;
+            checkpoint(AtomicWritePhase::Staged);
+            let mut file = File::from(fd);
+            file.write_all(contents)
+                .map_err(|error| invalid(&path, error))?;
+            file.sync_all().map_err(|error| invalid(&path, error))?;
+            checkpoint(AtomicWritePhase::Synced);
+            nix::fcntl::renameat(staging.fd(), temporary.as_str(), self.fd(), name)
+                .map_err(|error| invalid(&self.path.join(name), error))?;
+            checkpoint(AtomicWritePhase::Published);
+            self.sync()?;
+            staging.sync()
+        })();
+        if result.is_err() {
+            // Never remove the authoritative name after a successful rename.
+            staging.remove_tree(&temporary)?;
+        }
+        result
     }
 
     pub(crate) fn write_file(&self, name: &str, contents: &[u8]) -> Result<(), LibVmError> {

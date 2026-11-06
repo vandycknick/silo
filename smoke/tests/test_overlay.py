@@ -10,11 +10,19 @@ import time
 
 import pytest
 
-from silo_smoke import images, overlay, procs, shutdown
+from silo_smoke import image_cache, images, overlay, procs, shutdown
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
+
+
+@pytest.fixture
+def silo(workspace: Workspace, overlay_image_caches: dict[str, Path]) -> Silo:
+    seeded = image_cache.seed(overlay_image_caches["overlay"], workspace.silo_home)
+    assert len(seeded) == 1, seeded
+    workspace.record("image-cache", f"seeded session-prepared overlay image: {sorted(seeded)}\n")
+    return Silo(workspace)
 
 
 @pytest.fixture(scope="session")
@@ -949,3 +957,36 @@ def test_overlay_native_symlink_4095_and_flat_4096_refusal(silo: Silo, config: S
     assert refused.returncode != 0, "one-byte-overflow symlink must fail flat materialization"
     assert {UUID(machine["id"]) for machine in silo.ls()} == before, "failed flat materialization published a machine"
     silo.ws.record("overlay-symlink-boundary", json.dumps({"nativeReadlinkBytes": len(target), "refusedTargetBytes": 4096, "publishedMachineIds": sorted(str(value) for value in before)}) + "\n" + refused.stdout + refused.stderr)
+
+
+@pytest.mark.linux_only
+def test_overlay_private_runtime_copy_preserves_bytes_without_inode_aliases(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    assets = source / "assets"
+    assets.mkdir(parents=True)
+    executable = assets / "agent"
+    executable.write_bytes(b"original staged executable\n")
+    executable.chmod(0o755)
+    os.utime(executable, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    (source / "agent-link").symlink_to(executable)
+    (source / "assets-link").symlink_to(assets, target_is_directory=True)
+    private = tmp_path / "private"
+    successor = tmp_path / "successor"
+    overlay.copy_runtime(source, private)
+    overlay.copy_runtime(private, successor)
+    paths = [tree / relative for tree in (private, successor) for relative in ("assets/agent", "agent-link", "assets-link/agent")]
+    identities = {(executable.stat().st_dev, executable.stat().st_ino)}
+    for path in paths:
+        assert path.read_bytes() == executable.read_bytes()
+        assert path.stat().st_mode == executable.stat().st_mode
+        assert path.stat().st_mtime_ns == executable.stat().st_mtime_ns
+        assert not path.is_symlink() and not path.parent.is_symlink()
+        identities.add((path.stat().st_dev, path.stat().st_ino))
+    assert len(identities) == len(paths) + 1, "private runtime files must never hardlink the stage or each other"
+    with pytest.raises(FileExistsError):
+        overlay.copy_runtime(source, private)
+    (private / "assets/agent").write_bytes(b"mutated private runtime\n")
+    (successor / "assets/agent").unlink()
+    assert executable.read_bytes() == b"original staged executable\n"
+    assert (private / "agent-link").read_bytes() == executable.read_bytes()
+    assert (successor / "agent-link").read_bytes() == executable.read_bytes()

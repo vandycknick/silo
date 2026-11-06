@@ -93,6 +93,28 @@ def overlay_image_bytes(config: SmokeConfig, overlay_probe: Path) -> images.OciI
     return overlay.image(config, overlay_probe)
 
 
+@pytest.fixture(scope="session")
+def overlay_image_caches(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_bytes: images.OciImage, request: pytest.FixtureRequest) -> Generator[dict[str, Path], None, None]:
+    """Prepare image-only catalogs without introducing extra retention roots."""
+    preparations: list[Workspace] = []
+    caches: dict[str, Path] = {}
+    prepared = False
+    try:
+        for name in ("overlay", "stopped"):
+            preparation = Workspace(config, registry.ca_path)
+            preparations.append(preparation)
+            reference = registry.publish(overlay_image_bytes, name)
+            Silo(preparation).create("prepare-" + name, reference, "--disk-size", "512mib", "--network", "none")
+            cache = preparation.root / "prepared-images"
+            assert image_cache.persist(cache, preparation.silo_home)
+            caches[name] = cache
+        prepared = True
+        yield caches
+    finally:
+        for preparation in reversed(preparations):
+            preparation.cleanup(failed=not prepared or request.session.testsfailed > 0)
+
+
 @pytest.fixture
 def workspace(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.FixtureRequest) -> Generator[Workspace, None, None]:
     instance = Workspace(config, registry.ca_path)

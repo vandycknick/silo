@@ -26,6 +26,7 @@ mod krun;
 mod live;
 mod lock;
 mod machine;
+mod restore;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rosetta;
 mod secure_file;
@@ -104,6 +105,9 @@ fn main() -> eyre::Result<()> {
     if let Some(result) = capabilities::dispatch() {
         return result;
     }
+    if let Some(result) = restore::inspect::dispatch() {
+        return result;
+    }
     let args = Args::parse();
     let inherited_fds = InheritedPipeFds::from_env()?;
 
@@ -128,6 +132,8 @@ fn main() -> eyre::Result<()> {
     // Held through backend shutdown/finalization. This is a one-way lifetime
     // lease, not a health check; netd death never stops the VM.
     let _netd_exit = inherited_fds.take_netd_exit()?;
+    // Validated at entry, adopted only by a restore start request.
+    let restore_fds = inherited_fds.take_restore();
 
     // Fork the exit runner while this process is still single-threaded: the
     // tracing appender below starts the first thread.
@@ -180,6 +186,7 @@ fn main() -> eyre::Result<()> {
             serial_file,
             machine_log_dir,
             exit_runner,
+            restore_fds,
         ));
     // The entry owner outlives backend finalization and durable exit publication.
     drop(storage_lease);
@@ -246,6 +253,7 @@ async fn run(
     serial_file: std::fs::File,
     machine_log_dir: Option<std::os::fd::RawFd>,
     exit_runner: Option<ExitRunner>,
+    restore_fds: Vec<std::os::fd::RawFd>,
 ) -> eyre::Result<()> {
     let mut start_request = start_request;
     let mut sync_reporter = sync_reporter;
@@ -290,6 +298,7 @@ async fn run(
         agent_enabled: args.agent_enabled,
         serial_file,
         primary_machine: &primary_machine,
+        restore_fds,
     };
     let result = match startup::init(
         &runtime,
@@ -311,6 +320,7 @@ async fn run(
                     require_guest_ready: initialized.require_guest_ready,
                     deadline: initialized.startup_deadline,
                     cancelled: initialized.startup_cancel.clone(),
+                    activation: initialized.activation,
                 },
             )
             .await

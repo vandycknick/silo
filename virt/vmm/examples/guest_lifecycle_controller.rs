@@ -44,6 +44,8 @@ mod live;
 mod lock;
 #[path = "../src/machine.rs"]
 mod machine;
+#[path = "../src/restore/mod.rs"]
+mod restore;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[path = "../src/rosetta/mod.rs"]
 mod rosetta;

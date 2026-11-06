@@ -138,6 +138,7 @@ impl MockBackend {
             child,
             binding,
             self.native.clone(),
+            None,
             Box::new(move |reason: &str| {
                 fatal.crash(format!("native lifecycle control lost: {reason}"))
             }),

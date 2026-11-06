@@ -4,19 +4,23 @@ Run the real executable boundary tests without a working hypervisor:
 
 ```sh
 cargo test --locked -p silo-vmm --test krun_worker -- --nocapture
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm krun::worker::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::backend::krun::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm exit_command::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::serial::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm krun::worker::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm virt::backend::krun::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm exit_command::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm virt::serial::tests::
 cargo test --locked -p libvm machine::lifecycle::tests::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm machine::tests::vm_spec_machine_config_attaches_spec_disks_in_order
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm virt::config::tests::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm krun::engine::tests::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm capabilities::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm build_inputs::
-cargo test --locked -p silo-vmm --all-features --bin silo-vmm dependency_source::
-cargo test --locked -p silo-vmm --all-features --test capabilities
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm machine::tests::vm_spec_machine_config_attaches_spec_disks_in_order
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm virt::config::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm krun::engine::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm capabilities::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm build_inputs::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm dependency_source::
+cargo test --locked -p silo-vmm --features mock-backend --test capabilities
 ```
+
+The ordinary host suite excludes diagnostic native probe features. Build and
+exercise `restore-irq-probe` separately; its diagnostic identity cannot qualify
+the production lane.
 
 Capability Cargo tests use pure linked build facts or the VZ/scenario backend,
 never native host discovery. Real `--backend krun` queries now consume the
@@ -28,10 +32,11 @@ KVM x86_64 also supports native capture, restore, fork and incremental; those
 four primitives remain unsupported and pending on KVM arm64 and HVF arm64.
 Excluded lanes support none of the five primitives. Public pause is delivered
 with an immutable Linux KVM x86_64 qualification record bound to the verified
-native/build identity. Capture is delivered but remains `lane-not-qualified`
-until the combined capture/restore/fork admission gates pass. Restore, fork and
-incremental remain `not-delivered`. Tests distinguish native support, public
-delivery, host admission and qualification; none substitutes for another.
+native/build identity. Capture and restore are delivered but remain
+`lane-not-qualified` until the combined capture/restore/fork admission gates
+pass. Fork and incremental remain `not-delivered`. Tests distinguish native
+support, public delivery, host admission and qualification; none substitutes
+for another.
 These Cargo tests do not qualify runtime execution on KVM arm64 or HVF.
 
 To query the actual monitor, build its binary (not only the unit-test harness)
@@ -48,10 +53,10 @@ Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
 set. The krun query performs read-only host discovery, not a VM run. Its
 `native: true` fields follow the lane matrix above and do not grant public
 support or runtime qualification. Only the exact compiled qualification admits
-public pause. Capture requires the isolated Phase 14 test candidate until the
-combined admission milestone; production capture remains `lane-not-qualified`.
-Restore, fork and incremental remain `not-delivered`. Mutable qualification
-grants cannot change any of these results.
+public pause. Capture and restore require their isolated test candidates until
+the combined admission milestone; both remain `lane-not-qualified`.
+Fork and incremental remain `not-delivered`. Mutable qualification grants
+cannot change any of these results.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust
@@ -70,6 +75,10 @@ unit-test harness. The worker is that same executable spawned with argv[0]
 | 7 | vsock mux stream, only when the config enables it |
 | 8 | one generation lease, required even before config arrives |
 | 9..24 | retained Raw handles in manifest order, at most 16 |
+| 25..28 | restore-only RAM, layout, execution and devices objects |
+| 29..31 | forbidden in normal workers (standalone-native endpoints only) |
+| 32 | monitor lifecycle stream, required in every normal worker |
+| 33+ | restore-only VMDK descriptors and inherited extents, at most 16 + 1536 |
 
 The tests cover:
 
@@ -94,6 +103,14 @@ The tests cover:
   OFD held through exec and watchdog exit, and an unrelated child remaining
   alive without delaying lease release. Colliding source/target mappings run
   through the production pre-exec installer, not a synthetic FD mapper.
+- Restore bootstrap admits the exact state and lower table, restores CLOEXEC
+  before reading configuration, and rejects partial state, writable objects,
+  orphaned lowers and cross-role aliases before emitting any worker event.
+  Pure worker journal tests cover activation authority, serialized admission,
+  replay conflicts, exposure gating and private stop-only parking. Descriptor
+  tests preserve a generated read-only VMDK rather than flattening it, and keep
+  reading the inherited extent inode after its pathname is replaced. These are
+  descriptor/journal unit tests, not proof of native guest restore execution.
 - Manager launch unit tests execute a retained ELF through `/proc/self/fd/N`
   after child cleanup and check that its CLOEXEC executable FD is absent after
   exec. These tests need no guest or hypervisor.

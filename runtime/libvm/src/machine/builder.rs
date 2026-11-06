@@ -1070,9 +1070,51 @@ pub(crate) async fn publish_stopped_child(
     runtime: &Runtime,
     name: String,
     configuration: crate::SnapshotConfiguration,
+    storage: crate::MachineStorageRecord,
+    sources: Vec<crate::machine::stopped::PrivateSource>,
+    operation_id: uuid::Uuid,
+) -> Result<MachineConfig, LibVmError> {
+    publish_checkpoint_child(
+        runtime,
+        name,
+        configuration,
+        storage,
+        sources,
+        operation_id,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn publish_restored_child(
+    runtime: &Runtime,
+    name: String,
+    configuration: crate::SnapshotConfiguration,
+    storage: crate::MachineStorageRecord,
+    sources: Vec<crate::machine::stopped::PrivateSource>,
+    operation_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+) -> Result<MachineConfig, LibVmError> {
+    publish_checkpoint_child(
+        runtime,
+        name,
+        configuration,
+        storage,
+        sources,
+        operation_id,
+        Some(run_id),
+    )
+    .await
+}
+
+async fn publish_checkpoint_child(
+    runtime: &Runtime,
+    name: String,
+    configuration: crate::SnapshotConfiguration,
     mut storage: crate::MachineStorageRecord,
     sources: Vec<crate::machine::stopped::PrivateSource>,
     operation_id: uuid::Uuid,
+    restore_run: Option<uuid::Uuid>,
 ) -> Result<MachineConfig, LibVmError> {
     runtime
         .validate_machine_network_config(&configuration.network)
@@ -1155,11 +1197,19 @@ pub(crate) async fn publish_stopped_child(
         prepared.retain();
     }
     directory.remove_tree(&stage_name)?;
-    crate::machine::stopped::project_child_disks(
-        &mut create.spec,
-        &storage,
-        runtime.local_images_dir(),
-    )?;
+    if restore_run.is_some() {
+        crate::machine::restore::project_restore_disks(
+            &mut create.spec,
+            &storage,
+            runtime.local_images_dir(),
+        )?;
+    } else {
+        crate::machine::stopped::project_child_disks(
+            &mut create.spec,
+            &storage,
+            runtime.local_images_dir(),
+        )?;
+    }
     write_machine_config(create.dir(), &create.name, &create.spec)?;
     directory.sync()?;
     storage.validate()?;
@@ -1169,7 +1219,15 @@ pub(crate) async fn publish_stopped_child(
             upper, capacity, ..
         } => (upper, *capacity),
     };
-    let config = create.config("stopped-storage".to_owned(), Some(length))?;
+    let config = create.config(
+        if restore_run.is_some() {
+            "execution-restore"
+        } else {
+            "stopped-storage"
+        }
+        .to_owned(),
+        Some(length),
+    )?;
     let rootfs = MachineRootfsRecord {
         machine_id: config.id,
         source_kind: crate::ImageSourceKind::Disk,
@@ -1184,14 +1242,14 @@ pub(crate) async fn publish_stopped_child(
     };
     // A cancelled/failed COMMIT is not a rollback certificate. Keep all child
     // ownership until the same catalog proves absence or reports success.
+    let mut state = stopped_machine_state(config.id, None);
+    if let Some(run_id) = restore_run {
+        state.status = crate::store::models::MachineRuntimeState::Restoring;
+        state.run_id = Some(run_id.to_string());
+    }
     create.preserve = true;
     runtime
-        .add_machine_record_with_rootfs(
-            &config,
-            &stopped_machine_state(config.id, None),
-            &rootfs,
-            &storage,
-        )
+        .add_machine_record_with_rootfs(&config, &state, &rootfs, &storage)
         .await?;
     Ok(config)
 }

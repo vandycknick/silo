@@ -29,6 +29,12 @@ pub enum StorageError {
         required: u64,
         available: u64,
     },
+    #[error("restore {resource} budget requires {required} bytes, available {available} bytes")]
+    RestoreBudget {
+        resource: &'static str,
+        required: u64,
+        available: u64,
+    },
     #[error("invalid owned storage path: {0}")]
     InvalidPath(String),
     #[error("stream map has {actual} chunks, expected {expected} for its length")]

@@ -14,11 +14,6 @@ use crate::runtime::boot_assets::{self, BootAssetOverrides, ResolvedBootAssets};
 use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::runtime::{RuntimeConfig, RuntimeNetworkingConfig};
 use crate::RegistryPolicy;
-use nix::{
-    errno::Errno,
-    sys::signal::{kill, Signal},
-    unistd::Pid,
-};
 use utils::format_storage_size;
 use vm_spec::{Boot, Hardware, Kernel, VmSpec};
 
@@ -267,6 +262,9 @@ impl Runtime {
     pub fn local_home(&self) -> &Path {
         self.paths.home()
     }
+    pub(crate) fn asset_directory(&self) -> &Path {
+        self.components.asset_dir()
+    }
 
     pub(crate) fn native_store(&self) -> Result<Store, LibVmError> {
         self.store.native_store().ok_or_else(|| {
@@ -330,20 +328,6 @@ impl Runtime {
             crate::machine::live::observe_run(&self.paths, config, state)
                 .await?
                 .with_pending_pause(pending),
-        )
-    }
-
-    /// Execution restore is not delivered. Refuse before opening the artifact
-    /// or allocating any destination state, even for positive test scenarios.
-    pub async fn restore_execution(
-        &self,
-        report: &vm_spec::live::LiveHostReport,
-        _checkpoint: &Path,
-        _name: Option<&str>,
-    ) -> Result<(), LibVmError> {
-        crate::runtime::capabilities::require_host_live_operation(
-            report,
-            vm_spec::live::LiveOperation::Restore,
         )
     }
 
@@ -869,7 +853,7 @@ impl Runtime {
         .map_err(storage_error)?;
         let operation_id = uuid::Uuid::new_v4();
         let lease = self.store.begin_storage_operation(operation_id).await?;
-        if let Some(image) = self
+        if let Some(mut image) = self
             .store
             .cached_oci_image(&resolved.selected_reference, &resolved.platform)
             .await?
@@ -879,7 +863,7 @@ impl Runtime {
                 .await?;
             let images_dir = self.local_images_dir().to_path_buf();
             let (mut image, lease) = tokio::task::spawn_blocking(move || {
-                let fingerprint = verify_cached_image(&image, &images_dir)?;
+                let fingerprint = verify_cached_image(&mut image, &images_dir)?;
                 if fingerprint
                     != crate::storage::identity_file::SourceFingerprint::new(&fs::symlink_metadata(
                         &image.artifact.rootfs_path,
@@ -971,14 +955,14 @@ impl Runtime {
             .candidates(reference)
             .map_err(|error| image_error(reference, error))?
         {
-            if let Some(image) = self
+            if let Some(mut image) = self
                 .store
                 .cached_oci_image(&candidate.to_string(), platform)
                 .await?
             {
                 let images = self.local_images_dir().to_path_buf();
                 return tokio::task::spawn_blocking(move || {
-                    verify_cached_image(&image, &images)?;
+                    verify_cached_image(&mut image, &images)?;
                     Ok(Some(image))
                 })
                 .await
@@ -1317,8 +1301,10 @@ impl Runtime {
                 return Ok(true);
             }
             let preattachment = expected.is_some_and(|state| {
-                state.status == MachineRuntimeState::Starting
-                    && state.vmm_pid.is_none()
+                matches!(
+                    state.status,
+                    MachineRuntimeState::Starting | MachineRuntimeState::Restoring
+                ) && state.vmm_pid.is_none()
                     && state
                         .run_id
                         .as_deref()
@@ -2317,7 +2303,18 @@ impl Runtime {
             .observe_machine_state(&config, persisted.as_ref())
             .await
         {
-            Ok(observed) if machine_state_needs_writeback(persisted.as_ref(), &observed.state) => {
+            // A live generation can be inspected while its manager owns the
+            // mutation lock. The status RPC below authenticates that exact run;
+            // inspection never writes its observation back to the catalog.
+            Ok(observed)
+                if machine_state_needs_writeback(persisted.as_ref(), &observed.state)
+                    && !(observed.state.status.is_live()
+                        && observed.state.vmm_pid.is_some()
+                        && observed.state.run_id.is_some()
+                        && persisted
+                            .as_ref()
+                            .is_some_and(|state| state.run_id == observed.state.run_id)) =>
+            {
                 match self.try_acquire_machine_lock(config.lock_id) {
                     Ok(Some(_lock)) => Ok(observed),
                     Ok(None) => Err(LibVmError::MonitorConnection {
@@ -2771,32 +2768,6 @@ fn live_monitor_identity(
     Ok(None)
 }
 
-pub(crate) fn monitor_identity(
-    pid: i32,
-    pid_path: &Path,
-    machine_name: &str,
-) -> Result<ProcessIdentity, LibVmError> {
-    let Some(identity) = ProcessIdentity::for_pid(pid)? else {
-        return Err(LibVmError::MonitorConnection {
-            reference: machine_name.to_string(),
-            message: format!(
-                "silo-vmm pid {pid} from {} is not running",
-                pid_path.display()
-            ),
-        });
-    };
-    if !identity.is_alive()? {
-        return Err(LibVmError::MonitorConnection {
-            reference: machine_name.to_string(),
-            message: format!(
-                "silo-vmm pid {pid} from {} is not running",
-                pid_path.display()
-            ),
-        });
-    }
-    Ok(identity)
-}
-
 fn runtime_exit_matches(status: &CurrentExitRecord, state: Option<&MachineState>) -> bool {
     let Some(state) = state else {
         return false;
@@ -2913,29 +2884,6 @@ fn identity_matches_generation(
 
 fn transition_error(err: TransitionError) -> LibVmError {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string()).into()
-}
-
-pub(crate) fn interrupt_monitor(identity: &ProcessIdentity) -> io::Result<bool> {
-    if !identity.is_alive()? {
-        return Ok(false);
-    }
-    match kill(Pid::from_raw(identity.pid()), Some(Signal::SIGINT)) {
-        Ok(()) => Ok(true),
-        Err(Errno::ESRCH) => Ok(false),
-        Err(err) => Err(io::Error::other(err.to_string())),
-    }
-}
-
-pub(crate) fn kill_monitor_process_group(identity: &ProcessIdentity) -> io::Result<bool> {
-    if !identity.is_alive()? {
-        return Ok(false);
-    }
-
-    match kill(Pid::from_raw(-identity.pid()), Some(Signal::SIGKILL)) {
-        Ok(()) => Ok(true),
-        Err(Errno::ESRCH) => Ok(false),
-        Err(err) => Err(io::Error::other(err.to_string())),
-    }
 }
 
 pub(crate) fn stopped_machine_state(
@@ -3337,6 +3285,56 @@ pub(crate) mod tests {
                     .expect("explicit initramfs")
             )
         );
+    }
+
+    #[tokio::test]
+    async fn retained_image_resolves_current_home_after_relocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let relocated = temp.path().join("relocated home");
+        let paths = LocalPaths::new(original.clone());
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        let reference = "example.invalid/demo:latest";
+        write_cached_oci_rootfs(
+            &runtime,
+            &paths,
+            reference,
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+        )
+        .await;
+        let record = runtime
+            .store
+            .cached_oci_image(reference, &Platform::host().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let stream = record.artifact.stream_id;
+        runtime.store.native_store().unwrap().close().await;
+        drop(runtime);
+        std::fs::rename(&original, &relocated).unwrap();
+        let paths = LocalPaths::new(relocated);
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .unwrap();
+        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
+            let resolved = runtime
+                .resolve_oci_image(reference.into(), policy)
+                .await
+                .unwrap();
+            let image = runtime
+                .materialize_resolved_oci_image(&resolved)
+                .await
+                .unwrap();
+            assert_eq!(image.stream, Some(stream));
+            assert_eq!(
+                image.rootfs_path,
+                paths.images_dir().join("streams/sha256").join(stream.hex())
+            );
+            assert!(!image.rootfs_path.starts_with(&original));
+        }
     }
 
     #[tokio::test]

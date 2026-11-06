@@ -129,6 +129,16 @@ fn worker_with_attachments(
     raw_handles: &[&OwnedFd],
     mux: Option<&OwnedFd>,
 ) -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
+    worker_with_tables(prepare, raw_handles, mux, &[], &[])
+}
+
+fn worker_with_tables(
+    prepare: impl FnOnce(&OwnedFd),
+    raw_handles: &[&OwnedFd],
+    mux: Option<&OwnedFd>,
+    state: &[&std::fs::File],
+    lowers: &[&std::fs::File],
+) -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
     let (config, writer) = pipe();
     let (events, reporter) = pipe();
     let (watchdog, keepalive) = pipe();
@@ -176,6 +186,18 @@ fn worker_with_attachments(
             .iter()
             .enumerate()
             .map(|(index, fd)| (fd.as_raw_fd(), 9 + index as i32)),
+    );
+    mapping.extend(
+        state
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.as_raw_fd(), 25 + index as i32)),
+    );
+    mapping.extend(
+        lowers
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.as_raw_fd(), 33 + index as i32)),
     );
     fd_policy::install(&mut command, &mapping).expect("worker descriptors");
     let child = Process(
@@ -1096,10 +1118,10 @@ fn mapped_inheritance_parks_source_cycles_above_all_targets() {
 }
 
 #[test]
-fn only_the_lifecycle_role_crosses_into_the_standalone_range() {
+fn only_managed_restore_roles_cross_into_the_extended_descriptor_range() {
     let (_monitor, worker) = lifecycle_pair();
     let source = worker.as_raw_fd();
-    for target in [0, 2, 25, 28, 29, 31, 33] {
+    for target in [0, 2, 29, 30, 31, 33 + fd_policy::MAX_LOWER_FDS as i32] {
         assert!(
             fd_policy::install(&mut Command::new("/bin/sh"), &[(source, target)]).is_err(),
             "target {target} is not a normal worker role"
@@ -1109,12 +1131,13 @@ fn only_the_lifecycle_role_crosses_into_the_standalone_range() {
         fd_policy::install(&mut Command::new("/bin/sh"), &[(2, 32)]).is_err(),
         "stdio is never a mapping source"
     );
-    // Every normal role at once fits the bounded table; one more cannot.
-    let mut table: Vec<_> = (3..=24)
+    // Every cold and restore role at once fits the bounded mapping table.
+    let mut table: Vec<_> = (3..=28)
         .chain([fd_policy::LIFECYCLE_CHILD_FD])
+        .chain(33..33 + fd_policy::MAX_LOWER_FDS as i32)
         .map(|target| (source, target))
         .collect();
-    fd_policy::install(&mut Command::new("/bin/sh"), &table).expect("full normal table");
+    fd_policy::install(&mut Command::new("/bin/sh"), &table).expect("full bounded restore table");
     table.push((source, 3));
     assert!(
         fd_policy::install(&mut Command::new("/bin/sh"), &table).is_err(),
@@ -1208,6 +1231,97 @@ fn worker_adopts_only_the_optional_mux_and_bounded_raw_table_before_config() {
     }
     drop(keepalive);
     assert_eq!(child.output().status.code(), Some(125));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_worker_inherits_exactly_state_and_lower_roles_and_restores_cloexec() {
+    use std::os::unix::fs::MetadataExt;
+    let mut sources: Vec<_> = (0..6).map(|_| Lease::new()).collect();
+    for (index, source) in sources.iter_mut().enumerate() {
+        source.file.write_all(&[index as u8 + 1; 8]).unwrap();
+    }
+    let files: Vec<_> = sources
+        .iter()
+        .map(|source| std::fs::File::open(&source.path).unwrap())
+        .collect();
+    let state: Vec<_> = files[..4].iter().collect();
+    let lowers: Vec<_> = files[4..].iter().collect();
+    let (mut child, _config, keepalive, _events, _console) =
+        worker_with_tables(|_| {}, &[], None, &state, &lowers);
+    let pid = child.0.as_ref().unwrap().id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        if std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .count()
+            >= 2
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut descriptors = open_descriptors(pid);
+    descriptors.sort_unstable();
+    assert_eq!(
+        descriptors,
+        (0..=6)
+            .chain([8, 25, 26, 27, 28, 32, 33, 34])
+            .collect::<Vec<_>>()
+    );
+    for (file, role) in files.iter().zip([25, 26, 27, 28, 33, 34]) {
+        let expected = file.metadata().unwrap();
+        let actual = std::fs::metadata(format!("/proc/{pid}/fd/{role}")).unwrap();
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (expected.dev(), expected.ino())
+        );
+        let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{role}")).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .unwrap();
+        assert_ne!(u32::from_str_radix(flags, 8).unwrap() & 0o2000000, 0);
+    }
+    drop(keepalive);
+    assert_eq!(child.output().status.code(), Some(125));
+}
+
+#[test]
+fn restore_worker_refuses_partial_state_or_cross_role_aliases_before_config() {
+    let mut sources: Vec<_> = (0..5).map(|_| Lease::new()).collect();
+    for source in &mut sources {
+        source.file.write_all(b"state").unwrap();
+    }
+    let files: Vec<_> = sources
+        .iter()
+        .map(|source| std::fs::File::open(&source.path).unwrap())
+        .collect();
+    for (state, lowers) in [
+        (vec![&files[0], &files[1], &files[2]], vec![]),
+        (vec![], vec![&files[4]]),
+        (
+            vec![&files[0], &files[1], &files[2], &files[3]],
+            vec![&files[0]],
+        ),
+        (
+            vec![&sources[0].file, &files[1], &files[2], &files[3]],
+            vec![],
+        ),
+    ] {
+        let (child, _config, _keepalive, mut events, _console) =
+            worker_with_tables(|_| {}, &[], None, &state, &lowers);
+        let output = child.output();
+        assert!(!output.status.success());
+        let mut bytes = Vec::new();
+        events.read_to_end(&mut bytes).unwrap();
+        assert!(
+            bytes.is_empty(),
+            "invalid inherited roles fail before a worker event"
+        );
+    }
 }
 
 async fn native_serial(

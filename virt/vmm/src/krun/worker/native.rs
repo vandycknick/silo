@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use crate::krun::engine::Control;
 use crate::krun::worker::lifecycle::{
-    ExecutionCapture, GenerationPoll, MemoryCapture, NativeCaptureStatus, NativeLifecycle,
-    NativeState,
+    ExecutionCapture, FreshRequest, GenerationPoll, MemoryCapture, NativeCaptureStatus,
+    NativeExposure, NativeLifecycle, NativeState,
 };
 use crate::virt::lifecycle::{
     BlockBacking, CaptureStage, CaptureStateBinding, Digest32, FlushedAttachment,
@@ -74,10 +74,31 @@ impl KrunNative {
     }
 }
 
+#[cfg(all(
+    feature = "restore-irq-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+impl KrunNative {
+    /// Candidate-only native IRQ witness call under a worker-allocated
+    /// native operation; admission belongs to the lifecycle journal.
+    pub(crate) fn irq_probe(
+        &self,
+        request: libkrun::live::irq_probe::ProbeRequest,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<libkrun::live::irq_probe::ProbeObservation, NativeFailure> {
+        self.control
+            .irq_probe(request, OperationId(operation.get()), deadline)
+            .map_err(live_failure)
+    }
+}
+
 impl NativeLifecycle for KrunNative {
     type Token = PauseToken;
     type Ticket = GenerationTicket;
     type Capture = CaptureTicket;
+    type Restore = libkrun::live::restore::RestoreToken;
 
     fn pause(
         &self,
@@ -261,10 +282,29 @@ impl NativeLifecycle for KrunNative {
         self.protected.clone()
     }
 
+    /// A `restore-irq-probe` candidate binds captures to native's explicit
+    /// diagnostic producer, the exact one its envelopes carry. It is never
+    /// the ordinary producer, so no normal build restores or relabels it.
     fn native_producer(&self) -> Result<String, NativeFailure> {
-        libkrun::capabilities::compiled_live_build()
-            .execution_producer()
-            .map_err(|error| NativeFailure::with_detail(NativeFailureKind::Unsupported, error))
+        #[cfg(all(
+            feature = "restore-irq-probe",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        {
+            libkrun::capabilities::diagnostic_execution_producer()
+                .map_err(|error| NativeFailure::with_detail(NativeFailureKind::Unsupported, error))
+        }
+        #[cfg(not(all(
+            feature = "restore-irq-probe",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )))]
+        {
+            libkrun::capabilities::compiled_live_build()
+                .execution_producer()
+                .map_err(|error| NativeFailure::with_detail(NativeFailureKind::Unsupported, error))
+        }
     }
 
     fn ram_layout_digest(&self, deadline: Instant) -> Result<Digest32, NativeFailure> {
@@ -458,6 +498,98 @@ impl NativeLifecycle for KrunNative {
         self.control
             .preserve_pause(token, OperationId(operation.get()), deadline)
             .map_err(live_failure)
+    }
+
+    fn prepare_fresh(
+        &self,
+        restore: &libkrun::live::restore::RestoreToken,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(GenerationTicket, FreshRequest), NativeFailure> {
+        let ticket = self
+            .control
+            .prepare_generation(
+                StoppedOwner::Restore(restore),
+                GenerationKind::FreshIdentity,
+                OperationId(operation.get()),
+                deadline,
+            )
+            .map_err(live_failure)?;
+        let request = ticket.request();
+        Ok((
+            ticket,
+            FreshRequest {
+                sequence: request.sequence,
+                identity: request.id,
+                flags: request.flags,
+            },
+        ))
+    }
+
+    fn resume_restored(
+        &self,
+        restore: &libkrun::live::restore::RestoreToken,
+        ticket: &GenerationTicket,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        self.control
+            .resume_restored(restore, ticket, OperationId(operation.get()), deadline)
+            .map_err(live_failure)
+    }
+
+    fn release_activation(
+        &self,
+        restore: &libkrun::live::restore::RestoreToken,
+        ticket: &GenerationTicket,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<(), NativeFailure> {
+        self.control
+            .release_activation_fences(restore, ticket, OperationId(operation.get()), deadline)
+            .map_err(live_failure)
+    }
+
+    fn activation_exposure(
+        &self,
+        _restore: &libkrun::live::restore::RestoreToken,
+        deadline: Instant,
+    ) -> Result<NativeExposure, NativeFailure> {
+        let snapshot = self.control.live_snapshot(deadline).map_err(live_failure)?;
+        Ok(native_exposure(&snapshot))
+    }
+
+    fn park_restored(
+        &self,
+        _restore: &libkrun::live::restore::RestoreToken,
+        operation: NativeOperation,
+        deadline: Instant,
+    ) -> Result<PauseToken, NativeFailure> {
+        // A restored machine carries its restored execution profile, so the
+        // park needs no fresh guest clock observation.
+        self.control
+            .pause(PauseOwner::User, OperationId(operation.get()), deadline)
+            .map_err(control_failure)
+    }
+}
+
+/// Network and vsock providers carry the activation fence; each must report
+/// an effective fence. Other providers are not activation-fenced.
+fn native_exposure(snapshot: &libkrun::live::LiveSnapshot) -> NativeExposure {
+    let providers_fenced = snapshot.providers.iter().all(|provider| {
+        match provider_device(&provider.attachment.device_type.to_string()) {
+            ProviderDevice::Virtio {
+                kind: VirtioKind::Net | VirtioKind::Vsock,
+                ..
+            } => provider.activation_fenced == Some(true),
+            ProviderDevice::Virtio { .. } => true,
+            ProviderDevice::Unrecognized { .. } => false,
+        }
+    });
+    NativeExposure {
+        released: snapshot.activation_released,
+        failed: snapshot.activation_failed,
+        providers_fenced,
     }
 }
 

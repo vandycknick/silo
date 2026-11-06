@@ -1,6 +1,8 @@
 use std::io;
 
-use crate::supervisor::process::pid_exists;
+use nix::sys::signal::Signal;
+
+use crate::supervisor::process::{pid_exists, signal_pid};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessIdentity {
@@ -30,5 +32,21 @@ impl ProcessIdentity {
 
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
         pid_exists(self.pid)
+    }
+
+    /// This platform has no birth identity; only existence precedes the signal.
+    pub(crate) fn signal(&self, signal: Signal) -> io::Result<bool> {
+        if !self.is_alive()? {
+            return Ok(false);
+        }
+        signal_pid(self.pid, signal)
+    }
+
+    /// Signals the process group this process leads.
+    pub(crate) fn signal_process_group(&self, signal: Signal) -> io::Result<bool> {
+        if !self.is_alive()? {
+            return Ok(false);
+        }
+        signal_pid(-self.pid, signal)
     }
 }

@@ -13,7 +13,7 @@ use crate::store::models::MachineId;
 
 mod client;
 pub(crate) mod exit_status;
-mod launch;
+pub(crate) mod launch;
 mod launch_spec;
 pub(crate) mod process;
 pub(crate) mod start_request;

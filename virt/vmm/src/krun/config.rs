@@ -28,6 +28,10 @@ pub struct KrunConfig {
     pub stdio_console: bool,
     pub balloon: bool,
     pub rosetta: Option<RosettaLaunchConfig>,
+    /// A descriptor-fed restore launch: exact object and lower identities.
+    /// The worker adopts the inherited roles; the request's own descriptor
+    /// numbers are the monitor's and never authorize anything here.
+    pub restore: Option<vm_spec::restore::RestoreRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -86,6 +90,7 @@ impl Default for KrunConfig {
             stdio_console: false,
             balloon: false,
             rosetta: None,
+            restore: None,
         }
     }
 }
@@ -125,7 +130,7 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "krun requires memory_mib to be greater than zero".to_string(),
         ));
     }
-    if config.kernel.is_none() {
+    if config.kernel.is_none() && config.restore.is_none() {
         return Err(KrunBackendError::InvalidConfig(
             "krun requires a kernel".to_string(),
         ));
@@ -172,6 +177,10 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
                 "net tap is only supported on Linux".to_string(),
             ));
         }
+    }
+    if let Some(request) = &config.restore {
+        crate::krun::worker::restore::validate(config, request)
+            .map_err(|error| KrunBackendError::InvalidConfig(error.to_string()))?;
     }
     Ok(())
 }

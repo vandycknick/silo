@@ -976,7 +976,7 @@ def capabilities_cohort(args, _echo) -> dict:
         require(value["live"][operation]["native"] is True, "Main has not qualified/flipped the exercised native lane")
         expected = ({"status": "supported"} if operation == "pause" else
                     {"status": "unsupported", "reason": {
-                        "code": "lane-not-qualified" if operation == "capture" else "not-delivered",
+                        "code": "lane-not-qualified" if operation in ("capture", "restore") else "not-delivered",
                         "subject": None}})
         require(value["live"][operation]["availability"] == expected,
                 "public capture stays unqualified until the combined live admission gates pass")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import closing, contextmanager
 import fcntl
+from functools import cache
 import hashlib
 from pathlib import Path
 import platform
@@ -24,11 +25,16 @@ CATALOG_TABLES = {
 }
 
 
-def _cache_home(cache_dir: Path) -> Path:
-    # Staged binaries are built from this checkout. Never seed a Home carrying
-    # another embedded schema's migration checksum after a hard-breaking edit.
+@cache
+def _schema_identity() -> str:
+    # Freeze the selected schema for this runner. Editing the checkout while a
+    # staged-runtime suite is running must not switch its cache namespace.
     schema = Path(__file__).resolve().parents[2] / "runtime/libvm/migrations/0001_initial.sql"
-    return cache_dir / CACHE_NAME / hashlib.sha256(schema.read_bytes()).hexdigest()
+    return hashlib.sha256(schema.read_bytes()).hexdigest()
+
+
+def _cache_home(cache_dir: Path) -> Path:
+    return cache_dir / CACHE_NAME / _schema_identity()
 
 
 @contextmanager

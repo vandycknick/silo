@@ -62,11 +62,21 @@ impl PreparedVsockSurface {
     }
 
     pub(crate) async fn activate(
-        mut self,
+        self,
         machine: VirtualMachine,
         forwards: Arc<crate::forward::ForwardTable>,
     ) -> eyre::Result<VsockSurface> {
-        let _registration = forwards.lock_registrations().await;
+        Ok(self.stage(machine, forwards).await?.serve())
+    }
+
+    /// Every fallible step of activation: discovery, listener registration
+    /// and taking the bound mux. Nothing is served until [`StagedVsockSurface::serve`].
+    pub(crate) async fn stage(
+        mut self,
+        machine: VirtualMachine,
+        forwards: Arc<crate::forward::ForwardTable>,
+    ) -> eyre::Result<StagedVsockSurface> {
+        let registration = forwards.lock_registrations().await;
         let discovered = discovery::scan(&self.runtime_dir, &self.mux_filename)?;
         let mut registered = BTreeSet::new();
         let mut listeners = Vec::new();
@@ -79,17 +89,58 @@ impl PreparedVsockSurface {
             &forwards.registered_ports(),
         )
         .await?;
-        drop(_registration);
-
+        drop(registration);
         let mux_listener = self.mux.take_listener()?;
-        let mux_owner_uid = self.mux.owner_uid();
-        let mux_path = self.mux.path().to_path_buf();
+        Ok(StagedVsockSurface {
+            prepared: self,
+            machine,
+            forwards,
+            mux_listener,
+            registered,
+            listeners,
+        })
+    }
+}
+
+/// A bound, registered surface that accepts nothing yet. Dropping it closes
+/// every registration and unlinks the owned mux socket.
+pub(crate) struct StagedVsockSurface {
+    prepared: PreparedVsockSurface,
+    machine: VirtualMachine,
+    forwards: Arc<crate::forward::ForwardTable>,
+    mux_listener: UnixListener,
+    registered: BTreeSet<u32>,
+    listeners: Vec<(u32, PathBuf, VsockListener)>,
+}
+
+impl StagedVsockSurface {
+    /// Start serving. Infallible: it only spawns the surface task.
+    pub(crate) fn serve(self) -> VsockSurface {
+        let Self {
+            prepared,
+            machine,
+            forwards,
+            mux_listener,
+            registered,
+            listeners,
+        } = self;
+        let mux_owner_uid = prepared.mux.owner_uid();
+        let mux_path = prepared.mux.path().to_path_buf();
         let shutdown = CancellationToken::new();
         let task_shutdown = shutdown.clone();
+        let PreparedVsockSurface {
+            runtime_dir,
+            mux_filename,
+            mux,
+            watcher,
+            dirty_tx,
+            dirty_rx,
+            watcher_failed,
+        } = prepared;
         let task = tokio::spawn(async move {
             run_surface(
-                self.runtime_dir,
-                self.mux_filename,
+                runtime_dir,
+                mux_filename,
                 mux_path,
                 mux_listener,
                 mux_owner_uid,
@@ -97,19 +148,19 @@ impl PreparedVsockSurface {
                 forwards,
                 registered,
                 listeners,
-                self.watcher,
-                self.dirty_tx,
-                self.dirty_rx,
-                self.watcher_failed,
+                watcher,
+                dirty_tx,
+                dirty_rx,
+                watcher_failed,
                 task_shutdown,
             )
             .await
         });
-        Ok(VsockSurface {
+        VsockSurface {
             shutdown,
             task: Some(task),
-            mux: Some(self.mux),
-        })
+            mux: Some(mux),
+        }
     }
 }
 

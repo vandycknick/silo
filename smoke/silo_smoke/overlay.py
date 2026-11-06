@@ -87,6 +87,16 @@ def digest(path: Path, length: int | None = None) -> str:
     return value.hexdigest()
 
 
+def copy_runtime(source: Path, destination: Path) -> None:
+    """Copy a Linux fixture runtime with private inodes, reflinking where possible."""
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(destination)
+    subprocess.run(
+        ["cp", "-RL", "--reflink=auto", "--preserve=mode,timestamps,xattr", "--no-target-directory", "--", str(source), str(destination)],
+        check=True, capture_output=True, text=True, timeout=300,
+    )
+
+
 def compile_probe(destination: Path) -> Path:
     target = {"x86_64": "x86_64-unknown-linux-musl", "aarch64": "aarch64-unknown-linux-musl", "arm64": "aarch64-unknown-linux-musl"}[platform.machine()]
     sysroot = subprocess.run(["rustc", "--print", "sysroot"], check=True, capture_output=True, text=True, timeout=30).stdout.strip()

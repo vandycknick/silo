@@ -134,7 +134,20 @@ fn authentication(binding: StateBinding, path: &Path) -> eyre::Result<RamImageAu
     })
 }
 
+#[path = "mutate.rs"]
+mod mutate;
+
 pub(crate) fn main() -> eyre::Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    match arguments.next().as_deref() {
+        Some(command) if command == std::ffi::OsStr::new("mutate-execution") => {
+            return crate::entry::mutate::run(arguments.collect());
+        }
+        Some(command) if command == std::ffi::OsStr::new("inspect-execution") => {
+            return crate::entry::mutate::inspect(arguments.collect());
+        }
+        _ => {}
+    }
     let restore = std::env::args().any(|arg| arg == "--restore");
     let Bootstrap {
         config,
@@ -146,6 +159,8 @@ pub(crate) fn main() -> eyre::Result<()> {
         raw_handles,
         // The standalone table never includes the normal lifecycle endpoint.
         lifecycle: _,
+        // Nor any readonly VMDK lower restore roles.
+        lowers: _,
         state_files,
         standalone,
     } = Bootstrap::adopt_standalone_fixed(restore)?;
@@ -543,11 +558,11 @@ fn restored_inputs(
     } = endpoints;
     let mut resources = RestoreResources::default();
     for (index, fd) in disks.iter().enumerate() {
-        resources.blocks.push(RestoreBlock {
-            attachment: attachment(&format!("disk{index}"))?,
-            file: File::from(fd.try_clone()?),
-            read_only: false,
-        });
+        resources.blocks.push(RestoreBlock::raw(
+            attachment(&format!("disk{index}"))?,
+            File::from(fd.try_clone()?),
+            false,
+        ));
     }
     resources.networks.push(RestoreNetwork {
         attachment: attachment("net0")?,

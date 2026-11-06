@@ -182,38 +182,67 @@ impl Fork {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Restore image:NAME into a new stopped machine", long_about = "Restore image:NAME into a new stopped machine.\n\nStopped child publication requires catalog-owned secret-scope recovery. Custom Runtime::with_secret_store overrides are refused; the ordinary CLI FileStore and secret-provider path remains supported.", after_help = EXACT_BYTES_WARNING)]
+#[command(about = "Restore a checkpoint into a new machine", long_about = "Restore a checkpoint into a new machine.\n\nLive checkpoints resume captured execution through fenced activation; stopped checkpoints create a stopped child. Neither path cold-boots a failed execution restore. Publication uses catalog-owned secret-scope recovery. Custom Runtime::with_secret_store overrides are refused; the ordinary CLI FileStore and secret-provider path remains supported.", after_help = EXACT_BYTES_WARNING)]
 pub struct Restore {
     #[arg(value_name = "IMAGE_OR_CHECKPOINT")]
     checkpoint: String,
-    /// Restore execution state, never cold boot an execution artifact's disks.
-    #[arg(long, conflicts_with_all = ["external_requirements", "map_disk", "map_share"])]
-    pub(crate) execution: bool,
-    #[arg(long, value_name = "CHILD", required_unless_present = "execution")]
+    #[arg(long, value_name = "CHILD")]
     name: Option<String>,
+    /// Bounded RestoreHook JSON (argv, environment, workingDirectory, timeoutMs).
+    #[arg(long, value_name = "JSON", value_parser = activation_hook)]
+    activation_hook: Option<libvm::RestoreHook>,
+    /// Reserve this percentage of RAM for private writes (0..=100), rounded up to native pages.
+    #[arg(long, default_value = "25", value_parser = private_write_allowance)]
+    private_write_percent: libvm::PrivateWriteAllowance,
+    /// Explicitly allow memory overcommit for this restore. Disk/FD/closure gates still apply.
+    #[arg(long)]
+    memory_overcommit: bool,
     #[command(flatten)]
     external: ExternalResources,
 }
 impl Restore {
-    pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let api = context.app_api().await?;
-        if self.execution {
-            api.restore_execution(&self.checkpoint, self.name.as_deref())
-                .await
-        } else {
-            let name = self
-                .name
-                .ok_or_else(|| eyre::eyre!("stopped restore requires --name"))?;
-            let options = libvm::RestoreOptions {
-                name: Some(name),
-                external_resources: self.external.policy()?,
-            };
-            let machine = api.restore_snapshot(&self.checkpoint, options).await?;
-            crate::ui::warn(EXACT_BYTES_WARNING);
-            println!("{}", machine.id);
-            Ok(())
+    fn resource_policy(&self) -> libvm::RestoreResourcePolicy {
+        libvm::RestoreResourcePolicy {
+            private_write_allowance: self.private_write_percent,
+            memory: if self.memory_overcommit {
+                libvm::RestoreMemoryPolicy::AllowOvercommit
+            } else {
+                libvm::RestoreMemoryPolicy::Reserved
+            },
         }
     }
+
+    pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        let api = context.app_api().await?;
+        let resources = self.resource_policy();
+        let options = libvm::RestoreOptions {
+            name: self.name,
+            external_resources: self.external.policy()?,
+            activation_hook: self.activation_hook,
+            resources,
+        };
+        let machine = api.restore_snapshot(&self.checkpoint, options).await?;
+        crate::ui::warn(EXACT_BYTES_WARNING);
+        println!("{}", machine.id);
+        Ok(())
+    }
+}
+
+fn private_write_allowance(value: &str) -> Result<libvm::PrivateWriteAllowance, String> {
+    let percent: u32 = value
+        .parse()
+        .map_err(|error: std::num::ParseIntError| error.to_string())?;
+    libvm::PrivateWriteAllowance::try_from(percent).map_err(|error| error.to_string())
+}
+
+fn activation_hook(value: &str) -> Result<libvm::RestoreHook, String> {
+    if value.len() > 1 << 20 {
+        return Err("activation hook exceeds 1 MiB".into());
+    }
+    let hook: libvm::RestoreHook =
+        serde_json::from_str(value).map_err(|error| error.to_string())?;
+    hook.validate()?;
+    Ok(hook)
 }
 
 #[derive(Debug, Args)]
@@ -296,4 +325,58 @@ fn share_mapping(value: &str) -> Result<libvm::ExternalResourceMapping, String> 
     })
     .map_err(|error| error.to_string())?;
     Ok(libvm::ExternalResourceMapping { resource, path })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::Cli;
+    use crate::commands::Command;
+    use clap::Parser;
+
+    #[test]
+    fn restore_cli_resource_policy_defaults_boundaries_and_opt_in_reach_daemon_types() {
+        let cli = Cli::try_parse_from(["silo", "restore", "checkpoint"]).unwrap();
+        let Command::Restore(command) = cli.command else {
+            panic!("restore command")
+        };
+        assert_eq!(
+            command.resource_policy(),
+            libvm::RestoreResourcePolicy::default()
+        );
+        for percent in ["0", "1", "25", "33", "100"] {
+            let cli = Cli::try_parse_from([
+                "silo",
+                "restore",
+                "checkpoint",
+                "--private-write-percent",
+                percent,
+                "--memory-overcommit",
+            ])
+            .unwrap();
+            let Command::Restore(command) = cli.command else {
+                panic!("restore command")
+            };
+            let policy = command.resource_policy();
+            assert_eq!(
+                u32::from(policy.private_write_allowance),
+                percent.parse::<u32>().unwrap()
+            );
+            assert_eq!(policy.memory, libvm::RestoreMemoryPolicy::AllowOvercommit);
+            let wire = silo_vm_control::stopped::restore_resources_to_wire(policy);
+            assert_eq!(
+                silo_vm_control::stopped::restore_resources_from_wire(Some(wire)).unwrap(),
+                policy
+            );
+        }
+        for percent in ["-1", "101", "4294967296", "1.5", ""] {
+            assert!(Cli::try_parse_from([
+                "silo",
+                "restore",
+                "checkpoint",
+                "--private-write-percent",
+                percent
+            ])
+            .is_err());
+        }
+    }
 }
