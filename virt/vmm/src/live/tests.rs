@@ -39,7 +39,7 @@ struct Harness {
     run_id: LiveId,
     root_disk_bytes: u64,
     shutdown: CancellationToken,
-    guest: tokio::task::JoinHandle<()>,
+    guest: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// The harness's default writable raw root attachment.
@@ -216,7 +216,7 @@ impl Harness {
             run_id: live_id(run_uuid),
             root_disk_bytes,
             shutdown,
-            guest,
+            guest: Some(guest),
         };
         if wait_ready {
             harness
@@ -348,11 +348,23 @@ impl Harness {
         (state, lifecycle, status.readiness.unwrap().ready.unwrap())
     }
 
-    async fn stop(self) {
+    async fn stop_guest_services(&mut self) {
+        self.shutdown.cancel();
+        if let Some(guest) = self.guest.take() {
+            tokio::time::timeout(Duration::from_secs(5), guest)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    async fn stop(mut self) {
         self.live.begin_stop();
         self.shutdown.cancel();
         self.machine.stop().await.unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.guest).await;
+        if let Some(guest) = self.guest.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), guest).await;
+        }
         let _ = std::fs::remove_dir_all(self.root);
     }
 }
@@ -448,6 +460,62 @@ async fn live_pause_and_clock_only_resume_roundtrip_through_barriers() {
     let stale = harness.resume(&operation, token).await;
     assert!(
         matches!(stale, ResumeOutcome::Rejected { ref rejection } if rejection.reason == LiveRejectionReason::InvalidState)
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_resume_requests_post_thaw_status_without_unsolicited_heartbeats() {
+    let mut deadlines = timeouts();
+    deadlines.handshake = Duration::from_secs(1);
+    let mut harness = Harness::start_with(Some(serde_json::json!({})), deadlines, true).await;
+    let operation = harness.pause().await;
+    let paused = harness.settled(&operation).await;
+    let current = paused.current_pause.unwrap();
+    let held = harness
+        .store
+        .live_snapshot()
+        .unwrap()
+        .observed_identity
+        .unwrap();
+
+    // Keep lifecycle RPCs serving, but stop every unsolicited status/metrics/SSH
+    // supervisor. The pre-thaw handshake alone cannot satisfy the post-thaw
+    // boundary. No test-injected receipt or periodic heartbeat can rescue it.
+    harness.stop_guest_services().await;
+    assert!(!harness.status().2);
+    assert!(!harness.gate.is_open());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        harness.resume(&operation, current.token.clone()),
+    )
+    .await
+    .expect("resume must request fresh status after exact Thaw, without a heartbeat");
+    let ResumeOutcome::Resumed { resumed } = outcome else {
+        panic!("fresh post-thaw readiness completes resume: {outcome:?}");
+    };
+    assert_eq!(resumed.consumed_token, current.token);
+    assert_eq!(resumed.thawed_epoch, current.freeze_epoch);
+    let snapshot = harness.store.live_snapshot().unwrap();
+    assert_eq!(snapshot.ready_identity, Some(held));
+    assert_eq!(snapshot.state, VmLifecycleState::Running);
+    assert!(harness.status().2);
+    assert!(harness.gate.is_open());
+
+    let channel = crate::guest::connect(&harness.machine).await.unwrap();
+    let status = crate::guest::agent_client(channel)
+        .get_status(protocol::v1::GetAgentStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let lifecycle = status.report.as_ref().unwrap().lifecycle.as_ref().unwrap();
+    assert_eq!(
+        lifecycle.state,
+        protocol::v1::GuestLifecycleState::Thawed as i32
+    );
+    assert_eq!(
+        lifecycle.freeze_ref.as_ref().unwrap().freeze_epoch,
+        Some(current.freeze_epoch.get())
     );
     harness.stop().await;
 }

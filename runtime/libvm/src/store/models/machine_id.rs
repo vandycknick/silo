@@ -10,7 +10,7 @@ use uuid::Uuid;
 /// `MachineId` wraps a UUID but displays and serializes as 32 lowercase hex
 /// characters without dashes. SQLite indexes use that exact string form so ID
 /// prefix lookup can operate on normalized lowercase hex prefixes.
-pub(crate) struct MachineId(Uuid);
+pub struct MachineId(Uuid);
 
 impl MachineId {
     pub(crate) fn new() -> Self {
@@ -47,7 +47,7 @@ impl From<MachineId> for Uuid {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MachineIdParseError {
+pub enum MachineIdParseError {
     InvalidFormat(String),
 }
 
@@ -93,7 +93,7 @@ pub(crate) fn looks_like_id_prefix(input: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_id_prefix, MachineId};
+    use crate::store::models::machine_id::{looks_like_id_prefix, MachineId};
     use uuid::Uuid;
 
     #[test]

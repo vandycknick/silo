@@ -563,11 +563,10 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
                             .snapshot_live(&observed, capture_options())
                             .await
                             .map(|_| ()),
-                        LiveOperation::Fork => {
-                            machine
-                                .fork_execution(&observed, Some("unallocated-child"))
-                                .await
-                        }
+                        LiveOperation::Fork => machine
+                            .fork_live(&observed, fork_options())
+                            .await
+                            .map(|_| ()),
                         _ => unreachable!("machine-only operation table"),
                     }
                 },
@@ -613,7 +612,7 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
 }
 
 #[tokio::test]
-async fn live_capabilities_positive_mock_cannot_execute_undelivered_fork() {
+async fn live_capabilities_positive_mock_reports_delivered_fork_without_mutation() {
     let fixture = Fixture::new(&pause_scenario(Default::default())).await;
     let observation = LiveObservationReader::open(&fixture.config)
         .expect("reader")
@@ -622,19 +621,8 @@ async fn live_capabilities_positive_mock_cannot_execute_undelivered_fork() {
         .expect("observe positive scenario");
     let before = snapshot(&fixture.home);
     let before_catalog = live_catalog::snapshot(&fixture.home).await;
-    // Capture is delivered in Phase 14; Fork remains not-delivered even when
-    // a positive scenario advertises it.
-    unsupported(
-        fixture
-            .machine
-            .fork_execution(&observation, None)
-            .await
-            .expect_err("fork not delivered"),
-        LiveOperation::Fork,
-        LiveBackend::Mock,
-        LiveReasonCode::NotDelivered,
-        None,
-    );
+    libvm::require_live_operation(&observation, LiveOperation::Fork)
+        .expect("the delivered fork gate honors a positive capability observation");
     assert_eq!(snapshot(&fixture.home), before);
     assert_eq!(live_catalog::snapshot(&fixture.home).await, before_catalog);
     fixture.stop().await;
@@ -651,6 +639,20 @@ fn capture_options() -> libvm::LiveSnapshotOptions {
     libvm::LiveSnapshotOptions {
         name: None,
         resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
+    }
+}
+
+fn fork_options() -> libvm::LiveForkOptions {
+    libvm::LiveForkOptions {
+        operation_id: uuid::Uuid::new_v4(),
+        children: vec![libvm::LiveForkChild {
+            name: "unallocated-child".into(),
+            activation_hook: None,
+            destination: libvm::ForkDestination::default(),
+        }],
+        max_children: libvm::DEFAULT_LIVE_FORK_MAX_CHILDREN,
+        resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
+        resources: libvm::RestoreResourcePolicy::default(),
     }
 }
 
@@ -1701,8 +1703,9 @@ async fn live_capabilities_wrong_machine_evidence_fails_before_unsupported_reaso
             .await
             .map(|_| ()),
         other
-            .fork_execution(&observation, Some("unallocated"))
-            .await,
+            .fork_live(&observation, fork_options())
+            .await
+            .map(|_| ()),
     ] {
         assert!(
             matches!(result, Err(LibVmError::LiveObservation { .. })),

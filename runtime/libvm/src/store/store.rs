@@ -26,6 +26,8 @@ pub(crate) struct Store {
     pub(super) catalog: std::sync::Arc<CatalogGuard>,
     #[cfg(test)]
     pub(super) layer_hook: Option<std::sync::Arc<crate::store::layer_store::tests::WorkerHook>>,
+    #[cfg(test)]
+    pub(super) resource_budget_directory: Option<PathBuf>,
 }
 
 impl Store {
@@ -84,6 +86,8 @@ impl Store {
             catalog: guard,
             #[cfg(test)]
             layer_hook: None,
+            #[cfg(test)]
+            resource_budget_directory: Some(home.join("resource-budget")),
         };
         match store.recover_image_cache().await {
             Ok(report) => {
@@ -2655,6 +2659,42 @@ mod tests {
             .await
             .unwrap();
         config
+    }
+
+    #[tokio::test]
+    async fn machine_publication_waits_for_existing_catalog_writer_before_dependency_reads() {
+        use std::time::Duration;
+        let (_temporary, paths) = temp_paths();
+        let store = Store::new(&paths).await.unwrap();
+        let writer = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let worker = store.clone();
+        let mut publication = tokio::spawn(async move {
+            add_catalog_relative_raw_fixture(&worker, &paths, "concurrent-publication").await
+        });
+        let early = tokio::time::timeout(Duration::from_millis(150), &mut publication).await;
+        writer.commit().await.unwrap();
+        assert!(early.is_err(), "publication must wait for write admission, not fail upgrading a read transaction: {early:?}");
+        let config = tokio::time::timeout(Duration::from_secs(5), publication)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.machine_config(config.id).await.unwrap(),
+            Some(config.clone())
+        );
+        let rootfs = store.machine_rootfs(config.id).await.unwrap().unwrap();
+        assert_eq!(rootfs.root_disk_path, config.machine_dir.join("root.raw"));
+        assert_eq!(rootfs.root_disk_size_bytes, 512);
+        assert_eq!(
+            store
+                .machine_state(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MachineRuntimeState::Stopped
+        );
+        store.close().await;
     }
 
     #[tokio::test]

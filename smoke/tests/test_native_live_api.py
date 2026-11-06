@@ -416,5 +416,6 @@ class StoppedTraceLifecycleTests(unittest.TestCase):
             self.assertEqual(json.loads((directory / "return.json").read_text()), {"errno": 0})
 
 
+
 if __name__ == "__main__":
     unittest.main()

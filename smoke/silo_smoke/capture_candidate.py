@@ -1,8 +1,10 @@
-"""Build an isolated capture/restore candidate, never a production grant.
+"""Build an isolated capture/restore/fork candidate, never a production grant.
 
 Copied compiled qualification tables admit only the exact private build. An
 explicit IRQ candidate additionally enables source-only diagnostic witness
 transport; its build identity is retained separately, never called production.
+An explicit fork candidate admits delivered-but-unqualified live fork in the
+same private copy only; production qualification tables stay untouched.
 """
 from __future__ import annotations
 
@@ -19,9 +21,14 @@ from .overlay import digest, native_capabilities, native_source_identity
 from .overlay_faults import replace_once
 
 
-def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe: bool = False) -> dict:
+def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe: bool = False,
+          fork: bool = False, profile: str = "debug") -> dict:
+    if profile not in ("debug", "release"):
+        raise ValueError("candidate profile must be debug or release")
     if irq_probe and not restore:
         raise ValueError("IRQ probe requires the isolated restore candidate")
+    if fork and (not restore or irq_probe):
+        raise ValueError("fork requires the ordinary isolated restore candidate, never the IRQ probe")
     if destination.exists():
         raise FileExistsError(destination)
     for protected in (REPO, runtime):
@@ -42,12 +49,16 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
     target = destination / "target"
     command = ["cargo", "build", "--locked", "--offline", "--manifest-path", str(source / "Cargo.toml"),
                "--target-dir", str(target)]
+    if profile == "release":
+        command.append("--release")
     manifest = destination / "candidate-manifest.json"
-    operations = ("pause", "capture", "restore") if restore else ("pause", "capture")
-    phase = 15 if restore else 14
+    operations = ("pause", "capture", "restore", "fork") if fork else (
+        ("pause", "capture", "restore") if restore else ("pause", "capture"))
+    phase = 16 if fork else (15 if restore else 14)
     proof = {"scope": f"isolated Phase{phase} test-only candidate, not production qualification",
              "productionMonitorSha256": production_hash, "productionCapabilities": original,
              "commands": [], "mutations": []}
+    proof["profile"] = profile
     proof["irqProbe"] = irq_probe
     monitor_features = ["--features", "restore-irq-probe"] if irq_probe else []
     if irq_probe:
@@ -63,7 +74,7 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
             raise RuntimeError(f"candidate build failed ({result.returncode}): {label}.log")
 
     compile_candidate("unqualified-build", ["-p", "silo-vmm", "--bin", "silo-vmm", *monitor_features])
-    binary = target / "debug/silo-vmm"
+    binary = target / profile / "silo-vmm"
     unqualified = native_capabilities(binary, diagnostic=destination / "unqualified-capabilities.log")
     identity = native_source_identity(unqualified)
     binding = unqualified["qualificationIdentity"]
@@ -96,6 +107,12 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
                          "reason": {"code": "lane-not-qualified", "subject": None}},
     }:
         raise ValueError("production must deliver restore without qualifying it")
+    if fork and unqualified["live"]["fork"] != {
+        "native": True,
+        "availability": {"status": "unsupported",
+                         "reason": {"code": "lane-not-qualified", "subject": None}},
+    }:
+        raise ValueError("production must deliver fork without qualifying it")
     admitted_operations = ", ".join("LiveOperation::" + operation.capitalize()
                                     for operation in operations)
     proof["mutations"].append(replace_once(
@@ -143,7 +160,7 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
     replacement_path.chmod(0o700)
     private_bin = destination / "bin"
     private_bin.mkdir(mode=0o700)
-    shutil.copyfile(target / "debug/silo", private_bin / "silo")
+    shutil.copyfile(target / profile / "silo", private_bin / "silo")
     (private_bin / "silo").chmod(0o700)
     (private_bin / "examples").mkdir(mode=0o700)
     examples = ("live_acceptance", "storage_acceptance")
@@ -151,7 +168,7 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
         examples += ("native-live-api",)
     for name in examples:
         executable = private_bin / "examples" / name
-        shutil.copyfile(target / "debug/examples" / name, executable)
+        shutil.copyfile(target / profile / "examples" / name, executable)
         executable.chmod(0o700)
     if irq_probe:
         stage_irq_fixture(source, private_runtime, candidate, monitor_hash, proof)
@@ -226,13 +243,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--runtime", required=True, type=Path)
+    parser.add_argument("--profile", choices=("debug", "release"), default="debug",
+                        help="build profile; must match the supplied production runtime")
     parser.add_argument("--restore", action="store_true",
                         help="admit delivered restore in this isolated Phase15 candidate")
     parser.add_argument("--irq-probe", action="store_true",
                         help="build a separate restore candidate with source-only native IRQ witness transport")
+    parser.add_argument("--fork", action="store_true",
+                        help="also admit delivered live fork in this isolated Phase16 restore candidate")
     args = parser.parse_args()
     print(json.dumps(build(args.destination.resolve(), args.runtime.resolve(),
-                           restore=args.restore, irq_probe=args.irq_probe), sort_keys=True))
+                           restore=args.restore, irq_probe=args.irq_probe, fork=args.fork,
+                           profile=args.profile),
+                     sort_keys=True))
 
 
 if __name__ == "__main__":

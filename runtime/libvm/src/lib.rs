@@ -26,6 +26,11 @@ pub use crate::boot_qualification::{
     OverlayBootQualificationError, QualifiedOverlayBoot, UnqualifiedOverlayBootIdentity,
 };
 pub use crate::error::LibVmError;
+pub use crate::machine::live_fork::{
+    ForkCaptureOutcome, ForkChildOutcome, ForkChildResult, ForkDestination, ForkFailurePhase,
+    ForkSourceOutcome, ForkStage, LiveForkChild, LiveForkOptions, LiveForkResult,
+    DEFAULT_LIVE_FORK_MAX_CHILDREN,
+};
 pub use crate::machine::{
     preflight_restore_snapshot, preflight_stopped, validate_new_machine_name, ExternalResourceKey,
     ExternalResourceMapping, ExternalResourcePolicy, ExternalResourceRequirement, ForkOptions,
@@ -48,6 +53,7 @@ pub use crate::store::models::storage::{
     StorageOperationKind, StorageOperationRecord, StorageOperationState, StorageProfile,
     StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
 };
+pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{
     SnapshotCaptureKindName, SnapshotCaptureProvenance, SnapshotInfo, SnapshotRef, SnapshotStore,
 };

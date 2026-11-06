@@ -13,9 +13,30 @@ use crate::store::snapshot_store::{SnapshotConsumer, SnapshotStore};
 use crate::{LibVmError, MachineStorageRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum RestoreIdentity {
+    Snapshot { id: SnapshotId },
+    LocalCut { id: vm_spec::capture::Sha256Digest },
+}
+
+impl RestoreIdentity {
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        match self {
+            Self::Snapshot { id } => id.as_bytes(),
+            Self::LocalCut { id } => id.as_bytes(),
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Option<SnapshotId> {
+        match self {
+            Self::Snapshot { id } => Some(*id),
+            Self::LocalCut { .. } => None,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RestoreIntent {
-    pub checkpoint: SnapshotId,
+    pub checkpoint: RestoreIdentity,
     pub consumer_operation: Uuid,
     pub request: vm_spec::restore::RestoreRequest,
     pub memory: RestoreMemoryCharge,
@@ -32,6 +53,22 @@ pub(crate) struct RestoreConstruction {
     pub intent: RestoreIntent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DescriptorOwner {
+    pid: i32,
+    started_at: i64,
+}
+
+impl DescriptorOwner {
+    fn current() -> Result<Self, LibVmError> {
+        let pid = i32::try_from(std::process::id()).map_err(invalid)?;
+        let started_at = utils::process::start_time(pid)?
+            .ok_or_else(|| invalid("manager process birth identity is unavailable"))?;
+        Ok(Self { pid, started_at })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RestoreMemoryCharge {
@@ -46,10 +83,13 @@ pub(crate) struct RestoreMemoryCharge {
     pub disk_device: u64,
     pub disk_bytes: u64,
     pub construction_complete: bool,
+    pub descriptor_owner: Option<DescriptorOwner>,
+    pub descriptors: u64,
 }
 
 impl RestoreMemoryCharge {
     fn validate(&self) -> Result<(), LibVmError> {
+        validate_descriptor_charge(self.descriptor_owner, self.descriptors)?;
         if self.baseline_inode == 0
             || self.baseline_bytes == 0
             || self.baseline_bytes > self.configured_bytes
@@ -78,16 +118,62 @@ impl RestoreMemoryCharge {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PendingForkCharge {
+    pub consumer_id: Uuid,
+    pub configured_bytes: u64,
+    pub private_bytes: u64,
+    pub overhead_bytes: u64,
+    pub disk_device: u64,
+    pub disk_bytes: u64,
+    pub policy: crate::RestoreResourcePolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum CaptureBaseline {
+    Pending { capture_id: Uuid, bytes: u64 },
+    Bound { device: u64, inode: u64, bytes: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureBudgetInventory {
+    pub capture_id: Uuid,
+    pub capture_memory: u64,
+    pub baseline: Option<CaptureBaseline>,
+    pub capture_disks: Vec<crate::store::snapshot_store::CaptureSpaceCharge>,
+    pub pending: Vec<PendingForkCharge>,
+    pub bound: Vec<RestoreMemoryCharge>,
+    pub descriptor_owner: Option<DescriptorOwner>,
+    pub descriptors: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BudgetDocument {
+    Restore(RestoreMemoryCharge),
+    Capture(CaptureBudgetInventory),
+}
 #[derive(Default)]
 struct RestoreBudget {
     memory: u64,
     baselines: std::collections::BTreeMap<(u64, u64), u64>,
     disks: std::collections::BTreeMap<u64, u64>,
+    manager: Option<DescriptorOwner>,
+    descriptors: u64,
 }
 
 impl RestoreBudget {
     fn add(&mut self, charge: &RestoreMemoryCharge) -> Result<(), LibVmError> {
         charge.validate()?;
+        self.add_descriptors(charge.descriptor_owner, charge.descriptors)?;
         self.memory = self
             .memory
             .checked_add(charge.private_bytes)
@@ -121,21 +207,145 @@ impl RestoreBudget {
     }
 
     fn read(directory: &crate::paths::OwnedDirectory) -> Result<Self, LibVmError> {
-        let mut budget = Self::default();
+        Self::read_except(directory, None)
+    }
+
+    fn read_except(
+        directory: &crate::paths::OwnedDirectory,
+        excluded: Option<&str>,
+    ) -> Result<Self, LibVmError> {
+        let mut budget = Self {
+            manager: Some(DescriptorOwner::current()?),
+            ..Self::default()
+        };
         let mut bytes = Vec::new();
         for name in budget_entries(directory)? {
+            if excluded == Some(name.as_str()) {
+                continue;
+            }
             let file = directory
                 .open_file(&name)?
                 .ok_or_else(|| invalid("restore budget record disappeared"))?;
             bytes.clear();
-            file.take((64 << 10) + 1).read_to_end(&mut bytes)?;
-            if bytes.len() > 64 << 10 {
-                return Err(invalid("restore budget record exceeds 64 KiB"));
+            file.take((16 << 20) + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > 16 << 20 {
+                return Err(invalid("resource budget inventory exceeds 16 MiB"));
             }
-            let charge: RestoreMemoryCharge = serde_json::from_slice(&bytes).map_err(invalid)?;
-            budget.add(&charge)?;
+            match serde_json::from_slice::<BudgetDocument>(&bytes).map_err(invalid)? {
+                BudgetDocument::Restore(charge) => budget.add(&charge)?,
+                BudgetDocument::Capture(inventory) => budget.add_capture(&inventory)?,
+            }
         }
         Ok(budget)
+    }
+
+    fn add_capture(&mut self, inventory: &CaptureBudgetInventory) -> Result<(), LibVmError> {
+        self.add_descriptors(inventory.descriptor_owner, inventory.descriptors)?;
+        if inventory.capture_id.is_nil() {
+            return Err(invalid("capture budget identity is nil"));
+        }
+        self.memory = self
+            .memory
+            .checked_add(inventory.capture_memory)
+            .ok_or_else(|| invalid("capture budget overflow"))?;
+        match inventory.baseline {
+            Some(CaptureBaseline::Pending { capture_id, bytes }) => {
+                if capture_id != inventory.capture_id
+                    || bytes == 0
+                    || bytes > vm_spec::capture::MAX_CAPTURE_RAM_BYTES
+                {
+                    return Err(invalid("pending capture baseline identity is malformed"));
+                }
+                self.memory = self
+                    .memory
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid("pending capture baseline overflow"))?;
+            }
+            Some(CaptureBaseline::Bound {
+                device,
+                inode,
+                bytes,
+            }) => {
+                if inode == 0 || bytes == 0 || bytes > vm_spec::capture::MAX_CAPTURE_RAM_BYTES {
+                    return Err(invalid("capture baseline identity is invalid"));
+                }
+                match self.baselines.entry((device, inode)) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(bytes);
+                        self.memory = self
+                            .memory
+                            .checked_add(bytes)
+                            .ok_or_else(|| invalid("capture baseline overflow"))?;
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if *entry.get() != bytes =>
+                    {
+                        return Err(invalid(
+                            "capture baseline geometry contradicts a generation",
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            None => {}
+        }
+        for disk in &inventory.capture_disks {
+            let total = self.disks.entry(disk.device).or_default();
+            *total = total
+                .checked_add(disk.bytes)
+                .ok_or_else(|| invalid("capture disk budget overflow"))?;
+        }
+        for child in &inventory.pending {
+            if child.consumer_id.is_nil()
+                || child.configured_bytes == 0
+                || child.configured_bytes > vm_spec::capture::MAX_CAPTURE_RAM_BYTES
+                || child.private_bytes
+                    != child
+                        .policy
+                        .private_write_allowance
+                        .reservation(child.configured_bytes, 65536)?
+                || child.overhead_bytes
+                    != child.configured_bytes.div_ceil(512)
+                        + vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES
+                || child.disk_bytes < vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES
+            {
+                return Err(invalid("pending fork reservation is malformed"));
+            }
+            self.memory = self
+                .memory
+                .checked_add(child.private_bytes)
+                .and_then(|n| n.checked_add(child.overhead_bytes))
+                .ok_or_else(|| invalid("fork memory budget overflow"))?;
+            let total = self.disks.entry(child.disk_device).or_default();
+            *total = total
+                .checked_add(child.disk_bytes)
+                .ok_or_else(|| invalid("fork disk budget overflow"))?;
+        }
+        for child in &inventory.bound {
+            self.add(child)?;
+        }
+        Ok(())
+    }
+
+    fn add_descriptors(
+        &mut self,
+        owner: Option<DescriptorOwner>,
+        count: u64,
+    ) -> Result<(), LibVmError> {
+        validate_descriptor_charge(owner, count)?;
+        if owner.is_some() && owner == self.manager {
+            self.descriptors = self
+                .descriptors
+                .checked_add(count)
+                .ok_or_else(|| invalid("manager descriptor reservations overflow"))?;
+        }
+        Ok(())
+    }
+
+    fn admit_descriptors(&self) -> Result<(), LibVmError> {
+        crate::storage::limits::preflight_fd_budget(self.descriptors)
+            .map_err(crate::storage::StorageError::from)?;
+        Ok(())
     }
 
     fn admit_memory(
@@ -180,7 +390,7 @@ impl RestoreIntent {
             .map_err(invalid)?;
         let ram = &self.request.objects[0];
         if self.consumer_operation.is_nil()
-            || self.checkpoint.as_bytes() != self.request.checkpoint.as_bytes()
+            || self.checkpoint.digest() != self.request.checkpoint.as_bytes()
             || self.memory.baseline_device != ram.file_device
             || self.memory.baseline_inode != ram.file_inode
             || self.memory.baseline_bytes != ram.length
@@ -297,6 +507,7 @@ impl SnapshotStore {
         request: &vm_spec::restore::RestoreRequest,
         disk_parent: &Path,
         disk_peak: u64,
+        descriptor_peak: u64,
         policy: crate::RestoreResourcePolicy,
     ) -> Result<RestoreMemoryCharge, LibVmError> {
         let ram = &request.objects[0];
@@ -329,9 +540,16 @@ impl SnapshotStore {
             disk_device: disk_stat.st_dev as u64,
             disk_bytes: disk_peak,
             construction_complete: false,
+            descriptor_owner: Some(DescriptorOwner::current()?),
+            descriptors: descriptor_peak,
         };
         self.store
-            .reserve_restore_charge(consumer.operation_id, &charge, &disk, &budget_directory()?)
+            .reserve_restore_charge(
+                consumer.operation_id,
+                &charge,
+                &disk,
+                &budget_directory(&self.store)?,
+            )
             .await?;
         Ok(charge)
     }
@@ -364,6 +582,7 @@ impl crate::store::Store {
         )?;
         let mut budget = RestoreBudget::read(directory)?;
         budget.add(charge)?;
+        budget.admit_descriptors()?;
         budget.admit_memory(
             charge.policy.memory,
             crate::store::capture::available_memory()?,
@@ -406,7 +625,16 @@ impl crate::store::Store {
 
 /// A single authenticated user authority coordinates all of its runtime homes.
 /// No user-owned file is represented as host-global or cross-user authority.
-fn budget_directory() -> Result<crate::paths::OwnedDirectory, LibVmError> {
+fn budget_directory(
+    store: &crate::store::Store,
+) -> Result<crate::paths::OwnedDirectory, LibVmError> {
+    // Unit owners use real, isolated ledgers; cross-home tests explicitly pass
+    // the same directory. Production always uses the same-euid authority below.
+    #[cfg(test)]
+    if let Some(directory) = &store.resource_budget_directory {
+        return crate::paths::OwnedDirectory::open_root(directory);
+    }
+    let _ = store;
     let parent = if cfg!(target_os = "macos") {
         "/private/tmp"
     } else {
@@ -505,7 +733,7 @@ impl crate::store::Store {
         operation: Uuid,
         run: Uuid,
     ) -> Result<(), LibVmError> {
-        let directory = budget_directory()?;
+        let directory = budget_directory(self)?;
         let _admission = crate::storage::locks::blocking(
             &directory,
             "admission.lock",
@@ -514,10 +742,10 @@ impl crate::store::Store {
         let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT json(o.record_json),r.budget_id FROM storage_operation o JOIN restore_memory_reservation r ON r.operation_id=o.operation_id JOIN machine_state s ON s.machine_id=o.machine_id WHERE o.operation_id=?1 AND o.run_id=?2 AND o.kind='launch' AND s.status='running' AND json_extract(s.state_json,'$.runId')=?2"
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT json(o.record_json),r.budget_id,r.batch_id FROM storage_operation o JOIN restore_memory_reservation r ON r.operation_id=o.operation_id JOIN machine_state s ON s.machine_id=o.machine_id WHERE o.operation_id=?1 AND o.run_id=?2 AND o.kind='launch' AND s.status='running' AND json_extract(s.state_json,'$.runId')=?2"
         ).bind(operation.to_string()).bind(run.to_string()).fetch_optional(&mut *tx).await?;
-        let Some((json, budget_id)) = row else {
+        let Some((json, budget_id, batch)) = row else {
             return Ok(());
         };
         let mut record: crate::store::operation_store::RetainedStorageOperation =
@@ -533,6 +761,8 @@ impl crate::store::Store {
             .ok_or_else(|| invalid("restore completion has no execution intent"))?;
         intent.memory.construction_complete = true;
         intent.memory.disk_bytes = 0;
+        intent.memory.descriptor_owner = None;
+        intent.memory.descriptors = 0;
         let charge = serde_json::to_string(&intent.memory).map_err(invalid)?;
         let encoded = crate::store::operation_store::encode(&record)?;
         sqlx::query("UPDATE storage_operation SET record_json=jsonb(?2) WHERE operation_id=?1")
@@ -547,14 +777,15 @@ impl crate::store::Store {
         .bind(&charge)
         .execute(&mut *tx)
         .await?;
-        publish_budget(
-            tx,
-            &directory,
-            &budget_name(self, Uuid::parse_str(&budget_id).map_err(invalid)?)?,
-            &charge,
-            |_| {},
-        )
-        .await?;
+        tx.commit().await?;
+        // Batch reductions accumulate SQL-first. The outer reconciliation
+        // publishes one complete inventory, not N quadratic aggregate rewrites.
+        if batch.is_none() {
+            directory.write_file_atomic(
+                &budget_name(self, Uuid::parse_str(&budget_id).map_err(invalid)?)?,
+                charge.as_bytes(),
+            )?;
+        }
         Ok(())
     }
 
@@ -578,7 +809,8 @@ impl crate::store::Store {
                 .await?;
             }
         }
-        self.reconcile_restore_budget_in(&budget_directory()?).await
+        self.reconcile_restore_budget_in(&budget_directory(self)?)
+            .await
     }
 
     async fn reconcile_restore_budget_in(
@@ -591,31 +823,28 @@ impl crate::store::Store {
             nix::fcntl::FlockArg::LockExclusive,
         )?;
         let prefix = budget_prefix(self)?;
+        let mut authoritative = std::collections::BTreeSet::new();
+        let standalone:Vec<(String,String)>=sqlx::query_as("SELECT budget_id,json(charge_json) FROM restore_memory_reservation WHERE batch_id IS NULL").fetch_all(&self.pool).await?;
+        for (id, json) in standalone {
+            let charge: RestoreMemoryCharge = serde_json::from_str(&json).map_err(invalid)?;
+            charge.validate()?;
+            let name = budget_name(self, Uuid::parse_str(&id).map_err(invalid)?)?;
+            directory.write_file_atomic(&name, json.as_bytes())?;
+            authoritative.insert(name);
+        }
+        let captures: Vec<String> =
+            sqlx::query_scalar("SELECT operation_id FROM capture_resource_reservation")
+                .fetch_all(&self.pool)
+                .await?;
+        for id in captures {
+            let operation = Uuid::parse_str(&id).map_err(invalid)?;
+            let json = self.capture_budget_document(operation).await?;
+            let name = budget_name(self, operation)?;
+            directory.write_file_atomic(&name, json.as_bytes())?;
+            authoritative.insert(name);
+        }
         for name in budget_entries(directory)? {
-            let Some(id) = name
-                .strip_prefix(&prefix)
-                .and_then(|name| name.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            let operation = Uuid::parse_str(id).map_err(invalid)?;
-            let retained: Option<String> = sqlx::query_scalar(
-                "SELECT json(charge_json) FROM restore_memory_reservation WHERE budget_id=?1",
-            )
-            .bind(operation.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
-            if let Some(charge) = retained {
-                let decoded: RestoreMemoryCharge =
-                    serde_json::from_str(&charge).map_err(invalid)?;
-                decoded.validate()?;
-                directory.write_file_atomic(&name, charge.as_bytes())?;
-            } else {
-                let generation: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE kind='launch' AND json_extract(record_json,'$.restore.consumerOperation')=?1)")
-                    .bind(operation.to_string()).fetch_one(&self.pool).await?;
-                if generation {
-                    return Err(invalid("restore generation lost its quota owner"));
-                }
+            if name.starts_with(&prefix) && !authoritative.contains(&name) {
                 directory.remove_tree(&name)?;
             }
         }
@@ -668,6 +897,604 @@ impl crate::store::Store {
     }
 }
 
+impl crate::store::Store {
+    /// Shared cross-home admission. No capture command can precede successful
+    /// publication of this complete inventory under the restore admission lock.
+    pub(crate) async fn reserve_capture_inventory(
+        &self,
+        record: &crate::store::snapshot_store::CaptureRecord,
+    ) -> Result<(), LibVmError> {
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        let fork = self.fork_for_capture(record.capture_id).await?;
+        let owner = fork.unwrap_or(record.capture_id);
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(json) = existing {
+            return self
+                .replay_capture_inventory(owner, &directory, &json)
+                .await;
+        }
+        let mut inventory = CaptureBudgetInventory {
+            capture_id: record.capture_id,
+            capture_memory: record
+                .reservation_memory_bytes
+                .checked_sub(record.plan.ram_bytes)
+                .ok_or_else(|| invalid("capture scratch reservation underflow"))?,
+            baseline: Some(CaptureBaseline::Pending {
+                capture_id: record.capture_id,
+                bytes: record.plan.ram_bytes,
+            }),
+            capture_disks: record.disk_charges.clone(),
+            pending: Vec::new(),
+            bound: Vec::new(),
+            descriptor_owner: Some(DescriptorOwner::current()?),
+            descriptors: record.plan.configuration.attachments.len() as u64 * 3 + 12,
+        };
+        let mut policy = crate::RestoreMemoryPolicy::Reserved;
+        if let Some(operation) = fork {
+            let options = self.fork_options(operation).await?;
+            policy = options.resources.memory;
+            let parent =
+                crate::paths::OwnedDirectory::open_existing_root(&self.home.join("machines"))?
+                    .ok_or_else(|| invalid("fork destination parent missing"))?;
+            let stat = nix::sys::stat::fstat(parent.fd()).map_err(std::io::Error::from)?;
+            let mut disk = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
+            for attachment in &record.plan.configuration.attachments {
+                if !attachment.read_only {
+                    disk = disk
+                        .checked_add(attachment.geometry.length)
+                        .ok_or_else(|| invalid("fork disk peak overflow"))?;
+                }
+            }
+            // Retain the exact pinned boot provenance once per destination.
+            let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+            if let crate::BootProfile::LinuxDirect {
+                binding:
+                    crate::BootBinding::Pinned {
+                        kernel,
+                        base_initramfs,
+                        agent,
+                        ..
+                    },
+                ..
+            } = &record.storage.boot
+            {
+                for object in [kernel, base_initramfs].into_iter().chain(agent.iter()) {
+                    disk = disk
+                        .checked_add(std::fs::metadata(pool.object_path(object))?.len())
+                        .ok_or_else(|| invalid("fork boot peak overflow"))?;
+                }
+            }
+            let configured = record.plan.ram_bytes;
+            for child in self.fork_children(operation).await? {
+                inventory.pending.push(PendingForkCharge {
+                    consumer_id: child.consumer_id,
+                    configured_bytes: configured,
+                    private_bytes: options
+                        .resources
+                        .private_write_allowance
+                        .reservation(configured, 65536)?,
+                    overhead_bytes: configured.div_ceil(512)
+                        + vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
+                    disk_device: stat.st_dev as u64,
+                    disk_bytes: disk,
+                    policy: options.resources,
+                });
+            }
+            let roles = record.plan.configuration.attachments.len() as u64;
+            let (transfer_roles, native_records) = match &record.storage.root {
+                crate::MachineRoot::LinuxOverlay {
+                    lower:
+                        crate::OverlayLower::FlatExt4 {
+                            stream, geometry, ..
+                        },
+                    ..
+                } => {
+                    let occurrences = [crate::storage::vmdk::LowerOccurrence::resolved(
+                        *stream,
+                        self.images_dir.join("streams/sha256").join(stream.hex()),
+                        geometry.length,
+                    )];
+                    let lower = crate::storage::vmdk::FlatLowerPlan::new(&occurrences)?;
+                    (6, lower.preflight(roles)?.record_count())
+                }
+                _ => (4, 0),
+            };
+            let per_child = (3 * transfer_roles)
+                .max(native_records + transfer_roles)
+                .checked_add(3 * roles + 32)
+                .ok_or_else(|| invalid("fork FD peak overflow"))?;
+            let fds = (options.children.len() as u64)
+                .checked_mul(per_child)
+                .and_then(|n| n.checked_add(3 * roles + 32))
+                .ok_or_else(|| invalid("fork FD peak overflow"))?;
+            inventory.descriptors = fds;
+        }
+        let mut budget = RestoreBudget::read(&directory)?;
+        budget.add_capture(&inventory)?;
+        budget.admit_descriptors()?;
+        budget.admit_memory(policy, crate::store::capture::available_memory()?)?;
+        for path in [&self.images_dir, &self.home.join("machines")] {
+            let disk = crate::paths::OwnedDirectory::open_existing_root(path)?
+                .ok_or_else(|| invalid("capture budget filesystem disappeared"))?;
+            let stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
+            let filesystem =
+                nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
+            let available = filesystem
+                .blocks_available()
+                .checked_mul(filesystem.fragment_size())
+                .ok_or_else(|| invalid("capture free space overflow"))?;
+            let required = budget
+                .disks
+                .get(&(stat.st_dev as u64))
+                .copied()
+                .unwrap_or_default();
+            if required > available {
+                return Err(crate::storage::StorageError::RestoreBudget {
+                    resource: "disk",
+                    required,
+                    available,
+                }
+                .into());
+            }
+        }
+        let json = serde_json::to_string(&inventory).map_err(invalid)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO capture_resource_reservation(operation_id,charge_json) VALUES(?1,jsonb(?2))").bind(owner.to_string()).bind(&json).execute(&mut *tx).await?;
+        if let Some(operation) = fork {
+            sqlx::query("UPDATE live_fork SET admission_complete=1 WHERE operation_id=?1")
+                .bind(operation.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        publish_budget(tx, &directory, &budget_name(self, owner)?, &json, |_| {}).await?;
+        if let Some(operation) = fork {
+            self.fork_event(operation, None, "admission_committed")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The caller holds admission.lock. Replay transfers only the manager-local
+    /// FD charge; RAM, disk, and resource policy remain durably reserved.
+    async fn replay_capture_inventory(
+        &self,
+        owner: Uuid,
+        directory: &crate::paths::OwnedDirectory,
+        existing: &str,
+    ) -> Result<(), LibVmError> {
+        let mut retained: CaptureBudgetInventory =
+            serde_json::from_str(existing).map_err(invalid)?;
+        let mut inventory: CaptureBudgetInventory =
+            serde_json::from_str(&self.capture_budget_document(owner).await?).map_err(invalid)?;
+        validate_descriptor_charge(retained.descriptor_owner, retained.descriptors)?;
+        if inventory.descriptors != 0 {
+            inventory.descriptor_owner = Some(DescriptorOwner::current()?);
+        }
+        retained.descriptor_owner = inventory.descriptor_owner;
+        retained.descriptors = inventory.descriptors;
+        let name = budget_name(self, owner)?;
+        // Replace this operation's old ledger entry, including on same-birth
+        // replay, rather than counting the reservation twice.
+        let mut budget = RestoreBudget::read_except(directory, Some(&name))?;
+        budget.add_capture(&inventory)?;
+        budget.admit_descriptors()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .bind(serde_json::to_string(&retained).map_err(invalid)?)
+        .execute(&mut *tx)
+        .await?;
+        let json = serde_json::to_string(&inventory).map_err(invalid)?;
+        publish_budget(tx, directory, &name, &json, |_| {}).await
+    }
+
+    pub(crate) async fn capture_budget_document(&self, owner: Uuid) -> Result<String, LibVmError> {
+        let json: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
+        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='capture')").bind(inventory.capture_id.to_string()).fetch_one(&self.pool).await?;
+        if !retained {
+            inventory.capture_memory = 0;
+            inventory.baseline = None;
+            inventory.capture_disks.clear();
+        }
+        let rows:Vec<String>=sqlx::query_scalar("SELECT json(charge_json) FROM restore_memory_reservation WHERE batch_id=?1 ORDER BY budget_id").bind(owner.to_string()).fetch_all(&self.pool).await?;
+        inventory.bound = rows
+            .iter()
+            .map(|json| serde_json::from_str(json).map_err(invalid))
+            .collect::<Result<_, _>>()?;
+        if owner != inventory.capture_id {
+            let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_fork_child WHERE operation_id=?1 AND json_extract(result_json,'$.outcome.kind') IN ('pending','constructing','activating'))").bind(owner.to_string()).fetch_one(&self.pool).await?;
+            if !active {
+                inventory.descriptor_owner = None;
+                inventory.descriptors = 0;
+            }
+        }
+        serde_json::to_string(&inventory).map_err(invalid)
+    }
+
+    pub(crate) async fn bind_fork_resources(
+        &self,
+        cut: &crate::store::fork::VerifiedRestoreCut,
+    ) -> Result<(), LibVmError> {
+        let operation = cut.record.operation_id;
+        let options = self.fork_options(operation).await?;
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let json: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
+        let memory = cut
+            .record
+            .evidence
+            .memory
+            .as_ref()
+            .ok_or_else(|| invalid("fork cut lacks RAM evidence"))?;
+        let ram = cut
+            .record
+            .files
+            .iter()
+            .find(|file| file.role == vm_spec::capture::CaptureRole::Ram)
+            .ok_or_else(|| invalid("fork cut lacks RAM role"))?;
+        for pending in &inventory.pending {
+            let lease = pool.lease(pending.consumer_id)?;
+            let (device, inode) = lease.file_identity()?;
+            sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,file_device,file_inode,record_json) VALUES(?1,1,'import','staging',?2,?3,jsonb('{}'))").bind(pending.consumer_id.to_string()).bind(device.to_string()).bind(inode.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO storage_operation_cut(operation_id,cut_id) SELECT ?1,cut_id FROM storage_operation_cut WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
+            let granule = u64::from(memory.page_granule);
+            if !(4096..=65536).contains(&granule)
+                || !granule.is_power_of_two()
+                || options
+                    .resources
+                    .private_write_allowance
+                    .reservation(pending.configured_bytes, granule)?
+                    > pending.private_bytes
+            {
+                return Err(invalid(
+                    "sealed RAM granule exceeds the admitted private-memory reservation",
+                ));
+            }
+            let charge = RestoreMemoryCharge {
+                baseline_device: ram.device,
+                baseline_inode: ram.inode,
+                baseline_bytes: ram.length,
+                configured_bytes: pending.configured_bytes,
+                granule,
+                private_bytes: options
+                    .resources
+                    .private_write_allowance
+                    .reservation(pending.configured_bytes, granule)?,
+                overhead_bytes: pending.overhead_bytes,
+                policy: options.resources,
+                disk_device: pending.disk_device,
+                disk_bytes: pending.disk_bytes,
+                construction_complete: false,
+                descriptor_owner: None,
+                descriptors: 0,
+            };
+            charge.validate()?;
+            sqlx::query("INSERT INTO restore_memory_reservation(operation_id,budget_id,charge_json,batch_id) VALUES(?1,?1,jsonb(?2),?3)").bind(pending.consumer_id.to_string()).bind(serde_json::to_string(&charge).map_err(invalid)?).bind(operation.to_string()).execute(&mut *tx).await?;
+        }
+        inventory.pending.clear();
+        // Capture scratch remains separate; the final RAM baseline is charged
+        // once by the inode-deduplicated generation charges.
+        inventory.capture_memory = 16 << 20;
+        inventory.baseline = Some(CaptureBaseline::Bound {
+            device: cut.record.source_ram.device,
+            inode: cut.record.source_ram.inode,
+            bytes: cut.record.source_ram.length,
+        });
+        inventory.capture_disks.clear();
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .bind(serde_json::to_string(&inventory).map_err(invalid)?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let json = self.capture_budget_document(operation).await?;
+        directory.write_file_atomic(&budget_name(self, operation)?, json.as_bytes())?;
+        Ok(())
+    }
+
+    pub(crate) async fn fork_child_charge(
+        &self,
+        consumer: Uuid,
+    ) -> Result<RestoreMemoryCharge, LibVmError> {
+        let json: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM restore_memory_reservation WHERE operation_id=?1",
+        )
+        .bind(consumer.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let charge: RestoreMemoryCharge = serde_json::from_str(&json).map_err(invalid)?;
+        charge.validate()?;
+        Ok(charge)
+    }
+}
+
+impl crate::store::Store {
+    pub(crate) async fn complete_capture_peak(&self, capture: Uuid) -> Result<(), LibVmError> {
+        let owner = self.fork_for_capture(capture).await?.unwrap_or(capture);
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(json) = json else {
+            return Err(invalid(
+                "sealed capture lost its authoritative resource inventory",
+            ));
+        };
+        let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
+        inventory.capture_disks.clear();
+        if owner == capture {
+            inventory.descriptor_owner = None;
+            inventory.descriptors = 0;
+        }
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .bind(serde_json::to_string(&inventory).map_err(invalid)?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        directory.write_file_atomic(
+            &budget_name(self, owner)?,
+            self.capture_budget_document(owner).await?.as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) async fn refine_capture_boot_inventory(
+        &self,
+        capture: Uuid,
+    ) -> Result<(), LibVmError> {
+        let Some(owner) = self.fork_for_capture(capture).await? else {
+            return Ok(());
+        };
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        let json:String=sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(capture.to_string()).fetch_one(&self.pool).await?;
+        let record = crate::store::capture::decode_record(&json)?;
+        let boot = record
+            .captured_boot
+            .as_ref()
+            .ok_or_else(|| invalid("fork boot inventory is not pinned"))?;
+        let mut peak = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
+        for attachment in &record.plan.configuration.attachments {
+            if !attachment.read_only {
+                peak = peak
+                    .checked_add(attachment.geometry.length)
+                    .ok_or_else(|| invalid("fork disk peak overflow"))?;
+            }
+        }
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        if let crate::BootProfile::LinuxDirect {
+            binding:
+                crate::BootBinding::Pinned {
+                    kernel,
+                    base_initramfs,
+                    agent,
+                    ..
+                },
+            ..
+        } = boot
+        {
+            for object in [kernel, base_initramfs].into_iter().chain(agent.iter()) {
+                peak = peak
+                    .checked_add(std::fs::metadata(pool.object_path(object))?.len())
+                    .ok_or_else(|| invalid("fork boot peak overflow"))?;
+            }
+        }
+        let json: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
+        let mut budget = RestoreBudget::read(&directory)?;
+        let mut changed = false;
+        for child in &mut inventory.pending {
+            if peak > child.disk_bytes {
+                let charge = budget.disks.entry(child.disk_device).or_default();
+                *charge = charge
+                    .checked_add(peak - child.disk_bytes)
+                    .ok_or_else(|| invalid("fork boot reservation overflow"))?;
+                child.disk_bytes = peak;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let disk = crate::paths::OwnedDirectory::open_existing_root(&self.home.join("machines"))?
+            .ok_or_else(|| invalid("fork destination disappeared"))?;
+        let stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
+        let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
+        let available = filesystem
+            .blocks_available()
+            .checked_mul(filesystem.fragment_size())
+            .ok_or_else(|| invalid("fork disk availability overflow"))?;
+        let required = budget
+            .disks
+            .get(&(stat.st_dev as u64))
+            .copied()
+            .unwrap_or_default();
+        if required > available {
+            return Err(crate::storage::StorageError::RestoreBudget {
+                resource: "disk",
+                required,
+                available,
+            }
+            .into());
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .bind(serde_json::to_string(&inventory).map_err(invalid)?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        directory.write_file_atomic(
+            &budget_name(self, owner)?,
+            self.capture_budget_document(owner).await?.as_bytes(),
+        )?;
+        Ok(())
+    }
+}
+
+fn validate_descriptor_charge(
+    owner: Option<DescriptorOwner>,
+    count: u64,
+) -> Result<(), LibVmError> {
+    if owner.is_some() != (count != 0)
+        || owner.is_some_and(|owner| owner.pid <= 0 || owner.started_at <= 0)
+    {
+        return Err(invalid(
+            "manager descriptor reservation has no exact process owner",
+        ));
+    }
+    Ok(())
+}
+
+impl crate::store::Store {
+    /// Only a fenced never-submitted/refused command or an explicit native
+    /// release of a failed cut permits this reduction while the source lives.
+    pub(crate) async fn release_unused_capture_inventory(
+        &self,
+        capture: Uuid,
+    ) -> Result<(), LibVmError> {
+        let json:Option<String>=sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(capture.to_string()).fetch_optional(&self.pool).await?;
+        let Some(json) = json else {
+            return Ok(());
+        };
+        let record = crate::store::capture::decode_record(&json)?;
+        if record.evidence.is_some()
+            || !matches!(
+                record.state,
+                crate::store::snapshot_store::CaptureState::Abandoned
+                    | crate::store::snapshot_store::CaptureState::Released { snapshot: None }
+            )
+        {
+            return Ok(());
+        }
+        let intent = self
+            .live_command_record(record.machine_id, record.run_id, capture)
+            .await?;
+        let no_submission = intent.as_ref().is_none_or(|intent| {
+            matches!(
+                intent.result,
+                Some(vm_spec::lifecycle::LiveCommandResult::Capture(
+                    vm_spec::lifecycle::CaptureOutcome::Rejected { .. }
+                ))
+            )
+        });
+        if !no_submission
+            && !matches!(
+                record.state,
+                crate::store::snapshot_store::CaptureState::Released { snapshot: None }
+            )
+        {
+            return Ok(());
+        }
+        let owner = self.fork_for_capture(capture).await?.unwrap_or(capture);
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(json) = json else {
+            return Ok(());
+        };
+        let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
+        let bound: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM restore_memory_reservation WHERE batch_id=?1)",
+        )
+        .bind(owner.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if bound || !inventory.bound.is_empty() {
+            return Err(invalid(
+                "unsubmitted capture contradicts bound child generations",
+            ));
+        }
+        inventory.capture_memory = 0;
+        inventory.baseline = None;
+        inventory.capture_disks.clear();
+        inventory.descriptor_owner = None;
+        inventory.descriptors = 0;
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(owner.to_string())
+        .bind(serde_json::to_string(&inventory).map_err(invalid)?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        directory.write_file_atomic(
+            &budget_name(self, owner)?,
+            self.capture_budget_document(owner).await?.as_bytes(),
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::store::restore::{RestoreBudget, RestoreMemoryCharge};
@@ -686,7 +1513,314 @@ mod tests {
             disk_device,
             disk_bytes: vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
             construction_complete: false,
+            descriptor_owner: None,
+            descriptors: 0,
         }
+    }
+
+    fn capture_inventory(
+        input: &RestoreMemoryCharge,
+    ) -> crate::store::restore::CaptureBudgetInventory {
+        crate::store::restore::CaptureBudgetInventory {
+            capture_id: uuid::Uuid::new_v4(),
+            capture_memory: 16 << 20,
+            baseline: Some(crate::store::restore::CaptureBaseline::Bound {
+                device: input.baseline_device,
+                inode: input.baseline_inode,
+                bytes: input.baseline_bytes,
+            }),
+            capture_disks: Vec::new(),
+            pending: Vec::new(),
+            bound: Vec::new(),
+            descriptor_owner: None,
+            descriptors: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_replay_rebinds_manager_birth_and_refuses_fd_exhaustion_before_publication() {
+        use crate::paths::OwnedDirectory;
+        use crate::store::restore::{CaptureBudgetInventory, DescriptorOwner, PendingForkCharge};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = OwnedDirectory::open_root(&root.path().join("home")).unwrap();
+        let ledger = OwnedDirectory::open_root(&root.path().join("ledger")).unwrap();
+        let store = crate::store::Store::open(&home.path().join("state.db"))
+            .await
+            .unwrap();
+        let (operation, _lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE storage_operation SET kind='capture' WHERE operation_id=?1")
+            .bind(operation.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let current = DescriptorOwner::current().unwrap();
+        let previous = DescriptorOwner {
+            pid: current.pid,
+            started_at: current.started_at + 1,
+        };
+        let input = charge(10, 3);
+        let mut inventory = capture_inventory(&input);
+        inventory.capture_id = operation;
+        inventory.descriptor_owner = Some(previous);
+        inventory.descriptors = 1;
+        inventory.pending.push(PendingForkCharge {
+            consumer_id: uuid::Uuid::new_v4(),
+            configured_bytes: input.configured_bytes,
+            private_bytes: input.private_bytes,
+            overhead_bytes: input.overhead_bytes,
+            disk_device: input.disk_device,
+            disk_bytes: input.disk_bytes,
+            policy: crate::RestoreResourcePolicy {
+                memory: crate::RestoreMemoryPolicy::AllowOvercommit,
+                ..input.policy
+            },
+        });
+        let name = crate::store::restore::budget_name(&store, operation).unwrap();
+        let _admission = crate::storage::locks::blocking(
+            &ledger,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&inventory).unwrap();
+        sqlx::query("INSERT INTO capture_resource_reservation(operation_id,charge_json) VALUES(?1,jsonb(?2))")
+            .bind(operation.to_string())
+            .bind(&json)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        ledger.write_file_atomic(&name, json.as_bytes()).unwrap();
+        let before = RestoreBudget::read(&ledger).unwrap();
+        assert_eq!(
+            before.descriptors, 0,
+            "a different birth does not own this manager's FDs"
+        );
+        store
+            .replay_capture_inventory(operation, &ledger, &json)
+            .await
+            .unwrap();
+        let persisted: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        inventory.descriptor_owner = Some(current);
+        let expected = serde_json::to_value(&inventory).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&persisted).unwrap(),
+            expected
+        );
+        let published: CaptureBudgetInventory =
+            serde_json::from_reader(ledger.open_file(&name).unwrap().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(published).unwrap(), expected);
+        let after = RestoreBudget::read(&ledger).unwrap();
+        assert_eq!(after.descriptors, 1);
+        assert_eq!(after.memory, before.memory);
+        assert_eq!(after.disks, before.disks);
+
+        // A same-birth replay at the exact limit must replace its old charge.
+        // Counting it twice would refuse admission (or overflow) here.
+        let (_, hard) =
+            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+        inventory.descriptors = hard - crate::storage::limits::FD_RESERVED_OVERHEAD;
+        let full = serde_json::to_string(&inventory).unwrap();
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .bind(&full)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        ledger.write_file_atomic(&name, full.as_bytes()).unwrap();
+        store
+            .replay_capture_inventory(operation, &ledger, &full)
+            .await
+            .unwrap();
+        assert_eq!(
+            RestoreBudget::read(&ledger).unwrap().descriptors,
+            inventory.descriptors
+        );
+
+        // Even explicit RAM overcommit cannot bypass this manager's FD limit.
+        // Exceed the hard limit, since production admission may raise the soft limit.
+        inventory.descriptor_owner = Some(previous);
+        inventory.descriptors = hard
+            .saturating_sub(crate::storage::limits::FD_RESERVED_OVERHEAD)
+            .saturating_add(1);
+        let refused = serde_json::to_string(&inventory).unwrap();
+        sqlx::query(
+            "UPDATE capture_resource_reservation SET charge_json=jsonb(?2) WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .bind(&refused)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        ledger.write_file_atomic(&name, refused.as_bytes()).unwrap();
+        let error = store
+            .replay_capture_inventory(operation, &ledger, &refused)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("file descriptor budget"),
+            "{error}"
+        );
+        let unchanged: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let expected = serde_json::to_value(&inventory).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&unchanged).unwrap(),
+            expected
+        );
+        let published: CaptureBudgetInventory =
+            serde_json::from_reader(ledger.open_file(&name).unwrap().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(published).unwrap(), expected);
+        assert_eq!(RestoreBudget::read(&ledger).unwrap().descriptors, 0);
+        store.close().await;
+    }
+
+    #[test]
+    fn fork_batch_transfer_preserves_shared_admission_without_reacquiring_child_capacity() {
+        use crate::store::restore::PendingForkCharge;
+        let input = charge(10, 3);
+        let mut inventory = capture_inventory(&input);
+        inventory.pending = (0..17)
+            .map(|_| PendingForkCharge {
+                consumer_id: uuid::Uuid::new_v4(),
+                configured_bytes: input.configured_bytes,
+                private_bytes: input
+                    .policy
+                    .private_write_allowance
+                    .reservation(input.configured_bytes, 65536)
+                    .unwrap(),
+                overhead_bytes: input.overhead_bytes,
+                disk_device: input.disk_device,
+                disk_bytes: input.disk_bytes,
+                policy: input.policy,
+            })
+            .collect();
+        let mut admitted = RestoreBudget::default();
+        admitted.add_capture(&inventory).unwrap();
+        inventory.pending.clear();
+        inventory.bound = vec![input.clone(); 17];
+        let mut bound = RestoreBudget::default();
+        bound.add_capture(&inventory).unwrap();
+        assert_eq!(bound.memory, admitted.memory);
+        assert_eq!(bound.disks, admitted.disks);
+        assert_eq!(bound.baselines.len(), 1);
+        inventory.bound.pop();
+        let mut retired = RestoreBudget::default();
+        retired.add_capture(&inventory).unwrap();
+        assert_eq!(
+            bound.memory - retired.memory,
+            input.private_bytes + input.overhead_bytes
+        );
+        assert_eq!(
+            retired.baselines.len(),
+            1,
+            "source and remaining children still own the baseline"
+        );
+    }
+
+    #[test]
+    fn capture_and_standalone_restore_share_one_baseline_and_cross_device_copies_charge_two() {
+        let input = charge(10, 3);
+        let inventory = capture_inventory(&input);
+        let mut shared = RestoreBudget::default();
+        shared.add_capture(&inventory).unwrap();
+        shared.add(&input).unwrap();
+        assert_eq!(
+            shared.memory,
+            inventory.capture_memory
+                + input.baseline_bytes
+                + input.private_bytes
+                + input.overhead_bytes
+        );
+        let mut copied = input.clone();
+        copied.baseline_device += 1;
+        shared.add(&copied).unwrap();
+        assert_eq!(shared.baselines.len(), 2);
+        assert_eq!(
+            shared.memory,
+            inventory.capture_memory
+                + 2 * (input.baseline_bytes + input.private_bytes + input.overhead_bytes)
+        );
+        let mut source_gone = RestoreBudget::default();
+        source_gone.add(&input).unwrap();
+        assert_eq!(
+            source_gone.baselines.len(),
+            1,
+            "a child owns its baseline independently of the source"
+        );
+    }
+
+    #[test]
+    fn pending_fork_inventory_rejects_undercharge_and_unknown_baseline_identity() {
+        use crate::store::restore::{CaptureBaseline, PendingForkCharge};
+        let input = charge(10, 3);
+        let mut inventory = capture_inventory(&input);
+        inventory.pending.push(PendingForkCharge {
+            consumer_id: uuid::Uuid::new_v4(),
+            configured_bytes: input.configured_bytes,
+            private_bytes: input.private_bytes - 1,
+            overhead_bytes: input.overhead_bytes,
+            disk_device: input.disk_device,
+            disk_bytes: input.disk_bytes,
+            policy: input.policy,
+        });
+        assert!(RestoreBudget::default().add_capture(&inventory).is_err());
+        inventory.pending.clear();
+        inventory.baseline = Some(CaptureBaseline::Pending {
+            capture_id: uuid::Uuid::new_v4(),
+            bytes: input.baseline_bytes,
+        });
+        assert!(RestoreBudget::default().add_capture(&inventory).is_err());
+        inventory.baseline = Some(CaptureBaseline::Bound {
+            device: 1,
+            inode: 0,
+            bytes: input.baseline_bytes,
+        });
+        assert!(RestoreBudget::default().add_capture(&inventory).is_err());
+    }
+
+    #[test]
+    fn descriptor_budget_is_scoped_to_the_exact_manager_birth_not_all_homes() {
+        let owner = crate::store::restore::DescriptorOwner::current().unwrap();
+        let mut inventory = capture_inventory(&charge(10, 3));
+        inventory.descriptor_owner = Some(owner);
+        inventory.descriptors = 100;
+        let mut manager = RestoreBudget {
+            manager: Some(owner),
+            ..RestoreBudget::default()
+        };
+        manager.add_capture(&inventory).unwrap();
+        assert_eq!(manager.descriptors, 100);
+        inventory.descriptor_owner = Some(crate::store::restore::DescriptorOwner {
+            pid: owner.pid,
+            started_at: owner.started_at.checked_add(1).unwrap(),
+        });
+        manager.add_capture(&inventory).unwrap();
+        assert_eq!(
+            manager.descriptors, 100,
+            "a reused PID or another manager does not consume this process's RLIMIT"
+        );
+        inventory.descriptor_owner = None;
+        assert!(
+            manager.add_capture(&inventory).is_err(),
+            "unowned descriptor reservations are invalid"
+        );
     }
 
     #[test]

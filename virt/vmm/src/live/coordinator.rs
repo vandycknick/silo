@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use protocol::v1::{
-    ExpectedGuestIdentity, FreezeRef, FreezeWorkloadsRequest, GetAgentStatusRequest,
+    AgentStatus, ExpectedGuestIdentity, FreezeRef, FreezeWorkloadsRequest, GetAgentStatusRequest,
     GuestLifecycleStatus, ThawRequest,
 };
 use tokio_util::sync::CancellationToken;
@@ -135,6 +135,29 @@ enum GuestError {
     Stopped,
 }
 
+#[derive(Clone, Copy)]
+enum StatusBarrier {
+    ResumeHandshake,
+    Readiness,
+}
+
+impl StatusBarrier {
+    fn stage(self) -> LiveStage {
+        match self {
+            Self::ResumeHandshake => LiveStage::ResumeHandshake,
+            Self::Readiness => LiveStage::Readiness,
+        }
+    }
+
+    fn failure(self, message: impl Into<String>) -> LiveFailure {
+        let code = match self {
+            Self::ResumeHandshake => LiveFailureCode::HandshakeFailed,
+            Self::Readiness => LiveFailureCode::ReadinessFailed,
+        };
+        failure(code, self.stage(), message)
+    }
+}
+
 /// Outcome of continuing a natively released source to Running.
 enum Continued {
     Running,
@@ -225,6 +248,41 @@ pub(crate) fn guest_observation(
     };
     observation.validate()?;
     Ok(observation)
+}
+
+/// A unary response is proof only for the held source identity.
+/// Keep the full envelope on the ordinary observation path, which also checks
+/// agent-version continuity and does not grant readiness while fenced.
+fn observe_status_barrier(
+    store: &InstanceStore,
+    identity: &ReadyAgentIdentity,
+    status: AgentStatus,
+    barrier: StatusBarrier,
+) -> Result<(), GuestError> {
+    let invalid = |message: String| GuestError::Refused(barrier.failure(message));
+    let returned = status
+        .identity
+        .as_ref()
+        .ok_or_else(|| invalid("guest status has no identity".into()))?;
+    let parse = |value: Option<&str>| {
+        value
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| invalid("guest status identity has a missing or invalid UUID".into()))
+    };
+    let observed = ReadyAgentIdentity {
+        instance_id: parse(returned.instance_id.as_deref())?,
+        boot_id: parse(returned.boot_id.as_deref())?,
+    };
+    if &observed != identity {
+        return Err(GuestError::Refused(failure(
+            LiveFailureCode::GuestIdentityMismatch,
+            barrier.stage(),
+            "guest agent identity changed across a source resume",
+        )));
+    }
+    store
+        .observe_status(status, crate::guest::STATUS_FRESHNESS)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 /// Native provider inventory admission: every live device must be a
@@ -1477,9 +1535,8 @@ impl LiveCoordinator {
         epoch: NonZeroU64,
         consumed: NativePauseGeneration,
     ) -> Continued {
-        // Only receipts observed after confirmed native release can prove
-        // the source agent transport has re-handshaken.
-        let released = Instant::now();
+        // Request a new identity-bearing status only after confirmed native
+        // release, rather than waiting for an unsolicited watch heartbeat.
         self.publish_stage(
             operation,
             request,
@@ -1487,7 +1544,7 @@ impl LiveCoordinator {
             LiveStage::ResumeHandshake,
             false,
         );
-        match self.await_handshake(released, identity).await {
+        match self.guest_handshake(identity).await {
             Ok(()) => {}
             Err(GuestError::Stopped) => return Continued::Stopped,
             Err(GuestError::Refused(cause) | GuestError::Unknown(cause)) => {
@@ -2164,45 +2221,49 @@ impl LiveCoordinator {
         }
     }
 
-    async fn await_handshake(
-        &self,
-        since: Instant,
-        identity: &ReadyAgentIdentity,
-    ) -> Result<(), GuestError> {
+    async fn guest_handshake(&self, identity: &ReadyAgentIdentity) -> Result<(), GuestError> {
         let deadline = tokio::time::Instant::now() + self.timeouts.handshake;
-        let mut changes = self.store.subscribe();
+        self.request_status_barrier(identity, StatusBarrier::ResumeHandshake, deadline)
+            .await
+    }
+
+    /// Request and observe a fresh identity-validated status inside the
+    /// caller's fixed stage budget, using a new control connection per attempt.
+    async fn request_status_barrier(
+        &self,
+        identity: &ReadyAgentIdentity,
+        barrier: StatusBarrier,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), GuestError> {
         loop {
-            match self.store.status_identity_since(since) {
-                Ok(Some(observed)) if &observed == identity => return Ok(()),
-                Ok(Some(_)) => {
-                    return Err(GuestError::Refused(failure(
-                        LiveFailureCode::GuestIdentityMismatch,
-                        LiveStage::ResumeHandshake,
-                        "guest agent identity changed across a source resume",
-                    )))
+            if self.stop.is_cancelled() {
+                return Err(GuestError::Stopped);
+            }
+            // guest_call establishes a new control connection for every attempt.
+            let attempt = self.guest_call(deadline, |mut client| async move {
+                client.get_status(GetAgentStatusRequest {}).await
+            });
+            match attempt.await {
+                GuestCall::Stopped => return Err(GuestError::Stopped),
+                GuestCall::Response(response) => {
+                    return observe_status_barrier(
+                        &self.store,
+                        identity,
+                        response.into_inner(),
+                        barrier,
+                    );
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(GuestError::Refused(failure(
-                        LiveFailureCode::HandshakeFailed,
-                        LiveStage::ResumeHandshake,
-                        error.to_string(),
-                    )))
+                GuestCall::Refused(status) => {
+                    return Err(GuestError::Refused(barrier.failure(status.message())));
+                }
+                GuestCall::Transport(_) => {}
+                GuestCall::Expired => {
+                    return Err(GuestError::Unknown(
+                        barrier.failure("guest status was not refreshed before its deadline"),
+                    ));
                 }
             }
-            tokio::select! {
-                () = self.stop.cancelled() => return Err(GuestError::Stopped),
-                () = tokio::time::sleep_until(deadline) => {
-                    return Err(GuestError::Unknown(failure(
-                        LiveFailureCode::HandshakeFailed,
-                        LiveStage::ResumeHandshake,
-                        "guest agent did not re-handshake before its deadline",
-                    )))
-                }
-                changed = changes.changed() => if changed.is_err() {
-                    return Err(GuestError::Stopped);
-                },
-            }
+            self.retry_pause(deadline).await;
         }
     }
 
@@ -2214,6 +2275,12 @@ impl LiveCoordinator {
         identity: &ReadyAgentIdentity,
     ) -> Result<(), GuestError> {
         let deadline = tokio::time::Instant::now() + self.timeouts.readiness;
+        // The Thaw-emitted watch report can precede its RPC response and
+        // therefore `since`. Request a new receipt after that exact successful
+        // thaw instead of waiting for an unsolicited heartbeat. This consumes
+        // the readiness budget and does not replace any Ready prerequisites.
+        self.request_status_barrier(identity, StatusBarrier::Readiness, deadline)
+            .await?;
         let mut changes = self.store.subscribe();
         loop {
             match self.store.status_identity_since(since) {
@@ -2420,4 +2487,329 @@ fn stopped_cancel(record: vm_spec::lifecycle::LiveOperationRecord) -> LiveComman
             state: VmLifecycleState::Stopping,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use protocol::v1::{AgentIdentity, AgentStatus, AgentStatusReport, AgentStatusState, VmState};
+    use uuid::Uuid;
+    use vm_spec::lifecycle::{LiveFailureCode, LiveStage};
+
+    use crate::live::coordinator::{observe_status_barrier, GuestError, StatusBarrier};
+    use crate::state::{new_instance_store, InstanceStore, ReadyAgentIdentity};
+
+    fn source() -> (InstanceStore, ReadyAgentIdentity, AgentStatus) {
+        let identity = ReadyAgentIdentity {
+            instance_id: Uuid::new_v4(),
+            boot_id: Uuid::new_v4(),
+        };
+        let status = AgentStatus {
+            identity: Some(AgentIdentity {
+                instance_id: Some(identity.instance_id.to_string()),
+                boot_id: Some(identity.boot_id.to_string()),
+                version: Some("source-agent".into()),
+            }),
+            report: Some(AgentStatusReport {
+                observed_at: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+                state: Some(AgentStatusState::Ready as i32),
+                ..AgentStatusReport::default()
+            }),
+        };
+        let store = new_instance_store(Uuid::new_v4().to_string(), "handshake".into(), true);
+        store
+            .observe_status(status.clone(), Duration::from_secs(60))
+            .unwrap();
+        store.set_vm_state(VmState::Pausing, "resume").unwrap();
+        (store, identity, status)
+    }
+
+    fn refused(error: GuestError, expected: LiveFailureCode, barrier: StatusBarrier) {
+        let GuestError::Refused(failure) = error else {
+            panic!("status barrier must fail definitively");
+        };
+        assert_eq!(failure.code, expected);
+        assert_eq!(failure.stage, barrier.stage());
+    }
+
+    #[test]
+    fn handshake_observes_full_status_without_granting_readiness() {
+        let (store, identity, status) = source();
+        let since = Instant::now();
+        assert!(
+            observe_status_barrier(&store, &identity, status, StatusBarrier::ResumeHandshake,)
+                .is_ok()
+        );
+        assert_eq!(store.status_identity_since(since).unwrap(), Some(identity));
+        assert_eq!(
+            store.status().unwrap().readiness.unwrap().ready,
+            Some(false)
+        );
+        // The handshake cannot satisfy a subsequent post-thaw receipt boundary.
+        assert!(!store.prospective_readiness(Instant::now()).unwrap().0);
+    }
+
+    #[test]
+    fn post_thaw_status_refresh_requires_new_receipt_and_ready_without_unfencing() {
+        let (store, identity, mut status) = source();
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        status.report.as_mut().unwrap().lifecycle = Some(protocol::v1::GuestLifecycleStatus {
+            state: protocol::v1::GuestLifecycleState::Thawed as i32,
+            freeze_ref: Some(protocol::v1::FreezeRef {
+                machine_id: machine_id.clone(),
+                run_id: run_id.clone(),
+                operation_id: Uuid::new_v4().to_string(),
+                freeze_epoch: Some(1),
+            }),
+            machine_id,
+            run_id,
+            ..protocol::v1::GuestLifecycleStatus::default()
+        });
+        // The watch already delivered the thaw transition before its RPC
+        // response. Neither that receipt nor the handshake can cross `since`.
+        store
+            .observe_status(status.clone(), crate::guest::STATUS_FRESHNESS)
+            .unwrap();
+        let since = Instant::now();
+        assert_eq!(store.status_identity_since(since).unwrap(), None);
+        assert!(!store.prospective_readiness(since).unwrap().0);
+
+        let mut starting = status.clone();
+        starting.report.as_mut().unwrap().state = Some(AgentStatusState::Starting as i32);
+        assert!(
+            observe_status_barrier(&store, &identity, starting, StatusBarrier::Readiness).is_ok()
+        );
+        assert_eq!(
+            store.status_identity_since(since).unwrap(),
+            Some(identity.clone())
+        );
+        assert!(!store.prospective_readiness(since).unwrap().0);
+
+        assert!(
+            observe_status_barrier(&store, &identity, status, StatusBarrier::Readiness).is_ok()
+        );
+        assert!(store.prospective_readiness(since).unwrap().0);
+        assert_eq!(
+            store.status().unwrap().readiness.unwrap().ready,
+            Some(false),
+            "fresh Ready testimony cannot grant public readiness while fenced"
+        );
+        assert!(store.live_snapshot().unwrap().ready_identity.is_none());
+    }
+
+    #[test]
+    fn status_barriers_refuse_replaced_instance_or_boot_without_observing_it() {
+        for barrier in [StatusBarrier::ResumeHandshake, StatusBarrier::Readiness] {
+            for replace_boot in [false, true] {
+                let (store, identity, mut status) = source();
+                let returned = status.identity.as_mut().unwrap();
+                if replace_boot {
+                    returned.boot_id = Some(Uuid::new_v4().to_string());
+                } else {
+                    returned.instance_id = Some(Uuid::new_v4().to_string());
+                }
+                let since = Instant::now();
+                refused(
+                    observe_status_barrier(&store, &identity, status, barrier)
+                        .err()
+                        .unwrap(),
+                    LiveFailureCode::GuestIdentityMismatch,
+                    barrier,
+                );
+                assert_eq!(store.status_identity_since(since).unwrap(), None);
+                assert_eq!(
+                    store.live_snapshot().unwrap().observed_identity,
+                    Some(identity)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_barriers_reject_missing_or_malformed_envelope_and_version_change() {
+        let (store, identity, valid) = source();
+        let mut cases = Vec::new();
+        let mut status = valid.clone();
+        status.identity = None;
+        cases.push(status);
+        let mut status = valid.clone();
+        status.identity.as_mut().unwrap().instance_id = None;
+        cases.push(status);
+        let mut status = valid.clone();
+        status.identity.as_mut().unwrap().boot_id = Some("not-a-uuid".into());
+        cases.push(status);
+        let mut status = valid.clone();
+        status.identity.as_mut().unwrap().version = None;
+        cases.push(status);
+        let mut status = valid.clone();
+        status.identity.as_mut().unwrap().version = Some("changed-agent".into());
+        cases.push(status);
+        let mut status = valid.clone();
+        status.report = None;
+        cases.push(status);
+        let mut status = valid.clone();
+        status.report.as_mut().unwrap().observed_at = None;
+        cases.push(status);
+        let mut status = valid.clone();
+        status
+            .report
+            .as_mut()
+            .unwrap()
+            .observed_at
+            .as_mut()
+            .unwrap()
+            .nanos = -1;
+        cases.push(status);
+        let mut status = valid.clone();
+        status.report.as_mut().unwrap().state = Some(i32::MAX);
+        cases.push(status);
+        let mut status = valid;
+        status.report.as_mut().unwrap().code = Some("INVALID_READY_CODE".into());
+        cases.push(status);
+
+        for barrier in [StatusBarrier::ResumeHandshake, StatusBarrier::Readiness] {
+            for status in &cases {
+                let since = Instant::now();
+                let code = match barrier {
+                    StatusBarrier::ResumeHandshake => LiveFailureCode::HandshakeFailed,
+                    StatusBarrier::Readiness => LiveFailureCode::ReadinessFailed,
+                };
+                refused(
+                    observe_status_barrier(&store, &identity, status.clone(), barrier)
+                        .err()
+                        .unwrap(),
+                    code,
+                    barrier,
+                );
+                assert_eq!(store.status_identity_since(since).unwrap(), None);
+                assert_eq!(
+                    store.live_snapshot().unwrap().observed_identity,
+                    Some(identity.clone())
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "mock-backend")]
+    fn disconnected_source(
+        handshake: Duration,
+    ) -> (
+        std::sync::Arc<crate::live::coordinator::LiveCoordinator>,
+        ReadyAgentIdentity,
+    ) {
+        let (store, identity, _) = source();
+        let config = crate::virt::VmConfig::builder("disconnected-source")
+            .base_directory("/tmp")
+            .kernel(std::path::Path::new("/mock-kernel"))
+            .build();
+        // Never started: the real connection path returns NotRunning, without
+        // a scripted RPC response, filesystem fixture or native worker.
+        let machine =
+            crate::virt::VirtualMachine::with_backend(crate::virt::BackendKind::Mock, config)
+                .unwrap();
+        let coordinator = crate::live::coordinator::LiveCoordinator::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            std::sync::Arc::new(store),
+            machine,
+            crate::live::gate::LiveGate::new(),
+            crate::live::coordinator::LiveTimeouts {
+                handshake,
+                readiness: handshake,
+                ..crate::live::coordinator::LiveTimeouts::default()
+            },
+            None,
+        )
+        .unwrap();
+        (coordinator, identity)
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[tokio::test]
+    async fn handshake_transport_failure_expires_despite_cached_status() {
+        let (coordinator, identity) = disconnected_source(Duration::from_millis(30));
+        let since = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.guest_handshake(&identity),
+        )
+        .await
+        .expect("transport retries must retain the original handshake deadline");
+        let Err(GuestError::Unknown(failure)) = result else {
+            panic!("cached status cannot replace a fresh control response");
+        };
+        assert_eq!(failure.code, LiveFailureCode::HandshakeFailed);
+        assert_eq!(failure.stage, LiveStage::ResumeHandshake);
+        assert_eq!(
+            coordinator.store.status_identity_since(since).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[tokio::test]
+    async fn handshake_stop_cancels_transport_retry() {
+        let (coordinator, identity) = disconnected_source(Duration::from_secs(60));
+        let pending = coordinator.guest_handshake(&identity);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        coordinator.begin_stop();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut pending)
+            .await
+            .expect("stop must interrupt the handshake's retry wait");
+        assert!(matches!(result, Err(GuestError::Stopped)));
+        assert!(!coordinator.gate.is_open());
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[tokio::test]
+    async fn post_thaw_readiness_refresh_expires_despite_cached_ready_status() {
+        let (coordinator, identity) = disconnected_source(Duration::from_millis(30));
+        coordinator.gate.close();
+        let since = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.await_readiness(since, &identity),
+        )
+        .await
+        .expect("status retries must consume the original readiness deadline");
+        let Err(GuestError::Unknown(failure)) = result else {
+            panic!("cached readiness cannot replace a fresh post-thaw response");
+        };
+        assert_eq!(failure.code, LiveFailureCode::ReadinessFailed);
+        assert_eq!(failure.stage, LiveStage::Readiness);
+        assert_eq!(
+            coordinator.store.status_identity_since(since).unwrap(),
+            None
+        );
+        assert!(!coordinator.gate.is_open());
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[tokio::test]
+    async fn post_thaw_readiness_refresh_stop_cancels_transport_retry() {
+        let (coordinator, identity) = disconnected_source(Duration::from_secs(60));
+        let pending = coordinator.await_readiness(Instant::now(), &identity);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        coordinator.begin_stop();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut pending)
+            .await
+            .expect("stop must interrupt the post-thaw status retry");
+        assert!(matches!(result, Err(GuestError::Stopped)));
+        assert!(!coordinator.gate.is_open());
+    }
 }

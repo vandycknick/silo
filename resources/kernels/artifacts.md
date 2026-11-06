@@ -242,25 +242,25 @@ x86_64 KVM. The immutable boot-admission entry records exactly:
 | Identity | Value |
 | --- | --- |
 | Kernel | Linux `7.2.2`, SHA256 `ec6fee8b1885a71e78306fea384f4ff6687fd151b6f279c23117785027748f33` |
-| Reusable base initramfs | SHA256 `632d14f7ea50ee018a5e7a78f50a27fbdac2bb163589ec56e2e928b36e7015b8` |
-| Actual monitor and worker executable | SHA256 `14d5c9eb301ef042acd7d1961bb8a6d4eb8a87c407783d14779d1c982cb08307` |
+| Reusable base initramfs | SHA256 `5c48f328014d102a1f07bc22865141b72bdcfa0a94cdd30f3e567d1815c84e67` |
+| Actual monitor and worker executable | SHA256 `292c645775c0637c9f4336c11e494a7261dabc663e5faed608ee78457752f8d6` |
 | Actual resolved Kconfig | SHA256 `f3dab6adffce7cadde5ce693f9403ce88d66ab9f4ec503f7860ce9020cb142e6` |
 | Native source revision | `2606116528aaddbb5e87aeb045abed80456a822c` |
 | Guest / host lane | `amd64` / Linux `x86_64`, KVM |
 | Profiles | `linux-flat-overlay-v1`, `silo-upper-ext4-v1`, `silo-overlay-v1` |
 | Rendering / attachment | `linux-overlayfs-mountinfo-v1` / `krun-virtio-blk-v1` |
 
-Phase 15 refreshed this executable tuple after restore activation, retained
-provider ownership, and read-only inspection admission corrections. The controlled boot passed in
-`.tmp/plan/evidence/phase-15/overlay-inspector-requalification.xml`; its observed tuple and
-guest proof are retained alongside that report. This boot qualification does
-not grant public capture, restore or fork admission.
+Phase 16 refreshed this tuple after bounded two-lane capture authentication.
+The exact optimized monitor passed the real overlay boot gate in
+`.tmp/plan/evidence/phase-16/parallel-auth-release-overlay.xml`.
+Pause retains its previously qualified native binding.
+This boot qualification does not grant public capture, restore or fork admission.
 
 Retained candidate evidence:
-`.tmp/plan/evidence/phase-15/overlay-inspector-proof.log` and
-`.tmp/plan/evidence/phase-15/overlay-inspector-tuple.json`.
+`.tmp/plan/evidence/phase-16/parallel-auth-release-guest-proof.log` and
+`.tmp/plan/evidence/phase-16/parallel-auth-release-boot-tuple.json`.
 The tuple records native build identity
-`v2:path:clean:2606116528aaddbb5e87aeb045abed80456a822c:content=21a00aec6ce92e89eb74366fb510bfc306b045056c1e62f22646458136668927:inputs=cfda901013b8b21ddc4f7e9fe14f5cde5f2ec4955a39c1dafa748b1678c645a6`.
+`v2:path:clean:2606116528aaddbb5e87aeb045abed80456a822c:content=21a00aec6ce92e89eb74366fb510bfc306b045056c1e62f22646458136668927:inputs=08729bfbec57b6a7adb55a2c9d6fa075190eb3536ef7cf6588b0f8b7056eaac9`.
 Main independently extracted the exact tested kernel's embedded IKCONFIG and
 verified byte equality with the supplied resolved `.config`, binding the
 configuration to the executable rather than trusting its pathname. The

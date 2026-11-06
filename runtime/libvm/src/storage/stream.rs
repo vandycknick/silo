@@ -1,8 +1,8 @@
 //! Canonical 8 MiB stream identity and bounded sparse file capture.
 //!
-//! File scans use one chunk buffer and one monotonic extent cursor, with no
-//! allocation or byte scan proportional to hole length. Unknown extent support
-//! reads actual bytes. Only complete nonzero logical chunks incur SHA-256 work.
+//! File scans use one chunk buffer and one monotonic extent cursor. Ordinary
+//! scans do no byte hashing proportional to hole length; optional whole-file
+//! SHA-256 also feeds logical holes without reading them from the filesystem.
 //! Streaming output is independently authenticated before the caller syncs and
 //! publishes it; allocation, physical reads and logical hashing are separate costs.
 
@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
+use std::sync::Arc;
 
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, open, FcntlArg, OFlag};
@@ -18,6 +19,8 @@ use nix::sys::stat::Mode;
 use nix::unistd::{lseek, Whence};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
+use vm_spec::capture::Sha256Digest;
 
 use crate::storage::identity::{ObjectDigest, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
@@ -173,6 +176,8 @@ pub struct StreamStats {
     pub bytes_read: u64,
     /// Complete nonzero chunks hashed, including their interior zero regions.
     pub logical_bytes_hashed: u64,
+    /// Logical bytes fed to the optional whole-file SHA, including holes.
+    pub whole_bytes_hashed: u64,
     /// Host-reported allocation (st_blocks * 512), not logical length.
     pub allocated_bytes: u64,
     pub extent_queries: u64,
@@ -184,6 +189,69 @@ pub struct StreamScan {
     pub stats: StreamStats,
     /// Independent completed-output scan for streaming copies.
     pub verification_stats: Option<StreamStats>,
+}
+
+/// Costs of copying an already authenticated source and independently
+/// authenticating its completed output. Source hashes are reused, not rerun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCopyScan {
+    pub stats: StreamStats,
+    pub verification_stats: StreamStats,
+}
+
+/// An operation-scoped byte-authenticated map, inseparable from its held inode.
+/// Only the scanner can construct one; reopening shares the map, not an OFD.
+pub(crate) struct AuthenticatedStream {
+    file: File,
+    fingerprint: SourceFingerprint,
+    map: Arc<StreamMap>,
+}
+
+impl AuthenticatedStream {
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub(crate) fn fingerprint(&self) -> SourceFingerprint {
+        self.fingerprint
+    }
+
+    pub(crate) fn map(&self) -> &StreamMap {
+        &self.map
+    }
+
+    pub(crate) fn length(&self) -> u64 {
+        self.map.length()
+    }
+
+    pub(crate) fn reopen(&self, file: File) -> Result<Self, StorageError> {
+        if SourceFingerprint::new(&self.file.metadata()?) != self.fingerprint
+            || SourceFingerprint::new(&file.metadata()?) != self.fingerprint
+        {
+            return Err(invalid_data("authenticated stream was replaced or modified").into());
+        }
+        Ok(Self {
+            file,
+            fingerprint: self.fingerprint,
+            map: Arc::clone(&self.map),
+        })
+    }
+
+    /// Only the owner of an authenticated rename/permission transition may
+    /// refresh ctime. An inode, length or mtime change still fails closed.
+    pub(crate) fn refresh_after_owned_metadata_change(&mut self) -> Result<(), StorageError> {
+        let metadata = self.file.metadata()?;
+        if !self
+            .fingerprint
+            .same_contents_after_metadata_change(&metadata)
+        {
+            return Err(
+                invalid_data("authenticated stream changed during owned transition").into(),
+            );
+        }
+        self.fingerprint = SourceFingerprint::new(&metadata);
+        Ok(())
+    }
 }
 
 /// Reuses one fixed 8 MiB allocation across chunks and successive streams.
@@ -227,7 +295,141 @@ impl StreamHasher {
         source: &File,
         length: u64,
     ) -> Result<StreamScan, StorageError> {
-        self.scan_file(source, length, None, Extents::new(source, length))
+        self.scan_file(source, length, None, Extents::new(source, length), None)
+    }
+
+    /// Compute both identities in one extent-aware logical pass. Whole-file
+    /// SHA includes every logical zero and the exact final tail, unlike the
+    /// domain-separated stream identity. Ordinary stream scans do not do this
+    /// extra hashing.
+    pub fn hash_open_file_with_sha256(
+        &mut self,
+        source: &File,
+        length: u64,
+    ) -> Result<(StreamScan, Sha256Digest), StorageError> {
+        let mut sha256 = Sha256::new();
+        let scan = self.scan_file(
+            source,
+            length,
+            None,
+            Extents::new(source, length),
+            Some(&mut sha256),
+        )?;
+        Ok((scan, Sha256Digest::from_bytes(sha256.finalize().into())))
+    }
+
+    pub(crate) fn authenticate(
+        &mut self,
+        file: File,
+        length: u64,
+    ) -> Result<AuthenticatedStream, StorageError> {
+        let fingerprint = SourceFingerprint::new(&file.metadata()?);
+        let scan = self.hash_open_file(&file, length)?;
+        if SourceFingerprint::new(&file.metadata()?) != fingerprint {
+            return Err(invalid_data("stream changed during authentication").into());
+        }
+        Ok(AuthenticatedStream {
+            file,
+            fingerprint,
+            map: Arc::new(scan.map),
+        })
+    }
+
+    pub(crate) fn authenticate_with_sha256(
+        &mut self,
+        file: File,
+        length: u64,
+    ) -> Result<(AuthenticatedStream, Sha256Digest), StorageError> {
+        let fingerprint = SourceFingerprint::new(&file.metadata()?);
+        let (scan, sha256) = self.hash_open_file_with_sha256(&file, length)?;
+        if SourceFingerprint::new(&file.metadata()?) != fingerprint {
+            return Err(invalid_data("stream changed during authentication").into());
+        }
+        Ok((
+            AuthenticatedStream {
+                file,
+                fingerprint,
+                map: Arc::new(scan.map),
+            },
+            sha256,
+        ))
+    }
+
+    /// Reuse source map authority, never destination verification. Read every
+    /// reported data extent, even in a map-zero chunk, so copying does not
+    /// silently discard bytes if the authenticated source has changed.
+    pub(crate) fn copy_authenticated(
+        &mut self,
+        source: &AuthenticatedStream,
+        output: &File,
+    ) -> Result<StreamCopyScan, StorageError> {
+        let length = source.length();
+        Resource::ArtifactStreamBytes.check(length)?;
+        let metadata = source.file().metadata()?;
+        if !metadata.is_file()
+            || metadata.len() != length
+            || SourceFingerprint::new(&metadata) != source.fingerprint()
+        {
+            return Err(invalid_data("authenticated copy source changed").into());
+        }
+        let flags = OFlag::from_bits_truncate(fcntl(source.file(), FcntlArg::F_GETFL)?);
+        if flags & OFlag::O_ACCMODE == OFlag::O_WRONLY {
+            return Err(invalid_data("stream source requires read access").into());
+        }
+        validate_copy_output(&metadata, output)?;
+        let mut stats = StreamStats {
+            allocated_bytes: metadata
+                .blocks()
+                .checked_mul(512)
+                .ok_or_else(|| invalid_data("allocated stream length overflow"))?,
+            ..StreamStats::default()
+        };
+        let mut extents = Extents::new(source.file(), length);
+        let mut data = extents.next(0)?;
+        let mut offset = 0;
+        while offset < length {
+            let end = (offset + CHUNK_SIZE as u64).min(length);
+            if data.as_ref().is_none_or(|range| range.start >= end) {
+                offset = end;
+                continue;
+            }
+            let bytes = &mut self.buffer[..(end - offset) as usize];
+            bytes.fill(0);
+            while let Some(range) = data.as_ref() {
+                if range.start >= end {
+                    break;
+                }
+                let start = range.start;
+                let read_end = range.end.min(end);
+                let extent_end = range.end;
+                read_exact_at(
+                    source.file(),
+                    &mut bytes[(start - offset) as usize..(read_end - offset) as usize],
+                    start,
+                )?;
+                stats.bytes_read += read_end - start;
+                data = if read_end == extent_end {
+                    extents.next(read_end)?
+                } else {
+                    Some(read_end..extent_end)
+                };
+            }
+            write_sparse_at(output, bytes, offset)?;
+            offset = end;
+        }
+        stats.extent_queries = extents.queries;
+        output.set_len(length)?;
+        let verification = self.hash_open_file(output, length)?;
+        if verification.map != *source.map() {
+            return Err(invalid_data("completed stream output does not match source map").into());
+        }
+        if SourceFingerprint::new(&source.file().metadata()?) != source.fingerprint() {
+            return Err(invalid_data("stream source changed during output verification").into());
+        }
+        Ok(StreamCopyScan {
+            stats,
+            verification_stats: verification.stats,
+        })
     }
 
     /// Copy to a fresh empty read/write staging file, then independently scan
@@ -240,22 +442,14 @@ impl StreamHasher {
         output: &File,
     ) -> Result<StreamScan, StorageError> {
         let source_metadata = source.metadata()?;
-        let output_metadata = output.metadata()?;
-        let output_flags = OFlag::from_bits_truncate(fcntl(output, FcntlArg::F_GETFL)?);
-        if output_flags.contains(OFlag::O_APPEND)
-            || output_flags & OFlag::O_ACCMODE != OFlag::O_RDWR
-        {
-            return Err(invalid_data("stream output requires non-append read/write access").into());
-        }
-        if !output_metadata.is_file()
-            || output_metadata.len() != 0
-            || (source_metadata.dev(), source_metadata.ino())
-                == (output_metadata.dev(), output_metadata.ino())
-        {
-            return Err(invalid_data("stream output must be a distinct empty regular file").into());
-        }
-        let mut scan =
-            self.scan_file(source, length, Some(output), Extents::new(source, length))?;
+        validate_copy_output(&source_metadata, output)?;
+        let mut scan = self.scan_file(
+            source,
+            length,
+            Some(output),
+            Extents::new(source, length),
+            None,
+        )?;
         // A trailing hole does not otherwise extend the completed file.
         output.set_len(length)?;
         let verification = self.hash_open_file(output, length)?;
@@ -275,6 +469,7 @@ impl StreamHasher {
         length: u64,
         output: Option<&File>,
         mut extents: Extents<'_>,
+        mut sha256: Option<&mut Sha256>,
     ) -> Result<StreamScan, StorageError> {
         Resource::ArtifactStreamBytes.check(length)?;
         let metadata = source.metadata()?;
@@ -299,6 +494,12 @@ impl StreamHasher {
         while offset < length {
             let end = (offset + CHUNK_SIZE as u64).min(length);
             if data.as_ref().is_none_or(|range| range.start >= end) {
+                if let Some(sha256) = sha256.as_mut() {
+                    let bytes = &mut self.buffer[..(end - offset) as usize];
+                    bytes.fill(0);
+                    sha256.update(&*bytes);
+                    stats.whole_bytes_hashed += bytes.len() as u64;
+                }
                 chunks.push(Chunk::Zero);
                 offset = end;
                 continue;
@@ -323,6 +524,10 @@ impl StreamHasher {
                 } else {
                     Some(read_end..extent_end)
                 };
+            }
+            if let Some(sha256) = sha256.as_mut() {
+                sha256.update(&*bytes);
+                stats.whole_bytes_hashed += bytes.len() as u64;
             }
             let chunk = classify_chunk(bytes);
             if matches!(chunk, Chunk::Data(_)) {
@@ -367,6 +572,21 @@ impl StreamHasher {
         }
         StreamMap::new(length, chunks)
     }
+}
+
+fn validate_copy_output(source: &std::fs::Metadata, output: &File) -> Result<(), StorageError> {
+    let metadata = output.metadata()?;
+    let flags = OFlag::from_bits_truncate(fcntl(output, FcntlArg::F_GETFL)?);
+    if flags.contains(OFlag::O_APPEND) || flags & OFlag::O_ACCMODE != OFlag::O_RDWR {
+        return Err(invalid_data("stream output requires non-append read/write access").into());
+    }
+    if !metadata.is_file()
+        || metadata.len() != 0
+        || (source.dev(), source.ino()) == (metadata.dev(), metadata.ino())
+    {
+        return Err(invalid_data("stream output must be a distinct empty regular file").into());
+    }
+    Ok(())
 }
 
 fn classify_chunk(bytes: &[u8]) -> Chunk {
@@ -669,6 +889,40 @@ mod tests {
     }
 
     #[test]
+    fn fused_sha_matches_logical_bytes_for_sparse_mixed_chunks_holes_and_tails() {
+        let mut hasher = StreamHasher::new();
+        for length in [0, 1, CHUNK_SIZE, 2 * CHUNK_SIZE + 19] {
+            for nonzero in [false, true] {
+                let source = tempfile::tempfile().unwrap();
+                source.set_len(length as u64).unwrap();
+                let mut bytes = vec![0; length];
+                if nonzero && length > 0 {
+                    bytes[0] = 5;
+                    bytes[length - 1] = 7;
+                    source.write_all_at(&[5], 0).unwrap();
+                    source.write_all_at(&[7], length as u64 - 1).unwrap();
+                }
+                let (fused, sha256) = hasher
+                    .hash_open_file_with_sha256(&source, length as u64)
+                    .unwrap();
+                let ordinary = hasher.hash_open_file(&source, length as u64).unwrap();
+                let expected = hasher.hash_reader(bytes.as_slice()).unwrap();
+                assert_eq!(fused.map, expected);
+                assert_eq!(ordinary.map, expected);
+                assert_eq!(fused.stats.bytes_read, ordinary.stats.bytes_read);
+                assert_eq!(fused.stats.extent_queries, ordinary.stats.extent_queries);
+                assert_eq!(fused.stats.whole_bytes_hashed, length as u64);
+                assert_eq!(ordinary.stats.whole_bytes_hashed, 0);
+                assert_eq!(sha256, vm_spec::capture::Sha256Digest::of_bytes(&bytes));
+                assert_ne!(fused.map.id().as_bytes(), sha256.as_bytes());
+                if length > CHUNK_SIZE && nonzero {
+                    assert_eq!(fused.map.chunks()[1], Chunk::Zero);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn strict_stream_map_decode_preserves_identity_and_rejects_invalid_records() {
         let map = StreamHasher::new().hash_reader(b"abc".as_slice()).unwrap();
         let canonical = map.canonical_bytes().unwrap();
@@ -853,6 +1107,9 @@ mod tests {
         let write_only = OpenOptions::new().write(true).open(&path).unwrap();
         assert!(read_exact_at(&write_only, &mut [0; 3], 0).is_err());
         assert!(StreamHasher::new().hash_open_file(&write_only, 3).is_err());
+        assert!(StreamHasher::new()
+            .hash_open_file_with_sha256(&write_only, 3)
+            .is_err());
         let output = tempfile::tempfile().unwrap();
         output.write_all_at(b"owned", 0).unwrap();
         let mut hasher = StreamHasher::new();
@@ -860,6 +1117,8 @@ mod tests {
         assert!(hasher.copy_file_and_hash(&source, 3, &source).is_err());
         assert!(hasher.hash_open_file(&source, 2).is_err());
         assert!(hasher.hash_open_file(&source, 4).is_err());
+        assert!(hasher.hash_open_file_with_sha256(&source, 2).is_err());
+        assert!(hasher.hash_open_file_with_sha256(&source, 4).is_err());
         let mut retained = [0; 5];
         output.read_exact_at(&mut retained, 0).unwrap();
         assert_eq!(&retained, b"owned");
@@ -887,7 +1146,7 @@ mod tests {
         // all-data cursor selected by a real unsupported extent syscall.
         extents.supported = false;
         let scan = StreamHasher::new()
-            .scan_file(&source, length, None, extents)
+            .scan_file(&source, length, None, extents, None)
             .unwrap();
         assert_eq!(scan.stats.bytes_read, length);
         assert_eq!(scan.stats.logical_bytes_hashed, 23);
@@ -905,6 +1164,21 @@ mod tests {
                 .hash_open_file(&source, length)
                 .unwrap()
                 .map
+        );
+        let mut extents = Extents::new(&source, length);
+        extents.supported = false;
+        let mut sha256 = Sha256::new();
+        let fused = StreamHasher::new()
+            .scan_file(&source, length, None, extents, Some(&mut sha256))
+            .unwrap();
+        let mut expected = vec![0; length as usize];
+        expected[CHUNK_SIZE..].copy_from_slice(&tail);
+        assert_eq!(fused.map, scan.map);
+        assert_eq!(fused.stats.bytes_read, length);
+        assert_eq!(fused.stats.whole_bytes_hashed, length);
+        assert_eq!(
+            vm_spec::capture::Sha256Digest::from_bytes(sha256.finalize().into()),
+            vm_spec::capture::Sha256Digest::of_bytes(&expected)
         );
     }
 
@@ -937,5 +1211,130 @@ mod tests {
             "{{\"schema\":1,\"kind\":\"stream\",\"length\":4398046511104,\"chunkSize\":8388608,\"chunks\":[{chunks}]}}"
         );
         assert!(StreamMap::decode(record.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn authenticated_copy_shares_map_but_reopens_offsets_and_verifies_sparse_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        let source = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let length = 2 * CHUNK_SIZE as u64 + 19;
+        source.set_len(length).unwrap();
+        source.write_all_at(b"head", 17).unwrap();
+        source.write_all_at(b"tail", length - 4).unwrap();
+        let mut hasher = StreamHasher::new();
+        let authenticated = hasher.authenticate(source, length).unwrap();
+        let reopened = authenticated.reopen(File::open(&path).unwrap()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&authenticated.map, &reopened.map));
+        let mut original_position = authenticated.file();
+        original_position.seek(SeekFrom::Start(123)).unwrap();
+        let mut reopened_position = reopened.file();
+        assert_eq!(reopened_position.stream_position().unwrap(), 0);
+        let output = tempfile::tempfile().unwrap();
+        let scan = hasher.copy_authenticated(&reopened, &output).unwrap();
+        assert_eq!(scan.stats.logical_bytes_hashed, 0);
+        assert_eq!(scan.stats.whole_bytes_hashed, 0);
+        assert_eq!(
+            scan.verification_stats.logical_bytes_hashed,
+            CHUNK_SIZE as u64 + 19
+        );
+        assert_eq!(scan.verification_stats.whole_bytes_hashed, 0);
+        assert_eq!(output.metadata().unwrap().len(), length);
+        assert!(output.metadata().unwrap().blocks() * 512 < CHUNK_SIZE as u64);
+        assert_eq!(
+            hasher.hash_open_file(&output, length).unwrap().map,
+            *authenticated.map()
+        );
+        let mut actual = vec![0; length as usize];
+        output.read_exact_at(&mut actual, 0).unwrap();
+        let mut expected = vec![0; length as usize];
+        expected[17..21].copy_from_slice(b"head");
+        expected[length as usize - 4..].copy_from_slice(b"tail");
+        assert_eq!(actual, expected);
+        assert_eq!(original_position.stream_position().unwrap(), 123);
+    }
+
+    #[test]
+    fn authenticated_copy_zero_lengths_and_holes_still_verify_exact_outputs() {
+        let mut hasher = StreamHasher::new();
+        for length in [0, 1, CHUNK_SIZE as u64, CHUNK_SIZE as u64 + 3] {
+            let source = tempfile::tempfile().unwrap();
+            source.set_len(length).unwrap();
+            let authenticated = hasher.authenticate(source, length).unwrap();
+            let output = tempfile::tempfile().unwrap();
+            let scan = hasher.copy_authenticated(&authenticated, &output).unwrap();
+            assert_eq!(scan.stats.logical_bytes_hashed, 0);
+            assert_eq!(scan.verification_stats.logical_bytes_hashed, 0);
+            assert_eq!(output.metadata().unwrap().len(), length);
+            assert_eq!(output.metadata().unwrap().blocks(), 0);
+        }
+    }
+
+    #[test]
+    fn authenticated_copy_rejects_wrong_maps_after_copy_and_changed_sources_before_copy() {
+        let mut hasher = StreamHasher::new();
+        let source = tempfile::tempfile().unwrap();
+        source.write_all_at(b"abc", 0).unwrap();
+        let mut authenticated = hasher.authenticate(source, 3).unwrap();
+        // Inject contradictory authority only inside this unit test. Even a
+        // map-zero chunk cannot suppress reading/copying real source extents.
+        authenticated.map = std::sync::Arc::new(StreamMap::new(3, vec![Chunk::Zero]).unwrap());
+        let output = tempfile::tempfile().unwrap();
+        let error = hasher
+            .copy_authenticated(&authenticated, &output)
+            .unwrap_err();
+        assert!(error.to_string().contains("completed stream output"));
+        let mut bytes = [0; 3];
+        output.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"abc");
+
+        let source = tempfile::tempfile().unwrap();
+        source.write_all_at(b"abc", 0).unwrap();
+        let authenticated = hasher.authenticate(source, 3).unwrap();
+        let occupied = tempfile::tempfile().unwrap();
+        occupied.write_all_at(b"owned", 0).unwrap();
+        assert!(hasher
+            .copy_authenticated(&authenticated, &occupied)
+            .is_err());
+        assert!(hasher
+            .copy_authenticated(&authenticated, authenticated.file())
+            .is_err());
+        let read_only_path = tempfile::NamedTempFile::new().unwrap();
+        assert!(hasher
+            .copy_authenticated(&authenticated, &File::open(read_only_path.path()).unwrap())
+            .is_err());
+        authenticated.file().set_len(2).unwrap();
+        let empty = tempfile::tempfile().unwrap();
+        assert!(hasher.copy_authenticated(&authenticated, &empty).is_err());
+        assert_eq!(empty.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn authenticated_source_reopen_and_owned_metadata_refresh_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut hasher = StreamHasher::new();
+        let mut authenticated = hasher.authenticate(File::open(&path).unwrap(), 3).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(authenticated.reopen(File::open(&path).unwrap()).is_err());
+        authenticated.refresh_after_owned_metadata_change().unwrap();
+        let renamed = directory.path().join("renamed");
+        std::fs::rename(&path, &renamed).unwrap();
+        authenticated.refresh_after_owned_metadata_change().unwrap();
+        assert!(authenticated.reopen(File::open(&renamed).unwrap()).is_ok());
+        std::fs::write(&path, b"abc").unwrap();
+        assert!(authenticated.reopen(File::open(&path).unwrap()).is_err());
+        std::fs::set_permissions(&renamed, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&renamed, b"changed").unwrap();
+        assert!(authenticated.refresh_after_owned_metadata_change().is_err());
+        assert!(authenticated.reopen(File::open(&renamed).unwrap()).is_err());
     }
 }

@@ -209,8 +209,11 @@ evidence fails closed. The coordinator checks the boot identity; the worker
 installs the observed retired-PIT profile before native pause.
 
 Resume retains parked-status freshness until native positively releases the
-pause. After the ClockOnly generation acknowledgement, it requires a same-identity
-status receipt observed after native release, then exact guest Thaw and readiness,
+pause. After the ClockOnly generation acknowledgement, it requests `GetStatus`
+over a new agent-control connection, checks the returned instance and boot against
+the held source identity, and validates the full envelope (including version
+continuity) through the ordinary status store. It does not wait for an unsolicited
+watch heartbeat. Exact guest Thaw and fresh post-thaw readiness are still required
 before reporting `Running`. A lost Thaw acknowledgement requires
 a new freeze and native pause, with a new token; failed recovery stays fenced.
 Operation deadlines are never extended by parked freshness or transport retries.

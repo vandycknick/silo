@@ -5,14 +5,15 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
 use vm_spec::capture::{
-    CaptureDiskCopy, CaptureDiskName, CaptureDiskPlan, CaptureEvidence, CaptureLaunchLease,
-    CapturePlan, CaptureReadOnlyInput, CaptureRole, Sha256Digest,
+    CaptureDiskCopy, CaptureDiskName, CaptureDiskPlan, CaptureEvidence, CaptureInventoryEntry,
+    CaptureLaunchLease, CapturePlan, CaptureReadOnlyInput, CaptureRole, Sha256Digest,
 };
 use vm_spec::lifecycle::LiveId;
 
@@ -87,6 +88,7 @@ impl SnapshotStore {
                 return Err(invalid("capture reservation replay changed its inputs"));
             }
             let lease = pool.existing_lease(record.capture_id)?;
+            self.store.reserve_capture_inventory(&record).await?;
             check_lease(&self.store, &pool, record.capture_id, &lease).await?;
             return Ok(CaptureReservation {
                 record,
@@ -257,6 +259,16 @@ impl SnapshotStore {
                 });
             }
         }
+        let local_fork = self
+            .store
+            .fork_for_capture(request.capture_id)
+            .await?
+            .is_some();
+        if local_fork && machine_stat.st_dev == images_stat.st_dev {
+            // A local cut is renamed into the operation namespace. No durable
+            // stream/object publication or second RAM materialization occurs.
+            publication = 0;
+        }
         let reservation_bytes = stage
             .checked_add(publication)
             .ok_or_else(|| invalid("capture peak overflow"))?;
@@ -319,7 +331,12 @@ impl SnapshotStore {
             disk_charges,
             reservation_bytes,
             reservation_memory_bytes: ram
-                .checked_add(16 << 20)
+                .checked_mul(if local_fork && machine_stat.st_dev != images_stat.st_dev {
+                    2
+                } else {
+                    1
+                })
+                .and_then(|bytes| bytes.checked_add(CAPTURE_SCRATCH_BYTES))
                 .ok_or_else(|| invalid("capture memory budget overflow"))?,
             candidate: None,
             captured_boot: None,
@@ -354,12 +371,6 @@ impl SnapshotStore {
         {
             kernel.cmdline = record.plan.configuration.kernel_cmdline.clone();
         }
-        let mut available_disks =
-            BTreeMap::from([(machine_stat.st_dev as u64, available_disk(&machine)?)]);
-        if machine_stat.st_dev != images_stat.st_dev {
-            available_disks.insert(images_stat.st_dev as u64, available_disk(&images)?);
-        }
-        let available_memory = available_memory()?;
         let lease = pool.lease(record.capture_id)?;
         let (lease_device, lease_inode) = lease.file_identity()?;
         let _roots = pool.lock_roots()?;
@@ -369,6 +380,8 @@ impl SnapshotStore {
             let existing = decode_record(&json)?;
             if existing.request != record.request { return Err(invalid("capture reservation replay conflict")); }
             tx.commit().await?;
+            drop(_roots);
+            self.store.reserve_capture_inventory(&existing).await?;
             return Ok(CaptureReservation { record: existing, _lease: lease });
         }
         let current: Option<String> =
@@ -398,45 +411,6 @@ impl SnapshotStore {
         if busy {
             return Err(invalid("the source run already has an unresolved capture"));
         }
-        let mut disk_charges = BTreeMap::<u64, u64>::new();
-        let mut memory_charge = 0u64;
-        let mut cursor = String::new();
-        loop {
-            let rows = sqlx::query("SELECT operation_id,json(record_json) AS record_json FROM storage_operation WHERE kind='capture' AND operation_id>?1 ORDER BY operation_id LIMIT 256")
-                .bind(&cursor).fetch_all(&mut *tx).await?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in rows {
-                cursor = row.try_get("operation_id")?;
-                let existing = decode_record(&row.try_get::<String, _>("record_json")?)?;
-                for charge in &existing.disk_charges {
-                    let total = disk_charges.entry(charge.device).or_default();
-                    *total = total
-                        .checked_add(charge.bytes)
-                        .ok_or_else(|| invalid("capture disk reservation overflow"))?;
-                }
-                memory_charge = memory_charge
-                    .checked_add(existing.reservation_memory_bytes)
-                    .ok_or_else(|| invalid("capture RAM reservation overflow"))?;
-            }
-        }
-        for charge in &record.disk_charges {
-            let available = available_disks
-                .get(&charge.device)
-                .copied()
-                .ok_or_else(|| invalid("capture destination device lacks resource accounting"))?;
-            let outstanding = disk_charges
-                .get(&charge.device)
-                .copied()
-                .unwrap_or_default();
-            budget("disk", charge.bytes, available.saturating_sub(outstanding))?;
-        }
-        budget(
-            "RAM",
-            record.reservation_memory_bytes,
-            available_memory.saturating_sub(memory_charge),
-        )?;
         sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,record_json) VALUES(?1,1,'capture','staging',?2,?3,?4,?5,?6,jsonb(?7))")
             .bind(record.capture_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).bind(i64::try_from(record.storage.storage_generation).map_err(invalid)?).bind(lease_device.to_string()).bind(lease_inode.to_string()).bind(encode_record(&record)?).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
@@ -444,6 +418,7 @@ impl SnapshotStore {
         sqlx::query("INSERT INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
         tx.commit().await?;
         drop(_roots);
+        self.store.reserve_capture_inventory(&record).await?;
         let tmp = images
             .open_dir("tmp")?
             .ok_or_else(|| invalid("pool staging directory is missing"))?;
@@ -489,7 +464,9 @@ impl SnapshotStore {
                 }
                 if !matches!(
                     record.state,
-                    CaptureState::Released { .. } | CaptureState::Abandoned
+                    CaptureState::Released { .. }
+                        | CaptureState::ReleasedLocal { .. }
+                        | CaptureState::Abandoned
                 ) {
                     records.push(record);
                 }
@@ -524,7 +501,8 @@ impl SnapshotStore {
             record.captured_boot = Some(boot);
             Ok(())
         })
-        .await
+        .await?;
+        self.store.refine_capture_boot_inventory(capture).await
     }
 
     pub(crate) async fn record_capture_source(
@@ -576,14 +554,24 @@ impl SnapshotStore {
         }).await
     }
 
-    pub(crate) async fn finish_capture_release(&self, capture: Uuid) -> Result<(), LibVmError> {
-        self.update_capture(capture, |record| {
+    pub(crate) async fn finish_capture_release(
+        &self,
+        capture: Uuid,
+        baseline_retained: bool,
+    ) -> Result<(), LibVmError> {
+        self.update_capture(capture, move |record| {
             record.state = match record.state {
                 CaptureState::Published { snapshot } => CaptureState::Released {
                     snapshot: Some(snapshot),
                 },
-                CaptureState::Abandoned => CaptureState::Released { snapshot: None },
+                CaptureState::Abandoned if !baseline_retained => {
+                    CaptureState::Released { snapshot: None }
+                }
+                CaptureState::Abandoned => CaptureState::Abandoned,
                 CaptureState::Released { snapshot } => CaptureState::Released { snapshot },
+                CaptureState::Local { cut } | CaptureState::ReleasedLocal { cut } => {
+                    CaptureState::ReleasedLocal { cut }
+                }
                 _ => {
                     return Err(invalid(
                         "capture release requires publication or explicit abandonment",
@@ -592,7 +580,8 @@ impl SnapshotStore {
             };
             Ok(())
         })
-        .await
+        .await?;
+        self.store.release_unused_capture_inventory(capture).await
     }
 
     /// Caller must first reconcile no submission or positively ended generation.
@@ -616,7 +605,31 @@ impl SnapshotStore {
                 }
             }
         }
-        self.update_capture(capture, |record| {
+        let intent = self
+            .store
+            .live_command_record(record.machine_id, record.run_id, capture)
+            .await?;
+        let no_submission = intent.as_ref().is_none_or(|intent| {
+            matches!(
+                intent.result,
+                Some(vm_spec::lifecycle::LiveCommandResult::Capture(
+                    vm_spec::lifecycle::CaptureOutcome::Rejected { .. }
+                ))
+            )
+        });
+        let source_exists = self
+            .store
+            .machine_config(record.machine_id)
+            .await?
+            .is_some();
+        let source = if no_submission && source_exists {
+            CaptureSourceOutcome::Observed {
+                continuation: vm_spec::capture::CaptureContinuation::Unchanged,
+            }
+        } else {
+            CaptureSourceOutcome::Unknown
+        };
+        self.update_capture(capture, move |record| {
             if record.evidence.is_some()
                 || !matches!(
                     record.state,
@@ -626,9 +639,13 @@ impl SnapshotStore {
                 return Err(invalid("sealed capture cannot be abandoned"));
             }
             record.state = CaptureState::Abandoned;
+            if record.source_outcome.is_none() {
+                record.source_outcome = Some(source);
+            }
             Ok(())
         })
-        .await
+        .await?;
+        self.store.release_unused_capture_inventory(capture).await
     }
 
     pub(crate) async fn machine_capture_retained(
@@ -644,7 +661,7 @@ impl SnapshotStore {
                 .bind(machine.to_string()).fetch_all(&this.store.pool).await?;
             for json in rows {
                 let capture = decode_record(&json)?;
-                if !matches!(capture.state, CaptureState::Released { .. } | CaptureState::Abandoned) { return Ok(true); }
+                if !matches!(capture.state, CaptureState::Released { .. } | CaptureState::ReleasedLocal { .. } | CaptureState::Abandoned) { return Ok(true); }
                 let Some(own) = pool.try_exclusive_lease(capture.capture_id)? else { return Ok(true); };
                 let Some(launch) = pool.try_exclusive_lease(capture.launch_operation_id)? else { return Ok(true); };
                 check_lease(&this.store, &pool, capture.capture_id, &own).await?;
@@ -668,6 +685,17 @@ impl SnapshotStore {
             let mut record = decode_record(&json)?;
             update(&mut record)?;
             write_record(&mut tx, &record).await?;
+            if let Some(source)=&record.source_outcome {
+                let parent:Option<(String,String)>=sqlx::query_as("SELECT operation_id,json(result_json) FROM live_fork WHERE capture_id=?1").bind(capture.to_string()).fetch_optional(&mut *tx).await?;
+                if let Some((operation,json))=parent {
+                    let mut result:crate::LiveForkResult=serde_json::from_str(&json).map_err(invalid)?;
+                    let mut outcome=crate::machine::live_fork::source_outcome(source);
+                    if record.evidence.is_none() && (matches!(outcome,crate::ForkSourceOutcome::Resumed) || (matches!(outcome,crate::ForkSourceOutcome::Preserved) && matches!(record.plan.pause,vm_spec::capture::CapturePauseAuthority::Borrow{..}))) {outcome=crate::ForkSourceOutcome::Unchanged;}
+                    result.source=outcome;
+                    sqlx::query("UPDATE live_fork SET result_json=jsonb(?2) WHERE operation_id=?1").bind(&operation).bind(serde_json::to_string(&result).map_err(invalid)?).execute(&mut *tx).await?;
+                    sqlx::query("INSERT OR IGNORE INTO fork_event(operation_id,phase,monotonic_ns) VALUES(?1,'source_settled',?2)").bind(operation).bind(crate::machine::live_fork::monotonic_ns()?).execute(&mut *tx).await?;
+                }
+            }
             tx.commit().await?;
             Ok(())
         })).await?
@@ -738,7 +766,7 @@ impl SnapshotStore {
         }
         let directory = capture_directory(&self.store, &record)?
             .ok_or_else(|| invalid("capture staging is missing"))?;
-        let verified = verify_capture(&directory, &record)?;
+        let verified = verify_capture(&directory, &record, DiskAuthentication::WholeDigest)?;
         let boot = record
             .captured_boot
             .clone()
@@ -769,7 +797,7 @@ impl SnapshotStore {
             match payload.role {
                 CaptureRole::Ram | CaptureRole::Disk(_) => {
                     let (published, roots) = pool.publish_stream_file_for_catalog(
-                        payload.file.try_clone()?,
+                        payload.file().try_clone()?,
                         payload.length,
                     )?;
                     self.store
@@ -780,14 +808,14 @@ impl SnapshotStore {
                         &pool,
                         &self.store,
                         capture,
-                        published.map,
+                        &published.map,
                     )
                     .await?;
                     streams.insert(payload.role.relative_path(), content);
                 }
                 CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout => {
                     let (published, roots) = pool.publish_object_file_for_catalog(
-                        payload.file.try_clone()?,
+                        payload.file().try_clone()?,
                         &directory.path().join(payload.role.relative_path()),
                     )?;
                     self.store
@@ -828,7 +856,8 @@ impl SnapshotStore {
             }
             immutable.insert(
                 input.attachment_index,
-                crate::store::snapshot_store::publish_map(&pool, &self.store, capture, map).await?,
+                crate::store::snapshot_store::publish_map(&pool, &self.store, capture, &map)
+                    .await?,
             );
         }
         let root_index = if matches!(record.storage.root, MachineRoot::LinuxOverlay { .. }) {
@@ -987,6 +1016,7 @@ impl SnapshotStore {
         let result = self
             .publish_authenticated(&snapshot, capture, name.as_deref(), Some(&verified))
             .await?;
+        self.store.complete_capture_peak(capture).await?;
         drop(lease);
         Ok(result)
     }
@@ -1040,6 +1070,8 @@ pub(crate) fn decode_record(json: &str) -> Result<CaptureRecord, LibVmError> {
             ))
         }
         CaptureState::Sealed
+        | CaptureState::Local { .. }
+        | CaptureState::ReleasedLocal { .. }
         | CaptureState::Published { .. }
         | CaptureState::Released { snapshot: Some(_) }
             if record.evidence.is_none() =>
@@ -1107,7 +1139,10 @@ pub(crate) async fn write_record(
     connection: &mut sqlx::SqliteConnection,
     record: &CaptureRecord,
 ) -> Result<(), LibVmError> {
-    let state = if matches!(record.state, CaptureState::Released { .. }) {
+    let state = if matches!(
+        record.state,
+        CaptureState::Released { .. } | CaptureState::ReleasedLocal { .. }
+    ) {
         "committed"
     } else if record.state == CaptureState::Abandoned {
         "aborted"
@@ -1250,13 +1285,6 @@ fn open_relative(root: &OwnedDirectory, path: &Path) -> Result<File, LibVmError>
     Err(invalid("capture role path is empty"))
 }
 
-fn available_disk(directory: &OwnedDirectory) -> Result<u64, LibVmError> {
-    let stat = nix::sys::statvfs::fstatvfs(directory.fd()).map_err(std::io::Error::from)?;
-    stat.blocks_available()
-        .checked_mul(stat.fragment_size())
-        .ok_or_else(|| invalid("filesystem free-space overflow"))
-}
-
 pub(crate) fn available_memory() -> Result<u64, LibVmError> {
     #[cfg(target_os = "linux")]
     {
@@ -1325,18 +1353,6 @@ pub(crate) fn available_memory() -> Result<u64, LibVmError> {
     }
 }
 
-fn budget(resource: &'static str, required: u64, available: u64) -> Result<(), LibVmError> {
-    if required > available {
-        return Err(StorageError::CaptureBudget {
-            resource,
-            required,
-            available,
-        }
-        .into());
-    }
-    Ok(())
-}
-
 fn new_input(
     store: &Store,
     capture: Uuid,
@@ -1400,15 +1416,68 @@ fn read_optional(
     Ok(Some(bytes))
 }
 
+/// Each verification lane's reusable whole-digest read buffer.
+const AUTHENTICATION_BUFFER_BYTES: usize = 1 << 20;
+/// Explicit stack of the one extra verification thread. Its body is a fixed
+/// read/hash loop over heap scratch: no recursion and no large stack arrays.
+const AUTHENTICATION_LANE_STACK_BYTES: usize = 1 << 20;
+/// The second verification lane's input-independent allocations: its read
+/// buffer and full stack mapping (which on glibc also hosts the thread's TCB
+/// and static TLS). Monitor staging verification adds the same two bounds.
+/// The two stages never overlap: libvm verifies only the coherent seal the
+/// monitor writes after joining its own lanes, so one delta covers either.
+/// Remaining fixed-size thread bookkeeping (std `Thread`/packet `Arc`s, the
+/// moved closure and a fixed-size result) is input-independent metadata of
+/// the general capture scratch, not of this delta.
+const CAPTURE_VERIFICATION_LANE_BYTES: u64 =
+    (AUTHENTICATION_BUFFER_BYTES + AUTHENTICATION_LANE_STACK_BYTES) as u64;
+/// Capture-operation memory beyond RAM, charged at reservation before any
+/// staging or verification effect: the general 16 MiB capture scratch plus
+/// the explicit second-lane delta.
+const CAPTURE_SCRATCH_BYTES: u64 = (16 << 20) + CAPTURE_VERIFICATION_LANE_BYTES;
+
+/// Whether seal verification also derives canonical maps for writable disks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskAuthentication {
+    /// Snapshot publication scans each disk again while copying it into the pool.
+    WholeDigest,
+    /// Local fork children copy the retained cut. Each disk map comes from the
+    /// same traversal that measures its evidence-bound whole-byte digest.
+    WithStreamMap,
+}
+
+/// Exact staged bytes whose whole-byte SHA-256 equals the evidence inventory.
+enum VerifiedBytes {
+    Digest {
+        file: File,
+        fingerprint: SourceFingerprint,
+    },
+    /// The same digest relation, plus the canonical map of those bytes.
+    Stream(crate::storage::stream::AuthenticatedStream),
+}
+
 struct VerifiedPayload {
     role: CaptureRole,
-    file: File,
     length: u64,
-    fingerprint: SourceFingerprint,
+    bytes: VerifiedBytes,
 }
 impl VerifiedPayload {
+    fn file(&self) -> &File {
+        match &self.bytes {
+            VerifiedBytes::Digest { file, .. } => file,
+            VerifiedBytes::Stream(stream) => stream.file(),
+        }
+    }
+
+    fn fingerprint(&self) -> SourceFingerprint {
+        match &self.bytes {
+            VerifiedBytes::Digest { fingerprint, .. } => *fingerprint,
+            VerifiedBytes::Stream(stream) => stream.fingerprint(),
+        }
+    }
+
     fn recheck(&self) -> Result<(), LibVmError> {
-        if SourceFingerprint::new(&self.file.metadata()?) != self.fingerprint {
+        if SourceFingerprint::new(&self.file().metadata()?) != self.fingerprint() {
             return Err(invalid("authenticated staged capture bytes changed"));
         }
         Ok(())
@@ -1450,7 +1519,7 @@ impl VerifiedCapture {
             payload.recheck()?;
             let file = open_relative(&directory, Path::new(&payload.role.relative_path()))?;
             if file.metadata()?.nlink() != 1
-                || SourceFingerprint::new(&file.metadata()?) != payload.fingerprint
+                || SourceFingerprint::new(&file.metadata()?) != payload.fingerprint()
             {
                 return Err(invalid(
                     "registered capture payload changed before catalog commit",
@@ -1479,7 +1548,7 @@ impl VerifiedCapture {
         for payload in &self.files {
             let current = open_relative(directory, Path::new(&payload.role.relative_path()))?;
             if current.metadata()?.nlink() != 1
-                || SourceFingerprint::new(&current.metadata()?) != payload.fingerprint
+                || SourceFingerprint::new(&current.metadata()?) != payload.fingerprint()
             {
                 return Err(invalid(
                     "capture role pathname no longer names its authenticated inode",
@@ -1512,6 +1581,7 @@ impl VerifiedCapture {
 fn verify_capture(
     directory: &OwnedDirectory,
     record: &CaptureRecord,
+    disks: DiskAuthentication,
 ) -> Result<VerifiedCapture, LibVmError> {
     let request = read_optional(
         directory,
@@ -1568,9 +1638,12 @@ fn verify_capture(
         check_entries(&disks, &disk_names)?;
     }
     let stat = nix::sys::stat::fstat(directory.fd()).map_err(std::io::Error::from)?;
+    // Admit every role before any payload byte is read: geometry, hardlink,
+    // cross-role alias, writable-source alias and format bounds. All role
+    // descriptors open here are the ones the result retains, so the peak
+    // descriptor count equals the former end-of-loop count.
     let mut identities = BTreeSet::new();
-    let mut files = Vec::with_capacity(evidence.inventory.len());
-    let mut buffer = vec![0u8; 1 << 20];
+    let mut admitted = Vec::with_capacity(evidence.inventory.len());
     for entry in &evidence.inventory {
         let file = open_relative(directory, Path::new(&entry.role.relative_path()))?;
         let metadata = file.metadata()?;
@@ -1595,35 +1668,43 @@ fn verify_capture(
         if entry.length > maximum {
             return Err(invalid("capture payload exceeds its role's format bound"));
         }
-        let fingerprint = SourceFingerprint::new(&metadata);
-        let mut hash = Sha256::new();
-        let mut input = &file;
-        loop {
-            let count = input.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-        }
-        let digest: [u8; 32] = hash.finalize().into();
-        if &digest != entry.sha256.as_bytes() {
-            return Err(invalid("capture staged payload digest mismatch"));
-        }
-        let payload = VerifiedPayload {
-            role: entry.role.clone(),
+        admitted.push(AdmittedPayload {
+            entry,
+            fingerprint: SourceFingerprint::new(&metadata),
             file,
-            length: entry.length,
-            fingerprint,
-        };
-        payload.recheck()?;
-        files.push(payload);
+        });
     }
+    let ram_index = admitted
+        .iter()
+        .position(|payload| payload.entry.role == CaptureRole::Ram)
+        .ok_or_else(|| invalid("RAM role is missing"))?;
+    let ram = admitted.remove(ram_index);
+    let (ram, mut files) = authenticate_lanes(
+        move |stop| {
+            let mut buffer = vec![0u8; AUTHENTICATION_BUFFER_BYTES];
+            verify_payload(ram, disks, &mut buffer, &mut None, stop)
+        },
+        |stop| {
+            let mut buffer = vec![0u8; AUTHENTICATION_BUFFER_BYTES];
+            let mut hasher = None;
+            let mut files = Vec::with_capacity(admitted.len() + 1);
+            for payload in admitted {
+                match verify_payload(payload, disks, &mut buffer, &mut hasher, stop)? {
+                    Some(payload) => files.push(payload),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(files))
+        },
+    )?;
+    // Deterministic reduction: exactly the evidence inventory order.
+    files.insert(ram_index, ram);
     let layout = files
         .iter()
         .find(|file| file.role == CaptureRole::Layout)
         .ok_or_else(|| invalid("RAM layout role is missing"))?;
     let mut bytes = Vec::new();
-    let mut layout_file = layout.file.try_clone()?;
+    let mut layout_file = layout.file().try_clone()?;
     layout_file.seek(SeekFrom::Start(0))?;
     layout_file.take(65537).read_to_end(&mut bytes)?;
     let memory = evidence
@@ -1647,8 +1728,8 @@ fn verify_capture(
         .find(|file| file.role == CaptureRole::Devices)
         .ok_or_else(|| invalid("device role is missing"))?;
     crate::store::capture_native::verify_headers(
-        &execution.file,
-        &devices.file,
+        execution.file(),
+        devices.file(),
         &memory.binding,
         &record.plan,
         &layout,
@@ -1670,6 +1751,143 @@ fn verify_capture(
         directory_identity: (stat.st_dev as u64, stat.st_ino as u64),
         control_fingerprints,
     })
+}
+
+/// One admitted, still unhashed role: the exact inode later results retain.
+struct AdmittedPayload<'a> {
+    entry: &'a CaptureInventoryEntry,
+    file: File,
+    fingerprint: SourceFingerprint,
+}
+
+/// Authenticate one admitted role. `Ok(None)` means the sibling lane failed
+/// first and this lane stopped before accepting anything.
+fn verify_payload(
+    payload: AdmittedPayload<'_>,
+    disks: DiskAuthentication,
+    buffer: &mut [u8],
+    hasher: &mut Option<crate::storage::stream::StreamHasher>,
+    stop: &AtomicBool,
+) -> Result<Option<VerifiedPayload>, LibVmError> {
+    let AdmittedPayload {
+        entry,
+        file,
+        fingerprint,
+    } = payload;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let bytes = match (&entry.role, disks) {
+        (CaptureRole::Disk(_), DiskAuthentication::WithStreamMap) => {
+            // One traversal yields both the evidence digest and the map;
+            // the map is admitted only after that digest matches.
+            let (stream, digest) = hasher
+                .get_or_insert_with(crate::storage::stream::StreamHasher::new)
+                .authenticate_with_sha256(file, entry.length)?;
+            if digest != entry.sha256 {
+                return Err(invalid("capture staged payload digest mismatch"));
+            }
+            if stream.fingerprint() != fingerprint {
+                return Err(invalid("authenticated staged capture bytes changed"));
+            }
+            VerifiedBytes::Stream(stream)
+        }
+        _ => {
+            let mut hash = Sha256::new();
+            let mut input = &file;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                let count = input.read(buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            let digest: [u8; 32] = hash.finalize().into();
+            if &digest != entry.sha256.as_bytes() {
+                return Err(invalid("capture staged payload digest mismatch"));
+            }
+            VerifiedBytes::Digest { file, fingerprint }
+        }
+    };
+    let payload = VerifiedPayload {
+        role: entry.role.clone(),
+        length: entry.length,
+        bytes,
+    };
+    payload.recheck()?;
+    Ok(Some(payload))
+}
+
+/// Run RAM authentication on one bounded extra thread while the caller
+/// authenticates every other role, then reduce deterministically.
+///
+/// ```text
+///   caller ──spawn(stack 1 MiB)──► RAM lane ──────────────┐
+///     │                              (polls stop per read) │
+///     └─► other roles, in order ──► join ◄─────────────────┘
+///                                    │
+///                      both owners finished; only now return
+/// ```
+///
+/// A lane that fails, or unwinds, sets `stop` through its guard; its sibling
+/// returns `Ok(None)` at its next read or role boundary. A streamed disk map
+/// pass has no stop hook and runs to its admitted length. The scoped thread
+/// is joined on every path, including the caller lane unwinding, so no lane
+/// outlives the descriptors, staging directory or lease the caller owns.
+/// A genuine error wins over a stop; with two, the caller lane's is reported.
+fn authenticate_lanes<R: Send, O>(
+    ram: impl FnOnce(&AtomicBool) -> Result<Option<R>, LibVmError> + Send,
+    other: impl FnOnce(&AtomicBool) -> Result<Option<O>, LibVmError>,
+) -> Result<(R, O), LibVmError> {
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| -> Result<(R, O), LibVmError> {
+        let stop = &stop;
+        let lane = std::thread::Builder::new()
+            .stack_size(AUTHENTICATION_LANE_STACK_BYTES)
+            .spawn_scoped(scope, move || run_lane(stop, ram))?;
+        let other = run_lane(stop, other);
+        let ram = lane
+            .join()
+            .map_err(|_| std::io::Error::other("RAM authentication lane panicked"))?;
+        match (other, ram) {
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(Some(other)), Ok(Some(ram))) => Ok((ram, other)),
+            _ => Err(invalid(
+                "capture authentication lane stopped without a failure",
+            )),
+        }
+    })
+}
+
+/// Run one lane under a guard that stops its sibling unless the lane
+/// returned `Ok`: an error return and an unwind both release the sibling.
+fn run_lane<T>(
+    stop: &AtomicBool,
+    lane: impl FnOnce(&AtomicBool) -> Result<T, LibVmError>,
+) -> Result<T, LibVmError> {
+    let mut guard = StopSiblingUnlessOk {
+        stop,
+        succeeded: false,
+    };
+    let result = lane(stop);
+    guard.succeeded = result.is_ok();
+    result
+}
+
+struct StopSiblingUnlessOk<'a> {
+    stop: &'a AtomicBool,
+    succeeded: bool,
+}
+
+impl Drop for StopSiblingUnlessOk<'_> {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 fn check_entries(
@@ -1807,6 +2025,240 @@ fn validate_layout(
     Ok(layout)
 }
 
+impl SnapshotStore {
+    /// Authenticate once, then move immutable payloads without moving the
+    /// monitor-owned control namespace. The journal precedes every relocation.
+    ///
+    /// Writable disks verified by this call keep their held inode and map
+    /// through an owned same-filesystem rename. A cross-filesystem copy or a
+    /// relocation this call did not observe is authenticated again, deriving
+    /// the map in the same traversal as the evidence digest. The returned
+    /// disks belong to the caller's fork operation, never to a shared cache.
+    pub(crate) async fn retain_local_capture(
+        &self,
+        capture: Uuid,
+    ) -> Result<
+        (
+            crate::store::fork::LocalCut,
+            Option<crate::store::fork::AuthenticatedCutDisks>,
+        ),
+        LibVmError,
+    > {
+        let this = self.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || handle.block_on(async move {
+            let operation = this.store.fork_for_capture(capture).await?.ok_or_else(|| invalid("local capture has no fork owner"))?;
+            let record = this.capture_reservation(capture).await?.ok_or_else(|| invalid("local capture reservation disappeared"))?;
+            let pool = StoragePool::open(&this.store.images_dir)?;
+            let publication=ObjectDigest::of_bytes(format!("silo:local-cut:{operation}").as_bytes());
+            let _publisher=pool.lock_publication(&publication)?;
+            let _lease = pool.existing_lease(capture)?;
+            check_lease(&this.store,&pool,capture,&_lease).await?;
+            let source = capture_directory(&this.store, &record)?.ok_or_else(|| invalid("local capture source disappeared"))?;
+            let mut verified_disks = Vec::new();
+            let mut cut = match this.store.local_cut(operation).await? {
+                Some(cut) => cut,
+                None => {
+                    let verified = verify_capture(&source, &record, DiskAuthentication::WithStreamMap)?;
+                    verified.recheck_registered(&this.store, capture)?;
+                    let mut storage = record.storage.clone();
+                    storage.boot = record.captured_boot.clone().ok_or_else(|| invalid("local capture has no pinned boot closure"))?;
+                    storage.snapshot = None;
+                    storage.image = None;
+                    storage.storage_generation = 0;
+                    storage.ownership_epoch = 0;
+                    storage.stop_outcome = crate::StorageStopOutcome::Unknown;
+                    storage.operation = None;
+                    storage.fence = None;
+                    storage.relocation_operation = None;
+                    if let MachineRoot::OpaqueRaw { initial_content, .. } = &mut storage.root { *initial_content = None; }
+                    let files=verified.files.iter().map(|file| {
+                        let metadata=file.file().metadata()?;
+                        let entry=verified.evidence.inventory.iter().find(|entry| entry.role==file.role).ok_or_else(|| invalid("verified role missing from evidence"))?;
+                        Ok(crate::store::fork::LocalCutFile {role:file.role.clone(),device:metadata.dev(),inode:metadata.ino(),length:file.length,sha256:entry.sha256,fingerprint:SourceFingerprint::new(&metadata)})
+                    }).collect::<Result<Vec<_>,LibVmError>>()?;
+                    let source_ram=files.iter().find(|file| file.role==CaptureRole::Ram).cloned().ok_or_else(|| invalid("verified cut has no RAM role"))?;
+                    let mut cut=crate::store::fork::LocalCut {
+                        operation_id:operation,capture_id:capture,cut_id:Sha256Digest::from_bytes([0;32]),
+                        evidence:verified.evidence.clone(),plan:record.plan.clone(),configuration:record.configuration.clone(),storage,
+                        files,source_ram,relocated:false,
+                    };
+                    cut.cut_id = cut.identity()?;
+                    let _roots = pool.lock_roots()?;
+                    let mut tx = this.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                    sqlx::query("INSERT INTO local_cut(cut_id,operation_id,record_json) VALUES(?1,?2,jsonb(?3))").bind(cut.cut_id.to_string()).bind(operation.to_string()).bind(serde_json::to_string(&cut).map_err(invalid)?).execute(&mut *tx).await?;
+                    sqlx::query("INSERT INTO storage_operation_cut(operation_id,cut_id) VALUES(?1,?2)").bind(operation.to_string()).bind(cut.cut_id.to_string()).execute(&mut *tx).await?;
+                    sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id) VALUES(?1,?2)").bind(capture.to_string()).bind(cut.cut_id.to_string()).execute(&mut *tx).await?;
+                    sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
+                    sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
+                    sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
+                    tx.commit().await?;
+                    // Only the disks' held inodes and maps outlive verification;
+                    // state-role descriptors close here exactly as before.
+                    for payload in verified.files {
+                        if let VerifiedBytes::Stream(stream) = payload.bytes {
+                            verified_disks.push((payload.role, stream));
+                        }
+                    }
+                    cut
+                }
+            };
+            let mut relocated_disks = Vec::new();
+            if !cut.relocated {
+                let images = OwnedDirectory::open_existing_root(&this.store.images_dir)?.ok_or_else(|| invalid("pool disappeared"))?;
+                let tmp = images.open_dir("tmp")?.ok_or_else(|| invalid("pool tmp disappeared"))?;
+                let owner = tmp.ensure_dir(&operation.to_string())?;
+                let destination = owner.ensure_dir("cut")?;
+                destination.ensure_dir("disks")?;
+                let mut qualification = crate::machine::root_disk::CopyQualification::new(1);
+                let mut hasher = None;
+                for index in 0..cut.files.len() {
+                    let payload=&mut cut.files[index];
+                    let mut carrier = verified_disks.iter().position(|(role,_)| role==&payload.role).map(|position| verified_disks.swap_remove(position).1);
+                    let mut moved=false;
+                    let relative = payload.role.relative_path();
+                    let (source_parent,destination_parent,name) = match relative.split_once('/') {
+                        Some((parent,name)) => (source.open_dir(parent)?.ok_or_else(|| invalid("capture role parent missing"))?, destination.ensure_dir(parent)?, name),
+                        None => (source.try_clone()?, destination.try_clone()?, relative.as_str()),
+                    };
+                    if destination_parent.open_capture_payload(name)?.is_none() {
+                        let file = source_parent.open_file(name)?.ok_or_else(|| invalid("both local cut role locations are missing"))?;
+                        let metadata = file.metadata()?;
+                        if SourceFingerprint::new(&metadata)!=payload.fingerprint || carrier.as_ref().is_some_and(|held| held.fingerprint()!=payload.fingerprint) { return Err(invalid("local cut source fingerprint changed")); }
+                        if metadata.dev() == nix::sys::stat::fstat(destination_parent.fd()).map_err(std::io::Error::from)?.st_dev as u64 {
+                            crate::storage::pool::rename_component_no_replace(&source_parent,name,&destination_parent,name)?;
+                        } else {
+                            let temporary=format!(".relocating-{}",Uuid::new_v4());
+                            let copy_source = match &carrier {
+                                Some(held) => crate::machine::root_disk::CopySource::Authenticated(held),
+                                None => crate::machine::root_disk::CopySource::Unscanned { file: &file, length: payload.length },
+                            };
+                            let mut copied = crate::machine::root_disk::copy_private(copy_source,destination_parent.try_clone()?,&temporary,&mut qualification).map_err(|error| invalid(error.to_string()))?;
+                            // A new inode: only full authentication below may vouch for it.
+                            carrier = None;
+                            copied.publish(destination_parent.try_clone()?,name).map_err(|error| invalid(error.to_string()))?;
+                            copied.retain();
+                            let final_file = destination_parent.open_file(name)?.ok_or_else(|| invalid("relocated local cut disappeared"))?;
+                            nix::sys::stat::fchmod(&final_file,nix::sys::stat::Mode::S_IRUSR).map_err(std::io::Error::from)?;
+                            final_file.sync_all()?;
+                        }
+                        destination_parent.sync()?;
+                        source_parent.sync()?;
+                        moved=true;
+                    }
+                    let final_file=destination_parent.open_capture_payload(name)?.ok_or_else(|| invalid("local cut role disappeared"))?;
+                    let mut metadata=final_file.metadata()?;
+                    if metadata.mode()&0o7777==0o600 {
+                        nix::sys::stat::fchmod(&final_file,nix::sys::stat::Mode::S_IRUSR).map_err(std::io::Error::from)?;
+                        final_file.sync_all()?;
+                        metadata=final_file.metadata()?;
+                    }
+                    if metadata.len() != payload.length || metadata.nlink()!=1 || metadata.mode() & 0o7777 != 0o400 { return Err(invalid("relocated local cut role is not immutable")); }
+                    // Recovery may see a copied destination before its identity
+                    // commit, and a cross-filesystem copy is a new inode.
+                    // Authenticate that one copy before accepting it.
+                    let unchanged = if moved { payload.fingerprint.same_contents_after_metadata_change(&metadata) } else { SourceFingerprint::new(&metadata)==payload.fingerprint };
+                    // The carrier held this exact inode since seal verification; the
+                    // owned rename and 0600->0400 chmod changed only its ctime.
+                    let held_inode = carrier.as_ref().map(|held| held.file().metadata()).transpose()?.map(|held| (held.dev(),held.ino()));
+                    carrier = match carrier.take() {
+                        Some(mut held) if unchanged && held_inode==Some((metadata.dev(),metadata.ino())) => { held.refresh_after_owned_metadata_change()?; Some(held) }
+                        _ => None,
+                    };
+                    if !unchanged {
+                        if matches!(payload.role, CaptureRole::Disk(_)) {
+                            let (stream, digest) = hasher.get_or_insert_with(crate::storage::stream::StreamHasher::new).authenticate_with_sha256(final_file,payload.length)?;
+                            if digest != payload.sha256 || stream.fingerprint()!=SourceFingerprint::new(&metadata) {
+                                return Err(invalid("relocated local cut digest mismatch"));
+                            }
+                            carrier = Some(stream);
+                        } else if crate::machine::restore::hash_file(&final_file)? != payload.sha256 {
+                            return Err(invalid("relocated local cut digest mismatch"));
+                        }
+                    }
+                    if carrier.as_ref().is_some_and(|held| held.fingerprint()!=SourceFingerprint::new(&metadata)) {
+                        return Err(invalid("relocated local cut disk changed during relocation"));
+                    }
+                    payload.device=metadata.dev(); payload.inode=metadata.ino();
+                    payload.fingerprint=SourceFingerprint::new(&metadata);
+                    sqlx::query("UPDATE local_cut SET record_json=jsonb(?2) WHERE operation_id=?1").bind(operation.to_string()).bind(serde_json::to_string(&cut).map_err(invalid)?).execute(&this.store.pool).await?;
+                    if let Some(held) = carrier {
+                        relocated_disks.push((cut.files[index].role.clone(), held));
+                    }
+                }
+                destination.write_file_atomic(vm_spec::capture::CAPTURE_REQUEST_FILE,&record.plan.canonical_bytes().map_err(invalid)?)?;
+                destination.write_file_atomic(vm_spec::capture::CAPTURE_EVIDENCE_FILE,&cut.evidence.canonical_bytes().map_err(invalid)?)?;
+                destination.sync()?;
+                cut.relocated=true;
+                sqlx::query("UPDATE local_cut SET record_json=jsonb(?2) WHERE operation_id=?1").bind(operation.to_string()).bind(serde_json::to_string(&cut).map_err(invalid)?).execute(&this.store.pool).await?;
+            }
+                let evidence = String::from_utf8(cut.evidence.canonical_bytes().map_err(invalid)?).map_err(invalid)?;
+                let cut_id=cut.cut_id;
+            this.update_capture(capture,move |record| {
+                record.evidence=Some(evidence);
+                record.state=match record.state {
+                    CaptureState::ReleasedLocal { cut } if cut==cut_id=>CaptureState::ReleasedLocal {cut},
+                    CaptureState::Local {cut} if cut==cut_id=>CaptureState::Local {cut},
+                    CaptureState::Reserved|CaptureState::Sealed=>CaptureState::Local {cut:cut_id},
+                    _=>return Err(invalid("local cut cannot replace another capture disposition")),
+                };
+                Ok(())
+            }).await?;
+            this.store.update_fork(operation,move |result| { result.capture=crate::ForkCaptureOutcome::Sealed { cut_id }; if result.stage!=crate::ForkStage::Finished {result.stage=crate::ForkStage::Restoring;} Ok(()) }).await?;
+                this.store.fork_event(operation,None,"seal_authenticated").await?;
+                this.store.complete_capture_peak(capture).await?;
+            let disks = (!relocated_disks.is_empty()).then(|| crate::store::fork::AuthenticatedCutDisks::new(operation, cut_id, relocated_disks));
+            Ok((cut, disks))
+        })).await?
+    }
+}
+impl Store {
+    pub(crate) async fn require_capture_dispatch(
+        &self,
+        command: &vm_spec::lifecycle::CaptureCommand,
+    ) -> Result<(), LibVmError> {
+        let capture = Uuid::parse_str(command.plan.capture_id.as_str()).map_err(invalid)?;
+        // The caller holds the source machine lock through dispatch. Cancellation
+        // takes the same lock before committing its durable fence.
+        if let Some(operation) = self.fork_for_capture(capture).await? {
+            let fork = self
+                .fork_result(operation)
+                .await?
+                .ok_or_else(|| invalid("fork capture owner disappeared"))?;
+            if fork.cancellation_requested
+                || !matches!(fork.capture, crate::ForkCaptureOutcome::Pending)
+            {
+                return Err(invalid("fork no longer authorizes capture dispatch"));
+            }
+        }
+        let json:String=sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(capture.to_string()).fetch_one(&self.pool).await?;
+        let record = decode_record(&json)?;
+        if record.plan != command.plan || record.state != CaptureState::Reserved {
+            return Err(invalid(
+                "a sealed or retired capture can never be recaptured",
+            ));
+        }
+        self.reserve_capture_inventory(&record).await
+    }
+}
+
+impl Store {
+    /// Find a release receipt only for the capture's exact machine and run.
+    pub(crate) async fn capture_release_receipt_json(
+        &self,
+        machine: MachineId,
+        run: Uuid,
+        capture: &LiveId,
+    ) -> Result<Option<String>, LibVmError> {
+        Ok(sqlx::query_scalar("SELECT json(result_json) FROM live_command WHERE machine_id=?1 AND run_id=?2 AND json_extract(result_json,'$.command')='releaseCapture' AND json_extract(result_json,'$.outcome')='released' AND json_extract(result_json,'$.released.operationId')=?3 LIMIT 1")
+            .bind(machine.to_string())
+            .bind(run.to_string())
+            .bind(capture.as_str())
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1828,7 +2280,16 @@ mod tests {
     use crate::storage::identity::ObjectDigest;
     use crate::storage::pool::StoragePool;
     use crate::storage::stream::StreamHasher;
-    use crate::store::capture::{budget, capture_directory, validate_layout, verify_capture};
+    use crate::store::capture::{
+        authenticate_lanes, capture_directory, validate_layout, verify_capture, verify_payload,
+        AdmittedPayload, DiskAuthentication, VerifiedBytes, VerifiedPayload,
+        AUTHENTICATION_BUFFER_BYTES, CAPTURE_SCRATCH_BYTES,
+    };
+
+    const DISK_MODES: [DiskAuthentication; 2] = [
+        DiskAuthentication::WholeDigest,
+        DiskAuthentication::WithStreamMap,
+    ];
     use crate::store::models::{
         MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
     };
@@ -1852,6 +2313,117 @@ mod tests {
     }
 
     async fn fixture_with_external_data(include_data: bool) -> Fixture {
+        fixture_source(include_data, false).await
+    }
+
+    async fn fork_fixture() -> Fixture {
+        fixture_source(false, true).await
+    }
+
+    #[tokio::test]
+    async fn fork_cancellation_fences_initial_capture_dispatch_and_replay() {
+        let fixture = fork_fixture().await;
+        let store = &fixture.snapshots.store;
+        let record = &fixture.reservation.record;
+        let operation = store
+            .fork_for_capture(record.capture_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let command = vm_spec::lifecycle::CaptureCommand {
+            envelope: vm_spec::lifecycle::LiveCommandEnvelope {
+                machine_id: record.plan.machine_id.clone(),
+                run_id: vm_spec::lifecycle::LiveId::parse(&record.run_id.to_string()).unwrap(),
+                request_id: record.plan.capture_id.clone(),
+            },
+            plan: record.plan.clone(),
+        };
+        store.require_capture_dispatch(&command).await.unwrap();
+        store
+            .update_fork(operation, |fork| {
+                fork.cancellation_requested = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let error = store.require_capture_dispatch(&command).await.unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("fork no longer authorizes capture dispatch"));
+        }
+        assert_eq!(
+            fixture
+                .snapshots
+                .capture_reservation(record.capture_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            CaptureState::Reserved,
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_fork_preparation_failure_retires_unsubmitted_children_and_budget() {
+        let fixture = fork_fixture().await;
+        seal(&fixture);
+        let store = &fixture.snapshots.store;
+        let capture = fixture.reservation.record.capture_id;
+        let operation = store.fork_for_capture(capture).await.unwrap().unwrap();
+        let (_, retained) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        let cut = store.open_local_cut(operation, retained).await.unwrap();
+        store.bind_fork_resources(&cut).await.unwrap();
+        let before = store.fork_result(operation).await.unwrap().unwrap();
+        let children = store.fork_children(operation).await.unwrap();
+        let error =
+            crate::machine::root_storage::invalid("monitor executable authentication failed");
+        crate::machine::live_fork::fail_shared_preparation(store, operation, &error)
+            .await
+            .unwrap();
+        let result = store.fork_result(operation).await.unwrap().unwrap();
+        assert_eq!(result.source, before.source);
+        assert_eq!(result.capture, before.capture);
+        for child in &result.children {
+            assert!(matches!(
+                &child.outcome,
+                crate::ForkChildOutcome::Failed {
+                    phase: crate::ForkFailurePhase::Construction,
+                    diagnostic,
+                } if diagnostic.as_str().contains("monitor executable authentication failed")
+            ));
+        }
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        store
+            .release_unsubmitted_fork_budget(operation)
+            .await
+            .unwrap();
+        for child in children {
+            assert!(!store
+                .fork_child_storage_operations_retained(child.consumer_id, child.launch_id)
+                .await
+                .unwrap());
+            assert!(store
+                .reserved_fork_machine(child.consumer_id, &child.result.name)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let inventory: crate::store::restore::CaptureBudgetInventory =
+            serde_json::from_str(&store.capture_budget_document(operation).await.unwrap()).unwrap();
+        assert!(inventory.pending.is_empty());
+        assert!(inventory.bound.is_empty());
+    }
+
+    async fn fixture_source(include_data: bool, fork: bool) -> Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temporary.path().join("home"));
         let store = Store::new(&paths).await.unwrap();
@@ -1939,11 +2511,26 @@ mod tests {
             run_id: run,
             capture_id: Uuid::new_v4(),
             configuration: CaptureConfiguration::from_spec(&config.spec).unwrap(),
-            alias: Some("checkpoint".into()),
+            alias: if fork {
+                None
+            } else {
+                Some("checkpoint".into())
+            },
             policy: CapturePolicy::Full,
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
             pause: CapturePauseAuthority::Acquire,
         };
+        if fork {
+            let options = crate::store::fork::tests::options(&["fork-first", "fork-second"]);
+            let observed = crate::store::fork::tests::observation(id, run);
+            drop(
+                snapshots
+                    .store
+                    .admit_fork(id, &observed, &options, request.capture_id)
+                    .await
+                    .unwrap(),
+            );
+        }
         let reservation = snapshots.reserve_capture(&request).await.unwrap();
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
         let boot_input = temporary.path().join("boot");
@@ -2384,7 +2971,7 @@ mod tests {
             .unwrap();
         fixture
             .snapshots
-            .finish_capture_release(capture)
+            .finish_capture_release(capture, true)
             .await
             .unwrap();
         assert!(fixture
@@ -2473,7 +3060,7 @@ mod tests {
             .unwrap();
         fixture
             .snapshots
-            .finish_capture_release(first_capture)
+            .finish_capture_release(first_capture, true)
             .await
             .unwrap();
         let mut request = fixture.reservation.record.request.clone();
@@ -2659,10 +3246,12 @@ mod tests {
                 }
                 _ => directory.write_file("request.json", b"{}").unwrap(),
             }
-            assert!(
-                verify_capture(&directory, &fixture.reservation.record).is_err(),
-                "{fault}"
-            );
+            for disks in DISK_MODES {
+                assert!(
+                    verify_capture(&directory, &fixture.reservation.record, disks).is_err(),
+                    "{fault} {disks:?}"
+                );
+            }
             assert!(fixture.snapshots.list().await.unwrap().is_empty());
         }
     }
@@ -2698,7 +3287,9 @@ mod tests {
         ] {
             let fixture = fixture().await;
             let (directory, mut evidence) = seal(&fixture);
-            assert!(verify_capture(&directory, &fixture.reservation.record).is_ok());
+            for disks in DISK_MODES {
+                assert!(verify_capture(&directory, &fixture.reservation.record, disks).is_ok());
+            }
             let mut bytes = std::fs::read(directory.path().join(role.relative_path())).unwrap();
             if fault == "truncated" {
                 bytes.truncate(20);
@@ -2716,10 +3307,12 @@ mod tests {
             directory
                 .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
                 .unwrap();
-            assert!(
-                verify_capture(&directory, &fixture.reservation.record).is_err(),
-                "{fault}"
-            );
+            for disks in DISK_MODES {
+                assert!(
+                    verify_capture(&directory, &fixture.reservation.record, disks).is_err(),
+                    "{fault} {disks:?}"
+                );
+            }
         }
     }
 
@@ -2760,11 +3353,281 @@ mod tests {
             directory
                 .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
                 .unwrap();
+            for disks in DISK_MODES {
+                assert!(
+                    verify_capture(&directory, &fixture.reservation.record, disks).is_err(),
+                    "{fault} {disks:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_lanes_keep_inventory_order_and_held_inodes_and_reject_either_lane() {
+        let sealed = fixture().await;
+        let record = &sealed.reservation.record;
+        // The second verification lane is charged explicitly before effects.
+        assert_eq!(CAPTURE_SCRATCH_BYTES, 18 << 20);
+        assert_eq!(
+            record.reservation_memory_bytes,
+            record.plan.ram_bytes + CAPTURE_SCRATCH_BYTES
+        );
+        let (directory, evidence) = seal(&sealed);
+        for disks in DISK_MODES {
+            let verified = verify_capture(&directory, record, disks).unwrap();
+            assert_eq!(
+                verified
+                    .files
+                    .iter()
+                    .map(|payload| payload.role.clone())
+                    .collect::<Vec<_>>(),
+                evidence
+                    .inventory
+                    .iter()
+                    .map(|entry| entry.role.clone())
+                    .collect::<Vec<_>>(),
+                "{disks:?}"
+            );
+            for payload in &verified.files {
+                let held = payload.file().metadata().unwrap();
+                let named =
+                    std::fs::metadata(directory.path().join(payload.role.relative_path())).unwrap();
+                assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+                assert_eq!(payload.length, held.len());
+                assert_eq!(
+                    matches!(payload.bytes, VerifiedBytes::Stream(_)),
+                    disks == DiskAuthentication::WithStreamMap
+                        && matches!(payload.role, CaptureRole::Disk(_)),
+                    "{disks:?} {:?}",
+                    payload.role
+                );
+            }
+        }
+        let disk = evidence
+            .inventory
+            .iter()
+            .find(|entry| matches!(entry.role, CaptureRole::Disk(_)))
+            .unwrap()
+            .role
+            .relative_path();
+        // Same-length corruption in the RAM lane, the other lane, or both.
+        for fault in ["ram", "disk", "execution", "ram-and-disk"] {
+            let fixture = fixture().await;
+            let (directory, _) = seal(&fixture);
+            if fault.starts_with("ram") {
+                directory.write_file("memory.ram", &[0x77; 4096]).unwrap();
+            }
+            if fault.ends_with("disk") {
+                std::fs::write(directory.path().join(&disk), [0x52; 512]).unwrap();
+            }
+            if fault == "execution" {
+                let path = CaptureRole::Execution.relative_path();
+                let mut bytes = std::fs::read(directory.path().join(&path)).unwrap();
+                bytes[0] ^= 0x40;
+                directory.write_file(&path, &bytes).unwrap();
+            }
+            for disks in DISK_MODES {
+                let error = verify_capture(&directory, &fixture.reservation.record, disks)
+                    .err()
+                    .unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("capture staged payload digest mismatch"),
+                    "{fault} {disks:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_the_writable_source_inode_as_a_staged_role_before_hashing() {
+        let fixture = fixture().await;
+        let (directory, evidence) = seal(&fixture);
+        let disk = evidence
+            .inventory
+            .iter()
+            .find(|entry| matches!(entry.role, CaptureRole::Disk(_)))
+            .unwrap();
+        // The live source has exactly the sealed disk bytes, so only the
+        // source-inode alias check, not a digest, can refuse it.
+        let source = fixture.config.machine_dir.join("root.raw");
+        assert_eq!(
+            Sha256Digest::of_bytes(&std::fs::read(&source).unwrap()),
+            disk.sha256
+        );
+        std::fs::rename(&source, directory.path().join(disk.role.relative_path())).unwrap();
+        for disks in DISK_MODES {
+            let error = verify_capture(&directory, &fixture.reservation.record, disks)
+                .err()
+                .unwrap();
             assert!(
-                verify_capture(&directory, &fixture.reservation.record).is_err(),
-                "{fault}"
+                error
+                    .to_string()
+                    .contains("capture output geometry, alias or hardlink violation"),
+                "{disks:?}: {error}"
             );
         }
+    }
+
+    /// Bounded wait for the sibling's stop request; never hangs a test.
+    fn wait_for_stop(stop: &std::sync::atomic::AtomicBool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn admit<'a>(entry: &'a CaptureInventoryEntry, path: &std::path::Path) -> AdmittedPayload<'a> {
+        let file = std::fs::File::open(path).unwrap();
+        AdmittedPayload {
+            entry,
+            fingerprint: crate::storage::identity_file::SourceFingerprint::new(
+                &file.metadata().unwrap(),
+            ),
+            file,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn descriptors_to(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| std::fs::read_link(entry.path()).ok().as_deref() == Some(path))
+            .count()
+    }
+
+    /// A valid RAM role owned by its lane, plus a tampered execution role.
+    #[cfg(target_os = "linux")]
+    fn lane_payloads(
+        temporary: &tempfile::TempDir,
+    ) -> (
+        std::path::PathBuf,
+        CaptureInventoryEntry,
+        std::path::PathBuf,
+        CaptureInventoryEntry,
+    ) {
+        let ram_path = temporary.path().join("memory.ram");
+        std::fs::write(&ram_path, [0x32; 4096]).unwrap();
+        let ram_path = std::fs::canonicalize(ram_path).unwrap();
+        let execution_path = temporary.path().join("execution.state");
+        std::fs::write(&execution_path, b"tampered").unwrap();
+        let ram = CaptureInventoryEntry {
+            role: CaptureRole::Ram,
+            length: 4096,
+            sha256: Sha256Digest::of_bytes(&[0x32; 4096]),
+        };
+        let execution = CaptureInventoryEntry {
+            role: CaptureRole::Execution,
+            length: 8,
+            sha256: Sha256Digest::of_bytes(b"original"),
+        };
+        (ram_path, ram, execution_path, execution)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checkpoint_lane_failure_stops_and_joins_the_ram_owner_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let (ram_path, ram_entry, execution_path, execution_entry) = lane_payloads(&temporary);
+        let ram = admit(&ram_entry, &ram_path);
+        assert_eq!(descriptors_to(&ram_path), 1);
+        let saw_stop = AtomicBool::new(false);
+        let stopped = AtomicBool::new(false);
+        let error = authenticate_lanes(
+            |stop| {
+                // Valid RAM bytes: only the sibling's failure can stop them.
+                saw_stop.store(wait_for_stop(stop), Ordering::SeqCst);
+                let mut buffer = vec![0u8; AUTHENTICATION_BUFFER_BYTES];
+                let result = verify_payload(
+                    ram,
+                    DiskAuthentication::WithStreamMap,
+                    &mut buffer,
+                    &mut None,
+                    stop,
+                );
+                stopped.store(matches!(result, Ok(None)), Ordering::SeqCst);
+                result
+            },
+            |stop| {
+                let mut buffer = vec![0u8; AUTHENTICATION_BUFFER_BYTES];
+                verify_payload(
+                    admit(&execution_entry, &execution_path),
+                    DiskAuthentication::WithStreamMap,
+                    &mut buffer,
+                    &mut None,
+                    stop,
+                )
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("capture staged payload digest mismatch"));
+        assert!(saw_stop.load(Ordering::SeqCst));
+        assert!(stopped.load(Ordering::SeqCst));
+        // Joined before return: the RAM owner's descriptor is already closed.
+        assert_eq!(descriptors_to(&ram_path), 0);
+    }
+
+    #[test]
+    fn checkpoint_ram_lane_unwind_stops_the_sibling_and_is_a_typed_join_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let saw_stop = AtomicBool::new(false);
+        let result = authenticate_lanes::<(), ()>(
+            |_| panic!("injected RAM lane fault"),
+            |stop| {
+                saw_stop.store(wait_for_stop(stop), Ordering::SeqCst);
+                Ok(Some(()))
+            },
+        );
+        assert!(matches!(result, Err(crate::LibVmError::Io(_))));
+        assert!(saw_stop.load(Ordering::SeqCst));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checkpoint_caller_lane_unwind_stops_and_joins_the_ram_owner() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let (ram_path, ram_entry, _, _) = lane_payloads(&temporary);
+        let ram = admit(&ram_entry, &ram_path);
+        assert_eq!(descriptors_to(&ram_path), 1);
+        let saw_stop = AtomicBool::new(false);
+        let stopped = AtomicBool::new(false);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authenticate_lanes::<VerifiedPayload, ()>(
+                |stop| {
+                    saw_stop.store(wait_for_stop(stop), Ordering::SeqCst);
+                    let mut buffer = vec![0u8; AUTHENTICATION_BUFFER_BYTES];
+                    let result = verify_payload(
+                        ram,
+                        DiskAuthentication::WholeDigest,
+                        &mut buffer,
+                        &mut None,
+                        stop,
+                    );
+                    stopped.store(matches!(result, Ok(None)), Ordering::SeqCst);
+                    result
+                },
+                |_| panic!("injected caller lane fault"),
+            )
+        }));
+        assert!(unwound.is_err());
+        assert!(saw_stop.load(Ordering::SeqCst));
+        assert!(stopped.load(Ordering::SeqCst));
+        assert_eq!(descriptors_to(&ram_path), 0);
     }
 
     #[tokio::test]
@@ -2874,7 +3737,7 @@ mod tests {
                 .unwrap();
             fixture
                 .snapshots
-                .finish_capture_release(capture)
+                .finish_capture_release(capture, true)
                 .await
                 .unwrap();
             let charges = fixture.reservation.record.disk_charges.clone();
@@ -2948,7 +3811,7 @@ mod tests {
         assert_eq!(published, second.unwrap());
         fixture
             .snapshots
-            .finish_capture_release(capture)
+            .finish_capture_release(capture, true)
             .await
             .unwrap();
         assert_eq!(
@@ -3132,18 +3995,628 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn checkpoint_budget_errors_distinguish_required_and_available_resources() {
-        assert!(budget("disk", 100, 100).is_ok());
+    #[tokio::test]
+    async fn capture_result_release_does_not_claim_native_baseline_retirement() {
+        let fixture = fixture().await;
+        let capture = fixture.reservation.record.capture_id;
+        fixture.snapshots.abandon_capture(capture).await.unwrap();
+        fixture
+            .snapshots
+            .finish_capture_release(capture, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                fixture
+                    .snapshots
+                    .capture_reservation(capture)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                CaptureState::Abandoned
+            ),
+            "retained native RAM must remain guarded by the exact source run lease"
+        );
+        fixture
+            .snapshots
+            .finish_capture_release(capture, false)
+            .await
+            .unwrap();
+        assert!(matches!(fixture.snapshots.capture_reservation(capture).await.unwrap().unwrap().state,CaptureState::Released {snapshot:None}),"only positive no-baseline proof may release the failed capture while its source is live");
+    }
+
+    #[tokio::test]
+    async fn fork_local_cut_keeps_one_ram_inode_without_snapshot_publication_and_rejects_mutation()
+    {
+        use std::os::unix::fs::FileExt;
+        let fixture = fork_fixture().await;
+        let (staging, evidence) = seal(&fixture);
+        let original = staging
+            .open_file("memory.ram")
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .unwrap();
+        let capture = fixture.reservation.record.capture_id;
+        let operation = fixture
+            .snapshots
+            .store
+            .fork_for_capture(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        let (cut, retained) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        assert_eq!(cut.evidence, evidence);
+        assert!(staging.open_file("memory.ram").unwrap().is_none());
+        assert!(
+            staging
+                .open_file(vm_spec::capture::CAPTURE_REQUEST_FILE)
+                .unwrap()
+                .is_some(),
+            "monitor controls stay in the source namespace"
+        );
+        let ram = cut
+            .files
+            .iter()
+            .find(|file| file.role == CaptureRole::Ram)
+            .unwrap();
+        assert_eq!((ram.device, ram.inode), (original.dev(), original.ino()));
+        assert_eq!(
+            cut.storage.snapshot, None,
+            "a local cut is never a fabricated SnapshotId"
+        );
+        let published: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_snapshot")
+            .fetch_one(&fixture.snapshots.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(published, 0);
+        let held = fixture
+            .snapshots
+            .store
+            .open_local_cut(operation, retained)
+            .await
+            .unwrap();
+        let index = held
+            .record
+            .files
+            .iter()
+            .position(|file| file.role == CaptureRole::Ram)
+            .unwrap();
+        let file = held.held_file(index).unwrap();
+        assert_eq!(file.metadata().unwrap().ino(), original.ino());
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut first = held.reopen_role(&CaptureRole::Ram).unwrap();
+            let mut second = held.reopen_role(&CaptureRole::Ram).unwrap();
+            first.seek(SeekFrom::Start(7)).unwrap();
+            assert_eq!(
+                second.stream_position().unwrap(),
+                0,
+                "parallel children must not share seek position"
+            );
+            assert_eq!(
+                second.metadata().unwrap().ino(),
+                original.ino(),
+                "independent descriptions retain the same RAM inode"
+            );
+        }
+        nix::sys::stat::fchmod(
+            file,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let path = fixture
+            .snapshots
+            .store
+            .images_dir
+            .join("tmp")
+            .join(operation.to_string())
+            .join("cut/memory.ram");
+        let writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        writer.write_at(&[0x7a], 0).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        nix::sys::stat::fchmod(file, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert!(
+            fixture
+                .snapshots
+                .store
+                .open_local_cut(operation, None)
+                .await
+                .is_err(),
+            "same inode and length cannot hide modified sealed bytes"
+        );
+        assert!(
+            held.reopen_role(&CaptureRole::Ram).is_err(),
+            "handoff refuses mutation even through the already pinned directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_seal_recovery_reconciles_metadata_after_relocation_commit_without_recapture() {
+        let fixture = fork_fixture().await;
+        seal(&fixture);
+        let capture = fixture.reservation.record.capture_id;
+        let operation = fixture
+            .snapshots
+            .store
+            .fork_for_capture(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        let (original, _) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .update_capture(capture, |record| {
+                record.state = CaptureState::Sealed;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .store
+            .update_fork(operation, |result| {
+                result.capture = crate::ForkCaptureOutcome::Pending;
+                result.stage = crate::ForkStage::Capturing;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (recovered, recovered_disks) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        assert_eq!(recovered, original);
+        assert!(
+            recovered_disks.is_none(),
+            "recovery that did not observe relocation holds no disk map authority"
+        );
+        let parent = fixture
+            .snapshots
+            .store
+            .fork_result(operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent.capture,
+            crate::ForkCaptureOutcome::Sealed {
+                cut_id: original.cut_id
+            }
+        );
         assert!(matches!(
-            budget("RAM", 101, 100),
-            Err(crate::LibVmError::Storage(
-                crate::storage::StorageError::CaptureBudget {
-                    resource: "RAM",
-                    required: 101,
-                    available: 100
-                }
-            ))
+            fixture
+                .snapshots
+                .capture_reservation(capture)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            CaptureState::Local { .. }
         ));
+        let events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM fork_event WHERE operation_id=?1 AND phase='seal_authenticated'",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&fixture.snapshots.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn fork_cut_and_batch_charges_survive_source_removal_and_independent_slot_retirement() {
+        let fixture = fork_fixture().await;
+        let (_, evidence) = seal(&fixture);
+        let capture = fixture.reservation.record.capture_id;
+        let operation = fixture
+            .snapshots
+            .store
+            .fork_for_capture(capture)
+            .await
+            .unwrap()
+            .unwrap();
+        let (cut, retained) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        let held = fixture
+            .snapshots
+            .store
+            .open_local_cut(operation, retained)
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .store
+            .bind_fork_resources(&held)
+            .await
+            .unwrap();
+        let inode = cut
+            .files
+            .iter()
+            .find(|file| file.role == CaptureRole::Ram)
+            .unwrap()
+            .inode;
+        let path = fixture
+            .snapshots
+            .store
+            .images_dir
+            .join("tmp")
+            .join(operation.to_string())
+            .join("cut/memory.ram");
+        fixture
+            .snapshots
+            .record_capture_source(
+                capture,
+                CaptureSourceOutcome::Observed {
+                    continuation: vm_spec::capture::CaptureContinuation::Resumed {
+                        consumed_token: evidence.pause_token.unwrap(),
+                        thawed_epoch: evidence.freeze_epoch.unwrap(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        fixture
+            .snapshots
+            .finish_capture_release(capture, true)
+            .await
+            .unwrap();
+        let store = fixture.snapshots.store.clone();
+        let snapshots = fixture.snapshots.clone();
+        drop(held);
+        drop(fixture.reservation);
+        store.recover_image_cache().await.unwrap();
+        assert!(
+            snapshots
+                .capture_reservation(capture)
+                .await
+                .unwrap()
+                .is_some(),
+            "the exact source launch lease still owns its baseline"
+        );
+        drop(fixture.launch);
+        store.recover_image_cache().await.unwrap();
+        assert!(snapshots
+            .capture_reservation(capture)
+            .await
+            .unwrap()
+            .is_none());
+        store.remove_machine(&fixture.config).await.unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let before: crate::store::restore::CaptureBudgetInventory =
+            serde_json::from_str(&store.capture_budget_document(operation).await.unwrap()).unwrap();
+        assert_eq!(before.bound.len(), 2);
+        assert!(
+            before.baseline.is_none(),
+            "retired source owns no remaining baseline charge"
+        );
+        store
+            .set_fork_child(
+                operation,
+                0,
+                crate::ForkChildOutcome::Abandoned {
+                    diagnostic: crate::machine::live_fork::diagnostic("unsubmitted"),
+                },
+            )
+            .await
+            .unwrap();
+        store.recover_image_cache().await.unwrap();
+        let after: crate::store::restore::CaptureBudgetInventory =
+            serde_json::from_str(&store.capture_budget_document(operation).await.unwrap()).unwrap();
+        assert_eq!(after.bound.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        store
+            .set_fork_child(
+                operation,
+                1,
+                crate::ForkChildOutcome::Abandoned {
+                    diagnostic: crate::machine::live_fork::diagnostic("unsubmitted"),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .update_fork(operation, |result| {
+                result.stage = crate::ForkStage::Finished;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.recover_image_cache().await.unwrap();
+        assert!(
+            !path.parent().unwrap().parent().unwrap().exists(),
+            "one sweep retires the last slot, parent root and cut directory"
+        );
+        assert_eq!(
+            store
+                .fork_result(operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .children
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_retention_shares_seal_derived_disk_maps_with_independent_child_descriptors() {
+        use std::io::{Seek, SeekFrom};
+        let fixture = fork_fixture().await;
+        seal(&fixture);
+        let store = &fixture.snapshots.store;
+        let capture = fixture.reservation.record.capture_id;
+        let operation = store.fork_for_capture(capture).await.unwrap().unwrap();
+        let (cut, retained) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        let retained = retained.expect("seal verification derived the writable disk maps");
+        let expected = StreamHasher::new().hash_reader(&[0x51; 512][..]).unwrap();
+        let disks = cut
+            .files
+            .iter()
+            .filter(|file| matches!(file.role, CaptureRole::Disk(_)))
+            .map(|file| file.role.clone())
+            .collect::<Vec<_>>();
+        assert!(!disks.is_empty());
+        assert!(
+            store
+                .open_local_cut(
+                    operation,
+                    Some(crate::store::fork::AuthenticatedCutDisks::new(
+                        uuid::Uuid::new_v4(),
+                        cut.cut_id,
+                        Vec::new(),
+                    )),
+                )
+                .await
+                .is_err(),
+            "another operation's authentication never binds this cut"
+        );
+        let held = store
+            .open_local_cut(operation, Some(retained))
+            .await
+            .unwrap();
+        assert!(held.reopen_disk(&CaptureRole::Ram).is_err());
+        for role in &disks {
+            let first = held.reopen_disk(role).unwrap();
+            let second = held.reopen_disk(role).unwrap();
+            assert_eq!(*first.map(), expected);
+            assert_eq!(*second.map(), expected);
+            let mut first_file = first.file();
+            first_file.seek(SeekFrom::Start(9)).unwrap();
+            let mut second_file = second.file();
+            assert_eq!(
+                second_file.stream_position().unwrap(),
+                0,
+                "children never share a disk open-file description"
+            );
+        }
+        drop(held);
+        // Restart or another process: no retained carrier, so each disk is
+        // authenticated again against its evidence digest, deriving the map.
+        let recovered = store.open_local_cut(operation, None).await.unwrap();
+        for role in &disks {
+            assert_eq!(*recovered.reopen_disk(role).unwrap().map(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_cut_disk_authority_rejects_bytes_changed_behind_a_rewritten_fingerprint() {
+        use std::os::unix::fs::FileExt;
+        let fixture = fork_fixture().await;
+        seal(&fixture);
+        let store = &fixture.snapshots.store;
+        let capture = fixture.reservation.record.capture_id;
+        let operation = store.fork_for_capture(capture).await.unwrap().unwrap();
+        let (_, retained) = fixture
+            .snapshots
+            .retain_local_capture(capture)
+            .await
+            .unwrap();
+        let mut record = store.local_cut(operation).await.unwrap().unwrap();
+        let index = record
+            .files
+            .iter()
+            .position(|file| matches!(file.role, CaptureRole::Disk(_)))
+            .unwrap();
+        let path = store
+            .images_dir
+            .join("tmp")
+            .join(operation.to_string())
+            .join("cut")
+            .join(record.files[index].role.relative_path());
+        let file = std::fs::File::open(&path).unwrap();
+        nix::sys::stat::fchmod(
+            &file,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Same inode and length; only bytes inside the authenticated map change.
+        writer.write_at(&[0x52], 100).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        nix::sys::stat::fchmod(&file, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        // Model an uncertain relocation whose persisted identity names the
+        // changed inode: only content authentication can still refuse it.
+        record.files[index].fingerprint =
+            crate::storage::identity_file::SourceFingerprint::new(&file.metadata().unwrap());
+        sqlx::query("UPDATE local_cut SET record_json=jsonb(?2) WHERE operation_id=?1")
+            .bind(operation.to_string())
+            .bind(serde_json::to_string(&record).unwrap())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store.open_local_cut(operation, retained).await.is_err(),
+            "a held map never binds an inode whose fingerprint moved after sealing"
+        );
+        assert!(
+            store.open_local_cut(operation, None).await.is_err(),
+            "fallback authentication checks the evidence digest, not the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn measured_ram_sha_rejects_self_hash_valid_contradictory_capture_inventory() {
+        use std::os::fd::AsRawFd;
+
+        use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
+
+        let fixture = fixture().await;
+        let (directory, mut evidence) = seal(&fixture);
+        let info = fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        let consumer = fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &consumer.record.capture
+        else {
+            panic!("fixture is an execution checkpoint");
+        };
+        let memory = execution.memory.clone();
+        let (ram, measured) = consumer
+            .open_ram(&pool, &memory.stream, memory.length)
+            .unwrap();
+        let files = [
+            ram,
+            consumer.open_object(&pool, &execution.layout).unwrap(),
+            consumer.open_object(&pool, &execution.execution).unwrap(),
+            consumer.open_object(&pool, &execution.devices).unwrap(),
+        ];
+        let digests = [
+            measured,
+            Sha256Digest::from_bytes(*execution.layout.as_bytes()),
+            Sha256Digest::from_bytes(*execution.execution.as_bytes()),
+            Sha256Digest::from_bytes(*execution.devices.as_bytes()),
+        ];
+        let objects: Vec<_> = files
+            .iter()
+            .zip(RestoreObjectRole::ALL)
+            .zip(digests)
+            .map(|((file, role), sha256)| {
+                let metadata = file.metadata().unwrap();
+                RestoreObject {
+                    role,
+                    fd: file.as_raw_fd(),
+                    file_device: metadata.dev(),
+                    file_inode: metadata.ino(),
+                    length: metadata.len(),
+                    sha256,
+                }
+            })
+            .collect();
+        let mut request = RestoreRequest {
+            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+            checkpoint: Sha256Digest::from_bytes(*info.id.as_bytes()),
+            activation_id: vm_spec::lifecycle::LiveId::parse(&Uuid::new_v4().to_string()).unwrap(),
+            freeze_operation_id: evidence.freeze_operation_id.clone().unwrap(),
+            start_paused: true,
+            configuration: CaptureConfiguration::from_spec(&consumer.record.configuration.spec)
+                .unwrap(),
+            evidence: fixture
+                .snapshots
+                .restore_evidence(&consumer, &pool)
+                .unwrap(),
+            objects: objects.try_into().unwrap(),
+            lowers: Vec::new(),
+            network: None,
+            ssh_trusted_ca: None,
+            hook: None,
+        };
+        request.validate().unwrap();
+        let inventory = evidence
+            .inventory
+            .iter_mut()
+            .find(|entry| entry.role == CaptureRole::Ram)
+            .unwrap();
+        inventory.sha256 = Sha256Digest::of_bytes(b"contradictory RAM inventory");
+        assert_ne!(measured, inventory.sha256);
+        assert!(evidence.is_sealed());
+        let bytes = evidence.canonical_bytes().unwrap();
+        let input = fixture
+            ._temporary
+            .path()
+            .join("contradictory-evidence.json");
+        std::fs::write(&input, &bytes).unwrap();
+        let (object, roots) = pool.publish_object_for_catalog(&input).unwrap();
+        assert_eq!(object.digest, ObjectDigest::of_bytes(&bytes));
+        // Deliberately construct a hostile, internally self-hash-valid catalog
+        // state. Supported publication never replaces immutable provenance.
+        let mut tx = fixture.snapshots.store.pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM snapshot_capture_provenance WHERE capture_id=?1")
+            .bind(fixture.reservation.record.capture_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes) VALUES(?1,?2,?3,?4)")
+            .bind(fixture.reservation.record.capture_id.to_string())
+            .bind(info.id.to_string())
+            .bind(object.digest.to_string())
+            .bind(&bytes)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        drop(roots);
+        let contradictory = fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        request.evidence = fixture
+            .snapshots
+            .restore_evidence(&contradictory, &pool)
+            .unwrap();
+        assert_eq!(request.evidence, evidence);
+        let (ram, measured_again) = contradictory
+            .open_ram(&pool, &memory.stream, memory.length)
+            .unwrap();
+        assert_eq!(measured_again, measured);
+        assert_eq!(
+            measured_again,
+            crate::machine::restore::hash_file(&ram).unwrap()
+        );
+        let metadata = ram.metadata().unwrap();
+        request.objects[0] = RestoreObject {
+            role: RestoreObjectRole::Ram,
+            fd: ram.as_raw_fd(),
+            file_device: metadata.dev(),
+            file_inode: metadata.ino(),
+            length: metadata.len(),
+            sha256: measured_again,
+        };
+        assert_eq!(
+            request.validate().unwrap_err(),
+            "restore object identity differs from the captured cut"
+        );
     }
 }

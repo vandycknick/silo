@@ -159,6 +159,13 @@ def main() -> None:
         except BaseException:
             os._exit(126)
     tracked = {root}
+    # A creator's PTRACE_EVENT_{FORK,VFORK,CLONE} stop is not ordered against
+    # its auto-attached child's own waits: the child can stop, run and be
+    # reaped (or exec-collapsed, or detached) before that announcement is
+    # dequeued. Count announcements against kernel-proven ends per TID; a
+    # positive balance is an announced tracee still owing an end, in
+    # whichever order the waits arrive.
+    unaccounted = Counter({root: 1})
     configured = set()
     groups = {}
     stopped_status = {}
@@ -273,6 +280,15 @@ def main() -> None:
         with (evidence / "boundary-lifecycle.jsonl").open("a") as output:
             output.write(json.dumps({"event": event, "tid": tid, "tgid": groups.get(tid), **details}) + "\n")
 
+    def retire(tid: int) -> None:
+        """Account one kernel-proven end of a TID: terminal wait, exec collapse or detach."""
+        tracked.discard(tid)
+        configured.discard(tid)
+        stopped_status.pop(tid, None)
+        awaiting_terminal.pop(tid, None)
+        groups.pop(tid, None)
+        unaccounted[tid] -= 1
+
     def lost_stop(tid: int, error: ProcessLookupError) -> None:
         nonlocal held
         assert tid in stopped_status, "ESRCH without an observed ptrace stop"
@@ -353,11 +369,7 @@ def main() -> None:
             for sibling in siblings:
                 lifecycle("exec-retired-thread", sibling, exec_tid=tid,
                           lost_stop=awaiting_terminal.get(sibling), pending_injection=sibling in pending_injection)
-                tracked.discard(sibling)
-                configured.discard(sibling)
-                stopped_status.pop(sibling, None)
-                awaiting_terminal.pop(sibling, None)
-                groups.pop(sibling, None)
+                retire(sibling)
             lost_injections = siblings.intersection(pending_injection)
             assert not lost_injections, f"exec lost required injected returns for tids {lost_injections}"
             assert held not in siblings, f"exec lost the held boundary for tid {held}"
@@ -388,16 +400,15 @@ def main() -> None:
                     assert tid != held and tid not in pending_injection
                     ptrace(17, tid, 0, signal.SIGSTOP)  # PTRACE_DETACH
                     lifecycle("restore-manager-detached", tid, group=group, status=status)
-                    stopped_status.pop(tid)
-                    tracked.discard(tid)
-                    configured.discard(tid)
-                    groups.pop(tid)
-                    awaiting_terminal.pop(tid, None)
+                    retire(tid)
                     return
         if event in (1, 2, 3):
             child = ctypes.c_ulong()
             ptrace(0x4201, tid, 0, ctypes.byref(child))
-            tracked.add(child.value)
+            # The child may already have been reaped: never re-own its TID.
+            unaccounted[child.value] += 1
+            lifecycle("child-event", tid, child_tid=child.value, ptrace_event=event,
+                      ended_before_announcement=unaccounted[child.value] == 0)
         if stopped == signal.SIGTRAP | 0x80:
             info = SyscallInfo()
             ptrace(0x420E, tid, ctypes.sizeof(info), ctypes.byref(info))
@@ -627,7 +638,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, cancelled)
     try:
         while True:
-            assert time.monotonic() < deadline, f"actual operation exceeded 240s: {tracked}; lost stops: {awaiting_terminal}"
+            assert time.monotonic() < deadline, f"actual operation exceeded 240s: {tracked}; announced: {dict(+unaccounted)}; lost stops: {awaiting_terminal}"
             if held is not None and Path(request["release"]).is_file():
                 resume(24 if observe_net or held in pending_injection else 7, held)
             try:
@@ -635,7 +646,7 @@ def main() -> None:
             except ChildProcessError:
                 # A lost GETEVENTMSG may hide an auto-attached child until
                 # its own wait stop. Drain all real waits, not just known TIDs.
-                assert not tracked, f"missing terminal wait for tracees: {tracked}; lost stops: {awaiting_terminal}"
+                assert not tracked and not +unaccounted, f"missing terminal wait for tracees: {tracked}; announced: {dict(+unaccounted)}; lost stops: {awaiting_terminal}"
                 break
             if tid == 0:
                 signal.sigtimedwait({signal.SIGCHLD}, 0.05)
@@ -643,13 +654,9 @@ def main() -> None:
             if os.WIFEXITED(status) or os.WIFSIGNALED(status):
                 lifecycle("wait-terminal", tid, status=status, code=os.waitstatus_to_exitcode(status),
                           lost_stop=awaiting_terminal.get(tid), pending_injection=tid in pending_injection)
-                awaiting_terminal.pop(tid, None)
                 if held == tid:
                     held = None
-                stopped_status.pop(tid, None)
-                tracked.discard(tid)
-                configured.discard(tid)
-                groups.pop(tid, None)
+                retire(tid)
                 if tid == root:
                     root_result = os.waitstatus_to_exitcode(status)
                 assert tid not in pending_injection, f"terminal wait lost a required injected return for tid {tid}"
@@ -689,6 +696,7 @@ def main() -> None:
                 lifecycle("cleanup-wait-terminal", tid, status=status, code=os.waitstatus_to_exitcode(status),
                           lost_stop=awaiting_terminal.get(tid), pending_injection=tid in pending_injection)
                 tracked.discard(tid)
+                unaccounted[tid] -= 1
             else:
                 tracked.add(tid)
                 try:
@@ -706,7 +714,7 @@ def main() -> None:
             "syscallEntries": dict(syscall_counts), "recentCandidates": list(recent),
             "awaitingTerminal": awaiting_terminal,
         }, indent=2) + "\n")
-        assert not tracked, f"unreaped owned tracees: {tracked}"
+        assert not tracked and not +unaccounted, f"unreaped owned tracees: {tracked}; announced: {dict(+unaccounted)}"
 
 
 if __name__ == "__main__":

@@ -10,11 +10,12 @@ from pathlib import Path
 import selectors
 import signal
 import subprocess
+from uuid import UUID
 
 import pytest
 
 from silo_smoke import image_cache, images, overlay, procs, shutdown, stopped
-from silo_smoke.cli import Silo
+from silo_smoke.cli import TIMINGS_PROPERTY, Silo, release, timed
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -30,7 +31,8 @@ def stopped_silo(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_
         assert parent.is_absolute() and parent.is_dir(), "SILO_SMOKE_STOPPED_DIR must name an existing mounted writable directory"
     workspace = Workspace(config, registry.ca_path, parent=parent, runtime_parent=Path("/tmp") if parent is not None else None)
     try:
-        seeded = image_cache.seed(overlay_image_caches["stopped"], workspace.silo_home)
+        with timed(workspace, "image_cache.seed"):
+            seeded = image_cache.seed(overlay_image_caches["stopped"], workspace.silo_home)
         assert len(seeded) == 1, seeded
         workspace.record("image-cache", f"seeded session-prepared stopped image: {sorted(seeded)}\n")
         yield Silo(workspace)
@@ -38,7 +40,7 @@ def stopped_silo(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_
         # Pytest records call failure before fixture teardown. Keep all evidence
         # for a failed native gate, while always terminating registered guests.
         failed = request.session.testsfailed > 0
-        workspace.cleanup(failed=failed)
+        release(workspace, failed=failed, publish=lambda summary: request.node.user_properties.append((TIMINGS_PROPERTY, summary)))
 
 
 @pytest.fixture(scope="session")
@@ -66,21 +68,32 @@ def durable(silo: Silo, name: str, path: str) -> None:
     silo.exec(name, overlay.PROBE, "durable", path, user="root")
 
 
-def assert_guest_copy(silo: Silo, name: str, *, absent: str) -> None:
-    # Keep the same reads and absence check, but pay for one CLI/agent session.
-    # The marker preserves the exact cat bytes, including its final newline.
+def assert_guest_copy(silo: Silo, name: str, *, absent: tuple[str, ...], identity: str | None = None) -> None:
+    # Keep the same reads and absence checks, but pay for one CLI/agent session.
+    # Markers preserve the exact cat bytes, including their final newlines.
+    assert absent
     observed = silo.exec(name, "sh", "-eu", "-c", """
+read_identity=$1
+shift
 cat /stopped-common
 printf '%s\\n' SILO_STOPPED_COMMON_END
-test ! -e "$1"
+for path in "$@"; do
+    test ! -e "$path"
+done
 stat -c '%i %h' /stopped-hard-a /stopped-hard-b
 stat -c '%i %h' /stopped-hard-b
-""", "stopped-copy", absent, user="root").stdout
-    common, links = observed.split("SILO_STOPPED_COMMON_END\n", 1)
+printf '%s\\n' SILO_STOPPED_LINKS_END
+if test "$read_identity" = yes; then
+    cat /etc/machine-id
+fi
+""", "stopped-copy", "yes" if identity is not None else "no", *absent, user="root").stdout
+    common, rest = observed.split("SILO_STOPPED_COMMON_END\n", 1)
     assert common == "committed\n"
+    links, machine_identity = rest.split("SILO_STOPPED_LINKS_END\n", 1)
     identities = links.splitlines()
     assert len(identities) == 3, identities
     assert identities[0] == identities[2].strip()
+    assert machine_identity == ("" if identity is None else identity)
 
 
 @pytest.mark.parametrize("profile", ["raw", "flat"])
@@ -141,27 +154,26 @@ sync
     for child in (first, second):
         assert overlay.ext4(stopped.writable_paths(silo, child)["root"])["uuid"] == filesystem["uuid"]
     run_a = boot(silo, first)["run_id"]
-    assert_guest_copy(silo, first, absent="/second-only")
-    assert silo.exec(first, "cat", "/etc/machine-id", user="root").stdout == "stopped-guest-identity\n"
+    assert_guest_copy(silo, first, absent=("/second-only",), identity="stopped-guest-identity\n")
     durable(silo, first, "/first-only")
     stopped.stop(silo, first)
     a_after = stopped.backing(silo, first, "first-after-write-replay")
     stopped.same_content(baseline, stopped.backing(silo, source, "source-after-first"))
     stopped.same_content(b, stopped.backing(silo, second, "second-still-unreplayed"))
     run_b = boot(silo, second)["run_id"]
-    assert_guest_copy(silo, second, absent="/first-only")
+    assert_guest_copy(silo, second, absent=("/first-only",))
     durable(silo, second, "/second-only")
     stopped.stop(silo, second)
     stopped.same_content(a_after, stopped.backing(silo, first, "first-after-second"))
     stopped.same_content(baseline, stopped.backing(silo, source, "source-after-both"))
     assert len({original_run, run_a, run_b}) == 3
-    assert len({silo.machine_id(name) for name in (source, first, second)}) == 3
+    # Identity only: fresh independent catalog reads, compared canonically.
+    assert len({UUID(procs.machine_id(silo.ws, name)) for name in (source, first, second)}) == 3
     if lower is not None:
         assert overlay.digest(lower) == lower_before
         assert stopped.record(silo, first)["root"]["lower"] == stopped.record(silo, source)["root"]["lower"]
     boot(silo, source)
-    assert_guest_copy(silo, source, absent="/first-only")
-    silo.exec(source, "test", "!", "-e", "/second-only", user="root")
+    assert_guest_copy(silo, source, absent=("/first-only", "/second-only"))
     stopped.stop(silo, source)
 
 
@@ -239,7 +251,8 @@ def test_stopped_host_ext4_fork_requires_actual_mount(stopped_silo: Silo, stoppe
 def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo, stopped_image: str, custom_boot: bool) -> None:
     silo = stopped_silo
     private_runtime = silo.ws.root / "private-runtime"
-    overlay.copy_runtime(silo.ws.config.runtime_dir, private_runtime)
+    with timed(silo.ws, "overlay.copy_runtime"):
+        overlay.copy_runtime(silo.ws.config.runtime_dir, private_runtime)
     silo.ws.config = replace(silo.ws.config, runtime_dir=private_runtime)
     userdata = silo.ws.root / "userdata"
     userdata.write_text("#!/bin/sh\nprintf 'captured-host\\n' >/etc/hostname\n")

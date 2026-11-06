@@ -8,8 +8,9 @@ use nix::sys::stat::{fchmod, fstatat, Mode};
 use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
 
 use crate::paths::OwnedDirectory;
+use crate::storage::identity::StreamId;
 use crate::storage::identity_file::{FileIdentity, SourceFingerprint};
-use crate::storage::stream::{StreamHasher, StreamMap, StreamScan};
+use crate::storage::stream::{AuthenticatedStream, StreamHasher, StreamScan, StreamStats};
 use crate::storage::StorageError;
 
 use thiserror::Error;
@@ -108,6 +109,59 @@ impl CopyQualification {
     }
 }
 
+/// The content authority a private copy starts from. Both variants name an
+/// exact held inode; only the authenticated one carries a canonical map.
+#[derive(Clone, Copy)]
+pub(crate) enum CopySource<'a> {
+    /// Held under the caller's fences without content authority. A streaming
+    /// copy derives the source map while copying, then verifies the output.
+    Unscanned { file: &'a File, length: u64 },
+    /// Byte-authenticated against its map. A streaming copy reuses that map
+    /// and still independently scans and compares the completed output.
+    Authenticated(&'a AuthenticatedStream),
+}
+
+impl<'a> CopySource<'a> {
+    fn file(self) -> &'a File {
+        match self {
+            Self::Unscanned { file, .. } => file,
+            Self::Authenticated(stream) => stream.file(),
+        }
+    }
+
+    fn length(self) -> u64 {
+        match self {
+            Self::Unscanned { length, .. } => length,
+            Self::Authenticated(stream) => stream.length(),
+        }
+    }
+}
+
+/// Work a streaming copy actually executed. Clones carry none: they rely on
+/// the qualified kernel clone contract instead of an output scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CopyVerification {
+    /// Canonical identity of the independently scanned completed output.
+    pub(crate) stream: StreamId,
+    /// Source traversal. `logical_bytes_hashed` is zero when an authenticated
+    /// source map was reused instead of recomputed.
+    pub(crate) source: StreamStats,
+    /// Independent completed-output scan, never skipped.
+    pub(crate) output: StreamStats,
+}
+
+impl CopyVerification {
+    fn scanned(scan: StreamScan) -> Result<Self, RootDiskError> {
+        Ok(Self {
+            stream: scan.map.id(),
+            source: scan.stats,
+            output: scan
+                .verification_stats
+                .ok_or_else(|| invalid_copy("streaming copy omitted output verification"))?,
+        })
+    }
+}
+
 /// The file and its pinned parent travel with the actual blocking owner.
 /// Drop only removes a still-owned private entry, never an existing collision.
 pub(crate) struct PreparedPrivateCopy {
@@ -115,7 +169,7 @@ pub(crate) struct PreparedPrivateCopy {
     directory: OwnedDirectory,
     name: String,
     method: CloneDiskMethod,
-    scan: Option<StreamScan>,
+    verification: Option<CopyVerification>,
     preserve: bool,
 }
 
@@ -132,12 +186,8 @@ impl PreparedPrivateCopy {
         self.method
     }
 
-    pub(crate) fn map(&self) -> Option<&StreamMap> {
-        self.scan.as_ref().map(|scan| &scan.map)
-    }
-
-    pub(crate) fn scan(&self) -> Option<&StreamScan> {
-        self.scan.as_ref()
+    pub(crate) fn verification(&self) -> Option<&CopyVerification> {
+        self.verification.as_ref()
     }
 
     /// Once rename succeeds, a directory-sync error is an uncertain publication.
@@ -203,22 +253,34 @@ impl Drop for PreparedPrivateCopy {
 /// Copies exactly the admitted length from the held source, without reopening
 /// its pathname. Callers own source synchronization, quiescence and profile.
 /// No worker is spawned here: callers move all operation fences into the worker.
+///
+/// Streaming copies always scan the completed output and compare its complete
+/// map with the source map. An authenticated source contributes its existing
+/// map; it never waives the output scan, ownership, length, stability or sync.
 pub(crate) fn copy_private(
-    source: &File,
-    length: u64,
+    source: CopySource<'_>,
     staging: OwnedDirectory,
     name: &str,
     qualification: &mut CopyQualification,
 ) -> Result<PreparedPrivateCopy, RootDiskError> {
     validate_component(name)?;
-    let before = validate_source(source, length)?;
+    let file = source.file();
+    let length = source.length();
+    let before = validate_source(file, length)?;
+    if let CopySource::Authenticated(stream) = source {
+        if before != stream.fingerprint() {
+            return Err(invalid_copy(
+                "authenticated copy source changed after authentication",
+            ));
+        }
+    }
     validate_staging(&staging)?;
-    let source_device = source.metadata()?.dev();
+    let source_device = file.metadata()?.dev();
     let destination_device = File::from(staging.fd().try_clone()?).metadata()?.dev();
     // A destination-local probe cannot qualify a cross-filesystem source.
     let clone_supported = source_device == destination_device && qualification.qualify(&staging)?;
     let mut prepared = if clone_supported {
-        match clone_attempt(source, &staging, name)? {
+        match clone_attempt(file, &staging, name)? {
             CloneAttempt::Complete(prepared) => prepared,
             CloneAttempt::Unsupported => new_private_file(staging, name)?,
         }
@@ -226,13 +288,25 @@ pub(crate) fn copy_private(
         new_private_file(staging, name)?
     };
     if prepared.method == CloneDiskMethod::SparseCopy {
-        prepared.scan =
-            Some(StreamHasher::new().copy_file_and_hash(source, length, &prepared.file)?);
+        let mut hasher = StreamHasher::new();
+        prepared.verification = Some(match source {
+            CopySource::Unscanned { file, length } => CopyVerification::scanned(
+                hasher.copy_file_and_hash(file, length, &prepared.file)?,
+            )?,
+            CopySource::Authenticated(stream) => {
+                let copy = hasher.copy_authenticated(stream, &prepared.file)?;
+                CopyVerification {
+                    stream: stream.map().id(),
+                    source: copy.stats,
+                    output: copy.verification_stats,
+                }
+            }
+        });
     }
-    validate_destination(source, &prepared.file, length)?;
+    validate_destination(file, &prepared.file, length)?;
     validate_owned_entry(&prepared.directory, &prepared.name, &prepared.file)?;
     prepared.file.sync_all()?;
-    if before != SourceFingerprint::new(&source.metadata()?) {
+    if before != SourceFingerprint::new(&file.metadata()?) {
         return Err(invalid_copy("source changed during private copy"));
     }
     Ok(prepared)
@@ -350,7 +424,7 @@ fn new_private_file(
         directory,
         name: name.to_owned(),
         method: CloneDiskMethod::SparseCopy,
-        scan: None,
+        verification: None,
         preserve: false,
     };
     fchmod(&prepared.file, Mode::S_IRUSR | Mode::S_IWUSR).map_err(io::Error::from)?;
@@ -428,7 +502,7 @@ fn clone_attempt(
                 directory: directory.try_clone().map_err(owned_error)?,
                 name: name.to_owned(),
                 method: CloneDiskMethod::Clonefile,
-                scan: None,
+                verification: None,
                 preserve: false,
             };
             let metadata = prepared.file.metadata()?;
@@ -647,8 +721,10 @@ impl UpperReplacement {
         let result = (|| {
             source_file.sync_all()?;
             let mut copy = copy_private(
-                &source_file,
-                length,
+                CopySource::Unscanned {
+                    file: &source_file,
+                    length,
+                },
                 staging,
                 "content",
                 &mut CopyQualification::new(1),
@@ -778,7 +854,7 @@ mod tests {
 
     use crate::machine::root_disk::{
         clone_error_allows_fallback, copy_private, resize_raw_disk, CloneDiskMethod,
-        CopyQualification, RootDiskError, RootDiskResizeOutcome,
+        CopyQualification, CopySource, RootDiskError, RootDiskResizeOutcome,
     };
     use crate::paths::OwnedDirectory;
 
@@ -802,8 +878,10 @@ mod tests {
             .unwrap();
         let result = (|| {
             let mut copy = copy_private(
-                &input,
-                length,
+                CopySource::Unscanned {
+                    file: &input,
+                    length,
+                },
                 stage,
                 "content",
                 &mut CopyQualification::new(1),
@@ -1143,16 +1221,20 @@ mod tests {
         let staging = OwnedDirectory::open_root(&temp.path().join("staging")).unwrap();
         let mut qualification = CopyQualification::new(1);
         let first = copy_private(
-            &input,
-            length,
+            CopySource::Unscanned {
+                file: &input,
+                length,
+            },
             staging.try_clone().unwrap(),
             "first",
             &mut qualification,
         )
         .unwrap();
         let second = copy_private(
-            &input,
-            length,
+            CopySource::Unscanned {
+                file: &input,
+                length,
+            },
             staging.try_clone().unwrap(),
             "second",
             &mut qualification,
@@ -1177,12 +1259,15 @@ mod tests {
         assert_eq!(first.file().metadata().unwrap().mode() & 0o777, 0o600);
         assert_eq!(first.file().metadata().unwrap().nlink(), 1);
         if first.method() == CloneDiskMethod::SparseCopy {
-            let scan = first.scan().unwrap();
-            assert_eq!(scan.map.length(), length);
-            assert!(scan.verification_stats.is_some());
-            assert_eq!(Some(&scan.map), first.map());
+            let verification = first.verification().unwrap();
+            let expected_map = crate::storage::stream::StreamHasher::new()
+                .hash_reader(&expected[..])
+                .unwrap();
+            assert_eq!(verification.stream, expected_map.id());
+            assert!(verification.source.logical_bytes_hashed > 0);
+            assert!(verification.output.logical_bytes_hashed > 0);
         } else {
-            assert!(first.map().is_none());
+            assert!(first.verification().is_none());
         }
         input.write_all_at(b"parent", 4096).unwrap();
         input.sync_all().unwrap();
@@ -1215,8 +1300,16 @@ mod tests {
         let moved = temp.path().join("moved-stage");
         fs::rename(&stage_path, &moved).unwrap();
         fs::create_dir(&stage_path).unwrap();
-        let copy =
-            copy_private(&input, 14, stage, "content", &mut CopyQualification::new(1)).unwrap();
+        let copy = copy_private(
+            CopySource::Unscanned {
+                file: &input,
+                length: 14,
+            },
+            stage,
+            "content",
+            &mut CopyQualification::new(1),
+        )
+        .unwrap();
         assert_eq!(fs::read(moved.join("content")).unwrap(), b"admitted inode");
         assert!(!stage_path.join("content").exists());
         drop(copy);
@@ -1233,8 +1326,10 @@ mod tests {
         let stage = OwnedDirectory::open_root(&temp.path().join("stage")).unwrap();
         for length in [0, 5, 7] {
             assert!(copy_private(
-                &input,
-                length,
+                CopySource::Unscanned {
+                    file: &input,
+                    length
+                },
                 stage.try_clone().unwrap(),
                 "content",
                 &mut CopyQualification::new(1)
@@ -1244,8 +1339,10 @@ mod tests {
         }
         fs::hard_link(&source, temp.path().join("alias")).unwrap();
         assert!(copy_private(
-            &input,
-            6,
+            CopySource::Unscanned {
+                file: &input,
+                length: 6
+            },
             stage.try_clone().unwrap(),
             "content",
             &mut CopyQualification::new(1)
@@ -1254,8 +1351,10 @@ mod tests {
         fs::remove_file(temp.path().join("alias")).unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(copy_private(
-            &input,
-            6,
+            CopySource::Unscanned {
+                file: &input,
+                length: 6
+            },
             stage.try_clone().unwrap(),
             "content",
             &mut CopyQualification::new(1)
@@ -1280,8 +1379,10 @@ mod tests {
         let mut qualification = CopyQualification::new(1);
         for name in ["file", "directory", "symlink"] {
             assert!(copy_private(
-                &input,
-                6,
+                CopySource::Unscanned {
+                    file: &input,
+                    length: 6
+                },
                 stage.try_clone().unwrap(),
                 name,
                 &mut qualification
@@ -1307,8 +1408,10 @@ mod tests {
         let destination = OwnedDirectory::open_root(&temp.path().join("destination")).unwrap();
         fs::write(destination.path().join("root.raw"), b"another owner").unwrap();
         let mut copy = copy_private(
-            &input,
-            6,
+            CopySource::Unscanned {
+                file: &input,
+                length: 6,
+            },
             stage.try_clone().unwrap(),
             "content",
             &mut CopyQualification::new(1),
@@ -1325,8 +1428,10 @@ mod tests {
         drop(copy);
         assert!(!stage.path().join("content").exists());
         let mut copy = copy_private(
-            &input,
-            6,
+            CopySource::Unscanned {
+                file: &input,
+                length: 6,
+            },
             stage.try_clone().unwrap(),
             "content",
             &mut CopyQualification::new(1),
@@ -1340,8 +1445,10 @@ mod tests {
             b"source"
         );
         let mut copy = copy_private(
-            &input,
-            6,
+            CopySource::Unscanned {
+                file: &input,
+                length: 6,
+            },
             stage.try_clone().unwrap(),
             "content",
             &mut CopyQualification::new(1),
@@ -1361,8 +1468,10 @@ mod tests {
         let input = crate::storage::stream::open_regular_source(&source).unwrap();
         let stage = OwnedDirectory::open_root(&temp.path().join("stage")).unwrap();
         let copy = copy_private(
-            &input,
-            6,
+            CopySource::Unscanned {
+                file: &input,
+                length: 6,
+            },
             stage.try_clone().unwrap(),
             "content",
             &mut CopyQualification::new(1),
@@ -1377,8 +1486,10 @@ mod tests {
         );
         assert_eq!(fs::read(stage.path().join("moved")).unwrap(), b"source");
         let copy = copy_private(
-            &input,
-            6,
+            CopySource::Unscanned {
+                file: &input,
+                length: 6,
+            },
             stage.try_clone().unwrap(),
             "linked",
             &mut CopyQualification::new(1),
@@ -1400,8 +1511,10 @@ mod tests {
         let mut qualification = CopyQualification::new(1);
         drop(
             copy_private(
-                &input,
-                6,
+                CopySource::Unscanned {
+                    file: &input,
+                    length: 6,
+                },
                 stage.try_clone().unwrap(),
                 "first",
                 &mut qualification,
@@ -1411,8 +1524,10 @@ mod tests {
         assert_eq!(qualification.directories.len(), 1);
         drop(
             copy_private(
-                &input,
-                6,
+                CopySource::Unscanned {
+                    file: &input,
+                    length: 6,
+                },
                 stage.try_clone().unwrap(),
                 "second",
                 &mut qualification,
@@ -1420,8 +1535,26 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(qualification.directories.len(), 1);
-        assert!(copy_private(&input, 6, other, "third", &mut qualification).is_err());
-        assert!(copy_private(&input, 6, stage, "fourth", &mut CopyQualification::new(0)).is_err());
+        assert!(copy_private(
+            CopySource::Unscanned {
+                file: &input,
+                length: 6
+            },
+            other,
+            "third",
+            &mut qualification
+        )
+        .is_err());
+        assert!(copy_private(
+            CopySource::Unscanned {
+                file: &input,
+                length: 6
+            },
+            stage,
+            "fourth",
+            &mut CopyQualification::new(0)
+        )
+        .is_err());
     }
 
     #[test]
@@ -1522,8 +1655,16 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = tokio::task::spawn_blocking(move || {
-            let copy =
-                copy_private(&input, 6, stage, "content", &mut CopyQualification::new(1)).unwrap();
+            let copy = copy_private(
+                CopySource::Unscanned {
+                    file: &input,
+                    length: 6,
+                },
+                stage,
+                "content",
+                &mut CopyQualification::new(1),
+            )
+            .unwrap();
             ready_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             assert_eq!(copy.file().metadata().unwrap().len(), 6);
@@ -1590,15 +1731,26 @@ mod tests {
             "nul\0name",
         ] {
             assert!(copy_private(
-                &input,
-                0,
+                CopySource::Unscanned {
+                    file: &input,
+                    length: 0
+                },
                 stage.try_clone().unwrap(),
                 name,
                 &mut CopyQualification::new(1)
             )
             .is_err());
         }
-        let copy = copy_private(&input, 0, stage, "empty", &mut CopyQualification::new(1)).unwrap();
+        let copy = copy_private(
+            CopySource::Unscanned {
+                file: &input,
+                length: 0,
+            },
+            stage,
+            "empty",
+            &mut CopyQualification::new(1),
+        )
+        .unwrap();
         assert_eq!(copy.file().metadata().unwrap().len(), 0);
         assert!(fs::read(copy.path()).unwrap().is_empty());
     }
@@ -1622,11 +1774,170 @@ mod tests {
             fs::metadata(stage.path()).unwrap().dev()
         );
         let mut qualification = CopyQualification::new(0);
-        let copy = copy_private(&input, 22, stage, "content", &mut qualification).unwrap();
+        let copy = copy_private(
+            CopySource::Unscanned {
+                file: &input,
+                length: 22,
+            },
+            stage,
+            "content",
+            &mut qualification,
+        )
+        .unwrap();
         assert_eq!(copy.method(), CloneDiskMethod::SparseCopy);
         assert!(qualification.directories.is_empty());
         assert_eq!(fs::read(copy.path()).unwrap(), b"cross-filesystem bytes");
-        assert_eq!(copy.map().unwrap().length(), 22);
-        assert!(copy.scan().unwrap().verification_stats.is_some());
+        let verification = copy.verification().unwrap();
+        assert_eq!(
+            verification.stream,
+            crate::storage::stream::StreamHasher::new()
+                .hash_reader(&b"cross-filesystem bytes"[..])
+                .unwrap()
+                .id()
+        );
+        assert_eq!(verification.output.bytes_read, 22);
+    }
+
+    /// Three chunks: data prefix plus allocated zeros, a hole-only chunk and a
+    /// short tail whose only data is mixed with zeros.
+    fn authenticated_fixture(
+        directory: &Path,
+    ) -> (
+        std::path::PathBuf,
+        Vec<u8>,
+        crate::storage::stream::AuthenticatedStream,
+    ) {
+        let path = directory.join("authenticated.raw");
+        let file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let chunk = crate::storage::limits::CHUNK_SIZE as u64;
+        let length = 2 * chunk + 4099;
+        file.set_len(length).unwrap();
+        file.write_all_at(b"prefix", 0).unwrap();
+        file.write_all_at(&[0; 8192], 4096).unwrap();
+        file.write_all_at(b"tail", length - 4).unwrap();
+        file.sync_all().unwrap();
+        let mut expected = vec![0; length as usize];
+        file.read_exact_at(&mut expected, 0).unwrap();
+        drop(file);
+        let stream = crate::storage::stream::StreamHasher::new()
+            .authenticate(
+                crate::storage::stream::open_regular_source(&path).unwrap(),
+                length,
+            )
+            .unwrap();
+        (path, expected, stream)
+    }
+
+    #[test]
+    fn private_copy_authenticated_source_reuses_map_and_still_verifies_output() {
+        let temp = copy_tempdir();
+        let (source, expected, authenticated) = authenticated_fixture(temp.path());
+        let staging = OwnedDirectory::open_root(&temp.path().join("staging")).unwrap();
+        let mut qualification = CopyQualification::new(1);
+        let copy = copy_private(
+            CopySource::Authenticated(&authenticated),
+            staging.try_clone().unwrap(),
+            "child",
+            &mut qualification,
+        )
+        .unwrap();
+        assert_eq!(fs::read(copy.path()).unwrap(), expected);
+        assert_eq!(
+            copy.file().metadata().unwrap().len(),
+            authenticated.length()
+        );
+        assert_ne!(
+            copy.file().metadata().unwrap().ino(),
+            fs::metadata(&source).unwrap().ino()
+        );
+        if copy.method() == CloneDiskMethod::SparseCopy {
+            let verification = copy.verification().unwrap();
+            assert_eq!(verification.stream, authenticated.map().id());
+            // The authenticated map was reused, never recomputed from the
+            // source, while the completed output was hashed independently.
+            assert_eq!(verification.source.logical_bytes_hashed, 0);
+            assert!(verification.source.bytes_read > 0);
+            assert!(verification.output.logical_bytes_hashed > 0);
+            assert_eq!(
+                crate::storage::stream::StreamHasher::new()
+                    .hash_open_file(copy.file(), authenticated.length())
+                    .unwrap()
+                    .map,
+                *authenticated.map()
+            );
+        } else {
+            assert!(copy.verification().is_none());
+        }
+        let unscanned = copy_private(
+            CopySource::Unscanned {
+                file: authenticated.file(),
+                length: authenticated.length(),
+            },
+            staging,
+            "scanned",
+            &mut qualification,
+        )
+        .unwrap();
+        assert_eq!(fs::read(unscanned.path()).unwrap(), expected);
+        if let (Some(scanned), Some(reused)) = (unscanned.verification(), copy.verification()) {
+            assert_eq!(scanned.stream, reused.stream);
+            assert!(scanned.source.logical_bytes_hashed > 0);
+        }
+    }
+
+    #[test]
+    fn private_copy_authenticated_source_rejects_changes_after_authentication() {
+        let temp = copy_tempdir();
+        let (source, _, authenticated) = authenticated_fixture(temp.path());
+        let staging = OwnedDirectory::open_root(&temp.path().join("staging")).unwrap();
+        // Same length and inode; only the bytes behind the map changed.
+        let writer = File::options().write(true).open(&source).unwrap();
+        writer.write_all_at(b"PREFIX", 0).unwrap();
+        writer.sync_all().unwrap();
+        assert!(copy_private(
+            CopySource::Authenticated(&authenticated),
+            staging.try_clone().unwrap(),
+            "changed",
+            &mut CopyQualification::new(1),
+        )
+        .is_err());
+        assert!(!staging.path().join("changed").exists());
+        // A replaced inode at the same path cannot be bound to the old map.
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        assert!(authenticated
+            .reopen(crate::storage::stream::open_regular_source(&source).unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn private_copy_authenticated_reopen_uses_an_independent_open_file_description() {
+        let temp = copy_tempdir();
+        let (source, expected, authenticated) = authenticated_fixture(temp.path());
+        let mut held = authenticated.file();
+        held.seek(SeekFrom::Start(17)).unwrap();
+        let child = authenticated
+            .reopen(crate::storage::stream::open_regular_source(&source).unwrap())
+            .unwrap();
+        assert_eq!(child.map().id(), authenticated.map().id());
+        let staging = OwnedDirectory::open_root(&temp.path().join("staging")).unwrap();
+        let mut qualification = CopyQualification::new(1);
+        for name in ["first", "second"] {
+            let copy = copy_private(
+                CopySource::Authenticated(&child),
+                staging.try_clone().unwrap(),
+                name,
+                &mut qualification,
+            )
+            .unwrap();
+            assert_eq!(fs::read(copy.path()).unwrap(), expected);
+        }
+        // Extent seeks on the child's description never move the held one.
+        assert_eq!(held.stream_position().unwrap(), 17);
     }
 }

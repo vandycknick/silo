@@ -21,7 +21,8 @@ pub(crate) use image::{
     MachineRootfsRecord, OciImageRecord,
 };
 pub(crate) use machine::{MachineConfig, MachineRuntimeState, MachineState};
-pub(crate) use machine_id::{looks_like_id_prefix, MachineId};
+pub(crate) use machine_id::looks_like_id_prefix;
+pub use machine_id::{MachineId, MachineIdParseError};
 pub(crate) use network::{
     GuestPublish, MachineNetworkConfig, NetworkDefinition, NetworkDriverPreference,
     NetworkInstanceState, NetworkTopology, PublishBind,

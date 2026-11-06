@@ -57,7 +57,11 @@ The explicit execution-state command grammar is:
 ```sh
 silo pause <VM>
 silo snapshot create <VM> --live [--name <NAME>]
-silo fork <VM> --name <CHILD> --live
+silo fork <VM> --live --name <CHILD> [--name <CHILD>...] [--preserve]
+          [--max-children <N>] [--private-write-percent <P>] [--memory-overcommit]
+          [--operation-id <UUID>]
+silo fork <VM> --live --children-json '<JSON array>'
+silo fork --operation <UUID> [--cancel]
 silo restore <CHECKPOINT> --execution [--name <CHILD>]
 ```
 
@@ -65,6 +69,24 @@ These endpoints refuse unsupported operations with typed capability errors.
 They never stop a machine, capture only its disks, or cold boot as a fallback.
 For VZ the ordinary alternative is to use `silo stop`, then the stopped-storage
 snapshot workflow, not an execution checkpoint.
+
+A live fork is one durable operation: one capture of the source, one restored
+running child per `--name` (or `--children-json` entry of `name`,
+`activationHook` and `destination`). Children receive no host forwards or guest
+publication unless that entry's `destination` grants them. Sixteen is the
+default fan-out bound, never an implied child count; more children require an
+explicit `--max-children`. The CLI selects the operation UUID before submission
+unless `--operation-id` supplies it; repeating identical options replays that
+operation, while changed options conflict. Every accepted operation prints one
+complete JSON result naming each child with its reserved machine and run IDs,
+the capture and the independent source outcome. The exit status is zero only
+when the operation finished uncancelled with every child running and the source
+resumed (or preserved with `--preserve`); otherwise it is nonzero after the
+JSON is printed. A failed child never rolls back its siblings, and a nonzero
+status or an interrupted client never stops running children or cancels the
+operation. `silo fork --operation` observes the operation by ID even after its
+source is removed; `--cancel` records durable cancellation intent, so
+unsubmitted children never start while submitted children settle normally.
 
 Stopped-storage operations are separate mutations, never a live fallback:
 

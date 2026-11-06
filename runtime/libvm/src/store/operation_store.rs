@@ -73,7 +73,7 @@ fn validate_record(record: &RetainedStorageOperation) -> Result<(), LibVmError> 
     }
     if let Some(restore) = &record.restore {
         restore.validate()?;
-        if record.storage.snapshot != Some(restore.checkpoint)
+        if record.storage.snapshot != restore.checkpoint.snapshot()
             || (record.admitted
                 && (restore.request.ssh_trusted_ca.is_none()
                     || restore.network_attachment != restore.request.network.is_some()))
@@ -908,6 +908,22 @@ impl Store {
                     validate_lease_identity(&row, &_lease)?;
                     let kind: String = row.try_get("kind")?;
                     let state: String = row.try_get("state")?;
+                    if kind == "live-fork" {
+                        // Retire parents after all producers in this sweep.
+                        // Otherwise UUID ordering would require a second prune.
+                        tx.commit().await?;
+                        continue;
+                    }
+                    if kind == "import" {
+                        // A recorded failure forbids resubmission. Once its
+                        // consumer lease is exclusive, the reserved name must
+                        // not prevent retirement and terminal reconciliation.
+                        let reserved:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_fork_child WHERE consumer_id=?1 AND name_reserved=1 AND failure_json IS NULL)").bind(&cursor).fetch_one(&mut *tx).await?;
+                        if reserved {
+                            tx.commit().await?;
+                            continue;
+                        }
+                    }
                     if kind == "capture" {
                         let capture = crate::store::capture::decode_record(
                             &row.try_get::<String, _>("record_json")?,
@@ -915,32 +931,76 @@ impl Store {
                         if !matches!(
                             capture.state,
                             crate::store::snapshot_store::CaptureState::Released { .. }
+                                | crate::store::snapshot_store::CaptureState::ReleasedLocal { .. }
                                 | crate::store::snapshot_store::CaptureState::Abandoned
                         ) {
                             tx.commit().await?;
                             continue;
                         }
-                        let Some(launch_lease) =
-                            pool.try_exclusive_lease(capture.launch_operation_id)?
-                        else {
-                            report.deferred.push(
-                                crate::store::models::CacheCleanupDeferral::ActiveLease {
-                                    operation_id: capture.launch_operation_id,
-                                },
-                            );
-                            tx.commit().await?;
-                            continue;
+                        let fork_owned: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM live_fork WHERE capture_id=?1)",
+                        )
+                        .bind(capture.capture_id.to_string())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        let intent:Option<(Option<String>,)>=sqlx::query_as("SELECT json(result_json) FROM live_command WHERE machine_id=?1 AND run_id=?2 AND request_id=?3").bind(capture.machine_id.to_string()).bind(capture.run_id.to_string()).bind(capture.capture_id.to_string()).fetch_optional(&mut *tx).await?;
+                        let never_submitted = match intent {
+                            None => true,
+                            Some((Some(json),)) => matches!(
+                                serde_json::from_str::<vm_spec::lifecycle::LiveCommandResult>(
+                                    &json
+                                )
+                                .map_err(invalid)?,
+                                vm_spec::lifecycle::LiveCommandResult::Capture(
+                                    vm_spec::lifecycle::CaptureOutcome::Rejected { .. }
+                                )
+                            ),
+                            Some((None,)) => false,
                         };
-                        if launch_lease.file_identity()?
-                            != (
-                                capture.plan.reservation.launch_lease.device,
-                                capture.plan.reservation.launch_lease.inode,
+                        let unchanged = matches!(
+                            capture.source_outcome,
+                            Some(
+                                crate::store::snapshot_store::CaptureSourceOutcome::Observed {
+                                    continuation: vm_spec::capture::CaptureContinuation::Unchanged
+                                }
                             )
-                        {
-                            return Err(invalid("capture generation lease was replaced"));
+                        );
+                        let unused = fork_owned
+                            && capture.evidence.is_none()
+                            && (matches!(
+                                capture.state,
+                                crate::store::snapshot_store::CaptureState::Released {
+                                    snapshot: None
+                                }
+                            ) || (never_submitted && unchanged));
+                        let launch_lease = if unused {
+                            None
+                        } else {
+                            let Some(lease) =
+                                pool.try_exclusive_lease(capture.launch_operation_id)?
+                            else {
+                                report.deferred.push(
+                                    crate::store::models::CacheCleanupDeferral::ActiveLease {
+                                        operation_id: capture.launch_operation_id,
+                                    },
+                                );
+                                tx.commit().await?;
+                                continue;
+                            };
+                            Some(lease)
+                        };
+                        if let Some(launch_lease) = &launch_lease {
+                            if launch_lease.file_identity()?
+                                != (
+                                    capture.plan.reservation.launch_lease.device,
+                                    capture.plan.reservation.launch_lease.inode,
+                                )
+                            {
+                                return Err(invalid("capture generation lease was replaced"));
+                            }
                         }
-                        // Keep both exclusive OFDs across evidence I/O and deletion.
-                        // The terminal row remains the durable charge/pin owner.
+                        // An inherited baseline needs both exclusive OFDs.
+                        // A fenced no-cut fork instead has positive no-use proof.
                         tx.commit().await?;
                         drop(_roots);
                         let cleanup = CaptureCleanup::prepare(self, &capture, state == "cleaning")?;
@@ -1111,6 +1171,7 @@ impl Store {
                 tx.commit().await?;
             }
         }
+        self.retire_finished_fork_roots(pool).await?;
         self.reconcile_restore_budget().await?;
         Ok(report)
     }
@@ -1162,6 +1223,14 @@ impl Store {
         let lease = pool.lease(record.operation_id)?;
         let (device, inode) = lease.file_identity()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if restore.is_some() {
+            let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM machine_state WHERE machine_id=?1 AND status='restoring' AND json_extract(state_json,'$.runId')=?2)").bind(machine_id.to_string()).bind(run_id.to_string()).fetch_one(&mut *tx).await?;
+            if !current {
+                return Err(invalid(
+                    "restore construction lost its exact unpublished lifecycle generation",
+                ));
+            }
+        }
         let current: Option<String> =
             sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
                 .bind(machine_id.to_string())
@@ -1222,12 +1291,36 @@ impl Store {
                 .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2")
                 .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            let charged:String=sqlx::query_scalar("SELECT json(charge_json) FROM restore_memory_reservation WHERE operation_id=?1 AND construction_json IS NOT NULL").bind(restore.consumer_operation.to_string()).fetch_one(&mut *tx).await?;
+            let charged: crate::store::restore::RestoreMemoryCharge =
+                serde_json::from_str(&charged).map_err(invalid)?;
+            if charged != restore.memory {
+                return Err(invalid(
+                    "generation transfer changed its pre-admitted resource charge",
+                ));
+            }
             let reservation = sqlx::query("UPDATE restore_memory_reservation SET operation_id=?1 WHERE operation_id=?2 AND construction_json IS NOT NULL")
                 .bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             if reservation.rows_affected() != 1 {
                 return Err(invalid(
                     "restore generation handoff lost its exact construction budget owner",
                 ));
+            }
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id) SELECT ?1,cut_id FROM storage_operation_cut WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            if let crate::store::restore::RestoreIdentity::LocalCut { id } = &restore.checkpoint {
+                let child:Option<(String,i64,String,String)>=sqlx::query_as("SELECT c.operation_id,c.child_index,c.machine_id,c.run_id FROM live_fork_child c JOIN live_fork f ON f.operation_id=c.operation_id JOIN local_cut l ON l.operation_id=f.operation_id WHERE c.consumer_id=?1 AND c.launch_id IS NULL AND c.name_reserved=1 AND l.cut_id=?2 AND json_extract(f.result_json,'$.cancellationRequested')=0 AND f.admission_complete=1").bind(restore.consumer_operation.to_string()).bind(id.to_string()).fetch_optional(&mut *tx).await?;
+                let Some((parent, index, machine, run)) = child else {
+                    return Err(invalid(
+                        "fork child generation handoff was cancelled or lost its reserved identity",
+                    ));
+                };
+                if machine != machine_id.to_string() || run != run_id.to_string() {
+                    return Err(invalid(
+                        "fork child generation changed reserved machine/run identity",
+                    ));
+                }
+                sqlx::query("UPDATE live_fork_child SET launch_id=?3 WHERE operation_id=?1 AND child_index=?2 AND launch_id IS NULL").bind(parent).bind(index).bind(record.operation_id.to_string()).execute(&mut *tx).await?;
             }
         }
         tx.commit().await?;
@@ -1247,6 +1340,35 @@ impl Store {
             .await?
             .ok_or_else(|| invalid("launch operation disappeared"))?;
         let mut record = decode(&row)?;
+        if !record.admitted {
+            if record.restore.is_some() {
+                let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM machine_state WHERE machine_id=?1 AND status IN ('restoring','activating','starting') AND json_extract(state_json,'$.runId')=?2)").bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_one(&mut *tx).await?;
+                if !current {
+                    return Err(invalid(
+                        "restore launch was stopped or superseded before submission",
+                    ));
+                }
+            }
+            if let Some(restore) = &record.restore {
+                if matches!(
+                    restore.checkpoint,
+                    crate::store::restore::RestoreIdentity::LocalCut { .. }
+                ) {
+                    let row:Option<(String,i64,bool,String)>=sqlx::query_as("SELECT c.operation_id,c.child_index,json_extract(f.result_json,'$.cancellationRequested'),json(c.result_json) FROM live_fork_child c JOIN live_fork f ON f.operation_id=c.operation_id WHERE c.launch_id=?1 AND c.machine_id=?2 AND c.run_id=?3 AND c.submitted=0").bind(operation_id.to_string()).bind(record.machine_id.to_string()).bind(record.run_id.to_string()).fetch_optional(&mut *tx).await?;
+                    let Some((parent, index, cancelled, json)) = row else {
+                        return Err(invalid("fork launch lost its exact unsubmitted child slot"));
+                    };
+                    if cancelled {
+                        return Err(invalid("fork cancellation fences an unsubmitted launch"));
+                    }
+                    let mut child: crate::ForkChildResult =
+                        serde_json::from_str(&json).map_err(invalid)?;
+                    child.outcome = crate::ForkChildOutcome::Activating;
+                    sqlx::query("UPDATE live_fork_child SET submitted=1,result_json=jsonb(?3) WHERE operation_id=?1 AND child_index=?2").bind(&parent).bind(index).bind(serde_json::to_string(&child).map_err(invalid)?).execute(&mut *tx).await?;
+                    sqlx::query("INSERT OR IGNORE INTO fork_event(operation_id,child_index,phase,monotonic_ns) VALUES(?1,?2,'activating',?3)").bind(parent).bind(index).bind(crate::machine::live_fork::monotonic_ns()?).execute(&mut *tx).await?;
+                }
+            }
+        }
         record.admitted = true;
         sqlx::query("UPDATE storage_operation SET record_json=jsonb(?2) WHERE operation_id=?1")
             .bind(operation_id.to_string())
@@ -1417,13 +1539,14 @@ impl Store {
                             && !matches!(
                                 capture.state,
                                 crate::store::snapshot_store::CaptureState::Released { .. }
+                                    | crate::store::snapshot_store::CaptureState::ReleasedLocal { .. }
                                     | crate::store::snapshot_store::CaptureState::Abandoned
                             )
                         {
                             return Err(invalid("nonterminal capture has cleanup authority"));
                         }
                     }
-                    "convert" | "snapshot" | "fork" | "import"
+                    "live-fork" | "convert" | "snapshot" | "fork" | "import"
                         if matches!(state.as_str(), "staging" | "committed") =>
                     {
                         let json: String = row.try_get("record_json")?;

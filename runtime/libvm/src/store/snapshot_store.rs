@@ -1,6 +1,7 @@
 //! Immutable snapshot artifacts, shared image aliases, and independent retention.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::File;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -11,9 +12,11 @@ use uuid::Uuid;
 
 use crate::paths::OwnedDirectory;
 use crate::storage::identity::{ObjectDigest, SnapshotId, StreamId};
+use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::limits::Resource;
 use crate::storage::locks::StorageLock;
 use crate::storage::pool::StoragePool;
+use crate::storage::stream::AuthenticatedStream;
 use crate::store::models::snapshot::{invalid, SnapshotRecord, SnapshotStream};
 use crate::store::Store;
 use crate::LibVmError;
@@ -97,6 +100,8 @@ pub(crate) enum CaptureState {
     Sealed,
     Published { snapshot: SnapshotId },
     Released { snapshot: Option<SnapshotId> },
+    Local { cut: vm_spec::capture::Sha256Digest },
+    ReleasedLocal { cut: vm_spec::capture::Sha256Digest },
     Abandoned,
 }
 
@@ -156,10 +161,167 @@ pub(crate) struct SnapshotConsumer {
     pub info: SnapshotInfo,
     pub record: SnapshotRecord,
     pub operation_id: Uuid,
+    closure: Option<AuthenticatedClosure>,
     pub lease: StorageLock,
     // A consumer outlives its collection handle and retains the same writable
     // catalog capability through actual blocking reads/copy/publication.
     _store: Arc<Store>,
+}
+
+/// The exact inodes `consume` hashed, held until the consumer has opened its
+/// inputs. A held descriptor pins its device/inode pair, so a fresh descriptor
+/// with an equal fingerprint is that authenticated inode with unchanged bytes.
+/// Restore uses this instead of opening and hashing the same members again.
+struct AuthenticatedClosure {
+    streams: BTreeMap<StreamId, AuthenticatedStream>,
+    objects: BTreeMap<ObjectDigest, AuthenticatedObject>,
+    /// Measured from live RAM during this closure's stream authentication,
+    /// never copied from capture inventory. The stream entry pins its inode.
+    ram_sha256: Option<(StreamId, vm_spec::capture::Sha256Digest)>,
+}
+
+struct AuthenticatedObject {
+    file: File,
+    fingerprint: SourceFingerprint,
+}
+
+impl SnapshotConsumer {
+    /// The held authenticated stream itself, rechecked against its hashed state.
+    pub(crate) fn authenticated_stream(
+        &self,
+        stream: &StreamId,
+        length: u64,
+    ) -> Result<&AuthenticatedStream, LibVmError> {
+        let held = self
+            .closure()?
+            .streams
+            .get(stream)
+            .ok_or_else(|| invalid("stream is outside the authenticated snapshot closure"))?;
+        if held.length() != length {
+            return Err(invalid(
+                "authenticated snapshot stream geometry differs from its use",
+            ));
+        }
+        bind_held(held.file(), held.fingerprint())?;
+        Ok(held)
+    }
+
+    /// An independent open-file description of one authenticated stream, so
+    /// sparse-copy extent seeks and native readers never share file offsets.
+    /// Its fingerprint equals the held authenticated one when returned.
+    pub(crate) fn open_stream(
+        &self,
+        pool: &StoragePool,
+        stream: &StreamId,
+        length: u64,
+    ) -> Result<File, LibVmError> {
+        let held = self.authenticated_stream(stream, length)?;
+        let file = pool.open_stream(stream)?;
+        bind_reopened(&file, held.fingerprint())?;
+        Ok(file)
+    }
+
+    /// Retain the exact authenticated map with an independent source OFD.
+    /// The map is shared without copying its chunk vector.
+    pub(crate) fn open_copy_source(
+        &self,
+        pool: &StoragePool,
+        stream: &StreamId,
+        length: u64,
+    ) -> Result<AuthenticatedStream, LibVmError> {
+        let held = self.authenticated_stream(stream, length)?;
+        Ok(held.reopen(pool.open_stream(stream)?)?)
+    }
+
+    /// Reopen live RAM and return the whole-byte digest measured alongside
+    /// its stream map. Both held and fresh descriptors must still match the
+    /// authenticated fingerprint before the digest can leave the closure.
+    pub(crate) fn open_ram(
+        &self,
+        pool: &StoragePool,
+        stream: &StreamId,
+        length: u64,
+    ) -> Result<(File, vm_spec::capture::Sha256Digest), LibVmError> {
+        let (measured_stream, sha256) = self
+            .closure()?
+            .ram_sha256
+            .ok_or_else(|| invalid("snapshot closure has no measured live RAM digest"))?;
+        if measured_stream != *stream {
+            return Err(invalid("RAM digest belongs to a different stream"));
+        }
+        let file = self.open_stream(pool, stream, length)?;
+        Ok((file, sha256))
+    }
+
+    /// An independent, rewound descriptor of one authenticated whole-byte
+    /// object. Its `ObjectDigest` is the SHA-256 of exactly these bytes.
+    pub(crate) fn open_object(
+        &self,
+        pool: &StoragePool,
+        object: &ObjectDigest,
+    ) -> Result<File, LibVmError> {
+        let held = self
+            .closure()?
+            .objects
+            .get(object)
+            .ok_or_else(|| invalid("object is outside the authenticated snapshot closure"))?;
+        bind_held(&held.file, held.fingerprint)?;
+        let file = pool.open_object(object)?;
+        bind_reopened(&file, held.fingerprint)?;
+        Ok(file)
+    }
+
+    /// Descriptors currently held for closure reuse, beyond the lease.
+    pub(crate) fn retained_descriptors(&self) -> u64 {
+        self.closure.as_ref().map_or(0, |closure| {
+            (closure.streams.len() + closure.objects.len()) as u64
+        })
+    }
+
+    /// Close the held closure once every input has been opened. Reopened
+    /// descriptors keep their own inodes; the lease keeps the closure pinned.
+    /// Later reuse fails closed instead of reopening unauthenticated members.
+    pub(crate) fn release_closure(&mut self) {
+        self.closure = None;
+    }
+
+    fn closure(&self) -> Result<&AuthenticatedClosure, LibVmError> {
+        self.closure
+            .as_ref()
+            .ok_or_else(|| invalid("authenticated snapshot closure handles were released"))
+    }
+}
+
+fn bind_held(held: &File, fingerprint: SourceFingerprint) -> Result<(), LibVmError> {
+    if SourceFingerprint::new(&held.metadata()?) != fingerprint {
+        return Err(invalid(
+            "authenticated snapshot closure member was modified",
+        ));
+    }
+    Ok(())
+}
+
+fn bind_reopened(reopened: &File, fingerprint: SourceFingerprint) -> Result<(), LibVmError> {
+    if SourceFingerprint::new(&reopened.metadata()?) != fingerprint {
+        return Err(invalid(
+            "authenticated snapshot closure member was replaced or modified",
+        ));
+    }
+    Ok(())
+}
+
+/// Closure members whose authenticated descriptors a consumer holds. Map roots
+/// and pages are consumed through digest-checked reads only, so retention
+/// stays bounded by record roles rather than stream length.
+fn retained_members(record: &SnapshotRecord) -> (BTreeSet<StreamId>, BTreeSet<ObjectDigest>) {
+    let (streams, mut objects) = record.content_dependencies();
+    for stream in record.streams() {
+        objects.remove(&stream.map);
+        for page in &stream.map_pages {
+            objects.remove(page);
+        }
+    }
+    (streams, objects)
 }
 
 pub(crate) fn validate_alias(name: &str) -> Result<(), LibVmError> {
@@ -355,7 +517,7 @@ impl SnapshotStore {
         // be operation-pinned before opening their bytes.
         require_operation_closure(&self.store, operation_id, &streams, &objects, Some(digest))
             .await?;
-        let mut fingerprints = verify_closure(&pool, record, None)?;
+        let (mut fingerprints, _) = verify_closure(&pool, record, None, false)?;
         let input = RecordInput::new(&self.store.images_dir, operation_id, &bytes)?;
         let (published, roots) = pool.publish_object_for_catalog(&input.path())?;
         if published.digest != digest {
@@ -529,7 +691,7 @@ impl SnapshotStore {
                     tx.commit().await?;
                     Ok::<_, LibVmError>((info, lease))
                 })?;
-                verify_closure(&pool, &record, Some(info.record_digest))?;
+                let (_, closure) = verify_closure(&pool, &record, Some(info.record_digest), true)?;
                 for provenance in &info.provenance {
                     pool.verify_object(&provenance.evidence_digest)?;
                 }
@@ -537,6 +699,7 @@ impl SnapshotStore {
                     info,
                     record,
                     operation_id: id,
+                    closure: Some(closure),
                     lease,
                     _store: store.clone(),
                 })
@@ -927,16 +1090,11 @@ async fn require_operation_closure(
     Ok(())
 }
 
-type ClosureFingerprints = Vec<(
-    std::path::PathBuf,
-    crate::storage::identity_file::SourceFingerprint,
-)>;
+type ClosureFingerprints = Vec<(std::path::PathBuf, SourceFingerprint)>;
 
 fn recheck_closure(fingerprints: &ClosureFingerprints) -> Result<(), LibVmError> {
     for (path, before) in fingerprints {
-        if crate::storage::identity_file::SourceFingerprint::new(&std::fs::symlink_metadata(path)?)
-            != *before
-        {
+        if SourceFingerprint::new(&std::fs::symlink_metadata(path)?) != *before {
             return Err(invalid(
                 "authenticated snapshot closure changed before publication",
             ));
@@ -945,27 +1103,47 @@ fn recheck_closure(fingerprints: &ClosureFingerprints) -> Result<(), LibVmError>
     Ok(())
 }
 
+/// Verification is identical either way. With `retain`, the returned held
+/// descriptors are the exact inodes hashed here, each bound to the path state
+/// observed before hashing began; process descriptor admission for all of
+/// them precedes the first open. Without it, each descriptor closes after use.
 fn verify_closure(
     pool: &StoragePool,
     record: &SnapshotRecord,
     digest: Option<ObjectDigest>,
-) -> Result<ClosureFingerprints, LibVmError> {
+    retain: bool,
+) -> Result<(ClosureFingerprints, AuthenticatedClosure), LibVmError> {
     let bytes = record.canonical_bytes()?;
     let record_digest = ObjectDigest::of_bytes(&bytes);
     let (streams, mut objects) = record.content_dependencies();
     if digest.is_some() {
         objects.insert(record_digest);
     }
+    let (_, retained_objects) = retained_members(record);
+    if retain {
+        // Every held stream/object plus the one transient verification
+        // descriptor open at any time.
+        crate::storage::limits::preflight_fd_budget(
+            (streams.len() + retained_objects.len()) as u64 + 1,
+        )
+        .map_err(crate::storage::StorageError::from)?;
+    }
     let mut fingerprints = Vec::with_capacity(streams.len() + objects.len());
-    for path in streams.iter().map(|stream| pool.stream_path(stream)).chain(
-        objects
-            .iter()
-            .filter(|object| digest.is_some() || **object != record_digest)
-            .map(|object| pool.object_path(object)),
-    ) {
-        let before = crate::storage::identity_file::SourceFingerprint::new(
-            &std::fs::symlink_metadata(&path)?,
-        );
+    let mut stream_states = BTreeMap::new();
+    for stream in &streams {
+        let path = pool.stream_path(stream);
+        let before = SourceFingerprint::new(&std::fs::symlink_metadata(&path)?);
+        stream_states.insert(*stream, before);
+        fingerprints.push((path, before));
+    }
+    let mut object_states = BTreeMap::new();
+    for object in objects
+        .iter()
+        .filter(|object| digest.is_some() || **object != record_digest)
+    {
+        let path = pool.object_path(object);
+        let before = SourceFingerprint::new(&std::fs::symlink_metadata(&path)?);
+        object_states.insert(*object, before);
         fingerprints.push((path, before));
     }
     if let Some(digest) = digest {
@@ -975,6 +1153,19 @@ fn verify_closure(
             return Err(invalid("snapshot object contradicts its catalog record"));
         }
     }
+    let mut closure = AuthenticatedClosure {
+        streams: BTreeMap::new(),
+        objects: BTreeMap::new(),
+        ram_sha256: None,
+    };
+    let ram_stream = match &record.capture {
+        crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution }
+            if retain =>
+        {
+            Some(execution.memory.stream)
+        }
+        _ => None,
+    };
     let mut verified_streams = BTreeSet::new();
     for content in record.streams() {
         let root = crate::storage::map::StreamMapRoot::decode(
@@ -987,12 +1178,24 @@ fn verify_closure(
             return Err(invalid("snapshot map root contradicts content"));
         }
         let map = root.read_map(pool)?;
-        if map.id() != content.stream
-            || map.length() != content.length
-            || (verified_streams.insert(content.stream)
-                && pool.verify_stream(&content.stream)? != map)
-        {
+        if map.id() != content.stream || map.length() != content.length {
             return Err(invalid("snapshot stream/map/backing contradiction"));
+        }
+        if verified_streams.insert(content.stream) {
+            let verified = if ram_stream == Some(content.stream) {
+                let (verified, sha256) = pool.authenticate_stream_with_sha256(&content.stream)?;
+                closure.ram_sha256 = Some((content.stream, sha256));
+                verified
+            } else {
+                pool.authenticate_stream(&content.stream)?
+            };
+            if verified.map() != &map {
+                return Err(invalid("snapshot stream/map/backing contradiction"));
+            }
+            bind_hashed(verified.file(), stream_states.get(&content.stream))?;
+            if retain {
+                closure.streams.insert(content.stream, verified);
+            }
         }
     }
     let maps = record
@@ -1003,11 +1206,33 @@ fn verify_closure(
         if maps.contains(&object) || object == record_digest {
             continue;
         }
-        pool.verify_object(&object)?;
+        let file = pool.verify_object(&object)?;
+        if retain && retained_objects.contains(&object) {
+            let fingerprint = bind_hashed(&file, object_states.get(&object))?;
+            closure
+                .objects
+                .insert(object, AuthenticatedObject { file, fingerprint });
+        }
     }
     recheck_closure(&fingerprints)?;
-    Ok(fingerprints)
+    Ok((fingerprints, closure))
 }
+
+/// Equal pre-hash and post-hash states (ctime cannot be forged by an owner)
+/// bind the held descriptor's current bytes to the bytes just hashed.
+fn bind_hashed(
+    file: &File,
+    before: Option<&SourceFingerprint>,
+) -> Result<SourceFingerprint, LibVmError> {
+    let current = SourceFingerprint::new(&file.metadata()?);
+    if before != Some(&current) {
+        return Err(invalid(
+            "authenticated snapshot closure changed during verification",
+        ));
+    }
+    Ok(current)
+}
+
 struct RecordInput {
     parent: OwnedDirectory,
     directory: OwnedDirectory,
@@ -1049,7 +1274,7 @@ pub(crate) async fn publish_map(
     pool: &StoragePool,
     store: &Store,
     operation: Uuid,
-    map: crate::storage::stream::StreamMap,
+    map: &crate::storage::stream::StreamMap,
 ) -> Result<SnapshotStream, LibVmError> {
     let parent = OwnedDirectory::open_existing_root(
         &store
@@ -1063,7 +1288,7 @@ pub(crate) async fn publish_map(
         .create_dir(&name)?
         .ok_or_else(|| invalid("map staging collision"))?;
     let mut map_pages = Vec::new();
-    for (index, page) in crate::storage::map::pages(&map).enumerate() {
+    for (index, page) in crate::storage::map::pages(map).enumerate() {
         let name = format!("page-{index}");
         stage.write_file(&name, &page?)?;
         let (object, roots) = pool.publish_object_for_catalog(&stage.path().join(&name))?;
@@ -1073,7 +1298,7 @@ pub(crate) async fn publish_map(
         map_pages.push(object.digest);
         drop(roots);
     }
-    let root = crate::storage::map::StreamMapRoot::new(&map, map_pages.clone())?;
+    let root = crate::storage::map::StreamMapRoot::new(map, map_pages.clone())?;
     stage.write_file("record", &root.encode()?)?;
     let (object, roots) = pool.publish_object_for_catalog(&stage.path().join("record"))?;
     store
@@ -1128,7 +1353,7 @@ mod tests {
             .await
             .unwrap();
         drop(roots);
-        let map = crate::store::snapshot_store::publish_map(&pool, &store, operation, stream.map)
+        let map = crate::store::snapshot_store::publish_map(&pool, &store, operation, &stream.map)
             .await
             .unwrap();
         let kernel_path = temp.path().join("kernel");
@@ -1292,6 +1517,226 @@ mod tests {
         snapshots.store.recover_image_cache().await.unwrap();
         assert!(!pool.stream_path(&record.root.stream.stream).exists());
         assert!(!pool.object_path(&info.record_digest).exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_consumer_reopens_only_its_held_authenticated_closure_inodes() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (_temp, snapshots, record, operation, lease) = fixture("snapshot").await;
+        let info = snapshots.publish(&record, operation, None).await.unwrap();
+        snapshots
+            .store
+            .finish_stopped_operation(operation)
+            .await
+            .unwrap();
+        drop(lease);
+        let consumer = snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap();
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let stream = record.root.stream.stream;
+        // One root stream and one pinned boot object (kernel and initramfs share
+        // a digest); map roots, pages and the record hold no descriptor.
+        assert_eq!(consumer.retained_descriptors(), 2);
+        // The pre-open descriptor admission counts exactly what is retained.
+        let (streams, objects) = crate::store::snapshot_store::retained_members(&record);
+        assert_eq!(
+            (streams.len() + objects.len()) as u64,
+            consumer.retained_descriptors()
+        );
+        assert_eq!(
+            consumer.authenticated_stream(&stream, 512).unwrap().map(),
+            &pool.verify_stream(&stream).unwrap()
+        );
+        let copy = consumer.open_copy_source(&pool, &stream, 512).unwrap();
+        assert!(std::ptr::eq(
+            copy.map(),
+            consumer.authenticated_stream(&stream, 512).unwrap().map()
+        ));
+        let first = consumer.open_stream(&pool, &stream, 512).unwrap();
+        let second = consumer.open_stream(&pool, &stream, 512).unwrap();
+        let (left, right) = (first.metadata().unwrap(), second.metadata().unwrap());
+        assert_eq!((left.dev(), left.ino()), (right.dev(), right.ino()));
+        // Each use is its own open-file description: offsets never leak.
+        let mut moved = &second;
+        moved.seek(SeekFrom::Start(100)).unwrap();
+        let mut untouched = &first;
+        assert_eq!(untouched.stream_position().unwrap(), 0);
+        // Geometry and closure membership are exact; no foreign pool stream.
+        assert!(consumer.open_stream(&pool, &stream, 1024).is_err());
+        let foreign = format!("sha256:{}", "ab".repeat(32)).parse().unwrap();
+        assert!(consumer.open_stream(&pool, &foreign, 512).is_err());
+        let crate::BootProfile::LinuxDirect {
+            binding: crate::BootBinding::Pinned { kernel, .. },
+            ..
+        } = &record.boot
+        else {
+            panic!("fixture boot is pinned");
+        };
+        let mut object = consumer.open_object(&pool, kernel).unwrap();
+        // Restore descriptors reuse the ObjectDigest as whole-file SHA-256.
+        assert_eq!(
+            crate::machine::restore::hash_file(&object).unwrap(),
+            vm_spec::capture::Sha256Digest::from_bytes(*kernel.as_bytes())
+        );
+        let mut bytes = Vec::new();
+        object.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"exact boot fixture");
+        // Map roots/pages and the record are read through digests, never
+        // retained as reusable descriptors.
+        for unretained in record
+            .root
+            .stream
+            .map_pages
+            .iter()
+            .chain([&record.root.stream.map, &info.record_digest])
+        {
+            assert!(consumer.open_object(&pool, unretained).is_err());
+        }
+        // Rewriting identical bytes in place changes the authenticated state.
+        let path = pool.stream_path(&stream);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, [0x5a; 512]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(consumer.open_stream(&pool, &stream, 512).is_err());
+        assert!(consumer.open_copy_source(&pool, &stream, 512).is_err());
+        // A fresh inode with identical bytes is not the authenticated one.
+        let path = pool.object_path(kernel);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"exact boot fixture").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(pool.verify_object(kernel).is_ok());
+        assert!(consumer.open_object(&pool, kernel).is_err());
+        snapshots
+            .store
+            .finish_stopped_operation(consumer.operation_id)
+            .await
+            .unwrap();
+        drop(consumer);
+        // A fresh consumer authenticates the current bytes again. Releasing
+        // its closure keeps already opened inputs and fails later reuse closed.
+        let mut consumer = snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap();
+        let mut kept = consumer.open_stream(&pool, &stream, 512).unwrap();
+        let kept_copy = consumer.open_copy_source(&pool, &stream, 512).unwrap();
+        consumer.release_closure();
+        assert_eq!(consumer.retained_descriptors(), 0);
+        assert!(consumer.open_stream(&pool, &stream, 512).is_err());
+        assert!(consumer.open_copy_source(&pool, &stream, 512).is_err());
+        let output = tempfile::tempfile().unwrap();
+        crate::storage::stream::StreamHasher::new()
+            .copy_authenticated(&kept_copy, &output)
+            .unwrap();
+        assert!(consumer.authenticated_stream(&stream, 512).is_err());
+        assert!(consumer.open_object(&pool, kernel).is_err());
+        let mut bytes = Vec::new();
+        kept.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 512]);
+        snapshots
+            .store
+            .finish_stopped_operation(consumer.operation_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_ram_digest_is_measured_and_bound_to_held_and_reopened_inodes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::store::models::snapshot::{
+            SnapshotCaptureKind, SnapshotCompatibilityProfile, SnapshotExecution,
+        };
+        use crate::store::snapshot_store::verify_closure;
+
+        let (_temp, snapshots, record, operation, _lease) = fixture("snapshot").await;
+        let info = snapshots.publish(&record, operation, None).await.unwrap();
+        let mut consumer = snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap();
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let memory = record.root.stream.clone();
+        assert!(consumer
+            .open_ram(&pool, &memory.stream, memory.length)
+            .is_err());
+        let crate::BootProfile::LinuxDirect {
+            binding: crate::BootBinding::Pinned { kernel, .. },
+            ..
+        } = &record.boot
+        else {
+            panic!("fixture boot is pinned");
+        };
+        // Reuse a disk's stream as RAM to exercise duplicate stream roles:
+        // authentication must compute both identities on the first encounter.
+        consumer.record.capture = SnapshotCaptureKind::LiveExecution {
+            execution: Box::new(SnapshotExecution {
+                memory: memory.clone(),
+                layout: *kernel,
+                execution: *kernel,
+                devices: *kernel,
+                compatibility_profile: SnapshotCompatibilityProfile {
+                    native_producer: "unit-fixture".into(),
+                    silo_producer: *kernel,
+                    profile: *kernel,
+                    topology: *kernel,
+                    ram_layout: *kernel,
+                },
+            }),
+        };
+        let (_, unretained) = verify_closure(&pool, &consumer.record, None, false).unwrap();
+        assert!(unretained.ram_sha256.is_none());
+        consumer.closure = Some(
+            verify_closure(&pool, &consumer.record, None, true)
+                .unwrap()
+                .1,
+        );
+        let (file, sha256) = consumer
+            .open_ram(&pool, &memory.stream, memory.length)
+            .unwrap();
+        assert_eq!(
+            sha256,
+            vm_spec::capture::Sha256Digest::of_bytes(&[0x5a; 512])
+        );
+        assert_eq!(sha256, crate::machine::restore::hash_file(&file).unwrap());
+        assert_ne!(sha256.as_bytes(), memory.stream.as_bytes());
+        assert!(consumer
+            .open_ram(&pool, &memory.stream, memory.length + 1)
+            .is_err());
+        let foreign = ObjectDigest::of_bytes(b"foreign")
+            .to_string()
+            .parse()
+            .unwrap();
+        assert!(consumer.open_ram(&pool, &foreign, memory.length).is_err());
+
+        let path = pool.stream_path(&memory.stream);
+        // Equal bytes at a replacement pathname cannot inherit a held digest.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, [0x5a; 512]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(consumer
+            .open_ram(&pool, &memory.stream, memory.length)
+            .is_err());
+        consumer.closure = Some(
+            verify_closure(&pool, &consumer.record, None, true)
+                .unwrap()
+                .1,
+        );
+        // An in-place identical rewrite also invalidates the measured state.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, [0x5a; 512]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(consumer
+            .open_ram(&pool, &memory.stream, memory.length)
+            .is_err());
+        consumer.closure = Some(
+            verify_closure(&pool, &consumer.record, None, true)
+                .unwrap()
+                .1,
+        );
+        let (kept, measured) = consumer
+            .open_ram(&pool, &memory.stream, memory.length)
+            .unwrap();
+        consumer.release_closure();
+        assert_eq!(consumer.retained_descriptors(), 0);
+        assert!(consumer
+            .open_ram(&pool, &memory.stream, memory.length)
+            .is_err());
+        assert_eq!(crate::machine::restore::hash_file(&kept).unwrap(), measured);
     }
 
     #[tokio::test]

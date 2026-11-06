@@ -151,7 +151,10 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
                     "backend-excluded"
                 } else if matches!(
                     operation,
-                    LiveOperation::Pause | LiveOperation::Capture | LiveOperation::Restore
+                    LiveOperation::Pause
+                        | LiveOperation::Capture
+                        | LiveOperation::Restore
+                        | LiveOperation::Fork
                 ) {
                     "lane-not-qualified"
                 } else {
@@ -214,7 +217,7 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
             assert!(
                 error.contains(if backend == "vz" {
                     "backend-excluded"
-                } else if matches!(operation, "pause" | "capture" | "restore") {
+                } else if matches!(operation, "pause" | "capture" | "restore" | "fork") {
                     "lane-not-qualified"
                 } else {
                     "not-delivered"
@@ -250,6 +253,30 @@ fn early_rejection_explicit_live_execution_grammar_has_no_legacy_aliases_or_fall
             "ambiguous or obsolete grammar accepted: {args:?}"
         );
         assert_eq!(snapshot(temp.path()), before);
+    }
+}
+
+#[test]
+fn early_rejection_fork_operation_lookup_in_absent_home_creates_nothing() {
+    let temp = tempfile::tempdir().expect("private root");
+    install_runtime(&temp.path().join("runtime"));
+    let before = snapshot(temp.path());
+    let operation = "00000000-0000-4000-8000-0000000000aa";
+    for args in [
+        vec!["fork", "--operation", operation],
+        vec!["fork", "--operation", operation, "--cancel"],
+    ] {
+        let output = run(temp.path(), "krun", &args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).expect("UTF-8 error");
+        assert!(
+            error.contains(&format!("live fork {operation} was not found")),
+            "{error}"
+        );
+        assert_eq!(snapshot(temp.path()), before, "{args:?}");
+        assert!(!temp.path().join("home").exists());
+        assert!(!temp.path().join("run").exists());
     }
 }
 

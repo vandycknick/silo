@@ -172,14 +172,22 @@ impl Machine {
         self.send_prepared(prepared.intent).await
     }
 
-    /// Send an already durable intent and persist its exact result. No
-    /// transaction or machine lock spans the monitor round trip.
+    /// Send an already durable intent and persist its exact result. Capture
+    /// dispatch holds the machine lock through acknowledgment to serialize
+    /// fork cancellation; no database transaction spans the monitor round trip.
     pub(crate) async fn send_prepared(
         &self,
         intent: LiveCommandIntent,
     ) -> Result<LiveCommandResult, LibVmError> {
         let runtime = self.runtime();
         let store = runtime.native_store()?;
+        let capture_lock = if let LiveCommand::Capture(command) = &intent.command {
+            let (lock, _) = runtime.lock_machine_config(self.machine_id()).await?;
+            store.require_capture_dispatch(command).await?;
+            Some(lock)
+        } else {
+            None
+        };
         let result = runtime
             .supervisor()
             .client(self.machine_id())
@@ -191,6 +199,7 @@ impl Machine {
                     intent.command.envelope().request_id
                 ))
             })?;
+        drop(capture_lock);
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         save_result(runtime, &store, &config, &intent, &result).await?;
         Ok(result)

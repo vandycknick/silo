@@ -796,6 +796,20 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
             reference: Some(w::machine_ref::Reference::Name("not-created".into())),
         }),
     };
+    let fork_request = || w::LiveForkRequest {
+        machine: request().machine,
+        operation_id: "00000000-0000-4000-8000-0000000000aa".into(),
+        children: vec![w::LiveForkChild {
+            name: "child".into(),
+            activation_hook: None,
+            destination: Some(w::ForkDestination::default()),
+        }],
+        max_children: 16,
+        resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
+        resources: Some(silo_vm_control::stopped::restore_resources_to_wire(
+            libvm::RestoreResourcePolicy::default(),
+        )),
+    };
     let results = [
         (
             LiveOperation::Pause,
@@ -814,13 +828,7 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
         ),
         (
             LiveOperation::Fork,
-            machines
-                .fork_execution(w::LiveForkRequest {
-                    machine: request().machine,
-                    name: Some("child".into()),
-                })
-                .await
-                .unwrap_err(),
+            machines.fork_execution(fork_request()).await.unwrap_err(),
         ),
         (
             LiveOperation::Restore,
@@ -857,6 +865,29 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
             error => panic!("not a typed live refusal: {error:?}"),
         }
     }
+    // Malformed fork requests and operation references are refused before
+    // capability evidence, admission or runtime initialization.
+    let mut duplicate = fork_request();
+    duplicate.children.push(duplicate.children[0].clone());
+    let mut nil = fork_request();
+    nil.operation_id = "00000000-0000-0000-0000-000000000000".into();
+    for request in [duplicate, nil] {
+        assert_eq!(
+            machines.fork_execution(request).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let invalid = || w::ForkOperationRef {
+        operation_id: "00000000-0000-0000-0000-000000000000".into(),
+    };
+    assert_eq!(
+        runtime.get_fork(invalid()).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        runtime.cancel_fork(invalid()).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
     assert!(owner.runtime.get().is_none());
     assert!(owner.components.get().is_none());
     assert_eq!(owner.capacity.available_permits(), 0);

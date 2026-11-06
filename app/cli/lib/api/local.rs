@@ -146,7 +146,62 @@ impl LocalVmService {
         Ok(machine.snapshot_live(&observation, options).await?)
     }
 
-    pub(crate) async fn require_machine_live(
+    /// Live fork applies the daemon's strict request rules and requires exact
+    /// Fork capability admission from read-only evidence before writable
+    /// initialization; libvm repeats admission under its locks.
+    pub(crate) async fn fork_live(
+        &mut self,
+        reference: &str,
+        options: libvm::LiveForkOptions,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        let machine_ref = MachineRef::parse(reference)?;
+        silo_vm_control::fork::request_to_wire(&machine_ref, &options)?;
+        options.validate()?;
+        self.require_machine_live(reference, vm_spec::live::LiveOperation::Fork)
+            .await?;
+        let observation = self.observe_machine_live(&machine_ref).await?;
+        let machine = self.runtime().await?.get_machine(&machine_ref).await?;
+        Ok(machine.fork_live(&observation, options).await?)
+    }
+
+    /// Fork operations are addressed by ID alone, never through their source.
+    pub(crate) async fn inspect_fork(
+        &mut self,
+        operation_id: uuid::Uuid,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        self.require_fork_catalog(operation_id)?;
+        Ok(self.runtime().await?.inspect_fork(operation_id).await?)
+    }
+
+    pub(crate) async fn cancel_fork(
+        &mut self,
+        operation_id: uuid::Uuid,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        self.require_fork_catalog(operation_id)?;
+        Ok(self.runtime().await?.cancel_fork(operation_id).await?)
+    }
+
+    /// A home without a catalog holds no fork operation; answer that without
+    /// writable initialization.
+    fn require_fork_catalog(&self, operation_id: uuid::Uuid) -> eyre::Result<()> {
+        match self {
+            Self::Uninitialized {
+                config: Some(config),
+                ..
+            } if !libvm::LiveObservationReader::open(config)?.catalog_exists()? => {
+                Err(libvm::LibVmError::LiveForkNotFound {
+                    operation_id: operation_id.hyphenated().to_string(),
+                }
+                .into())
+            }
+            Self::Uninitialized { config: None, .. } => {
+                eyre::bail!("local runtime configuration unavailable")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn require_machine_live(
         &self,
         reference: &str,
         operation: vm_spec::live::LiveOperation,

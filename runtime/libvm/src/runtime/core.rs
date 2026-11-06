@@ -164,6 +164,9 @@ impl Runtime {
         if let Err(error) = crate::machine::live_capture::reconcile_captures(&runtime, None).await {
             tracing::warn!(%error, "live capture recovery retained uncertainty");
         }
+        if let Err(error) = crate::machine::live_fork::reconcile_forks(&runtime).await {
+            tracing::warn!(%error, "live fork recovery retained uncertainty");
+        }
         Ok(runtime)
     }
 

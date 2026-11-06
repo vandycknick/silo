@@ -91,15 +91,43 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn fork_execution(&mut self, reference: &str, name: &str) -> eyre::Result<()> {
-        match self {
-            Self::Local(service) => {
-                service
-                    .require_machine_live(reference, vm_spec::live::LiveOperation::Fork)
-                    .await
-            }
-            Self::Daemon(service) => service.fork_execution(reference, name).await,
-        }
+    /// Both transports run the same libvm operation and every accepted result
+    /// must answer exactly this request.
+    pub(crate) async fn fork_live(
+        &mut self,
+        reference: &str,
+        options: libvm::LiveForkOptions,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        let result = match self {
+            Self::Local(service) => service.fork_live(reference, options.clone()).await?,
+            Self::Daemon(service) => service.fork_live(reference, options.clone()).await?,
+        };
+        silo_vm_control::fork::validate_creation(&result, &options)?;
+        Ok(result)
+    }
+
+    pub(crate) async fn inspect_fork(
+        &mut self,
+        operation_id: uuid::Uuid,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        let result = match self {
+            Self::Local(service) => service.inspect_fork(operation_id).await?,
+            Self::Daemon(service) => service.inspect_fork(operation_id).await?,
+        };
+        silo_vm_control::fork::validate_observation(&result, operation_id)?;
+        Ok(result)
+    }
+
+    pub(crate) async fn cancel_fork(
+        &mut self,
+        operation_id: uuid::Uuid,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        let result = match self {
+            Self::Local(service) => service.cancel_fork(operation_id).await?,
+            Self::Daemon(service) => service.cancel_fork(operation_id).await?,
+        };
+        silo_vm_control::fork::validate_observation(&result, operation_id)?;
+        Ok(result)
     }
 
     pub(crate) async fn fork_stopped(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 import platform
 
@@ -8,7 +10,7 @@ from pluggy import Result
 import pytest
 
 from silo_smoke import config as smoke_config, image_cache, images, overlay, preflight
-from silo_smoke.cli import Silo, Vm
+from silo_smoke.cli import TIMINGS_PROPERTY, Silo, Vm, release, timed
 from silo_smoke.config import SmokeConfig
 from silo_smoke.daemon import Daemon
 from silo_smoke.errors import SmokeEnvironmentError
@@ -93,26 +95,41 @@ def overlay_image_bytes(config: SmokeConfig, overlay_probe: Path) -> images.OciI
     return overlay.image(config, overlay_probe)
 
 
-@pytest.fixture(scope="session")
-def overlay_image_caches(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_bytes: images.OciImage, request: pytest.FixtureRequest) -> Generator[dict[str, Path], None, None]:
-    """Prepare image-only catalogs without introducing extra retention roots."""
-    preparations: list[Workspace] = []
+@contextmanager
+def _prepared_image_catalogs(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.FixtureRequest, record_testsuite_property: Callable[[str, object], None], references: dict[str, str]) -> Iterator[dict[str, Path]]:
+    """Prepare one image-only catalog per reference, each from its own never-booted machine and Home."""
+    preparations: list[tuple[str, Workspace]] = []
     caches: dict[str, Path] = {}
     prepared = False
     try:
-        for name in ("overlay", "stopped"):
+        for name, reference in references.items():
             preparation = Workspace(config, registry.ca_path)
-            preparations.append(preparation)
-            reference = registry.publish(overlay_image_bytes, name)
-            Silo(preparation).create("prepare-" + name, reference, "--disk-size", "512mib", "--network", "none")
-            cache = preparation.root / "prepared-images"
-            assert image_cache.persist(cache, preparation.silo_home)
+            preparations.append((name, preparation))
+            with timed(preparation, "image_cache.prepare"):
+                Silo(preparation).create("prepare-" + name, reference, "--disk-size", "512mib", "--network", "none")
+                cache = preparation.root / "prepared-images"
+                assert image_cache.persist(cache, preparation.silo_home)
             caches[name] = cache
         prepared = True
         yield caches
     finally:
-        for preparation in reversed(preparations):
-            preparation.cleanup(failed=not prepared or request.session.testsfailed > 0)
+        for name, preparation in reversed(preparations):
+            release(preparation, failed=not prepared or request.session.testsfailed > 0, publish=partial(record_testsuite_property, f"{TIMINGS_PROPERTY}-prepare-{name}"))
+
+
+@pytest.fixture(scope="session")
+def overlay_image_caches(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_bytes: images.OciImage, request: pytest.FixtureRequest, record_testsuite_property: Callable[[str, object], None]) -> Generator[dict[str, Path], None, None]:
+    """Separate references/catalogs, so neither adds a retention root to the other."""
+    references = {name: registry.publish(overlay_image_bytes, name) for name in ("overlay", "stopped")}
+    with _prepared_image_catalogs(config, registry, request, record_testsuite_property, references) as caches:
+        yield caches
+
+
+@pytest.fixture(scope="session")
+def basic_image_cache(config: SmokeConfig, registry: LoopbackRegistry, basic_image: str, request: pytest.FixtureRequest, record_testsuite_property: Callable[[str, object], None]) -> Generator[Path, None, None]:
+    """BASIC-only catalog for the common `vm` fixture; never merged with other caches."""
+    with _prepared_image_catalogs(config, registry, request, record_testsuite_property, {"basic": basic_image}) as caches:
+        yield caches["basic"]
 
 
 @pytest.fixture
@@ -121,7 +138,7 @@ def workspace(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.F
     try:
         yield instance
     finally:
-        instance.cleanup(failed=request.node.stash.get(_FAILED, False))
+        release(instance, failed=request.node.stash.get(_FAILED, False), publish=lambda summary: request.node.user_properties.append((TIMINGS_PROPERTY, summary)))
 
 
 @pytest.fixture
@@ -130,12 +147,18 @@ def silo(workspace: Workspace) -> Silo:
 
 
 @pytest.fixture
-def vm(silo: Silo, basic_image: str) -> Generator[Vm, None, None]:
+def vm(silo: Silo, basic_image: str, basic_image_cache: Path) -> Generator[Vm, None, None]:
+    # Seed only this fixture's fresh Home. Create, boot and readiness stay real
+    # and private; acquisition coverage lives in unseeded lifecycle/cache tests.
+    with timed(silo.ws, "image_cache.seed"):
+        seeded = image_cache.seed(basic_image_cache, silo.ws.silo_home)
+    assert seeded == {basic_image}, seeded
+    silo.ws.record("image-cache", f"seeded session-prepared BASIC image: {sorted(seeded)}\n")
     name = "smoke-vm"
     silo.create(name, basic_image, "--cpus", "1", "--memory", "512mb", "--vsock", "--network", "none")
     silo.start(name)
-    silo.wait_ready(name)
-    yield Vm(name, silo.machine_id(name))
+    ready = silo.wait_ready(name)
+    yield Vm(name, str(ready["id"]))
 
 
 @pytest.fixture

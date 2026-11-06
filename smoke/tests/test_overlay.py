@@ -11,7 +11,7 @@ import time
 import pytest
 
 from silo_smoke import image_cache, images, overlay, procs, shutdown
-from silo_smoke.cli import Silo
+from silo_smoke.cli import Silo, timed
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -19,7 +19,8 @@ from silo_smoke.workspace import Workspace
 
 @pytest.fixture
 def silo(workspace: Workspace, overlay_image_caches: dict[str, Path]) -> Silo:
-    seeded = image_cache.seed(overlay_image_caches["overlay"], workspace.silo_home)
+    with timed(workspace, "image_cache.seed"):
+        seeded = image_cache.seed(overlay_image_caches["overlay"], workspace.silo_home)
     assert len(seeded) == 1, seeded
     workspace.record("image-cache", f"seeded session-prepared overlay image: {sorted(seeded)}\n")
     return Silo(workspace)
@@ -48,7 +49,7 @@ def test_overlay_production_persistence_index_metadata_whiteouts(silo: Silo, ove
     name = "overlay-persist"
     overlay.create(silo, name, overlay_image)
     observed = overlay.evidence(silo, name)
-    first_frame = overlay.metrics(silo, name)["_observation"]
+    first_frame = observed.metrics["_observation"]
     first_run = procs.run_id(silo.ws, name)
     first_monitor = procs.vmm_pid(silo.ws, name)
     descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
@@ -106,7 +107,7 @@ printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
     assert index_lines[0].strip() == index_inode
     assert readback_parts[1] == "committed\n"
     assert readback_parts[2] == "committed\n"
-    assert overlay.observation(silo, name)["root"]["upper"]["filesystemUuid"] == observed["root"]["upper"]["filesystemUuid"]
+    assert overlay.observation(silo, name)["root"]["upper"]["filesystemUuid"] == observed.observation["root"]["upper"]["filesystemUuid"]
     assert overlay.digest(lower) == before
 
 
@@ -334,7 +335,7 @@ def test_overlay_replacement_growth_and_short_tails(silo: Silo, overlay_image: s
     silo.ws.record("overlay-growth-allocation", json.dumps({"stage": "replacement-before-boot", "originalPrefixBytesCompared": old_length, "files": [{"path": str(path), "logicalBytes": path.stat().st_size, "allocatedBytes": path.stat().st_blocks * 512} for path in (source, second_source, replacement)]}) + "\n")
     silo.start(name)
     silo.wait_ready(name, timeout=240)
-    after = overlay.evidence(silo, name)
+    after = overlay.evidence(silo, name).observation
     assert after["root"]["upper"]["filesystemUuid"] == before["root"]["upper"]["filesystemUuid"]
     assert after["upperFilesystemBytes"] + after["unusableTailBytes"] == capacity
     assert after["unusableTailBytes"] == (4096 if capacity in {128 * 1024**2 + 4096, 16 * 1024**3 + 4096} else 0)

@@ -185,6 +185,21 @@ impl OwnedDirectory {
 
     /// Opens one private regular file without creating it.
     pub(crate) fn open_file(&self, name: &str) -> Result<Option<File>, LibVmError> {
+        self.open_file_modes(name, &[PRIVATE_FILE_MODE])
+    }
+
+    /// Immutable cut payload, never a mutable control/configuration record.
+    pub(crate) fn open_immutable_file(&self, name: &str) -> Result<Option<File>, LibVmError> {
+        self.open_file_modes(name, &[Mode::S_IRUSR])
+    }
+
+    /// A sealed capture may be journaled between relocation and chmod. Both
+    /// private staging and final read-only modes remain explicit here.
+    pub(crate) fn open_capture_payload(&self, name: &str) -> Result<Option<File>, LibVmError> {
+        self.open_file_modes(name, &[PRIVATE_FILE_MODE, Mode::S_IRUSR])
+    }
+
+    fn open_file_modes(&self, name: &str, modes: &[Mode]) -> Result<Option<File>, LibVmError> {
         if !is_single_component(name) {
             return Err(invalid(
                 &self.path.join(name),
@@ -202,7 +217,7 @@ impl OwnedDirectory {
             Err(nix::errno::Errno::ENOENT) => return Ok(None),
             Err(error) => return Err(invalid(&path, error)),
         };
-        validate_file(&fd, &path)?;
+        validate_file_modes(&fd, &path, modes)?;
         Ok(Some(File::from(fd)))
     }
 
@@ -490,6 +505,10 @@ fn validate_directory(fd: &OwnedFd, path: &Path, require_private: bool) -> Resul
 }
 
 fn validate_file(fd: &OwnedFd, path: &Path) -> Result<(), LibVmError> {
+    validate_file_modes(fd, path, &[PRIVATE_FILE_MODE])
+}
+
+fn validate_file_modes(fd: &OwnedFd, path: &Path, modes: &[Mode]) -> Result<(), LibVmError> {
     let stat = fstat(fd).map_err(|error| invalid(path, error))?;
     if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFREG {
         return Err(invalid(path, "is not a regular file"));
@@ -505,10 +524,10 @@ fn validate_file(fd: &OwnedFd, path: &Path) -> Result<(), LibVmError> {
         ));
     }
     let mode = Mode::from_bits_retain(stat.st_mode & 0o7777);
-    if mode != PRIVATE_FILE_MODE {
+    if !modes.contains(&mode) {
         return Err(invalid(
             path,
-            format!("has mode {mode:o}, expected {PRIVATE_FILE_MODE:o}"),
+            format!("has mode {mode:o}, not an admitted private file mode"),
         ));
     }
     Ok(())
@@ -531,6 +550,25 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     use crate::paths::OwnedDirectory;
+
+    #[test]
+    fn immutable_cut_payload_modes_do_not_weaken_private_control_file_checks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = OwnedDirectory::open_root(&temporary.path().join("owned")).unwrap();
+        directory.write_file("payload", b"sealed").unwrap();
+        assert!(directory.open_file("payload").unwrap().is_some());
+        assert!(directory.open_immutable_file("payload").is_err());
+        let path = directory.path().join("payload");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(directory.open_immutable_file("payload").unwrap().is_some());
+        assert!(
+            directory.open_file("payload").is_err(),
+            "mutable control APIs still require exactly 0600"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(directory.open_immutable_file("payload").is_err());
+        assert!(directory.open_file("payload").is_err());
+    }
 
     #[test]
     fn owned_directories_are_private_and_descriptor_relative() {
