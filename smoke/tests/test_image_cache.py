@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sqlite3
 
-from silo_smoke import image_cache
+from silo_smoke import image_cache, procs, stopped
 from silo_smoke.cli import Silo
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -22,7 +23,7 @@ def test_image_catalog_snapshot_seeds_cache_without_private_machine_state(
     destination = tmp_path / "destination"
     destination.mkdir(mode=0o700)
     carried = image_cache.seed(cache, destination)
-    assert basic_image in carried
+    assert carried == {basic_image}
     assert not (destination / "machines").exists()
     assert not (destination / "images/tmp").exists()
     assert not (destination / "images/locks").exists()
@@ -30,6 +31,7 @@ def test_image_catalog_snapshot_seeds_cache_without_private_machine_state(
     with sqlite3.connect(destination / "state.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM machine_config").fetchone() == (0,)
         assert connection.execute("SELECT COUNT(*) FROM storage_operation").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM storage_snapshot").fetchone() == (0,)
         for table in ("storage_operation_stream", "storage_operation_object", "storage_operation_layer"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
         paths = connection.execute("SELECT rootfs_path FROM image_rootfs_artifact").fetchall()
@@ -44,5 +46,16 @@ def test_image_catalog_snapshot_seeds_cache_without_private_machine_state(
     try:
         assert registry.requests == requests
         assert silo.json("info", "catalog-clone", env=environment)["state"] == "stopped"
+        rows = procs.query(destination / "state.db", """
+SELECT c.id, json(s.record_json) FROM machine_config c
+JOIN machine_storage s ON s.machine_id=c.id WHERE c.name='catalog-clone'
+""")
+        assert len(rows) == 1, rows
+        machine_id, encoded = rows[0]
+        root = json.loads(encoded)["root"]
+        relative = root["path"] if root["kind"] == "opaque-raw" else root["upper"]
+        cloned = destination / "machines" / machine_id / relative
+        original = stopped.writable_paths(silo, "catalog-source")["root"]
+        assert (cloned.stat().st_dev, cloned.stat().st_ino) != (original.stat().st_dev, original.stat().st_ino)
     finally:
         silo.run("rm", "catalog-clone", "--force", env=environment)

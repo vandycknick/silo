@@ -142,9 +142,28 @@ impl Store {
                 result,
             });
         }
+        if let LiveCommand::Capture(command) = &intent.command {
+            let json:String=sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'").bind(request_id.to_string()).fetch_one(&mut *tx).await?;
+            let reservation = crate::store::capture::decode_record(&json)?;
+            if reservation.state != crate::store::snapshot_store::CaptureState::Reserved
+                || reservation.plan != command.plan
+            {
+                return Err(invalid("capture intent has no eligible exact reservation"));
+            }
+            let refused:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_fork WHERE capture_id=?1 AND (admission_complete=0 OR json_extract(result_json,'$.cancellationRequested')=1 OR json_extract(result_json,'$.capture.kind')!='pending'))").bind(request_id.to_string()).fetch_one(&mut *tx).await?;
+            if refused {
+                return Err(invalid(
+                    "fork cancellation or incomplete batch admission fences capture submission",
+                ));
+            }
+        }
         sqlx::query("INSERT INTO live_command(machine_id,run_id,request_id,monitor_id,input_json) VALUES(?1,?2,?3,?4,jsonb(?5))")
             .bind(machine_id.to_string()).bind(run_id.to_string()).bind(request_id.to_string())
             .bind(&intent.report.monitor_id).bind(input).execute(&mut *tx).await?;
+        if matches!(intent.command, LiveCommand::Capture(_)) {
+            sqlx::query("UPDATE live_fork SET result_json=jsonb_set(result_json,'$.stage','capturing') WHERE capture_id=?1").bind(request_id.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO fork_event(operation_id,phase,monotonic_ns) SELECT operation_id,'capture_submitted',?2 FROM live_fork WHERE capture_id=?1").bind(request_id.to_string()).bind(crate::machine::live_fork::monotonic_ns()?).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(RetainedLiveCommand {
             intent: intent.clone(),

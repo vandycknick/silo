@@ -40,6 +40,9 @@ const COPY_BUFFER_BYTES: usize = 1 << 20;
 /// Native canonical layouts are bounded at 64 KiB.
 const MAX_LAYOUT_BYTES: u64 = 64 * 1024;
 
+/// Non-stream authentication needs no canonical 8 MiB chunk buffer.
+const WHOLE_FILE_HASH_BUFFER_BYTES: usize = 1 << 20;
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -614,7 +617,7 @@ fn next_extent(source: &File, offset: u64, length: u64) -> io::Result<Option<(u6
 }
 
 /// Whole-file SHA-256 plus, for RAM, the ADR 0014 stream identity, in one
-/// bounded sequential pass with a reusable 8 MiB buffer.
+/// bounded sequential pass (8 MiB RAM scratch, 1 MiB for other roles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HashedFile {
     pub(crate) length: u64,
@@ -633,6 +636,13 @@ impl Hasher {
         }
     }
 
+    /// Whole-file SHA only, using the smaller serial-role lane scratch.
+    pub(crate) fn whole_file() -> Self {
+        Self {
+            buffer: vec![0u8; WHOLE_FILE_HASH_BUFFER_BYTES],
+        }
+    }
+
     pub(crate) fn hash(
         &mut self,
         file: &File,
@@ -641,6 +651,9 @@ impl Hasher {
         cancel: &CancellationToken,
     ) -> io::Result<HashedFile> {
         use sha2::Digest as _;
+        if stream && self.buffer.len() as u64 != STREAM_CHUNK_BYTES {
+            return Err(invalid("stream hashing requires canonical chunk scratch"));
+        }
         let mut whole = sha2::Sha256::new();
         let mut identity = stream.then(StreamIdentity::new);
         let mut offset = 0u64;
@@ -651,7 +664,7 @@ impl Hasher {
                     "hashing cancelled",
                 ));
             }
-            let span = usize::try_from((length - offset).min(STREAM_CHUNK_BYTES))
+            let span = usize::try_from((length - offset).min(self.buffer.len() as u64))
                 .map_err(|_| invalid("hash span overflow"))?;
             let chunk = &mut self.buffer[..span];
             file.read_exact_at(chunk, offset)?;
@@ -1047,6 +1060,17 @@ mod tests {
             identity.push_chunk(chunk).unwrap();
         }
         assert_eq!(result.stream, Some(identity.finish()));
+        // Non-stream roles use smaller scratch, but authenticate the same
+        // sparse bytes and short tail independently of read chunk size.
+        let whole = Hasher::whole_file()
+            .hash(&file, length, false, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(whole.length, result.length);
+        assert_eq!(whole.sha256, result.sha256);
+        assert_eq!(whole.stream, None);
+        assert!(Hasher::whole_file()
+            .hash(&file, length, true, &CancellationToken::new())
+            .is_err());
         assert!(Hasher::new()
             .hash(&file, length + 1, true, &CancellationToken::new())
             .is_err());

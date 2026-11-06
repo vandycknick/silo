@@ -97,11 +97,31 @@ impl w::machine_service_server::MachineService for Service {
         Ok(Response::new(result))
     }
 
-    async fn fork_execution(&self, r: Request<w::LiveForkRequest>) -> Result<Response<()>, Status> {
-        let reference = reference(r.into_inner().machine)?;
+    async fn fork_execution(
+        &self,
+        r: Request<w::LiveForkRequest>,
+    ) -> Result<Response<w::LiveForkResult>, Status> {
+        let (reference, options) =
+            silo_vm_control::fork::request_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        options.validate().map_err(native)?;
+        // Capability refusal precedes every lock, reservation and journal row.
         self.require_machine_live(&reference, vm_spec::live::LiveOperation::Fork)
             .await?;
-        Ok(Response::new(()))
+        let observation = self.observe_machine_live(&reference).await?;
+        let state = self.clone();
+        // The spawned mutation owns the operation: a client disconnect is not cancellation.
+        let result = self
+            .mutate(&r, true, async move {
+                let result = state
+                    .machine(&reference)
+                    .await?
+                    .fork_live(&observation, options)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::fork::result_to_wire(&result).map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(result))
     }
 
     async fn fork_stopped(

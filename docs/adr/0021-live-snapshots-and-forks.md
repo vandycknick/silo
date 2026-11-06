@@ -275,9 +275,14 @@ suspended for the duration of a pause; operation deadlines are not.
 clock-only VM generation request so the guest corrects wall time without
 treating itself as a clone, and resumes the vCPUs. The monitor re-handshakes
 agent transport and sends `Thaw`; the agent acknowledges with the set it
-thawed. The machine returns `Running` only when the thaw acknowledgement and
-readiness are established. A stale or foreign token, or a `Resume` while a
-capture is in progress, is rejected.
+thawed. After that exact successful acknowledgement, the monitor requests a
+new identity-validated status within the fixed readiness deadline. A watch
+report received before the acknowledgement (even one emitted by the thaw)
+cannot satisfy this post-thaw freshness boundary. The full Ready prerequisites
+still apply, and public readiness and admission stay fenced until `Running`.
+The machine returns `Running` only when the thaw acknowledgement and readiness
+are established. A stale or foreign token, or a `Resume` while a capture is in
+progress, is rejected.
 
 If the thaw acknowledgement is lost, the workload may have executed. The
 monitor re-issues `FreezeWorkloads`, which is idempotent; on acknowledgement
@@ -663,6 +668,14 @@ outcome. Before the capture seals, every child fails together. After it seals,
 one child's failure does not roll back running siblings or recapture the
 source. Cancelling a fork never deletes a running child's dependency root.
 
+An observed child restore failure retains its original bounded diagnostic and
+typed construction or activation phase in the fork journal before failed-start
+cleanup may delete the child and its monitor records. Retained generation,
+consumer or holder ownership keeps the child `recovery-pending`; positive
+retirement resolves it to `failed` with that original evidence, not `abandoned`
+or a generic cleanup diagnostic. A lost manager without retained failure
+evidence remains uncertain and is never assigned an invented activation cause.
+
 Children inherit the source's configuration, guest settings and backend
 requirement. They inherit no session forwards, netd publications, published
 ports, external mounts, secret authorizations or open host resources; those
@@ -704,7 +717,7 @@ not the fragments.
 | --- | --- |
 | Silo machine, run, monitor, worker, sockets | New. |
 | Agent instance identity | Rotated by the agent during `Activate`; the captured boot ID is provenance. |
-| MAC, IP, routes, DNS | New host identities, applied by the agent during `Activate`. |
+| MAC, IP, routes, DNS | Fresh destination network reservation, applied by the agent during `Activate`. MACs are distinct; numeric IPs may repeat across separate private networks, each with its own netd instance and data socket (ADR 0010). |
 | Hostname, machine-id, filesystem UUIDs, partition GUIDs, SSH host keys | Preserved. An explicitly selected activation hook may change what it supports; there is no universal live generalizer. |
 | Kernel entropy pool | Reseeded through the VM generation protocol before the workload runs. |
 | Userspace RNG state, tokens, nonces, cached credentials | Duplicated. Disclosed in the checkpoint description; not sanitized. |

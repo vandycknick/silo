@@ -107,16 +107,51 @@ impl DaemonVmService {
         )?)
     }
 
-    pub(crate) async fn fork_execution(&self, value: &str, name: &str) -> eyre::Result<()> {
-        self.machines
-            .clone()
-            .fork_execution(w::LiveForkRequest {
-                machine: Some(reference(value)?),
-                name: Some(name.into()),
-            })
-            .await
-            .map_err(native_status)?;
-        Ok(())
+    /// The daemon owns the operation once submitted: a lost reply or client
+    /// disconnect is not cancellation.
+    pub(crate) async fn fork_live(
+        &self,
+        value: &str,
+        options: libvm::LiveForkOptions,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        let request =
+            silo_vm_control::fork::request_to_wire(&libvm::MachineRef::parse(value)?, &options)?;
+        Ok(silo_vm_control::fork::result_from_wire(
+            self.machines
+                .clone()
+                .fork_execution(request)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn inspect_fork(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        Ok(silo_vm_control::fork::result_from_wire(
+            self.runtime
+                .clone()
+                .get_fork(silo_vm_control::fork::operation_to_wire(operation_id)?)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn cancel_fork(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> eyre::Result<libvm::LiveForkResult> {
+        Ok(silo_vm_control::fork::result_from_wire(
+            self.runtime
+                .clone()
+                .cancel_fork(silo_vm_control::fork::operation_to_wire(operation_id)?)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
     }
 
     pub(crate) async fn fork_stopped(

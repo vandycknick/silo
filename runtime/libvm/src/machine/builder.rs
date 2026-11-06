@@ -691,16 +691,17 @@ async fn create_machine_config_with_name(
         })?;
         let mut qualification = CopyQualification::new(32);
         let mut prepared = copy_private(
-            &source,
-            materialized.size_bytes,
+            crate::machine::root_disk::CopySource::Unscanned {
+                file: &source,
+                length: materialized.size_bytes,
+            },
             stage,
             "content",
             &mut qualification,
         )?;
         tracing::debug!(
             method = ?prepared.method(),
-            stream = ?prepared.map().map(|map| map.id()),
-            scan = ?prepared.scan().map(|scan| &scan.stats),
+            verification = ?prepared.verification(),
             file = ?prepared.file(),
             length = materialized.size_bytes,
             "prepared private root copy",
@@ -773,7 +774,14 @@ async fn create_machine_guard(
         return Err(LibVmError::MachineAlreadyExists { name });
     }
 
-    let id = MachineId::new();
+    let id = match stopped_operation {
+        Some(operation) => runtime
+            .native_store()?
+            .reserved_fork_machine(operation, &name)
+            .await?
+            .unwrap_or_else(MachineId::new),
+        None => MachineId::new(),
+    };
     let machine_dir = runtime.machine_paths(id).dir().to_path_buf();
     let lock = runtime.allocate_machine_lock()?;
     let mut create = MachineCreateGuard {
@@ -1161,7 +1169,7 @@ async fn publish_checkpoint_child(
                     .iter_mut()
                     .find(|disk| {
                         matches!(&disk.storage, crate::DiskStorage::ManagedWritable { path, .. }
-                        if path == &source.path)
+                        if path == source.path())
                     })
                     .ok_or_else(|| {
                         crate::machine::root_storage::invalid(
@@ -1179,18 +1187,16 @@ async fn publish_checkpoint_child(
             crate::machine::root_storage::invalid("child private path is not UTF-8")
         })?;
         let mut prepared = copy_private(
-            &source.file,
-            source.length,
+            source.copy_source(),
             stage.try_clone()?,
             &format!("file-{index}"),
             &mut qualification,
         )?;
         tracing::debug!(
             method = ?prepared.method(),
-            stream = ?prepared.map().map(|map| map.id()),
-            scan = ?prepared.scan().map(|scan| &scan.stats),
+            verification = ?prepared.verification(),
             file = ?prepared.file(),
-            length = source.length,
+            length = source.length(),
             "prepared stopped private attachment",
         );
         prepared.publish(directory.try_clone()?, target_name)?;

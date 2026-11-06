@@ -145,6 +145,7 @@ async fn stream_events(
     let control = session.control();
     let mut stdin: Option<libvm::ExecutionStdin> = None;
     let mut stdin_closed = false;
+    let mut stdin_close_error = None;
     let mut started = false;
     let mut launch_cancelled = false;
     let mut signals = match mode {
@@ -161,7 +162,10 @@ async fn stream_events(
                     stdin_closed = true;
                     if mode == StreamMode::Piped {
                         if let Some(stdin) = stdin.as_ref() {
-                            stdin.close().await.context("close guest stdin")?;
+                            // A short-lived process may close requests before its
+                            // terminal response reaches us. Keep draining responses;
+                            // only an actual terminal result can supersede this error.
+                            stdin_close_error = stdin.close().await.context("close guest stdin").err();
                         }
                     }
                 } else if let Some(stdin) = stdin.as_ref() {
@@ -243,6 +247,9 @@ async fn stream_events(
             }
             ExecutionEvent::Terminal(result) => return Ok(result),
         }
+    }
+    if let Some(error) = stdin_close_error {
+        return Err(error);
     }
     eyre::bail!("guest command ended without a terminal result")
 }

@@ -89,6 +89,13 @@ mod tests {
             vec!["silo", "pause", "vm"],
             vec!["silo", "snapshot", "create", "vm", "--live"],
             vec!["silo", "fork", "vm", "--name", "child", "--live"],
+            vec![
+                "silo",
+                "fork",
+                "--operation",
+                "00000000-0000-4000-8000-0000000000aa",
+                "--cancel",
+            ],
             vec!["silo", "restore", "checkpoint"],
             vec!["silo", "system", "info"],
         ] {

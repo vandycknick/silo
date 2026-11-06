@@ -32,7 +32,7 @@ service MachineService {
  rpc PauseMachine(LiveMachineRequest) returns (MachineSnapshot);
  rpc ResumeMachine(LiveMachineRequest) returns (MachineSnapshot);
  rpc CaptureExecution(LiveCaptureRequest) returns (LiveSnapshotInfo);
- rpc ForkExecution(LiveForkRequest) returns (google.protobuf.Empty);
+ rpc ForkExecution(LiveForkRequest) returns (LiveForkResult);
  rpc ForkStopped(StoppedForkRequest) returns (MachineSnapshot);
  rpc SnapshotStopped(CreateStorageSnapshotRequest) returns (StorageSnapshotInfo);
 }
@@ -55,6 +55,10 @@ service RuntimeService {
  rpc ListStorageSnapshots(google.protobuf.Empty) returns (StorageSnapshotList);
  rpc ReleaseSnapshotRetention(StorageSnapshotRef) returns (google.protobuf.Empty);
  rpc RemoveImageAlias(Name) returns (google.protobuf.Empty);
+ // Operation-scoped live fork observation and durable cancellation intent;
+ // never resolved through a source machine, which may since have been removed.
+ rpc GetFork(ForkOperationRef) returns (LiveForkResult);
+ rpc CancelFork(ForkOperationRef) returns (LiveForkResult);
 }
 message Name { string name = 1; }
 message MachineRef { oneof reference { string id = 1; string name = 2; string id_prefix = 3; } }
@@ -248,7 +252,6 @@ enum MachineCaptureStage { MACHINE_CAPTURE_STAGE_UNSPECIFIED = 0; MACHINE_CAPTUR
 // A retained, not yet released capture of this machine. source_outcome is
 // UNSPECIFIED until the continuation is recorded.
 message MachineCapture { string capture_id = 1; string run_id = 2; CaptureResumePolicy resume_policy = 3; CapturePauseDisposition pause = 4; MachineCaptureStage stage = 5; optional string snapshot_id = 6; CaptureSourceOutcome source_outcome = 7; string staging = 8; }
-message LiveForkRequest { MachineRef machine = 1; optional string name = 2; }
 // Stopped artifacts are distinct from MachineSnapshot, the observational read model.
 message StorageSnapshotRef { oneof reference { string id = 1; string image_alias = 2; } }
 message ExternalResourceKey { oneof resource { uint32 disk_order = 1; string share_tag = 2; } }
@@ -264,6 +267,25 @@ message RestoreActivationHook { repeated string argv = 1; repeated EnvironmentPa
 enum RestoreMemoryPolicy { RESTORE_MEMORY_POLICY_UNSPECIFIED = 0; RESTORE_MEMORY_POLICY_RESERVED = 1; RESTORE_MEMORY_POLICY_ALLOW_OVERCOMMIT = 2; }
 message RestoreResourcePolicy { uint32 private_write_percent = 1; RestoreMemoryPolicy memory = 2; }
 message RestoreStorageSnapshotRequest { StorageSnapshotRef snapshot = 1; optional string name = 2; ExternalResourcePolicy external_resources = 3; RestoreActivationHook activation_hook = 4; RestoreResourcePolicy resources = 5; }
+// Live fork: one capture of a running source, N restored children. The
+// caller-selected, non-nil operation_id is the exact replay key; changed
+// options under an existing ID conflict. An empty destination grants no host
+// forwards or guest publication. Children keep request order.
+message ForkDestination { repeated Forward forwards = 1; optional PublishBind guest_publish = 2; }
+message LiveForkChild { string name = 1; RestoreActivationHook activation_hook = 2; ForkDestination destination = 3; }
+message LiveForkRequest { MachineRef machine = 1; string operation_id = 2; repeated LiveForkChild children = 3; uint32 max_children = 4; CaptureResumePolicy resume_policy = 5; RestoreResourcePolicy resources = 6; }
+message ForkOperationRef { string operation_id = 1; }
+enum ForkStage { FORK_STAGE_UNSPECIFIED = 0; FORK_STAGE_ADMITTED = 1; FORK_STAGE_CAPTURING = 2; FORK_STAGE_RESTORING = 3; FORK_STAGE_SETTLING = 4; FORK_STAGE_FINISHED = 5; }
+enum ForkFailurePhase { FORK_FAILURE_PHASE_UNSPECIFIED = 0; FORK_FAILURE_PHASE_CAPTURE = 1; FORK_FAILURE_PHASE_CONSTRUCTION = 2; FORK_FAILURE_PHASE_ACTIVATION = 3; FORK_FAILURE_PHASE_CLEANUP = 4; }
+// String alternatives carry the bounded diagnostic; sealed carries the local cut digest.
+message ForkCaptureOutcome { oneof outcome { google.protobuf.Empty pending = 1; string sealed_cut_id = 2; string failed = 3; string abandoned = 4; } }
+message ForkSourceOutcome { oneof outcome { google.protobuf.Empty pending = 1; google.protobuf.Empty unchanged = 2; google.protobuf.Empty resumed = 3; google.protobuf.Empty preserved = 4; string resume_failed = 5; string unknown = 6; } }
+message ForkChildFailure { ForkFailurePhase phase = 1; string diagnostic = 2; }
+// running records completion of this exact launch, not current machine state.
+message ForkChildOutcome { oneof outcome { google.protobuf.Empty pending = 1; google.protobuf.Empty constructing = 2; google.protobuf.Empty activating = 3; google.protobuf.Empty running = 4; ForkChildFailure failed = 5; google.protobuf.Empty cancelled = 6; string abandoned = 7; string recovery_pending = 8; } }
+// Reserved identities are named even when the child was never created.
+message ForkChildResult { uint32 index = 1; string name = 2; string machine_id = 3; string run_id = 4; ForkChildOutcome outcome = 5; }
+message LiveForkResult { string operation_id = 1; string source_machine_id = 2; string source_run_id = 3; string capture_id = 4; ForkStage stage = 5; bool cancellation_requested = 6; ForkCaptureOutcome capture = 7; ForkSourceOutcome source = 8; RestoreResourcePolicy resources = 9; repeated ForkChildResult children = 10; }
 enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_KIND_STOPPED_STORAGE = 1; STORAGE_CAPTURE_KIND_LIVE_EXECUTION = 2; }
 // Capture provenance is catalog metadata outside snapshot identity.
 message SnapshotCaptureProvenance { string capture_id = 1; string machine_id = 2; string run_id = 3; string evidence_digest = 4; }

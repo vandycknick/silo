@@ -1,8 +1,8 @@
 //! Execution checkpoints have their own constructor. No ordinary start, root
 //! repair, resize, bootstrap execution or fallback is part of this path.
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Stdio;
@@ -18,7 +18,7 @@ use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
 
 use crate::machine::lifecycle::{finish_failed_start, started_run_monitor, FailedStartState};
 use crate::machine::root_storage::invalid;
-use crate::machine::stopped::{open_immutable_stream, PrivateSource};
+use crate::machine::stopped::PrivateSource;
 use crate::storage::pool::StoragePool;
 use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord, SnapshotRootProfile};
 use crate::store::restore::RestoreIntent;
@@ -87,11 +87,11 @@ pub(crate) async fn restore_owned(
     }
     let store = runtime.native_store()?;
     let snapshots = SnapshotStore::from_store(Arc::new(store.clone()));
-    let consumer = snapshots.consume(&reference).await?;
+    let mut consumer = snapshots.consume(&reference).await?;
     let result = restore_consumer(
         &runtime,
         &snapshots,
-        &consumer,
+        &mut consumer,
         options,
         preview,
         host_report,
@@ -119,12 +119,11 @@ pub(crate) async fn restore_owned(
 async fn restore_consumer(
     runtime: &Runtime,
     snapshots: &SnapshotStore,
-    consumer: &crate::store::snapshot_store::SnapshotConsumer,
+    consumer: &mut crate::store::snapshot_store::SnapshotConsumer,
     options: RestoreOptions,
     preview: SnapshotRecord,
     host_report: LiveHostReport,
 ) -> Result<Machine, LibVmError> {
-    let store = runtime.native_store()?;
     if consumer.record != preview {
         return Err(invalid(
             "checkpoint alias changed between preflight and verification",
@@ -144,18 +143,34 @@ async fn restore_consumer(
     } else {
         0
     };
+    // The consumer still holds its authenticated closure descriptors until
+    // every input below is open; they are part of this process peak.
     crate::storage::limits::preflight_fd_budget(
-        3 * transfer_roles + 3 * consumer.record.disks.len() as u64 + 32,
+        3 * transfer_roles
+            + 3 * consumer.record.disks.len() as u64
+            + 32
+            + consumer.retained_descriptors(),
     )
     .map_err(crate::storage::StorageError::from)?;
+    // `consume` measured both RAM identities in one pass. Reopen its exact
+    // held inode with that measured SHA, never the evidence inventory SHA.
+    // Object digests already are whole-byte SHA-256 identities.
+    let (ram, ram_sha256) =
+        consumer.open_ram(&pool, &execution.memory.stream, execution.memory.length)?;
     let objects = [
-        open_immutable_stream(&pool, &execution.memory.stream, execution.memory.length)?.file,
-        crate::storage::stream::open_regular_source(&pool.object_path(&execution.layout))?,
-        crate::storage::stream::open_regular_source(&pool.object_path(&execution.execution))?,
-        crate::storage::stream::open_regular_source(&pool.object_path(&execution.devices))?,
+        ram,
+        consumer.open_object(&pool, &execution.layout)?,
+        consumer.open_object(&pool, &execution.execution)?,
+        consumer.open_object(&pool, &execution.devices)?,
+    ];
+    let digests = [
+        ram_sha256,
+        Sha256Digest::from_bytes(*execution.layout.as_bytes()),
+        Sha256Digest::from_bytes(*execution.execution.as_bytes()),
+        Sha256Digest::from_bytes(*execution.devices.as_bytes()),
     ];
     let mut descriptors = Vec::with_capacity(4);
-    for (file, role) in objects.iter().zip(RestoreObjectRole::ALL) {
+    for ((file, role), sha256) in objects.iter().zip(RestoreObjectRole::ALL).zip(digests) {
         let metadata = file.metadata()?;
         if metadata.mode() & 0o7777 != 0o400
             || metadata.nlink() != 1
@@ -171,7 +186,7 @@ async fn restore_consumer(
             file_device: metadata.dev(),
             file_inode: metadata.ino(),
             length: metadata.len(),
-            sha256: hash_file(file)?,
+            sha256,
         });
     }
     let lower_inputs = prepare_lower(&pool, consumer)?;
@@ -238,35 +253,41 @@ async fn restore_consumer(
     let native_records = lower_inputs
         .as_ref()
         .map_or(0, |lower| lower.native_records);
-    crate::storage::limits::preflight_fd_budget(
-        (3 * transfer_roles).max(native_records + transfer_roles)
-            + 3 * request.configuration.attachments.len() as u64
-            + 32,
-    )
-    .map_err(crate::storage::StorageError::from)?;
-    let mut sources = vec![PrivateSource {
+    let descriptor_peak = (3 * transfer_roles).max(native_records + transfer_roles)
+        + 3 * request.configuration.attachments.len() as u64
+        + 32;
+    // Held closure descriptors are released below, before the ledger charge
+    // for `descriptor_peak`, but are still open while sources are opened.
+    crate::storage::limits::preflight_fd_budget(descriptor_peak + consumer.retained_descriptors())
+        .map_err(crate::storage::StorageError::from)?;
+    // Each writable input reuses the closure's authenticated map on its own
+    // descriptor; private copying still scans and compares the output.
+    let mut sources = vec![PrivateSource::Authenticated {
         path: crate::PrivatePath::new(match &storage.root {
             MachineRoot::OpaqueRaw { .. } => "root.raw",
             _ => "upper.raw",
         })?,
-        file: open_immutable_stream(
+        stream: consumer.open_copy_source(
             &pool,
             &consumer.record.root.stream.stream,
             consumer.record.root.geometry.length,
-        )?
-        .file,
-        length: consumer.record.root.geometry.length,
+        )?,
     }];
     for disk in &consumer.record.disks {
         if disk.writable {
-            sources.push(PrivateSource {
+            sources.push(PrivateSource::Authenticated {
                 path: crate::PrivatePath::new(format!("disk-{}.raw", disk.order))?,
-                file: open_immutable_stream(&pool, &disk.content.stream, disk.geometry.length)?
-                    .file,
-                length: disk.geometry.length,
+                stream: consumer.open_copy_source(
+                    &pool,
+                    &disk.content.stream,
+                    disk.geometry.length,
+                )?,
             });
         }
     }
+    // Every authenticated input now has its own descriptor; the lease keeps the
+    // closure pinned. Only `descriptor_peak` remains to be charged.
+    consumer.release_closure();
     let disk_peak = restore_disk_peak(runtime, &sources, &consumer.record)?;
     let memory = snapshots
         .reserve_restore_resources(
@@ -274,6 +295,7 @@ async fn restore_consumer(
             &request,
             &runtime.local_home().join("machines"),
             disk_peak,
+            descriptor_peak,
             options.resources,
         )
         .await?;
@@ -282,7 +304,9 @@ async fn restore_consumer(
         crate::machine::builder::stopped_child_name(runtime, options.name.as_deref()).await?;
     let run = Uuid::new_v4();
     let intent = RestoreIntent {
-        checkpoint: consumer.info.id,
+        checkpoint: crate::store::restore::RestoreIdentity::Snapshot {
+            id: consumer.info.id,
+        },
         consumer_operation: consumer.operation_id,
         request: request.clone(),
         memory,
@@ -290,6 +314,60 @@ async fn restore_consumer(
         inspection,
         network_attachment: network,
     };
+    execute_prepared(
+        runtime,
+        PreparedRestore {
+            configuration: consumer.record.configuration.clone(),
+            storage,
+            sources,
+            intent,
+            request,
+            objects,
+            executable,
+            executable_identity,
+            lower_inputs,
+        },
+        name,
+        run,
+        Some(_names),
+    )
+    .await
+}
+
+struct PreparedRestore {
+    configuration: crate::SnapshotConfiguration,
+    storage: MachineStorageRecord,
+    sources: Vec<PrivateSource>,
+    intent: RestoreIntent,
+    request: RestoreRequest,
+    objects: [File; 4],
+    executable: File,
+    executable_identity: crate::storage::identity_file::SourceFingerprint,
+    lower_inputs: Option<LowerInputs>,
+}
+
+/// Both snapshot and local-cut restore use this exact construction, generation
+/// handoff, activation and failed-start cleanup path.
+async fn execute_prepared(
+    runtime: &Runtime,
+    prepared: PreparedRestore,
+    name: String,
+    run: Uuid,
+    names: Option<File>,
+) -> Result<Machine, LibVmError> {
+    let PreparedRestore {
+        configuration,
+        storage,
+        sources,
+        intent,
+        request,
+        objects,
+        executable,
+        executable_identity,
+        lower_inputs,
+    } = prepared;
+    let store = runtime.native_store()?;
+    let snapshots = SnapshotStore::from_store(Arc::new(store.clone()));
     store
         .persist_restore_construction(&crate::store::restore::RestoreConstruction {
             run_id: run,
@@ -300,14 +378,17 @@ async fn restore_consumer(
     let config = crate::machine::builder::publish_restored_child(
         runtime,
         name,
-        consumer.record.configuration.clone(),
+        configuration,
         storage,
         sources,
-        consumer.operation_id,
+        intent.consumer_operation,
         run,
     )
     .await?;
-    drop(_names);
+    store
+        .child_event(intent.consumer_operation, "prepared")
+        .await?;
+    drop(names);
     let (lock, config) = runtime.lock_machine_config(config.id).await?;
     let storage = runtime.machine_storage_record(config.id).await?;
     if let Some(lower) = &lower_inputs {
@@ -328,7 +409,7 @@ async fn restore_consumer(
     // Generation registration copies all consumer roots in the same transaction.
     // Keep the old OFD until that commit, including an uncertain result.
     store
-        .finish_stopped_operation(consumer.operation_id)
+        .finish_stopped_operation(intent.consumer_operation)
         .await?;
     let mut launch = RestoreLaunch {
         request,
@@ -359,8 +440,26 @@ async fn restore_consumer(
     }
     .await;
     match result {
-        Ok(()) => Ok(Machine::new(runtime.clone(), config.id)),
+        Ok(()) => {
+            store
+                .child_event(intent.consumer_operation, "running")
+                .await?;
+            Ok(Machine::new(runtime.clone(), config.id))
+        }
         Err(error) => {
+            // Failed-start cleanup can delete the child and its monitor/live
+            // records. Retain the exact run's original failure before that
+            // destructive boundary; cleanup uncertainty remains independent.
+            let error = match store
+                .record_fork_child_failure(config.id, run, &error)
+                .await
+            {
+                Ok(()) => error,
+                Err(retain) => LibVmError::MachineStartCleanupFailed {
+                    primary: error.to_string(),
+                    cleanup: format!("retain fork restore failure: {retain}"),
+                },
+            };
             let error = finish_failed_start(
                 runtime,
                 &config,
@@ -411,11 +510,13 @@ pub(crate) async fn await_restored_start(
     if state.status == crate::store::models::MachineRuntimeState::ActivationFailed {
         // This exact run still owns failed activation cleanup, never readiness,
         // even if its pipe acknowledgement raced the stop-only observation.
-        return Ok((
-            lock,
-            current,
-            result.and(Err(invalid("restored activation failed before readiness"))),
-        ));
+        // Prefer the authenticated lifecycle diagnostic if the startup pipe was
+        // lost or only reported a transport error.
+        let result = match state.last_error {
+            Some(message) => Err(std::io::Error::other(message).into()),
+            None => result.and(Err(invalid("restored activation failed before readiness"))),
+        };
+        return Ok((lock, current, result));
     }
     if !matches!(
         state.status,
@@ -477,41 +578,74 @@ fn prepare_lower(
     else {
         return Ok(None);
     };
-    let occurrence = pool.lower_occurrence(&lower.stream)?;
-    if occurrence.length() != lower_geometry.length
-        || crate::machine::root_storage::filesystem_uuid(occurrence.path())?
-            != *lower_filesystem_uuid
-    {
+    // The lower backing is a duplicate of the held authenticated descriptor,
+    // as for local-fork cuts; it outlives `release_closure`.
+    let authenticated = consumer.authenticated_stream(&lower.stream, lower_geometry.length)?;
+    let verified = verify_lower_shape(
+        pool,
+        lower.stream,
+        lower_geometry.length,
+        *lower_filesystem_uuid,
+        &consumer.record.configuration,
+        authenticated,
+    )?;
+    prepare_lower_descriptor(pool, &verified, consumer.operation_id, &consumer.lease).map(Some)
+}
+
+pub(crate) struct VerifiedLower {
+    descriptor: String,
+    backing: File,
+    fingerprint: crate::storage::identity_file::SourceFingerprint,
+    path: std::path::PathBuf,
+    length: u64,
+    block_id: vm_spec::BlockId,
+    native_records: u64,
+}
+
+fn verify_lower_shape(
+    pool: &StoragePool,
+    stream: crate::storage::identity::StreamId,
+    length: u64,
+    filesystem_uuid: Uuid,
+    configuration: &crate::SnapshotConfiguration,
+    authenticated: &crate::storage::stream::AuthenticatedStream,
+) -> Result<VerifiedLower, LibVmError> {
+    if authenticated.map().id() != stream || authenticated.length() != length {
         return Err(invalid(
-            "authenticated lower differs from the captured geometry or filesystem",
+            "verified lower stream identity or geometry differs from capture",
         ));
     }
-    let extent_path = occurrence.path().to_path_buf();
+    let occurrence = pool.lower_occurrence(&stream)?;
+    if occurrence.length() != length
+        || crate::machine::root_storage::filesystem_uuid(occurrence.path())? != filesystem_uuid
+    {
+        return Err(invalid(
+            "authenticated lower filesystem differs from capture",
+        ));
+    }
     let occurrences = [occurrence];
     let plan = crate::storage::vmdk::FlatLowerPlan::new(&occurrences)?;
-    let admitted = plan.preflight(consumer.record.disks.len() as u64)?;
+    let data = configuration
+        .spec
+        .storage
+        .iter()
+        .flat_map(|storage| &storage.disks)
+        .filter(|disk| disk.role == vm_spec::DiskRole::Data)
+        .count() as u64;
+    let admitted = plan.preflight(data)?;
     crate::storage::limits::preflight_fd_budget(admitted.record_count() + 6)
         .map_err(crate::storage::StorageError::from)?;
-    admitted.verify(pool)?;
-    let stage = crate::machine::stopped::OperationStaging::new(
-        pool,
-        consumer.operation_id,
-        &consumer.lease,
-    )?;
-    let directory = stage.directory()?;
-    directory.write_file("lower.vmdk", admitted.descriptor()?.as_bytes())?;
-    let descriptor = directory
-        .open_file("lower.vmdk")?
-        .ok_or_else(|| invalid("restore lower descriptor disappeared"))?;
-    nix::sys::stat::fchmod(&descriptor, nix::sys::stat::Mode::S_IRUSR)
-        .map_err(std::io::Error::from)?;
-    descriptor.sync_all()?;
-    let backing = open_immutable_stream(pool, &lower.stream, lower.length)?.file;
-    let descriptor_stat = descriptor.metadata()?;
-    let backing_stat = backing.metadata()?;
-    let block_id = consumer
-        .record
-        .configuration
+    let metadata = authenticated.file().metadata()?;
+    if crate::storage::identity_file::SourceFingerprint::new(&metadata)
+        != authenticated.fingerprint()
+        || metadata.len() != length
+        || metadata.mode() & 0o7777 != 0o400
+        || metadata.nlink() != 1
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+    {
+        return Err(invalid("verified lower lost its immutable inode"));
+    }
+    let block_id = configuration
         .spec
         .storage
         .iter()
@@ -520,9 +654,80 @@ fn prepare_lower(
         .ok_or_else(|| invalid("captured lower attachment missing"))?
         .block_id
         .clone();
-    Ok(Some(LowerInputs {
+    Ok(VerifiedLower {
+        descriptor: admitted.descriptor()?,
+        backing: authenticated.file().try_clone()?,
+        fingerprint: crate::storage::identity_file::SourceFingerprint::new(&metadata),
+        path: pool.stream_path(&stream),
+        length,
+        block_id,
+        native_records: admitted.record_count(),
+    })
+}
+
+pub(crate) fn verify_local_lower(
+    pool: &StoragePool,
+    storage: &MachineStorageRecord,
+    configuration: &crate::SnapshotConfiguration,
+    streams: &std::collections::BTreeMap<
+        crate::storage::identity::StreamId,
+        crate::storage::stream::AuthenticatedStream,
+    >,
+) -> Result<Option<VerifiedLower>, LibVmError> {
+    match &storage.root {
+        MachineRoot::LinuxOverlay {
+            lower:
+                crate::OverlayLower::FlatExt4 {
+                    stream,
+                    geometry,
+                    filesystem_uuid,
+                },
+            ..
+        } => {
+            let source = streams
+                .get(stream)
+                .ok_or_else(|| invalid("fork lower has no authenticated pool owner"))?;
+            verify_lower_shape(
+                pool,
+                *stream,
+                geometry.length,
+                *filesystem_uuid,
+                configuration,
+                source,
+            )
+            .map(Some)
+        }
+        MachineRoot::LinuxOverlay { .. } => Err(invalid("fork lower profile is not delivered")),
+        MachineRoot::OpaqueRaw { .. } => Ok(None),
+    }
+}
+
+fn prepare_lower_descriptor(
+    pool: &StoragePool,
+    verified: &VerifiedLower,
+    operation: Uuid,
+    lease: &crate::storage::locks::StorageLock,
+) -> Result<LowerInputs, LibVmError> {
+    if crate::storage::identity_file::SourceFingerprint::new(&verified.backing.metadata()?)
+        != verified.fingerprint
+    {
+        return Err(invalid("verified lower changed before descriptor handoff"));
+    }
+    let stage = crate::machine::stopped::OperationStaging::new(pool, operation, lease)?;
+    let directory = stage.directory()?;
+    directory.write_file("lower.vmdk", verified.descriptor.as_bytes())?;
+    let descriptor = directory
+        .open_file("lower.vmdk")?
+        .ok_or_else(|| invalid("restore lower descriptor disappeared"))?;
+    nix::sys::stat::fchmod(&descriptor, nix::sys::stat::Mode::S_IRUSR)
+        .map_err(std::io::Error::from)?;
+    descriptor.sync_all()?;
+    let backing = verified.backing.try_clone()?;
+    let descriptor_stat = descriptor.metadata()?;
+    let backing_stat = backing.metadata()?;
+    Ok(LowerInputs {
         request: vm_spec::restore::RestoreLower {
-            block_id,
+            block_id: verified.block_id.clone(),
             descriptor: vm_spec::restore::RestoreDescriptor {
                 fd: descriptor.as_raw_fd(),
                 file_device: descriptor_stat.dev(),
@@ -530,21 +735,22 @@ fn prepare_lower(
                 length: descriptor_stat.len(),
             },
             extents: vec![vm_spec::restore::RestoreExtent {
-                path: extent_path
+                path: verified
+                    .path
                     .to_str()
-                    .ok_or_else(|| invalid("lower extent path is not UTF-8"))?
-                    .to_owned(),
+                    .ok_or_else(|| invalid("lower path is not UTF-8"))?
+                    .into(),
                 fd: backing.as_raw_fd(),
                 file_device: backing_stat.dev(),
                 file_inode: backing_stat.ino(),
-                length: backing_stat.len(),
+                length: verified.length,
             }],
         },
         files: vec![descriptor, backing],
-        native_records: admitted.record_count(),
+        native_records: verified.native_records,
         directory,
         _stage: stage,
-    }))
+    })
 }
 
 fn storage_from_snapshot(
@@ -638,7 +844,7 @@ fn restore_disk_peak(
     let mut required = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
     for source in sources {
         required = required
-            .checked_add(source.length)
+            .checked_add(source.length())
             .ok_or_else(|| invalid("restore disk peak overflow"))?;
     }
     if let crate::BootProfile::LinuxDirect {
@@ -845,19 +1051,18 @@ async fn launch_restored(
     Ok((pending, lifetime))
 }
 
-fn hash_file(file: &File) -> Result<Sha256Digest, LibVmError> {
-    let mut reader = file.try_clone()?;
-    reader.seek(SeekFrom::Start(0))?;
+pub(crate) fn hash_file(file: &File) -> Result<Sha256Digest, LibVmError> {
+    let mut offset = 0;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 << 10];
     loop {
-        let count = reader.read(&mut buffer)?;
+        let count = file.read_at(&mut buffer, offset)?;
         if count == 0 {
             break;
         }
         hash.update(&buffer[..count]);
+        offset += count as u64;
     }
-    reader.seek(SeekFrom::Start(0))?;
     Ok(Sha256Digest::from_bytes(hash.finalize().into()))
 }
 
@@ -963,6 +1168,231 @@ fn pinned_command(executable: &File) -> std::process::Command {
     std::process::Command::new(Path::new(root).join(executable.as_fd().as_raw_fd().to_string()))
 }
 
+pub(crate) struct VerifiedForkRestore {
+    cut: crate::store::fork::VerifiedRestoreCut,
+    executable: File,
+    executable_identity: crate::storage::identity_file::SourceFingerprint,
+    inspected_executable: crate::storage::identity::ObjectDigest,
+    lane: vm_spec::live::LiveLane,
+}
+
+pub(crate) async fn prepare_fork_restore(
+    runtime: &Runtime,
+    cut: crate::store::fork::VerifiedRestoreCut,
+) -> Result<VerifiedForkRestore, LibVmError> {
+    let host = runtime.live_capabilities().await?;
+    crate::require_host_live_operation(&host, LiveOperation::Restore)?;
+    let executable =
+        crate::storage::stream::open_regular_source(runtime.supervisor().executable())?;
+    let executable_identity =
+        crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?);
+    let inspected_executable =
+        crate::storage::identity::ObjectDigest::from_sha256(*hash_file(&executable)?.as_bytes());
+    if crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?)
+        != executable_identity
+    {
+        return Err(invalid(
+            "fork monitor executable changed during authentication",
+        ));
+    }
+    Ok(VerifiedForkRestore {
+        cut,
+        executable,
+        executable_identity,
+        inspected_executable,
+        lane: host.lane,
+    })
+}
+
+pub(crate) async fn restore_reserved_fork_child(
+    runtime: &Runtime,
+    prepared: Arc<VerifiedForkRestore>,
+    child: crate::store::fork::ForkChildIdentity,
+    options: crate::LiveForkChild,
+) -> Result<Machine, LibVmError> {
+    let cut = &prepared.cut;
+    let store = runtime.native_store()?;
+    let pool = StoragePool::open(runtime.local_images_dir())?;
+    let consumer_lease = pool.existing_lease(child.consumer_id)?;
+    let configuration = crate::machine::live_fork::project_destination(
+        &cut.record.configuration,
+        &options.destination,
+    )?;
+    let mut storage = cut.record.storage.clone();
+    let mut sources = Vec::new();
+    for disk in &mut storage.disks {
+        disk.id = Uuid::new_v4();
+    }
+    for disk in &cut.record.plan.disks {
+        let role = vm_spec::capture::CaptureRole::Disk(disk.name.clone());
+        let attachment = cut
+            .record
+            .plan
+            .configuration
+            .attachments
+            .get(disk.attachment_index as usize)
+            .ok_or_else(|| invalid("fork disk attachment missing"))?;
+        let path = crate::PrivatePath::new(match attachment.role {
+            vm_spec::DiskRole::Root => "root.raw".into(),
+            vm_spec::DiskRole::RootUpper => "upper.raw".into(),
+            vm_spec::DiskRole::Data => format!("disk-{}.raw", disk.attachment_index),
+            vm_spec::DiskRole::RootLower => return Err(invalid("fork lower cannot be writable")),
+        })?;
+        if attachment.role == vm_spec::DiskRole::Data {
+            if let Some(target) = storage
+                .disks
+                .iter_mut()
+                .find(|target| target.order == disk.attachment_index)
+            {
+                target.storage = DiskStorage::ManagedWritable {
+                    path: path.clone(),
+                    geometry: attachment.geometry,
+                };
+            } else {
+                storage.disks.push(crate::IncludedDisk {
+                    id: Uuid::new_v4(),
+                    role: attachment.role,
+                    order: disk.attachment_index,
+                    storage: DiskStorage::ManagedWritable {
+                        path: path.clone(),
+                        geometry: attachment.geometry,
+                    },
+                });
+            }
+        }
+        // An independent descriptor sharing the cut's seal-derived map.
+        let stream = cut.reopen_disk(&role)?;
+        if stream.length() != disk.length {
+            return Err(invalid("fork cut disk geometry differs from its plan"));
+        }
+        sources.push(PrivateSource::Authenticated { path, stream });
+    }
+    // The constructor expects root first, then the remaining private roles.
+    sources.sort_by_key(|source| {
+        if matches!(
+            source.path().as_path().to_str(),
+            Some("root.raw" | "upper.raw")
+        ) {
+            0
+        } else {
+            1
+        }
+    });
+    for source in cut.pool_streams.values() {
+        if crate::storage::identity_file::SourceFingerprint::new(&source.file().metadata()?)
+            != source.fingerprint()
+        {
+            return Err(invalid(
+                "authenticated fork pool stream changed before handoff",
+            ));
+        }
+    }
+    let lower_inputs = cut
+        .lower
+        .as_ref()
+        .map(|lower| prepare_lower_descriptor(&pool, lower, child.consumer_id, &consumer_lease))
+        .transpose()?;
+    let mut files = Vec::with_capacity(4);
+    let mut descriptors = Vec::with_capacity(4);
+    for role in RestoreObjectRole::ALL {
+        let index = cut
+            .record
+            .files
+            .iter()
+            .position(|file| file.role == role.capture_role())
+            .ok_or_else(|| invalid("fork restore object missing"))?;
+        let identity = &cut.record.files[index];
+        let file = cut.reopen_role(&role.capture_role())?;
+        let metadata = file.metadata()?;
+        if crate::storage::identity_file::SourceFingerprint::new(&metadata) != identity.fingerprint
+            || metadata.mode() & 0o7777 != 0o400
+        {
+            return Err(invalid("shared fork cut inode changed"));
+        }
+        descriptors.push(RestoreObject {
+            role,
+            fd: file.as_raw_fd(),
+            file_device: identity.device,
+            file_inode: identity.inode,
+            length: identity.length,
+            sha256: identity.sha256,
+        });
+        files.push(file);
+    }
+    let request = RestoreRequest {
+        version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+        checkpoint: cut.record.cut_id,
+        activation_id: vm_spec::lifecycle::LiveId::parse(&child.activation_id.to_string())
+            .map_err(invalid)?,
+        freeze_operation_id: cut
+            .record
+            .evidence
+            .freeze_operation_id
+            .clone()
+            .ok_or_else(|| invalid("fork freeze operation missing"))?,
+        start_paused: true,
+        configuration: cut.record.plan.configuration.clone(),
+        evidence: cut.record.evidence.clone(),
+        objects: descriptors
+            .try_into()
+            .map_err(|_| invalid("fork restore needs four objects"))?,
+        lowers: lower_inputs
+            .as_ref()
+            .map(|lower| vec![lower.request.clone()])
+            .unwrap_or_default(),
+        network: None,
+        ssh_trusted_ca: None,
+        hook: options.activation_hook,
+    };
+    request.validate().map_err(invalid)?;
+    let executable = prepared.executable.try_clone()?;
+    let executable_identity = prepared.executable_identity;
+    let inspected_executable = prepared.inspected_executable;
+    let network = !matches!(
+        configuration.network,
+        crate::store::models::MachineNetworkConfig::None
+    );
+    let inspection = inspect(&executable, &request, network).await?;
+    if inspection.lane != prepared.lane
+        || crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?)
+            != executable_identity
+    {
+        return Err(invalid("fork restore native inspection identity changed"));
+    }
+    let intent = RestoreIntent {
+        checkpoint: crate::store::restore::RestoreIdentity::LocalCut {
+            id: cut.record.cut_id,
+        },
+        consumer_operation: child.consumer_id,
+        request: request.clone(),
+        memory: store.fork_child_charge(child.consumer_id).await?,
+        inspected_executable,
+        inspection,
+        network_attachment: network,
+    };
+    execute_prepared(
+        runtime,
+        PreparedRestore {
+            configuration,
+            storage,
+            sources,
+            intent,
+            request,
+            objects: files
+                .try_into()
+                .map_err(|_| invalid("fork restore needs four files"))?,
+            executable,
+            executable_identity,
+            lower_inputs,
+        },
+        child.result.name,
+        Uuid::parse_str(child.result.run_id.as_str())
+            .map_err(|error| invalid(error.to_string()))?,
+        None,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::machine::restore::hash_file;
@@ -973,7 +1403,10 @@ mod tests {
         file.write_all(b"checkpoint state").unwrap();
         let expected = vm_spec::capture::Sha256Digest::of_bytes(b"checkpoint state");
         assert_eq!(hash_file(&file).unwrap(), expected);
-        assert_eq!(file.stream_position().unwrap(), 0);
+        assert_eq!(
+            file.stream_position().unwrap(),
+            b"checkpoint state".len() as u64
+        );
     }
 
     fn snapshot() -> crate::store::models::snapshot::SnapshotRecord {

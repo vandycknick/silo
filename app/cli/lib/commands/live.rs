@@ -151,34 +151,265 @@ impl Snapshot {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Fork a stopped VM into a new stopped machine", long_about = "Fork a stopped VM into a new stopped machine.\n\nStopped child publication requires catalog-owned secret-scope recovery. Custom Runtime::with_secret_store overrides are refused; the ordinary CLI FileStore and secret-provider path remains supported.", after_help = EXACT_BYTES_WARNING)]
+#[command(
+    about = "Fork a stopped VM into a stopped machine, or a running VM into running children",
+    long_about = "Fork a stopped VM into a new stopped machine, or (--live) fork a running VM's execution into running children.\n\nA live fork captures the source once and restores one running child per --name (or --children-json entry) under one durable operation. Its JSON result names every child with its reserved machine and run IDs, plus the source outcome. A failed child never rolls back its siblings and a nonzero exit never stops running children. More than 16 children requires an explicit --max-children. Children receive no host forwards or guest publication unless granted per child in --children-json. Interrupting the CLI does not cancel the operation: observe it with --operation ID, or record cancellation with --operation ID --cancel.\n\nStopped child publication requires catalog-owned secret-scope recovery. Custom Runtime::with_secret_store overrides are refused; the ordinary CLI FileStore and secret-provider path remains supported.",
+    after_help = EXACT_BYTES_WARNING
+)]
 pub struct Fork {
-    #[arg(value_name = "VM")]
-    machine: String,
-    #[arg(long, value_name = "CHILD")]
-    name: String,
+    #[arg(value_name = "VM", required_unless_present = "operation")]
+    machine: Option<String>,
+    /// Child name. A stopped fork takes exactly one; repeat it once per child with --live.
+    #[arg(
+        long,
+        value_name = "CHILD",
+        required_unless_present_any = ["operation", "children_json"]
+    )]
+    name: Vec<String>,
     /// Request live execution fork, never implicitly stop the source.
     #[arg(long, conflicts_with_all = ["external_requirements", "map_disk", "map_share"])]
-    pub(crate) live: bool,
+    live: bool,
+    /// Live children as a bounded JSON array of {name, activationHook, destination}; destination
+    /// grants explicit {forwards, guestPublish} and defaults to no host access.
+    #[arg(long, value_name = "JSON", requires = "live", conflicts_with = "name", value_parser = live_fork_children)]
+    children_json: Option<LiveForkChildren>,
+    /// Explicit live fan-out maximum (default 16). It is a bound, never a child count.
+    #[arg(long, value_name = "N", requires = "live")]
+    max_children: Option<std::num::NonZeroU32>,
+    /// Keep the source paused after the capture (user-owned pause). Required when the source is
+    /// already paused; without it a running source is resumed.
+    #[arg(long, requires = "live")]
+    preserve: bool,
+    /// Reserve this percentage of RAM per child for private writes (0..=100, default 25),
+    /// rounded up to native pages.
+    #[arg(long, value_name = "PERCENT", requires = "live", value_parser = private_write_allowance)]
+    private_write_percent: Option<libvm::PrivateWriteAllowance>,
+    /// Explicitly allow memory overcommit for every child. Disk/FD/closure gates still apply.
+    #[arg(long, requires = "live")]
+    memory_overcommit: bool,
+    /// Caller-selected live fork operation UUID. Repeating identical options replays the same
+    /// operation; changed options conflict. Generated when omitted.
+    #[arg(long, value_name = "UUID", requires = "live", value_parser = operation_id)]
+    operation_id: Option<uuid::Uuid>,
+    /// Observe an existing live fork operation by ID, independent of its source.
+    #[arg(
+        long,
+        value_name = "UUID",
+        value_parser = operation_id,
+        conflicts_with_all = [
+            "machine", "name", "live", "children_json", "max_children", "preserve",
+            "private_write_percent", "memory_overcommit", "operation_id",
+            "external_requirements", "map_disk", "map_share",
+        ]
+    )]
+    operation: Option<uuid::Uuid>,
+    /// Durably request cancellation of --operation: unsubmitted children never start, submitted
+    /// children settle normally and running children are never stopped.
+    #[arg(long, requires = "operation", conflicts_with_all = [
+        "machine", "name", "live", "children_json", "max_children", "preserve",
+        "private_write_percent", "memory_overcommit", "operation_id",
+        "external_requirements", "map_disk", "map_share",
+    ])]
+    cancel: bool,
     #[command(flatten)]
     external: ExternalResources,
 }
+
+/// Strictly decoded `--children-json` array (newtype so clap keeps it one value).
+#[derive(Debug, Clone)]
+struct LiveForkChildren(Vec<libvm::LiveForkChild>);
+
+#[derive(Debug)]
+enum ForkMode {
+    Stopped {
+        machine: String,
+        options: libvm::ForkOptions,
+    },
+    Live {
+        machine: String,
+        options: libvm::LiveForkOptions,
+    },
+    Inspect(uuid::Uuid),
+    Cancel(uuid::Uuid),
+}
+
 impl Fork {
+    /// Live execution modes may reach an owned, stopping daemon for typed refusal or observation.
+    pub(crate) fn is_live(&self) -> bool {
+        self.live || self.operation.is_some()
+    }
+
+    /// Resolves every option before any runtime, daemon or source access.
+    fn mode(self) -> eyre::Result<ForkMode> {
+        if let Some(operation) = self.operation {
+            return Ok(if self.cancel {
+                ForkMode::Cancel(operation)
+            } else {
+                ForkMode::Inspect(operation)
+            });
+        }
+        let machine = self
+            .machine
+            .ok_or_else(|| eyre::eyre!("fork requires a source VM"))?;
+        if !self.live {
+            let [name] = <[String; 1]>::try_from(self.name).map_err(|_| {
+                eyre::eyre!(
+                    "a stopped fork takes exactly one --name; repeat --name only with --live"
+                )
+            })?;
+            return Ok(ForkMode::Stopped {
+                machine,
+                options: libvm::ForkOptions {
+                    name: Some(name),
+                    external_resources: self.external.policy()?,
+                },
+            });
+        }
+        let children = match self.children_json {
+            Some(LiveForkChildren(children)) => children,
+            None => self
+                .name
+                .into_iter()
+                .map(|name| libvm::LiveForkChild {
+                    name,
+                    activation_hook: None,
+                    destination: libvm::ForkDestination::default(),
+                })
+                .collect(),
+        };
+        let defaults = libvm::RestoreResourcePolicy::default();
+        let options = libvm::LiveForkOptions {
+            operation_id: self.operation_id.unwrap_or_else(uuid::Uuid::new_v4),
+            children,
+            max_children: self
+                .max_children
+                .unwrap_or(libvm::DEFAULT_LIVE_FORK_MAX_CHILDREN),
+            resume_policy: if self.preserve {
+                vm_spec::lifecycle::CaptureResumePolicy::Preserve
+            } else {
+                vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired
+            },
+            resources: libvm::RestoreResourcePolicy {
+                private_write_allowance: self
+                    .private_write_percent
+                    .unwrap_or(defaults.private_write_allowance),
+                memory: if self.memory_overcommit {
+                    libvm::RestoreMemoryPolicy::AllowOvercommit
+                } else {
+                    libvm::RestoreMemoryPolicy::Reserved
+                },
+            },
+        };
+        options.validate()?;
+        Ok(ForkMode::Live { machine, options })
+    }
+
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        let mode = self.mode()?;
         let api = context.app_api().await?;
-        if self.live {
-            api.fork_execution(&self.machine, &self.name).await
-        } else {
-            let options = libvm::ForkOptions {
-                name: Some(self.name),
-                external_resources: self.external.policy()?,
-            };
-            let machine = api.fork_stopped(&self.machine, options).await?;
-            crate::ui::warn(EXACT_BYTES_WARNING);
-            println!("{}", machine.id);
-            Ok(())
+        match mode {
+            ForkMode::Stopped { machine, options } => {
+                let machine = api.fork_stopped(&machine, options).await?;
+                crate::ui::warn(EXACT_BYTES_WARNING);
+                println!("{}", machine.id);
+                Ok(())
+            }
+            ForkMode::Live { machine, options } => {
+                let operation_id = options.operation_id;
+                let resume_policy = options.resume_policy;
+                let result = api
+                    .fork_live(&machine, options)
+                    .await
+                    .inspect_err(|error| unconfirmed_fork_note(error, operation_id))?;
+                crate::ui::warn(EXACT_BYTES_WARNING);
+                // The complete result precedes any failure status.
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                live_fork_status(&result, resume_policy)
+            }
+            ForkMode::Inspect(operation_id) => {
+                let result = api.inspect_fork(operation_id).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(())
+            }
+            ForkMode::Cancel(operation_id) => {
+                let result = api.cancel_fork(operation_id).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                if result.stage != libvm::ForkStage::Finished {
+                    crate::ui::warn(format!(
+                        "cancellation of live fork {operation_id} is recorded; submitted children are still settling and running children are never stopped. Observe it with `silo fork --operation {operation_id}`."
+                    ));
+                }
+                Ok(())
+            }
         }
     }
+}
+
+/// Past validation the operation may have been admitted even when the reply
+/// was lost; it stays discoverable by the ID the CLI chose before submission.
+fn unconfirmed_fork_note(error: &eyre::Report, operation_id: uuid::Uuid) {
+    if matches!(
+        error.downcast_ref::<libvm::LibVmError>(),
+        Some(libvm::LibVmError::LiveOperationUnsupported { .. })
+    ) {
+        return;
+    }
+    crate::ui::warn(format!(
+        "live fork operation {operation_id} was not confirmed; if it was accepted, observe it with `silo fork --operation {operation_id}`"
+    ));
+}
+
+/// Success means a finished, uncancelled operation with every child running
+/// and the source continuation the policy requested. Anything else is a
+/// failure status after the full result is printed, never a rollback.
+fn live_fork_status(
+    result: &libvm::LiveForkResult,
+    resume_policy: vm_spec::lifecycle::CaptureResumePolicy,
+) -> eyre::Result<()> {
+    let source_satisfied = match resume_policy {
+        vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired => {
+            matches!(result.source, libvm::ForkSourceOutcome::Resumed)
+        }
+        vm_spec::lifecycle::CaptureResumePolicy::Preserve => {
+            matches!(result.source, libvm::ForkSourceOutcome::Preserved)
+        }
+    };
+    let running = result
+        .children
+        .iter()
+        .filter(|child| matches!(child.outcome, libvm::ForkChildOutcome::Running))
+        .count();
+    if result.stage == libvm::ForkStage::Finished
+        && !result.cancellation_requested
+        && source_satisfied
+        && running == result.children.len()
+    {
+        return Ok(());
+    }
+    eyre::bail!(
+        "live fork {} did not fully succeed: {running} of {} children running, source continuation {}, operation {}; the JSON result is authoritative and running children are retained",
+        result.operation_id,
+        result.children.len(),
+        if source_satisfied { "as requested" } else { "not as requested" },
+        if result.stage == libvm::ForkStage::Finished { "finished" } else { "still in progress" },
+    )
+}
+
+fn live_fork_children(value: &str) -> Result<LiveForkChildren, String> {
+    if value.len() > 1 << 20 {
+        return Err("children JSON exceeds 1 MiB".into());
+    }
+    serde_json::from_str(value)
+        .map(LiveForkChildren)
+        .map_err(|error| error.to_string())
+}
+
+fn operation_id(value: &str) -> Result<uuid::Uuid, String> {
+    let id = uuid::Uuid::parse_str(value).map_err(|error| error.to_string())?;
+    if id.is_nil() {
+        return Err("operation ID must not be the nil UUID".into());
+    }
+    Ok(id)
 }
 
 #[derive(Debug, Args)]
@@ -330,8 +561,375 @@ fn share_mapping(value: &str) -> Result<libvm::ExternalResourceMapping, String> 
 #[cfg(test)]
 mod tests {
     use crate::app::Cli;
+    use crate::commands::live::{live_fork_status, ForkMode};
     use crate::commands::Command;
     use clap::Parser;
+    use vm_spec::lifecycle::CaptureResumePolicy;
+
+    const OPERATION: &str = "00000000-0000-4000-8000-0000000000aa";
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["silo", "fork"].iter().chain(args).copied())
+    }
+
+    fn fork_mode(args: &[&str]) -> eyre::Result<ForkMode> {
+        let Command::Fork(command) = parse(args)?.command else {
+            panic!("fork command")
+        };
+        command.mode()
+    }
+
+    fn live(args: &[&str]) -> (String, libvm::LiveForkOptions) {
+        match fork_mode(args).unwrap() {
+            ForkMode::Live { machine, options } => (machine, options),
+            mode => panic!("expected live fork: {mode:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_grammar_separates_stopped_live_and_operation_modes() {
+        for args in [
+            vec!["vm", "--name", "a"],
+            vec!["vm", "--name", "a", "--live", "--name", "b"],
+            vec!["vm", "--live", "--children-json", r#"[{"name":"a"}]"#],
+            vec![
+                "vm",
+                "--live",
+                "--name",
+                "a",
+                "--max-children",
+                "32",
+                "--preserve",
+                "--private-write-percent",
+                "0",
+                "--memory-overcommit",
+                "--operation-id",
+                OPERATION,
+            ],
+            vec!["--operation", OPERATION],
+            vec!["--operation", OPERATION, "--cancel"],
+        ] {
+            assert!(parse(&args).is_ok(), "{args:?}");
+        }
+        for args in [
+            vec!["vm"],
+            vec!["--live", "--name", "a"],
+            vec!["vm", "--name", "a", "--max-children", "4"],
+            vec!["vm", "--name", "a", "--preserve"],
+            vec!["vm", "--name", "a", "--private-write-percent", "10"],
+            vec!["vm", "--name", "a", "--memory-overcommit"],
+            vec!["vm", "--name", "a", "--operation-id", OPERATION],
+            vec!["vm", "--children-json", r#"[{"name":"a"}]"#],
+            vec![
+                "vm",
+                "--live",
+                "--name",
+                "a",
+                "--children-json",
+                r#"[{"name":"b"}]"#,
+            ],
+            vec!["vm", "--live", "--name", "a", "--max-children", "0"],
+            vec![
+                "vm",
+                "--live",
+                "--name",
+                "a",
+                "--operation-id",
+                "00000000-0000-0000-0000-000000000000",
+            ],
+            vec![
+                "vm",
+                "--live",
+                "--name",
+                "a",
+                "--operation-id",
+                "not-a-uuid",
+            ],
+            vec![
+                "vm",
+                "--live",
+                "--name",
+                "a",
+                "--private-write-percent",
+                "101",
+            ],
+            vec![
+                "vm",
+                "--live",
+                "--children-json",
+                r#"[{"name":"a","unknown":1}]"#,
+            ],
+            vec!["vm", "--live", "--children-json", r#"{"name":"a"}"#],
+            vec!["--cancel"],
+            vec!["vm", "--name", "a", "--cancel"],
+            vec!["vm", "--operation", OPERATION],
+            vec!["--operation", OPERATION, "--name", "a"],
+            vec!["--operation", OPERATION, "--live"],
+            vec!["--operation", OPERATION, "--preserve"],
+            vec!["--operation", OPERATION, "--max-children", "2"],
+            vec!["--operation", OPERATION, "--operation-id", OPERATION],
+            vec!["--operation", OPERATION, "--external-requirements"],
+            vec!["--operation", "00000000-0000-0000-0000-000000000000"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        let oversized = format!(r#"[{{"name":"{}"}}]"#, "a".repeat(1 << 20));
+        assert!(parse(&["vm", "--live", "--children-json", oversized.as_str()]).is_err());
+    }
+
+    #[test]
+    fn live_fork_names_become_explicit_children_and_sixteen_is_only_a_bound() {
+        let (machine, options) = live(&["vm", "--live", "--name", "a", "--name", "b"]);
+        assert_eq!(machine, "vm");
+        assert_eq!(
+            options
+                .children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        for child in &options.children {
+            assert_eq!(child.activation_hook, None);
+            assert_eq!(child.destination, libvm::ForkDestination::default());
+        }
+        assert_eq!(options.max_children, libvm::DEFAULT_LIVE_FORK_MAX_CHILDREN);
+        assert_eq!(options.max_children.get(), 16);
+        assert_eq!(options.resume_policy, CaptureResumePolicy::ResumeIfAcquired);
+        assert_eq!(options.resources, libvm::RestoreResourcePolicy::default());
+        assert!(!options.operation_id.is_nil());
+        let (_, single) = live(&["vm", "--live", "--name", "a"]);
+        assert_eq!(single.children.len(), 1);
+        assert_ne!(
+            single.operation_id, options.operation_id,
+            "each creation selects a fresh operation ID"
+        );
+
+        let (_, explicit) = live(&[
+            "vm",
+            "--live",
+            "--name",
+            "a",
+            "--max-children",
+            "32",
+            "--preserve",
+            "--private-write-percent",
+            "0",
+            "--memory-overcommit",
+            "--operation-id",
+            "00000000-0000-4000-8000-0000000000AA",
+        ]);
+        assert_eq!(explicit.operation_id.to_string(), OPERATION);
+        assert_eq!(explicit.max_children.get(), 32);
+        assert_eq!(explicit.resume_policy, CaptureResumePolicy::Preserve);
+        assert_eq!(u32::from(explicit.resources.private_write_allowance), 0);
+        assert_eq!(
+            explicit.resources.memory,
+            libvm::RestoreMemoryPolicy::AllowOvercommit
+        );
+        let wire = silo_vm_control::fork::request_to_wire(
+            &libvm::MachineRef::parse("vm").unwrap(),
+            &explicit,
+        )
+        .unwrap();
+        assert_eq!(
+            silo_vm_control::fork::request_from_wire(wire).unwrap().1,
+            explicit
+        );
+    }
+
+    #[test]
+    fn live_fork_refuses_invalid_child_sets_before_any_runtime_access() {
+        let names = |count: usize| {
+            (0..count)
+                .flat_map(|index| ["--name".to_owned(), format!("child-{index}")])
+                .collect::<Vec<_>>()
+        };
+        let args = |count: usize, extra: &[&str]| {
+            let names = names(count);
+            let mut args = vec!["vm".to_owned(), "--live".to_owned()];
+            args.extend(names);
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+        let run = |args: Vec<String>| {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            fork_mode(&args)
+        };
+        assert!(run(args(16, &[])).is_ok());
+        assert!(
+            run(args(17, &[])).is_err(),
+            "17 children need an explicit maximum"
+        );
+        assert!(run(args(17, &["--max-children", "17"])).is_ok());
+        assert!(run(args(3, &["--max-children", "2"])).is_err());
+        assert!(fork_mode(&["vm", "--live", "--name", "a", "--name", "a"]).is_err());
+        assert!(fork_mode(&["vm", "--live", "--name", "../escape"]).is_err());
+        assert!(fork_mode(&["vm", "--live", "--children-json", "[]"]).is_err());
+        assert!(fork_mode(&[
+            "vm",
+            "--live",
+            "--children-json",
+            r#"[{"name":"a","activationHook":{"argv":[],"environment":[],"workingDirectory":"/","timeoutMs":1000}}]"#,
+        ])
+        .is_err());
+        assert!(
+            fork_mode(&["vm", "--name", "a", "--name", "b"]).is_err(),
+            "a stopped fork takes exactly one child"
+        );
+        assert!(matches!(
+            fork_mode(&["vm", "--name", "a"]).unwrap(),
+            ForkMode::Stopped { .. }
+        ));
+        let operation: uuid::Uuid = OPERATION.parse().unwrap();
+        assert!(matches!(
+            fork_mode(&["--operation", OPERATION]).unwrap(),
+            ForkMode::Inspect(id) if id == operation
+        ));
+        assert!(matches!(
+            fork_mode(&["--operation", OPERATION, "--cancel"]).unwrap(),
+            ForkMode::Cancel(id) if id == operation
+        ));
+    }
+
+    #[test]
+    fn children_json_carries_hooks_and_only_explicit_destination_grants() {
+        let (_, options) = live(&[
+            "vm",
+            "--live",
+            "--children-json",
+            r#"[
+                {"name":"web","activationHook":{"argv":["/bin/true"],"environment":[],"workingDirectory":"/","timeoutMs":30000},
+                 "destination":{"forwards":[{"listen":"host:tcp:127.0.0.1:8080","connect":"guest:tcp:80"}],"guestPublish":{"bind":"loopback"}}},
+                {"name":"worker"}
+            ]"#,
+        ]);
+        let [web, worker] = options.children.as_slice() else {
+            panic!("two children")
+        };
+        assert_eq!(web.name, "web");
+        assert_eq!(
+            web.activation_hook.as_ref().unwrap().argv,
+            vec!["/bin/true".to_owned()]
+        );
+        assert_eq!(web.destination.forwards.len(), 1);
+        assert_eq!(
+            web.destination.guest_publish,
+            Some(libvm::GuestPublish {
+                bind: libvm::PublishBind::Loopback
+            })
+        );
+        assert_eq!(worker.name, "worker");
+        assert_eq!(worker.activation_hook, None);
+        assert_eq!(worker.destination, libvm::ForkDestination::default());
+    }
+
+    fn result(
+        source: libvm::ForkSourceOutcome,
+        outcomes: [libvm::ForkChildOutcome; 2],
+    ) -> libvm::LiveForkResult {
+        libvm::LiveForkResult {
+            operation_id: OPERATION.parse().unwrap(),
+            source_machine_id: "000000000000400080000000000000dd".parse().unwrap(),
+            source_run_id: "00000000-0000-4000-8000-0000000000cc".parse().unwrap(),
+            capture_id: vm_spec::lifecycle::LiveId::parse("00000000-0000-4000-8000-0000000000bb")
+                .unwrap(),
+            stage: libvm::ForkStage::Finished,
+            cancellation_requested: false,
+            capture: libvm::ForkCaptureOutcome::Sealed {
+                cut_id: format!("sha256:{}", "e".repeat(64)).parse().unwrap(),
+            },
+            source,
+            resources: libvm::RestoreResourcePolicy::default(),
+            children: outcomes
+                .into_iter()
+                .enumerate()
+                .map(|(index, outcome)| libvm::ForkChildResult {
+                    index: u32::try_from(index).unwrap(),
+                    name: format!("child-{index}"),
+                    machine_id: format!("00000000000040008000000000001{index:03}")
+                        .parse()
+                        .unwrap(),
+                    run_id: format!("00000000-0000-4000-8000-000000002{index:03}")
+                        .parse()
+                        .unwrap(),
+                    outcome,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn live_fork_status_succeeds_only_for_complete_requested_outcomes() {
+        use libvm::{ForkChildOutcome as Child, ForkSourceOutcome as Source};
+        let running = || [Child::Running, Child::Running];
+        let ok = result(Source::Resumed, running());
+        silo_vm_control::fork::validate_result(&ok).unwrap();
+        live_fork_status(&ok, CaptureResumePolicy::ResumeIfAcquired).unwrap();
+        live_fork_status(
+            &result(Source::Preserved, running()),
+            CaptureResumePolicy::Preserve,
+        )
+        .unwrap();
+
+        let diagnostic = || vm_spec::lifecycle::Diagnostic::new("failed");
+        let mut failures = vec![
+            (
+                result(Source::Preserved, running()),
+                CaptureResumePolicy::ResumeIfAcquired,
+            ),
+            (
+                result(Source::Resumed, running()),
+                CaptureResumePolicy::Preserve,
+            ),
+            (
+                result(
+                    Source::ResumeFailed {
+                        diagnostic: diagnostic(),
+                    },
+                    running(),
+                ),
+                CaptureResumePolicy::ResumeIfAcquired,
+            ),
+            (
+                result(
+                    Source::Resumed,
+                    [
+                        Child::Running,
+                        Child::Failed {
+                            phase: libvm::ForkFailurePhase::Activation,
+                            diagnostic: diagnostic(),
+                        },
+                    ],
+                ),
+                CaptureResumePolicy::ResumeIfAcquired,
+            ),
+            (
+                result(
+                    Source::Resumed,
+                    [
+                        Child::Running,
+                        Child::RecoveryPending {
+                            diagnostic: diagnostic(),
+                        },
+                    ],
+                ),
+                CaptureResumePolicy::ResumeIfAcquired,
+            ),
+        ];
+        let mut settling = result(Source::Resumed, [Child::Running, Child::Activating]);
+        settling.stage = libvm::ForkStage::Settling;
+        failures.push((settling, CaptureResumePolicy::ResumeIfAcquired));
+        let mut cancelled = result(Source::Resumed, running());
+        cancelled.cancellation_requested = true;
+        failures.push((cancelled, CaptureResumePolicy::ResumeIfAcquired));
+        for (result, policy) in failures {
+            silo_vm_control::fork::validate_result(&result).unwrap();
+            let error = live_fork_status(&result, policy).unwrap_err().to_string();
+            assert!(error.contains(OPERATION), "{error}");
+            assert!(error.contains("running children are retained"), "{error}");
+        }
+    }
 
     #[test]
     fn restore_cli_resource_policy_defaults_boundaries_and_opt_in_reach_daemon_types() {

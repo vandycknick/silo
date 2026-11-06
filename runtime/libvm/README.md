@@ -382,7 +382,85 @@ for exact reconciliation, not speculative rollback.
 Checkpoints preserve credentials, guest keys, dirty journals and deleted-data
 remnants exactly. They are not automatically generalized or safe public
 templates. Prepare a separate private fork explicitly before publishing prepared
-bytes. `fork_execution` remains separately capability-gated.
+bytes. `fork_live` remains separately capability-gated.
+
+### Live local forks
+
+`Machine::fork_live(observation, LiveForkOptions)` admits the complete batch
+before freezing the exact source run. The caller supplies a nonnil operation
+UUID and ordered unique child names. The default maximum is 16, not a request
+for sixteen children. A higher explicit maximum does not bypass resource
+admission. Replaying an operation ID requires exactly the original inputs.
+
+One authenticated operation-owned local cut supplies all children. RAM is not
+published as a named checkpoint or copied once per child: every child maps the
+same immutable inode privately. Writable disks remain independent qualified
+private copies. Empty destination options inherit no forwards, publications,
+network credentials, mount grants or secret scopes. Captured NIC presence and
+execution/device identities are preserved.
+
+`Runtime::inspect_fork(UUID)` and `Runtime::cancel_fork(UUID)` do not require the
+source to exist. Results name every preselected machine/run identity, including
+children never constructed, and report capture, source continuation and each
+child independently. Wait expiry is not cancellation. Cancellation prevents new
+submissions but does not stop a child that completed activation. Running is a
+historical outcome; use ordinary machine observation for later liveness.
+Capture dispatch and the durable cancellation fence share the source machine
+lock, so cancellation committed before dispatch also rejects capture retries.
+Shared monitor preparation failures before child submission become construction
+failure outcomes for the reserved children; normal reconciliation releases their
+unused consumers, names and budget while source continuation settles independently.
+
+After manager death, recovery reconciles exact submitted generations and
+deterministically abandons never-submitted child slots. Unknown ownership keeps
+its cut and resource charges until positive retirement. Child generation roots
+and stable budget ownership survive source deletion and parent cancellation.
+
+The original construction or activation failure is retained before destructive
+failed-start cleanup. A reserved import cannot indefinitely block that child's
+terminal result after its worker lease ends. Manager-death recovery releases an
+unsubmitted child's name for cleanup only while owning the parent and consumer
+exclusively, with no linked/submitted launch or active exact-generation holder.
+The child outcome and resource charges remain pending until cleanup retires its
+exact storage operations. A live detached worker therefore still blocks reuse
+and abandonment.
+
+The native source may retain the accepted RAM baseline after releasing capture
+result ownership. Its exact run lease therefore keeps the cut and baseline
+charge alive until that run ends; stopping only the last child is not sufficient
+for collection while the source still maps the cut. Every child independently
+retains its own generation roots and charges. Same-filesystem relocation keeps
+one RAM inode; a qualified cross-filesystem publication charges both actual
+source and final baseline inodes.
+
+Capture, snapshot restore and live-fork batches share cross-home admission.
+The entire batch reserves memory, disk construction peaks and manager-local
+descriptor capacity before capture dispatch. Stable reservation ownership moves
+to exact child generations atomically with their launch dependency closure.
+Construction is parallel within that pre-admitted inventory, not subject to a
+fixed concurrent-restore cap. Metadata readers use independent descriptors of
+the authenticated immutable roles rather than rehashing RAM for every child.
+Seal verification derives each writable disk's canonical stream map in the same
+traversal that checks its evidence SHA-256; the fork loop that retained the cut
+hands those held inodes and maps directly to its cut opening, and every child
+copies from its own descriptor sharing that map. A cross-filesystem or
+uncertain relocation authenticates the resulting inode again (SHA-256 plus map)
+during retention; a restart or another process lacks the handoff and does the
+same for every cut disk before any child uses it.
+
+Seal verification (publication and local-cut retention) first admits every
+role's geometry, hardlink, cross-role and writable-source alias bounds, then
+authenticates in exactly two lanes: RAM on one extra thread with an explicit
+1 MiB stack and 1 MiB read buffer, every other role in inventory order on the
+caller. The capture reservation charges that 2 MiB delta on top of the general
+16 MiB capture scratch before any effect; monitor staging verification uses
+the same delta and never overlaps libvm's, which needs the sealed evidence. A
+lane that fails or unwinds stops its sibling at the next read or role
+boundary; both are joined before verification returns (a panicked RAM lane is
+a typed error), so no lane outlives the caller's
+descriptors, staging or lease. Results keep the evidence inventory order.
+Restore consumer verification stays one serial lane: it precedes the restore
+ledger reservation, so a second 8 MiB stream lane would be unadmitted.
 
 ### Execution restore
 
@@ -390,11 +468,23 @@ bytes. `fork_execution` remains separately capability-gated.
 checkpoint alias and uses the same typed API locally and through the daemon.
 Live restore first checks the selected host capability without initializing a
 writable runtime. A leased verification consumer authenticates the complete
-closure and locally recorded capture seal. The exact selected monitor executable
-then inspects inherited state/lower descriptors and the real host profile before
-any child directory, private disk or network reservation is created.
+closure and locally recorded capture seal, holding each hashed stream and
+non-map object inode; descriptor admission for exactly that set precedes the
+first open. Restore and stopped-snapshot construction take fresh independent
+descriptors bound to those held inodes by fingerprint instead of reopening and
+rehashing them, then close the held set before resource reservation; the lease
+keeps the closure pinned. State object digests are their whole-file SHA-256;
+RAM still receives one whole-file SHA-256 pass for its evidence binding, and
+private copies still verify their completed output. The exact selected monitor
+executable then inspects inherited state/lower descriptors and the real host
+profile before any child directory, private disk or network reservation is
+created.
 
-Raw roots and writable Data disks become isolated private copies. Flat-overlay
+Raw roots and writable Data disks become isolated private copies. A streaming
+copy from an authenticated closure or cut reuses that source map instead of
+recomputing it, but still scans the completed output and compares its complete
+map and length, rechecks source stability and syncs before publication; stopped
+machine disks, which carry no map authority, are scanned while copying. Flat-overlay
 lowers remain read-only VMDK devices with an explicitly retained descriptor/extent
 closure; the generated descriptor is moved into the child without changing its
 inode. Source device IDs, order, format, access and geometry are preserved.
@@ -496,6 +586,10 @@ may coordinate its WAL/SHM files; their presence alone is not an error. Planning
 does not delete sidecars, invoke writable application recovery, or fall back to
 another reader mode. Native guard ownership survives connection teardown.
 Driver/SQLite upgrades must requalify this ordering.
+Machine publication and configuration updates acquire SQLite write admission
+with `BEGIN IMMEDIATE` before reading cleanup dependencies. Concurrent fork
+children therefore wait before taking a catalog snapshot instead of racing a
+deferred read-to-write upgrade. VM construction itself remains concurrent.
 Store and detached filesystem workers also own an explicit clone of the writable
 catalog capability. Closing the SQL pool or cancelling the awaiting task does not
 authorize a no-write opener while that worker can still mutate or clean up files.
@@ -812,6 +906,10 @@ println!("{outcome:?}");
 
 `wait()` consumes and discards subsequent output. `collect()` buffers it in
 memory. Use `recv()` for bounded streaming or external sinks.
+
+The CLI drains execution responses when sending pipe EOF races process exit.
+A received terminal result remains authoritative; a closed request stream
+alone is never evidence of successful execution.
 
 ### Local SSH login
 

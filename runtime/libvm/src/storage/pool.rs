@@ -14,7 +14,7 @@ use crate::storage::identity::{parse_hex, ObjectDigest, StreamId};
 use crate::storage::identity_file::SourceFingerprint;
 use crate::storage::limits::Resource;
 use crate::storage::locks::{self, StorageLock};
-use crate::storage::stream::{open_regular_source, StreamHasher, StreamMap};
+use crate::storage::stream::{open_regular_source, AuthenticatedStream, StreamHasher, StreamMap};
 use crate::storage::StorageError;
 
 pub struct PublishedStream {
@@ -323,24 +323,60 @@ impl StoragePool {
 
     /// Validate the immutable pool file and its identity without modifying state.
     pub fn verify_stream(&self, id: &StreamId) -> Result<StreamMap, StorageError> {
-        let name = id.hex();
-        let path = self.streams.path().join(&name);
-        let file = existing(&self.streams, &name)?.ok_or_else(|| {
-            StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("missing stream {}", path.display()),
-            ))
-        })?;
+        let file = self.open_stream(id)?;
         let metadata = file.metadata()?;
         Resource::ArtifactStreamBytes.check(metadata.len())?;
         let before = SourceFingerprint::new(&metadata);
-        let map = StreamHasher::new()
-            .hash_open_file(&file, metadata.len())?
-            .map;
-        if map.id() != *id || before != SourceFingerprint::new(&file.metadata()?) {
-            return Err(StorageError::ContentMismatch(path));
+        let scan = StreamHasher::new().hash_open_file(&file, metadata.len())?;
+        if scan.map.id() != *id || before != SourceFingerprint::new(&file.metadata()?) {
+            return Err(StorageError::ContentMismatch(self.stream_path(id)));
         }
-        Ok(map)
+        Ok(scan.map)
+    }
+
+    /// Authenticate a stream through its pinned pool directory and return the
+    /// exact hashed descriptor. A caller that later relies on it must bind its
+    /// fingerprint to a state observed before this hash began.
+    pub(crate) fn authenticate_stream(
+        &self,
+        id: &StreamId,
+    ) -> Result<AuthenticatedStream, StorageError> {
+        let file = self.open_stream(id)?;
+        let length = file.metadata()?.len();
+        Resource::ArtifactStreamBytes.check(length)?;
+        let authenticated = StreamHasher::new().authenticate(file, length)?;
+        if authenticated.map().id() != *id {
+            return Err(StorageError::ContentMismatch(self.stream_path(id)));
+        }
+        Ok(authenticated)
+    }
+
+    /// Measure whole-byte SHA only where live RAM needs both identities.
+    /// Both results authenticate the same held inode in the same scan.
+    pub(crate) fn authenticate_stream_with_sha256(
+        &self,
+        id: &StreamId,
+    ) -> Result<(AuthenticatedStream, vm_spec::capture::Sha256Digest), StorageError> {
+        let file = self.open_stream(id)?;
+        let length = file.metadata()?.len();
+        Resource::ArtifactStreamBytes.check(length)?;
+        let (authenticated, sha256) = StreamHasher::new().authenticate_with_sha256(file, length)?;
+        if authenticated.map().id() != *id {
+            return Err(StorageError::ContentMismatch(self.stream_path(id)));
+        }
+        Ok((authenticated, sha256))
+    }
+
+    /// Open a sealed stream through its retained parent. The caller must
+    /// authenticate the descriptor, or bind it to an already authenticated
+    /// held inode, before treating its bytes as that stream.
+    pub(crate) fn open_stream(&self, id: &StreamId) -> Result<File, StorageError> {
+        existing(&self.streams, &id.hex())?.ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing stream {}", self.stream_path(id).display()),
+            ))
+        })
     }
 
     pub fn object_path(&self, digest: &ObjectDigest) -> PathBuf {

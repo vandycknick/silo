@@ -358,7 +358,7 @@ impl Store {
                     record: "capture-workspace",
                     message: "workspace name is not UTF-8".into(),
                 })?;
-            let retained_capture: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='capture')")
+            let retained_capture: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('capture','live-fork'))")
                 .bind(name).fetch_one(&mut *tx).await?;
             if retained_capture {
                 tx.commit().await?;

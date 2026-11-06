@@ -265,7 +265,7 @@ CREATE TABLE machine_storage (
 CREATE TABLE storage_operation (
     operation_id TEXT PRIMARY KEY NOT NULL,
     schema INTEGER NOT NULL CHECK (schema = 1),
-    kind TEXT NOT NULL CHECK (kind IN ('import', 'convert', 'snapshot', 'capture', 'fork', 'relocate', 'update-boot-assets', 'launch')),
+    kind TEXT NOT NULL CHECK (kind IN ('import', 'convert', 'snapshot', 'capture', 'fork', 'live-fork', 'relocate', 'update-boot-assets', 'launch')),
     state TEXT NOT NULL CHECK (state IN ('prepared', 'staging', 'committing', 'cleaning', 'committed', 'aborted')),
     machine_id TEXT,
     run_id TEXT,
@@ -280,7 +280,8 @@ CREATE TABLE restore_memory_reservation (
     operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     budget_id TEXT UNIQUE NOT NULL,
     charge_json BLOB NOT NULL,
-    construction_json BLOB
+    construction_json BLOB,
+    batch_id TEXT REFERENCES live_fork(operation_id) ON DELETE RESTRICT
 );
 CREATE TABLE storage_operation_stream (
     operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
@@ -294,6 +295,80 @@ CREATE TABLE storage_operation_object (
     PRIMARY KEY (operation_id, object_digest)
 );
 CREATE INDEX storage_operation_object_reverse_idx ON storage_operation_object(object_digest, operation_id);
+
+-- Results survive source deletion and retirement of operation roots.
+CREATE TABLE live_fork (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    capture_id TEXT UNIQUE NOT NULL,
+    cancellation_id TEXT UNIQUE NOT NULL,
+    request_json BLOB NOT NULL,
+    observation_json BLOB NOT NULL,
+    result_json BLOB NOT NULL,
+    admission_complete INTEGER NOT NULL DEFAULT 0 CHECK(admission_complete IN (0,1))
+);
+CREATE TABLE live_fork_child (
+    operation_id TEXT NOT NULL REFERENCES live_fork(operation_id) ON DELETE RESTRICT,
+    child_index INTEGER NOT NULL CHECK(child_index >= 0),
+    name TEXT NOT NULL,
+    machine_id TEXT UNIQUE NOT NULL,
+    run_id TEXT UNIQUE NOT NULL,
+    activation_id TEXT UNIQUE NOT NULL,
+    consumer_id TEXT UNIQUE NOT NULL,
+    launch_id TEXT UNIQUE,
+    submitted INTEGER NOT NULL DEFAULT 0 CHECK(submitted IN (0,1)),
+    result_json BLOB NOT NULL,
+    failure_json BLOB,
+    name_reserved INTEGER NOT NULL DEFAULT 1 CHECK(name_reserved IN (0,1)),
+    PRIMARY KEY(operation_id,child_index)
+);
+CREATE UNIQUE INDEX live_fork_reserved_name ON live_fork_child(name) WHERE name_reserved=1;
+CREATE TRIGGER live_fork_child_failure_immutable BEFORE UPDATE OF failure_json ON live_fork_child
+WHEN OLD.failure_json IS NOT NULL
+BEGIN SELECT RAISE(ABORT,'live fork child failure is immutable'); END;
+CREATE TRIGGER machine_config_fork_reserved_insert BEFORE INSERT ON machine_config
+WHEN EXISTS(SELECT 1 FROM live_fork_child WHERE name=NEW.name AND name_reserved=1 AND machine_id!=NEW.id)
+BEGIN SELECT RAISE(ABORT,'machine name reserved by live fork'); END;
+CREATE TRIGGER machine_config_fork_reserved_update BEFORE UPDATE OF name ON machine_config
+WHEN EXISTS(SELECT 1 FROM live_fork_child WHERE name=NEW.name AND name_reserved=1 AND machine_id!=NEW.id)
+BEGIN SELECT RAISE(ABORT,'machine name reserved by live fork'); END;
+CREATE TABLE local_cut (
+    cut_id TEXT PRIMARY KEY NOT NULL,
+    operation_id TEXT UNIQUE NOT NULL REFERENCES live_fork(operation_id) ON DELETE RESTRICT,
+    record_json BLOB NOT NULL
+);
+CREATE TABLE storage_operation_cut (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    cut_id TEXT NOT NULL REFERENCES local_cut(cut_id) ON DELETE RESTRICT,
+    PRIMARY KEY(operation_id,cut_id)
+);
+CREATE INDEX storage_operation_cut_reverse ON storage_operation_cut(cut_id,operation_id);
+CREATE TABLE capture_resource_reservation (
+    operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    charge_json BLOB NOT NULL
+);
+CREATE TABLE fork_event (
+    operation_id TEXT NOT NULL REFERENCES live_fork(operation_id) ON DELETE RESTRICT,
+    child_index INTEGER,
+    phase TEXT NOT NULL,
+    monotonic_ns INTEGER NOT NULL CHECK(monotonic_ns>=0)
+);
+CREATE UNIQUE INDEX fork_parent_event ON fork_event(operation_id,phase) WHERE child_index IS NULL;
+CREATE UNIQUE INDEX fork_child_event ON fork_event(operation_id,child_index,phase) WHERE child_index IS NOT NULL;
+CREATE TRIGGER live_fork_request_immutable BEFORE UPDATE OF operation_id,capture_id,cancellation_id,request_json,observation_json ON live_fork
+BEGIN SELECT RAISE(ABORT,'live fork request is immutable'); END;
+CREATE TRIGGER live_fork_child_identity_immutable BEFORE UPDATE OF operation_id,child_index,name,machine_id,run_id,activation_id,consumer_id ON live_fork_child
+BEGIN SELECT RAISE(ABORT,'live fork child identity is immutable'); END;
+CREATE TRIGGER live_fork_child_launch_immutable BEFORE UPDATE OF launch_id ON live_fork_child
+WHEN OLD.launch_id IS NOT NULL AND NEW.launch_id IS NOT OLD.launch_id
+BEGIN SELECT RAISE(ABORT,'live fork child launch is immutable'); END;
+CREATE TRIGGER live_fork_child_submission_monotonic BEFORE UPDATE OF submitted ON live_fork_child
+WHEN OLD.submitted=1 AND NEW.submitted!=1
+BEGIN SELECT RAISE(ABORT,'live fork child submission is permanent'); END;
+CREATE TRIGGER live_fork_child_name_retirement BEFORE UPDATE OF name_reserved ON live_fork_child
+WHEN OLD.name_reserved=0 AND NEW.name_reserved=1
+BEGIN SELECT RAISE(ABORT,'live fork child name reservation is retired'); END;
+CREATE TRIGGER local_cut_identity_immutable BEFORE UPDATE OF cut_id,operation_id ON local_cut
+BEGIN SELECT RAISE(ABORT,'local cut identity is immutable'); END;
 
 CREATE TABLE image_stream_gc (
     stream_id TEXT PRIMARY KEY NOT NULL,

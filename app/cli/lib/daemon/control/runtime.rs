@@ -135,6 +135,47 @@ impl w::runtime_service_server::RuntimeService for Service {
         Ok(Response::new(()))
     }
 
+    /// Operation-scoped observation; never resolved through the source machine.
+    async fn get_fork(
+        &self,
+        r: Request<w::ForkOperationRef>,
+    ) -> Result<Response<w::LiveForkResult>, Status> {
+        let operation_id =
+            silo_vm_control::fork::operation_from_wire(r.into_inner()).map_err(conversion)?;
+        let result = self
+            .runtime()
+            .await?
+            .inspect_fork(operation_id)
+            .await
+            .map_err(native)?;
+        Ok(Response::new(
+            silo_vm_control::fork::result_to_wire(&result).map_err(conversion)?,
+        ))
+    }
+
+    /// Durable cancellation intent. Like stop/kill it stays admitted while
+    /// host shutdown seals new protected work.
+    async fn cancel_fork(
+        &self,
+        r: Request<w::ForkOperationRef>,
+    ) -> Result<Response<w::LiveForkResult>, Status> {
+        let operation_id =
+            silo_vm_control::fork::operation_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, false, async move {
+                let result = state
+                    .runtime()
+                    .await?
+                    .cancel_fork(operation_id)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::fork::result_to_wire(&result).map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(result))
+    }
+
     async fn resolve_image(
         &self,
         r: Request<w::ResolveImageRequest>,

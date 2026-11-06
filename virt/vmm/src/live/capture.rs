@@ -52,7 +52,9 @@ use crate::live::coordinator::{
 };
 use crate::live::gate::DrainError;
 use crate::live::journal::{CaptureBinding, Eligibility, Phase, WorkerPreparation};
-use crate::live::staging::{parse_layout, CaptureStaging, DiskCopyError, Hasher, RecordCommit};
+use crate::live::staging::{
+    parse_layout, CaptureStaging, DiskCopyError, Hasher, LayoutGeometry, RecordCommit,
+};
 use crate::state::ReadyAgentIdentity;
 use crate::virt::lifecycle::{
     CancelSettlement, CaptureContinuation as NativeContinuation, CaptureDigests,
@@ -65,6 +67,9 @@ use crate::virt::lifecycle::{
 
 /// Bound for the native canonical RAM layout read during verification.
 const MAX_LAYOUT_BYTES: u64 = 64 * 1024;
+
+/// One owned RAM authentication thread, never a thread per role.
+const VERIFY_THREAD_STACK_BYTES: usize = 1 << 20;
 
 /// This run's trusted capture identity, fixed at monitor startup.
 #[derive(Debug)]
@@ -1051,6 +1056,11 @@ impl LiveCoordinator {
         let (Some(staging), Some(outputs)) = (run.staging.clone(), run.outputs) else {
             return Err(fail("capture staging is not prepared".into()));
         };
+        if !run.facts.memory_state_sealed {
+            return Err(fail(
+                "native capture writers are not sealed and closed".into(),
+            ));
+        }
         let roles = run.plan.roles();
         let disks = run.plan.disks.clone();
         let ram_limit = run.plan.ram_bytes;
@@ -2298,82 +2308,56 @@ fn verify_staging(
     abort: &CancellationToken,
 ) -> io::Result<Verified> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
-    let mut hasher = Hasher::new();
-    let mut inventory = Vec::with_capacity(roles.len());
-    let mut state_bytes = 0u64;
-    let mut staged_bytes = staging.request_allocation()?;
-    let mut geometry = None;
-    let mut ram = None;
-    for role in roles {
-        let (file, facts) = staging.open_sealed(role)?;
-        let prepared = match role {
-            CaptureRole::Execution => Some(outputs.execution),
-            CaptureRole::Devices => Some(outputs.devices),
-            CaptureRole::Ram => Some(outputs.ram),
-            CaptureRole::Layout => Some(outputs.layout),
-            CaptureRole::Disk(_) => None,
-        };
-        if let Some(expected) = prepared {
-            if (facts.device, facts.inode) != (expected.device, expected.inode) {
-                return Err(invalid(format!(
-                    "{} is not the prepared output inode",
-                    role.relative_path()
-                )));
+    let staged_request_bytes = staging.request_allocation()?;
+    let ram_input = roles
+        .iter()
+        .enumerate()
+        .find(|(_, role)| **role == CaptureRole::Ram);
+    let ram_index = ram_input.map(|(index, _)| index);
+    let (ram_role, (mut inventory, state_bytes, mut staged_bytes, geometry)) = authenticate_lanes(
+        abort,
+        |abort| {
+            ram_input
+                .map(|(_, role)| {
+                    let mut hasher = Hasher::new();
+                    verify_role(staging, role, disks, outputs, &mut hasher, abort)
+                })
+                .transpose()
+        },
+        |abort| {
+            let mut hasher = Hasher::whole_file();
+            let mut inventory = Vec::with_capacity(roles.len());
+            let mut state_bytes = 0u64;
+            let mut staged_bytes = staged_request_bytes;
+            let mut geometry = None;
+            for (index, role) in roles.iter().enumerate() {
+                if Some(index) == ram_index {
+                    continue;
+                }
+                let verified = verify_role(staging, role, disks, outputs, &mut hasher, abort)?;
+                state_bytes = state_bytes.saturating_add(verified.state_bytes);
+                staged_bytes = staged_bytes.saturating_add(verified.staged_bytes);
+                geometry = verified.geometry.or(geometry);
+                inventory.push(verified.entry);
             }
+            Ok((inventory, state_bytes, staged_bytes, geometry))
+        },
+    )?;
+    // The serial lane already reduced its roles in admitted order. Insert
+    // the fixed-size RAM result without a second inventory allocation.
+    let ram = match (ram_index, ram_role) {
+        (Some(index), Some(role)) => {
+            let ram = role.stream.map(|stream| (role.entry.length, stream));
+            staged_bytes = staged_bytes.saturating_add(role.staged_bytes);
+            inventory.push(role.entry);
+            inventory
+                .get_mut(index..)
+                .ok_or_else(|| invalid("authenticated RAM position is missing".into()))?
+                .rotate_right(1);
+            ram
         }
-        let disk = match role {
-            CaptureRole::Disk(name) => Some(
-                disks
-                    .iter()
-                    .find(|disk| disk.name == *name)
-                    .ok_or_else(|| invalid(format!("{} has no disk plan", role.relative_path())))?,
-            ),
-            _ => None,
-        };
-        if disk.is_some_and(|disk| facts.length != disk.length) {
-            return Err(invalid(format!(
-                "{} length differs from its attachment",
-                role.relative_path()
-            )));
-        }
-        if matches!(
-            role,
-            CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout
-        ) {
-            if facts.length == 0 {
-                return Err(invalid(format!("{} is empty", role.relative_path())));
-            }
-            state_bytes = state_bytes.saturating_add(facts.length);
-        }
-        if *role == CaptureRole::Layout {
-            if facts.length > MAX_LAYOUT_BYTES {
-                return Err(invalid(format!("{CAPTURE_LAYOUT_FILE} exceeds its bound")));
-            }
-            let length = usize::try_from(facts.length)
-                .map_err(|_| invalid("layout length overflows".into()))?;
-            let mut bytes = vec![0u8; length];
-            std::os::unix::fs::FileExt::read_exact_at(&file, &mut bytes, 0)?;
-            geometry = Some(parse_layout(&bytes)?);
-        }
-        let hashed = hasher.hash(&file, facts.length, *role == CaptureRole::Ram, abort)?;
-        if *role == CaptureRole::Ram {
-            ram = hashed.stream.map(|stream| (hashed.length, stream));
-        }
-        // fsync of the exact inode; native and copy writers are closed.
-        file.sync_all()?;
-        let charge = match disk.map(|disk| disk.copy) {
-            Some(CaptureDiskCopy::Clone) => CAPTURE_CLONE_RESERVE_BYTES,
-            Some(CaptureDiskCopy::Copy) | None => {
-                std::os::unix::fs::MetadataExt::blocks(&file.metadata()?).saturating_mul(512)
-            }
-        };
-        staged_bytes = staged_bytes.saturating_add(charge);
-        inventory.push(CaptureInventoryEntry {
-            role: role.clone(),
-            length: hashed.length,
-            sha256: hashed.sha256,
-        });
-    }
+        _ => None,
+    };
     staging.sync_directories()?;
     staged_bytes = staged_bytes.saturating_add(staging.directory_allocation()?);
     if state_bytes > CAPTURE_STATE_RESERVE_BYTES {
@@ -2394,6 +2378,163 @@ fn verify_staging(
         regions: geometry.regions,
         ram_stream,
         staged_bytes,
+    })
+}
+
+/// Authentication of one exact staged inode, before cross-role reduction.
+#[derive(Debug)]
+struct VerifiedRole {
+    entry: CaptureInventoryEntry,
+    state_bytes: u64,
+    staged_bytes: u64,
+    geometry: Option<LayoutGeometry>,
+    stream: Option<Sha256Digest>,
+}
+
+fn verify_role(
+    staging: &CaptureStaging,
+    role: &CaptureRole,
+    disks: &[CaptureDiskPlan],
+    outputs: CaptureOutputIdentities,
+    hasher: &mut Hasher,
+    abort: &CancellationToken,
+) -> io::Result<VerifiedRole> {
+    let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+    let (file, facts) = staging.open_sealed(role)?;
+    let prepared = match role {
+        CaptureRole::Execution => Some(outputs.execution),
+        CaptureRole::Devices => Some(outputs.devices),
+        CaptureRole::Ram => Some(outputs.ram),
+        CaptureRole::Layout => Some(outputs.layout),
+        CaptureRole::Disk(_) => None,
+    };
+    if let Some(expected) = prepared {
+        if (facts.device, facts.inode) != (expected.device, expected.inode) {
+            return Err(invalid(format!(
+                "{} is not the prepared output inode",
+                role.relative_path()
+            )));
+        }
+    }
+    let disk = match role {
+        CaptureRole::Disk(name) => Some(
+            disks
+                .iter()
+                .find(|disk| disk.name == *name)
+                .ok_or_else(|| invalid(format!("{} has no disk plan", role.relative_path())))?,
+        ),
+        _ => None,
+    };
+    if disk.is_some_and(|disk| facts.length != disk.length) {
+        return Err(invalid(format!(
+            "{} length differs from its attachment",
+            role.relative_path()
+        )));
+    }
+    let state_bytes = if matches!(
+        role,
+        CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout
+    ) {
+        if facts.length == 0 {
+            return Err(invalid(format!("{} is empty", role.relative_path())));
+        }
+        facts.length
+    } else {
+        0
+    };
+    let geometry = if *role == CaptureRole::Layout {
+        if facts.length > MAX_LAYOUT_BYTES {
+            return Err(invalid(format!("{CAPTURE_LAYOUT_FILE} exceeds its bound")));
+        }
+        let length =
+            usize::try_from(facts.length).map_err(|_| invalid("layout length overflows".into()))?;
+        let mut bytes = vec![0u8; length];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut bytes, 0)?;
+        Some(parse_layout(&bytes)?)
+    } else {
+        None
+    };
+    let hashed = hasher.hash(&file, facts.length, *role == CaptureRole::Ram, abort)?;
+    // fsync of the exact inode; native and copy writers are closed.
+    file.sync_all()?;
+    let staged_bytes = match disk.map(|disk| disk.copy) {
+        Some(CaptureDiskCopy::Clone) => CAPTURE_CLONE_RESERVE_BYTES,
+        Some(CaptureDiskCopy::Copy) | None => {
+            std::os::unix::fs::MetadataExt::blocks(&file.metadata()?).saturating_mul(512)
+        }
+    };
+    Ok(VerifiedRole {
+        entry: CaptureInventoryEntry {
+            role: role.clone(),
+            length: hashed.length,
+            sha256: hashed.sha256,
+        },
+        state_bytes,
+        staged_bytes,
+        geometry,
+        stream: hashed.stream,
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("RAM authentication thread panicked")]
+struct AuthenticationThreadPanicked;
+
+/// Cancel the sibling on an error or unwind, but not on successful completion.
+struct AuthenticationOwner<'a> {
+    abort: &'a CancellationToken,
+    completed: bool,
+}
+
+impl Drop for AuthenticationOwner<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.abort.cancel();
+        }
+    }
+}
+
+fn authenticate_lane<R>(
+    abort: &CancellationToken,
+    authenticate: impl FnOnce(&CancellationToken) -> io::Result<R>,
+) -> io::Result<R> {
+    let mut owner = AuthenticationOwner {
+        abort,
+        completed: false,
+    };
+    let result = authenticate(abort);
+    owner.completed = result.is_ok();
+    result
+}
+
+/// Both owners finish inside the existing blocking stage. A lane failure
+/// stops its sibling through a child token, without cancelling the capture's
+/// external token or replacing the original I/O error with that interruption.
+fn authenticate_lanes<R: Send, S>(
+    abort: &CancellationToken,
+    ram: impl FnOnce(&CancellationToken) -> io::Result<R> + Send,
+    remaining: impl FnOnce(&CancellationToken) -> io::Result<S>,
+) -> io::Result<(R, S)> {
+    let abort = abort.child_token();
+    std::thread::scope(|scope| {
+        let ram_owner = std::thread::Builder::new()
+            .name("capture-ram-auth".into())
+            .stack_size(VERIFY_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || authenticate_lane(&abort, ram))?;
+        let remaining = authenticate_lane(&abort, remaining);
+        // No early return is permitted between spawn and this explicit join.
+        let ram = ram_owner
+            .join()
+            .map_err(|_| io::Error::other(AuthenticationThreadPanicked))
+            .and_then(|result| result);
+        match (ram, remaining) {
+            (Ok(ram), Ok(remaining)) => Ok((ram, remaining)),
+            (Err(ram), Err(remaining)) if ram.kind() == io::ErrorKind::Interrupted => {
+                Err(remaining)
+            }
+            (Err(ram), _) => Err(ram),
+            (_, Err(remaining)) => Err(remaining),
+        }
     })
 }
 
@@ -2434,9 +2575,11 @@ fn staging_budget(reserved: u64, staged: u64) -> Result<u64, LiveFailure> {
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use tokio_util::sync::CancellationToken;
     use vm_spec::capture::{
@@ -2446,8 +2589,10 @@ mod tests {
     };
     use vm_spec::lifecycle::{LiveFailureCode, LiveId, LiveStage};
 
-    use crate::live::coordinator::capture::{staging_budget, verify_staging};
-    use crate::live::staging::CaptureStaging;
+    use crate::live::coordinator::capture::{
+        authenticate_lanes, staging_budget, verify_role, verify_staging,
+    };
+    use crate::live::staging::{CaptureStaging, Hasher};
     use crate::virt::lifecycle::{CaptureOutputIdentities, OutputIdentity};
 
     struct Root(PathBuf);
@@ -2586,6 +2731,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verified.inventory.len(), 5);
+        assert_eq!(
+            verified
+                .inventory
+                .iter()
+                .map(|entry| &entry.role)
+                .collect::<Vec<_>>(),
+            roles.iter().collect::<Vec<_>>()
+        );
+        for entry in &verified.inventory {
+            let bytes = std::fs::read(staging.path().join(entry.role.relative_path())).unwrap();
+            assert_eq!(entry.length, bytes.len() as u64);
+            assert_eq!(
+                entry.sha256,
+                vm_spec::capture::Sha256Digest::of_bytes(&bytes)
+            );
+        }
         assert_eq!(verified.packed_length, 8192);
         assert_eq!(verified.regions, 1);
         let ram = &verified.inventory[2];
@@ -2815,5 +2976,147 @@ mod tests {
                 WorkerPreparation::Uncertain
             );
         }
+    }
+
+    #[test]
+    fn authentication_failure_joins_ram_and_preserves_the_inode_error() {
+        let (_root, staging, outputs, _roles) = staged();
+        let abort = CancellationToken::new();
+        let (ram_opened, wait_ram_opened) = mpsc::sync_channel(1);
+        let (release_ram, wait_release_ram) = mpsc::sync_channel(1);
+        let (role_failed, wait_role_failed) = mpsc::sync_channel(1);
+        let (ram_finished, wait_ram_finished) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let (staging, abort) = (&staging, &abort);
+            let owner = scope.spawn(move || {
+                authenticate_lanes(
+                    abort,
+                    move |abort| {
+                        // Retain an actual role FD while the other lane fails.
+                        let (file, facts) = staging.open_sealed(&CaptureRole::Ram)?;
+                        ram_opened.send(()).unwrap();
+                        wait_release_ram
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        let result = Hasher::new().hash(&file, facts.length, true, abort);
+                        drop(file);
+                        ram_finished.send(()).unwrap();
+                        result
+                    },
+                    move |abort| {
+                        wait_ram_opened
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        let mut swapped = outputs;
+                        swapped.execution = outputs.devices;
+                        let result = verify_role(
+                            staging,
+                            &CaptureRole::Execution,
+                            &[],
+                            swapped,
+                            &mut Hasher::whole_file(),
+                            abort,
+                        );
+                        role_failed.send(()).unwrap();
+                        result
+                    },
+                )
+            });
+            wait_role_failed
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            // The failed owner cannot return while its RAM sibling owns the FD.
+            assert!(!owner.is_finished());
+            release_ram.send(()).unwrap();
+            let error = owner.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("execution.state is not the prepared output inode"),
+                "{error}"
+            );
+            wait_ram_finished.try_recv().unwrap();
+        });
+        // Sibling interruption is internal, not capture cancellation.
+        assert!(!abort.is_cancelled());
+    }
+
+    #[test]
+    fn authentication_cancellation_joins_both_real_file_owners() {
+        let (_root, staging, _outputs, _roles) = staged();
+        let abort = CancellationToken::new();
+        let (ram_opened, wait_ram_opened) = mpsc::sync_channel(1);
+        let (release_ram, wait_release_ram) = mpsc::sync_channel(1);
+        let (other_opened, wait_other_opened) = mpsc::sync_channel(1);
+        let (release_other, wait_release_other) = mpsc::sync_channel(1);
+        let (other_finished, wait_other_finished) = mpsc::sync_channel(1);
+        let (ram_finished, wait_ram_finished) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let (staging, abort) = (&staging, &abort);
+            let owner = scope.spawn(move || {
+                authenticate_lanes(
+                    abort,
+                    move |abort| {
+                        let (file, facts) = staging.open_sealed(&CaptureRole::Ram)?;
+                        ram_opened.send(()).unwrap();
+                        wait_release_ram
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        let result = Hasher::new().hash(&file, facts.length, true, abort);
+                        drop(file);
+                        ram_finished.send(()).unwrap();
+                        result
+                    },
+                    move |abort| {
+                        let (file, facts) = staging.open_sealed(&CaptureRole::Execution)?;
+                        other_opened.send(()).unwrap();
+                        wait_release_other
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        let result = Hasher::whole_file().hash(&file, facts.length, false, abort);
+                        drop(file);
+                        other_finished.send(()).unwrap();
+                        result
+                    },
+                )
+            });
+            wait_ram_opened
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            wait_other_opened
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            abort.cancel();
+            release_other.send(()).unwrap();
+            wait_other_finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert!(!owner.is_finished());
+            release_ram.send(()).unwrap();
+            let error = owner.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            wait_ram_finished.try_recv().unwrap();
+        });
+    }
+
+    #[test]
+    fn authentication_thread_panic_is_a_typed_join_error() {
+        use crate::live::coordinator::capture::AuthenticationThreadPanicked;
+
+        let (_root, staging, _outputs, _roles) = staged();
+        let error = authenticate_lanes(
+            &CancellationToken::new(),
+            |_| -> io::Result<()> { panic!("authentication owner failed") },
+            |abort| {
+                let (file, facts) = staging.open_sealed(&CaptureRole::Execution)?;
+                Hasher::whole_file().hash(&file, facts.length, false, abort)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error
+            .get_ref()
+            .is_some_and(|error| error.is::<AuthenticationThreadPanicked>()));
     }
 }

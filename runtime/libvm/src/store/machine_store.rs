@@ -122,7 +122,7 @@ impl MachineStore for Store {
         }
 
         let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
         Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
         let platform = oci::Platform::host().map_err(|error| LibVmError::InvalidStorageRecord {
@@ -251,7 +251,7 @@ impl MachineStore for Store {
 
     async fn save_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
         let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
         let result = sqlx::query(
             "UPDATE machine_config
@@ -456,7 +456,9 @@ impl Store {
             .as_ref()
             .map(|pool| pool.lock_roots_shared())
             .transpose()?;
-        let mut tx = self.pool.begin().await?;
+        // Acquire write admission before dependency reads, avoiding a read
+        // transaction upgrade racing another child's publication.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
         Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
         Self::insert_machine_rootfs(&mut tx, rootfs).await?;
@@ -488,7 +490,7 @@ impl Store {
             .as_ref()
             .map(|pool| pool.lock_roots_shared())
             .transpose()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
         let result =
             sqlx::query("UPDATE machine_config SET name=?1, config_json=jsonb(?2) WHERE id=?3")

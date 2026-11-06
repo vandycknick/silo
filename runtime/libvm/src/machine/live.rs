@@ -27,6 +27,10 @@ impl MachineLiveObservation {
         &self.report
     }
 
+    pub(crate) fn machine_id(&self) -> MachineId {
+        self.machine_id
+    }
+
     /// New Pause requires capability admission; reconnecting an already durable
     /// exact Pause intent must not be stranded by a narrowed guest vector.
     pub fn require_pause_submission(&self) -> Result<(), LibVmError> {
@@ -257,9 +261,9 @@ pub(crate) fn report_from_status(
     Ok(report)
 }
 
-/// Manager delivery: Pause and Capture are delivered; Restore, Fork and
-/// Incremental stay not-delivered even when a vector advertises them. The
-/// monitor vector remains the qualification authority.
+/// Manager admission for source-run Pause, Capture and Fork commands. Restore
+/// has a separate checkpoint-construction entrypoint. The monitor vector
+/// remains the qualification authority.
 pub fn require_live_operation(
     observation: &MachineLiveObservation,
     operation: LiveOperation,
@@ -268,7 +272,10 @@ pub fn require_live_operation(
     let reason = match &report.live.get(operation).availability {
         LiveAvailability::Unsupported { reason } => reason.clone(),
         LiveAvailability::Supported
-            if matches!(operation, LiveOperation::Pause | LiveOperation::Capture) =>
+            if matches!(
+                operation,
+                LiveOperation::Pause | LiveOperation::Capture | LiveOperation::Fork
+            ) =>
         {
             return Ok(())
         }
@@ -294,42 +301,6 @@ impl Machine {
         observation: &MachineLiveObservation,
     ) -> Result<crate::MachineLifecycle, LibVmError> {
         self.pause_and_wait(observation).await
-    }
-
-    pub async fn fork_execution(
-        &self,
-        observation: &MachineLiveObservation,
-        _name: Option<&str>,
-    ) -> Result<(), LibVmError> {
-        if observation.machine_id == self.machine_id()
-            && matches!(
-                self.runtime()
-                    .machine_storage_record(self.machine_id())
-                    .await?
-                    .root,
-                crate::MachineRoot::LinuxOverlay {
-                    lower: crate::OverlayLower::FlatExt4 { .. },
-                    ..
-                }
-            )
-        {
-            return Err(LibVmError::FlatOverlayPublicationUnsupported);
-        }
-        self.require_exact_live(observation, LiveOperation::Fork)
-    }
-
-    fn require_exact_live(
-        &self,
-        observation: &MachineLiveObservation,
-        operation: LiveOperation,
-    ) -> Result<(), LibVmError> {
-        if observation.machine_id != self.machine_id() {
-            return Err(LibVmError::LiveObservation {
-                reference: self.id(),
-                message: "observation belongs to another machine".to_string(),
-            });
-        }
-        require_live_operation(observation, operation)
     }
 }
 
@@ -426,7 +397,6 @@ mod tests {
                 LiveReasonCode::DeviceProfileRejected,
                 Some(LiveDeviceSubject::Virtiofs),
             ),
-            (LiveOperation::Fork, LiveReasonCode::NotDelivered, None),
             (LiveOperation::Restore, LiveReasonCode::NotDelivered, None),
         ] {
             match require_live_operation(&observed, operation).unwrap_err() {

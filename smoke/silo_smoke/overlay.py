@@ -26,7 +26,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 from . import images, procs, shutdown
-from .cli import Silo
+from .cli import Silo, timed
 from .config import REPO, SmokeConfig
 from .workspace import Workspace
 
@@ -282,33 +282,35 @@ def metrics(silo: Silo, name: str) -> dict:
     binary = silo.ws.config.bin_dir / "examples/root_metrics"
     if not binary.is_file():
         binary = REPO / "target/debug/examples/root_metrics"
-    # Require a new post-effect report, not merely a previously fresh report.
-    after = int(time.time() * 1000)
-    machine_id = UUID(silo.machine_id(name))
-    deadline = time.monotonic() + 20
-    while True:
-        result = subprocess.run([str(binary), name], env=silo.ws.env(), capture_output=True, text=True, timeout=30)
-        silo.ws.record("overlay-metrics", result.stdout + result.stderr)
-        assert result.returncode == 0, result.stderr
-        snapshot = json.loads(result.stdout)
-        assert UUID(snapshot["machineId"]) == machine_id
-        assert snapshot["agentInstanceId"]
-        root = snapshot["rootStorage"]
-        temporary = root["temporaryDirectory"]
-        if snapshot["freshness"] == "Fresh" and snapshot["observedAtUnixMillis"] >= after:
-            # One guest stat invocation observes both real filesystems without
-            # paying for a second CLI/transport/guest process round trip.
-            lines = silo.exec(name, "stat", "-f", "-c", "%S %b %f %a %c %d", "/run/silo/rootfs/upperfs", "/tmp", user="root").stdout.splitlines()
-            assert len(lines) == 2, lines
-            def measured(line: str) -> dict:
-                fragment, blocks, free, available, inodes, free_inodes = map(int, line.split())
-                return {"usable": fragment * blocks, "used": fragment * (blocks - free), "free": fragment * free, "available": fragment * available, "inodes": inodes, "freeInodes": free_inodes}
-            upper_actual, tmp_actual = map(measured, lines)
-            if (root["upperUsableBytes"], root["upperUsedBytes"], root["upperFreeBytes"], root["upperAvailableBytes"], root["upperTotalInodes"], root["upperFreeInodes"]) == tuple(upper_actual[key] for key in ("usable", "used", "free", "available", "inodes", "freeInodes")) and (temporary["capacityBytes"], temporary["usedBytes"], temporary["freeBytes"], temporary["availableBytes"]) == tuple(tmp_actual[key] for key in ("usable", "used", "free", "available")):
-                silo.ws.record("overlay-independent-statvfs", json.dumps({"upper": upper_actual, "temporary": tmp_actual, "observedAtUnixMillis": snapshot["observedAtUnixMillis"], "agentInstanceId": snapshot["agentInstanceId"]}) + "\n")
-                break
-        assert time.monotonic() < deadline, "no fresh post-effect capacity report matching independent guest statvfs"
-        time.sleep(0.1)
+    with timed(silo.ws, "overlay.metrics"):
+        # Require a new post-effect report, not merely a previously fresh report.
+        after = int(time.time() * 1000)
+        machine_id = UUID(procs.machine_id(silo.ws, name))
+        deadline = time.monotonic() + 20
+        while True:
+            with timed(silo.ws, "root_metrics"):
+                result = subprocess.run([str(binary), name], env=silo.ws.env(), capture_output=True, text=True, timeout=30)
+            silo.ws.record("overlay-metrics", result.stdout + result.stderr)
+            assert result.returncode == 0, result.stderr
+            snapshot = json.loads(result.stdout)
+            assert UUID(snapshot["machineId"]) == machine_id
+            assert snapshot["agentInstanceId"]
+            root = snapshot["rootStorage"]
+            temporary = root["temporaryDirectory"]
+            if snapshot["freshness"] == "Fresh" and snapshot["observedAtUnixMillis"] >= after:
+                # One guest stat invocation observes both real filesystems without
+                # paying for a second CLI/transport/guest process round trip.
+                lines = silo.exec(name, "stat", "-f", "-c", "%S %b %f %a %c %d", "/run/silo/rootfs/upperfs", "/tmp", user="root").stdout.splitlines()
+                assert len(lines) == 2, lines
+                def measured(line: str) -> dict:
+                    fragment, blocks, free, available, inodes, free_inodes = map(int, line.split())
+                    return {"usable": fragment * blocks, "used": fragment * (blocks - free), "free": fragment * free, "available": fragment * available, "inodes": inodes, "freeInodes": free_inodes}
+                upper_actual, tmp_actual = map(measured, lines)
+                if (root["upperUsableBytes"], root["upperUsedBytes"], root["upperFreeBytes"], root["upperAvailableBytes"], root["upperTotalInodes"], root["upperFreeInodes"]) == tuple(upper_actual[key] for key in ("usable", "used", "free", "available", "inodes", "freeInodes")) and (temporary["capacityBytes"], temporary["usedBytes"], temporary["freeBytes"], temporary["availableBytes"]) == tuple(tmp_actual[key] for key in ("usable", "used", "free", "available")):
+                    silo.ws.record("overlay-independent-statvfs", json.dumps({"upper": upper_actual, "temporary": tmp_actual, "observedAtUnixMillis": snapshot["observedAtUnixMillis"], "agentInstanceId": snapshot["agentInstanceId"]}) + "\n")
+                    break
+            assert time.monotonic() < deadline, "no fresh post-effect capacity report matching independent guest statvfs"
+            time.sleep(0.1)
     assert root["upperBackingBytes"] == root["upperFilesystemBytes"] + root["unusableTailBytes"]
     assert root["upperFilesystemBytes"] == root["upperUsableBytes"] + root["filesystemOverheadBytes"]
     assert root["upperUsedBytes"] + root["upperFreeBytes"] == root["upperUsableBytes"]
@@ -317,9 +319,20 @@ def metrics(silo: Silo, name: str) -> dict:
     return root
 
 
-def evidence(silo: Silo, name: str) -> dict:
+@dataclass(frozen=True)
+class Evidence:
+    """The guest's boot observation and the validated metrics frame checked against it."""
+
+    observation: dict
+    metrics: dict
+
+
+def evidence(silo: Silo, name: str) -> Evidence:
     value = observation(silo, name)
     silo.ws.record("overlay-observation", json.dumps(value, sort_keys=True) + "\n")
+    # The diagnostics below are read-only, so the fresh frame need not follow
+    # them; sampling first keeps their guest sessions out of the cutoff wait.
+    root_metrics = metrics(silo, name)
     # Keep every diagnostic and fail on any failed read, but use one real guest
     # exec rather than one SSH/CLI session per small procfs/sysfs file.
     silo.exec(name, "sh", "-eu", "-c", """
@@ -330,7 +343,6 @@ done
 df -Pk / /tmp /run/silo/rootfs/upperfs
 df -Pi /run/silo/rootfs/upperfs
 """, user="root")
-    root_metrics = metrics(silo, name)
     assert root_metrics["upperBackingBytes"] == value["root"]["upper"]["lengthBytes"]
     assert root_metrics["sharedLowerLogicalBytes"] == value["root"]["lower"]["lengthBytes"]
     temporary = root_metrics["temporaryDirectory"]
@@ -339,7 +351,7 @@ df -Pi /run/silo/rootfs/upperfs
         assert temporary["capacityBytes"] == value["root"]["temporaryDirectory"]["capacityBytes"]
     else:
         assert temporary["kind"] == "upper" and temporary["memoryCharged"] is False and temporary["persistent"] is True
-    return value
+    return Evidence(value, root_metrics)
 
 
 def worker_pid(silo: Silo, name: str) -> int:
@@ -406,7 +418,7 @@ def ext4(path: Path) -> dict:
 
 
 def shutdown_watch(silo: Silo, name: str) -> dict:
-    path = silo.ws.silo_home / "logs/machines" / silo.machine_id(name) / "serial.log"
+    path = silo.ws.silo_home / "logs/machines" / procs.machine_id(silo.ws, name) / "serial.log"
     assert path.is_file()
     return {"path": str(path), "offset": path.stat().st_size, "runId": procs.run_id(silo.ws, name), "monitorPid": procs.vmm_pid(silo.ws, name)}
 
@@ -436,7 +448,7 @@ def orderly_guest_shutdown(silo: Silo, name: str, *, timeout: float = 90) -> dic
         result = silo.run("stop", name, "--timeout", f"{int(timeout)}s", expect=None, timeout=timeout + 30)
         silo.ws.record("overlay-orderly-cli-stop", json.dumps({"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}) + "\n")
         terminal = shutdown.exit_record(silo, name, watched["runId"])
-        assert_unforced_native_exit(terminal, machine_id=silo.machine_id(name), run_id=watched["runId"], monitor=watched["monitorPid"], worker=worker)
+        assert_unforced_native_exit(terminal, machine_id=procs.machine_id(silo.ws, name), run_id=watched["runId"], monitor=watched["monitorPid"], worker=worker)
         procs.wait_gone(worker, timeout=20)
         procs.wait_gone(watched["monitorPid"], timeout=20)
         assert terminal["storageShutdown"]["guestProtocolCompleted"] is True

@@ -8,6 +8,7 @@ mod lifecycle;
 mod lifecycle_options;
 pub(crate) mod live;
 pub(crate) mod live_capture;
+pub(crate) mod live_fork;
 pub(crate) mod live_operations;
 mod logs;
 mod memory;

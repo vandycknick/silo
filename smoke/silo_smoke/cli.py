@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 import json
 import shlex
 import subprocess
@@ -14,6 +16,72 @@ from .errors import SmokeAssertion
 
 if TYPE_CHECKING:
     from .workspace import Workspace
+
+TIMING_EVIDENCE = "timing"
+# Per-test JUnit property; session preparations append `-prepare-<catalog>`.
+TIMINGS_PROPERTY = "silo-smoke-timings"
+
+
+def record_timing(ws: Workspace, operation: str, started: float, outcome: str) -> None:
+    """Append one monotonic duration line to the workspace's evidence log."""
+    elapsed = time.monotonic() - started
+    ws.record(TIMING_EVIDENCE, json.dumps({"operation": operation, "outcome": outcome, "seconds": round(elapsed, 6)}, sort_keys=True) + "\n")
+
+
+@contextmanager
+def timed(ws: Workspace, operation: str) -> Iterator[None]:
+    """Time one harness operation, recording failures under their exception type."""
+    started = time.monotonic()
+    try:
+        yield
+    except BaseException as error:
+        record_timing(ws, operation, started, type(error).__name__)
+        raise
+    record_timing(ws, operation, started, "ok")
+
+
+def timing_summary(ws: Workspace) -> dict[str, dict[str, dict[str, float]]]:
+    """Aggregate timing evidence per operation and outcome; size is independent of call count."""
+    path = ws.evidence_path(TIMING_EVIDENCE)
+    summary: dict[str, dict[str, dict[str, float]]] = {}
+    if not path.is_file():
+        return summary
+    for line in path.read_text(encoding="utf-8").splitlines():
+        entry = json.loads(line)
+        aggregate = summary.setdefault(entry["operation"], {}).setdefault(entry["outcome"], {"count": 0, "seconds": 0.0, "maxSeconds": 0.0})
+        aggregate["count"] += 1
+        aggregate["seconds"] += entry["seconds"]
+        aggregate["maxSeconds"] = max(aggregate["maxSeconds"], entry["seconds"])
+    for outcomes in summary.values():
+        for aggregate in outcomes.values():
+            aggregate["seconds"] = round(aggregate["seconds"], 3)
+            aggregate["maxSeconds"] = round(aggregate["maxSeconds"], 3)
+    return summary
+
+
+def release(ws: Workspace, *, failed: bool, publish: Callable[[str], None]) -> None:
+    """Clean up a workspace and publish its timing summary outside the evidence tree.
+
+    Successful cleanup deletes the workspace evidence, so the bounded aggregate,
+    including cleanup itself, goes to the caller's pytest report instead.
+    """
+    try:
+        summary = timing_summary(ws)
+    except BaseException:
+        # Never leak guests over unreadable timing evidence; retain it instead.
+        ws.cleanup(failed=True)
+        raise
+    started = time.monotonic()
+    outcome = "ok"
+    try:
+        ws.cleanup(failed=failed)
+    except BaseException as error:
+        outcome = type(error).__name__
+        raise
+    finally:
+        elapsed = round(time.monotonic() - started, 3)
+        summary["workspace cleanup"] = {outcome: {"count": 1, "seconds": elapsed, "maxSeconds": elapsed}}
+        publish(json.dumps(summary, sort_keys=True))
 
 
 @dataclass
@@ -48,16 +116,23 @@ class Silo:
         command = [str(self.ws.config.silo), *args]
         data = stdin.encode() if isinstance(stdin, str) else stdin
         evidence_label = label or (args[0] if args else "silo")
+        operation = "silo " + evidence_label
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 command, input=data, env=self.ws.env() if env is None else env,
                 capture_output=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
+            record_timing(self.ws, operation, started, "timeout")
             stdout = (exc.stdout or b"").decode(errors="replace")
             stderr = (exc.stderr or b"").decode(errors="replace")
             self.ws.record(evidence_label, f"$ silo {shlex.join(args)}\n{stdout}\n[stderr]\n{stderr}\n")
             raise SmokeAssertion(f"silo {shlex.join(args)} timed out after {timeout}s: {stderr[-4000:]}") from exc
+        except OSError:
+            record_timing(self.ws, operation, started, "spawn-error")
+            raise
+        record_timing(self.ws, operation, started, f"exit-{completed.returncode}")
         result = Result(command, completed.returncode, completed.stdout.decode(errors="replace"), completed.stderr.decode(errors="replace"))
         self.ws.record(evidence_label, f"$ silo {shlex.join(args)}\n{result.stdout}\n[stderr]\n{result.stderr}\n")
         if expect is not None and result.returncode != expect:
@@ -79,15 +154,18 @@ class Silo:
         return self.json("ls")
 
     def wait_ready(self, name: str, timeout: float = 90) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout
-        while True:
-            last = self.info(name)
-            if last.get("observation") == "observed" and last.get("state") == "running" and last.get("ready") is True:
-                return last
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SmokeAssertion(f"machine {name} not ready after {timeout}s: {json.dumps(last)}")
-            time.sleep(min(0.25, remaining))
+        # Polls log under their own label, so identity/state `info` counts stay
+        # comparable independently of how many readiness retries a boot needed.
+        with timed(self.ws, "wait_ready"):
+            deadline = time.monotonic() + timeout
+            while True:
+                last = self.json("info", name, label="wait-ready")
+                if last.get("observation") == "observed" and last.get("state") == "running" and last.get("ready") is True:
+                    return last
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SmokeAssertion(f"machine {name} not ready after {timeout}s: {json.dumps(last)}")
+                time.sleep(min(0.25, remaining))
 
     def create(self, name: str, image: str, *flags: str) -> dict[str, Any]:
         self.run("create", image, "--name", name, *flags)

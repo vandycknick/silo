@@ -3,6 +3,7 @@ pub(crate) mod capture;
 mod capture_native;
 mod catalog_guard;
 mod config_store;
+pub(crate) mod fork;
 mod image_store;
 pub(crate) mod layer_store;
 pub(crate) mod live_store;

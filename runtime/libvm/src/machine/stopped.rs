@@ -349,16 +349,63 @@ impl Runtime {
 struct StoppedStorageGuard {
     config: MachineConfig,
     storage: MachineStorageRecord,
-    files: Vec<PrivateSource>,
+    files: Vec<FencedSource>,
     _lifecycle: crate::lock_manager::LockGuard,
     _disks: Vec<StorageLock>,
     _lifetime: Option<crate::lock_manager::MachineLifetimeLock>,
 }
 
-pub(crate) struct PrivateSource {
+/// An exact private inode held under the source machine's storage fences.
+/// It carries no content authority, so a streaming copy scans it.
+pub(crate) struct FencedSource {
     pub(crate) path: crate::PrivatePath,
     pub(crate) file: File,
     pub(crate) length: u64,
+}
+
+/// One writable role of a constructed child and the authority its bytes carry.
+pub(crate) enum PrivateSource {
+    Fenced(FencedSource),
+    /// A byte-authenticated inode whose map the completed copy must reproduce.
+    Authenticated {
+        path: crate::PrivatePath,
+        stream: crate::storage::stream::AuthenticatedStream,
+    },
+}
+
+impl PrivateSource {
+    pub(crate) fn path(&self) -> &crate::PrivatePath {
+        match self {
+            Self::Fenced(source) => &source.path,
+            Self::Authenticated { path, .. } => path,
+        }
+    }
+
+    pub(crate) fn file(&self) -> &File {
+        match self {
+            Self::Fenced(source) => &source.file,
+            Self::Authenticated { stream, .. } => stream.file(),
+        }
+    }
+
+    pub(crate) fn length(&self) -> u64 {
+        match self {
+            Self::Fenced(source) => source.length,
+            Self::Authenticated { stream, .. } => stream.length(),
+        }
+    }
+
+    pub(crate) fn copy_source(&self) -> crate::machine::root_disk::CopySource<'_> {
+        match self {
+            Self::Fenced(source) => crate::machine::root_disk::CopySource::Unscanned {
+                file: &source.file,
+                length: source.length,
+            },
+            Self::Authenticated { stream, .. } => {
+                crate::machine::root_disk::CopySource::Authenticated(stream)
+            }
+        }
+    }
 }
 
 async fn admit_stopped(
@@ -576,7 +623,7 @@ fn open_private(
     directory: &OwnedDirectory,
     path: &crate::PrivatePath,
     length: u64,
-) -> Result<PrivateSource, LibVmError> {
+) -> Result<FencedSource, LibVmError> {
     let mut parent = directory.try_clone()?;
     let mut components = path.as_path().components().peekable();
     while let Some(component) = components.next() {
@@ -605,7 +652,7 @@ fn open_private(
                     "private source type, owner, mode, links or geometry is invalid",
                 ));
             }
-            return Ok(PrivateSource {
+            return Ok(FencedSource {
                 path: path.clone(),
                 file,
                 length,
@@ -819,7 +866,10 @@ async fn fork_owned(
         &options.external_resources,
     )?;
     reset_child_storage(&mut storage);
-    let files = std::mem::take(&mut source.files);
+    let files = std::mem::take(&mut source.files)
+        .into_iter()
+        .map(PrivateSource::Fenced)
+        .collect();
     let config = crate::machine::builder::publish_stopped_child(
         &runtime,
         name,
@@ -898,7 +948,7 @@ async fn snapshot_owned(
             ),
             DiskStorage::ManagedReadOnly { stream, geometry } => {
                 let authenticated = open_immutable_stream(&pool, stream, geometry.length)?;
-                let content = publish_map(&pool, &store, operation_id, authenticated.map).await?;
+                let content = publish_map(&pool, &store, operation_id, authenticated.map()).await?;
                 (content, *geometry, false)
             }
         };
@@ -943,14 +993,14 @@ async fn publish_private_stream(
     pool: &StoragePool,
     store: &Store,
     operation: Uuid,
-    source: PrivateSource,
+    source: FencedSource,
 ) -> Result<SnapshotStream, LibVmError> {
     let (stream, roots) = pool.publish_stream_file_for_catalog(source.file, source.length)?;
     store
         .pin_published_storage_dependencies(operation, &[stream.id], &[])
         .await?;
     drop(roots);
-    publish_map(pool, store, operation, stream.map).await
+    publish_map(pool, store, operation, &stream.map).await
 }
 
 fn reset_child_storage(storage: &mut MachineStorageRecord) {
@@ -1071,7 +1121,7 @@ async fn restore_owned(
     let name =
         crate::machine::builder::stopped_child_name(&runtime, options.name.as_deref()).await?;
     let snapshots = SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
-    let consumer = snapshots.consume(&reference).await?;
+    let mut consumer = snapshots.consume(&reference).await?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let mut staging = OperationStaging::new(&pool, consumer.operation_id, &consumer.lease)?;
     tracing::debug!(snapshot = %consumer.info.id, operation = %consumer.operation_id, "restoring stopped snapshot");
@@ -1088,28 +1138,39 @@ async fn restore_owned(
         &configuration.guest.agent,
         &runtime.captured_boot_context(&pool, &store, consumer.operation_id),
     )?;
-    let mut sources = vec![PrivateSource {
+    let writable = consumer
+        .record
+        .disks
+        .iter()
+        .filter(|disk| disk.writable)
+        .count() as u64;
+    // Held authenticated closure descriptors stay open while every private
+    // source gets its own descriptor.
+    crate::storage::limits::preflight_fd_budget(consumer.retained_descriptors() + 1 + writable)
+        .map_err(crate::storage::StorageError::from)?;
+    let mut sources = vec![PrivateSource::Authenticated {
         path: crate::PrivatePath::new("root.raw")?,
-        file: open_immutable_stream(
+        stream: consumer.open_copy_source(
             &pool,
             &consumer.record.root.stream.stream,
             consumer.record.root.geometry.length,
-        )?
-        .file,
-        length: consumer.record.root.geometry.length,
+        )?,
     }];
     for disk in &consumer.record.disks {
         if disk.writable {
-            sources.push(PrivateSource {
+            sources.push(PrivateSource::Authenticated {
                 path: crate::PrivatePath::new(format!("disk-{}.raw", disk.order))?,
-                file: open_immutable_stream(&pool, &disk.content.stream, disk.geometry.length)?
-                    .file,
-                length: disk.geometry.length,
+                stream: consumer.open_copy_source(
+                    &pool,
+                    &disk.content.stream,
+                    disk.geometry.length,
+                )?,
             });
         }
     }
+    consumer.release_closure();
     for source in &sources {
-        source.file.sync_all()?;
+        source.file().sync_all()?;
     }
     let config = crate::machine::builder::publish_stopped_child(
         &runtime,
@@ -1178,16 +1239,11 @@ impl Drop for OperationStaging {
     }
 }
 
-pub(crate) struct AuthenticatedStream {
-    pub(crate) file: File,
-    pub(crate) map: crate::storage::stream::StreamMap,
-}
-
 pub(crate) fn open_immutable_stream(
     pool: &StoragePool,
     stream: &crate::storage::identity::StreamId,
     length: u64,
-) -> Result<AuthenticatedStream, LibVmError> {
+) -> Result<crate::storage::stream::AuthenticatedStream, LibVmError> {
     let file = crate::storage::stream::open_regular_source(&pool.stream_path(stream))?;
     let metadata = file.metadata()?;
     if metadata.uid() != nix::unistd::geteuid().as_raw()
@@ -1199,16 +1255,14 @@ pub(crate) fn open_immutable_stream(
             "immutable Data backing has invalid owner, mode, links or geometry",
         ));
     }
-    let scanned = crate::storage::stream::StreamHasher::new().hash_open_file(&file, length)?;
-    if scanned.map.id() != *stream {
+    // Binds the map to this descriptor's fingerprint before and after scanning.
+    let authenticated = crate::storage::stream::StreamHasher::new().authenticate(file, length)?;
+    if authenticated.map().id() != *stream {
         return Err(invalid(
             "immutable stream backing does not match its authenticated identity",
         ));
     }
-    Ok(AuthenticatedStream {
-        file,
-        map: scanned.map,
-    })
+    Ok(authenticated)
 }
 
 /// Rebuild private/read-only attachment paths from semantic ownership, never

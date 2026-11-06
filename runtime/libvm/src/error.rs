@@ -22,6 +22,13 @@ pub enum LibVmError {
     /// by its run. The capture identity, reservation and staging are retained.
     #[error("live capture {capture_id}: {message}")]
     LiveCapture { capture_id: String, message: String },
+    #[error("live fork {operation_id}: {message}")]
+    LiveFork {
+        operation_id: String,
+        message: String,
+    },
+    #[error("live fork {operation_id} was not found")]
+    LiveForkNotFound { operation_id: String },
 
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
@@ -323,6 +330,8 @@ impl LibVmError {
             Self::LiveProtocol { .. } => "LiveProtocol",
             Self::LiveObservation { .. } => "LiveObservation",
             Self::LiveCapture { .. } => "LiveCapture",
+            Self::LiveFork { .. } => "LiveFork",
+            Self::LiveForkNotFound { .. } => "LiveForkNotFound",
             Self::Storage(_) => "Storage",
             Self::OverlayBootQualification(_) => "OverlayBootQualification",
             Self::OverlayBackendUnsupported { .. } => "OverlayBackendUnsupported",

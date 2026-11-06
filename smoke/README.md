@@ -236,6 +236,130 @@ detaches only that manager before SIGSTOP; monitor/worker tracing remains active
 These cases require monitor events and `--activation-hook`; without them they
 fail, never skip.
 
+### Live fork acceptance, crash and sharing gates (Phase 16)
+
+`tests/test_fork.py` needs an isolated candidate that also admits delivered
+live fork: `python -m silo_smoke.capture_candidate --destination PATH --runtime
+STAGED_RUNTIME --restore --fork`. It requires production fork to be delivered,
+native and still `lane-not-qualified`, admits pause, capture, restore and fork
+only in the private compiled copy, and leaves the production stage unchanged.
+Point `SILO_SMOKE_BIN_DIR`/`SILO_SMOKE_RUNTIME_DIR` at it, then run:
+
+```sh
+uv run --project smoke pytest smoke/tests/test_fork.py -m slow --keep
+```
+
+Every case drives the real `silo fork SOURCE --live` against the detached
+`restore_execution.c` witness. Oracles: the CLI's single `LiveForkResult`
+document (strict keys, kebab `kind` tags, every requested child named with a
+reserved machine/run identity), the durable journal (`live_fork`,
+`live_fork_child`) and `fork_event` CLOCK_MONOTONIC phase stamps, bracketed by
+the harness's own dispatch/exit clock; the authenticated local cut under
+`images/tmp/<operation>/cut`; source monitor trace lines; `/proc`; and the guest.
+
+- Four children (raw and flat profiles, `--network private`, a source host
+  forward): all Running with distinct machine/run/MAC and private-network
+  identities matching their bound restore requests. Each netd process owns
+  a distinct instance and Unix data socket, and its reserved address matches
+  the guest; numeric IPv4 may repeat across those isolated networks. Fresh
+  VM generation, inherited boot ID, no
+  inherited forward, matched RAM/disk cut read independently from the cut,
+  exact continuation in every child and in the resumed source, distinct
+  writable inodes, one shared RAM inode and no unowned VM process.
+- Child k (index 2) fails in its own activation hook after the seal; the result
+  names it `failed`/`activation` while its siblings run and continue the cut.
+  A failed child is destroyed or stop-only `activation-failed`, never Running.
+- Physical sharing for N = 1, 2 and 4: each child reads the same 128 MiB guest
+  tmpfs blob from the baseline; the exact `rw-p` RAM VMAs of every child's
+  krun worker share one (device, inode); RSS minus PSS proves shared clean pages;
+  a 32 MiB private write grows only the writer's `Private_Dirty`. RSS sums are
+  recorded but never used as physical RAM.
+- Source stop, removal and prune leave the cut's RAM inode and bytes intact
+  while children run; a child can be recaptured and restored. Stopping and
+  removing the last child then lets prune remove the operation's transient root.
+- Pre-freeze refusal: 17 children without `--max-children`, a 100%-private
+  batch twice `MemAvailable`, and sixteen children under `RLIMIT_NOFILE=48` are
+  refused with no capture staging, no source trace staging line, no child, no
+  cut and no new ledger record for this home. A second same-user home holds an
+  admitted batch (its capture held by `stopped_trace` before the seal); home
+  A's batch that alone fits is refused with the reported requirement including
+  home B's batch. Home B is then cancelled before its seal: no child or cut, its
+  ledger records gone and the source `unchanged` and still running.
+- Post-seal cancellation (held at the source continuation record) leaves every
+  child Running or Cancelled. Manager SIGKILL before the seal recovers one cut
+  (never a recapture) and abandons every child; SIGKILL right after the first
+  durable child stamp recovers by reconciling submitted children and
+  abandoning the rest. Recovery runs through `silo fork --operation`; no case
+  leaves an orphan monitor/worker.
+- A running source may keep mapping its accepted capture baseline, and capture
+  GC waits for that exact source launch lease. Every case therefore asserts the
+  cut's removal only after its children and the source run have ended and
+  prune has run; the source-deletion case alone proves retention by children.
+
+All new cases are `slow`; the default selection and its identities are
+unchanged. Traced cases use the existing `stopped_trace` controller through
+`silo_smoke.fork_process`, so its 240 s whole-session bound applies.
+
+### Live fork budget cohorts (Phase 16)
+
+`tests/test_fork_budget.py` measures ADR 0021 full capture interruption,
+restore to Running and four-child fork to Running. Use the same `--fork`
+candidate, durable workspace storage (tmpfs is refused) and a durable evidence
+directory outside the workspace. `SILO_SMOKE_BUDGET_DIR` selects a mounted
+workspace parent; sockets and runtime locks then use a separately owned short
+runtime directory, never the RAM or disk bytes. Without it, `TMPDIR` selects
+the workspace as usual and must be short enough for Unix socket paths:
+
+The isolated candidate builder accepts `--profile debug|release` (default
+`debug`) and records the selected profile in its manifest. For optimized budget
+qualification, stage an unqualified release runtime with `make stage
+PROFILE=release`, then build the `--fork --restore --profile release` candidate
+against that runtime. The exact production/candidate qualification-identity
+check still applies; a release candidate cannot reuse a debug runtime's binding.
+Keep failed debug measurements as evidence of that build, not release results.
+The candidate's direct Cargo invocation must also receive the staged release
+environment from `xtask/src/release.rs::configure_command`. On Linux this pins
+the system compiler/linker and target rustflags and removes the listed Nix
+compiler variables. Selecting `--release` alone does not reproduce those inputs;
+the identity check rejects that mismatch before granting candidate admission.
+
+```sh
+SILO_SMOKE_BUDGET_EVIDENCE=$PWD/.tmp/plan/evidence/phase-16 \
+SILO_SMOKE_BUDGET_DIR=/home/$USER/sm/phase16-ext4 TMPDIR=/home/$USER/sm \
+  uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow
+```
+
+The exact fixture, cache method and boundaries are in
+`silo_smoke/fork_budget.py`: `restore-execution` image, 2 vCPUs, 4096 MiB RAM,
+`--network private`, flat-overlay with a 2 GiB upper holding exactly 1 GiB of
+guest-written `/dev/urandom` bytes (logical, allocated and nonzero upper bytes
+are recorded separately). Each test runs five cold samples, one discarded
+warm-up and five warm samples sequentially and reports median, minimum and
+maximum per cohort. Cold samples fsync and `POSIX_FADV_DONTNEED` every owned
+input file before dispatch, with mincore(2) residency before and after; there
+is no global `drop_caches` and no sudo. Pages a live process still maps (the
+running source) remain resident and the sample is labelled `partial-cold`.
+Fresh capture RAM written inside the timed fork is part of the measurement.
+
+Gated values: fork4 is CLI dispatch to the last durable child `running` stamp
+(API entry, seal to Running and caller end-to-end are separate fields); capture
+interruption is the larger of the source monitor's conservative staging-to-
+continuation interval and an independent host observation of the guest's
+durable 50 ms witness writes in the source backing; without a clone contract
+the ADR allowance (upper allocated bytes at the measured sequential copy rate)
+is subtracted and the actual disk-seal duration recorded; restore is dispatch
+to CLI exit with the child Running and ready. Samples, the reference-host record
+(CPU, memory, kernel, filesystem, input hashes, candidate manifest) and
+`summary.json`/`summary.md` are written before assertions. Recompute a summary
+with `python -m silo_smoke.fork_budget DIRECTORY`. A running source keeps its
+accepted capture baseline, so every successful fork sample stops and removes
+its children, stops the source and prunes before the next; the next sample
+restarts the same source (its populated upper preserved) with a fresh witness
+and host observer outside the timed window. At most one sample's cut exists;
+failed samples stay in the retained workspace. Per-file residency inventories
+are kept in each sample record.
+A median over its target fails the gate and blocks admission.
+
 ### Restored guest activation (Phase 12)
 
 `silo_smoke/guest_restored.py` joins the standalone `native-live-api` owner
@@ -373,7 +497,8 @@ own machines, writable disks, runtime namespace, catalog and locks; no
 previously booted root or machine/operation/network row is carried over. The
 cache is not reused across pytest sessions. Invalid OCI variants still take
 their original acquisition/materialization paths, and acquisition/cache tests
-outside these two modules retain fresh, unseeded Homes.
+retain fresh, unseeded Homes. The common `vm` fixture's Home is the only other
+seeded Home; see the Phase 16 notes below.
 
 The two exact-boot snapshot cases contribute 88.861 seconds and the retained
 stage-replacement case 16.181 seconds to that baseline. Their private runtime
@@ -395,6 +520,58 @@ and after, taking 291.08 and 233.94 seconds respectively; `info` calls fell to
 80. These are targeted-run timings, not a full-suite speed claim. Raw commands
 and timings are retained in `.tmp/plan/evidence/phase-12/stopped-speedup.json`
 and its adjacent `stopped-{before,after}-command-times.jsonl` files.
+
+The Phase 15 default run, `.tmp/plan/evidence/phase-15/default-speed-final.xml`,
+took 955.552 seconds of suite wall time: 120 testcase rows, 119 passed and the one
+opt-in internet case skipped (the header's `tests` count is not the row count).
+That exceeds the 900-second rule, so Phase 16 removes more redundant smoke work
+without removing any boot, stop, replay, hash or guest check:
+
+- Identity-only lookups use a fresh read of the independent read-only catalog
+  process instead of CLI `info`: the source in each `stopped.fork` distinctness
+  check, the two-child test's final three-machine uniqueness check, the expected
+  machine in `overlay.metrics`, and the log path and terminal machine ID in
+  `overlay.shutdown_watch`/`orderly_guest_shutdown`. Both sides of every
+  comparison are normalized with `UUID`. The child's own `info` state, run and
+  readiness assertions stay. In the six stopped fork/exact-boot cases this
+  removes 22 `info` calls. The common `vm` fixture takes its ID from its own
+  `wait_ready` response, one fewer `info` for each of its 11 default cases.
+- `overlay.evidence` returns `Evidence(observation, metrics)`. Overlay
+  persistence uses that already validated frame as its pre-restart agent
+  identity instead of collecting a second one. Evidence now samples metrics
+  before its read-only diagnostics. Each `metrics` call still sets its own
+  new freshness cutoff and compares against independent guest statvfs, and the
+  post-restart frame is still collected fresh.
+- The common `vm` fixture seeds its fresh Home from a session-local BASIC-only
+  catalog. That catalog is prepared like the overlay/stopped catalogs, in its
+  own preparation Home and never merged with them. The fixture asserts the seed
+  carried exactly the BASIC reference, then runs its unchanged create, start and
+  readiness. The general `workspace`/`silo` fixtures, lifecycle, image-cache and
+  malformed-image tests stay unseeded.
+- In each two-child fork case, the first child's machine-ID read and the
+  source's final `/second-only` absence check join the existing guest-copy
+  batch, with a second textual boundary and exact-byte checks. That is two fewer
+  guest sessions per case, eight in the default selection.
+
+Overlay `info` removals are counted from command evidence, not listed here.
+None of these removals has a measured elapsed-time effect until Main runs a
+controlled before/after pair of complete suites.
+
+Command timing is recorded so the before/after pair can be compared. Every
+`Silo.run` appends one monotonic duration line to the workspace's
+`evidence/timing.log`: an `operation` (`silo <label>`), an `outcome`
+(`exit-<code>`, `timeout` or `spawn-error`) and `seconds`. Readiness polls use
+the `wait-ready` label, so the remaining `info` count does not depend on boot
+time. `wait_ready`, `overlay.metrics`, each `root_metrics` attempt,
+`stopped.backing`, `image_cache.seed`, catalog preparation and the exact-boot
+private-runtime copy are timed at their harness callsites, with an exception
+recorded under its type name. Successful cleanup deletes that log, so teardown
+publishes a summary of count, total and maximum seconds per operation/outcome,
+plus the cleanup time itself. The summary's size does not grow with the
+number of calls. It goes into the JUnit `silo-smoke-timings` testcase property
+for the `workspace` and `stopped_silo` fixtures, and into the
+`silo-smoke-timings-prepare-<catalog>` suite properties for session
+preparations. Use `--junitxml` to keep them.
 
 The Phase 9 complete default baseline is
 `.tmp/phase09-corrected-default.xml`, with its command and call-only durations in
@@ -472,8 +649,9 @@ independent pytest processes.
 Teardown stops/removes registered VMs and terminates tracked daemons. Failed
 runs and runs with `--keep` retain the workspace and print its path; successful
 runs otherwise remove it. Command transcripts and daemon output are in
-`/tmp/silo-smoke-*/evidence/*.log` (or the macOS equivalent). Keeping evidence
-does not keep the VMs running.
+`/tmp/silo-smoke-*/evidence/*.log` (or the macOS equivalent), command and
+harness durations in `evidence/timing.log`. Keeping evidence does not keep the
+VMs running.
 
 ## Images and registry
 
@@ -1193,10 +1371,20 @@ timeout does not lose all selection evidence. `boundary-lifecycle.jsonl` records
 ESRCH from any stop inspection or resume, including disappearing `/proc` status
 or memory, as a lost stop awaiting an actual terminal wait, never as exit proof.
 Only a kernel exec event can account for collapsed former TIDs without a
-terminal wait. Neither path supplies a missing checked injected return. Host-only
+terminal wait. Wait order is not creation order: an auto-attached child can stop,
+run and be reaped before its creator's fork/vfork/clone event stop is dequeued.
+Each `child-event` announcement is therefore balanced per TID against that
+TID's terminal wait, exec collapse or manager detach, in either order, and
+records `ended_before_announcement`; a reaped TID is never re-owned, and an
+announced TID still owing an end fails the gate. No lifecycle path supplies a
+missing checked injected return. Host-only
 regressions in `test_native_live_api.StoppedTraceLifecycleTests` schedule real
 SIGKILL between a stop and ptrace inspection, without replacing syscall or wait
-results. These are process/syscall evidence, not a power-loss simulation. The controller's
+results. A separate real-subprocess clone-race probe reproduced the late
+announcement failure before correction and passed afterward. It is not a
+permanent suite requirement: observing that ordering depends on kernel
+scheduling, even when a child's exit is already waitable.
+These are process/syscall evidence, not a power-loss simulation. The controller's
 240-second deadline and helper's
 60-second boundary wait are unchanged; missing ptrace permission is an unresolved
 gate.

@@ -21,6 +21,7 @@ use crate::state::{InstanceStore, StoreError};
 
 pub(crate) const GUEST_CONTROL_PORT: u32 = 1027;
 const HEARTBEAT: Duration = Duration::from_secs(5);
+pub(crate) const STATUS_FRESHNESS: Duration = HEARTBEAT.saturating_mul(3);
 const METRICS_INTERVAL: Duration = Duration::from_secs(5);
 const FIRST_STATUS_DEADLINE: Duration = Duration::from_secs(5);
 const FAST_DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
@@ -222,7 +223,7 @@ async fn status_stream(
                     .map_err(|error| (error, received_snapshot))?
                     .ok_or_else(|| (tonic::Status::unavailable("guest status stream ended"), received_snapshot))?;
                 store
-                    .observe_status(message, HEARTBEAT * 3)
+                    .observe_status(message, STATUS_FRESHNESS)
                     .map_err(|error| (observation_error(error), received_snapshot))?;
                 if !received_snapshot {
                     tracing::debug!(

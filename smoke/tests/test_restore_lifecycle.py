@@ -347,7 +347,7 @@ def test_restore_generation_acknowledgement_missing_or_late_fails_closed(
                 held = traced.held()
                 assert held["thread"].startswith("fc_vcpu"), held
                 machine = evidence.machine_hex()
-                installed = lifecycle.first(evidence.events(), lifecycle.GENERATION_INSTALLED)
+                installed = evidence.wait(lifecycle.GENERATION_INSTALLED, timeout=30)
                 expired = evidence.wait(lifecycle.GENERATION_EXPIRED, timeout=30)
                 assert expired.realtime_ns - installed.realtime_ns >= 4_950_000_000, (installed, expired)
                 assert silo.info(child)["state"] in {"restoring", "activating"}, "held child is not nonterminal"

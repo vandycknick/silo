@@ -129,6 +129,43 @@ The default suite does **not** qualify successful guest boot, macOS entitlements
 graceful HVF/VZ shutdown, or Rosetta. Native qualification is explicitly ignored
 unless requested, rather than silently passing when assets or a hypervisor are absent.
 
+## Capture verification ownership
+
+The monitor authenticates capture outputs only at `CaptureVerify`, after native
+execution/RAM completion has closed all four output writers. One owned RAM
+thread overlaps the existing blocking stage's serial remaining-role lane.
+Neither the coherent seal nor source continuation can begin until the RAM
+thread has been joined and both lanes have released their scratch. A role
+failure cancels a child token, not the operation's cancellation token, and
+joining preserves the original I/O failure rather than its sibling's induced
+`Interrupted` error. Thread creation errors remain I/O errors; thread panic is
+reported as a typed verification I/O error.
+
+The resource increment is explicit: a 1 MiB remaining-role SHA buffer and one
+1 MiB requested RAM-thread stack. The existing 8 MiB RAM buffer still computes
+whole-file SHA and canonical stream identity together. libvm admits the
+additional 2 MiB in `reservation_memory_bytes`, separately from its existing
+16 MiB general capture overhead and from persistent state/staging charges.
+The thread's fixed-size closure, result, cancellation and standard-library
+bookkeeping are input-independent metadata covered by that existing general
+overhead, not an unaccounted per-file allocation. Monitor and manager
+authentication are sequential, so their extra-lane charges are a maximum,
+not a sum. There is one fixed-size RAM result, no second role inventory, and
+at most two authentication file descriptors. That descriptor peak is below
+the four native output descriptors already admitted during capture preparation;
+held staging directories and the launch lease are unchanged.
+
+Real-file module regressions cover inventory order and byte-derived digests,
+prepared-inode/length/layout failures, actual staging charges, a role failure
+while RAM retains its descriptor, cancellation with both owners active, and
+typed thread-join failure. The ownership cases use channels rather than sleeps,
+and do not require a hypervisor or a simulated virtualization backend:
+
+```sh
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm live::coordinator::capture::tests::
+cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm live::staging::tests::
+```
+
 ## Native guest acceptance
 
 Build matching kernel/initramfs assets with the normal `make build` or `make stage`

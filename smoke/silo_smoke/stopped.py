@@ -19,10 +19,10 @@ import shutil
 import stat
 import subprocess
 import sys
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from . import overlay, procs, shutdown
-from .cli import Silo
+from .cli import Silo, timed
 from .config import REPO
 
 
@@ -94,7 +94,8 @@ def writable_paths(silo: Silo, name: str) -> dict[str, Path]:
 
 
 def backing(silo: Silo, name: str, stage: str) -> dict[str, Bytes]:
-    result = {role: read_bytes(path) for role, path in writable_paths(silo, name).items()}
+    with timed(silo.ws, "stopped.backing"):
+        result = {role: read_bytes(path) for role, path in writable_paths(silo, name).items()}
     silo.ws.record("stopped-bytes", json.dumps({"stage": stage, "machine": name, "files": {role: asdict(value) for role, value in result.items()}}, sort_keys=True) + "\n")
     return result
 
@@ -114,7 +115,8 @@ def fork(silo: Silo, source: str, child: str) -> None:
     silo.ws.register_machine(child)
     info = silo.info(child)
     assert info["state"] == "stopped" and info["run_id"] is None and info["ready"] is False
-    assert silo.machine_id(source) != info["id"]
+    # Identity only: a fresh independent catalog read, compared canonically.
+    assert UUID(procs.machine_id(silo.ws, source)) != UUID(info["id"])
 
 
 def restore(silo: Silo, reference: str, child: str) -> None:

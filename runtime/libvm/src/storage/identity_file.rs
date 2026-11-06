@@ -7,7 +7,7 @@ use std::path::Path;
 ///
 /// Path-based stat is lock-preserving on Linux and macOS: unlike opening and
 /// closing an ordinary descriptor, it cannot drop SQLite's POSIX record locks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileIdentity {
     device: u64,
     inode: u64,
@@ -26,7 +26,7 @@ impl FileIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SourceFingerprint {
     identity: FileIdentity,
     length: u64,
@@ -42,6 +42,12 @@ impl SourceFingerprint {
             mtime: (metadata.mtime(), metadata.mtime_nsec()),
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
         }
+    }
+
+    pub(crate) fn same_contents_after_metadata_change(&self, metadata: &Metadata) -> bool {
+        self.identity == FileIdentity::from_metadata(metadata)
+            && self.length == metadata.len()
+            && self.mtime == (metadata.mtime(), metadata.mtime_nsec())
     }
 }
 

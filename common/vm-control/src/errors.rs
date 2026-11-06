@@ -107,6 +107,21 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = message.clone();
             tonic::Code::FailedPrecondition
         }
+        E::LiveFork {
+            operation_id,
+            message,
+        } => {
+            d.kind = 4;
+            d.reference = Some(operation_id.clone());
+            d.safe_message = message.clone();
+            tonic::Code::FailedPrecondition
+        }
+        E::LiveForkNotFound { operation_id } => {
+            d.kind = 2;
+            d.reference = Some(operation_id.clone());
+            d.safe_message = "live fork operation not found".into();
+            tonic::Code::NotFound
+        }
         E::MachineAlreadyRunning { reference } => {
             d.kind = 4;
             d.code = 1;
@@ -324,6 +339,17 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
                     message: d.safe_message,
                 }
             }
+            "LiveFork" if v.code() == tonic::Code::FailedPrecondition && d.kind == 4 => {
+                E::LiveFork {
+                    operation_id: required(d.reference, "error.reference")?,
+                    message: d.safe_message,
+                }
+            }
+            "LiveForkNotFound" if v.code() == tonic::Code::NotFound && d.kind == 2 => {
+                E::LiveForkNotFound {
+                    operation_id: required(d.reference, "error.reference")?,
+                }
+            }
             "MachineNotFound" => E::MachineNotFound {
                 reference: required(d.reference, "error.reference")?,
             },
@@ -449,6 +475,49 @@ mod tests {
             "pause unsupported: backend-excluded"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn live_fork_errors_keep_operation_identity_and_category() {
+        let operation = "00000000-0000-4000-8000-0000000000aa";
+        let refusal = libvm::LibVmError::LiveFork {
+            operation_id: operation.into(),
+            message: "admission commit uncertain; recover by this operation ID".into(),
+        };
+        let refusal_status = native_error_to_status(&refusal);
+        assert_eq!(refusal_status.code(), tonic::Code::FailedPrecondition);
+        match status_to_native_error(&refusal_status).unwrap() {
+            libvm::LibVmError::LiveFork {
+                operation_id,
+                message,
+            } => {
+                assert_eq!(operation_id, operation);
+                assert_eq!(
+                    message,
+                    "admission commit uncertain; recover by this operation ID"
+                );
+            }
+            error => panic!("lost typed fork error: {error:?}"),
+        }
+        let missing = libvm::LibVmError::LiveForkNotFound {
+            operation_id: operation.into(),
+        };
+        let missing_status = native_error_to_status(&missing);
+        assert_eq!(missing_status.code(), tonic::Code::NotFound);
+        match status_to_native_error(&missing_status).unwrap() {
+            libvm::LibVmError::LiveForkNotFound { operation_id } => {
+                assert_eq!(operation_id, operation)
+            }
+            error => panic!("lost typed fork lookup error: {error:?}"),
+        }
+        let detail = w::ErrorDetail {
+            kind: 4,
+            code: 7,
+            native_variant: Some("LiveForkNotFound".into()),
+            reference: Some(operation.into()),
+            ..Default::default()
+        };
+        assert!(status_to_native_error(&status(detail, tonic::Code::FailedPrecondition)).is_err());
     }
 
     #[test]

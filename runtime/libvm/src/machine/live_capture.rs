@@ -138,6 +138,7 @@ pub(crate) enum CaptureProgress {
     /// Still owned by the monitor or awaiting continuation; nothing guessed.
     Pending(&'static str),
     Finished(Box<LiveSnapshot>),
+    Local,
     /// No admissible seal. The reservation is abandoned; diagnostics remain.
     Abandoned(String),
 }
@@ -270,6 +271,20 @@ impl Machine {
             if admission(&fresh, options.resume_policy)? != pause {
                 return Err(protocol("pause authority changed since capture admission"));
             }
+            if let Some(operation) = store.fork_for_capture(request_id).await? {
+                let fork = store
+                    .fork_result(operation)
+                    .await?
+                    .ok_or_else(|| protocol("fork capture owner disappeared"))?;
+                if fork.cancellation_requested
+                    || !matches!(fork.capture, crate::ForkCaptureOutcome::Pending)
+                {
+                    return Err(capture_error(
+                        &live_id(request_id)?,
+                        "fork no longer authorizes a new capture submission",
+                    ));
+                }
+            }
             let configuration = launched_configuration(runtime, config.id)?;
             let snapshots = snapshot_store(runtime)?;
             let reservation = snapshots
@@ -284,6 +299,12 @@ impl Machine {
                     pause,
                 })
                 .await?;
+            if reservation.record.state != CaptureState::Reserved {
+                return Err(capture_error(
+                    &live_id(request_id)?,
+                    "capture reservation is no longer eligible for submission",
+                ));
+            }
             let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
             let boot = crate::runtime::boot_assets::capture_boot(
                 &reservation.record.storage,
@@ -327,8 +348,17 @@ impl Machine {
         let deadline = tokio::time::Instant::now() + CAPTURE_WAIT;
         let mut delay = POLL_MIN;
         loop {
-            let stage = match advance(self.runtime(), self.machine_id(), capture_id).await? {
+            // A snapshot capture never retains a local cut to open.
+            let stage = match advance(self.runtime(), self.machine_id(), capture_id, &mut None)
+                .await?
+            {
                 CaptureProgress::Finished(snapshot) => return Ok(*snapshot),
+                CaptureProgress::Local => {
+                    return Err(capture_error(
+                        &capture,
+                        "capture belongs to a live fork, not a snapshot",
+                    ))
+                }
                 CaptureProgress::Abandoned(reason) => return Err(capture_error(&capture, reason)),
                 CaptureProgress::Pending(stage) => stage,
             };
@@ -346,7 +376,7 @@ impl Machine {
     }
 
     fn require_observation(&self, observation: &MachineLiveObservation) -> Result<(), LibVmError> {
-        if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
+        if observation.machine_id() != self.machine_id() {
             return Err(LibVmError::LiveObservation {
                 reference: self.id(),
                 message: "observation belongs to another machine".into(),
@@ -580,9 +610,17 @@ async fn unsubmitted(
     let store = runtime.native_store()?;
     let retained = {
         let _lock = runtime.lock_machine_config(record.machine_id).await?;
-        store
+        let retained = store
             .live_command_record(record.machine_id, record.run_id, record.capture_id)
-            .await?
+            .await?;
+        if retained.is_none() {
+            // Fence a never-submitted reservation while holding the same
+            // machine lock as submit_capture's journal-before-send step.
+            snapshot_store(runtime)?
+                .abandon_capture(record.capture_id)
+                .await?;
+        }
+        retained
     };
     match retained {
         None => Ok(Some(CaptureProgress::Abandoned(
@@ -627,6 +665,62 @@ async fn unsubmitted(
     }
 }
 
+async fn retained_release(
+    runtime: &Runtime,
+    record: &CaptureRecord,
+) -> Result<Option<vm_spec::capture::CaptureReleased>, LibVmError> {
+    let json = runtime
+        .native_store()?
+        .capture_release_receipt_json(record.machine_id, record.run_id, &record.plan.capture_id)
+        .await?;
+    json.map(|json| {
+        match serde_json::from_str::<LiveCommandResult>(&json)
+            .map_err(|error| protocol(error.to_string()))?
+        {
+            LiveCommandResult::ReleaseCapture(ReleaseCaptureOutcome::Released { released })
+                if released.operation_id == record.plan.capture_id =>
+            {
+                Ok(released)
+            }
+            _ => Err(protocol(
+                "retained capture release contradicts its journal key",
+            )),
+        }
+    })
+    .transpose()
+}
+
+async fn settle_abandoned_release(
+    snapshots: &SnapshotStore,
+    record: &CaptureRecord,
+    released: &vm_spec::capture::CaptureReleased,
+) -> Result<CaptureProgress, LibVmError> {
+    let record = snapshots
+        .capture_reservation(record.capture_id)
+        .await?
+        .ok_or_else(|| protocol("released capture reservation disappeared"))?;
+    if released.operation_id != record.plan.capture_id
+        || released.disposition != CaptureReleaseDisposition::Abandoned
+        || record.source_outcome.is_none()
+    {
+        return Err(protocol(
+            "abandoned release lacks its exact terminal source authority",
+        ));
+    }
+    if matches!(record.state, CaptureState::Released { snapshot: None }) {
+        return Ok(CaptureProgress::Abandoned(
+            "failed capture result ownership was released".into(),
+        ));
+    }
+    snapshots.abandon_capture(record.capture_id).await?;
+    snapshots
+        .finish_capture_release(record.capture_id, released.baseline_retained)
+        .await?;
+    Ok(CaptureProgress::Abandoned(
+        "failed capture result ownership was released".into(),
+    ))
+}
+
 async fn release(
     runtime: &Runtime,
     machine: &Machine,
@@ -634,6 +728,14 @@ async fn release(
     record: &CaptureRecord,
     disposition: CaptureReleaseDisposition,
 ) -> Result<Option<vm_spec::capture::CaptureReleased>, LibVmError> {
+    if let Some(released) = retained_release(runtime, record).await? {
+        if released.disposition != disposition {
+            return Err(protocol(
+                "retained release names another disposition for this capture",
+            ));
+        }
+        return Ok(Some(released));
+    }
     let store = runtime.native_store()?;
     let run = record.run_id;
     let pending = store
@@ -655,6 +757,11 @@ async fn release(
             ))
         }
         Some(command) => command,
+        // GetOperation may observe terminal continuation after the earlier
+        // run observation still reported Capturing. Wait for an admissible
+        // run projection before creating a new release; exact replays above
+        // retain their original identity regardless of the current state.
+        None if !observation.state()?.admits(LiveCommandKind::ReleaseCapture) => return Ok(None),
         None => LiveCommand::ReleaseCapture(ReleaseCaptureCommand {
             envelope: envelope(observation, Uuid::new_v4())?,
             operation_id: record.plan.capture_id.clone(),
@@ -685,10 +792,15 @@ async fn release(
 
 /// Advance one retained capture by observed facts only. Never Resume, never
 /// reinterpret an absent continuation, never resubmit under a new identity.
+///
+/// When this step retains a fork's local cut, the writable disks it
+/// authenticated are handed to `retained` for that fork's own cut opening.
+/// Callers that never open the cut pass a fresh `None` and drop it.
 pub(crate) async fn advance(
     runtime: &Runtime,
     machine_id: MachineId,
     capture_id: Uuid,
+    retained: &mut Option<crate::store::fork::AuthenticatedCutDisks>,
 ) -> Result<CaptureProgress, LibVmError> {
     let snapshots = snapshot_store(runtime)?;
     let record = snapshots
@@ -698,30 +810,42 @@ pub(crate) async fn advance(
     if record.machine_id != machine_id {
         return Err(protocol("capture belongs to another machine"));
     }
+    if matches!(
+        record.state,
+        CaptureState::Reserved | CaptureState::Abandoned
+    ) {
+        if let Some(released) = retained_release(runtime, &record).await? {
+            if released.disposition == CaptureReleaseDisposition::Abandoned {
+                return settle_abandoned_release(&snapshots, &record, &released).await;
+            }
+        }
+    }
     match &record.state {
         CaptureState::Released {
             snapshot: Some(snapshot),
         } => return finished(runtime, &snapshots, &record, snapshot).await,
+        CaptureState::ReleasedLocal { .. } => return Ok(CaptureProgress::Local),
         CaptureState::Released { snapshot: None } | CaptureState::Abandoned => {
             return Ok(CaptureProgress::Abandoned(
                 "capture produced no admissible checkpoint".into(),
             ))
         }
-        CaptureState::Reserved | CaptureState::Sealed | CaptureState::Published { .. } => {}
+        CaptureState::Reserved
+        | CaptureState::Sealed
+        | CaptureState::Local { .. }
+        | CaptureState::Published { .. } => {}
     }
     // Durable capture success does not depend on source continuation or on
     // reaching the original monitor. Preserve the closure before reconciling
     // run authority; uncertainty must retain ownership, not postpone publication.
-    let record = if !matches!(record.state, CaptureState::Published { .. })
-        && durable_seal(runtime, &record)?.is_some()
+    let record = if !matches!(
+        record.state,
+        CaptureState::Published { .. } | CaptureState::Local { .. }
+    ) && durable_seal(runtime, &record)?.is_some()
     {
-        snapshots
-            .publish_capture(
-                capture_id,
-                &staging_absolute(runtime, &record),
-                record.alias.clone(),
-            )
-            .await?;
+        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record).await? {
+            *retained = Some(disks);
+        }
         snapshots
             .capture_reservation(capture_id)
             .await?
@@ -730,12 +854,34 @@ pub(crate) async fn advance(
         record
     };
     let machine = Machine::new(runtime.clone(), machine_id);
+    let published = matches!(
+        record.state,
+        CaptureState::Published { .. } | CaptureState::Local { .. }
+    );
     let liveness = run_liveness(runtime, machine_id, record.run_id).await?;
     let monitor = match &liveness {
         RunLiveness::Alive(observation) => {
             match observe_capture(&machine, observation, &record.plan.capture_id).await? {
                 MonitorCapture::Observed(observed) => Some(observed),
+                MonitorCapture::NotFound if published => None,
                 MonitorCapture::NotFound => {
+                    let releasing=runtime.native_store()?.pending_live_commands(record.machine_id,record.run_id,&observation.report().monitor_id).await?.into_iter().any(|retained| matches!(retained.intent.command,LiveCommand::ReleaseCapture(command) if command.operation_id==record.plan.capture_id && command.disposition==CaptureReleaseDisposition::Abandoned));
+                    if releasing {
+                        return match release(
+                            runtime,
+                            &machine,
+                            observation,
+                            &record,
+                            CaptureReleaseDisposition::Abandoned,
+                        )
+                        .await?
+                        {
+                            Some(released) => {
+                                settle_abandoned_release(&snapshots, &record, &released).await
+                            }
+                            None => Ok(CaptureProgress::Pending("failed capture release replay")),
+                        };
+                    }
                     return match unsubmitted(runtime, &machine, Some(observation), &record).await? {
                         Some(CaptureProgress::Abandoned(reason)) => {
                             snapshots.abandon_capture(capture_id).await?;
@@ -750,7 +896,6 @@ pub(crate) async fn advance(
         RunLiveness::Ended => None,
         RunLiveness::Uncertain => return Ok(CaptureProgress::Pending("run reconciliation")),
     };
-    let published = matches!(record.state, CaptureState::Published { .. });
     let sealed = published
         || match &monitor {
             Some(observed) => match &observed.operation.outcome {
@@ -796,13 +941,9 @@ pub(crate) async fn advance(
         ));
     }
     if !published {
-        snapshots
-            .publish_capture(
-                capture_id,
-                &staging_absolute(runtime, &record),
-                record.alias.clone(),
-            )
-            .await?;
+        if let Some(disks) = retain_or_publish(runtime, &snapshots, &record).await? {
+            *retained = Some(disks);
+        }
     }
     let record = snapshots
         .capture_reservation(capture_id)
@@ -829,6 +970,10 @@ pub(crate) async fn advance(
                     },
                 }
             }
+            (RunLiveness::Alive(_), None) => match source_record(runtime, &record)? {
+                Some(source) => CaptureSourceOutcome::Known { record: source },
+                None => return Ok(CaptureProgress::Pending("sealed capture monitor ownership")),
+            },
             _ => match source_record(runtime, &record)? {
                 Some(source) => CaptureSourceOutcome::Known { record: source },
                 None => CaptureSourceOutcome::Unknown,
@@ -854,7 +999,7 @@ pub(crate) async fn advance(
         // The exact run ended: no monitor result ownership survives it.
         RunLiveness::Ended | RunLiveness::Uncertain => {}
     }
-    snapshots.finish_capture_release(capture_id).await?;
+    snapshots.finish_capture_release(capture_id, true).await?;
     let record = snapshots
         .capture_reservation(capture_id)
         .await?
@@ -863,6 +1008,7 @@ pub(crate) async fn advance(
         CaptureState::Released {
             snapshot: Some(snapshot),
         } => finished(runtime, &snapshots, &record, snapshot).await,
+        CaptureState::ReleasedLocal { .. } => Ok(CaptureProgress::Local),
         _ => Err(protocol("released capture lost its published checkpoint")),
     }
 }
@@ -884,7 +1030,17 @@ async fn abandon_failed(
         if !terminal {
             return Ok(CaptureProgress::Pending("failed capture continuation"));
         }
-        if release(
+        if let Some(capture) = &observed.capture {
+            snapshots
+                .record_capture_source(
+                    record.capture_id,
+                    CaptureSourceOutcome::Observed {
+                        continuation: capture.continuation.clone(),
+                    },
+                )
+                .await?;
+        }
+        let Some(released) = release(
             runtime,
             machine,
             observation,
@@ -892,10 +1048,11 @@ async fn abandon_failed(
             CaptureReleaseDisposition::Abandoned,
         )
         .await?
-        .is_none()
-        {
+        else {
             return Ok(CaptureProgress::Pending("failed capture continuation"));
-        }
+        };
+        settle_abandoned_release(snapshots, record, &released).await?;
+        return Ok(CaptureProgress::Abandoned(failure));
     }
     snapshots.abandon_capture(record.capture_id).await?;
     Ok(CaptureProgress::Abandoned(failure))
@@ -987,11 +1144,15 @@ pub(crate) async fn machine_captures(
         .map(|record| {
             let (stage, snapshot_id) = match &record.state {
                 CaptureState::Reserved => (MachineCaptureStage::Reserved, None),
-                CaptureState::Sealed => (MachineCaptureStage::Sealed, None),
+                CaptureState::Sealed | CaptureState::Local { .. } => {
+                    (MachineCaptureStage::Sealed, None)
+                }
                 CaptureState::Published { snapshot } => {
                     (MachineCaptureStage::Published, Some(*snapshot))
                 }
-                CaptureState::Released { .. } | CaptureState::Abandoned => {
+                CaptureState::Released { .. }
+                | CaptureState::ReleasedLocal { .. }
+                | CaptureState::Abandoned => {
                     return Err(protocol("pending captures include a terminal capture"))
                 }
             };
@@ -1024,13 +1185,16 @@ pub(crate) async fn reconcile_captures(
     };
     let snapshots = SnapshotStore::from_store(Arc::new(store));
     for record in snapshots.pending_captures(machine).await? {
-        match advance(runtime, record.machine_id, record.capture_id).await {
+        // Reconciliation never opens a fork cut; a fork whose own loop is not
+        // running here later authenticates its cut disks again.
+        match advance(runtime, record.machine_id, record.capture_id, &mut None).await {
             Ok(CaptureProgress::Pending(stage)) => {
                 tracing::debug!(capture = %record.capture_id, stage, "capture remains owned by its run");
             }
             Ok(CaptureProgress::Finished(snapshot)) => {
                 tracing::info!(capture = %record.capture_id, snapshot = %snapshot.snapshot.id, "reconciled live capture");
             }
+            Ok(CaptureProgress::Local) => {}
             Ok(CaptureProgress::Abandoned(reason)) => {
                 tracing::info!(capture = %record.capture_id, reason, "abandoned unsealed live capture");
             }
@@ -1040,6 +1204,32 @@ pub(crate) async fn reconcile_captures(
         }
     }
     Ok(())
+}
+
+/// A fork capture yields the disks its seal verification authenticated;
+/// snapshot publication copies into the pool and yields none.
+async fn retain_or_publish(
+    runtime: &Runtime,
+    snapshots: &SnapshotStore,
+    record: &CaptureRecord,
+) -> Result<Option<crate::store::fork::AuthenticatedCutDisks>, LibVmError> {
+    if runtime
+        .native_store()?
+        .fork_for_capture(record.capture_id)
+        .await?
+        .is_some()
+    {
+        let (_, disks) = snapshots.retain_local_capture(record.capture_id).await?;
+        return Ok(disks);
+    }
+    snapshots
+        .publish_capture(
+            record.capture_id,
+            &staging_absolute(runtime, record),
+            record.alias.clone(),
+        )
+        .await?;
+    Ok(None)
 }
 
 impl Runtime {
