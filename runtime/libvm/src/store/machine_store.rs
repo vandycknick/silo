@@ -573,6 +573,28 @@ impl Store {
             .bind(machine_id.to_string())
             .bind(json)
             .execute(&mut **tx).await?;
+        let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(storage)?;
+        let generation =
+            i64::try_from(storage.storage_generation).map_err(|error| LibVmError::StateDecode {
+                field: "machine_storage.storage_generation",
+                message: error.to_string(),
+            })?;
+        sqlx::query("DELETE FROM machine_stream_dependency WHERE machine_id=?1")
+            .bind(machine_id.to_string())
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM machine_object_dependency WHERE machine_id=?1")
+            .bind(machine_id.to_string())
+            .execute(&mut **tx)
+            .await?;
+        for stream in streams {
+            sqlx::query("INSERT INTO machine_stream_dependency(machine_id,generation,stream_id) VALUES(?1,?2,?3)")
+                .bind(machine_id.to_string()).bind(generation).bind(stream.to_string()).execute(&mut **tx).await?;
+        }
+        for object in objects {
+            sqlx::query("INSERT INTO machine_object_dependency(machine_id,generation,object_digest) VALUES(?1,?2,?3)")
+                .bind(machine_id.to_string()).bind(generation).bind(object.to_string()).execute(&mut **tx).await?;
+        }
         Ok(())
     }
     async fn insert_machine_config_and_state(

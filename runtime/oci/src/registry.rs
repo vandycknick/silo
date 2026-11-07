@@ -13,7 +13,14 @@ use crate::{OciError, OciResult, Platform};
 
 #[derive(Clone)]
 pub(crate) struct RegistryClient {
-    client: Client,
+    pub(crate) client: Client,
+}
+
+#[derive(Debug)]
+pub(crate) struct RegistryManifest {
+    pub(crate) manifest: OciManifest,
+    pub(crate) digest: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +39,13 @@ pub struct ResolvedImage {
     pub platform: Platform,
     pub(crate) reference: Reference,
     pub(crate) layers: Vec<ResolvedLayer>,
+}
+
+impl ResolvedImage {
+    /// Immutable source blobs that the caller must pin before cache access.
+    pub fn layer_digests(&self) -> impl Iterator<Item = &str> {
+        self.layers.iter().map(|layer| layer.digest.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,11 +131,19 @@ impl RegistryClient {
             .user_agent(concat!("silo-oci/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| OciError::Io(std::io::Error::other(error)))?;
-        let (manifest, digest) = self.pull_manifest_bounded(&http, reference, None).await?;
+        let RegistryManifest {
+            manifest, digest, ..
+        } = self.pull_manifest_bounded(&http, reference, None).await?;
 
         let (manifest, manifest_digest) = match manifest {
             OciManifest::Image(manifest) => (manifest, digest),
             OciManifest::ImageIndex(index) => {
+                if index.artifact_type.as_deref() == Some("application/vnd.silo.vm.v1") {
+                    return Err(OciError::VmArtifactRequiresAcquisition {
+                        reference: requested_ref,
+                        index_digest: digest,
+                    });
+                }
                 let descriptor =
                     select_platform_descriptor(&requested_ref, &index.manifests, platform)?;
                 let manifest_reference = reference.clone_with_digest(descriptor.digest.clone());
@@ -129,7 +151,11 @@ impl RegistryClient {
                     reference: requested_ref.clone(),
                     message: "selected manifest descriptor has a negative size".into(),
                 })?;
-                let (selected, selected_digest) = self
+                let RegistryManifest {
+                    manifest: selected,
+                    digest: selected_digest,
+                    ..
+                } = self
                     .pull_manifest_bounded(&http, &manifest_reference, Some(size))
                     .await?;
                 match selected {
@@ -192,12 +218,12 @@ impl RegistryClient {
         })
     }
 
-    async fn pull_manifest_bounded(
+    pub(crate) async fn pull_manifest_bounded(
         &self,
         http: &reqwest::Client,
         reference: &Reference,
         expected_size: Option<u64>,
-    ) -> OciResult<(OciManifest, String)> {
+    ) -> OciResult<RegistryManifest> {
         let requested = reference.to_string();
         if expected_size.is_some_and(|length| length > METADATA_LIMIT) {
             return Err(OciError::MetadataSize {
@@ -315,7 +341,7 @@ async fn read_manifest_response(
     reference: &str,
     expected_digest: Option<&str>,
     expected_size: Option<u64>,
-) -> OciResult<(OciManifest, String)> {
+) -> OciResult<RegistryManifest> {
     let status = response.status();
     let success = status == reqwest::StatusCode::OK;
     let expected_size = if success { expected_size } else { None };
@@ -436,8 +462,25 @@ async fn read_manifest_response(
         }
     }
     let count_valid = match &manifest {
-        OciManifest::Image(image) => image.layers.len() <= 1024,
-        OciManifest::ImageIndex(index) => index.manifests.len() <= 4096,
+        OciManifest::Image(image) => {
+            let limit =
+                if image.artifact_type.as_deref() == Some("application/vnd.silo.vm.payloads.v1") {
+                    4096
+                } else {
+                    1024
+                };
+            image.layers.len() <= limit
+        }
+        OciManifest::ImageIndex(index) => {
+            let limit = if index.artifact_type.as_deref()
+                == Some(crate::vm_artifact::graph::ARTIFACT_TYPE)
+            {
+                crate::vm_artifact::wire::MAX_PAGE_ENTRIES + 1
+            } else {
+                4096
+            };
+            index.manifests.len() <= limit
+        }
     };
     if !count_valid {
         return Err(OciError::ImageConfig {
@@ -445,7 +488,11 @@ async fn read_manifest_response(
             message: "OCI manifest descriptor count exceeds its bound".into(),
         });
     }
-    Ok((manifest, digest))
+    Ok(RegistryManifest {
+        manifest,
+        digest,
+        bytes,
+    })
 }
 
 const METADATA_LIMIT: u64 = 4 * 1024 * 1024;
@@ -817,7 +864,7 @@ mod tests {
         header_digest: Option<String>,
         expected_digest: Option<&str>,
         expected_size: Option<u64>,
-    ) -> crate::OciResult<(oci_client::manifest::OciManifest, String)> {
+    ) -> crate::OciResult<crate::registry::RegistryManifest> {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -902,7 +949,7 @@ mod tests {
     fn bounded_http_manifest_verifies_raw_digest_and_exact_selected_descriptor_size() {
         let body = manifest_fixture_bytes();
         let digest = crate::digest::Sha256Digest::from_bytes(&body).to_string();
-        let (_, actual) = manifest_http_fixture(
+        let actual = manifest_http_fixture(
             "200 OK",
             body.clone(),
             false,
@@ -911,7 +958,8 @@ mod tests {
             Some(body.len() as u64),
         )
         .unwrap();
-        assert_eq!(actual, digest);
+        assert_eq!(actual.digest, digest);
+        assert_eq!(actual.bytes, body);
         assert!(matches!(
             manifest_http_fixture(
                 "200 OK",
@@ -948,6 +996,34 @@ mod tests {
             manifest_http_fixture("200 OK", body, true, None, None, None),
             Err(OciError::MetadataSize { actual, limit, .. }) if actual > limit
         ));
+    }
+
+    #[test]
+    fn vm_index_allows_metadata_child_beyond_payload_child_limit() {
+        let descriptor = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": crate::digest::Sha256Digest::from_bytes(b"child").to_string(),
+            "size": 5
+        });
+        for (artifact_type, count, admitted) in [
+            ("application/vnd.silo.vm.v1", 4097, true),
+            ("application/vnd.silo.vm.v1", 4098, false),
+            ("application/vnd.example.other", 4097, false),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "artifactType": artifact_type,
+                "manifests": vec![descriptor.clone(); count],
+            }))
+            .unwrap();
+            let result = manifest_http_fixture("200 OK", bytes.clone(), false, None, None, None);
+            if admitted {
+                assert_eq!(result.unwrap().bytes, bytes);
+            } else {
+                assert!(matches!(result, Err(OciError::ImageConfig { .. })));
+            }
+        }
     }
 
     #[test]

@@ -484,6 +484,43 @@ pub struct Image {
 }
 #[derive(Debug, Subcommand)]
 enum ImageCommand {
+    /// Acquire a complete VM artifact without starting it. Digest approval is
+    /// integrity consent, not authenticated publisher identity.
+    Pull {
+        #[arg(value_name = "OCI_REFERENCE")]
+        reference: String,
+        #[arg(
+            long,
+            value_name = "SHA256",
+            required_unless_present = "require_signature",
+            conflicts_with = "require_signature"
+        )]
+        approve_digest: Option<libvm::ObjectDigest>,
+        /// Refuse unless a signature provider is configured and verifies the index.
+        #[arg(long)]
+        require_signature: bool,
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Publish complete immutable image or checkpoint content to an OCI repository.
+    Push {
+        #[arg(value_name = "IMAGE")]
+        source: String,
+        #[arg(value_name = "OCI_DESTINATION")]
+        destination: String,
+        /// Use raw chunks instead of opportunistic zstd compression.
+        #[arg(long)]
+        raw: bool,
+        /// Acknowledge that publishing a checkpoint exposes its disks and RAM,
+        /// including secrets, to the named destination.
+        #[arg(long)]
+        acknowledge_checkpoint: bool,
+    },
+    /// Inspect a remote VM artifact's immutable index without retaining or booting it.
+    InspectRemote {
+        #[arg(value_name = "OCI_REFERENCE")]
+        reference: String,
+    },
     /// Import a quiesced raw or qcow2 disk as a reusable direct-boot image.
     /// Platform and root selection are required; the boot bundle is pinned now.
     Import {
@@ -543,6 +580,60 @@ enum ImportBootProfile {
 impl Image {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         match self.command {
+            ImageCommand::Pull {
+                reference,
+                approve_digest,
+                require_signature,
+                name,
+            } => {
+                let trust = if require_signature {
+                    libvm::ArtifactTrust::RequireSignature
+                } else {
+                    libvm::ArtifactTrust::ApproveDigest {
+                        digest: approve_digest
+                            .ok_or_else(|| eyre::eyre!("--approve-digest is required"))?,
+                    }
+                };
+                let request = libvm::ArtifactAcquireRequest {
+                    reference,
+                    trust,
+                    alias: name
+                        .map(|name| silo_vm_control::stopped::alias(&name))
+                        .transpose()?,
+                };
+                print_json(&context.app_api().await?.acquire_artifact(request).await?)
+            }
+            ImageCommand::Push {
+                source,
+                destination,
+                raw,
+                acknowledge_checkpoint,
+            } => {
+                let api = context.app_api().await?;
+                let source = api.managed_reference(&source).await?;
+                let checkpoint_acknowledgement =
+                    acknowledge_checkpoint.then(|| libvm::CheckpointPublication {
+                        destination: destination.clone(),
+                    });
+                let request = libvm::ArtifactPublishRequest {
+                    source,
+                    destination,
+                    encoding: if raw {
+                        libvm::ArtifactEncoding::Raw
+                    } else {
+                        libvm::ArtifactEncoding::Zstd
+                    },
+                    checkpoint_acknowledgement,
+                };
+                print_json(&api.publish_artifact(request).await?)
+            }
+            ImageCommand::InspectRemote { reference } => print_json(
+                &context
+                    .app_api()
+                    .await?
+                    .inspect_artifact(&reference)
+                    .await?,
+            ),
             ImageCommand::Import {
                 path,
                 platform,

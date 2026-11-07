@@ -163,6 +163,9 @@ pub struct MachineData {
     pub rootfs: Option<MachineRootfs>,
     /// Typed root, boot, storage and ownership meaning.
     pub storage: Option<crate::MachineStorageRecord>,
+    /// Observed terminal storage result, also available through daemon inspection.
+    /// Absent when storage metadata is unavailable.
+    pub storage_stop_outcome: Option<crate::StorageStopOutcome>,
     /// Pinned boot profile, also available through daemon inspection.
     pub boot_profile: Option<crate::BootProfile>,
     /// Distinct locally admitted packaged bundle, without changing the current pin.
@@ -235,6 +238,7 @@ impl MachineData {
             image_ref: String::new(),
             rootfs: None,
             storage: None,
+            storage_stop_outcome: None,
             boot_profile: None,
             boot_replacement: None,
             external_resources,
@@ -299,6 +303,7 @@ impl MachineData {
             image_ref: config.image_ref,
             rootfs: rootfs.map(Into::into),
             storage: None,
+            storage_stop_outcome: None,
             boot_profile: None,
             boot_replacement: None,
             external_resources,

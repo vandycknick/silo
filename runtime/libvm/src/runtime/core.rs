@@ -563,6 +563,10 @@ impl Runtime {
         self.image_pull_policy
     }
 
+    pub(crate) fn registry_policy(&self) -> &RegistryPolicy {
+        &self.registry_policy
+    }
+
     /// Returns a runtime handle that reports future image materialization progress.
     ///
     /// Progress is runtime-scoped on purpose: machine start options stay focused
@@ -2540,6 +2544,7 @@ impl Runtime {
             state,
         );
         data.storage = storage;
+        data.storage_stop_outcome = data.storage.as_ref().map(|storage| storage.stop_outcome);
         data.boot_profile = data.storage.as_ref().map(|storage| storage.boot.clone());
         if let Some(storage) = data.storage.as_ref() {
             data.boot_replacement =
@@ -6800,6 +6805,11 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty());
             assert_eq!(runtime.machine_state(config.id).await.unwrap().run_id, None);
+            // The transport-neutral projection carried by daemon inspection must
+            // equal the durable terminal record, including a clean certificate.
+            let inspected = runtime.machine_inspect_data(config.clone()).await.unwrap();
+            assert_eq!(inspected.storage_stop_outcome, Some(expected));
+            assert_eq!(inspected.storage.unwrap().stop_outcome, expected);
         }
     }
 
@@ -7386,12 +7396,20 @@ pub(crate) mod tests {
             live.storage.unwrap().stop_outcome,
             crate::StorageStopOutcome::Unknown
         );
+        assert_eq!(
+            live.storage_stop_outcome,
+            Some(crate::StorageStopOutcome::Unknown)
+        );
         worker.kill();
         let terminal = runtime.machine_inspect_data(config.clone()).await.unwrap();
         assert!(matches!(terminal.status, MachineStatus::Error { .. }));
         assert_eq!(
             terminal.storage.unwrap().stop_outcome,
             crate::StorageStopOutcome::Forced
+        );
+        assert_eq!(
+            terminal.storage_stop_outcome,
+            Some(crate::StorageStopOutcome::Forced)
         );
         assert_eq!(runtime.machine_state(config.id).await.unwrap(), before);
         assert_eq!(

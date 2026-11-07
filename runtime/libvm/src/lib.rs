@@ -72,6 +72,11 @@ pub use crate::store::snapshot_store::{
 pub use vm_spec::restore::{RestoreEnvironmentVariable, RestoreHook};
 pub use vm_spec::{live, BlockId, DiskFormat};
 pub mod policy_secrets;
+pub use crate::image::transport::{
+    ArtifactAcquireReport, ArtifactAcquireRequest, ArtifactEncoding, ArtifactInspection,
+    ArtifactPublishReport, ArtifactPublishRequest, ArtifactPurpose, ArtifactRootFamily,
+    ArtifactTrust, CheckpointPublication, PublisherAuthentication,
+};
 pub use crate::image::{
     ImageBuilder, ImageCacheState, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress,
     ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,

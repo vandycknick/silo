@@ -89,6 +89,7 @@ mock! {
     #[async_trait]
     impl ImageStore for DataStore {
         async fn begin_storage_operation(&self, operation_id: uuid::Uuid) -> Result<crate::storage::locks::StorageLock, LibVmError>;
+        async fn pin_source_blobs(&self, operation_id: uuid::Uuid, digests: &[crate::storage::identity::ObjectDigest]) -> Result<(),LibVmError>;
         async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
 
         async fn retain_storage_stream(

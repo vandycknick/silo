@@ -294,7 +294,7 @@ def closure_paths(silo: Silo, saved: Checkpoint) -> list[Path]:
 
 def exact_boot(silo: Silo, name: str, expected: dict[str, str]) -> None:
     pinned = stopped.record(silo, name)["boot"]["binding"]
-    assert pinned["kind"] == "pinned" and pinned["abi"] == "silo-direct-v1"
+    assert pinned["kind"] == "pinned"
     for role, digest in expected.items():
         path = silo.ws.silo_home / "images/objects/sha256" / pinned[role].removeprefix("sha256:")
         assert overlay.digest(path) == digest

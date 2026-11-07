@@ -807,6 +807,51 @@ impl DaemonVmService {
         Ok(())
     }
 
+    pub(crate) async fn inspect_artifact(
+        &self,
+        reference: &str,
+    ) -> eyre::Result<libvm::ArtifactInspection> {
+        silo_vm_control::artifacts::validate_reference(reference)?;
+        let result = self
+            .runtime
+            .clone()
+            .inspect_artifact(w::InspectArtifactRequest {
+                reference: reference.into(),
+            })
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        Ok(silo_vm_control::artifacts::inspection_from_wire(result)?)
+    }
+
+    pub(crate) async fn acquire_artifact(
+        &self,
+        request: libvm::ArtifactAcquireRequest,
+    ) -> eyre::Result<libvm::ArtifactAcquireReport> {
+        let result = self
+            .runtime
+            .clone()
+            .acquire_artifact(silo_vm_control::artifacts::acquire_to_wire(&request)?)
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        Ok(silo_vm_control::artifacts::acquired_from_wire(result)?)
+    }
+
+    pub(crate) async fn publish_artifact(
+        &self,
+        request: libvm::ArtifactPublishRequest,
+    ) -> eyre::Result<libvm::ArtifactPublishReport> {
+        let result = self
+            .runtime
+            .clone()
+            .publish_artifact(silo_vm_control::artifacts::publish_to_wire(&request)?)
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        Ok(silo_vm_control::artifacts::published_from_wire(result)?)
+    }
+
     /// The daemon owns the import once submitted; a lost reply is not cancellation.
     pub(crate) async fn import_image(
         &self,

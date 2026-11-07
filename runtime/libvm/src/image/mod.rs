@@ -9,6 +9,7 @@ pub(crate) mod import_types;
 pub(crate) mod local_disk;
 pub(crate) mod oci;
 pub(crate) mod progress;
+pub(crate) mod transport;
 
 use crate::runtime::Runtime;
 use crate::LibVmError;

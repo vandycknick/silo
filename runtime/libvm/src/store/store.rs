@@ -2929,4 +2929,82 @@ mod tests {
             [0x51; 512]
         );
     }
+    #[tokio::test]
+    async fn machine_dependency_indexes_follow_exact_generation_and_not_raw_provenance() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        seed_machine(
+            &db,
+            &machine_from_path(id, "indexed-closure".into(), paths.machine(id).dir()),
+        )
+        .await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        let source = crate::storage::identity::StreamId::from_sha256([0x42; 32]);
+        let kernel = crate::storage::identity::ObjectDigest::of_bytes(b"indexed boot kernel");
+        if let crate::MachineRoot::OpaqueRaw {
+            initial_content, ..
+        } = &mut storage.root
+        {
+            *initial_content = Some(source);
+        }
+        storage.boot = crate::store::models::snapshot::tests::record(source, kernel, kernel).boot;
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .unwrap();
+        let mut connection = db.pool.acquire().await.unwrap();
+        assert!(
+            crate::store::cache_paths::machine_retains_object(&mut connection, kernel)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !crate::store::cache_paths::machine_retains_stream(&mut connection, source)
+                .await
+                .unwrap()
+        );
+        drop(connection);
+        sqlx::query(
+            "UPDATE machine_object_dependency SET generation=generation+1 WHERE machine_id=?1",
+        )
+        .bind(id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .is_err());
+        storage.storage_generation += 1;
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM machine_object_dependency WHERE object_digest=?1")
+            .bind(kernel.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .is_err());
+        let mut tx = db.pool.begin().await.unwrap();
+        Store::write_machine_storage(&mut tx, id, &storage)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("INSERT INTO machine_stream_dependency(machine_id,generation,stream_id) VALUES(?1,?2,?3)")
+            .bind(id.to_string()).bind(storage.storage_generation as i64).bind(source.to_string()).execute(&db.pool).await.unwrap();
+        assert!(crate::store::cache_paths::check_machine_dependencies(&db)
+            .await
+            .is_err());
+    }
 }

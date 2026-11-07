@@ -130,7 +130,7 @@ async fn restore_consumer(
         ));
     }
     let pool = StoragePool::open(runtime.local_images_dir())?;
-    let evidence = snapshots.restore_evidence(consumer, &pool)?;
+    let evidence = snapshots.restore_evidence(consumer, &pool)?.evidence;
     let execution = match &consumer.record.capture {
         SnapshotCaptureKind::LiveExecution { execution } => execution,
         _ => return Err(invalid("checkpoint capture kind changed")),
@@ -293,7 +293,6 @@ async fn restore_consumer(
         .reserve_restore_resources(
             consumer,
             &request,
-            &runtime.local_home().join("machines"),
             disk_peak,
             descriptor_peak,
             options.resources,

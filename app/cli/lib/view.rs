@@ -244,7 +244,7 @@ impl MachineView {
             issues: data.issues.clone(),
             last_error: data.last_error.clone(),
             run_id: data.run_id.as_ref().map(ToString::to_string),
-            storage_stop_outcome: data.storage.as_ref().map(|storage| storage.stop_outcome),
+            storage_stop_outcome: data.storage_stop_outcome,
             live: data.live.clone(),
             prospective_live: data.prospective_live.clone(),
             lifecycle: data.lifecycle.clone(),

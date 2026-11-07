@@ -260,6 +260,20 @@ CREATE TABLE machine_storage (
     machine_id TEXT PRIMARY KEY NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
     record_json BLOB NOT NULL
 );
+CREATE TABLE machine_stream_dependency (
+    machine_id TEXT NOT NULL REFERENCES machine_storage(machine_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL CHECK(generation>=0),
+    stream_id TEXT NOT NULL,
+    PRIMARY KEY(machine_id,stream_id)
+);
+CREATE INDEX machine_stream_reverse ON machine_stream_dependency(stream_id,machine_id);
+CREATE TABLE machine_object_dependency (
+    machine_id TEXT NOT NULL REFERENCES machine_storage(machine_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL CHECK(generation>=0),
+    object_digest TEXT NOT NULL,
+    PRIMARY KEY(machine_id,object_digest)
+);
+CREATE INDEX machine_object_reverse ON machine_object_dependency(object_digest,machine_id);
 
 
 CREATE TABLE storage_operation (
@@ -295,6 +309,70 @@ CREATE TABLE storage_operation_object (
     PRIMARY KEY (operation_id, object_digest)
 );
 CREATE INDEX storage_operation_object_reverse_idx ON storage_operation_object(object_digest, operation_id);
+CREATE TABLE storage_operation_managed (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    managed_kind TEXT NOT NULL CHECK(managed_kind IN ('image','snapshot')),
+    managed_id TEXT NOT NULL,
+    PRIMARY KEY(operation_id,managed_kind,managed_id)
+);
+CREATE INDEX storage_operation_managed_reverse ON storage_operation_managed(managed_kind,managed_id,operation_id);
+
+CREATE TABLE storage_cache_entry (
+    kind TEXT NOT NULL CHECK(kind IN ('source-blob','transport')),
+    digest TEXT NOT NULL,
+    size_bytes INTEGER CHECK(size_bytes >= 0),
+    last_used_at INTEGER NOT NULL,
+    PRIMARY KEY(kind,digest)
+);
+CREATE TABLE storage_operation_cache (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('source-blob','transport')),
+    digest TEXT NOT NULL,
+    PRIMARY KEY(operation_id,kind,digest),
+    FOREIGN KEY(kind,digest) REFERENCES storage_cache_entry(kind,digest) ON DELETE RESTRICT
+);
+CREATE INDEX storage_operation_cache_reverse ON storage_operation_cache(kind,digest,operation_id);
+
+CREATE TABLE storage_stream (
+    stream_id TEXT PRIMARY KEY NOT NULL,
+    length INTEGER NOT NULL CHECK(length >= 0),
+    map_digest TEXT NOT NULL,
+    flat_state TEXT NOT NULL CHECK(flat_state IN ('present','evicting','absent'))
+);
+CREATE TABLE stream_representation (
+    stream_id TEXT NOT NULL REFERENCES storage_stream(stream_id) ON DELETE CASCADE,
+    root_digest TEXT NOT NULL,
+    PRIMARY KEY(stream_id,root_digest)
+);
+CREATE TABLE stream_representation_profile (
+    stream_id TEXT NOT NULL,
+    root_digest TEXT NOT NULL,
+    encoding TEXT NOT NULL CHECK(encoding IN ('raw','zstd')),
+    PRIMARY KEY(stream_id,root_digest,encoding),
+    FOREIGN KEY(stream_id,root_digest) REFERENCES stream_representation(stream_id,root_digest) ON DELETE CASCADE
+);
+CREATE TABLE object_stream_representation (
+    object_digest TEXT PRIMARY KEY NOT NULL,
+    stream_id TEXT UNIQUE NOT NULL REFERENCES storage_stream(stream_id) ON DELETE CASCADE
+);
+CREATE TRIGGER stream_representation_profile_immutable BEFORE UPDATE ON stream_representation_profile
+BEGIN SELECT RAISE(ABORT,'stream encoding profile is immutable'); END;
+CREATE TRIGGER object_stream_representation_immutable BEFORE UPDATE ON object_stream_representation
+BEGIN SELECT RAISE(ABORT,'object stream binding is immutable'); END;
+CREATE TABLE stream_representation_object (
+    stream_id TEXT NOT NULL,
+    root_digest TEXT NOT NULL,
+    object_digest TEXT NOT NULL,
+    PRIMARY KEY(stream_id,root_digest,object_digest),
+    FOREIGN KEY(stream_id,root_digest) REFERENCES stream_representation(stream_id,root_digest) ON DELETE CASCADE
+);
+CREATE INDEX stream_representation_object_reverse ON stream_representation_object(object_digest,stream_id);
+CREATE TRIGGER storage_stream_identity_immutable BEFORE UPDATE OF stream_id,length,map_digest ON storage_stream
+BEGIN SELECT RAISE(ABORT,'stream identity is immutable'); END;
+CREATE TRIGGER stream_representation_immutable BEFORE UPDATE ON stream_representation
+BEGIN SELECT RAISE(ABORT,'stream representation is immutable'); END;
+CREATE TRIGGER stream_representation_object_immutable BEFORE UPDATE ON stream_representation_object
+BEGIN SELECT RAISE(ABORT,'stream representation edge is immutable'); END;
 
 -- Results survive source deletion and retirement of operation roots.
 CREATE TABLE live_fork (
@@ -519,3 +597,32 @@ CREATE TABLE snapshot_capture_provenance (
 CREATE INDEX snapshot_capture_provenance_reverse_idx ON snapshot_capture_provenance(evidence_digest, snapshot_id);
 CREATE TRIGGER snapshot_capture_provenance_immutable BEFORE UPDATE ON snapshot_capture_provenance
 BEGIN SELECT RAISE(ABORT, 'capture provenance is immutable'); END;
+
+CREATE TABLE snapshot_imported_capture (
+    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
+    provenance_digest TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL,
+    provenance_bytes BLOB NOT NULL,
+    PRIMARY KEY(snapshot_id,provenance_digest)
+);
+CREATE INDEX snapshot_imported_capture_evidence ON snapshot_imported_capture(evidence_digest,snapshot_id);
+CREATE TABLE managed_artifact_acquisition (
+    managed_kind TEXT NOT NULL CHECK(managed_kind IN ('image','snapshot')),
+    managed_id TEXT NOT NULL,
+    index_digest TEXT NOT NULL,
+    receipt_digest TEXT NOT NULL,
+    receipt_bytes BLOB NOT NULL,
+    provenance_digest TEXT,
+    encoding_bytes BLOB NOT NULL,
+    PRIMARY KEY(managed_kind,managed_id,index_digest,receipt_digest),
+    CHECK(managed_kind='snapshot' OR provenance_digest IS NULL)
+);
+CREATE INDEX managed_artifact_acquisition_receipt ON managed_artifact_acquisition(receipt_digest);
+CREATE TRIGGER snapshot_imported_capture_immutable BEFORE UPDATE ON snapshot_imported_capture
+BEGIN SELECT RAISE(ABORT,'imported capture provenance is immutable'); END;
+CREATE TRIGGER managed_artifact_acquisition_immutable BEFORE UPDATE ON managed_artifact_acquisition
+BEGIN SELECT RAISE(ABORT,'artifact acquisition is immutable'); END;
+CREATE TRIGGER storage_image_acquisition_delete AFTER DELETE ON storage_image
+BEGIN DELETE FROM managed_artifact_acquisition WHERE managed_kind='image' AND managed_id=OLD.id; END;
+CREATE TRIGGER storage_snapshot_acquisition_delete AFTER DELETE ON storage_snapshot
+BEGIN DELETE FROM managed_artifact_acquisition WHERE managed_kind='snapshot' AND managed_id=OLD.id; END;

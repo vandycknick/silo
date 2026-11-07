@@ -296,6 +296,7 @@ const (
 	MachineService_ForkExecution_FullMethodName       = "/silo.daemon.v1.MachineService/ForkExecution"
 	MachineService_ForkStopped_FullMethodName         = "/silo.daemon.v1.MachineService/ForkStopped"
 	MachineService_SnapshotStopped_FullMethodName     = "/silo.daemon.v1.MachineService/SnapshotStopped"
+	MachineService_UpdateBootAssets_FullMethodName    = "/silo.daemon.v1.MachineService/UpdateBootAssets"
 )
 
 // MachineServiceClient is the client API for MachineService service.
@@ -321,9 +322,11 @@ type MachineServiceClient interface {
 	PauseMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	ResumeMachine(ctx context.Context, in *LiveMachineRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	CaptureExecution(ctx context.Context, in *LiveCaptureRequest, opts ...grpc.CallOption) (*LiveSnapshotInfo, error)
-	ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*LiveForkResult, error)
 	ForkStopped(ctx context.Context, in *StoppedForkRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	SnapshotStopped(ctx context.Context, in *CreateStorageSnapshotRequest, opts ...grpc.CallOption) (*StorageSnapshotInfo, error)
+	// Explicit stopped boot-bundle replacement; the root and its platform never change.
+	UpdateBootAssets(ctx context.Context, in *UpdateBootAssetsRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 }
 
 type machineServiceClient struct {
@@ -551,9 +554,9 @@ func (c *machineServiceClient) CaptureExecution(ctx context.Context, in *LiveCap
 	return out, nil
 }
 
-func (c *machineServiceClient) ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *machineServiceClient) ForkExecution(ctx context.Context, in *LiveForkRequest, opts ...grpc.CallOption) (*LiveForkResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(LiveForkResult)
 	err := c.cc.Invoke(ctx, MachineService_ForkExecution_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -575,6 +578,16 @@ func (c *machineServiceClient) SnapshotStopped(ctx context.Context, in *CreateSt
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StorageSnapshotInfo)
 	err := c.cc.Invoke(ctx, MachineService_SnapshotStopped_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *machineServiceClient) UpdateBootAssets(ctx context.Context, in *UpdateBootAssetsRequest, opts ...grpc.CallOption) (*MachineSnapshot, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSnapshot)
+	err := c.cc.Invoke(ctx, MachineService_UpdateBootAssets_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -604,9 +617,11 @@ type MachineServiceServer interface {
 	PauseMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error)
 	ResumeMachine(context.Context, *LiveMachineRequest) (*MachineSnapshot, error)
 	CaptureExecution(context.Context, *LiveCaptureRequest) (*LiveSnapshotInfo, error)
-	ForkExecution(context.Context, *LiveForkRequest) (*emptypb.Empty, error)
+	ForkExecution(context.Context, *LiveForkRequest) (*LiveForkResult, error)
 	ForkStopped(context.Context, *StoppedForkRequest) (*MachineSnapshot, error)
 	SnapshotStopped(context.Context, *CreateStorageSnapshotRequest) (*StorageSnapshotInfo, error)
+	// Explicit stopped boot-bundle replacement; the root and its platform never change.
+	UpdateBootAssets(context.Context, *UpdateBootAssetsRequest) (*MachineSnapshot, error)
 	mustEmbedUnimplementedMachineServiceServer()
 }
 
@@ -674,7 +689,7 @@ func (UnimplementedMachineServiceServer) ResumeMachine(context.Context, *LiveMac
 func (UnimplementedMachineServiceServer) CaptureExecution(context.Context, *LiveCaptureRequest) (*LiveSnapshotInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method CaptureExecution not implemented")
 }
-func (UnimplementedMachineServiceServer) ForkExecution(context.Context, *LiveForkRequest) (*emptypb.Empty, error) {
+func (UnimplementedMachineServiceServer) ForkExecution(context.Context, *LiveForkRequest) (*LiveForkResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ForkExecution not implemented")
 }
 func (UnimplementedMachineServiceServer) ForkStopped(context.Context, *StoppedForkRequest) (*MachineSnapshot, error) {
@@ -682,6 +697,9 @@ func (UnimplementedMachineServiceServer) ForkStopped(context.Context, *StoppedFo
 }
 func (UnimplementedMachineServiceServer) SnapshotStopped(context.Context, *CreateStorageSnapshotRequest) (*StorageSnapshotInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method SnapshotStopped not implemented")
+}
+func (UnimplementedMachineServiceServer) UpdateBootAssets(context.Context, *UpdateBootAssetsRequest) (*MachineSnapshot, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateBootAssets not implemented")
 }
 func (UnimplementedMachineServiceServer) mustEmbedUnimplementedMachineServiceServer() {}
 func (UnimplementedMachineServiceServer) testEmbeddedByValue()                        {}
@@ -1079,6 +1097,24 @@ func _MachineService_SnapshotStopped_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MachineService_UpdateBootAssets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateBootAssetsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).UpdateBootAssets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_UpdateBootAssets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).UpdateBootAssets(ctx, req.(*UpdateBootAssetsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MachineService_ServiceDesc is the grpc.ServiceDesc for MachineService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1161,6 +1197,10 @@ var MachineService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SnapshotStopped",
 			Handler:    _MachineService_SnapshotStopped_Handler,
+		},
+		{
+			MethodName: "UpdateBootAssets",
+			Handler:    _MachineService_UpdateBootAssets_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -1453,6 +1493,17 @@ const (
 	RuntimeService_ListStorageSnapshots_FullMethodName     = "/silo.daemon.v1.RuntimeService/ListStorageSnapshots"
 	RuntimeService_ReleaseSnapshotRetention_FullMethodName = "/silo.daemon.v1.RuntimeService/ReleaseSnapshotRetention"
 	RuntimeService_RemoveImageAlias_FullMethodName         = "/silo.daemon.v1.RuntimeService/RemoveImageAlias"
+	RuntimeService_ImportImage_FullMethodName              = "/silo.daemon.v1.RuntimeService/ImportImage"
+	RuntimeService_ConvertImage_FullMethodName             = "/silo.daemon.v1.RuntimeService/ConvertImage"
+	RuntimeService_InspectArtifact_FullMethodName          = "/silo.daemon.v1.RuntimeService/InspectArtifact"
+	RuntimeService_AcquireArtifact_FullMethodName          = "/silo.daemon.v1.RuntimeService/AcquireArtifact"
+	RuntimeService_PublishArtifact_FullMethodName          = "/silo.daemon.v1.RuntimeService/PublishArtifact"
+	RuntimeService_ResolveManagedDigest_FullMethodName     = "/silo.daemon.v1.RuntimeService/ResolveManagedDigest"
+	RuntimeService_InspectManagedImage_FullMethodName      = "/silo.daemon.v1.RuntimeService/InspectManagedImage"
+	RuntimeService_ListManagedImages_FullMethodName        = "/silo.daemon.v1.RuntimeService/ListManagedImages"
+	RuntimeService_ReleaseImageRetention_FullMethodName    = "/silo.daemon.v1.RuntimeService/ReleaseImageRetention"
+	RuntimeService_GetFork_FullMethodName                  = "/silo.daemon.v1.RuntimeService/GetFork"
+	RuntimeService_CancelFork_FullMethodName               = "/silo.daemon.v1.RuntimeService/CancelFork"
 )
 
 // RuntimeServiceClient is the client API for RuntimeService service.
@@ -1470,6 +1521,20 @@ type RuntimeServiceClient interface {
 	ListStorageSnapshots(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StorageSnapshotList, error)
 	ReleaseSnapshotRetention(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RemoveImageAlias(ctx context.Context, in *Name, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ImportImage(ctx context.Context, in *DiskImportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ManagedImageEvent], error)
+	ConvertImage(ctx context.Context, in *ConvertImageRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ManagedImageEvent], error)
+	InspectArtifact(ctx context.Context, in *InspectArtifactRequest, opts ...grpc.CallOption) (*ArtifactInspection, error)
+	AcquireArtifact(ctx context.Context, in *AcquireArtifactRequest, opts ...grpc.CallOption) (*ArtifactAcquireReport, error)
+	PublishArtifact(ctx context.Context, in *PublishArtifactRequest, opts ...grpc.CallOption) (*ArtifactPublishReport, error)
+	ResolveManagedDigest(ctx context.Context, in *ManagedDigest, opts ...grpc.CallOption) (*ManagedSourceId, error)
+	InspectManagedImage(ctx context.Context, in *ManagedSourceRef, opts ...grpc.CallOption) (*ManagedSourceInfo, error)
+	ListManagedImages(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ManagedSourceList, error)
+	// Releases explicit retention only; aliases and consumers still retain bytes.
+	ReleaseImageRetention(ctx context.Context, in *ManagedSourceRef, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Operation-scoped live fork observation and durable cancellation intent;
+	// never resolved through a source machine, which may since have been removed.
+	GetFork(ctx context.Context, in *ForkOperationRef, opts ...grpc.CallOption) (*LiveForkResult, error)
+	CancelFork(ctx context.Context, in *ForkOperationRef, opts ...grpc.CallOption) (*LiveForkResult, error)
 }
 
 type runtimeServiceClient struct {
@@ -1608,6 +1673,134 @@ func (c *runtimeServiceClient) RemoveImageAlias(ctx context.Context, in *Name, o
 	return out, nil
 }
 
+func (c *runtimeServiceClient) ImportImage(ctx context.Context, in *DiskImportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ManagedImageEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RuntimeService_ServiceDesc.Streams[2], RuntimeService_ImportImage_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[DiskImportRequest, ManagedImageEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimeService_ImportImageClient = grpc.ServerStreamingClient[ManagedImageEvent]
+
+func (c *runtimeServiceClient) ConvertImage(ctx context.Context, in *ConvertImageRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ManagedImageEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RuntimeService_ServiceDesc.Streams[3], RuntimeService_ConvertImage_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ConvertImageRequest, ManagedImageEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimeService_ConvertImageClient = grpc.ServerStreamingClient[ManagedImageEvent]
+
+func (c *runtimeServiceClient) InspectArtifact(ctx context.Context, in *InspectArtifactRequest, opts ...grpc.CallOption) (*ArtifactInspection, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ArtifactInspection)
+	err := c.cc.Invoke(ctx, RuntimeService_InspectArtifact_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) AcquireArtifact(ctx context.Context, in *AcquireArtifactRequest, opts ...grpc.CallOption) (*ArtifactAcquireReport, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ArtifactAcquireReport)
+	err := c.cc.Invoke(ctx, RuntimeService_AcquireArtifact_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) PublishArtifact(ctx context.Context, in *PublishArtifactRequest, opts ...grpc.CallOption) (*ArtifactPublishReport, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ArtifactPublishReport)
+	err := c.cc.Invoke(ctx, RuntimeService_PublishArtifact_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) ResolveManagedDigest(ctx context.Context, in *ManagedDigest, opts ...grpc.CallOption) (*ManagedSourceId, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ManagedSourceId)
+	err := c.cc.Invoke(ctx, RuntimeService_ResolveManagedDigest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) InspectManagedImage(ctx context.Context, in *ManagedSourceRef, opts ...grpc.CallOption) (*ManagedSourceInfo, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ManagedSourceInfo)
+	err := c.cc.Invoke(ctx, RuntimeService_InspectManagedImage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) ListManagedImages(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ManagedSourceList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ManagedSourceList)
+	err := c.cc.Invoke(ctx, RuntimeService_ListManagedImages_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) ReleaseImageRetention(ctx context.Context, in *ManagedSourceRef, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, RuntimeService_ReleaseImageRetention_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) GetFork(ctx context.Context, in *ForkOperationRef, opts ...grpc.CallOption) (*LiveForkResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LiveForkResult)
+	err := c.cc.Invoke(ctx, RuntimeService_GetFork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) CancelFork(ctx context.Context, in *ForkOperationRef, opts ...grpc.CallOption) (*LiveForkResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LiveForkResult)
+	err := c.cc.Invoke(ctx, RuntimeService_CancelFork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RuntimeServiceServer is the server API for RuntimeService service.
 // All implementations must embed UnimplementedRuntimeServiceServer
 // for forward compatibility.
@@ -1623,6 +1816,20 @@ type RuntimeServiceServer interface {
 	ListStorageSnapshots(context.Context, *emptypb.Empty) (*StorageSnapshotList, error)
 	ReleaseSnapshotRetention(context.Context, *StorageSnapshotRef) (*emptypb.Empty, error)
 	RemoveImageAlias(context.Context, *Name) (*emptypb.Empty, error)
+	ImportImage(*DiskImportRequest, grpc.ServerStreamingServer[ManagedImageEvent]) error
+	ConvertImage(*ConvertImageRequest, grpc.ServerStreamingServer[ManagedImageEvent]) error
+	InspectArtifact(context.Context, *InspectArtifactRequest) (*ArtifactInspection, error)
+	AcquireArtifact(context.Context, *AcquireArtifactRequest) (*ArtifactAcquireReport, error)
+	PublishArtifact(context.Context, *PublishArtifactRequest) (*ArtifactPublishReport, error)
+	ResolveManagedDigest(context.Context, *ManagedDigest) (*ManagedSourceId, error)
+	InspectManagedImage(context.Context, *ManagedSourceRef) (*ManagedSourceInfo, error)
+	ListManagedImages(context.Context, *emptypb.Empty) (*ManagedSourceList, error)
+	// Releases explicit retention only; aliases and consumers still retain bytes.
+	ReleaseImageRetention(context.Context, *ManagedSourceRef) (*emptypb.Empty, error)
+	// Operation-scoped live fork observation and durable cancellation intent;
+	// never resolved through a source machine, which may since have been removed.
+	GetFork(context.Context, *ForkOperationRef) (*LiveForkResult, error)
+	CancelFork(context.Context, *ForkOperationRef) (*LiveForkResult, error)
 	mustEmbedUnimplementedRuntimeServiceServer()
 }
 
@@ -1665,6 +1872,39 @@ func (UnimplementedRuntimeServiceServer) ReleaseSnapshotRetention(context.Contex
 }
 func (UnimplementedRuntimeServiceServer) RemoveImageAlias(context.Context, *Name) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveImageAlias not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ImportImage(*DiskImportRequest, grpc.ServerStreamingServer[ManagedImageEvent]) error {
+	return status.Error(codes.Unimplemented, "method ImportImage not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ConvertImage(*ConvertImageRequest, grpc.ServerStreamingServer[ManagedImageEvent]) error {
+	return status.Error(codes.Unimplemented, "method ConvertImage not implemented")
+}
+func (UnimplementedRuntimeServiceServer) InspectArtifact(context.Context, *InspectArtifactRequest) (*ArtifactInspection, error) {
+	return nil, status.Error(codes.Unimplemented, "method InspectArtifact not implemented")
+}
+func (UnimplementedRuntimeServiceServer) AcquireArtifact(context.Context, *AcquireArtifactRequest) (*ArtifactAcquireReport, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcquireArtifact not implemented")
+}
+func (UnimplementedRuntimeServiceServer) PublishArtifact(context.Context, *PublishArtifactRequest) (*ArtifactPublishReport, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishArtifact not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ResolveManagedDigest(context.Context, *ManagedDigest) (*ManagedSourceId, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveManagedDigest not implemented")
+}
+func (UnimplementedRuntimeServiceServer) InspectManagedImage(context.Context, *ManagedSourceRef) (*ManagedSourceInfo, error) {
+	return nil, status.Error(codes.Unimplemented, "method InspectManagedImage not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ListManagedImages(context.Context, *emptypb.Empty) (*ManagedSourceList, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListManagedImages not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ReleaseImageRetention(context.Context, *ManagedSourceRef) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseImageRetention not implemented")
+}
+func (UnimplementedRuntimeServiceServer) GetFork(context.Context, *ForkOperationRef) (*LiveForkResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFork not implemented")
+}
+func (UnimplementedRuntimeServiceServer) CancelFork(context.Context, *ForkOperationRef) (*LiveForkResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelFork not implemented")
 }
 func (UnimplementedRuntimeServiceServer) mustEmbedUnimplementedRuntimeServiceServer() {}
 func (UnimplementedRuntimeServiceServer) testEmbeddedByValue()                        {}
@@ -1871,6 +2111,190 @@ func _RuntimeService_RemoveImageAlias_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimeService_ImportImage_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(DiskImportRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(RuntimeServiceServer).ImportImage(m, &grpc.GenericServerStream[DiskImportRequest, ManagedImageEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimeService_ImportImageServer = grpc.ServerStreamingServer[ManagedImageEvent]
+
+func _RuntimeService_ConvertImage_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ConvertImageRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(RuntimeServiceServer).ConvertImage(m, &grpc.GenericServerStream[ConvertImageRequest, ManagedImageEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimeService_ConvertImageServer = grpc.ServerStreamingServer[ManagedImageEvent]
+
+func _RuntimeService_InspectArtifact_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InspectArtifactRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).InspectArtifact(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_InspectArtifact_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).InspectArtifact(ctx, req.(*InspectArtifactRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_AcquireArtifact_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcquireArtifactRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).AcquireArtifact(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_AcquireArtifact_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).AcquireArtifact(ctx, req.(*AcquireArtifactRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_PublishArtifact_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PublishArtifactRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).PublishArtifact(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_PublishArtifact_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).PublishArtifact(ctx, req.(*PublishArtifactRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_ResolveManagedDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ManagedDigest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).ResolveManagedDigest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_ResolveManagedDigest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).ResolveManagedDigest(ctx, req.(*ManagedDigest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_InspectManagedImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ManagedSourceRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).InspectManagedImage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_InspectManagedImage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).InspectManagedImage(ctx, req.(*ManagedSourceRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_ListManagedImages_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).ListManagedImages(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_ListManagedImages_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).ListManagedImages(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_ReleaseImageRetention_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ManagedSourceRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).ReleaseImageRetention(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_ReleaseImageRetention_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).ReleaseImageRetention(ctx, req.(*ManagedSourceRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_GetFork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForkOperationRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).GetFork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_GetFork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).GetFork(ctx, req.(*ForkOperationRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_CancelFork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForkOperationRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).CancelFork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_CancelFork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).CancelFork(ctx, req.(*ForkOperationRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RuntimeService_ServiceDesc is the grpc.ServiceDesc for RuntimeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1914,6 +2338,42 @@ var RuntimeService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "RemoveImageAlias",
 			Handler:    _RuntimeService_RemoveImageAlias_Handler,
 		},
+		{
+			MethodName: "InspectArtifact",
+			Handler:    _RuntimeService_InspectArtifact_Handler,
+		},
+		{
+			MethodName: "AcquireArtifact",
+			Handler:    _RuntimeService_AcquireArtifact_Handler,
+		},
+		{
+			MethodName: "PublishArtifact",
+			Handler:    _RuntimeService_PublishArtifact_Handler,
+		},
+		{
+			MethodName: "ResolveManagedDigest",
+			Handler:    _RuntimeService_ResolveManagedDigest_Handler,
+		},
+		{
+			MethodName: "InspectManagedImage",
+			Handler:    _RuntimeService_InspectManagedImage_Handler,
+		},
+		{
+			MethodName: "ListManagedImages",
+			Handler:    _RuntimeService_ListManagedImages_Handler,
+		},
+		{
+			MethodName: "ReleaseImageRetention",
+			Handler:    _RuntimeService_ReleaseImageRetention_Handler,
+		},
+		{
+			MethodName: "GetFork",
+			Handler:    _RuntimeService_GetFork_Handler,
+		},
+		{
+			MethodName: "CancelFork",
+			Handler:    _RuntimeService_CancelFork_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -1924,6 +2384,16 @@ var RuntimeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "PullImage",
 			Handler:       _RuntimeService_PullImage_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ImportImage",
+			Handler:       _RuntimeService_ImportImage_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ConvertImage",
+			Handler:       _RuntimeService_ConvertImage_Handler,
 			ServerStreams: true,
 		},
 	},

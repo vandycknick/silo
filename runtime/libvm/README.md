@@ -219,6 +219,36 @@ alias does not release explicit retention. Catalog removal never recursively
 unlinks shared content. Stream and object collectors account for image maps,
 canonical records, bundle records and every exact boot member.
 
+A retained stream can have a verified complete chunk representation in canonical
+`objects/` independently of its flat `streams/` materialization. Explicit pruning
+may evict that flat file only when no operation, machine, OCI cache artifact or
+layer result needs it. Eviction journals `present` → `evicting` → `absent`; missing
+flat bytes without that authority are corruption. A managed consumer reconstructs
+from the exact canonical map and retained encoded chunks into fresh sparse
+staging, verifies both chunk identities and StreamId, then joins the shared
+immutable stream publication. Reconstruction never contacts a registry. Canonical
+sole-copy chunks have no TTL.
+Publication retains the selected exact encoding and its writer profile, including
+zstd's legitimate all-raw fallback, for subsequent pushes without recompression.
+Whole boot-object stream encodings remain rooted by their semantic object owners;
+representation-only self references never become permanent retention roots.
+
+Source blobs expire after seven days and redundant transport bytes after thirty
+days of recorded use. Explicit cache pressure may remove them sooner, but never
+while the existing operation's one closure lease pins them. Expected cache
+identities are registered before lookup/download; no lease descriptor is opened
+per chunk. Machine dependency indexes are committed with their exact storage
+generation, and collectors reject missing or surplus indexed edges.
+
+An imported live checkpoint retains its exact portable provenance and source seal
+separately from a local capture reservation. A local acquisition receipt binds
+the approved immutable index, repository, policy and selected provenance through
+the exact metadata child/config descriptor chain. Restore selects matching
+authenticated local or imported provenance, rather than trusting the first row.
+Digest approval establishes integrity and permission to import, not an
+authenticated publisher or proof that a local monitor performed the source cut.
+
+
 `Images::import_disk` imports a quiesced caller-owned regular file. The path is
 opened once with `O_NOFOLLOW`; a final-component symlink, directory, FIFO or
 device is rejected, and every later read uses that held descriptor. Format is
@@ -290,6 +320,40 @@ Consumers resolve and recheck the typed public target and register its entire
 closure in one roots-coordinated transaction before opening artifact bytes.
 Inspection is not a lease. Abandoned operation recovery and GC use the existing
 journal and lease machinery; there is no second cleanup or alias namespace.
+
+## OCI VM Artifact Transport
+
+`Images::inspect_artifact` resolves and checks bounded remote metadata without
+retaining content or booting it. `acquire_artifact(ArtifactAcquireRequest)`
+requires an exact immutable index digest via `ArtifactTrust::ApproveDigest`;
+the resulting publisher is explicitly unauthenticated. `RequireSignature`
+fails closed because no signing provider is integrated. A VM artifact is
+recognized before OCI container platform selection; ordinary container
+creation refuses it and requires explicit acquisition.
+
+`publish_artifact(ArtifactPublishRequest)` exports the complete managed image
+or checkpoint, including pinned boot bytes and all included disks. Checkpoints
+require acknowledgement naming the exact destination. Live checkpoints also
+carry their execution state, device state, RAM and portable source seal.
+Acquisition does not grant live-restore compatibility or capability admission.
+
+The OCI index has a metadata child and bounded payload children. Every
+descriptor preserves exact bytes in the destination repository; source OCI
+manifests and referrers are not payload dependencies. Raw/zstd transport
+encodings and pagination do not change semantic or decoded stream identities.
+Publication uploads payloads before child manifests, then the index, then the
+optional tag. Retry reuses retained exact encodings and skips existing registry
+blobs. Pull rehashes completed cached bytes, refetches invalid/missing chunks,
+and reconstructs streams into fresh zero-filled staging before publication.
+Concurrent cache publishers serialize by digest; a contradictory descriptor
+cannot delete another acquisition's valid cached input.
+
+Acquisition reserves its conservative simultaneous download, decoded-staging
+and immutable-publication peak through the shared cross-home import ledger
+before bulk effects. Detached operations retain their lease and capacity
+through blocking work even if the caller disappears. Complete semantic
+verification precedes atomic catalog publication; failed operations retain
+recovery authority, not partial public images or aliases.
 
 ## Stopped Snapshot Retention And Identity
 
@@ -392,7 +456,9 @@ There is no upgrade, root conversion, or old-cache adoption path.
 By default new machines own a private `root.raw` disk. SQLite records closed root,
 boot, storage-profile and backend variants, relative private paths, geometry,
 ownership epoch and storage stop outcome. `MachineData::storage` exposes that
-typed meaning. Source manifest/config references are provenance; retained lower
+typed meaning; `MachineData::storage_stop_outcome` also carries the observed
+outcome through daemon inspection, without fabricating a complete local storage
+record. Source manifest/config references are provenance; retained lower
 stream identities, not source tags or descriptor text, are GC dependencies.
 
 Private machine directories are derived from the currently opened catalog home
@@ -867,8 +933,14 @@ different parents, or fail a particular composition without invalidating the lay
 * `find_recipe` and `load` authenticate retained records, the complete pack stream
   and index closure without source blobs. They use `open_existing`, never creating
   missing directories or trusting catalog IDs without byte verification.
+* `load` returns a `HeldLayer`; `compose` returns a `HeldNamespace`. Their
+  metadata is accessible through `Deref`, but callers retain the owning value
+  through the last payload read. Composition pins all ordered inputs under one
+  operation lease, independent of layer/chunk count.
 * `compose` consumes authenticated results in occurrence order and returns neutral
-  inode/name/body-origin facts, not a host-extracted tree.
+  inode/name/body-origin facts, not a host-extracted tree. Recipes, results and
+  occurrence sets are subordinate cache facts: explicit prune retires them when
+  neither a retained owner nor an active consumer needs their closure.
 
 The [normative changeset ABI](../../docs/adr/0014-layered-oci-image-storage.md#changeset-byte-abi)
 fixes exact JCS fields, domain-separated recipe/result IDs and deterministic

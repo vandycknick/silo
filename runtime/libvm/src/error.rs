@@ -64,6 +64,21 @@ pub enum LibVmError {
     DiskImport(#[from] Box<crate::image::import::DiskImportError>),
     #[error("development flat overlay roots cannot be published or snapshotted")]
     FlatOverlayPublicationUnsupported,
+    /// Names the failing artifact boundary (config, table, transfer map,
+    /// chunk, object, record, provenance) and the stable identity involved.
+    #[error("VM artifact {boundary} rejected: {message}")]
+    ArtifactInvalid {
+        boundary: &'static str,
+        message: String,
+    },
+    #[error(transparent)]
+    ArtifactWire(#[from] oci::vm_artifact::Error),
+    #[error("approved VM artifact index {expected} differs from resolved index {actual}")]
+    ArtifactTrustMismatch { expected: String, actual: String },
+    #[error("signature-required VM artifact policy has no configured signature verifier; digest approval cannot substitute for publisher authentication")]
+    ArtifactSignatureProviderUnavailable,
+    #[error("checkpoint publication to {destination} requires an acknowledgement naming exactly that destination: disks and RAM export secrets and deleted-data remnants")]
+    CheckpointPublicationNotAcknowledged { destination: String },
     #[error("format private overlay upper: {0}")]
     UpperFormat(#[from] disk_image::ext4::FormatError),
     #[error(transparent)]
@@ -345,6 +360,13 @@ impl LibVmError {
             Self::RootSelectionFailed(_) => "RootSelectionFailed",
             Self::DiskImport(_) => "DiskImport",
             Self::FlatOverlayPublicationUnsupported => "FlatOverlayPublicationUnsupported",
+            Self::ArtifactInvalid { .. } => "ArtifactInvalid",
+            Self::ArtifactWire(_) => "ArtifactWire",
+            Self::ArtifactTrustMismatch { .. } => "ArtifactTrustMismatch",
+            Self::ArtifactSignatureProviderUnavailable => "ArtifactSignatureProviderUnavailable",
+            Self::CheckpointPublicationNotAcknowledged { .. } => {
+                "CheckpointPublicationNotAcknowledged"
+            }
             Self::UpperFormat(_) => "UpperFormat",
             Self::Changeset(_) => "Changeset",
             Self::Namespace(_) => "Namespace",

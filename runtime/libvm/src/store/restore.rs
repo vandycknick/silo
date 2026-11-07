@@ -404,14 +404,62 @@ impl RestoreIntent {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct AuthenticatedRestoreCapture {
+    pub(crate) evidence: vm_spec::capture::CaptureEvidence,
+    _authority: RestoreCaptureAuthority,
+}
+
+#[derive(Debug)]
+enum RestoreCaptureAuthority {
+    LocalCapture,
+    ApprovedImport,
+}
+
+pub(crate) fn authenticate_imported_captures(
+    pool: &crate::storage::pool::StoragePool,
+    record: &crate::store::models::snapshot::SnapshotRecord,
+    snapshot: SnapshotId,
+    refs: &[crate::store::artifact_store::ImportedCaptureRef],
+) -> Result<Vec<vm_spec::capture::CaptureEvidence>, LibVmError> {
+    let mut evidence = Vec::with_capacity(refs.len());
+    for capture in refs {
+        let receipt_bytes = pool.read_object(
+            &capture.receipt_digest,
+            crate::storage::limits::Resource::MetadataPageBytes.maximum(),
+        )?;
+        let receipt = crate::image::transport::trust::AcquisitionReceipt::decode(&receipt_bytes)?;
+        if receipt.canonical_bytes()? != receipt_bytes
+            || receipt.index_digest != capture.index_digest
+        {
+            return Err(invalid(
+                "restore receipt does not approve the selected immutable index",
+            ));
+        }
+        let wrapper = pool.read_object(
+            &capture.provenance_digest,
+            crate::storage::limits::Resource::MetadataPageBytes.maximum(),
+        )?;
+        let bytes = pool.read_object(
+            &capture.evidence_digest,
+            vm_spec::capture::MAX_CAPTURE_RECORD_BYTES as u64,
+        )?;
+        let verified = crate::image::transport::provenance::verify_portable_binding(
+            record, snapshot, &wrapper, &bytes,
+        )?;
+        evidence.push(verified.evidence);
+    }
+    Ok(evidence)
+}
+
 impl SnapshotStore {
-    /// Only catalog-authenticated local capture provenance grants executable
-    /// authority here. Hash-valid bytes without that provenance are not enough.
+    /// Select matching authenticated authority, never the first provenance row.
+    /// Every catalog candidate is checked, including rows after the selection.
     pub(crate) fn restore_evidence(
         &self,
         consumer: &SnapshotConsumer,
         pool: &crate::storage::pool::StoragePool,
-    ) -> Result<vm_spec::capture::CaptureEvidence, LibVmError> {
+    ) -> Result<AuthenticatedRestoreCapture, LibVmError> {
         let configuration =
             vm_spec::capture::CaptureConfiguration::from_spec(&consumer.record.configuration.spec)
                 .map_err(invalid)?;
@@ -421,7 +469,8 @@ impl SnapshotStore {
             }
             _ => return Err(invalid("execution restore requires a live checkpoint")),
         };
-        if let Some(provenance) = consumer.info.provenance.first() {
+        let mut selected = None;
+        for provenance in &consumer.info.provenance {
             pool.verify_object(&provenance.evidence_digest)?;
             let bytes = pool.read_object(
                 &provenance.evidence_digest,
@@ -478,14 +527,30 @@ impl SnapshotStore {
                     "RAM layout",
                 ),
             ];
-            if let Some((_, pin)) = pins.into_iter().find(|(admitted, _)| !*admitted) {
-                return Err(invalid(format!("restore compatibility pin {pin} differs from authenticated local capture provenance")));
+            if pins.into_iter().all(|(admitted, _)| admitted) && selected.is_none() {
+                selected = Some(AuthenticatedRestoreCapture {
+                    evidence,
+                    _authority: RestoreCaptureAuthority::LocalCapture,
+                });
             }
-            return Ok(evidence);
         }
-        Err(invalid(
-            "execution checkpoint lacks authenticated local capture provenance",
-        ))
+        let imported = authenticate_imported_captures(
+            pool,
+            &consumer.record,
+            consumer.info.id,
+            consumer.imported_provenance(),
+        )?;
+        if selected.is_none() {
+            if let Some(evidence) = imported.into_iter().next() {
+                selected = Some(AuthenticatedRestoreCapture {
+                    evidence,
+                    _authority: RestoreCaptureAuthority::ApprovedImport,
+                });
+            }
+        }
+        selected.ok_or_else(|| {
+            invalid("execution checkpoint lacks an authorized matching capture provenance")
+        })
     }
 
     pub(crate) async fn register_restore_generation(
@@ -505,7 +570,6 @@ impl SnapshotStore {
         &self,
         consumer: &SnapshotConsumer,
         request: &vm_spec::restore::RestoreRequest,
-        disk_parent: &Path,
         disk_peak: u64,
         descriptor_peak: u64,
         policy: crate::RestoreResourcePolicy,
@@ -523,8 +587,12 @@ impl SnapshotStore {
         if granule == 0 || !granule.is_power_of_two() {
             return Err(invalid("invalid native RAM granule"));
         }
-        let disk = crate::paths::OwnedDirectory::open_existing_root(disk_parent)?
-            .ok_or_else(|| invalid("restore destination parent disappeared"))?;
+        // Imported checkpoints can be restored before this home has ever owned a
+        // machine. Create only the private container, not a child or disk, before
+        // measuring and reserving space on its actual filesystem.
+        let home = crate::paths::OwnedDirectory::open_existing_root(&self.store.home)?
+            .ok_or_else(|| invalid("restore destination home disappeared"))?;
+        let disk = home.ensure_dir("machines")?;
         let disk_stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
         let charge = RestoreMemoryCharge {
             baseline_device: ram.file_device,
@@ -1611,6 +1679,178 @@ impl crate::store::Store {
 #[cfg(test)]
 mod tests {
     use crate::store::restore::{RestoreBudget, RestoreMemoryCharge};
+
+    #[tokio::test]
+    async fn restore_consumer_initializes_first_machine_parent_without_bypassing_admission() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        use crate::storage::pool::StoragePool;
+        use crate::store::capture::tests::{fixture, seal};
+        use vm_spec::capture::{CaptureConfiguration, Sha256Digest};
+        use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
+
+        let fixture = fixture().await;
+        let snapshots = &fixture.snapshots;
+        let (sealed, _) = seal(&fixture);
+        let info = snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                sealed.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let consumer = snapshots
+            .consume(&crate::SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &consumer.record.capture
+        else {
+            panic!("fixture must be an execution checkpoint");
+        };
+        let (ram, ram_sha256) = consumer
+            .open_ram(&pool, &execution.memory.stream, execution.memory.length)
+            .unwrap();
+        let files = [
+            ram,
+            consumer.open_object(&pool, &execution.layout).unwrap(),
+            consumer.open_object(&pool, &execution.execution).unwrap(),
+            consumer.open_object(&pool, &execution.devices).unwrap(),
+        ];
+        let digests = [
+            ram_sha256,
+            Sha256Digest::from_bytes(*execution.layout.as_bytes()),
+            Sha256Digest::from_bytes(*execution.execution.as_bytes()),
+            Sha256Digest::from_bytes(*execution.devices.as_bytes()),
+        ];
+        let objects: Vec<_> = files
+            .iter()
+            .zip(RestoreObjectRole::ALL)
+            .zip(digests)
+            .map(|((file, role), sha256)| {
+                let metadata = file.metadata().unwrap();
+                RestoreObject {
+                    role,
+                    fd: file.as_raw_fd(),
+                    file_device: metadata.dev(),
+                    file_inode: metadata.ino(),
+                    length: metadata.len(),
+                    sha256,
+                }
+            })
+            .collect();
+        let evidence = snapshots
+            .restore_evidence(&consumer, &pool)
+            .unwrap()
+            .evidence;
+        let request = RestoreRequest {
+            version: vm_spec::restore::RESTORE_REQUEST_VERSION,
+            checkpoint: Sha256Digest::from_bytes(*info.id.as_bytes()),
+            activation_id: vm_spec::lifecycle::LiveId::parse(&uuid::Uuid::new_v4().to_string())
+                .unwrap(),
+            freeze_operation_id: evidence.freeze_operation_id.clone().unwrap(),
+            start_paused: true,
+            configuration: CaptureConfiguration::from_spec(&consumer.record.configuration.spec)
+                .unwrap(),
+            evidence,
+            objects: objects.try_into().unwrap(),
+            lowers: Vec::new(),
+            network: None,
+            ssh_trusted_ca: None,
+            hook: None,
+        };
+        request.validate().unwrap();
+        let policy = crate::RestoreResourcePolicy {
+            memory: crate::RestoreMemoryPolicy::AllowOvercommit,
+            ..Default::default()
+        };
+        let disk_peak = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES + 512;
+
+        // Keep the source intact but unavailable at the destination path. Every
+        // restore input is now authenticated in the pool, as after acquisition.
+        let machines = snapshots.store.home.join("machines");
+        let source = snapshots.store.home.join("captured-source");
+        std::fs::rename(&machines, &source).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        symlink(external.path(), &machines).unwrap();
+        assert!(snapshots
+            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .await
+            .is_err());
+        assert!(std::fs::read_dir(external.path()).unwrap().next().is_none());
+        std::fs::remove_file(&machines).unwrap();
+        std::fs::write(&machines, b"not a directory").unwrap();
+        assert!(snapshots
+            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .await
+            .is_err());
+        std::fs::remove_file(&machines).unwrap();
+        std::fs::create_dir(&machines).unwrap();
+        std::fs::set_permissions(&machines, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(snapshots
+            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .await
+            .is_err());
+        assert_eq!(std::fs::metadata(&machines).unwrap().mode() & 0o7777, 0o755);
+        std::fs::remove_dir(&machines).unwrap();
+
+        let error = snapshots
+            .reserve_restore_resources(&consumer, &request, u64::MAX / 2, 32, policy)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::LibVmError::Storage(crate::storage::StorageError::RestoreBudget {
+                resource: "disk",
+                ..
+            })
+        ));
+        let metadata = std::fs::metadata(&machines).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert!(std::fs::read_dir(&machines).unwrap().next().is_none());
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM restore_memory_reservation")
+            .fetch_one(&snapshots.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "unsafe paths and disk refusal publish no charge");
+
+        let charge = snapshots
+            .reserve_restore_resources(&consumer, &request, disk_peak, 32, policy)
+            .await
+            .unwrap();
+        assert_eq!(charge.disk_device, metadata.dev());
+        assert_eq!(charge.disk_bytes, disk_peak);
+        assert_eq!(std::fs::metadata(&machines).unwrap().ino(), metadata.ino());
+        let json: String = sqlx::query_scalar(
+            "SELECT json(charge_json) FROM restore_memory_reservation WHERE operation_id=?1",
+        )
+        .bind(consumer.operation_id.to_string())
+        .fetch_one(&snapshots.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RestoreMemoryCharge>(&json).unwrap(),
+            charge
+        );
+        std::fs::remove_dir(&machines).unwrap();
+        std::fs::rename(&source, &machines).unwrap();
+        snapshots
+            .store
+            .finish_stopped_operation(consumer.operation_id)
+            .await
+            .unwrap();
+        drop(consumer);
+        snapshots
+            .store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        snapshots.store.reconcile_restore_budget().await.unwrap();
+    }
 
     #[tokio::test]
     async fn import_capacity_is_shared_and_detached_workers_keep_their_charge_until_recovery() {

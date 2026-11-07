@@ -55,9 +55,10 @@ It retains one shared read-only ext4 lower and creates a fresh private ext4 uppe
 reported unusable short-group tail reduce usable capacity. A small growth can
 increase backing length without adding usable space. Resize requires a stopped
 machine; the next boot replays and grows the upper in the guest.
-The profile requires an exactly qualified kernel/init tuple on libkrun, is never
-silently substituted for raw, cannot be published or snapshotted, and will be
-removed rather than migrated when the EROFS profile replaces it.
+The profile requires an exactly qualified kernel/init tuple on libkrun and is
+never silently substituted for raw. It is not a reusable published image or a
+stopped-snapshot source. Live execution checkpoints remain separately gated.
+The profile will be removed rather than migrated when EROFS replaces it.
 
 `/tmp` remains persistent and disk-backed by default. With the overlay profile,
 `--tmpfs-size 64mib` explicitly selects a memory-charged, nonpersistent `/tmp`;
@@ -155,9 +156,28 @@ silo image remove image:cloud     # removes the alias only
 silo image release image:sha256:HEX  # releases explicit retention only
 ```
 
-Aliases share one `image:` namespace with snapshots. Creating from a snapshot
-performs the full stopped restore of its captured configuration; only `--name`
-applies.
+Aliases share one `image:` namespace with snapshots. A snapshot source preserves
+its complete captured configuration; only `--name` applies. Stopped checkpoints
+restore stopped; live execution checkpoints require compatible live-restore
+admission rather than falling back to a cold boot.
+
+Transfer a complete managed image through an OCI VM artifact:
+
+```bash
+silo image push image:cloud registry.example/team/cloud:v1
+silo image inspect-remote registry.example/team/cloud:v1
+silo image pull registry.example/team/cloud:v1 --approve-digest sha256:HEX --name received
+silo create image:received --name web-copy
+```
+
+Use the immutable index digest reported by inspection for `--approve-digest`.
+Approval authorizes those exact bytes, not the publisher's identity.
+`--require-signature` fails closed until a signature verifier is integrated.
+Ordinary OCI creation does not implicitly acquire VM artifacts.
+Publication uses independent zstd chunks by default; `--raw` changes the transfer
+encoding, not the canonical image identity. Checkpoint publication additionally
+requires `--acknowledge-checkpoint`: disks and RAM can contain secrets and
+deleted-data remnants. Pull retains the complete closure without starting it.
 
 A machine never changes kernel or initramfs on its own. `silo info` shows the
 pinned bundle and a newer locally admitted packaged bundle when one exists;

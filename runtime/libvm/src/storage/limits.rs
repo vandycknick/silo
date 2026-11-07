@@ -1,8 +1,7 @@
 //! ADR 0014 v1 compatibility limits. Bounds are inclusive, not resource promises.
 
-pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+pub const CHUNK_SIZE: usize = oci::vm_artifact::wire::CHUNK_SIZE as usize;
 const GIB: u64 = 1024 * 1024 * 1024;
-const TIB: u64 = 1024 * GIB;
 pub const JSON_SAFE_INTEGER_MAX: u64 = oci::changeset::limits::JSON_SAFE_INTEGER_MAX;
 pub const LOGICAL_SECTOR_SIZE: u64 = 512;
 pub const MTIME_FRACTIONAL_DIGITS: usize = 9;
@@ -64,19 +63,21 @@ impl Resource {
             Self::EncodedXattrBytes => oci::changeset::limits::FORMAT_LIMITS.max_xattr_bytes,
             Self::RegularFileBytes => oci::changeset::limits::FORMAT_LIMITS.max_file_bytes,
             Self::ExpandedLayerBytes => oci::changeset::limits::FORMAT_LIMITS.max_expanded_bytes,
-            Self::LogicalLowerBytes | Self::VirtualDiskBytes => TIB,
+            Self::LogicalLowerBytes | Self::VirtualDiskBytes => {
+                oci::vm_artifact::wire::MAX_STREAM_BYTES
+            }
             Self::CapturedRamBytes => vm_spec::capture::MAX_CAPTURE_RAM_BYTES,
             Self::FsmetaBytes => 4 * GIB,
             Self::HardlinkNames => oci::changeset::limits::FORMAT_LIMITS.max_hardlinks,
             Self::GptEntries => 128,
             Self::MbrPrimaryEntries => 4,
             Self::IncludedDisks => 16,
-            Self::ArtifactStreamBytes => 4 * TIB,
+            Self::ArtifactStreamBytes => oci::vm_artifact::wire::MAX_ARTIFACT_BYTES,
             Self::MetadataPageBytes | Self::OciManifestBytes => {
-                oci::changeset::limits::FORMAT_LIMITS.max_page_bytes
+                oci::vm_artifact::wire::MAX_METADATA_BYTES as u64
             }
             Self::MetadataPageEntries | Self::OciChildDescriptors | Self::OciPayloadChildren => {
-                oci::changeset::limits::FORMAT_LIMITS.max_page_entries
+                oci::vm_artifact::wire::MAX_PAGE_ENTRIES as u64
             }
             Self::RootBootstrapBytes => oci::changeset::limits::MAX_ROOT_BYTES,
             Self::OciGraphLevels => 2,
