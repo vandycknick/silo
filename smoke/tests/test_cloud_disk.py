@@ -312,8 +312,11 @@ def test_unsupported_inputs_refuse_before_any_operation(silo: Silo, cloud_roots:
     for feature in cloud_disk.QCOW2_FORBIDDEN:
         path = cloud_disk.qcow2_forbidden(tiny, silo.ws.root / f"forbidden-{feature}.qcow2", feature)
         cases.append((f"qcow2-{feature}", import_args(path), (path,)))
+    # All fixture writes are complete. Only serial early rejections and evidence
+    # logging follow, so the verified after-state is the next request's before.
+    refusals = cloud_disk.EarlyRefusals(silo)
     for label, args, sources in cases:
-        result = cloud_disk.refuse_without_effects(silo, *args, sources=sources)
+        result = refusals.refuse(*args, sources=sources)
         silo.ws.record("phase17-early-refusal-case", json.dumps({"case": label, "stderr": result.stderr[-2000:]}) + "\n")
         if label.startswith("qcow2-"):
             assert "qcow2" in result.stderr.lower(), (label, result.stderr)
@@ -412,14 +415,18 @@ def test_init_selects_root_serial_under_shuffled_order_and_fails_closed(silo: Si
         "mbr-on-gpt": cloud_disk.raw_bootstrap(length, {"kind": "mbr-partition", "number": 4}),
         "wrong-length": cloud_disk.raw_bootstrap(length + 512, selector(guids.root)),
     }
+    # Each candidate is stopped and reaped before the next request; rejected
+    # bootstrap contracts never mount a root and there are no host disk writes.
+    before = {path: overlay.digest(path) for path in (disk.path, clone.path)}
     for label, bootstrap in invalid.items():
-        before = {path: overlay.digest(path) for path in (disk.path, clone.path)}
         with cloud_disk.RawCandidate(silo, disks=shuffled, bootstrap=bootstrap) as candidate:
             candidate.start()
             text = candidate.wait(rejected=True)
         silo.ws.record("phase17-candidate-refusal", json.dumps({"case": label, "tail": text[-2000:]}) + "\n")
         # No root was mounted, so no ext4 superblock or journal byte changed.
-        assert {path: overlay.digest(path) for path in (disk.path, clone.path)} == before, label
+        after = {path: overlay.digest(path) for path in (disk.path, clone.path)}
+        assert after == before, label
+        before = after
 
 
 @linux
@@ -654,3 +661,28 @@ def test_vz_refuses_oci_and_overlay_roots_and_boots_converted_raw(silo: Silo, ba
     cloud_disk.boot(silo, "vz-raw-vm")
     silo.exec("vz-raw-vm", "test", "-f", "/etc/proof", user="root")
     silo.stop("vz-raw-vm")
+
+
+@linux
+@pytest.mark.parametrize("location", ("home", "input"))
+def test_early_refusal_batch_detects_same_size_byte_changes(silo: Silo, location: str) -> None:
+    """A verified after-state is retained, never silently re-baselined."""
+    initialize(silo)
+    root = silo.ws.silo_home if location == "home" else silo.ws.root
+    source = root / "refusal-byte-oracle.raw"
+    source.write_bytes(b"\0" * 512)
+    metadata = source.stat()
+    sources = (source,) if location == "input" else ()
+    args = ("image", "import", str(source), "--platform", "linux/riscv64",
+            "--root", "whole-disk", "--boot", "linux-direct")
+    refusals = cloud_disk.EarlyRefusals(silo)
+    refusals.refuse(*args, sources=sources)
+
+    # Deliberately violate the batch's no-writer contract. Same length, mode and
+    # mtime cannot substitute for reading complete bytes after the next request.
+    with source.open("r+b") as stream:
+        stream.write(b"\x01")
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    message = "refusal had catalog or file effects" if location == "home" else "refused input was modified"
+    with pytest.raises(AssertionError, match=message):
+        refusals.refuse(*args, sources=sources)

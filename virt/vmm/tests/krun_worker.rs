@@ -1249,7 +1249,14 @@ fn mapped_inheritance_parks_source_cycles_above_all_targets() {
 fn only_managed_restore_roles_cross_into_the_extended_descriptor_range() {
     let (_monitor, worker) = lifecycle_pair();
     let source = worker.as_raw_fd();
-    for target in [0, 2, 29, 30, 31, 33 + fd_policy::MAX_LOWER_FDS as i32] {
+    for target in [
+        0,
+        2,
+        29,
+        30,
+        31,
+        fd_policy::FIRST_LOWER_CHILD_FD + fd_policy::MAX_LOWER_FDS as i32,
+    ] {
         assert!(
             fd_policy::install(&mut Command::new("/bin/sh"), &[(source, target)]).is_err(),
             "target {target} is not a normal worker role"
@@ -1261,8 +1268,11 @@ fn only_managed_restore_roles_cross_into_the_extended_descriptor_range() {
     );
     // Every cold and restore role at once fits the bounded mapping table.
     let mut table: Vec<_> = (3..=28)
-        .chain([fd_policy::LIFECYCLE_CHILD_FD])
-        .chain(33..33 + fd_policy::MAX_LOWER_FDS as i32)
+        .chain([fd_policy::LIFECYCLE_CHILD_FD, 33])
+        .chain(
+            fd_policy::FIRST_LOWER_CHILD_FD
+                ..fd_policy::FIRST_LOWER_CHILD_FD + fd_policy::MAX_LOWER_FDS as i32,
+        )
         .map(|target| (source, target))
         .collect();
     fd_policy::install(&mut Command::new("/bin/sh"), &table).expect("full bounded restore table");

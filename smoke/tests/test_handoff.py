@@ -104,12 +104,14 @@ def test_relocate_raw_keeps_identity_fences_source_and_boots_only_destination(ru
     # another runtime's run root can stand in for the selected destination Home.
     handoff.refuse(laptop, laptop, "same-runtime", "plan", name, "--mode", "relocate", "--operation", operation)
     mixed = ["--destination-home", str(cloud.ws.silo_home), "--destination-config", str(cloud.config_dir), "--destination-run-root", str(laptop.ws.run_root)]
+    preflight = handoff.NoEffects((laptop, cloud))
     wrong_root = handoff.without_effects((laptop, cloud), "mismatched-run-root", lambda: laptop.silo.run(
-        "handoff", "plan", name, "--mode", "relocate", "--operation", operation, *mixed, expect=None, label="handoff-plan"))
+        "handoff", "plan", name, "--mode", "relocate", "--operation", operation, *mixed, expect=None, label="handoff-plan"), batch=preflight)
     assert wrong_root.returncode != 0
 
-    proposal = handoff.plan(laptop, cloud, name, "relocate", operation)
-    assert handoff.plan(laptop, cloud, name, "relocate", operation)["digest"] == proposal["digest"], "preflight must be deterministic"
+    proposal = handoff.plan(laptop, cloud, name, "relocate", operation, batch=preflight)
+    assert handoff.plan(laptop, cloud, name, "relocate", operation, batch=preflight)["digest"] == proposal["digest"], "preflight must be deterministic"
+    del preflight
     handoff.assert_immutable_warm(laptop, name, cloud)
     missing = handoff.expected_mutable(laptop, name, cloud)
     assert missing, "a booted raw root has private chunks the destination lacks"
@@ -209,9 +211,11 @@ def test_wrong_or_stale_approved_plan_refuses_before_any_side_effect(runtimes: t
     _create(laptop, stopped_image, name, "raw")
     _warm(cloud, stopped_image, "raw")
     operation = handoff.new_operation()
-    relocate = handoff.plan(laptop, cloud, name, "relocate", operation)["digest"]
-    fork = handoff.plan(laptop, cloud, name, "fork", operation)["digest"]
-    renamed = handoff.plan(laptop, cloud, name, "relocate", operation, "--name", "renamed")["digest"]
+    # No guest, host fixture or ownership writes occur until the boot below.
+    preflight = handoff.NoEffects((laptop, cloud))
+    relocate = handoff.plan(laptop, cloud, name, "relocate", operation, batch=preflight)["digest"]
+    fork = handoff.plan(laptop, cloud, name, "fork", operation, batch=preflight)["digest"]
+    renamed = handoff.plan(laptop, cloud, name, "relocate", operation, "--name", "renamed", batch=preflight)["digest"]
     assert len({relocate, fork, renamed}) == 3
     for label, digest, flags in (
         ("fork-plan-approves-relocation", fork, ()),
@@ -219,9 +223,10 @@ def test_wrong_or_stale_approved_plan_refuses_before_any_side_effect(runtimes: t
         ("renamed-plan-approves-default-name", renamed, ()),
         ("default-plan-approves-renamed", relocate, ("--name", "renamed")),
     ):
-        handoff.refuse(laptop, cloud, label, *handoff.transfer_args(name, "relocate", operation, digest, *flags))
+        handoff.refuse(laptop, cloud, label, *handoff.transfer_args(name, "relocate", operation, digest, *flags), batch=preflight)
     assert handoff.ledger(laptop, operation) is None and handoff.ledger(cloud, operation) is None
     assert handoff.ownership(laptop, name) == (0, OWNED)
+    del preflight
 
     # The source changes after approval: the old approval is stale, not reinterpreted.
     handoff.boot(laptop, name)
@@ -277,13 +282,15 @@ def test_destination_crash_then_explicit_abort_unfences_only_the_source(runtimes
     assert handoff.ledger(cloud, operation)["phase"] == "aborted" and handoff.ledger(cloud, operation)["terminal"]
 
     # The abort is final: replays repeat it, and nothing can resurrect a commit.
-    replay = handoff.stale(laptop, cloud, "abort-replay", "abort", str(operation))
+    replays = handoff.NoEffects((laptop, cloud))
+    replay = handoff.stale(laptop, cloud, "abort-replay", "abort", str(operation), batch=replays)
     assert replay is not None and _records(replay) == _records(aborted)
     for label, args in (("recover-after-abort", ("recover", operation)),
                         ("transfer-after-abort", tuple(handoff.transfer_args(name, "relocate", operation, approved)))):
-        answer = handoff.stale(laptop, cloud, label, *args)
+        answer = handoff.stale(laptop, cloud, label, *args, batch=replays)
         assert answer is None or answer.get("decision") == "aborted", answer
     assert machine not in handoff.machine_ids(cloud)
+    del replays
 
     # The unfenced source is an ordinary stopped owner again, contents intact.
     handoff.boot(laptop, name)
@@ -382,11 +389,13 @@ def test_direct_return_cycles_recover_after_crash_and_ignore_stale_requests(runt
     # Every earlier request replayed after later commits: history only, no effect.
     history = ((op1, plan1, report1, laptop, cloud), (op2, plan2, report2, cloud, laptop))
     for operation, approved, original, source, destination in history:
+        replays = handoff.NoEffects((source, destination))
         for label, args in (("stale-transfer", tuple(handoff.transfer_args(name, "relocate", operation, approved["digest"]))),
                             ("stale-recover", ("recover", operation)), ("stale-abort", ("abort", operation))):
-            answer = handoff.stale(source, destination, label, *args)
+            answer = handoff.stale(source, destination, label, *args, batch=replays)
             assert answer is None or _records(answer) == _records(original), (label, answer)
-        assert _records(handoff.status(source, destination, operation)) == _records(original)
+        assert _records(handoff.status(source, destination, operation, batch=replays)) == _records(original)
+        del replays
     assert handoff.ownership(cloud, name) == (3, OWNED)
     _relocated(laptop, name, operation=op3, successor=cloud, successor_epoch=3, epoch=2)
 

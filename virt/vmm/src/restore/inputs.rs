@@ -10,8 +10,8 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::stat::{fstat, SFlag};
 use vm_spec::restore::RestoreRequest;
 
-/// 4 state objects plus every lower descriptor and extent.
-pub(crate) const MAX_RESTORE_FDS: usize = 4 + 16 + vm_spec::restore::MAX_RESTORE_LOWER_EXTENTS;
+/// Five state objects plus every lower descriptor and extent.
+pub(crate) const MAX_RESTORE_FDS: usize = 5 + 16 + vm_spec::restore::MAX_RESTORE_LOWER_EXTENTS;
 const MAX_ENV_BYTES: usize = 16 * 1024;
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -33,8 +33,8 @@ pub(crate) fn parse_env(value: Option<&std::ffi::OsStr>) -> eyre::Result<Vec<Raw
     let fds: Vec<RawFd> = serde_json::from_str(value)
         .map_err(|error| eyre::eyre!("invalid restore descriptor list: {error}"))?;
     eyre::ensure!(
-        (4..=MAX_RESTORE_FDS).contains(&fds.len()),
-        "restore descriptor list must name 4..={MAX_RESTORE_FDS} descriptors"
+        (5..=MAX_RESTORE_FDS).contains(&fds.len()),
+        "restore descriptor list must name 5..={MAX_RESTORE_FDS} descriptors"
     );
     Ok(fds)
 }
@@ -94,7 +94,7 @@ pub(crate) struct LowerFiles {
 /// The monitor's owned restore objects, in request order.
 #[derive(Debug)]
 pub(crate) struct RestoreFiles {
-    pub(crate) objects: [File; 4],
+    pub(crate) objects: [File; 5],
     pub(crate) lowers: Vec<LowerFiles>,
 }
 
@@ -151,7 +151,7 @@ fn check(raw: RawFd, expected_fd: i32, device: u64, inode: u64, length: u64) -> 
 /// Adopt the complete inherited set only after every descriptor matched the
 /// request. On refusal nothing is adopted; the CLOEXEC numbers die with exit.
 pub(crate) fn adopt(raw: Vec<RawFd>, request: &RestoreRequest) -> io::Result<RestoreFiles> {
-    let expected = 4 + request
+    let expected = 5 + request
         .lowers
         .iter()
         .map(|lower| 1 + lower.extents.len())
@@ -209,7 +209,7 @@ pub(crate) fn adopt(raw: Vec<RawFd>, request: &RestoreRequest) -> io::Result<Res
             .next()
             .ok_or_else(|| invalid("inherited restore descriptor is missing"))
     };
-    let objects = [take()?, take()?, take()?, take()?];
+    let objects = [take()?, take()?, take()?, take()?, take()?];
     let mut lowers = Vec::with_capacity(request.lowers.len());
     for lower in &request.lowers {
         let descriptor = take()?;
@@ -230,6 +230,47 @@ pub(crate) fn identity(file: &File) -> io::Result<(u64, u64)> {
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
+/// Decode the already immutable inherited map and authenticate its whole file
+/// and complete stream identity against the seal, never against live child RAM.
+pub(crate) fn verified_ram_map(
+    request: &RestoreRequest,
+    file: &File,
+) -> io::Result<vm_spec::capture::StreamMap> {
+    use std::os::unix::fs::FileExt as _;
+    let object = request
+        .objects
+        .iter()
+        .find(|object| object.role == vm_spec::restore::RestoreObjectRole::RamMap)
+        .ok_or_else(|| invalid("restore lacks its complete RAM map"))?;
+    if object.length > vm_spec::capture::MAX_RAM_MAP_BYTES as u64
+        || file.metadata()?.len() != object.length
+    {
+        return Err(invalid(
+            "restore RAM map exceeds its bound or changed length",
+        ));
+    }
+    let mut bytes = vec![0; object.length as usize];
+    file.read_exact_at(&mut bytes, 0)?;
+    if vm_spec::capture::Sha256Digest::of_bytes(&bytes) != object.sha256 {
+        return Err(invalid("restore RAM map differs from its sealed SHA"));
+    }
+    let map = vm_spec::capture::StreamMap::decode(&bytes).map_err(invalid)?;
+    let memory = request
+        .evidence
+        .memory
+        .as_ref()
+        .ok_or_else(|| invalid("restore lacks RAM evidence"))?;
+    if map.length() != memory.packed_length
+        || map.id() != memory.ram_stream
+        || map.canonical_bytes().map_err(invalid)? != bytes
+    {
+        return Err(invalid(
+            "restore RAM map differs from the complete canonical stream",
+        ));
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -241,10 +282,10 @@ mod tests {
     fn restore_descriptor_list_is_bounded_json() {
         assert!(parse_env(None).unwrap().is_empty());
         assert_eq!(
-            parse_env(Some("[10,11,12,13]".as_ref())).unwrap(),
-            vec![10, 11, 12, 13]
+            parse_env(Some("[10,11,12,13,14]".as_ref())).unwrap(),
+            vec![10, 11, 12, 13, 14]
         );
-        for refused in ["[10,11,12]", "not json", "{\"fd\":1}"] {
+        for refused in ["[10,11,12,13]", "not json", "{\"fd\":1}"] {
             assert!(parse_env(Some(refused.as_ref())).is_err(), "{refused}");
         }
         let oversized =
@@ -276,6 +317,31 @@ mod tests {
         std::fs::File::create(&empty).unwrap();
         let empty = std::fs::File::open(&empty).unwrap();
         assert!(validate_inherited(&[empty.as_raw_fd()], &[]).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn inherited_map_is_bound_to_sealed_sha_length_and_complete_stream_without_live_ram() {
+        use crate::restore::inputs::verified_ram_map;
+        let directory =
+            std::env::temp_dir().join(format!("silo-restore-map-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let launch = crate::krun::worker::restore::tests::launch(&directory);
+        let map = verified_ram_map(&launch.request, &launch.files.objects[4]).unwrap();
+        assert_eq!(
+            map.id(),
+            launch.request.evidence.memory.as_ref().unwrap().ram_stream
+        );
+        let mut wrong = launch.request.clone();
+        wrong.evidence.memory.as_mut().unwrap().ram_stream =
+            vm_spec::capture::Sha256Digest::of_bytes(b"different stream");
+        assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
+        let mut wrong = launch.request.clone();
+        wrong.objects[4].sha256 = vm_spec::capture::Sha256Digest::of_bytes(b"different full file");
+        assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
+        let mut wrong = launch.request.clone();
+        wrong.objects[4].length += 1;
+        assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

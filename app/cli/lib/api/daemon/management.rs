@@ -93,6 +93,7 @@ impl DaemonVmService {
         value: &str,
         options: libvm::LiveSnapshotOptions,
     ) -> eyre::Result<libvm::LiveSnapshot> {
+        options.validate()?;
         Ok(silo_vm_control::capture::live_snapshot_from_wire(
             self.machines
                 .clone()
@@ -102,6 +103,8 @@ impl DaemonVmService {
                     resume_policy: silo_vm_control::capture::resume_policy_to_wire(
                         options.resume_policy,
                     ),
+                    policy: silo_vm_control::capture::policy_to_wire(options.policy),
+                    dirty_crossover_percent: u32::from(options.dirty_crossover_percent),
                 })
                 .await
                 .map_err(native_status)?
@@ -219,6 +222,27 @@ impl DaemonVmService {
                         .transpose()?,
                     resources: Some(silo_vm_control::stopped::restore_resources_to_wire(
                         options.resources,
+                    )),
+                })
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn recover_checkpoint_disks(
+        &self,
+        reference: libvm::SnapshotRef,
+        options: libvm::RecoverDisksOptions,
+    ) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.runtime
+                .clone()
+                .recover_checkpoint_disks(w::RecoverCheckpointDisksRequest {
+                    snapshot: Some(silo_vm_control::stopped::reference_to_wire(&reference)),
+                    name: options.name,
+                    external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+                        &options.external_resources,
                     )),
                 })
                 .await

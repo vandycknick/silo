@@ -539,11 +539,7 @@ impl LiveCoordinator {
             lifecycle: snapshot.lifecycle.clone(),
             pause: availability(LiveOperation::Pause, &snapshot.live.pause),
             capture,
-            // Phase 14 delivers full capture only.
-            incremental: unsupported(
-                LiveOperation::Incremental,
-                LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
-            ),
+            incremental: availability(LiveOperation::Incremental, &snapshot.live.incremental),
             capture_binding: self.capture.as_ref().map(|context| context.binding()),
             guest_ready: snapshot.ready_identity.is_some() && snapshot.guest_rejection.is_none(),
         }

@@ -84,6 +84,7 @@ pub(crate) struct CaptureReservationRequest {
     pub configuration: vm_spec::capture::CaptureConfiguration,
     pub alias: Option<String>,
     pub policy: vm_spec::lifecycle::CapturePolicy,
+    pub dirty_crossover_percent: u8,
     pub resume_policy: vm_spec::lifecycle::CaptureResumePolicy,
     pub pause: vm_spec::capture::CapturePauseAuthority,
 }
@@ -636,6 +637,21 @@ impl SnapshotStore {
         &self,
         reference: &SnapshotRef,
     ) -> Result<SnapshotConsumer, LibVmError> {
+        self.consume_selected(reference, false).await
+    }
+
+    pub(crate) async fn consume_disks(
+        &self,
+        reference: &SnapshotRef,
+    ) -> Result<SnapshotConsumer, LibVmError> {
+        self.consume_selected(reference, true).await
+    }
+
+    async fn consume_selected(
+        &self,
+        reference: &SnapshotRef,
+        disks_only: bool,
+    ) -> Result<SnapshotConsumer, LibVmError> {
         let store = self.store.clone();
         let (record, observed) = self.load_observed(reference).await?;
         let bytes = record.canonical_bytes()?;
@@ -694,10 +710,36 @@ impl SnapshotStore {
                     tx.commit().await?;
                     Ok::<_, LibVmError>((info, lease, imported))
                 })?;
-                for content in record.streams() {
+                let contents = if disks_only {
+                    record.storage_streams().collect::<Vec<_>>()
+                } else {
+                    record.streams().collect::<Vec<_>>()
+                };
+                for content in &contents {
                     runtime.block_on(store.materialize_stream(id, content))?;
                 }
-                let (_, closure) = verify_closure(&pool, &record, Some(info.record_digest), true)?;
+                let (_, closure) = if disks_only {
+                    let (_, objects) = record.storage_content_dependencies()?;
+                    let mut retained = objects.clone();
+                    for content in &contents {
+                        retained.remove(&content.map);
+                        for page in &content.map_pages {
+                            retained.remove(page);
+                        }
+                    }
+                    verify_artifact_closure(
+                        &pool,
+                        &record.canonical_bytes()?,
+                        &contents,
+                        objects,
+                        retained,
+                        Some(info.record_digest),
+                        true,
+                        None,
+                    )?
+                } else {
+                    verify_closure(&pool, &record, Some(info.record_digest), true)?
+                };
                 for provenance in &info.provenance {
                     pool.verify_object(&provenance.evidence_digest)?;
                 }
@@ -1674,7 +1716,7 @@ pub(crate) mod tests {
         let mut object = consumer.open_object(&pool, kernel).unwrap();
         // Restore descriptors reuse the ObjectDigest as whole-file SHA-256.
         assert_eq!(
-            crate::machine::restore::hash_file(&object).unwrap(),
+            crate::storage::stream::whole_file_sha256(&object).unwrap(),
             vm_spec::capture::Sha256Digest::from_bytes(*kernel.as_bytes())
         );
         let mut bytes = Vec::new();
@@ -1791,7 +1833,10 @@ pub(crate) mod tests {
             sha256,
             vm_spec::capture::Sha256Digest::of_bytes(&[0x5a; 512])
         );
-        assert_eq!(sha256, crate::machine::restore::hash_file(&file).unwrap());
+        assert_eq!(
+            sha256,
+            crate::storage::stream::whole_file_sha256(&file).unwrap()
+        );
         assert_ne!(sha256.as_bytes(), memory.stream.as_bytes());
         assert!(consumer
             .open_ram(&pool, &memory.stream, memory.length + 1)
@@ -1835,7 +1880,10 @@ pub(crate) mod tests {
         assert!(consumer
             .open_ram(&pool, &memory.stream, memory.length)
             .is_err());
-        assert_eq!(crate::machine::restore::hash_file(&kept).unwrap(), measured);
+        assert_eq!(
+            crate::storage::stream::whole_file_sha256(&kept).unwrap(),
+            measured
+        );
     }
 
     #[tokio::test]

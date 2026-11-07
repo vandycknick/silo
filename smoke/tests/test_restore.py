@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from silo_smoke import capture, overlay, pause, procs, restore, shutdown, stopped
+from silo_smoke import capture, incremental, overlay, pause, procs, restore, shutdown, stopped
 from silo_smoke.cli import Result, Silo
 from silo_smoke.restore import restore_image, restore_irq_fixture  # noqa: F401, pytest fixtures
 
@@ -292,14 +292,27 @@ def refused_before_allocation(silo: Silo, reference: str, name: str, *,
     return result
 
 
+def checkpoint_for_policy(silo: Silo, policy: str) -> restore.Checkpoint:
+    if policy == "full":
+        return restore.checkpoint(silo, "restore-source")
+    incremental.require_candidate(silo.info("restore-source"))
+    baseline = restore.checkpoint(silo, "restore-source", alias="restore-baseline")
+    silo.run("resume", "restore-source")
+    silo.exec("restore-source", "sh", "-eu", "-c", "printf incremental >/dev/shm/incremental-negative", user="root")
+    saved = restore.checkpoint(silo, "restore-source", policy="incremental")
+    incremental.authenticated_map(silo, saved, mode="incremental", baseline=baseline)
+    return saved
+
+
+@pytest.mark.parametrize("policy", ["full", "incremental"])
 @pytest.mark.parametrize("member", ["ram", "root", "layout", "execution", "devices", "kernel",
                                     "baseInitramfs", "agent", "map", "map-page", "provenance"])
 def test_restore_corrupt_real_closure_refuses_before_child_allocation(
-    silo: Silo, restore_image: str, member: str, restore_processes: list[shutdown.Process],
+    silo: Silo, restore_image: str, member: str, policy: str, restore_processes: list[shutdown.Process],
 ) -> None:
     restore.create_source(silo, restore_image)
     own(silo, "restore-source", restore_processes)
-    saved = restore.checkpoint(silo, "restore-source")
+    saved = checkpoint_for_policy(silo, policy)
     record = restore.snapshot_record(silo, saved)
     stop_owned(silo, "restore-source", restore_processes)
     shutdown.storage_tool(silo, "prune")
@@ -340,18 +353,23 @@ def test_restore_corrupt_real_closure_refuses_before_child_allocation(
         path.chmod(mode)
 
 
-@pytest.mark.parametrize("mutation", ["cpu", "profile", "producer", "xsave"])
+@pytest.mark.parametrize("policy", ["full", "incremental"])
+@pytest.mark.parametrize("mutation", ["cpu", "profile", "producer", "xsave", "tsc-rate", "msr"])
 def test_restore_real_native_incompatibility_refuses_before_child_allocation(
-    silo: Silo, restore_image: str, mutation: str, restore_processes: list[shutdown.Process],
+    silo: Silo, restore_image: str, mutation: str, policy: str, restore_processes: list[shutdown.Process],
 ) -> None:
     restore.create_source(silo, restore_image)
     own(silo, "restore-source", restore_processes)
-    saved = restore.checkpoint(silo, "restore-source")
+    saved = checkpoint_for_policy(silo, policy)
     stop_owned(silo, "restore-source", restore_processes)
     shutdown.storage_tool(silo, "prune")
     with restore.incompatible_checkpoint(silo, saved, mutation) as (reference, subject):
         result = refused_before_allocation(silo, reference, "restore-incompatible-" + mutation)
-        assert "restore compatibility refused:" in result.stderr, result.stderr
+        pin = {"cpu": "cpu.cpuid", "profile": "host-build", "producer": "native-producer",
+               "xsave": "cpu.xsave", "tsc-rate": "clock.tsc-rate", "msr": "cpu.msr-inventory"}[mutation]
+        for required in ("restore-preflight", "pin " + pin, "expected ", "destination ",
+                         "no execution child was started"):
+            assert required in result.stderr, result.stderr
         assert subject in result.stderr, "refusal did not reach the actual native compatibility subject"
     shutdown.storage_tool(silo, "prune")
 

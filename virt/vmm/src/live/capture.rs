@@ -80,6 +80,14 @@ pub(crate) struct CaptureContext {
     launch: CaptureLaunchLease,
     lease: Arc<OwnedFd>,
     digests: CaptureDigests,
+    baseline: std::sync::Mutex<Option<AcceptedMap>>,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptedMap {
+    map: Arc<vm_spec::capture::StreamMap>,
+    layout: Sha256Digest,
+    stream: Sha256Digest,
 }
 
 impl CaptureContext {
@@ -119,7 +127,28 @@ impl CaptureContext {
             configuration_digest,
             launch: launch_lease,
             lease: launch.lease.clone(),
+            baseline: std::sync::Mutex::new(None),
         })
+    }
+
+    pub(crate) fn inherit(&self, restore: &crate::virt::RestoreLaunch) -> io::Result<()> {
+        let map =
+            crate::restore::inputs::verified_ram_map(&restore.request, &restore.files.objects[4])?;
+        let memory = restore
+            .request
+            .evidence
+            .memory
+            .as_ref()
+            .ok_or_else(|| io::Error::other("restore lacks RAM evidence"))?;
+        *self
+            .baseline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(AcceptedMap {
+            map: Arc::new(map),
+            layout: memory.binding.ram_layout,
+            stream: memory.ram_stream,
+        });
+        Ok(())
     }
 
     pub(crate) fn binding(&self) -> CaptureBinding {
@@ -216,6 +245,8 @@ struct Run {
     binding: Option<NativeBinding>,
     memory: Option<CaptureMemoryEvidence>,
     inventory: Vec<CaptureInventoryEntry>,
+    native_memory: Option<CommandOutcome>,
+    resolved_map: Option<Arc<vm_spec::capture::StreamMap>>,
 }
 
 impl Run {
@@ -302,6 +333,8 @@ struct Verified {
     ram_stream: Sha256Digest,
     /// Actual staged bytes charged against the reservation, before the seal.
     staged_bytes: u64,
+    map: Arc<vm_spec::capture::StreamMap>,
+    identity_bytes_hashed: u64,
 }
 
 /// A token tripped by cancel or stop for blocking stages; the watcher ends
@@ -463,6 +496,8 @@ impl LiveCoordinator {
             binding: None,
             memory: None,
             inventory: Vec::new(),
+            native_memory: None,
+            resolved_map: None,
         };
         match self.capture_stages(&mut run).await {
             Ok(evidence) => self.seal(run, evidence).await,
@@ -589,6 +624,14 @@ impl LiveCoordinator {
                 outputs,
                 pin,
                 pause,
+                policy: run.plan.policy,
+                dirty_crossover_percent: run.plan.dirty_crossover_percent,
+                baseline: context
+                    .baseline
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .map(|baseline| Digest32(*baseline.stream.as_bytes())),
                 resume_policy: match run.plan.resume_policy {
                     CaptureResumePolicy::ResumeIfAcquired => NativeResumePolicy::ResumeIfAcquired,
                     CaptureResumePolicy::Preserve => NativeResumePolicy::Preserve,
@@ -984,41 +1027,42 @@ impl LiveCoordinator {
                     timeout: self.timeouts.native,
                 },
             ))
-            .await;
-        let writers_closed = match result {
-            Ok(CommandOutcome::MemoryCaptured {
+            .await
+            .map_err(|error| {
+                Abort::native(
+                    error,
+                    LiveFailureCode::MemoryCaptureFailed,
+                    LiveStage::CaptureMemory,
+                )
+            })?;
+        let writers_closed = match &result {
+            CommandOutcome::MemoryCaptured {
                 binding: memory,
                 ram,
                 layout,
                 writers_closed,
                 ..
-            }) => {
+            } => {
                 if ram.identity() != outputs.ram || layout.identity() != outputs.layout {
                     return Err(fail_memory("RAM receipts name other outputs".into()));
                 }
-                if memory != binding {
+                if memory != &binding {
                     return Err(fail_memory(
                         "RAM binding differs from the execution binding".into(),
                     ));
                 }
-                writers_closed
+                *writers_closed
             }
-            Ok(CommandOutcome::CaptureFailed {
+            CommandOutcome::CaptureFailed {
                 failure: native, ..
-            }) => return Err(fail_memory(native.to_string())),
-            Ok(outcome) => {
+            } => return Err(fail_memory(native.to_string())),
+            outcome => {
                 return Err(fail_memory(format!(
                     "unexpected native RAM outcome {outcome:?}"
                 )))
             }
-            Err(error) => {
-                return Err(Abort::native(
-                    error,
-                    LiveFailureCode::MemoryCaptureFailed,
-                    LiveStage::CaptureMemory,
-                ))
-            }
         };
+        run.native_memory = Some(result);
         run.binding = Some(*binding);
 
         // Seal facts come from retained native authority, not RPC success.
@@ -1064,10 +1108,46 @@ impl LiveCoordinator {
         let roles = run.plan.roles();
         let disks = run.plan.disks.clone();
         let ram_limit = run.plan.ram_bytes;
+        let receipt = run
+            .native_memory
+            .take()
+            .ok_or_else(|| fail("native memory receipt is missing".into()))?;
+        let baseline = self.capture.as_ref().and_then(|context| {
+            context
+                .baseline
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        });
+        let reuse = match &receipt {
+            CommandOutcome::MemoryCaptured {
+                mode: vm_spec::lifecycle::CapturePolicy::Incremental,
+                baseline: Some(expected),
+                dirty_chunks,
+                binding,
+                ..
+            } => {
+                let baseline = baseline
+                    .ok_or_else(|| fail("incremental receipt lacks its retained map".into()))?;
+                if baseline.stream != *expected
+                    || baseline.layout.as_bytes() != &binding.ram_layout.0
+                {
+                    return Err(fail(
+                        "incremental receipt differs from the exact retained map/layout".into(),
+                    ));
+                }
+                Some((baseline.map, dirty_chunks.clone()))
+            }
+            CommandOutcome::MemoryCaptured {
+                mode: vm_spec::lifecycle::CapturePolicy::Full,
+                ..
+            } => None,
+            _ => return Err(fail("native memory mode or baseline is malformed".into())),
+        };
         let (abort, watcher) = abort_token(&run.cancel, &self.stop);
         let verified = tokio::task::spawn_blocking({
             let abort = abort.clone();
-            move || verify_staging(&staging, &roles, &disks, outputs, ram_limit, &abort)
+            move || verify_staging(&staging, &roles, &disks, outputs, ram_limit, reuse, &abort)
         })
         .await;
         watcher.abort();
@@ -1079,7 +1159,7 @@ impl LiveCoordinator {
             }
             Err(error) => return Err(fail(format!("verification task failed: {error}"))),
         };
-        let Some(binding) = run.binding.clone() else {
+        let Some(binding) = run.binding.take() else {
             return Err(fail("capture binding was not observed".into()));
         };
         let Some(source_run) = live_id(binding.source_run) else {
@@ -1090,13 +1170,32 @@ impl LiveCoordinator {
         let Some(pause_generation) = NonZeroU64::new(binding.pause_generation.get()) else {
             return Err(fail("binding pause generation is zero".into()));
         };
+        let CommandOutcome::MemoryCaptured {
+            mode,
+            baseline,
+            full_reason,
+            dirty_chunks,
+            mut stats,
+            ..
+        } = receipt
+        else {
+            return Err(fail("native memory receipt has the wrong role".into()));
+        };
+        stats.identity_bytes_hashed = verified.identity_bytes_hashed;
+        stats.whole_file_bytes_hashed = verified.packed_length;
+        run.resolved_map = Some(verified.map);
         run.memory = Some(CaptureMemoryEvidence {
             packed_length: verified.packed_length,
             page_granule: verified.page_granule,
             regions: verified.regions,
             ram_stream: verified.ram_stream,
+            mode,
+            baseline,
+            full_reason,
+            dirty_chunks,
+            stats: *stats,
             binding: CaptureStateBinding {
-                native_producer: binding.native_producer.clone(),
+                native_producer: binding.native_producer,
                 silo_producer: digest(binding.silo_producer),
                 profile: digest(binding.profile),
                 topology: digest(binding.topology),
@@ -1488,6 +1587,16 @@ impl LiveCoordinator {
             .await;
         match result {
             Ok(CommandOutcome::CaptureAccepted { memory_generation }) => {
+                if let (Some(context), Some(map)) = (&self.capture, &run.resolved_map) {
+                    *context
+                        .baseline
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(AcceptedMap {
+                        map: map.clone(),
+                        layout: memory.binding.ram_layout,
+                        stream: memory.ram_stream,
+                    });
+                }
                 tracing::info!(operation = %run.operation, memory_generation, "sealed RAM accepted as the source baseline");
                 Ok(())
             }
@@ -2305,6 +2414,7 @@ fn verify_staging(
     disks: &[CaptureDiskPlan],
     outputs: CaptureOutputIdentities,
     ram_limit: u64,
+    reuse: Option<(Arc<vm_spec::capture::StreamMap>, Vec<u8>)>,
     abort: &CancellationToken,
 ) -> io::Result<Verified> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
@@ -2320,6 +2430,9 @@ fn verify_staging(
             ram_input
                 .map(|(_, role)| {
                     let mut hasher = Hasher::new();
+                    if let Some((map, bitmap)) = reuse {
+                        hasher.reuse(map, bitmap);
+                    }
                     verify_role(staging, role, disks, outputs, &mut hasher, abort)
                 })
                 .transpose()
@@ -2331,7 +2444,7 @@ fn verify_staging(
             let mut staged_bytes = staged_request_bytes;
             let mut geometry = None;
             for (index, role) in roles.iter().enumerate() {
-                if Some(index) == ram_index {
+                if Some(index) == ram_index || *role == CaptureRole::RamMap {
                     continue;
                 }
                 let verified = verify_role(staging, role, disks, outputs, &mut hasher, abort)?;
@@ -2344,6 +2457,21 @@ fn verify_staging(
         },
     )?;
     // The serial lane already reduced its roles in admitted order. Insert
+    let resolved = ram_role
+        .as_ref()
+        .and_then(|role| role.map.clone())
+        .ok_or_else(|| invalid("complete RAM map is missing".into()))?;
+    let identity_bytes_hashed = ram_role
+        .as_ref()
+        .map_or(0, |role| role.identity_bytes_hashed);
+    if roles.contains(&CaptureRole::RamMap) {
+        use std::io::Write as _;
+        let mut output = staging.create_output(&CaptureRole::RamMap)?;
+        resolved.write_canonical(&mut output)?;
+        output.flush()?;
+        output.sync_all()?;
+        drop(output);
+    }
     // the fixed-size RAM result without a second inventory allocation.
     let ram = match (ram_index, ram_role) {
         (Some(index), Some(role)) => {
@@ -2358,6 +2486,21 @@ fn verify_staging(
         }
         _ => None,
     };
+    let mut state_bytes = state_bytes;
+    if let Some(index) = roles.iter().position(|role| *role == CaptureRole::RamMap) {
+        let mut hasher = Hasher::whole_file();
+        let role = verify_role(
+            staging,
+            &CaptureRole::RamMap,
+            disks,
+            outputs,
+            &mut hasher,
+            abort,
+        )?;
+        state_bytes = state_bytes.saturating_add(role.state_bytes);
+        staged_bytes = staged_bytes.saturating_add(role.staged_bytes);
+        inventory.insert(index, role.entry);
+    }
     staging.sync_directories()?;
     staged_bytes = staged_bytes.saturating_add(staging.directory_allocation()?);
     if state_bytes > CAPTURE_STATE_RESERVE_BYTES {
@@ -2378,6 +2521,8 @@ fn verify_staging(
         regions: geometry.regions,
         ram_stream,
         staged_bytes,
+        map: resolved,
+        identity_bytes_hashed,
     })
 }
 
@@ -2389,6 +2534,8 @@ struct VerifiedRole {
     staged_bytes: u64,
     geometry: Option<LayoutGeometry>,
     stream: Option<Sha256Digest>,
+    map: Option<Arc<vm_spec::capture::StreamMap>>,
+    identity_bytes_hashed: u64,
 }
 
 fn verify_role(
@@ -2406,7 +2553,7 @@ fn verify_role(
         CaptureRole::Devices => Some(outputs.devices),
         CaptureRole::Ram => Some(outputs.ram),
         CaptureRole::Layout => Some(outputs.layout),
-        CaptureRole::Disk(_) => None,
+        CaptureRole::Disk(_) | CaptureRole::RamMap => None,
     };
     if let Some(expected) = prepared {
         if (facts.device, facts.inode) != (expected.device, expected.inode) {
@@ -2431,9 +2578,14 @@ fn verify_role(
             role.relative_path()
         )));
     }
+    if *role == CaptureRole::RamMap && facts.length > vm_spec::capture::MAX_RAM_MAP_BYTES as u64 {
+        return Err(invalid(
+            "complete RAM map exceeds its metadata bound".into(),
+        ));
+    }
     let state_bytes = if matches!(
         role,
-        CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout
+        CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout | CaptureRole::RamMap
     ) {
         if facts.length == 0 {
             return Err(invalid(format!("{} is empty", role.relative_path())));
@@ -2473,6 +2625,8 @@ fn verify_role(
         staged_bytes,
         geometry,
         stream: hashed.stream,
+        map: hashed.map.map(Arc::new),
+        identity_bytes_hashed: hashed.identity_bytes_hashed,
     })
 }
 
@@ -2727,6 +2881,7 @@ mod tests {
             &disks,
             outputs,
             1 << 20,
+            None,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -2764,6 +2919,7 @@ mod tests {
             &disks,
             outputs,
             4096,
+            None,
             &CancellationToken::new()
         )
         .is_err());
@@ -2776,6 +2932,7 @@ mod tests {
             &disks,
             swapped,
             1 << 20,
+            None,
             &CancellationToken::new()
         )
         .is_err());
@@ -2787,6 +2944,7 @@ mod tests {
             &wrong,
             outputs,
             1 << 20,
+            None,
             &CancellationToken::new()
         )
         .is_err());
@@ -2799,6 +2957,7 @@ mod tests {
             &disks,
             outputs,
             1 << 20,
+            None,
             &CancellationToken::new()
         )
         .is_err());
@@ -2818,6 +2977,7 @@ mod tests {
             &disks,
             outputs,
             1 << 20,
+            None,
             &CancellationToken::new()
         )
         .is_err());
@@ -2833,6 +2993,7 @@ mod tests {
                 &disk_plan(SOURCE_BYTES, copy),
                 staged.outputs,
                 PLANNED_RAM,
+                None,
                 &CancellationToken::new(),
             )
             .unwrap()
@@ -2875,6 +3036,7 @@ mod tests {
             &disk_plan(SOURCE_BYTES, CaptureDiskCopy::Copy),
             staged.outputs,
             PLANNED_RAM,
+            None,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -2902,6 +3064,7 @@ mod tests {
             &disk_plan(SOURCE_BYTES, CaptureDiskCopy::Copy),
             staged.outputs,
             PLANNED_RAM,
+            None,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -3118,5 +3281,41 @@ mod tests {
         assert!(error
             .get_ref()
             .is_some_and(|error| error.is::<AuthenticationThreadPanicked>()));
+    }
+
+    #[test]
+    fn complete_map_sidecar_is_canonical_authenticated_and_part_of_staged_inventory() {
+        let (_root, staging, outputs, mut roles) = staged();
+        roles.insert(4, CaptureRole::RamMap);
+        let disks = disk_plan(4096, CaptureDiskCopy::Copy);
+        let verified = verify_staging(
+            &staging,
+            &roles,
+            &disks,
+            outputs,
+            PLANNED_RAM,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let bytes = std::fs::read(staging.path().join("memory.map.json")).unwrap();
+        let map = vm_spec::capture::StreamMap::decode(&bytes).unwrap();
+        assert_eq!(map.canonical_bytes().unwrap(), bytes);
+        assert_eq!(map.id(), verified.ram_stream);
+        assert_eq!(&map, verified.map.as_ref());
+        assert_eq!(verified.identity_bytes_hashed, 8192);
+        assert_eq!(verified.inventory[4].role, CaptureRole::RamMap);
+        assert_eq!(verified.inventory[4].length, bytes.len() as u64);
+        assert_eq!(
+            verified.inventory[4].sha256,
+            vm_spec::capture::Sha256Digest::of_bytes(&bytes)
+        );
+        assert_eq!(
+            std::fs::metadata(staging.path().join("memory.map.json"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
     }
 }

@@ -1862,6 +1862,9 @@ mod tests {
                 pause,
                 resume_policy,
                 binding: digests(),
+                policy: vm_spec::lifecycle::CapturePolicy::Full,
+                dirty_crossover_percent: 60,
+                baseline: None,
             },
             timeout: BUDGET,
         }
@@ -2529,6 +2532,9 @@ mod tests {
                 pause: CapturePauseSource::Acquire,
                 resume_policy: CaptureResumePolicy::Preserve,
                 binding: digests(),
+                policy: vm_spec::lifecycle::CapturePolicy::Full,
+                dirty_crossover_percent: 60,
+                baseline: None,
             },
             timeout: BUDGET,
         };

@@ -170,7 +170,71 @@ pub(crate) fn inspect(
         &devices,
         deadline,
     )
-    .map_err(|error| invalid(format!("restore compatibility refused: {error}")))?;
+    .map_err(|error| {
+        use libkrun::live::inspection::InspectionError;
+        let pin = match &error {
+            InspectionError::Producer(_) => "native-producer",
+            InspectionError::Lane => "guest-isa/hypervisor",
+            InspectionError::Codec { .. } => "capture-abi/device-codec",
+            InspectionError::Binding => "execution-binding",
+            InspectionError::Profile(cause)
+                if cause.contains("cpuid") || cause.contains("CPUID") =>
+            {
+                "cpu.cpuid"
+            }
+            InspectionError::Profile(cause)
+                if cause.contains("xsave") || cause.contains("XSAVE") =>
+            {
+                "cpu.xsave"
+            }
+            InspectionError::Profile(cause) if cause.contains("msr") || cause.contains("MSR") => {
+                "cpu.msr-inventory"
+            }
+            InspectionError::Profile(cause) if cause.contains("rate-disagreement") => {
+                "clock.tsc-rate"
+            }
+            InspectionError::Profile(_) => "cpu.profile",
+            InspectionError::Device { .. } | InspectionError::Expectations => "topology.devices",
+            InspectionError::Layout(_) => "ram-layout",
+            InspectionError::Host { cause }
+                if cause.contains("cpuid") || cause.contains("CPUID") =>
+            {
+                "cpu.cpuid"
+            }
+            InspectionError::Host { cause }
+                if cause.contains("xsave") || cause.contains("XSAVE") =>
+            {
+                "cpu.xsave"
+            }
+            InspectionError::Host { cause } if cause.contains("msr") || cause.contains("MSR") => {
+                "cpu.msr-inventory"
+            }
+            InspectionError::Host { cause }
+                if cause.contains("tsc")
+                    || cause.contains("TSC")
+                    || cause.contains("unscaled-rate-mismatch") =>
+            {
+                "clock.tsc-rate"
+            }
+            InspectionError::Host { .. } => "host-build",
+            InspectionError::Descriptor(_) => "storage",
+            InspectionError::Deadline => "host-build",
+        };
+        let expected = request
+            .evidence
+            .memory
+            .as_ref()
+            .map(|memory| match pin {
+                "native-producer" => memory.binding.native_producer.clone(),
+                "ram-layout" => memory.binding.ram_layout.to_string(),
+                _ => memory.binding.profile.to_string(),
+            })
+            .unwrap_or_else(|| "captured execution contract".into());
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            vm_spec::restore::RestorePortabilityRefusal::new(pin, expected, error.to_string()),
+        )
+    })?;
     if shape.cpu_count() != usize::from(request.configuration.cpus) {
         return Err(invalid(
             "restored vCPU count differs from the captured configuration",

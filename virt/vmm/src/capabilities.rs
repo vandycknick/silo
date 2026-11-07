@@ -23,6 +23,7 @@ const DELIVERED: &[LiveOperation] = &[
     LiveOperation::Capture,
     LiveOperation::Restore,
     LiveOperation::Fork,
+    LiveOperation::Incremental,
 ];
 
 #[derive(Debug, Parser)]
@@ -431,10 +432,10 @@ struct Qualification<'a> {
 
 // Supervisor-verified real CLI/guest pause, ClockOnly resume and paused stop.
 const QUALIFICATIONS: &[Qualification<'static>] = &[Qualification {
-    binding: "v2:native=9cf385b61cb89d00324047c75453d541ea0c57c6bbdbc5803b2331513316cf04:binding=c63be6ffdc486400258719cc3b29be5461ec8dc76574787186ea5499ca8ee836:eligible=true",
+    binding: "v2:native=5dc953ce29ce5423789ae9c2e253a6ad5ee1b96ac9712394d37227ce6ef56f5b:binding=f1da2da8957f4719807551bdc5bc333f912ade28065b0ebae83a2c4ddadf36d7:eligible=true",
     lane: LiveLane::KvmX86_64,
     operations: &[LiveOperation::Pause],
-    evidence: "phase-17/pause-candidate-final.xml; exact release CLI/guest pause, resume, paused stop and profile refusal",
+    evidence: "phase-20/pause-candidate-requalification.xml; exact release CLI/guest pause, resume, paused stop and profile refusal",
 }];
 
 fn qualification_matches(

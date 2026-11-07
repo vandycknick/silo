@@ -26,10 +26,13 @@ from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import platform
+import ssl
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 import pytest
 
-from silo_smoke import capture, overlay, procs, restore, shutdown, stopped
+from silo_smoke import capture, incremental, overlay, procs, restore, shutdown, stopped
 from silo_smoke.cli import TIMINGS_PROPERTY, Result, Silo, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.distribution_registry import (
@@ -283,7 +286,7 @@ def source_closure(silo: Silo, saved: restore.Checkpoint) -> tuple[bytes, bytes,
 
 
 def verify_graph(graph: PublishedGraph, saved: restore.Checkpoint, record_bytes: bytes, evidence: bytes,
-                 record: dict, *, profile: str, encoding: str) -> None:
+                 record: dict, *, profile: str, encoding: str, state_digests: dict[str, str]) -> None:
     config = graph.config
     assert (config["schema"], config["kind"], config["encoding"]) == (1, "vm-artifact", "silo-chunks-v1")
     assert config["purpose"] == "checkpoint" and config["captureKind"] == "live-execution"
@@ -305,7 +308,7 @@ def verify_graph(graph: PublishedGraph, saved: restore.Checkpoint, record_bytes:
     for role, filename, media in (("execution", "execution.state", EXECUTION_MEDIA),
                                   ("devices", "devices.state", DEVICE_MEDIA)):
         assert graph.direct.get(execution[role]) == media, (role, execution[role])
-        assert digest_of((saved.staging / filename).read_bytes()) == execution[role]
+        assert state_digests[filename] == execution[role]
     assert graph.direct.get(execution["layout"]) == RECORD_MEDIA
     assert execution["memory"]["stream"] in graph.streams
     if encoding == "raw":
@@ -401,6 +404,22 @@ def quarantined_home(silo: Silo) -> Iterator[Path]:
         hidden.rename(original)
 
 
+@contextmanager
+def unavailable_source(registry: LoopbackRegistry, reference: str) -> Iterator[None]:
+    """Prove the original source manifest is really 404 over its TLS server."""
+    authority, repository_tag = reference.split("/", 1)
+    repository, tag = repository_tag.rsplit(":", 1)
+    url = f"https://{authority}/v2/{repository}/manifests/{tag}"
+    with registry.unpublished(reference):
+        try:
+            with urlopen(url, context=ssl.create_default_context(cafile=str(registry.ca_path)), timeout=10) as reply:
+                raise AssertionError(f"removed source OCI still served HTTP {reply.status}")
+        except HTTPError as error:
+            assert error.code == 404, error
+            error.close()
+        yield
+
+
 def allocation_state(silo: Silo) -> dict:
     roots = [silo.ws.silo_home / "machines", silo.ws.run_root]
     return {"catalog": stopped.catalog(silo), "directories": {
@@ -409,11 +428,13 @@ def allocation_state(silo: Silo) -> dict:
     }}
 
 
-@pytest.mark.parametrize(("profile", "encoding"), [("raw", "zstd"), ("flat", "raw")],
-                         ids=["raw-root-zstd-chunks", "flat-root-raw-chunks"])
+@pytest.mark.parametrize(("profile", "encoding", "policy"), [
+    ("raw", "zstd", "full"), ("flat", "raw", "full"), ("raw", "zstd", "incremental"),
+], ids=["raw-root-zstd-chunks", "flat-root-raw-chunks", "incremental-standalone"])
 def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
     silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,  # noqa: F811
-    profile: str, encoding: str, artifact_processes: list[shutdown.Process],
+    registry: LoopbackRegistry, profile: str, encoding: str, policy: str,
+    artifact_processes: list[shutdown.Process],
 ) -> None:
     expected_boot = {role: overlay.digest(silo.ws.config.runtime_dir / "assets" / filename)
                      for role, filename in BOOT_ASSETS.items()}
@@ -428,18 +449,52 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
     armed = restore.witness(silo, SOURCE, "arm")
     assert armed["timerPending"] == armed["signalPending"] == 1
     saved = restore.checkpoint(silo, SOURCE, alias="artifact-checkpoint")
+    if policy == "incremental":
+        incremental.require_candidate(saved.source_info)
+        incremental.authenticated_map(silo, saved, mode="full", reason="requested")
+        baseline = saved
+        silo.run("resume", SOURCE)
+        restore.advances(silo, SOURCE, armed)
+        parent = restore.checkpoint(silo, SOURCE, alias="artifact-incremental-parent", policy="incremental")
+        incremental.authenticated_map(silo, parent, mode="incremental", baseline=baseline)
+        silo.run("resume", SOURCE)
+        restore.advances(silo, SOURCE, restore.witness(silo, SOURCE))
+        saved = restore.checkpoint(silo, SOURCE, alias="artifact-incremental", policy="incremental")
+        captured_map = incremental.authenticated_map(silo, saved, mode="incremental", baseline=parent)["map"]
+        # The latest graph must stand alone even before transport. Parent
+        # retention and aliases are not reconstruction dependencies.
+        silo.run("image", "remove", "image:artifact-checkpoint")
+        silo.run("snapshot", "remove", baseline.reference)
+        silo.run("image", "remove", "image:artifact-incremental-parent")
+        silo.run("snapshot", "remove", parent.reference)
     cut = restore.matched_cut(silo, saved, initial, profile=profile)
     sealed = capture.inventory(saved.staging)
     record_bytes, evidence, record = source_closure(silo, saved)
+    state_digests = {filename: digest_of((saved.staging / filename).read_bytes())
+                     for filename in ("execution.state", "devices.state")}
+    if policy == "incremental":
+        # Reap the capture owner before collection: its durable operation
+        # legitimately retains earlier cuts until source cleanup.
+        silo.run("resume", SOURCE)
+        restore.resumed(silo, SOURCE, initial, cut)
+        mark(silo, SOURCE, "source-before-publication")
+        capture.unchanged(silo, saved.staging, sealed)
+        stop_owned(silo, SOURCE, artifact_processes)
+        silo.rm(SOURCE)
+        shutdown.storage_tool(silo, "prune")
+        assert count(silo, f"SELECT count(*) FROM storage_snapshot WHERE id='{baseline.snapshot}'") == 0
+        assert count(silo, f"SELECT count(*) FROM storage_snapshot WHERE id='{parent.snapshot}'") == 0
 
     # Normal CLI publication; refused without the destination acknowledgement.
     flags = ("--raw",) if encoding == "raw" else ()
-    report = push_checkpoint(silo, distribution, "image:artifact-checkpoint", saved.snapshot, "v1", *flags)
+    report = push_checkpoint(silo, distribution, saved.reference, saved.snapshot, "v1", *flags)
     client = distribution.client()
     graph = published_graph(client, "v1")
     assert report["indexDigest"] == graph.index_digest
-    verify_graph(graph, saved, record_bytes, evidence, record, profile=profile, encoding=encoding)
-    capture.unchanged(silo, saved.staging, sealed)
+    verify_graph(graph, saved, record_bytes, evidence, record, profile=profile, encoding=encoding,
+                 state_digests=state_digests)
+    if policy == "full":
+        capture.unchanged(silo, saved.staging, sealed)
     silo.ws.record("artifact-graph", json.dumps({
         "indexDigest": graph.index_digest, "digests": sorted(graph.digests), "layers": graph.layers,
         "config": graph.config, "streams": sorted(graph.streams), "chunkMedia": sorted(graph.chunk_media),
@@ -471,15 +526,18 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
     verify_acquisition(destination, acquired, graph, saved, record_bytes, evidence, report["repository"],
                        "artifact-pulled")
 
-    # The source keeps its own execution and diverges after publication.
-    silo.run("resume", SOURCE)
-    restore.resumed(silo, SOURCE, initial, cut)
-    mark(silo, SOURCE, "source-after-publication")
-    assert marker(silo, SOURCE) == "source-after-publication"
-    stop_owned(silo, SOURCE, artifact_processes)
-    silo.rm(SOURCE)
-    silo.run("image", "remove", "image:artifact-checkpoint")
+    # Full captures also prove source divergence after publication. Incremental
+    # sources were reaped before transport to prove parent-independent GC.
+    if policy == "full":
+        silo.run("resume", SOURCE)
+        restore.resumed(silo, SOURCE, initial, cut)
+        mark(silo, SOURCE, "source-after-publication")
+        assert marker(silo, SOURCE) == "source-after-publication"
+        stop_owned(silo, SOURCE, artifact_processes)
+        silo.rm(SOURCE)
+    silo.run("image", "remove", "image:" + ("artifact-incremental" if policy == "incremental" else "artifact-checkpoint"))
     silo.run("snapshot", "remove", saved.reference)
+    shutdown.storage_tool(silo, "remove-image", restore_image)
     shutdown.storage_tool(silo, "prune")
 
     # Delete and physically collect the published graph, then stop the registry.
@@ -502,7 +560,8 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
 
     child = "artifact-restored"
     pulled = replace(saved, reference="image:artifact-pulled")
-    with quarantined_home(silo) as hidden:
+    with quarantined_home(silo) as hidden, unavailable_source(registry, restore_image):
+        source_requests = registry.requests
         restored = restore.restore_child(destination, pulled, child)
         own(destination, child, artifact_processes)
         restore.exact_boot(destination, child, expected_boot)
@@ -514,6 +573,20 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
         mark(destination, child, "destination-only")
         assert marker(destination, child) == "destination-only"
 
+        if policy == "incremental":
+            restore.witness(destination, child, "arm")
+            child_checkpoint = restore.checkpoint(destination, child, alias="artifact-child-incremental",
+                                                   policy="incremental")
+            # Its imported source has no capture staging directory, so bind the
+            # expected complete map to the independently retained source map.
+            inherited = incremental.authenticated_map(destination, child_checkpoint,
+                                                       mode="incremental", baseline=saved, baseline_map=captured_map)
+            assert inherited["stats"]["liveBytesRead"] < child_checkpoint.seal["memory"]["packedLength"]
+            child_cut = restore.matched_cut(destination, child_checkpoint, initial, profile=profile)
+            destination.run("resume", child)
+            restore.resumed(destination, child, initial, child_cut)
+            destination.run("image", "remove", "image:artifact-child-incremental")
+            destination.run("snapshot", "remove", child_checkpoint.reference)
         # Explicit retention and alias released while running: leases, not the
         # catalog root, protect the imported closure until the child is reaped.
         streams = sorted(graph.streams)
@@ -531,6 +604,7 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
         assert not any(pool_path(destination, "streams", stream).exists() for stream in streams)
         assert not any(pool_path(destination, "objects", digest).exists() for digest in objects)
         assert hidden.stat().st_mode & 0o777 == 0
+        assert registry.requests == source_requests, "standalone restore contacted removed source OCI"
     destination.ws.record("artifact-live", json.dumps({
         "profile": profile, "encoding": encoding, "snapshot": saved.snapshot, "indexDigest": graph.index_digest,
         "registry": distribution.identity(), "keptMarked": len(kept.marked), "swept": sorted(graph.digests),
@@ -541,18 +615,21 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
 
 def test_incompatible_imported_execution_refuses_before_child_allocation(
     silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,  # noqa: F811
-    artifact_processes: list[shutdown.Process],
+    registry: LoopbackRegistry, artifact_processes: list[shutdown.Process],
 ) -> None:
-    """Phase 15 native admission over the Phase 18 imported route.
+    """Exact Phase 20 portability refusal, then separately named cold recovery.
 
     The CPUID mutation keeps every header and binding valid, so publication,
-    graph verification and import succeed; only the destination's native
-    execution admission may refuse, before any child state exists. This is not
-    the Phase 20 preflight portability refusal.
+    graph verification and import succeed. Only execution admission refuses.
     """
     restore.create_source(silo, restore_image, name=SOURCE)
     own(silo, SOURCE, artifact_processes)
+    mark(silo, SOURCE, "recoverable-disk-cut")
+    silo.exec(SOURCE, "sh", "-eu", "-c", "printf live-only >/dev/shm/recovery-live-only", user="root")
     saved = restore.checkpoint(silo, SOURCE, alias="artifact-checkpoint")
+    captured_disks = list((saved.staging / "disks").glob("*.raw"))
+    assert len(captured_disks) == 1
+    captured_disk = stopped.read_bytes(captured_disks[0])
     stop_owned(silo, SOURCE, artifact_processes)
     with restore.incompatible_checkpoint(silo, saved, "cpu") as (source_reference, subject):
         forged = source_reference.removeprefix("image:")
@@ -577,13 +654,76 @@ def test_incompatible_imported_execution_refuses_before_child_allocation(
     }, sort_keys=True) + "\n")
     assert result.returncode != 0, "an incompatible imported execution restored"
     assert subject in result.stderr, result.stderr
+    for required in ("restore-preflight", "pin cpu.cpuid", "expected ", "destination ",
+                     "no execution child was started"):
+        assert required in result.stderr, (required, result.stderr)
     assert before["directories"] == after["directories"], "refusal allocated child directories"
-    for table, rows in before["catalog"].items():
+    for table, catalog_rows in before["catalog"].items():
         actual = after["catalog"][table]
         if table == "storage_operation" or table.startswith("storage_operation_"):
             # Opening the runtime may retire the completed pull's operation.
-            assert set(map(tuple, actual)) <= set(map(tuple, rows)), table
+            assert set(map(tuple, actual)) <= set(map(tuple, catalog_rows)), table
         else:
-            assert actual == rows, table
+            assert actual == catalog_rows, table
     assert all(not shutdown.lease_busy(path) for path in new_leases)
     assert not any(machine["name"] == child for machine in destination.ls())
+
+    # Import/inspection is independent of execution admission. The artifact
+    # stays authentic and transferable; recovery is an explicitly different
+    # operation, never a fallback inside the failed restore request.
+    imported_record = rows(destination, f"SELECT hex(record_bytes) FROM storage_snapshot WHERE id='{forged}'")
+    assert json.loads(bytes.fromhex(imported_record[0][0]))["captureKind"] == "live-execution"
+    immutable_paths = [pool_path(destination, "streams", stream) for stream in graph.streams]
+    immutable_paths += [pool_path(destination, "objects", digest) for digest in graph.direct]
+    immutable = {path: stopped.read_bytes(path) for path in immutable_paths}
+    silo.rm(SOURCE)
+    silo.run("image", "remove", "image:artifact-checkpoint")
+    silo.run("snapshot", "remove", saved.reference)
+    shutdown.storage_tool(silo, "remove-image", restore_image)
+    shutdown.storage_tool(silo, "prune")
+    client = distribution.client()
+    client.delete_manifest(REPOSITORY, graph.index_digest)
+    distribution.stop()
+    collected = distribution.garbage_collect(delete_untagged=True)
+    assert graph.digests <= collected.eligible_blobs
+    assert not graph.digests & distribution.stored_blob_digests()
+
+    recovered = "artifact-disk-recovery"
+    with quarantined_home(silo), unavailable_source(registry, restore_image):
+        source_requests = registry.requests
+        destination.ws.register_machine(recovered)
+        destination.run("recover-disks", "image:artifact-incompatible", "--name", recovered, timeout=240)
+        info = destination.info(recovered)
+        assert info["name"] == recovered and info["id"] != saved.source_info["id"]
+        assert info["state"] == "stopped" and info["run_id"] is None and info["ready"] is False
+        storage = stopped.record(destination, recovered)
+        assert storage["snapshot"] == forged and storage["stopOutcome"] == "unknown"
+        assert storage["boot"] == json.loads(bytes.fromhex(imported_record[0][0]))["boot"]
+        assert count(destination, "SELECT count(*) FROM restore_memory_reservation") == 0
+        directory = overlay.machine_dir(destination, recovered)
+        assert not any(path.name in {"memory.ram", "execution.state", "devices.state"}
+                       for path in directory.rglob("*")), "disk recovery installed execution inputs"
+        private = stopped.backing(destination, recovered, "recovery-before-boot")
+        assert set(private) == {"root"}
+        assert private["root"].content() == captured_disk.content()
+        stopped.independent({"root": captured_disk}, private)
+        assert rows(destination, f"SELECT hex(record_bytes) FROM storage_snapshot WHERE id='{forged}'") == imported_record
+        # Ordinary explicit start is a new boot, not resumed incompatible RAM.
+        destination.start(recovered)
+        destination.wait_ready(recovered)
+        own(destination, recovered, artifact_processes)
+        assert destination.exec(recovered, "cat", "/proc/sys/kernel/random/boot_id").stdout != saved.boot_id
+        assert marker(destination, recovered) == "recoverable-disk-cut"
+        destination.exec(recovered, "test", "!", "-e", "/dev/shm/recovery-live-only")
+        mark(destination, recovered, "recovered-private-write")
+        assert marker(destination, recovered) == "recovered-private-write"
+        for path, before_bytes in immutable.items():
+            assert stopped.read_bytes(path) == before_bytes, "cold recovery mutated immutable imported closure"
+        assert rows(destination, f"SELECT hex(record_bytes) FROM storage_snapshot WHERE id='{forged}'") == imported_record
+        assert registry.requests == source_requests, "disk recovery contacted removed source OCI"
+        stop_owned(destination, recovered, artifact_processes)
+    destination.ws.record("artifact-disk-recovery", json.dumps({
+        "checkpoint": forged, "machine": recovered, "sourceBootId": saved.boot_id,
+        "privateDiskSha256": private["root"].sha256, "registryGraphCollected": True,
+        "executionRefusal": result.stderr, "stopOutcomeAtCreation": storage["stopOutcome"],
+    }, sort_keys=True) + "\n")

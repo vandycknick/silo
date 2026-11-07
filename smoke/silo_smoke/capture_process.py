@@ -32,7 +32,10 @@ def main() -> None:
             (evidence / "capture-manager.stderr").open("wb") as errors:
         process = subprocess.Popen(
             [silo, "snapshot", "create", name, "--live", "--name", "crash-captured",
-             *(["--preserve"] if request["preserve"] else [])],
+             *(["--preserve"] if request["preserve"] else []),
+             *(["--capture-policy", request["capturePolicy"],
+                "--dirty-crossover-percent", str(request["dirtyCrossoverPercent"])]
+               if "capturePolicy" in request else [])],
             stdout=output, stderr=errors,
         )
         record("capture-manager-process.json", {"pid": process.pid})

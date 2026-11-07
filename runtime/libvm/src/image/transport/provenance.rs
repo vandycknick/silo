@@ -20,11 +20,12 @@ use crate::store::models::snapshot::{
 };
 use crate::LibVmError;
 
-const FIXED_ROLES: [CaptureRole; 4] = [
+const FIXED_ROLES: [CaptureRole; 5] = [
     CaptureRole::Execution,
     CaptureRole::Devices,
     CaptureRole::Ram,
     CaptureRole::Layout,
+    CaptureRole::RamMap,
 ];
 const MAX_LAYOUT_BYTES: u64 = 65536;
 
@@ -305,6 +306,7 @@ pub(crate) fn verify_portable_binding(
 /// measured during decode/materialization, never copied from inventory.
 pub(crate) struct MeasuredCapture<'a> {
     pub(crate) stream_sha256: &'a BTreeMap<StreamId, Sha256Digest>,
+    pub(crate) ram_map: &'a crate::storage::stream::StreamMap,
     pub(crate) layout: &'a [u8],
     pub(crate) execution: &'a File,
     pub(crate) devices: &'a File,
@@ -351,6 +353,14 @@ pub(crate) fn verify_portable_capture(
         return Err(failure(
             "RAM whole-byte SHA-256 or length differs from its seal",
         ));
+    }
+    let map = state(CaptureRole::RamMap)?;
+    let map_bytes = measured.ram_map.canonical_bytes()?;
+    if measured.ram_map.id() != execution.memory.stream
+        || map.length != map_bytes.len() as u64
+        || map.sha256 != Sha256Digest::of_bytes(&map_bytes)
+    {
+        return Err(failure("complete RAM map differs from its seal"));
     }
     for (role, object, length, maximum) in [
         (
@@ -628,6 +638,10 @@ mod tests {
             .unwrap();
         let execution_file = published.pool.verify_object(&execution.execution).unwrap();
         let devices_file = published.pool.verify_object(&execution.devices).unwrap();
+        let ram_map = published
+            .pool
+            .verify_stream(&execution.memory.stream)
+            .unwrap();
         let measured = |sha: &BTreeMap<StreamId, Sha256Digest>,
                         layout: &[u8],
                         swap: bool|
@@ -642,6 +656,7 @@ mod tests {
                 &binding,
                 &MeasuredCapture {
                     stream_sha256: sha,
+                    ram_map: &ram_map,
                     layout,
                     execution: first,
                     devices: second,

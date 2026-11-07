@@ -57,6 +57,27 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         ..Default::default()
     };
     let code = match v {
+        E::CheckpointPortability {
+            checkpoint,
+            refusal,
+        } => {
+            if refusal.validate().is_err() {
+                return native_error_to_status(&E::LiveProtocol {
+                    message: "invalid checkpoint portability refusal".into(),
+                });
+            }
+            d.kind = 4;
+            d.code = 15;
+            d.reference = Some(checkpoint.clone());
+            d.safe_message = v.to_string();
+            d.checkpoint_portability = Some(w::RestorePortabilityRefusal {
+                pin: refusal.pin.clone(),
+                expected: refusal.expected.clone(),
+                actual: refusal.actual.clone(),
+                stage: refusal.stage.clone(),
+            });
+            tonic::Code::FailedPrecondition
+        }
         E::LiveOperationUnsupported {
             operation,
             backend,
@@ -432,6 +453,30 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             E::BootBundleAbiUnsupported {
                 expected: crate::boot::digest_from_wire(&value.expected, "error.expected")?,
                 actual: crate::boot::digest_from_wire(&value.actual, "error.actual")?,
+            }
+        }
+        15 => {
+            category(
+                tonic::Code::FailedPrecondition,
+                4,
+                "error.checkpoint_portability",
+            )?;
+            let value = required(d.checkpoint_portability, "error.checkpoint_portability")?;
+            let refusal = vm_spec::restore::RestorePortabilityRefusal {
+                pin: value.pin,
+                expected: value.expected,
+                actual: value.actual,
+                stage: value.stage,
+            };
+            refusal.validate().map_err(|_| {
+                invalid(
+                    "error.checkpoint_portability",
+                    "invalid portability refusal",
+                )
+            })?;
+            E::CheckpointPortability {
+                checkpoint: required(d.reference, "error.reference")?,
+                refusal: Box::new(refusal),
             }
         }
         13 => {
@@ -887,6 +932,49 @@ mod tests {
             "pause unsupported: backend-excluded"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn portability_refusal_requires_preflight_stage_and_failed_precondition() {
+        let detail = w::ErrorDetail {
+            kind: 4,
+            code: 15,
+            reference: Some(format!("image:sha256:{}", "a".repeat(64))),
+            checkpoint_portability: Some(w::RestorePortabilityRefusal {
+                pin: "cpu".into(),
+                expected: "captured-cpu".into(),
+                actual: "unavailable".into(),
+                stage: "restore-preflight".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            status_to_native_error(&status(detail.clone(), tonic::Code::FailedPrecondition))
+                .unwrap(),
+            libvm::LibVmError::CheckpointPortability { .. }
+        ));
+        assert!(status_to_native_error(&status(detail.clone(), tonic::Code::Internal)).is_err());
+        let mut wrong_stage = detail.clone();
+        wrong_stage.checkpoint_portability.as_mut().unwrap().stage = "activation".into();
+        assert!(
+            status_to_native_error(&status(wrong_stage, tonic::Code::FailedPrecondition)).is_err()
+        );
+        let mut absent_pin = detail.clone();
+        absent_pin
+            .checkpoint_portability
+            .as_mut()
+            .unwrap()
+            .pin
+            .clear();
+        assert!(
+            status_to_native_error(&status(absent_pin, tonic::Code::FailedPrecondition)).is_err()
+        );
+        let mut absent_receipt = detail;
+        absent_receipt.checkpoint_portability = None;
+        assert!(
+            status_to_native_error(&status(absent_receipt, tonic::Code::FailedPrecondition))
+                .is_err()
+        );
     }
 
     #[test]

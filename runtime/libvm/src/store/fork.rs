@@ -1069,6 +1069,8 @@ pub(crate) mod tests {
                 .collect(),
             max_children: crate::DEFAULT_LIVE_FORK_MAX_CHILDREN,
             resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
+            policy: vm_spec::lifecycle::CapturePolicy::Full,
+            dirty_crossover_percent: 60,
             resources: crate::RestoreResourcePolicy::default(),
         }
     }

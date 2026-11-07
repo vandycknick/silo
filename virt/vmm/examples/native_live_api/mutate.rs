@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 pub(crate) fn run(arguments: Vec<OsString>) -> eyre::Result<()> {
     ensure!(
         arguments.len() == 3,
-        "usage: native-live-api mutate-execution INPUT OUTPUT cpu|producer|profile|xsave"
+        "usage: native-live-api mutate-execution INPUT OUTPUT cpu|producer|profile|xsave|tsc-rate|msr"
     );
     let input = Path::new(&arguments[0]);
     let output = Path::new(&arguments[1]);
@@ -60,6 +60,31 @@ pub(crate) fn run(arguments: Vec<OsString>) -> eyre::Result<()> {
                 cpu.xsave.extend_from_slice(&[0; 4]);
             }
             "kvm/xsave2/destination-layout"
+        }
+        "tsc-rate" => {
+            for state in &mut saved.cpus {
+                let CpuExecutionState::Kvm(kvm::KvmCpuState::X86(cpu)) = state else {
+                    eyre::bail!("TSC mutation requires an actual captured KVM x86 CPU");
+                };
+                cpu.tsc_khz = cpu
+                    .tsc_khz
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("captured TSC rate overflow"))?;
+            }
+            "kvm/clock/unscaled-rate-mismatch"
+        }
+        "msr" => {
+            for state in &mut saved.cpus {
+                let CpuExecutionState::Kvm(kvm::KvmCpuState::X86(cpu)) = state else {
+                    eyre::bail!("MSR mutation requires an actual captured KVM x86 CPU");
+                };
+                let model = cpu
+                    .model_msrs
+                    .first_mut()
+                    .ok_or_else(|| eyre::eyre!("captured model MSR inventory is empty"))?;
+                model.value ^= 1;
+            }
+            "kvm/msr/destination-model-values"
         }
         _ => eyre::bail!("unknown explicit execution mutation"),
     };
@@ -119,6 +144,36 @@ pub(crate) fn inspect(arguments: Vec<OsString>) -> eyre::Result<()> {
             "codec": "public ExecutionEnvelope::decode", "lane": format!("{:?}", saved.lane),
             "cpus": cpus, "pitProfile": vm.pit_profile, "clock": vm.clock,
             "clockFlags": vm.clock_flags, "hostTsc": vm.host_tsc, "realtime": vm.realtime,
+        })
+    )?;
+    Ok(())
+}
+
+pub(crate) fn inspect_devices(arguments: Vec<OsString>) -> eyre::Result<()> {
+    ensure!(
+        arguments.len() == 1,
+        "usage: native-live-api inspect-devices INPUT"
+    );
+    let bytes = crate::entry::bounded(Path::new(&arguments[0]), 32 << 20)?;
+    let devices = libkrun::live::inspection::decode_device_transports(&bytes)?;
+    let devices: Vec<_> = devices
+        .into_iter()
+        .map(|device| {
+            let state = device.transport;
+            let queues: Vec<_> = state.queues.iter().enumerate().map(|(index, queue)| json!({
+            "index":index, "size":queue.size, "ready":queue.ready,
+            "descTable":queue.desc_table, "availRing":queue.avail_ring,
+            "usedRing":queue.used_ring, "nextAvail":queue.next_avail, "nextUsed":queue.next_used,
+        })).collect();
+            json!({"configuredId":device.configured_id, "deviceType":state.device_type,
+            "ackedFeatures":state.acked_features, "queues":queues})
+        })
+        .collect();
+    writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        json!({
+            "codec":"existing bounded native DeviceEnvelope::decode", "devices":devices,
         })
     )?;
     Ok(())

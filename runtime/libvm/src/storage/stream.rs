@@ -17,8 +17,6 @@ use nix::errno::Errno;
 use nix::fcntl::{fcntl, open, FcntlArg, OFlag};
 use nix::sys::stat::Mode;
 use nix::unistd::{lseek, Whence};
-use serde::de::{self, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use vm_spec::capture::Sha256Digest;
 
@@ -63,32 +61,18 @@ impl StreamMap {
     /// Decode only the bounded current record. Duplicate, unknown and missing
     /// fields, noninteger numbers and noncanonical digest spellings are errors.
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        const MAX_CHUNKS: usize =
-            (Resource::ArtifactStreamBytes.maximum() / CHUNK_SIZE as u64) as usize;
-        // The largest canonical entry is a quoted SHA-256 digest and a comma.
-        // A little framing allowance also permits bounded JSON whitespace.
-        if bytes.len() > MAX_CHUNKS * 74 + 256 {
-            return Err(invalid_data("stream map exceeds its encoded size bound").into());
-        }
-        if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
-            return Err(invalid_data("stream map must be a JSON object").into());
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields, rename_all = "camelCase")]
-        struct Record {
-            schema: u64,
-            kind: String,
-            length: u64,
-            chunk_size: u64,
-            #[serde(deserialize_with = "decode_chunks")]
-            chunks: Vec<Chunk>,
-        }
-        let record: Record = serde_json::from_slice(bytes)
-            .map_err(|error| invalid_data(format!("invalid stream map: {error}")))?;
-        if record.schema != 1 || record.kind != "stream" || record.chunk_size != CHUNK_SIZE as u64 {
-            return Err(invalid_data("unsupported stream map schema, kind or chunk size").into());
-        }
-        Self::new(record.length, record.chunks)
+        let map = vm_spec::capture::StreamMap::decode(bytes).map_err(invalid_data)?;
+        let length = map.length();
+        Self::new(
+            length,
+            map.into_chunks()
+                .into_iter()
+                .map(|chunk| match chunk {
+                    None => Chunk::Zero,
+                    Some(digest) => Chunk::Data(ObjectDigest::from_sha256(*digest.as_bytes())),
+                })
+                .collect(),
+        )
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, StorageError> {
@@ -140,34 +124,6 @@ impl StreamMap {
             self.length
         )
     }
-}
-
-fn decode_chunks<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<Chunk>, D::Error> {
-    struct Chunks;
-    impl<'de> Visitor<'de> for Chunks {
-        type Value = Vec<Chunk>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a bounded array of zero or lowercase SHA-256 chunk entries")
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-            let maximum = Resource::ArtifactStreamBytes.maximum() / CHUNK_SIZE as u64;
-            let mut chunks = Vec::new();
-            while let Some(entry) = sequence.next_element::<String>()? {
-                if chunks.len() as u64 == maximum {
-                    return Err(de::Error::custom("too many stream chunks"));
-                }
-                chunks.push(if entry == "zero" {
-                    Chunk::Zero
-                } else {
-                    Chunk::Data(entry.parse().map_err(de::Error::custom)?)
-                });
-            }
-            Ok(chunks)
-        }
-    }
-    decoder.deserialize_seq(Chunks)
 }
 
 /// Costs of one file scan, not the logical file length or bytes sent.
@@ -252,6 +208,22 @@ impl AuthenticatedStream {
         self.fingerprint = SourceFingerprint::new(&metadata);
         Ok(())
     }
+}
+
+/// Whole-byte authentication, independent of stream chunk identity.
+pub(crate) fn whole_file_sha256(file: &File) -> Result<Sha256Digest, StorageError> {
+    let mut buffer = [0u8; 64 << 10];
+    let mut offset = 0;
+    let mut hash = Sha256::new();
+    loop {
+        let count = file.read_at(&mut buffer, offset)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+        offset += count as u64;
+    }
+    Ok(Sha256Digest::from_bytes(hash.finalize().into()))
 }
 
 /// Reuses one fixed 8 MiB allocation across chunks and successive streams.

@@ -168,6 +168,22 @@ impl AppApi {
         }
     }
 
+    pub(crate) async fn recover_checkpoint_disks(
+        &mut self,
+        reference: &str,
+        options: libvm::RecoverDisksOptions,
+    ) -> eyre::Result<MachineData> {
+        let reference: libvm::SnapshotRef = if reference.starts_with("image:") {
+            reference.parse()?
+        } else {
+            format!("image:{reference}").parse()?
+        };
+        match self {
+            Self::Local(service) => service.recover_checkpoint_disks(reference, options).await,
+            Self::Daemon(service) => service.recover_checkpoint_disks(reference, options).await,
+        }
+    }
+
     pub(crate) async fn inspect_snapshot(
         &mut self,
         reference: &str,

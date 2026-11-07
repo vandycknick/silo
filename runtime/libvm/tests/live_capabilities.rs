@@ -646,6 +646,8 @@ fn capture_options() -> libvm::LiveSnapshotOptions {
     libvm::LiveSnapshotOptions {
         name: None,
         resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
+        policy: vm_spec::lifecycle::CapturePolicy::Full,
+        dirty_crossover_percent: 60,
     }
 }
 
@@ -659,6 +661,8 @@ fn fork_options() -> libvm::LiveForkOptions {
         }],
         max_children: libvm::DEFAULT_LIVE_FORK_MAX_CHILDREN,
         resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
+        policy: vm_spec::lifecycle::CapturePolicy::Full,
+        dirty_crossover_percent: 60,
         resources: libvm::RestoreResourcePolicy::default(),
     }
 }

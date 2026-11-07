@@ -80,7 +80,8 @@ class Checkpoint:
 
 
 def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
-               borrowed: bool = False) -> Checkpoint:
+               borrowed: bool = False, policy: str = "full",
+               dirty_crossover_percent: int = 60) -> Checkpoint:
     """Capture a real guest, preserving acquired or borrowed pause authority.
 
     This deliberately does not start or assume an execution witness, so the
@@ -94,7 +95,8 @@ def checkpoint(silo: Silo, name: str, *, alias: str = "restore-checkpoint",
         silo.run("pause", name)
         original_pause = silo.info(name)["lifecycle"]["lifecycle"]["currentPause"]
     result = silo.run("snapshot", "create", name, "--live", "--preserve", "--name", alias,
-                      timeout=240)
+                      "--capture-policy", policy,
+                      "--dirty-crossover-percent", str(dirty_crossover_percent), timeout=240)
     value = json.loads(result.stdout)
     summary = value["capture"]
     assert value["snapshot"]["captureKind"] == "live-execution"
@@ -330,7 +332,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
     the altered envelope. Thus only an exact native refusal subject, not a hash
     error, satisfies the test. Original provenance is moved back on exit.
     """
-    assert mutation in {"cpu", "producer", "profile", "xsave"}
+    assert mutation in {"cpu", "producer", "profile", "xsave", "tsc-rate", "msr"}
     binary = silo.ws.config.bin_dir / "examples/native-live-api"
     assert binary.is_file(), "Main must stage cargo build -p silo-vmm --example native-live-api"
     original = snapshot_record(silo, saved)

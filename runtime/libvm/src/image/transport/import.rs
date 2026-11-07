@@ -304,6 +304,10 @@ pub(crate) fn verify_imported_artifact(
                         &binding,
                         &MeasuredCapture {
                             stream_sha256: &stream_sha256,
+                            ram_map: &streams
+                                .get(&execution.memory.stream)
+                                .ok_or_else(|| invalid("RAM map", "missing verified stream map"))?
+                                .map,
                             layout: &layout,
                             execution: held(&execution.execution)?,
                             devices: held(&execution.devices)?,

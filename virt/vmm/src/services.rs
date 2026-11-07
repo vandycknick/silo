@@ -1549,6 +1549,7 @@ mod tests {
                 ram_bytes: configuration.ram_bytes(),
                 configuration,
                 policy: vm_spec::lifecycle::CapturePolicy::Full,
+                dirty_crossover_percent: 60,
                 resume_policy: vm_spec::lifecycle::CaptureResumePolicy::ResumeIfAcquired,
                 pause: CapturePauseAuthority::Acquire,
                 disks: Vec::new(),

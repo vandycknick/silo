@@ -807,6 +807,8 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
         }],
         max_children: 16,
         resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
+        policy: w::CapturePolicy::Full as i32,
+        dirty_crossover_percent: 60,
         resources: Some(silo_vm_control::stopped::restore_resources_to_wire(
             libvm::RestoreResourcePolicy::default(),
         )),
@@ -823,6 +825,8 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
                     machine: request().machine,
                     name: None,
                     resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
+                    policy: w::CapturePolicy::Full as i32,
+                    dirty_crossover_percent: 60,
                 })
                 .await
                 .unwrap_err(),
@@ -878,6 +882,49 @@ async fn early_rejection_precedes_sealed_and_exhausted_daemon_admission() {
             tonic::Code::InvalidArgument
         );
     }
+    for (policy, crossover) in [
+        (w::CapturePolicy::Unspecified as i32, 60),
+        (i32::MAX, 60),
+        (w::CapturePolicy::Incremental as i32, 0),
+        (w::CapturePolicy::Incremental as i32, 61),
+        (w::CapturePolicy::Full as i32, u32::MAX),
+    ] {
+        let status = machines
+            .capture_execution(w::LiveCaptureRequest {
+                machine: request().machine,
+                name: None,
+                resume_policy: w::CaptureResumePolicy::ResumeIfAcquired as i32,
+                policy,
+                dirty_crossover_percent: crossover,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let mut fork = fork_request();
+        fork.policy = policy;
+        fork.dirty_crossover_percent = crossover;
+        assert_eq!(
+            machines.fork_execution(fork).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let invalid_recovery = w::RecoverCheckpointDisksRequest {
+        snapshot: Some(silo_vm_control::stopped::reference_to_wire(
+            &"image:missing".parse().unwrap(),
+        )),
+        name: Some("../escape".into()),
+        external_resources: Some(silo_vm_control::stopped::policy_to_wire(
+            &libvm::ExternalResourcePolicy::Reject,
+        )),
+    };
+    assert_eq!(
+        runtime
+            .recover_checkpoint_disks(invalid_recovery)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
     let invalid = || w::ForkOperationRef {
         operation_id: "00000000-0000-0000-0000-000000000000".into(),
     };

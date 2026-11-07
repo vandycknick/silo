@@ -104,6 +104,51 @@ pub(crate) struct MemoryCapture {
     pub(crate) layout: OutputReceipt,
     pub(crate) memory_generation: u64,
     pub(crate) writers_closed: bool,
+    pub(crate) mode: vm_spec::lifecycle::CapturePolicy,
+    pub(crate) baseline: Option<vm_spec::capture::Sha256Digest>,
+    pub(crate) full_reason: Option<vm_spec::capture::CaptureFullReason>,
+    pub(crate) dirty_chunks: Vec<u8>,
+    pub(crate) stats: vm_spec::capture::CaptureMemoryStats,
+}
+
+impl MemoryCapture {
+    fn valid_for(&self, preparation: &CapturePreparation) -> bool {
+        use vm_spec::capture::{validate_dirty_chunks, CaptureFullReason, STREAM_CHUNK_BYTES};
+        use vm_spec::lifecycle::CapturePolicy;
+        if self.memory_generation == 0
+            || self.stats.logical_bytes != self.ram.length
+            || validate_dirty_chunks(self.ram.length, &self.dirty_chunks).is_err()
+        {
+            return false;
+        }
+        match self.mode {
+            CapturePolicy::Full => {
+                self.baseline.is_none()
+                    && self.full_reason.is_some()
+                    && self
+                        .dirty_chunks
+                        .iter()
+                        .map(|byte| u64::from(byte.count_ones()))
+                        .sum::<u64>()
+                        == self.ram.length.div_ceil(STREAM_CHUNK_BYTES)
+                    && match preparation.policy {
+                        CapturePolicy::Full => {
+                            self.full_reason == Some(CaptureFullReason::Requested)
+                        }
+                        CapturePolicy::Incremental => {
+                            self.full_reason != Some(CaptureFullReason::Requested)
+                        }
+                    }
+            }
+            CapturePolicy::Incremental => {
+                preparation.policy == CapturePolicy::Incremental
+                    && self.full_reason.is_none()
+                    && self.baseline.is_some()
+                    && self.baseline.map(|digest| Digest32(*digest.as_bytes()))
+                        == preparation.baseline
+            }
+        }
+    }
 }
 
 /// Native capture status, already free of resource-bearing errors.
@@ -158,11 +203,15 @@ pub(crate) trait NativeLifecycle: Send + Sync + 'static {
     /// backend that never restores uses an uninhabited type.
     type Restore: Clone + Send + 'static;
 
+    /// Profile, pause and guarded recovery use distinct worker-reserved
+    /// operations. A successful recovery returns the original pause's token,
+    /// without repairing incremental coverage.
     fn pause(
         &self,
         owner: NativePauseOwner,
         operation: NativeOperation,
         profile_operation: NativeOperation,
+        recovery_operation: NativeOperation,
         clock_profile: Option<ObservedClockProfile>,
         deadline: Instant,
     ) -> Result<Self::Token, NativeFailure>;
@@ -220,12 +269,14 @@ pub(crate) trait NativeLifecycle: Send + Sync + 'static {
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<ExecutionCapture<Self::Capture>, NativeFailure>;
-    /// Always a full capture: no baseline, no dirty crossover.
+    /// Capture according to the validated policy and exact content binding.
+    #[allow(clippy::too_many_arguments)]
     fn capture_memory(
         &self,
         capture: &Self::Capture,
         ram: File,
         layout: File,
+        preparation: &CapturePreparation,
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<MemoryCapture, NativeFailure>;
@@ -924,6 +975,7 @@ enum Admission<T, C> {
         owner: NativePauseOwner,
         native: NativeOperation,
         profile_operation: NativeOperation,
+        recovery_operation: NativeOperation,
         clock_profile: Option<ObservedClockProfile>,
         deadline: Instant,
     },
@@ -1260,6 +1312,7 @@ impl<N: NativeLifecycle> Shared<N> {
                 }
                 let profile_operation = next_native(&mut journal)?;
                 let native = next_native(&mut journal)?;
+                let recovery_operation = next_native(&mut journal)?;
                 journal.slot = Some(PauseSlot {
                     operation,
                     native,
@@ -1275,6 +1328,7 @@ impl<N: NativeLifecycle> Shared<N> {
                     },
                     native,
                     profile_operation,
+                    recovery_operation,
                     clock_profile,
                     deadline: now + timeout,
                 })
@@ -2142,11 +2196,17 @@ impl<N: NativeLifecycle> Shared<N> {
                         owner,
                         native,
                         profile_operation,
+                        recovery_operation,
                         clock_profile,
                         deadline,
-                    } => {
-                        shared.run_pause(owner, native, profile_operation, clock_profile, deadline)
-                    }
+                    } => shared.run_pause(
+                        owner,
+                        native,
+                        profile_operation,
+                        recovery_operation,
+                        clock_profile,
+                        deadline,
+                    ),
                     Admission::Resume {
                         token,
                         generation,
@@ -2479,17 +2539,21 @@ impl<N: NativeLifecycle> Shared<N> {
         owner: NativePauseOwner,
         native: NativeOperation,
         profile_operation: NativeOperation,
+        recovery_operation: NativeOperation,
         clock_profile: Option<ObservedClockProfile>,
         deadline: Instant,
     ) -> CommandOutcome {
-        let result =
-            match self
-                .native
-                .pause(owner, native, profile_operation, clock_profile, deadline)
-            {
-                Ok(token) => PauseResult::Token(token),
-                Err(failure) => self.classify_pause_failure(native, failure, deadline),
-            };
+        let result = match self.native.pause(
+            owner,
+            native,
+            profile_operation,
+            recovery_operation,
+            clock_profile,
+            deadline,
+        ) {
+            Ok(token) => PauseResult::Token(token),
+            Err(failure) => self.classify_pause_failure(native, failure, deadline),
+        };
         let mut journal = lock(&self.journal);
         let Some(slot) = journal.slot.as_mut() else {
             return CommandOutcome::PauseFailed {
@@ -3135,9 +3199,13 @@ impl<N: NativeLifecycle> Shared<N> {
         layout: File,
         deadline: Instant,
     ) -> CommandOutcome {
+        let preparation = self.with_capture(capture, |record| record.preparation.clone());
+        let Some(preparation) = preparation else {
+            return Self::missing_capture();
+        };
         let result = self.native_operation().and_then(|operation| {
             self.native
-                .capture_memory(&ticket, ram, layout, operation, deadline)
+                .capture_memory(&ticket, ram, layout, &preparation, operation, deadline)
         });
         let status = match result {
             Ok(memory) => Ok(NativeCaptureStatus::CandidateComplete { ticket, memory }),
@@ -3160,6 +3228,11 @@ impl<N: NativeLifecycle> Shared<N> {
                             layout: memory.layout,
                             memory_generation: memory.memory_generation,
                             writers_closed: memory.writers_closed,
+                            mode: memory.mode,
+                            baseline: memory.baseline,
+                            full_reason: memory.full_reason,
+                            dirty_chunks: memory.dirty_chunks.clone(),
+                            stats: Box::new(memory.stats.clone()),
                         }
                     }
                     (CaptureProgress::Failed { stage, failure }, _) => {
@@ -3553,6 +3626,8 @@ fn apply_status<C>(record: &mut CaptureRecord<C>, status: NativeCaptureStatus<C>
                 Some("native RAM receipt names foreign outputs")
             } else if record.binding.as_ref() != Some(memory.binding.as_ref()) {
                 Some("native RAM binding differs from the execution binding")
+            } else if !memory.valid_for(&record.preparation) {
+                Some("native RAM mode, baseline, coverage or statistics differ from the request")
             } else {
                 None
             };
@@ -3819,6 +3894,9 @@ mod tests {
                         profile: Digest32([2; 32]),
                         topology: Digest32([3; 32]),
                     },
+                    policy: vm_spec::lifecycle::CapturePolicy::Full,
+                    dirty_crossover_percent: 60,
+                    baseline: None,
                 },
                 origin: CapturePauseOrigin::Acquired,
                 progress: CaptureProgress::MemoryPending,
@@ -3855,6 +3933,14 @@ mod tests {
                 layout: receipt(4),
                 memory_generation: 1,
                 writers_closed: true,
+                mode: vm_spec::lifecycle::CapturePolicy::Full,
+                baseline: None,
+                full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
+                dirty_chunks: vec![1],
+                stats: vm_spec::capture::CaptureMemoryStats {
+                    logical_bytes: 4096,
+                    ..Default::default()
+                },
             },
         }
     }
@@ -3915,6 +4001,34 @@ mod tests {
             None,
             "a complete candidate is never refreshed again"
         );
+    }
+
+    #[test]
+    fn coverage_lost_full_candidate_preserves_the_incremental_fallback_reason() {
+        use vm_spec::capture::CaptureFullReason;
+        use vm_spec::lifecycle::CapturePolicy;
+
+        let mut journal = Journal::default();
+        let capture = Uuid::new_v4();
+        let binding = memory_pending(&mut journal, capture);
+        let record = journal.captures.get_mut(&capture).expect("record");
+        record.preparation.policy = CapturePolicy::Incremental;
+        record.preparation.baseline = Some(Digest32([5; 32]));
+        let mut status = candidate(&binding);
+        let NativeCaptureStatus::CandidateComplete { memory, .. } = &mut status else {
+            panic!("candidate");
+        };
+        memory.full_reason = Some(CaptureFullReason::CoverageLost);
+        let revision = journal.pending_revision(capture).expect("pending");
+        assert!(journal.apply_observed(capture, revision, status));
+        assert_eq!(
+            progress(&journal, capture),
+            CaptureProgress::CandidateComplete
+        );
+        let memory = journal.captures[&capture].memory.as_ref().expect("memory");
+        assert_eq!(memory.mode, CapturePolicy::Full);
+        assert_eq!(memory.full_reason, Some(CaptureFullReason::CoverageLost));
+        assert_eq!(memory.baseline, None);
     }
 
     #[test]
@@ -4457,5 +4571,35 @@ mod tests {
         journal.last_native = u64::MAX;
         assert_eq!(journal.probe_operation(), Err(ProbeRefusal::Exhausted));
         assert_eq!(journal.last_native, u64::MAX);
+    }
+
+    #[test]
+    fn candidate_projection_rejects_wrong_policy_baseline_coverage_and_bounds() {
+        for defect in 0..6 {
+            let mut journal = Journal::<(), u32>::default();
+            let capture = Uuid::new_v4();
+            let binding = memory_pending(&mut journal, capture);
+            let mut status = candidate(&binding);
+            let NativeCaptureStatus::CandidateComplete { memory, .. } = &mut status else {
+                panic!("candidate");
+            };
+            match defect {
+                0 => memory.dirty_chunks.clear(),
+                1 => memory.dirty_chunks[0] = 2,
+                2 => memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental,
+                3 => {
+                    memory.baseline =
+                        Some(vm_spec::capture::Sha256Digest::of_bytes(b"wrong baseline"))
+                }
+                4 => memory.stats.logical_bytes += 1,
+                _ => memory.full_reason = Some(vm_spec::capture::CaptureFullReason::NoBaseline),
+            }
+            let revision = journal.pending_revision(capture).unwrap();
+            assert!(journal.apply_observed(capture, revision, status));
+            assert!(matches!(
+                progress(&journal, capture),
+                CaptureProgress::Failed { .. }
+            ));
+        }
     }
 }

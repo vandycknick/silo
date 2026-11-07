@@ -298,7 +298,6 @@ impl SnapshotRecord {
         Ok(bytes)
     }
 
-    #[cfg(test)]
     pub fn id(&self) -> Result<SnapshotId, LibVmError> {
         Ok(snapshot_id(&self.canonical_bytes()?))
     }
@@ -321,19 +320,22 @@ impl SnapshotRecord {
         Ok(record)
     }
 
-    pub fn streams(&self) -> impl Iterator<Item = &SnapshotStream> {
+    pub(crate) fn storage_streams(&self) -> impl Iterator<Item = &SnapshotStream> {
         let lower = match &self.root.profile {
             SnapshotRootProfile::LinuxOverlay { lower, .. } => Some(lower),
             SnapshotRootProfile::OpaqueRaw => None,
         };
+        std::iter::once(&self.root.stream)
+            .chain(lower)
+            .chain(self.disks.iter().map(|disk| &disk.content))
+    }
+
+    pub fn streams(&self) -> impl Iterator<Item = &SnapshotStream> {
         let memory = match &self.capture {
             SnapshotCaptureKind::LiveExecution { execution } => Some(&execution.memory),
             SnapshotCaptureKind::StoppedStorage { .. } => None,
         };
-        std::iter::once(&self.root.stream)
-            .chain(lower)
-            .chain(self.disks.iter().map(|disk| &disk.content))
-            .chain(memory)
+        self.storage_streams().chain(memory)
     }
 
     #[cfg(test)]
@@ -346,12 +348,12 @@ impl SnapshotRecord {
 
     /// Typed content edges only. Catalog root traversal adds the separately
     /// authenticated record ObjectDigest without hashing under coordination.
-    pub(crate) fn content_dependencies(
+    pub(crate) fn storage_content_dependencies(
         &self,
     ) -> Result<(BTreeSet<StreamId>, BTreeSet<ObjectDigest>), LibVmError> {
         let mut streams = BTreeSet::new();
         let mut objects = BTreeSet::new();
-        for stream in self.streams() {
+        for stream in self.storage_streams() {
             streams.insert(stream.stream);
             objects.insert(stream.map);
             objects.extend(stream.map_pages.iter().copied());
@@ -373,7 +375,17 @@ impl SnapshotRecord {
             objects.insert(binding.digest()?);
         }
         objects.extend(self.platform_files.iter().map(|file| file.object));
+        Ok((streams, objects))
+    }
+
+    pub(crate) fn content_dependencies(
+        &self,
+    ) -> Result<(BTreeSet<StreamId>, BTreeSet<ObjectDigest>), LibVmError> {
+        let (mut streams, mut objects) = self.storage_content_dependencies()?;
         if let SnapshotCaptureKind::LiveExecution { execution } = &self.capture {
+            streams.insert(execution.memory.stream);
+            objects.insert(execution.memory.map);
+            objects.extend(execution.memory.map_pages.iter().copied());
             objects.extend([execution.layout, execution.execution, execution.devices]);
         }
         Ok((streams, objects))

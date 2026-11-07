@@ -261,7 +261,7 @@ pub(crate) fn report_from_status(
     Ok(report)
 }
 
-/// Manager admission for source-run Pause, Capture and Fork commands. Restore
+/// Manager admission for source-run Pause, Capture, Fork and Incremental commands. Restore
 /// has a separate checkpoint-construction entrypoint. The monitor vector
 /// remains the qualification authority.
 pub fn require_live_operation(
@@ -274,7 +274,10 @@ pub fn require_live_operation(
         LiveAvailability::Supported
             if matches!(
                 operation,
-                LiveOperation::Pause | LiveOperation::Capture | LiveOperation::Fork
+                LiveOperation::Pause
+                    | LiveOperation::Capture
+                    | LiveOperation::Fork
+                    | LiveOperation::Incremental
             ) =>
         {
             return Ok(())
@@ -381,6 +384,8 @@ mod tests {
         report.live.fork.native = true;
         report.live.restore.availability = LiveAvailability::Supported;
         report.live.restore.native = true;
+        report.live.incremental.availability = LiveAvailability::Supported;
+        report.live.incremental.native = true;
         let observed = bind_run(
             report.machine_id.parse().unwrap(),
             "machine",
@@ -391,6 +396,7 @@ mod tests {
         // Capture is delivered by the manager in Phase 14; the vector stays the
         // qualification authority, so a Supported capture bit is admitted.
         assert!(require_live_operation(&observed, LiveOperation::Capture).is_ok());
+        assert!(require_live_operation(&observed, LiveOperation::Incremental).is_ok());
         for (operation, code, subject) in [
             (
                 LiveOperation::Pause,

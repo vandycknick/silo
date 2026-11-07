@@ -1692,7 +1692,7 @@ mod tests {
 
         let fixture = fixture().await;
         let snapshots = &fixture.snapshots;
-        let (sealed, _) = seal(&fixture);
+        let (sealed, sealed_evidence) = seal(&fixture);
         let info = snapshots
             .publish_capture(
                 fixture.reservation.record.capture_id,
@@ -1719,12 +1719,20 @@ mod tests {
             consumer.open_object(&pool, &execution.layout).unwrap(),
             consumer.open_object(&pool, &execution.execution).unwrap(),
             consumer.open_object(&pool, &execution.devices).unwrap(),
+            std::fs::File::open(sealed.path().join(vm_spec::capture::CAPTURE_RAM_MAP_FILE))
+                .unwrap(),
         ];
         let digests = [
             ram_sha256,
             Sha256Digest::from_bytes(*execution.layout.as_bytes()),
             Sha256Digest::from_bytes(*execution.execution.as_bytes()),
             Sha256Digest::from_bytes(*execution.devices.as_bytes()),
+            sealed_evidence
+                .inventory
+                .iter()
+                .find(|entry| entry.role == vm_spec::capture::CaptureRole::RamMap)
+                .unwrap()
+                .sha256,
         ];
         let objects: Vec<_> = files
             .iter()

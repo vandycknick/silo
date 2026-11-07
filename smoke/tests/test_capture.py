@@ -205,8 +205,8 @@ def test_capture_rejects_readonly_virtiofs_before_freeze(silo: Silo, capture_ima
         silo.stop(name)
 
 
-@pytest.mark.parametrize(("boundary", "victim"), [
-    (boundary, victim)
+@pytest.mark.parametrize(("boundary", "victim", "capture_policy"), [
+    (boundary, victim, "full")
     for boundary in (
         "capture-disk-sync", "capture-execution-sync", "capture-ram-sync",
         "capture-seal-publish", "capture-seal-sync", "capture-source-sync",
@@ -214,11 +214,15 @@ def test_capture_rejects_readonly_virtiofs_before_freeze(silo: Silo, capture_ima
         "capture-catalog-commit",
     )
     for victim in ("manager", "monitor", "krun-worker")
-] + [("capture-source-sync", "cancel")]
-  + [("capture-execution-sync", policy) for policy in
-     ("cancel-resume", "cancel-preserve", "cancel-borrow")])
+] + [("capture-source-sync", "cancel", "full")]
+  + [("capture-execution-sync", policy, "full") for policy in
+     ("cancel-resume", "cancel-preserve", "cancel-borrow")]
+  + [(boundary, "manager", "incremental") for boundary in (
+      "capture-pool-sync", "capture-pool-rename", "capture-pool-directory-sync",
+      "capture-catalog-commit",
+  )])
 def test_capture_process_boundary_preserves_only_coherent_closure(
-    silo: Silo, capture_image: str, boundary: str, victim: str,
+    silo: Silo, capture_image: str, boundary: str, victim: str, capture_policy: str,
 ) -> None:
     name = "capture-crash"
     silo.create(name, capture_image, "--cpus", "1", "--memory", "512mib",
@@ -229,14 +233,19 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
     driver_request.write_text(json.dumps({
         "silo": str(silo.ws.config.silo), "name": name, "evidence": str(evidence),
         "preserve": victim != "cancel-resume",
+        "capturePolicy": capture_policy, "dirtyCrossoverPercent": 60,
     }) + "\n")
     trace_request = evidence / "boundary-request.json"
     release = evidence / "boundary-release"
+    arm = evidence / "publication-armed"
+    excluded_captures = evidence / "publication-prior-captures.json"
     trace_request.write_text(json.dumps({
         "command": [sys.executable, "-m", "silo_smoke.capture_process", str(driver_request)],
         "target": str(target), "boundary": boundary,
         "machines": str(silo.ws.silo_home / "machines"),
         "evidence": str(evidence), "release": str(release),
+        **({"arm": str(arm), "excludeCapturesFile": str(excluded_captures)}
+           if capture_policy == "incremental" else {}),
     }) + "\n")
     owned: list[shutdown.Process] = []
     cancel_process = None
@@ -262,6 +271,14 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                                      timeout=90, description="traced start did not finish")
             assert started["code"] == 0
             running = silo.wait_ready(name)
+            if capture_policy == "incremental":
+                baseline = json.loads(silo.run(
+                    "snapshot", "create", name, "--live", "--name", "crash-baseline",
+                    "--capture-policy", "incremental", timeout=120,
+                ).stdout)
+                assert baseline["capture"]["memory"]["mode"] == "full"
+                excluded_captures.write_text(json.dumps([baseline["capture"]["captureId"]]) + "\n")
+                arm.touch()
             if victim.startswith("cancel-"):
                 counter = capture.Counter(silo, name, PROBE)
                 counter.advances()
@@ -297,6 +314,8 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                     "crash gate reached failure diagnostics instead of a coherent cut")
                 if boundary != "capture-seal-publish":
                     observed_seal = cut
+                    if capture_policy == "incremental":
+                        assert cut["memory"]["mode"] == "incremental", cut["memory"]
             if borrowed is not None:
                 refused = pause.request(silo, name, {
                     "command": "resume",
@@ -372,6 +391,25 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                     counter.stationary()
                     silo.run("resume", name)
                     counter.advances()
+            if capture_policy == "incremental":
+                assert observed_seal is not None
+                binary = silo.ws.config.bin_dir / "examples/live_acceptance"
+                assert binary.is_file(), "build the exact candidate's durable capture driver"
+                recovered_live = subprocess.run(
+                    [str(binary), name, "complete-capture", plan["captureId"]],
+                    env=silo.ws.env(), capture_output=True, text=True, timeout=120,
+                )
+                silo.ws.record("capture-live-publication-recovery",
+                               recovered_live.stdout + "\n[stderr]\n" + recovered_live.stderr)
+                assert recovered_live.returncode == 0, recovered_live.stderr
+                retry = json.loads(silo.run(
+                    "snapshot", "create", name, "--live", "--preserve", "--name", "crash-retry",
+                    "--capture-policy", "incremental", timeout=120,
+                ).stdout)
+                memory = retry["capture"]["memory"]
+                assert memory["mode"] == "incremental", memory
+                assert memory["baseline"] == observed_seal["memory"]["ramStream"], memory
+                assert memory["ramStream"] == observed_seal["memory"]["ramStream"], memory
             controller.stdin.write(b"stop\n")
             controller.stdin.flush()
             assert controller.wait(timeout=90) == 0, "trace owners did not finish"

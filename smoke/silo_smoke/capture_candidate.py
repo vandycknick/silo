@@ -1,10 +1,12 @@
-"""Build an isolated capture/restore/fork candidate, never a production grant.
+"""Build an isolated capture/restore/fork/incremental candidate, never a production grant.
 
 Copied compiled qualification tables admit only the exact private build. An
 explicit IRQ candidate additionally enables source-only diagnostic witness
 transport; its build identity is retained separately, never called production.
 An explicit fork candidate admits delivered-but-unqualified live fork in the
 same private copy only; production qualification tables stay untouched.
+An explicit incremental candidate additionally admits delivered incremental
+capture only with ordinary restore; it never changes production capabilities.
 """
 from __future__ import annotations
 
@@ -22,13 +24,15 @@ from .overlay_faults import replace_once
 
 
 def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe: bool = False,
-          fork: bool = False, profile: str = "debug") -> dict:
+          fork: bool = False, incremental: bool = False, profile: str = "debug") -> dict:
     if profile not in ("debug", "release"):
         raise ValueError("candidate profile must be debug or release")
     if irq_probe and not restore:
         raise ValueError("IRQ probe requires the isolated restore candidate")
     if fork and (not restore or irq_probe):
         raise ValueError("fork requires the ordinary isolated restore candidate, never the IRQ probe")
+    if incremental and (not restore or irq_probe):
+        raise ValueError("incremental requires the ordinary isolated restore candidate")
     if destination.exists():
         raise FileExistsError(destination)
     for protected in (REPO, runtime):
@@ -55,12 +59,16 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
     operations = ("pause", "capture", "restore", "fork") if fork else (
         ("pause", "capture", "restore") if restore else ("pause", "capture"))
     phase = 16 if fork else (15 if restore else 14)
+    if incremental:
+        operations += ("incremental",)
+        phase = 20
     proof = {"scope": f"isolated Phase{phase} test-only candidate, not production qualification",
              "productionMonitorSha256": production_hash, "productionCapabilities": original,
              "commands": [], "mutations": []}
     proof["profile"] = profile
     proof["irqProbe"] = irq_probe
     monitor_features = ["--features", "restore-irq-probe"] if irq_probe else []
+    proof["incremental"] = incremental
     if irq_probe:
         configure_irq_candidate(source, proof)
 
@@ -113,6 +121,12 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
                          "reason": {"code": "lane-not-qualified", "subject": None}},
     }:
         raise ValueError("production must deliver fork without qualifying it")
+    if incremental and unqualified["live"]["incremental"] != {
+        "native": True,
+        "availability": {"status": "unsupported",
+                         "reason": {"code": "lane-not-qualified", "subject": None}},
+    }:
+        raise ValueError("production must deliver incremental without qualifying it")
     admitted_operations = ", ".join("LiveOperation::" + operation.capitalize()
                                     for operation in operations)
     proof["mutations"].append(replace_once(
@@ -251,9 +265,12 @@ def main() -> None:
                         help="build a separate restore candidate with source-only native IRQ witness transport")
     parser.add_argument("--fork", action="store_true",
                         help="also admit delivered live fork in this isolated Phase16 restore candidate")
+    parser.add_argument("--incremental", action="store_true",
+                        help="also admit incremental in this isolated Phase20 restore candidate")
     args = parser.parse_args()
     print(json.dumps(build(args.destination.resolve(), args.runtime.resolve(),
                            restore=args.restore, irq_probe=args.irq_probe, fork=args.fork,
+                           incremental=args.incremental,
                            profile=args.profile),
                      sort_keys=True))
 

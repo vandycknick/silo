@@ -307,13 +307,22 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
         layout,
         execution,
         devices,
+        ram_map,
     } = state;
-    for (file, object) in [&ram, &layout, &execution, &devices]
+    for (file, object) in [&ram, &layout, &execution, &devices, &ram_map]
         .into_iter()
         .zip(&request.objects)
     {
         same(file, object.file_device, object.file_inode, object.length)?;
     }
+    let inherited_map = crate::restore::inputs::verified_ram_map(&request, &ram_map)?;
+    let inherited_layout = request
+        .evidence
+        .memory
+        .as_ref()
+        .ok_or_else(|| invalid("restore lacks RAM evidence"))?
+        .binding
+        .ram_layout;
     let deadline = Instant::now() + CONSTRUCTION_BUDGET;
     let shape = crate::krun::restore::inspect(
         &request,
@@ -355,7 +364,10 @@ pub(crate) fn run(launch: Launch<'_>) -> eyre::Result<()> {
             let served = lifecycle::serve(
                 endpoint,
                 binding,
-                native::KrunNative::new(control.clone(), config),
+                native::KrunNative::new(control.clone(), config).inherit_baseline(
+                    crate::virt::lifecycle::Digest32(*inherited_map.id().as_bytes()),
+                    crate::virt::lifecycle::Digest32(*inherited_layout.as_bytes()),
+                ),
                 Some(RestoreAuthority { activation, token }),
                 Box::new(|reason: &str| {
                     eprintln!("krun lifecycle control lost: {reason}");
@@ -470,6 +482,16 @@ pub(crate) mod tests {
                     pause_generation: NonZeroU64::new(1).unwrap(),
                     capture: capture.clone(),
                 },
+                mode: vm_spec::lifecycle::CapturePolicy::Full,
+                baseline: None,
+                full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
+                dirty_chunks: vm_spec::capture::full_dirty_chunks(4096).unwrap(),
+                stats: vm_spec::capture::CaptureMemoryStats {
+                    logical_bytes: 4096,
+                    whole_file_bytes_hashed: 4096,
+                    identity_bytes_hashed: 4096,
+                    ..Default::default()
+                },
             }),
             inventory: objects
                 .iter()
@@ -511,9 +533,20 @@ pub(crate) mod tests {
 
     pub(crate) fn launch(directory: &std::path::Path) -> crate::virt::RestoreLaunch {
         let mut request = request();
+        let map =
+            vm_spec::capture::StreamMap::new(4096, vec![Some(Sha256Digest::of_bytes(&[1; 4096]))])
+                .unwrap();
+        let map_bytes = map.canonical_bytes().unwrap();
+        request.objects[4].length = map_bytes.len() as u64;
+        request.evidence.inventory[4].length = map_bytes.len() as u64;
+        request.evidence.memory.as_mut().unwrap().ram_stream = map.id();
         let objects = std::array::from_fn(|index| {
             let path = directory.join(format!("restore-object-{index}"));
-            let bytes = vec![index as u8 + 1; request.objects[index].length as usize];
+            let bytes = if index == 4 {
+                map_bytes.clone()
+            } else {
+                vec![index as u8 + 1; request.objects[index].length as usize]
+            };
             std::fs::write(&path, &bytes).unwrap();
             let file = File::open(path).unwrap();
             let metadata = file.metadata().unwrap();

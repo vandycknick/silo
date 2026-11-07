@@ -66,8 +66,8 @@ impl SnapshotStore {
         Resource::CapturedRamBytes
             .check(request.configuration.ram_bytes())
             .map_err(StorageError::from)?;
-        if request.policy != vm_spec::lifecycle::CapturePolicy::Full {
-            return Err(invalid("only full capture is delivered"));
+        if !(1..=60).contains(&request.dirty_crossover_percent) {
+            return Err(invalid("dirty crossover percent must be between 1 and 60"));
         }
         let mut logical = request.configuration.ram_bytes();
         for attachment in &request.configuration.attachments {
@@ -279,6 +279,7 @@ impl SnapshotStore {
             configuration: request.configuration.clone(),
             configuration_digest: request.configuration.digest().map_err(invalid)?,
             policy: request.policy,
+            dirty_crossover_percent: request.dirty_crossover_percent,
             resume_policy: request.resume_policy,
             pause: request.pause.clone(),
             ram_bytes: ram,
@@ -792,7 +793,33 @@ impl SnapshotStore {
         for payload in &verified.files {
             payload.recheck()?;
             match payload.role {
-                CaptureRole::Ram | CaptureRole::Disk(_) => {
+                CaptureRole::Ram => {
+                    let sha256 = verified
+                        .evidence
+                        .inventory
+                        .iter()
+                        .find(|entry| entry.role == CaptureRole::Ram)
+                        .ok_or_else(|| invalid("RAM evidence is missing"))?
+                        .sha256;
+                    let (id, roots) = pool.publish_sealed_ram_for_catalog(
+                        payload.file(),
+                        &verified.ram_map,
+                        sha256,
+                    )?;
+                    self.store
+                        .pin_published_storage_dependencies(capture, &[id], &[])
+                        .await?;
+                    drop(roots);
+                    let content = crate::store::snapshot_store::publish_map(
+                        &pool,
+                        &self.store,
+                        capture,
+                        &verified.ram_map,
+                    )
+                    .await?;
+                    streams.insert(payload.role.relative_path(), content);
+                }
+                CaptureRole::Disk(_) => {
                     let (published, roots) = pool.publish_stream_file_for_catalog(
                         payload.file().try_clone()?,
                         payload.length,
@@ -821,6 +848,7 @@ impl SnapshotStore {
                     drop(roots);
                     objects.insert(payload.role.relative_path(), published.digest);
                 }
+                CaptureRole::RamMap => {}
             }
             payload.recheck()?;
         }
@@ -1428,10 +1456,15 @@ const AUTHENTICATION_LANE_STACK_BYTES: usize = 1 << 20;
 /// the general capture scratch, not of this delta.
 const CAPTURE_VERIFICATION_LANE_BYTES: u64 =
     (AUTHENTICATION_BUFFER_BYTES + AUTHENTICATION_LANE_STACK_BYTES) as u64;
-/// Capture-operation memory beyond RAM, charged at reservation before any
-/// staging or verification effect: the general 16 MiB capture scratch plus
-/// the explicit second-lane delta.
-const CAPTURE_SCRATCH_BYTES: u64 = (16 << 20) + CAPTURE_VERIFICATION_LANE_BYTES;
+/// At 1 TiB, five simultaneous decoded maps cost at most 20.625 MiB
+/// (retained/candidate monitor maps and manager codec/adapter ownership), and
+/// one bounded canonical encoding costs under 9.3 MiB. Reserve the rounded
+/// bound separately from byte-copy buffers and verification lane scratch.
+const CAPTURE_RAM_MAP_SCRATCH_BYTES: u64 = 32 << 20;
+/// Charged before staging: byte-copy scratch, complete map ownership and the
+/// explicit second verification lane. No full map enters a control record.
+const CAPTURE_SCRATCH_BYTES: u64 =
+    (16 << 20) + CAPTURE_RAM_MAP_SCRATCH_BYTES + CAPTURE_VERIFICATION_LANE_BYTES;
 
 /// Whether seal verification also derives canonical maps for writable disks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1484,6 +1517,7 @@ pub(crate) struct VerifiedCapture {
     evidence: CaptureEvidence,
     evidence_bytes: Vec<u8>,
     files: Vec<VerifiedPayload>,
+    ram_map: crate::storage::stream::StreamMap,
     directory_identity: (u64, u64),
     control_fingerprints: Vec<(&'static str, SourceFingerprint)>,
 }
@@ -1660,6 +1694,12 @@ fn verify_capture(
             CaptureRole::Devices => crate::store::capture_native::MAX_DEVICE_BYTES,
             CaptureRole::Layout => 65536,
             CaptureRole::Ram => record.plan.ram_bytes,
+            CaptureRole::RamMap => {
+                (vm_spec::capture::MAX_CAPTURE_RAM_BYTES
+                    .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
+                    * 74)
+                    + 256
+            }
             CaptureRole::Disk(_) => Resource::VirtualDiskBytes.maximum(),
         };
         if entry.length > maximum {
@@ -1708,6 +1748,25 @@ fn verify_capture(
         .memory
         .as_ref()
         .ok_or_else(|| invalid("RAM geometry evidence is missing"))?;
+    let map_payload = files
+        .iter()
+        .find(|file| file.role == CaptureRole::RamMap)
+        .ok_or_else(|| invalid("complete RAM map role is missing"))?;
+    let mut map_bytes = Vec::new();
+    let mut map_file = map_payload.file().try_clone()?;
+    map_file.seek(SeekFrom::Start(0))?;
+    map_file
+        .take(map_payload.length + 1)
+        .read_to_end(&mut map_bytes)?;
+    let ram_map = crate::storage::stream::StreamMap::decode(&map_bytes)?;
+    if ram_map.length() != memory.packed_length
+        || ram_map.id().as_bytes() != memory.ram_stream.as_bytes()
+        || ram_map.canonical_bytes()? != map_bytes
+    {
+        return Err(invalid(
+            "complete RAM map differs from sealed memory identity",
+        ));
+    }
     let layout = validate_layout(&bytes, memory, record.plan.ram_bytes)?;
     if memory.binding.ram_layout != Sha256Digest::of_bytes(&bytes)
         || memory.binding.topology != record.plan.configuration_digest
@@ -1744,6 +1803,7 @@ fn verify_capture(
     Ok(VerifiedCapture {
         evidence,
         evidence_bytes,
+        ram_map,
         files,
         directory_identity: (stat.st_dev as u64, stat.st_ino as u64),
         control_fingerprints,
@@ -2168,7 +2228,7 @@ impl SnapshotStore {
                                 return Err(invalid("relocated local cut digest mismatch"));
                             }
                             carrier = Some(stream);
-                        } else if crate::machine::restore::hash_file(&final_file)? != payload.sha256 {
+                        } else if crate::storage::stream::whole_file_sha256(&final_file)? != payload.sha256 {
                             return Err(invalid("relocated local cut digest mismatch"));
                         }
                     }
@@ -2309,11 +2369,11 @@ pub(crate) mod tests {
     }
 
     async fn fixture_with_external_data(include_data: bool) -> Fixture {
-        fixture_source(include_data, false).await
+        fixture_source(include_data, false, CapturePolicy::Full).await
     }
 
     async fn fork_fixture() -> Fixture {
-        fixture_source(false, true).await
+        fixture_source(false, true, CapturePolicy::Full).await
     }
 
     #[tokio::test]
@@ -2419,7 +2479,7 @@ pub(crate) mod tests {
         assert!(inventory.bound.is_empty());
     }
 
-    async fn fixture_source(include_data: bool, fork: bool) -> Fixture {
+    async fn fixture_source(include_data: bool, fork: bool, policy: CapturePolicy) -> Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temporary.path().join("home"));
         let store = Store::new(&paths).await.unwrap();
@@ -2512,7 +2572,8 @@ pub(crate) mod tests {
             } else {
                 Some("checkpoint".into())
             },
-            policy: CapturePolicy::Full,
+            policy,
+            dirty_crossover_percent: 60,
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
             pause: CapturePauseAuthority::Acquire,
         };
@@ -2636,6 +2697,7 @@ pub(crate) mod tests {
         })).unwrap();
         let ram = vec![0x32; 4096];
         let ram_map = StreamHasher::new().hash_reader(Cursor::new(&ram)).unwrap();
+        let ram_map_bytes = ram_map.canonical_bytes().unwrap();
         let binding = CaptureStateBinding {
             native_producer: "unit-file-format".into(),
             silo_producer: Sha256Digest::of_bytes(b"silo"),
@@ -2655,6 +2717,7 @@ pub(crate) mod tests {
                 CaptureRole::Devices => &native_devices,
                 CaptureRole::Ram => &ram,
                 CaptureRole::Layout => &layout,
+                CaptureRole::RamMap => &ram_map_bytes,
                 CaptureRole::Disk(_) => &[0x51; 512],
             };
             match &role {
@@ -2691,6 +2754,21 @@ pub(crate) mod tests {
                 regions: 1,
                 ram_stream: Sha256Digest::from_bytes(*ram_map.id().as_bytes()),
                 binding,
+                mode: CapturePolicy::Full,
+                baseline: None,
+                full_reason: Some(match record.plan.policy {
+                    CapturePolicy::Full => vm_spec::capture::CaptureFullReason::Requested,
+                    CapturePolicy::Incremental => vm_spec::capture::CaptureFullReason::NoBaseline,
+                }),
+                dirty_chunks: vec![1],
+                stats: vm_spec::capture::CaptureMemoryStats {
+                    logical_bytes: 4096,
+                    live_bytes_read: 4096,
+                    full_bytes_written: 4096,
+                    identity_bytes_hashed: 4096,
+                    whole_file_bytes_hashed: 4096,
+                    ..Default::default()
+                },
             }),
             inventory,
             started_at_unix_ms: 1,
@@ -3383,12 +3461,21 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn complete_ram_map_peak_is_charged_at_the_one_tib_boundary() {
+        let chunks = vm_spec::capture::MAX_CAPTURE_RAM_BYTES
+            .div_ceil(crate::storage::limits::CHUNK_SIZE as u64);
+        let decoded = 5 * chunks * std::mem::size_of::<Option<Sha256Digest>>() as u64;
+        let encoded = chunks * 74 + 256;
+        assert!(decoded + encoded <= crate::store::capture::CAPTURE_RAM_MAP_SCRATCH_BYTES);
+    }
+
     #[tokio::test]
     async fn checkpoint_lanes_keep_inventory_order_and_held_inodes_and_reject_either_lane() {
         let sealed = fixture().await;
         let record = &sealed.reservation.record;
-        // The second verification lane is charged explicitly before effects.
-        assert_eq!(CAPTURE_SCRATCH_BYTES, 18 << 20);
+        // Complete map ownership and the second lane are charged before effects.
+        assert_eq!(CAPTURE_SCRATCH_BYTES, 50 << 20);
         assert_eq!(
             record.reservation_memory_bytes,
             record.plan.ram_bytes + CAPTURE_SCRATCH_BYTES
@@ -4496,6 +4583,163 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_complete_map_publishes_without_parent_retention() {
+        let fixture = fixture_source(false, false, CapturePolicy::Incremental).await;
+        let (directory, mut evidence) = seal(&fixture);
+        let memory = evidence.memory.as_mut().unwrap();
+        memory.mode = CapturePolicy::Incremental;
+        memory.baseline = Some(Sha256Digest::of_bytes(b"unretained predecessor stream"));
+        memory.full_reason = None;
+        memory.stats.full_bytes_written = 0;
+        memory.stats.overlay_bytes_written = memory.packed_length;
+        directory
+            .write_file("vm.capture.json", &evidence.canonical_bytes().unwrap())
+            .unwrap();
+        let published = fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let consumer = fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(published.id))
+            .await
+            .unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &consumer.record.capture
+        else {
+            panic!("live checkpoint required");
+        };
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        let (ram, _) = consumer
+            .open_ram(&pool, &execution.memory.stream, execution.memory.length)
+            .unwrap();
+        assert_eq!(ram.metadata().unwrap().len(), 4096);
+        assert_eq!(
+            consumer
+                .authenticated_stream(&execution.memory.stream, 4096)
+                .unwrap()
+                .map()
+                .chunks()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .snapshots
+                .restore_evidence(&consumer, &pool)
+                .unwrap()
+                .evidence
+                .memory
+                .unwrap()
+                .mode,
+            CapturePolicy::Incremental
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_complete_ram_map_corruption_refuses_before_publication() {
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        directory
+            .write_file(&CaptureRole::RamMap.relative_path(), b"{}")
+            .unwrap();
+        assert!(fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            fixture
+                .snapshots
+                .capture_reservation(fixture.reservation.record.capture_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            CaptureState::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_recovery_authenticates_storage_without_opening_captured_ram() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let published = fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&fixture.snapshots.store.images_dir).unwrap();
+        let consumer = fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(published.id))
+            .await
+            .unwrap();
+        let record = consumer.record.clone();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &record.capture
+        else {
+            panic!("live checkpoint required");
+        };
+        drop(consumer);
+        std::fs::remove_file(pool.stream_path(&execution.memory.stream)).unwrap();
+        assert!(fixture
+            .snapshots
+            .consume(&SnapshotRef::Id(published.id))
+            .await
+            .is_err());
+        let recovered = fixture
+            .snapshots
+            .consume_disks(&SnapshotRef::Id(published.id))
+            .await
+            .unwrap();
+        let storage =
+            crate::machine::restore::storage_from_snapshot(&record, published.id).unwrap();
+        assert_eq!(storage.stop_outcome, crate::StorageStopOutcome::Unknown);
+        assert_eq!(storage.snapshot, Some(published.id));
+        assert_eq!(storage.boot, record.boot);
+        let source = recovered
+            .open_copy_source(
+                &pool,
+                &record.root.stream.stream,
+                record.root.geometry.length,
+            )
+            .unwrap();
+        let private = tempfile::tempfile().unwrap();
+        StreamHasher::new()
+            .copy_authenticated(&source, &private)
+            .unwrap();
+        use std::os::unix::fs::FileExt;
+        private.write_all_at(b"private child", 0).unwrap();
+        let source_bytes = std::fs::read(pool.stream_path(&record.root.stream.stream)).unwrap();
+        assert_eq!(source_bytes, vec![0x51; 512]);
+        let path = pool.stream_path(&record.root.stream.stream);
+        drop(recovered);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, vec![0x52; 512]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(fixture
+            .snapshots
+            .consume_disks(&SnapshotRef::Id(published.id))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn measured_ram_sha_rejects_self_hash_valid_contradictory_capture_inventory() {
         use std::os::fd::AsRawFd;
 
@@ -4527,17 +4771,27 @@ pub(crate) mod tests {
         let (ram, measured) = consumer
             .open_ram(&pool, &memory.stream, memory.length)
             .unwrap();
+        let map_bytes = consumer
+            .authenticated_stream(&memory.stream, memory.length)
+            .unwrap()
+            .map()
+            .canonical_bytes()
+            .unwrap();
+        let map_path = fixture._temporary.path().join("restore-memory-map");
+        std::fs::write(&map_path, &map_bytes).unwrap();
         let files = [
             ram,
             consumer.open_object(&pool, &execution.layout).unwrap(),
             consumer.open_object(&pool, &execution.execution).unwrap(),
             consumer.open_object(&pool, &execution.devices).unwrap(),
+            std::fs::File::open(&map_path).unwrap(),
         ];
         let digests = [
             measured,
             Sha256Digest::from_bytes(*execution.layout.as_bytes()),
             Sha256Digest::from_bytes(*execution.execution.as_bytes()),
             Sha256Digest::from_bytes(*execution.devices.as_bytes()),
+            Sha256Digest::of_bytes(&map_bytes),
         ];
         let objects: Vec<_> = files
             .iter()
@@ -4626,7 +4880,7 @@ pub(crate) mod tests {
         assert_eq!(measured_again, measured);
         assert_eq!(
             measured_again,
-            crate::machine::restore::hash_file(&ram).unwrap()
+            crate::storage::stream::whole_file_sha256(&ram).unwrap()
         );
         let metadata = ram.metadata().unwrap();
         request.objects[0] = RestoreObject {

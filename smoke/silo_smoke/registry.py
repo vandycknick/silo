@@ -193,3 +193,26 @@ class LoopbackRegistry:
             self._publications = [entry for entry in self._publications if (entry.name, entry.tag) != (name, tag)]
             self._publications.append(_Publication(name, tag, image))
         return f"{self.host}:{self.port}/smoke/{name}:{tag}"
+
+    @contextmanager
+    def unpublished(self, reference: str) -> Iterator[None]:
+        """Temporarily make one exact source OCI publication unavailable.
+
+        The session registry and every other publication stay live. Restore the
+        fixture on every exit so source-free gates do not poison later tests.
+        """
+        with self._lock:
+            matches = [entry for entry in self._publications
+                       if reference == f"{self.host}:{self.port}/smoke/{entry.name}:{entry.tag}"]
+            if self._stopped or len(matches) != 1:
+                raise ValueError("source-free gate requires one exact live OCI publication")
+            removed = matches[0]
+            self._publications.remove(removed)
+        try:
+            yield
+        finally:
+            with self._lock:
+                if any((entry.name, entry.tag) == (removed.name, removed.tag)
+                       for entry in self._publications):
+                    raise RuntimeError("source OCI publication was replaced while unavailable")
+                self._publications.append(removed)

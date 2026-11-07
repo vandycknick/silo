@@ -34,7 +34,8 @@ use crate::virt::lifecycle::{
 };
 
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
-pub(crate) const MAX_FRAME: usize = 16 * 1024;
+/// Includes the bounded 1 TiB affected bitmap and exact native producer binding.
+pub(crate) const MAX_FRAME: usize = vm_spec::capture::MAX_CAPTURE_RECORD_BYTES;
 /// The largest typed descriptor set of any command.
 pub(crate) const MAX_RIGHTS: usize = 5;
 
@@ -497,6 +498,9 @@ mod tests {
                         profile: digest(2),
                         topology: digest(3),
                     },
+                    policy: vm_spec::lifecycle::CapturePolicy::Full,
+                    dirty_crossover_percent: 60,
+                    baseline: None,
                 },
                 timeout: Duration::from_secs(5),
             },
@@ -621,5 +625,56 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn one_tib_receipt_bitmap_and_exact_producer_fit_bounded_control_frame() {
+        use crate::virt::lifecycle::{
+            CaptureStateBinding, CommandOutcome, NativePauseGeneration, OutputReceipt,
+        };
+        use vm_spec::capture::{
+            full_dirty_chunks, CaptureFullReason, CaptureMemoryStats, MAX_CAPTURE_RAM_BYTES,
+            MAX_NATIVE_PRODUCER_BYTES,
+        };
+        let outcome = CommandOutcome::MemoryCaptured {
+            binding: Box::new(CaptureStateBinding {
+                native_producer: "\u{1}".repeat(MAX_NATIVE_PRODUCER_BYTES),
+                silo_producer: digest(1),
+                profile: digest(2),
+                topology: digest(3),
+                ram_layout: digest(4),
+                source_run: Uuid::new_v4(),
+                capture: Uuid::new_v4(),
+                pause_generation: NativePauseGeneration::new(1).unwrap(),
+            }),
+            ram: OutputReceipt {
+                device: 1,
+                inode: 2,
+                length: MAX_CAPTURE_RAM_BYTES,
+            },
+            layout: OutputReceipt {
+                device: 1,
+                inode: 3,
+                length: 65536,
+            },
+            memory_generation: 1,
+            writers_closed: true,
+            mode: vm_spec::lifecycle::CapturePolicy::Full,
+            baseline: None,
+            full_reason: Some(CaptureFullReason::Requested),
+            dirty_chunks: full_dirty_chunks(MAX_CAPTURE_RAM_BYTES).unwrap(),
+            stats: Box::new(CaptureMemoryStats {
+                logical_bytes: MAX_CAPTURE_RAM_BYTES,
+                identity_bytes_hashed: MAX_CAPTURE_RAM_BYTES,
+                whole_file_bytes_hashed: MAX_CAPTURE_RAM_BYTES,
+                ..Default::default()
+            }),
+        };
+        let bytes = encode(&outcome).unwrap();
+        assert!(bytes.len() > 16 * 1024);
+        assert!(bytes.len() <= MAX_FRAME + 4);
+        let mut buffer = FrameBuffer::default();
+        buffer.extend(&bytes).unwrap();
+        assert_eq!(buffer.next::<CommandOutcome>().unwrap(), Some(outcome));
     }
 }

@@ -531,6 +531,7 @@ impl NativeLifecycle for ScenarioNative {
         owner: NativePauseOwner,
         operation: NativeOperation,
         _profile_operation: NativeOperation,
+        _recovery_operation: NativeOperation,
         _clock_profile: Option<ObservedClockProfile>,
         deadline: Instant,
     ) -> Result<ScenarioToken, NativeFailure> {
@@ -982,6 +983,7 @@ impl NativeLifecycle for ScenarioNative {
         capture: &ScenarioCapture,
         ram: File,
         layout: File,
+        _preparation: &crate::virt::lifecycle::CapturePreparation,
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<MemoryCapture, NativeFailure> {
@@ -1037,6 +1039,18 @@ impl NativeLifecycle for ScenarioNative {
             layout: layout_receipt,
             memory_generation,
             writers_closed: true,
+            mode: vm_spec::lifecycle::CapturePolicy::Full,
+            baseline: None,
+            full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
+            dirty_chunks: vm_spec::capture::full_dirty_chunks(length)
+                .map_err(|error| participant(&error))?,
+            stats: vm_spec::capture::CaptureMemoryStats {
+                logical_bytes: length,
+                live_bytes_read: length,
+                full_bytes_written: length,
+                layout_bytes_written: layout_bytes.len() as u64,
+                ..Default::default()
+            },
         };
         entry.memory = Some(memory.clone());
         entry.state = CaptureState::CandidateComplete;

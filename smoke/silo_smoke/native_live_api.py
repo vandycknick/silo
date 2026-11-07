@@ -34,7 +34,7 @@ import sys
 import time
 
 MIB = 1024 * 1024
-CAPTURE_OUTPUTS = ("memory.ram", "memory-layout.json", "execution.state", "devices.state")
+CAPTURE_OUTPUTS = ("memory.ram", "memory-layout.json", "execution.state", "devices.state", "memory.map.json")
 
 
 def require(condition: bool, explanation: str) -> None:
@@ -1046,7 +1046,8 @@ def main() -> None:
          "api":"Silo engine::{run_process,run_restore_process,Control} / public libkrun::live",
          "fd_roles":{"3":"bootstrap JSON FIFO","4":"reply FIFO","5":"parent-watchdog FIFO","6":"PTY console",
              "7":"new vsock mux","8":"closure lease","9..24":"Raw disks only","25":"readonly RAM","26":"readonly layout",
-             "27":"readonly execution","28":"readonly devices","29":"managed unixgram","30":"console input","31":"console output"},
+             "27":"readonly execution","28":"readonly devices","29":"managed unixgram","30":"console input","31":"console output",
+             "33":"readonly complete RAM map"},
          "normal_worker_wire_delivered":False,"public_delivery":False,"qualification":False,
          "guest_lifecycle_freeze_activate_thaw":"not exercised; native cut/control-service/fence-release proof only"})
     echo=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);echo.bind(("127.0.0.1",0));echo.setblocking(False)

@@ -57,7 +57,7 @@ pub(crate) struct VmmLaunch<'a> {
 /// monitor's final startup outcome or actual failed-start cleanup.
 pub(crate) struct RestoreLaunch {
     pub(crate) request: vm_spec::restore::RestoreRequest,
-    pub(crate) objects: [std::fs::File; 4],
+    pub(crate) objects: [std::fs::File; 5],
     pub(crate) executable: std::fs::File,
     pub(crate) executable_identity: crate::storage::identity_file::SourceFingerprint,
     pub(crate) lowers: Vec<std::fs::File>,

@@ -73,6 +73,16 @@ impl Control {
         self.handle.pause(owner, operation, deadline)
     }
 
+    /// Recover the exact failed memory cut without restoring dirty coverage.
+    pub fn recover_memory_cut(
+        &self,
+        pausing: OperationId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<PauseToken, LiveError> {
+        self.handle.recover_memory_cut(pausing, operation, deadline)
+    }
+
     pub fn resume(
         &self,
         pause: PauseToken,
