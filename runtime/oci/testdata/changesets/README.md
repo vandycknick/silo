@@ -472,3 +472,90 @@ GOWORK=off GOTOOLCHAIN=local go -C runtime/oci/testdata/changesets/extractor tes
 Then run the actual synthetic, socket and six published-image acquisition/
 qualification commands above and retain their JSON+Markdown evidence. No fixture
 generation, build, test, formatter or extraction was executed by the slice coder.
+
+## Phase 21 canonical EROFS compositions
+
+`oci::composition` is a production, path-independent recipe/result boundary.
+It does not select the runtime lower default or retire the flat renderer.
+Recipes bind ordered `LayerResultId`/index-root pairs, a Linux OCI platform,
+`silo-namespace-v1`, `silo-erofs-v1`, and `silo-overlay-v1`. Architecture and
+optional variant are nonempty lowercase OCI tokens of at most 64 bytes.
+Recipe and result IDs use separate `silo:composition-recipe:v1\n` and
+`silo:composition-result:v1\n` SHA-256 domains. Records use the existing canonical
+JSON conventions, closed true-object schemas, safe unsigned integers, strict
+SHA-256 spellings, and a 1 MiB record limit. A result records the fsmeta digest,
+exact padded length and lowercase raw-byte UUID, every ordered pack stream and
+its byte/block range, total lower length, and the storage-owned lower stream ID.
+
+The preparation sequence is:
+
+1. Authenticate the layer results against the retained recipe. The optional
+   `composition::authenticate_layer` helper decodes an exact canonical result
+   against its expected ID, checks its diff-ID recipe and root digest, and
+   authenticates all index pages using the existing changeset decoder.
+2. Authenticate and retain immutable, exact pack file descriptors using the
+   existing storage stream implementation. OCI deliberately supplies no pack or
+   logical-lower stream hasher. Construct borrowed `erofs::Layer` values with
+   each result, decoded changeset, and held pack.
+3. Call `CompositionRecipe::from_layers` for a fresh recipe, or strictly decode
+   the retained recipe and verify its expected recipe ID. Call
+   `composition::prepare(&recipe, &layers, &mut staged_fsmeta)`.
+   Preparation independently checks result IDs, canonical regenerated index
+   roots, diff-ID recipe bindings, exact regular pack lengths, and namespace
+   composition before invoking the EROFS encoder.
+4. Compute the complete logical-lower identity with libvm's existing
+   `StreamHasher`, over exact padded fsmeta followed by **every occurrence** of
+   its complete logical pack bytes. Call `prepared.finalize(lower_stream)`.
+   SHA-256 of the concatenation is not the stream identity ABI.
+5. Publish only after finalization succeeds. Keep staging ownership and closure
+   retention through failure cleanup. OCI borrows file handles and never owns
+   or deletes caller paths.
+
+`PreparedComposition::logical_extents` and `CompositionResult::logical_extents`
+expose fsmeta first and then all pack occurrences, including empty slots and
+repeated objects, with no paths or descriptor text. libvm resolves these
+whole-object identities under closure retention and feeds the existing VMDK
+planner. That planner splits nonempty occurrences at 2 GiB and emits no
+zero-sector FLAT record. There is no second descriptor codec in OCI.
+
+`composition::load_exact` invokes the bounded structural EROFS validator on an
+exact retained fsmeta file, rebuilds the authenticated namespace, and compares
+every result field other than the lower stream ID, which finalization compares
+against the caller's independently computed ID. It does not invoke the writer.
+`composition::regenerate_exact` writes only to a caller-owned staging file and
+refuses any fsmeta digest/UUID/length, pack range, recipe, total-length, or final
+lower-ID mismatch. A mismatch never authorizes replacing the retained result.
+
+`erofs::encode`/`erofs::validate` accept the validated namespace, occurrence-
+ordered borrowed layers, and the recipe ID's canonical ASCII spelling. Their
+`EncodedFsmeta` returns digest, length, UUID and ordered device ranges.
+The fixed binary ABI uses a zero boot/checksum block except for the superblock,
+an occurrence-preserving device table starting in block 1, component-sorted DFS
+extended inodes, sorted inline xattrs, streamed 4 KiB chunk indexes, and canonical
+NULL records for all logically zero chunks regardless of host allocation.
+Fsmeta is bounded at 4 GiB, total lower at 1 TiB, and occurrence count at 1024.
+
+The unit tests at the bottom of `src/composition.rs` cover exact canonical
+recipe bytes and independent identity domains/UUID derivation, malformed and
+non-object record variants, authenticated result/index/page corruption,
+occurrence ordering and empty/repeated slots, deterministic sparse/dense pack
+copies, retained-fsmeta corruption, and regeneration/finalization mismatch
+refusal. Run `cargo test --locked -p oci composition::tests` alongside
+`cargo test --locked -p oci erofs::tests`. These unit tests do not replace
+independent binary-reader or kernel admission evidence.
+
+`libvm::storage::composition::{compose,load_exact,regenerate_exact}` authenticates
+held pack descriptors against the existing stream ABI before invoking OCI.
+Its bounded concatenation scanner preserves file offsets and repeated
+occurrences, checks input fingerprints, and independently binds the fsmeta
+whole-byte digest and complete lower stream map. Callers retain closure leases
+through publication.
+
+`cargo run --locked -p libvm --example erofs_qualification -- OUTPUT rich`
+produces controlled fixtures through those public APIs and the existing pool
+and VMDK planner. Supported fixtures are `empty`, `metadata`, `rich`, `many`
+(1024 occurrences, including zero-length slots), and `split` (a sparse file
+larger than 2 GiB). Every run exercises exact regeneration and retained loading.
+The independent guest probe and upstream fsck/dump commands are documented in
+`smoke/README.md`. Linux x86_64 is exercised locally; other host lanes remain
+pending and must run the same golden vectors, not adopt host-specific digests.

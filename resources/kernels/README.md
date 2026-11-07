@@ -172,6 +172,18 @@ required; building a bare rprobe kernel is rejected.
 The generated `.config` contains thousands of transitive dependencies and
 Kconfig defaults. It is an artifact, not a maintained source file.
 
+The `silo-erofs-v1` lower requires built-in `EROFS_FS`, `EROFS_FS_XATTR`,
+`EROFS_FS_POSIX_ACL`, `EROFS_FS_SECURITY`, and `EXPORTFS`. Uncompressed
+chunk-indexed files and external-device tables are part of the EROFS driver,
+not separate Kconfig options. Compression and file-backed EROFS are disabled;
+the runtime presents fsmeta and ordered payload packs as one read-only VMDK.
+Stable and longterm resolved configs and actual guest mounts are qualified by
+`smoke/tests/test_erofs.py`, including export-handle round trips, indexed
+overlay copy-up, 1024 device slots, and a file crossing 2 GiB FLAT extents.
+This candidate qualification does not enable a runtime profile or live grant.
+Longterm5 remains raw-only.
+
+
 ## Workload Patches
 
 Stable and longterm workload kernels first apply the shared ordered patches in

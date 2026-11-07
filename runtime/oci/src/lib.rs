@@ -1,6 +1,8 @@
 pub mod artifact_registry;
 pub mod changeset;
+pub mod composition;
 mod digest;
+pub mod erofs;
 mod error;
 mod flat_ext4;
 mod lock;

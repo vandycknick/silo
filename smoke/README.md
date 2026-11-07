@@ -23,6 +23,37 @@ make smoke SMOKE_ARGS="--backend vz"   # macOS only
 make smoke SMOKE_ARGS="-k tty_resize --keep"
 ```
 
+### Controlled EROFS encoder qualification
+
+Build `cargo build --locked -p libvm --example erofs_qualification` and the
+stable/longterm workload kernels with the current fragments. Build upstream
+erofs-utils 1.9.4 separately; it is a verifier, not a production dependency.
+
+```sh
+export SILO_SMOKE_EROFS_KERNELS='{"stable":"/absolute/stable/build/vmlinux","longterm":"/absolute/longterm/build/vmlinux"}'
+export SILO_SMOKE_EROFS_UTILS=/absolute/erofs-utils-1.9.4
+uv run --project smoke pytest smoke/tests/test_erofs.py --keep
+```
+
+Each kernel must have its resolved `.config` beside `vmlinux`. The fixture
+producer authenticates packs, composes fsmeta twice, checks exact retained
+loading, and publishes a descriptor through the existing storage/VMDK codec.
+The suite runs upstream `fsck.erofs` and `dump.erofs`, then mounts the actual
+VMDK in a guest using a static, independently authored C probe. It covers
+empty/metadata-only packs, byte names and symlinks, ownership and timestamps,
+xattrs and ACLs, hardlinks and special inode types, NULL chunks, 1024 device
+slots, and a sparse file larger than 2 GiB. Rich fixtures also round-trip
+export handles and verify indexed-overlay copy-up and clean remount.
+
+The 1024-slot fixture uses structural fsck and guest reads instead of passing
+1024 `--device` arguments, which exceed erofs-utils' 256-device CLI limit.
+All other fixtures use `fsck.erofs --extract` to verify file data without
+extracting host special files. Monitor identity, kernel/config digests,
+descriptor backing digests, and guest output are retained. These are
+candidate-only format/attachment checks, not a production-root or live
+qualification grant. Other host/architecture lanes remain pending.
+
+
 ### Controlled Distribution registry
 
 `test_distribution_registry.py` runs CNCF Distribution 3.1.2 as a real local

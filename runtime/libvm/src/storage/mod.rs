@@ -2,6 +2,7 @@
 //!
 //! Byte-object digests and logical stream IDs deliberately occupy different types
 //! and directories. These primitives do not assign image or snapshot semantics.
+pub mod composition;
 pub mod identity;
 pub mod identity_file;
 pub mod limits;
