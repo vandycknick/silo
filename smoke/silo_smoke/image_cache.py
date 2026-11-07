@@ -19,8 +19,10 @@ import uuid
 
 CACHE_NAME = "image-catalog"
 POOL_DIRECTORIES = ("objects", "streams", "source-blobs", "transport")
+# db_config is deliberately absent: each seeded Home must initialize its own
+# persistent runtime identity on first open, never copy the preparer's.
 CATALOG_TABLES = {
-    "_sqlx_migrations", "db_config", "image_manifest", "image_ref", "image_config",
+    "_sqlx_migrations", "image_manifest", "image_ref", "image_config",
     "image_layer", "image_manifest_layer", "image_rootfs_artifact",
 }
 

@@ -1500,6 +1500,7 @@ impl Runtime {
                 message: format!("machine {} has no durable storage record", config.id),
             })?;
         storage.validate()?;
+        storage.ownership.ensure_owned(config.id)?;
         if !storage.external_requirements.is_empty() {
             return Err(crate::machine::root_storage::invalid(
                 "required external resources are unresolved; supply explicit destination mappings",
@@ -2607,11 +2608,18 @@ fn validate_launch_storage(storage: &crate::MachineStorageRecord) -> Result<(), 
     };
     storage.validate_persistent()?;
     let admitted = matches!(
-        (&storage.root, &storage.boot, storage.profile, storage.backend),
-        (MachineRoot::OpaqueRaw { path, .. },
-         BootProfile::LinuxDirect { .. },
-         StorageProfile::OpaqueRawV1, BackendRequirement::RawBlock)
-        if path.as_path() == crate::paths::root_disk_relative_path().as_path()
+        (
+            &storage.root,
+            &storage.boot,
+            storage.profile,
+            storage.backend
+        ),
+        (
+            MachineRoot::OpaqueRaw { .. },
+            BootProfile::LinuxDirect { .. },
+            StorageProfile::OpaqueRawV1,
+            BackendRequirement::RawBlock
+        )
     ) || matches!(
         (
             &storage.root,
@@ -2632,7 +2640,7 @@ fn validate_launch_storage(storage: &crate::MachineStorageRecord) -> Result<(), 
             BackendRequirement::KrunOverlay
         )
     );
-    if !admitted || storage.fence.is_some() || storage.relocation_operation.is_some() {
+    if !admitted {
         return Err(LibVmError::InvalidStorageRecord {
             record: "machine-storage",
             message: "storage/boot combination has not passed the launch gate".into(),
@@ -2685,13 +2693,12 @@ pub(crate) fn empty_hardware() -> Hardware {
 
 pub(crate) fn validate_root_disk_growth(
     config: &MachineConfig,
+    path: &Path,
     desired_size: u64,
 ) -> Result<(), LibVmError> {
     crate::storage::limits::validate_disk_length(desired_size)
         .map_err(crate::storage::StorageError::from)?;
-    let root_disk_path = config
-        .machine_dir
-        .join(crate::paths::root_disk_relative_path());
+    let root_disk_path = config.machine_dir.join(path);
     let current_size = fs::metadata(&root_disk_path)?.len();
     if desired_size < current_size {
         return Err(LibVmError::InvalidMachineUpdate {
@@ -2708,6 +2715,7 @@ pub(crate) fn validate_root_disk_growth(
 
 pub(crate) fn reconcile_root_disk_size(
     config: &MachineConfig,
+    path: &Path,
 ) -> Result<crate::machine::root_disk::RootDiskResizeOutcome, LibVmError> {
     let Some(desired_size) = config.root_disk_size else {
         return Ok(crate::machine::root_disk::RootDiskResizeOutcome::GuestRequired);
@@ -2715,9 +2723,7 @@ pub(crate) fn reconcile_root_disk_size(
     crate::storage::limits::validate_disk_length(desired_size)
         .map_err(crate::storage::StorageError::from)?;
 
-    let root_disk_path = config
-        .machine_dir
-        .join(crate::paths::root_disk_relative_path());
+    let root_disk_path = config.machine_dir.join(path);
     resize_raw_disk(&root_disk_path, desired_size).map_err(Into::into)
 }
 
@@ -6545,7 +6551,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn launch_admission_checks_pinned_root_selectors_and_canonical_paths() {
+    async fn launch_admission_checks_pinned_root_selectors() {
         let mut storage = crate::MachineStorageRecord::opaque_raw(
             crate::PrivatePath::new("root.raw").unwrap(),
             512,
@@ -6584,16 +6590,6 @@ pub(crate) mod tests {
             assert!(crate::runtime::core::validate_launch_storage(&partitioned).is_err());
         }
         crate::runtime::core::validate_launch_storage(&storage).unwrap();
-        if let crate::MachineRoot::OpaqueRaw { path, .. } = &mut storage.root {
-            *path = crate::PrivatePath::new("different.raw").unwrap();
-        }
-        assert!(matches!(
-            crate::runtime::core::validate_launch_storage(&storage),
-            Err(LibVmError::InvalidStorageRecord { .. })
-        ));
-        if let crate::MachineRoot::OpaqueRaw { path, .. } = &mut storage.root {
-            *path = crate::PrivatePath::new("root.raw").unwrap();
-        }
         if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
             *root_selector = crate::RootSelector::ManagedOverlay;
         }

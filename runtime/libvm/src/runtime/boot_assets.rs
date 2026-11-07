@@ -385,6 +385,44 @@ pub(crate) fn locally_admitted_replacement(
     Ok((digest != current.digest()?).then_some(digest))
 }
 
+/// The complete packaged tuple this runtime would pin for `boot`, qualified
+/// for its backend but not published. A handoff destination proposes it as
+/// an explicit replacement bundle; approval still names its digest.
+pub(crate) fn packaged_binding(
+    boot: &BootProfile,
+    agent: bool,
+    context: BootSelectionContext<'_>,
+) -> Result<BootBinding, LibVmError> {
+    let BootProfile::LinuxDirect {
+        kernel_architecture,
+        ..
+    } = boot
+    else {
+        return Err(invalid_capture("packaged boot requires Linux direct boot"));
+    };
+    let kernel = qualify_kernel_source(context.default_kernel)?;
+    let initramfs = qualify_capture_source(context.default_initramfs)?;
+    let agent = agent
+        .then(|| qualify_capture_source(context.default_agent))
+        .transpose()?;
+    let assets = qualify_captured_assets(
+        boot,
+        kernel,
+        initramfs,
+        context.backend,
+        context.native_executable,
+    )?;
+    Ok(BootBinding::Pinned {
+        kernel: ObjectDigest::from_sha256(assets.kernel().digest()),
+        base_initramfs: ObjectDigest::from_sha256(assets.initramfs().digest()),
+        agent: agent
+            .as_ref()
+            .map(|asset| ObjectDigest::from_sha256(asset.digest())),
+        architecture: *kernel_architecture,
+        abi: DIRECT_BOOT_ABI.to_owned(),
+    })
+}
+
 // One short-lived selection owns its retained descriptors; boxing adds an
 // allocation without reducing a collection or long-lived per-machine footprint.
 #[allow(clippy::large_enum_variant)]

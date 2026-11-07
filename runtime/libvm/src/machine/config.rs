@@ -29,6 +29,7 @@ impl Machine {
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
         let storage = runtime.machine_storage_record(config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
         runtime
             .preflight_stopped_generation_locked(&config, &storage)
             .await?;
@@ -77,6 +78,7 @@ impl Machine {
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
         let storage = runtime.machine_storage_record(config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
         runtime
             .preflight_stopped_generation_locked(&config, &storage)
             .await?;
@@ -179,6 +181,7 @@ impl Machine {
         // Refuse live attachment owners before node-state lock creation or
         // reconciliation can change the source's durable lifecycle record.
         let storage = runtime.machine_storage_record(config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
         runtime
             .preflight_stopped_generation_locked(&config, &storage)
             .await?;
@@ -232,11 +235,10 @@ impl Machine {
                 None
             };
         if let Some(size_bytes) = update.root_disk_size {
-            if matches!(
-                storage_update.as_ref().map(|storage| &storage.root),
-                Some(crate::MachineRoot::OpaqueRaw { .. })
-            ) {
-                validate_root_disk_growth(&config, size_bytes)?;
+            if let Some(crate::MachineRoot::OpaqueRaw { path, .. }) =
+                storage_update.as_ref().map(|storage| &storage.root)
+            {
+                validate_root_disk_growth(&config, path.as_path(), size_bytes)?;
             }
             config.root_disk_size = Some(size_bytes);
         }
@@ -479,6 +481,7 @@ impl Machine {
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
         let mut storage = runtime.machine_storage_record(config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
         runtime
             .preflight_stopped_generation_locked(&config, &storage)
             .await?;

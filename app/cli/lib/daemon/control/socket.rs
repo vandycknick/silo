@@ -135,6 +135,12 @@ impl BoundServer {
                 interceptor.clone(),
             ))
             .add_service(tonic::service::interceptor::InterceptedService::new(
+                w::handoff_service_server::HandoffServiceServer::new(Service(self.state.clone()))
+                    .max_decoding_message_size(limit)
+                    .max_encoding_message_size(limit),
+                interceptor.clone(),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
                 w::runtime_service_server::RuntimeServiceServer::new(Service(self.state.clone()))
                     .max_decoding_message_size(limit)
                     .max_encoding_message_size(limit),

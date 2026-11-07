@@ -1252,3 +1252,80 @@ async fn restore_resource_policy_is_validated_before_daemon_native_initializatio
     assert_eq!(owner.capacity.available_permits(), 64);
     assert!(!owner.host.home().join("state.db").exists());
 }
+
+#[tokio::test]
+async fn handoff_rejects_malformed_streams_over_private_socket_without_native_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = state(root.path());
+    let dir = root.path().join("control");
+    let server = socket::BoundServer::bind_at(owner.clone(), dir.clone()).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let path = dir.join("control.sock");
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let mut client = w::handoff_service_client::HandoffServiceClient::new(channel);
+    for frames in [
+        vec![],
+        vec![w::HandoffWriteRequest { part: None }],
+        vec![w::HandoffWriteRequest {
+            part: Some(w::handoff_write_request::Part::Frame(vec![1])),
+        }],
+        vec![w::HandoffWriteRequest {
+            part: Some(w::handoff_write_request::Part::Header(
+                w::HandoffPayloadRequest {
+                    operation: uuid::Uuid::nil().to_string(),
+                    descriptor: None,
+                    length: 1,
+                },
+            )),
+        }],
+        vec![w::HandoffWriteRequest {
+            part: Some(w::handoff_write_request::Part::Header(
+                w::HandoffPayloadRequest {
+                    operation: uuid::Uuid::new_v4().to_string(),
+                    descriptor: Some(w::HandoffPayloadDescriptor {
+                        payload: Some(w::handoff_payload_descriptor::Payload::Chunk(
+                            w::HandoffPayloadIdentity {
+                                digest: format!("sha256:{}", "ab".repeat(32)),
+                                length: 1,
+                            },
+                        )),
+                    }),
+                    length: 2,
+                },
+            )),
+        }],
+    ] {
+        let error = client
+            .write_payload(tokio_stream::iter(frames))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    let mut stale = Request::new(());
+    stale.metadata_mut().insert(
+        "x-silo-helper-generation",
+        uuid::Uuid::new_v4().to_string().parse().unwrap(),
+    );
+    assert_eq!(
+        client.get_capabilities(stale).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(owner.runtime.get().is_none());
+    assert!(owner.handoff.get().is_none());
+    assert!(owner.components.get().is_none());
+    owner.drain_mutations().await.unwrap();
+    assert_eq!(owner.capacity.available_permits(), 64);
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+}

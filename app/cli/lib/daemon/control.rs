@@ -10,6 +10,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, OnceCell, Semaphore};
 use tonic::{Request, Status};
 mod daemon;
+mod handoff;
 mod machine;
 mod network;
 mod runtime;
@@ -78,6 +79,7 @@ pub(crate) struct ControlState {
     pub(super) shutdown_only: bool,
     components: OnceCell<ResolvedRuntimeComponents>,
     runtime: OnceCell<Runtime>,
+    handoff: OnceCell<libvm::handoff::service::HandoffService>,
     live_query: OnceCell<libvm::LiveCapabilityQuery>,
     publisher: Arc<crate::daemon::status::StatusPublisher>,
     admission: Mutex<Admission>,
@@ -102,6 +104,7 @@ impl ControlState {
             shutdown_only: false,
             components: OnceCell::new(),
             runtime: OnceCell::new(),
+            handoff: OnceCell::new(),
             live_query: OnceCell::new(),
             publisher,
             admission: Mutex::new(Admission {

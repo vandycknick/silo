@@ -191,6 +191,34 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = message.clone();
             tonic::Code::InvalidArgument
         }
+        E::Handoff(error) => {
+            use libvm::handoff::types::HandoffError as H;
+            d.safe_message = error.to_string();
+            match error {
+                H::InvalidIdentity
+                | H::SameRuntime
+                | H::WrongRuntime
+                | H::EpochExhausted
+                | H::ReceiptMismatch => {
+                    d.kind = 1;
+                    tonic::Code::InvalidArgument
+                }
+                H::UnknownOperation { operation } => {
+                    d.kind = 2;
+                    d.reference = Some(operation.to_string());
+                    tonic::Code::NotFound
+                }
+                H::MachineIdConflict { machine } => {
+                    d.kind = 3;
+                    d.reference = Some(machine.to_string());
+                    tonic::Code::AlreadyExists
+                }
+                _ => {
+                    d.kind = 4;
+                    tonic::Code::FailedPrecondition
+                }
+            }
+        }
         E::ArtifactInvalid { .. } | E::ArtifactWire(_) => {
             d.kind = 1;
             d.safe_message = "artifact integrity or semantic validation failed".into();

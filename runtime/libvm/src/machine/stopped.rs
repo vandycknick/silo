@@ -227,7 +227,7 @@ pub async fn preflight_stopped(
         let (machine, state) = observer.lookup(reference).await?;
         let storage = observer.machine_storage(machine.id).await?;
         validate_managed_attachments(&machine.spec, &storage)?;
-        validate_capture_shape(&storage, snapshot)?;
+        validate_capture_shape(&storage, snapshot, StoppedAdmission::Ordinary)?;
         check_policy(&external_requirements(&machine.spec, &storage)?, policy)?;
         if let Some(pid) = state.vmm_pid {
             if let Some(identity) = crate::supervisor::process::ProcessIdentity::for_pid(pid)? {
@@ -353,13 +353,22 @@ impl Runtime {
     }
 }
 
-struct StoppedStorageGuard {
-    config: MachineConfig,
-    storage: MachineStorageRecord,
-    files: Vec<FencedSource>,
+pub(crate) struct StoppedStorageGuard {
+    pub(crate) config: MachineConfig,
+    pub(crate) storage: MachineStorageRecord,
+    pub(crate) files: Vec<FencedSource>,
     _lifecycle: crate::lock_manager::LockGuard,
     _disks: Vec<StorageLock>,
     _lifetime: Option<crate::lock_manager::MachineLifetimeLock>,
+}
+
+/// Whose stopped boundary is being admitted. Ordinary copies require plain
+/// ownership; a handoff cut requires exactly its own durable reservation,
+/// which the ownership ledger wrote under this same lifecycle lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoppedAdmission {
+    Ordinary,
+    Handoff(crate::handoff::types::OperationId),
 }
 
 /// An exact private inode held under the source machine's storage fences.
@@ -415,16 +424,17 @@ impl PrivateSource {
     }
 }
 
-async fn admit_stopped(
+pub(crate) async fn admit_stopped(
     runtime: &Runtime,
     id: MachineId,
     snapshot: bool,
     policy: &ExternalResourcePolicy,
+    admission: StoppedAdmission,
 ) -> Result<StoppedStorageGuard, LibVmError> {
     let (lifecycle, config) = runtime.lock_machine_config(id).await?;
     runtime.validate_machine_data_dir(&config)?;
     let initial_storage = runtime.machine_storage_record(id).await?;
-    validate_capture_shape(&initial_storage, snapshot)?;
+    validate_capture_shape(&initial_storage, snapshot, admission)?;
     validate_managed_attachments(&config.spec, &initial_storage)?;
     check_policy(
         &external_requirements(&config.spec, &initial_storage)?,
@@ -486,7 +496,7 @@ async fn admit_stopped(
     }
     let mut storage = runtime.machine_storage_record(id).await?;
     storage.disks.sort_by_key(|disk| disk.order);
-    validate_capture_shape(&storage, snapshot)?;
+    validate_capture_shape(&storage, snapshot, admission)?;
     let directory = OwnedDirectory::open_existing_root(&config.machine_dir)?
         .ok_or_else(|| invalid("source machine directory is missing"))?;
     let mut files = Vec::with_capacity(storage.disks.len() + 1);
@@ -518,15 +528,19 @@ async fn admit_stopped(
     })
 }
 
-fn validate_capture_shape(
+pub(crate) fn validate_capture_shape(
     storage: &MachineStorageRecord,
     snapshot: bool,
+    admission: StoppedAdmission,
 ) -> Result<(), LibVmError> {
     storage.validate()?;
-    if storage.operation.is_some()
-        || storage.fence.is_some()
-        || storage.relocation_operation.is_some()
-    {
+    let admitted = match admission {
+        StoppedAdmission::Ordinary => storage.ownership.is_owned(),
+        StoppedAdmission::Handoff(operation) => {
+            storage.ownership == crate::MachineOwnership::Reserved { operation }
+        }
+    };
+    if storage.operation.is_some() || !admitted {
         return Err(invalid(
             "storage has an unresolved offline operation or ownership fence",
         ));
@@ -550,7 +564,7 @@ fn validate_capture_shape(
     Ok(())
 }
 
-fn validate_managed_attachments(
+pub(crate) fn validate_managed_attachments(
     spec: &vm_spec::VmSpec,
     storage: &MachineStorageRecord,
 ) -> Result<(), LibVmError> {
@@ -618,7 +632,7 @@ fn validate_upper_metadata(storage: &MachineStorageRecord, file: &File) -> Resul
     Ok(())
 }
 
-fn root_private(storage: &MachineStorageRecord) -> (&crate::PrivatePath, u64) {
+pub(crate) fn root_private(storage: &MachineStorageRecord) -> (&crate::PrivatePath, u64) {
     match &storage.root {
         MachineRoot::OpaqueRaw { path, geometry, .. } => (path, geometry.length),
         MachineRoot::LinuxOverlay {
@@ -627,7 +641,7 @@ fn root_private(storage: &MachineStorageRecord) -> (&crate::PrivatePath, u64) {
     }
 }
 
-fn open_private(
+pub(crate) fn open_private(
     directory: &OwnedDirectory,
     path: &crate::PrivatePath,
     length: u64,
@@ -677,7 +691,7 @@ fn validate_snapshot_policy(policy: &ExternalResourcePolicy) -> Result<(), LibVm
     Ok(())
 }
 
-fn external_requirements(
+pub(crate) fn external_requirements(
     spec: &vm_spec::VmSpec,
     storage: &MachineStorageRecord,
 ) -> Result<Vec<ExternalResourceRequirement>, LibVmError> {
@@ -744,7 +758,7 @@ fn external_requirements(
     Ok(requirements)
 }
 
-fn check_policy(
+pub(crate) fn check_policy(
     requirements: &[ExternalResourceRequirement],
     policy: &ExternalResourcePolicy,
 ) -> Result<(), LibVmError> {
@@ -776,7 +790,7 @@ fn check_policy(
     }
 }
 
-fn apply_resources(
+pub(crate) fn apply_resources(
     configuration: &mut SnapshotConfiguration,
     requirements: &[ExternalResourceRequirement],
     policy: &ExternalResourcePolicy,
@@ -846,7 +860,14 @@ async fn fork_owned(
     let _names = runtime.lock_machine_names().await?;
     let name =
         crate::machine::builder::stopped_child_name(&runtime, options.name.as_deref()).await?;
-    let mut source = admit_stopped(&runtime, id, false, &options.external_resources).await?;
+    let mut source = admit_stopped(
+        &runtime,
+        id,
+        false,
+        &options.external_resources,
+        StoppedAdmission::Ordinary,
+    )
+    .await?;
     let store = runtime.native_store()?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage)?;
@@ -904,7 +925,14 @@ async fn snapshot_owned(
         crate::store::snapshot_store::validate_alias(name)?;
     }
     let _names = runtime.lock_machine_names().await?;
-    let mut source = admit_stopped(&runtime, id, true, &options.external_resources).await?;
+    let mut source = admit_stopped(
+        &runtime,
+        id,
+        true,
+        &options.external_resources,
+        StoppedAdmission::Ordinary,
+    )
+    .await?;
     let store = runtime.native_store()?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage)?;
@@ -1017,8 +1045,7 @@ fn reset_child_storage(storage: &mut MachineStorageRecord) {
     storage.storage_generation = 0;
     storage.ownership_epoch = 0;
     storage.stop_outcome = StorageStopOutcome::Unknown;
-    storage.relocation_operation = None;
-    storage.fence = None;
+    storage.ownership = crate::MachineOwnership::Owned;
     storage.operation = None;
     storage.image = None;
     storage.snapshot = None;
@@ -1075,14 +1102,13 @@ fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord
         storage_generation: 0,
         ownership_epoch: 0,
         stop_outcome: StorageStopOutcome::Unknown,
-        relocation_operation: None,
-        fence: None,
+        ownership: crate::MachineOwnership::Owned,
         operation: None,
         image: None,
         snapshot: None,
     };
     reset_child_storage(&mut storage);
-    validate_capture_shape(&storage, true)?;
+    validate_capture_shape(&storage, true, StoppedAdmission::Ordinary)?;
     if !matches!(
         storage.boot,
         BootProfile::LinuxDirect {

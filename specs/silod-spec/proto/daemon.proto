@@ -72,6 +72,165 @@ service RuntimeService {
  rpc GetFork(ForkOperationRef) returns (LiveForkResult);
  rpc CancelFork(ForkOperationRef) returns (LiveForkResult);
 }
+// Same-user stopped-storage handoff. No RPC starts either machine.
+service HandoffService {
+ rpc GetCapabilities(google.protobuf.Empty) returns (HandoffCapabilities);
+ rpc ObserveSource(MachineRef) returns (HandoffDocument);
+ rpc PreflightDestination(HandoffPreflightRequest) returns (HandoffProposal);
+ rpc BeginSource(HandoffReceiveRequest) returns (HandoffStatus);
+ rpc CaptureSource(HandoffCaptureRequest) returns (HandoffCaptureOffer);
+ rpc ReadPayload(HandoffReadRequest) returns (HandoffPayloadFrame);
+ rpc FenceSource(HandoffPreparedReceipt) returns (HandoffCommitAuthorization);
+ rpc ResolveSource(HandoffTerminalReceipt) returns (HandoffStatus);
+ rpc Receive(HandoffReceiveRequest) returns (HandoffStatus);
+ rpc OfferCapture(HandoffCaptureOffer) returns (HandoffStatus);
+ rpc ListNeeds(HandoffNeedsRequest) returns (HandoffNeedsPage);
+ rpc WritePayload(stream HandoffWriteRequest) returns (HandoffPayloadReceipt);
+ rpc Prepare(HandoffBinding) returns (HandoffPreparedReceipt);
+ rpc Commit(HandoffCommitAuthorization) returns (HandoffTerminalReceipt);
+ rpc Abort(HandoffIntent) returns (HandoffTerminalReceipt);
+ rpc GetStatus(HandoffOperationRef) returns (HandoffStatus);
+ rpc GetPlan(HandoffOperationRef) returns (HandoffDocument);
+}
+// Canonical typed document bytes, bounded to 1 MiB and checked against digest.
+message HandoffDocument { string digest = 1; bytes content = 2; }
+message HandoffCapabilities {
+ string runtime = 1;
+ GuestArchitecture kernel_architecture = 2;
+ LiveBackend backend = 3;
+ uint32 max_document_bytes = 4;
+ uint32 max_frame_bytes = 5;
+ uint32 max_page_entries = 6;
+}
+message HandoffOperationRef { string operation = 1; }
+message HandoffBootSelection {
+ oneof selection {
+  google.protobuf.Empty exact_recorded = 1;
+  string destination_bundle = 2;
+ }
+}
+message HandoffDestinationRequest {
+ HandoffMode mode = 1;
+ HandoffBootSelection boot = 2;
+ ExternalResourcePolicy resources = 3;
+ optional string name = 4;
+ string operation = 5;
+}
+message HandoffPreflightRequest {
+ HandoffDocument observation = 1;
+ HandoffDestinationRequest destination = 2;
+}
+message HandoffTransferEstimate {
+ uint64 writable_bytes = 1;
+ uint64 immutable_bytes = 2;
+ uint64 missing_immutable_bytes = 3;
+ uint64 available_bytes = 4;
+}
+message HandoffProposal { HandoffDocument plan = 1; HandoffTransferEstimate estimate = 2; }
+enum HandoffSourceStop {
+ HANDOFF_SOURCE_STOP_UNSPECIFIED = 0;
+ HANDOFF_SOURCE_STOP_REQUIRE = 1;
+ HANDOFF_SOURCE_STOP_STOP_RUNNING = 2;
+}
+message HandoffCaptureRequest {
+ string operation = 1;
+ HandoffDocument approved_plan = 2;
+ HandoffSourceStop stop = 3;
+}
+message HandoffCaptureOffer { HandoffBinding binding = 1; HandoffDocument manifest = 2; }
+message HandoffReceiveRequest { string operation = 1; HandoffDocument approved_plan = 2; }
+message HandoffPayloadIdentity { string digest = 1; uint64 length = 2; }
+message HandoffPayloadDescriptor {
+ oneof payload {
+  HandoffPayloadIdentity object = 1;
+  HandoffPayloadIdentity chunk = 2;
+  string stream_map = 3;
+ }
+}
+message HandoffPayloadRequest { string operation = 1; HandoffPayloadDescriptor descriptor = 2; uint64 length = 3; }
+message HandoffReadRequest {
+ string operation = 1;
+ HandoffPayloadDescriptor descriptor = 2;
+ uint64 offset = 3;
+ uint32 max_bytes = 4;
+}
+message HandoffPayloadFrame { bytes content = 1; bool end = 2; uint64 total_length = 3; }
+message HandoffNeedsRequest { string operation = 1; optional uint64 cursor = 2; uint32 limit = 3; }
+message HandoffNeedsPage { repeated HandoffPayloadDescriptor needs = 1; optional uint64 next = 2; }
+// Exactly one header first, followed by nonempty frames of at most 1 MiB.
+// EOF completes only the descriptor's exact length; cancellation discards partials.
+message HandoffWriteRequest {
+ oneof part { HandoffPayloadRequest header = 1; bytes frame = 2; }
+}
+message HandoffPayloadReceipt { HandoffPayloadDescriptor descriptor = 1; uint64 bytes = 2; }
+enum HandoffRole {
+ HANDOFF_ROLE_UNSPECIFIED = 0;
+ HANDOFF_ROLE_SOURCE = 1;
+ HANDOFF_ROLE_DESTINATION = 2;
+}
+enum HandoffPhase {
+ HANDOFF_PHASE_UNSPECIFIED = 0;
+ HANDOFF_PHASE_RESERVED = 1;
+ HANDOFF_PHASE_CAPTURED = 2;
+ HANDOFF_PHASE_FENCED = 3;
+ HANDOFF_PHASE_RECEIVING = 4;
+ HANDOFF_PHASE_PREPARED = 5;
+ HANDOFF_PHASE_COMMITTED = 6;
+ HANDOFF_PHASE_ABORTED = 7;
+ HANDOFF_PHASE_INTENDED = 8;
+}
+message HandoffRecord {
+ uint32 schema = 1;
+ HandoffRole role = 2;
+ HandoffIntent intent = 3;
+ optional HandoffBinding binding = 4;
+ HandoffPhase phase = 5;
+ optional HandoffPreparedReceipt prepared = 6;
+ optional HandoffCommitAuthorization authorization = 7;
+ optional HandoffTerminalReceipt terminal = 8;
+}
+// An absent record is unknown, never evidence of durable abort.
+message HandoffStatus { optional HandoffRecord record = 1; }
+enum HandoffMode {
+ HANDOFF_MODE_UNSPECIFIED = 0;
+ HANDOFF_MODE_FORK = 1;
+ HANDOFF_MODE_RELOCATE = 2;
+}
+message HandoffIntent {
+ string operation = 1;
+ HandoffMode mode = 2;
+ string source_runtime = 3;
+ string destination_runtime = 4;
+ string source_machine = 5;
+ string destination_machine = 6;
+ uint64 from_epoch = 7;
+ string intent_digest = 8;
+ string approved_plan_digest = 9;
+}
+message HandoffBinding {
+ HandoffIntent intent = 1;
+ string capture = 2;
+ string capture_manifest_digest = 3;
+}
+message HandoffPreparedReceipt {
+ HandoffBinding binding = 1;
+ string receipt_id = 2;
+}
+message HandoffCommitAuthorization {
+ HandoffPreparedReceipt prepared = 1;
+ string nonce = 2;
+}
+enum HandoffDecision {
+ HANDOFF_DECISION_UNSPECIFIED = 0;
+ HANDOFF_DECISION_COMMITTED = 1;
+ HANDOFF_DECISION_ABORTED = 2;
+}
+message HandoffTerminalReceipt {
+ HandoffIntent intent = 1;
+ optional HandoffBinding binding = 2;
+ HandoffDecision decision = 3;
+ optional HandoffCommitAuthorization authorization = 4;
+}
 message InspectArtifactRequest { string reference = 1; }
 message AcquireArtifactRequest {
  string reference = 1;

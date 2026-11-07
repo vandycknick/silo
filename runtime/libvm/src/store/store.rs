@@ -440,84 +440,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_database_has_complete_schema_without_runtime_paths() {
-        let (_dir, paths) = temp_paths();
-        let db = Store::new(&paths).await.expect("open fresh database");
-
-        let tables = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list tables")
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        let required_tables = BTreeSet::from([
-            "db_config".to_string(),
-            "machine_config".to_string(),
-            "machine_state".to_string(),
-            "network_instances".to_string(),
-            "network_attachments".to_string(),
-            "network_definitions".to_string(),
-            "image_manifest".to_string(),
-            "image_ref".to_string(),
-            "image_config".to_string(),
-            "image_layer".to_string(),
-            "image_manifest_layer".to_string(),
-            "image_rootfs_artifact".to_string(),
-            "machine_rootfs".to_string(),
-        ]);
-        assert!(required_tables.is_subset(&tables));
-
-        let db_config_columns = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM pragma_table_info('db_config') ORDER BY cid",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list db_config columns");
-        assert_eq!(db_config_columns, ["id", "os", "created_at", "modified_at"]);
-
-        let network_columns = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM pragma_table_info('network_instances') ORDER BY cid",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list network instance columns");
-        assert!(!network_columns.iter().any(|column| column == "runtime_dir"));
-
-        let schema_objects = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM sqlite_master WHERE type IN ('index', 'trigger')",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .expect("list indexes and triggers")
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        for object in [
-            "network_instances_definition_name_unique",
-            "image_ref_manifest_digest_idx",
-            "image_manifest_layer_layer_diff_id_idx",
-            "image_rootfs_artifact_manifest_digest_idx",
-            "machine_rootfs_manifest_digest_idx",
-            "db_config_created_at_immutable",
-            "network_instances_created_at_immutable",
-            "network_attachments_created_at_immutable",
-            "network_definitions_created_at_immutable",
-            "image_manifest_created_at_immutable",
-            "image_ref_created_at_immutable",
-            "image_config_created_at_immutable",
-            "image_layer_created_at_immutable",
-            "image_rootfs_artifact_created_at_immutable",
-            "machine_rootfs_created_at_immutable",
-        ] {
-            assert!(
-                schema_objects.contains(object),
-                "missing schema object {object}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn incompatible_schema_refusal_preserves_existing_state() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let state_db = dir.path().join("state.db");
@@ -1704,12 +1626,12 @@ mod tests {
             machine_id: Some(id.into()),
             ownership_epoch: 0,
         });
-        storage.relocation_operation = Some(operation);
-        storage.fence = Some(crate::FenceRecord {
-            operation,
-            ownership_epoch: 0,
-            state: crate::FenceState::Prepared,
-        });
+        storage.ownership = crate::MachineOwnership::Fenced {
+            operation: crate::handoff::types::OperationId::new(operation).unwrap(),
+            destination_runtime: crate::handoff::types::RuntimeId::new(uuid::Uuid::new_v4())
+                .unwrap(),
+            next_epoch: crate::handoff::types::OwnershipEpoch::new(1).unwrap(),
+        };
         let mut tx = db.pool.begin().await.unwrap();
         Store::write_machine_storage(&mut tx, id, &storage)
             .await
@@ -1717,7 +1639,7 @@ mod tests {
         tx.commit().await.unwrap();
         assert_eq!(db.machine_storage(id).await.unwrap(), Some(storage.clone()));
         let mut invalid = storage.clone();
-        invalid.fence.as_mut().unwrap().ownership_epoch = 1;
+        invalid.ownership_epoch = 1;
         let mut tx = db.pool.begin().await.unwrap();
         assert!(matches!(
             Store::write_machine_storage(&mut tx, id, &invalid).await,

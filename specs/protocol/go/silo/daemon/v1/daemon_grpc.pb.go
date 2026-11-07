@@ -2399,3 +2399,711 @@ var RuntimeService_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "daemon.proto",
 }
+
+const (
+	HandoffService_GetCapabilities_FullMethodName      = "/silo.daemon.v1.HandoffService/GetCapabilities"
+	HandoffService_ObserveSource_FullMethodName        = "/silo.daemon.v1.HandoffService/ObserveSource"
+	HandoffService_PreflightDestination_FullMethodName = "/silo.daemon.v1.HandoffService/PreflightDestination"
+	HandoffService_BeginSource_FullMethodName          = "/silo.daemon.v1.HandoffService/BeginSource"
+	HandoffService_CaptureSource_FullMethodName        = "/silo.daemon.v1.HandoffService/CaptureSource"
+	HandoffService_ReadPayload_FullMethodName          = "/silo.daemon.v1.HandoffService/ReadPayload"
+	HandoffService_FenceSource_FullMethodName          = "/silo.daemon.v1.HandoffService/FenceSource"
+	HandoffService_ResolveSource_FullMethodName        = "/silo.daemon.v1.HandoffService/ResolveSource"
+	HandoffService_Receive_FullMethodName              = "/silo.daemon.v1.HandoffService/Receive"
+	HandoffService_OfferCapture_FullMethodName         = "/silo.daemon.v1.HandoffService/OfferCapture"
+	HandoffService_ListNeeds_FullMethodName            = "/silo.daemon.v1.HandoffService/ListNeeds"
+	HandoffService_WritePayload_FullMethodName         = "/silo.daemon.v1.HandoffService/WritePayload"
+	HandoffService_Prepare_FullMethodName              = "/silo.daemon.v1.HandoffService/Prepare"
+	HandoffService_Commit_FullMethodName               = "/silo.daemon.v1.HandoffService/Commit"
+	HandoffService_Abort_FullMethodName                = "/silo.daemon.v1.HandoffService/Abort"
+	HandoffService_GetStatus_FullMethodName            = "/silo.daemon.v1.HandoffService/GetStatus"
+	HandoffService_GetPlan_FullMethodName              = "/silo.daemon.v1.HandoffService/GetPlan"
+)
+
+// HandoffServiceClient is the client API for HandoffService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Same-user stopped-storage handoff. No RPC starts either machine.
+type HandoffServiceClient interface {
+	GetCapabilities(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HandoffCapabilities, error)
+	ObserveSource(ctx context.Context, in *MachineRef, opts ...grpc.CallOption) (*HandoffDocument, error)
+	PreflightDestination(ctx context.Context, in *HandoffPreflightRequest, opts ...grpc.CallOption) (*HandoffProposal, error)
+	BeginSource(ctx context.Context, in *HandoffReceiveRequest, opts ...grpc.CallOption) (*HandoffStatus, error)
+	CaptureSource(ctx context.Context, in *HandoffCaptureRequest, opts ...grpc.CallOption) (*HandoffCaptureOffer, error)
+	ReadPayload(ctx context.Context, in *HandoffReadRequest, opts ...grpc.CallOption) (*HandoffPayloadFrame, error)
+	FenceSource(ctx context.Context, in *HandoffPreparedReceipt, opts ...grpc.CallOption) (*HandoffCommitAuthorization, error)
+	ResolveSource(ctx context.Context, in *HandoffTerminalReceipt, opts ...grpc.CallOption) (*HandoffStatus, error)
+	Receive(ctx context.Context, in *HandoffReceiveRequest, opts ...grpc.CallOption) (*HandoffStatus, error)
+	OfferCapture(ctx context.Context, in *HandoffCaptureOffer, opts ...grpc.CallOption) (*HandoffStatus, error)
+	ListNeeds(ctx context.Context, in *HandoffNeedsRequest, opts ...grpc.CallOption) (*HandoffNeedsPage, error)
+	WritePayload(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[HandoffWriteRequest, HandoffPayloadReceipt], error)
+	Prepare(ctx context.Context, in *HandoffBinding, opts ...grpc.CallOption) (*HandoffPreparedReceipt, error)
+	Commit(ctx context.Context, in *HandoffCommitAuthorization, opts ...grpc.CallOption) (*HandoffTerminalReceipt, error)
+	Abort(ctx context.Context, in *HandoffIntent, opts ...grpc.CallOption) (*HandoffTerminalReceipt, error)
+	GetStatus(ctx context.Context, in *HandoffOperationRef, opts ...grpc.CallOption) (*HandoffStatus, error)
+	GetPlan(ctx context.Context, in *HandoffOperationRef, opts ...grpc.CallOption) (*HandoffDocument, error)
+}
+
+type handoffServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewHandoffServiceClient(cc grpc.ClientConnInterface) HandoffServiceClient {
+	return &handoffServiceClient{cc}
+}
+
+func (c *handoffServiceClient) GetCapabilities(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HandoffCapabilities, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffCapabilities)
+	err := c.cc.Invoke(ctx, HandoffService_GetCapabilities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) ObserveSource(ctx context.Context, in *MachineRef, opts ...grpc.CallOption) (*HandoffDocument, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffDocument)
+	err := c.cc.Invoke(ctx, HandoffService_ObserveSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) PreflightDestination(ctx context.Context, in *HandoffPreflightRequest, opts ...grpc.CallOption) (*HandoffProposal, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffProposal)
+	err := c.cc.Invoke(ctx, HandoffService_PreflightDestination_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) BeginSource(ctx context.Context, in *HandoffReceiveRequest, opts ...grpc.CallOption) (*HandoffStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffStatus)
+	err := c.cc.Invoke(ctx, HandoffService_BeginSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) CaptureSource(ctx context.Context, in *HandoffCaptureRequest, opts ...grpc.CallOption) (*HandoffCaptureOffer, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffCaptureOffer)
+	err := c.cc.Invoke(ctx, HandoffService_CaptureSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) ReadPayload(ctx context.Context, in *HandoffReadRequest, opts ...grpc.CallOption) (*HandoffPayloadFrame, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffPayloadFrame)
+	err := c.cc.Invoke(ctx, HandoffService_ReadPayload_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) FenceSource(ctx context.Context, in *HandoffPreparedReceipt, opts ...grpc.CallOption) (*HandoffCommitAuthorization, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffCommitAuthorization)
+	err := c.cc.Invoke(ctx, HandoffService_FenceSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) ResolveSource(ctx context.Context, in *HandoffTerminalReceipt, opts ...grpc.CallOption) (*HandoffStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffStatus)
+	err := c.cc.Invoke(ctx, HandoffService_ResolveSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) Receive(ctx context.Context, in *HandoffReceiveRequest, opts ...grpc.CallOption) (*HandoffStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffStatus)
+	err := c.cc.Invoke(ctx, HandoffService_Receive_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) OfferCapture(ctx context.Context, in *HandoffCaptureOffer, opts ...grpc.CallOption) (*HandoffStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffStatus)
+	err := c.cc.Invoke(ctx, HandoffService_OfferCapture_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) ListNeeds(ctx context.Context, in *HandoffNeedsRequest, opts ...grpc.CallOption) (*HandoffNeedsPage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffNeedsPage)
+	err := c.cc.Invoke(ctx, HandoffService_ListNeeds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) WritePayload(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[HandoffWriteRequest, HandoffPayloadReceipt], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &HandoffService_ServiceDesc.Streams[0], HandoffService_WritePayload_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[HandoffWriteRequest, HandoffPayloadReceipt]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type HandoffService_WritePayloadClient = grpc.ClientStreamingClient[HandoffWriteRequest, HandoffPayloadReceipt]
+
+func (c *handoffServiceClient) Prepare(ctx context.Context, in *HandoffBinding, opts ...grpc.CallOption) (*HandoffPreparedReceipt, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffPreparedReceipt)
+	err := c.cc.Invoke(ctx, HandoffService_Prepare_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) Commit(ctx context.Context, in *HandoffCommitAuthorization, opts ...grpc.CallOption) (*HandoffTerminalReceipt, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffTerminalReceipt)
+	err := c.cc.Invoke(ctx, HandoffService_Commit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) Abort(ctx context.Context, in *HandoffIntent, opts ...grpc.CallOption) (*HandoffTerminalReceipt, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffTerminalReceipt)
+	err := c.cc.Invoke(ctx, HandoffService_Abort_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) GetStatus(ctx context.Context, in *HandoffOperationRef, opts ...grpc.CallOption) (*HandoffStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffStatus)
+	err := c.cc.Invoke(ctx, HandoffService_GetStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *handoffServiceClient) GetPlan(ctx context.Context, in *HandoffOperationRef, opts ...grpc.CallOption) (*HandoffDocument, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HandoffDocument)
+	err := c.cc.Invoke(ctx, HandoffService_GetPlan_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// HandoffServiceServer is the server API for HandoffService service.
+// All implementations must embed UnimplementedHandoffServiceServer
+// for forward compatibility.
+//
+// Same-user stopped-storage handoff. No RPC starts either machine.
+type HandoffServiceServer interface {
+	GetCapabilities(context.Context, *emptypb.Empty) (*HandoffCapabilities, error)
+	ObserveSource(context.Context, *MachineRef) (*HandoffDocument, error)
+	PreflightDestination(context.Context, *HandoffPreflightRequest) (*HandoffProposal, error)
+	BeginSource(context.Context, *HandoffReceiveRequest) (*HandoffStatus, error)
+	CaptureSource(context.Context, *HandoffCaptureRequest) (*HandoffCaptureOffer, error)
+	ReadPayload(context.Context, *HandoffReadRequest) (*HandoffPayloadFrame, error)
+	FenceSource(context.Context, *HandoffPreparedReceipt) (*HandoffCommitAuthorization, error)
+	ResolveSource(context.Context, *HandoffTerminalReceipt) (*HandoffStatus, error)
+	Receive(context.Context, *HandoffReceiveRequest) (*HandoffStatus, error)
+	OfferCapture(context.Context, *HandoffCaptureOffer) (*HandoffStatus, error)
+	ListNeeds(context.Context, *HandoffNeedsRequest) (*HandoffNeedsPage, error)
+	WritePayload(grpc.ClientStreamingServer[HandoffWriteRequest, HandoffPayloadReceipt]) error
+	Prepare(context.Context, *HandoffBinding) (*HandoffPreparedReceipt, error)
+	Commit(context.Context, *HandoffCommitAuthorization) (*HandoffTerminalReceipt, error)
+	Abort(context.Context, *HandoffIntent) (*HandoffTerminalReceipt, error)
+	GetStatus(context.Context, *HandoffOperationRef) (*HandoffStatus, error)
+	GetPlan(context.Context, *HandoffOperationRef) (*HandoffDocument, error)
+	mustEmbedUnimplementedHandoffServiceServer()
+}
+
+// UnimplementedHandoffServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedHandoffServiceServer struct{}
+
+func (UnimplementedHandoffServiceServer) GetCapabilities(context.Context, *emptypb.Empty) (*HandoffCapabilities, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCapabilities not implemented")
+}
+func (UnimplementedHandoffServiceServer) ObserveSource(context.Context, *MachineRef) (*HandoffDocument, error) {
+	return nil, status.Error(codes.Unimplemented, "method ObserveSource not implemented")
+}
+func (UnimplementedHandoffServiceServer) PreflightDestination(context.Context, *HandoffPreflightRequest) (*HandoffProposal, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreflightDestination not implemented")
+}
+func (UnimplementedHandoffServiceServer) BeginSource(context.Context, *HandoffReceiveRequest) (*HandoffStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginSource not implemented")
+}
+func (UnimplementedHandoffServiceServer) CaptureSource(context.Context, *HandoffCaptureRequest) (*HandoffCaptureOffer, error) {
+	return nil, status.Error(codes.Unimplemented, "method CaptureSource not implemented")
+}
+func (UnimplementedHandoffServiceServer) ReadPayload(context.Context, *HandoffReadRequest) (*HandoffPayloadFrame, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReadPayload not implemented")
+}
+func (UnimplementedHandoffServiceServer) FenceSource(context.Context, *HandoffPreparedReceipt) (*HandoffCommitAuthorization, error) {
+	return nil, status.Error(codes.Unimplemented, "method FenceSource not implemented")
+}
+func (UnimplementedHandoffServiceServer) ResolveSource(context.Context, *HandoffTerminalReceipt) (*HandoffStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveSource not implemented")
+}
+func (UnimplementedHandoffServiceServer) Receive(context.Context, *HandoffReceiveRequest) (*HandoffStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method Receive not implemented")
+}
+func (UnimplementedHandoffServiceServer) OfferCapture(context.Context, *HandoffCaptureOffer) (*HandoffStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method OfferCapture not implemented")
+}
+func (UnimplementedHandoffServiceServer) ListNeeds(context.Context, *HandoffNeedsRequest) (*HandoffNeedsPage, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListNeeds not implemented")
+}
+func (UnimplementedHandoffServiceServer) WritePayload(grpc.ClientStreamingServer[HandoffWriteRequest, HandoffPayloadReceipt]) error {
+	return status.Error(codes.Unimplemented, "method WritePayload not implemented")
+}
+func (UnimplementedHandoffServiceServer) Prepare(context.Context, *HandoffBinding) (*HandoffPreparedReceipt, error) {
+	return nil, status.Error(codes.Unimplemented, "method Prepare not implemented")
+}
+func (UnimplementedHandoffServiceServer) Commit(context.Context, *HandoffCommitAuthorization) (*HandoffTerminalReceipt, error) {
+	return nil, status.Error(codes.Unimplemented, "method Commit not implemented")
+}
+func (UnimplementedHandoffServiceServer) Abort(context.Context, *HandoffIntent) (*HandoffTerminalReceipt, error) {
+	return nil, status.Error(codes.Unimplemented, "method Abort not implemented")
+}
+func (UnimplementedHandoffServiceServer) GetStatus(context.Context, *HandoffOperationRef) (*HandoffStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetStatus not implemented")
+}
+func (UnimplementedHandoffServiceServer) GetPlan(context.Context, *HandoffOperationRef) (*HandoffDocument, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetPlan not implemented")
+}
+func (UnimplementedHandoffServiceServer) mustEmbedUnimplementedHandoffServiceServer() {}
+func (UnimplementedHandoffServiceServer) testEmbeddedByValue()                        {}
+
+// UnsafeHandoffServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to HandoffServiceServer will
+// result in compilation errors.
+type UnsafeHandoffServiceServer interface {
+	mustEmbedUnimplementedHandoffServiceServer()
+}
+
+func RegisterHandoffServiceServer(s grpc.ServiceRegistrar, srv HandoffServiceServer) {
+	// If the following call panics, it indicates UnimplementedHandoffServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&HandoffService_ServiceDesc, srv)
+}
+
+func _HandoffService_GetCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).GetCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_GetCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).GetCapabilities(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_ObserveSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).ObserveSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_ObserveSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).ObserveSource(ctx, req.(*MachineRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_PreflightDestination_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffPreflightRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).PreflightDestination(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_PreflightDestination_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).PreflightDestination(ctx, req.(*HandoffPreflightRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_BeginSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffReceiveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).BeginSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_BeginSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).BeginSource(ctx, req.(*HandoffReceiveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_CaptureSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffCaptureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).CaptureSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_CaptureSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).CaptureSource(ctx, req.(*HandoffCaptureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_ReadPayload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffReadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).ReadPayload(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_ReadPayload_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).ReadPayload(ctx, req.(*HandoffReadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_FenceSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffPreparedReceipt)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).FenceSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_FenceSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).FenceSource(ctx, req.(*HandoffPreparedReceipt))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_ResolveSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffTerminalReceipt)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).ResolveSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_ResolveSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).ResolveSource(ctx, req.(*HandoffTerminalReceipt))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_Receive_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffReceiveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).Receive(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_Receive_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).Receive(ctx, req.(*HandoffReceiveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_OfferCapture_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffCaptureOffer)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).OfferCapture(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_OfferCapture_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).OfferCapture(ctx, req.(*HandoffCaptureOffer))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_ListNeeds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffNeedsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).ListNeeds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_ListNeeds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).ListNeeds(ctx, req.(*HandoffNeedsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_WritePayload_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(HandoffServiceServer).WritePayload(&grpc.GenericServerStream[HandoffWriteRequest, HandoffPayloadReceipt]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type HandoffService_WritePayloadServer = grpc.ClientStreamingServer[HandoffWriteRequest, HandoffPayloadReceipt]
+
+func _HandoffService_Prepare_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffBinding)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).Prepare(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_Prepare_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).Prepare(ctx, req.(*HandoffBinding))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_Commit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffCommitAuthorization)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).Commit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_Commit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).Commit(ctx, req.(*HandoffCommitAuthorization))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_Abort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffIntent)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).Abort(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_Abort_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).Abort(ctx, req.(*HandoffIntent))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_GetStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffOperationRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).GetStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_GetStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).GetStatus(ctx, req.(*HandoffOperationRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HandoffService_GetPlan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HandoffOperationRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandoffServiceServer).GetPlan(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandoffService_GetPlan_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandoffServiceServer).GetPlan(ctx, req.(*HandoffOperationRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// HandoffService_ServiceDesc is the grpc.ServiceDesc for HandoffService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var HandoffService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "silo.daemon.v1.HandoffService",
+	HandlerType: (*HandoffServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetCapabilities",
+			Handler:    _HandoffService_GetCapabilities_Handler,
+		},
+		{
+			MethodName: "ObserveSource",
+			Handler:    _HandoffService_ObserveSource_Handler,
+		},
+		{
+			MethodName: "PreflightDestination",
+			Handler:    _HandoffService_PreflightDestination_Handler,
+		},
+		{
+			MethodName: "BeginSource",
+			Handler:    _HandoffService_BeginSource_Handler,
+		},
+		{
+			MethodName: "CaptureSource",
+			Handler:    _HandoffService_CaptureSource_Handler,
+		},
+		{
+			MethodName: "ReadPayload",
+			Handler:    _HandoffService_ReadPayload_Handler,
+		},
+		{
+			MethodName: "FenceSource",
+			Handler:    _HandoffService_FenceSource_Handler,
+		},
+		{
+			MethodName: "ResolveSource",
+			Handler:    _HandoffService_ResolveSource_Handler,
+		},
+		{
+			MethodName: "Receive",
+			Handler:    _HandoffService_Receive_Handler,
+		},
+		{
+			MethodName: "OfferCapture",
+			Handler:    _HandoffService_OfferCapture_Handler,
+		},
+		{
+			MethodName: "ListNeeds",
+			Handler:    _HandoffService_ListNeeds_Handler,
+		},
+		{
+			MethodName: "Prepare",
+			Handler:    _HandoffService_Prepare_Handler,
+		},
+		{
+			MethodName: "Commit",
+			Handler:    _HandoffService_Commit_Handler,
+		},
+		{
+			MethodName: "Abort",
+			Handler:    _HandoffService_Abort_Handler,
+		},
+		{
+			MethodName: "GetStatus",
+			Handler:    _HandoffService_GetStatus_Handler,
+		},
+		{
+			MethodName: "GetPlan",
+			Handler:    _HandoffService_GetPlan_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WritePayload",
+			Handler:       _HandoffService_WritePayload_Handler,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "daemon.proto",
+}

@@ -116,10 +116,7 @@ impl SnapshotStore {
             .into_iter()
             .find(|launch| launch.run_id == request.run_id && launch.admitted)
             .ok_or_else(|| invalid("capture has no admitted exact-run launch owner"))?;
-        if storage != launch.storage
-            || storage.operation.is_some()
-            || storage.fence.is_some()
-            || storage.relocation_operation.is_some()
+        if storage != launch.storage || storage.operation.is_some() || !storage.ownership.is_owned()
         {
             return Err(invalid(
                 "capture source generation changed or has an unresolved operation",
@@ -2069,8 +2066,7 @@ impl SnapshotStore {
                     storage.ownership_epoch = 0;
                     storage.stop_outcome = crate::StorageStopOutcome::Unknown;
                     storage.operation = None;
-                    storage.fence = None;
-                    storage.relocation_operation = None;
+                    storage.ownership = crate::MachineOwnership::Owned;
                     if let MachineRoot::OpaqueRaw { initial_content, .. } = &mut storage.root { *initial_content = None; }
                     let files=verified.files.iter().map(|file| {
                         let metadata=file.file().metadata()?;

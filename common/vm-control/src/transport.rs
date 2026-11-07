@@ -38,7 +38,18 @@ pub async fn probe(host: &HostPaths, admission: Admission) -> eyre::Result<Optio
     .await
 }
 
-// Alternate endpoints are private to transport fixtures, never an operator setting.
+/// Select a second runtime without changing process-wide environment.
+/// The selected Home/config roots and same-user peer are checked exactly as
+/// for ordinary management; a lost connection never reconnects implicitly.
+pub async fn probe_selected(
+    host: &HostPaths,
+    run_root: &Path,
+    admission: Admission,
+) -> eyre::Result<Option<SelectedDaemon>> {
+    eyre::ensure!(run_root.is_absolute(), "runtime root must be absolute");
+    probe_at(host, admission, silod_spec::paths::control_socket(run_root)).await
+}
+
 async fn probe_at(
     host: &HostPaths,
     admission: Admission,
