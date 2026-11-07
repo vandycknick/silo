@@ -2532,26 +2532,8 @@ mod tests {
             );
         }
         let reservation = snapshots.reserve_capture(&request).await.unwrap();
-        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
-        let boot_input = temporary.path().join("boot");
-        std::fs::write(&boot_input, b"retained boot bytes").unwrap();
-        let (object, roots) = pool.publish_object_for_catalog(&boot_input).unwrap();
         snapshots
-            .store
-            .pin_published_storage_dependencies(request.capture_id, &[], &[object.digest])
-            .await
-            .unwrap();
-        drop(roots);
-        let boot = crate::store::models::snapshot::tests::record(
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .parse()
-                .unwrap(),
-            ObjectDigest::of_bytes(b"map"),
-            object.digest,
-        )
-        .boot;
-        snapshots
-            .bind_capture_boot(request.capture_id, boot)
+            .bind_capture_boot(request.capture_id, storage.boot.clone())
             .await
             .unwrap();
         Fixture {
@@ -2941,6 +2923,12 @@ mod tests {
             .consume(&SnapshotRef::Id(result.id))
             .await
             .unwrap();
+        assert_eq!(consumer.record.boot, fixture.launch.storage_record().boot);
+        let (_, boot_objects) = crate::store::cache_paths::storage_pool_dependencies(
+            &fixture.reservation.record.storage,
+        )
+        .unwrap();
+        assert!(!boot_objects.is_empty());
         let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
             &consumer.record.capture
         else {
@@ -3005,11 +2993,48 @@ mod tests {
             .release_retention(&SnapshotRef::Id(result.id))
             .await
             .unwrap();
+        let launches = snapshots
+            .store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap();
+        assert_eq!(launches.len(), 1);
+        let launch = &launches[0];
+        let mut stopped = snapshots
+            .store
+            .machine_state(config.id)
+            .await
+            .unwrap()
+            .unwrap();
+        stopped.status = MachineRuntimeState::Stopped;
+        stopped.run_id = None;
+        stopped.updated_at = 2;
+        // Closing the fixture's OFD does not reconcile its admitted launch.
+        assert!(snapshots
+            .store
+            .try_retire_launch_storage(
+                launch.operation_id,
+                launch.run_id,
+                launch.storage_generation,
+                &stopped,
+                crate::StorageStopOutcome::Unknown,
+            )
+            .await
+            .unwrap());
+        assert!(snapshots
+            .store
+            .launch_storage_operations(config.id)
+            .await
+            .unwrap()
+            .is_empty());
         snapshots.store.remove_machine(&config).await.unwrap();
         std::fs::remove_dir_all(&config.machine_dir).unwrap();
         snapshots.store.recover_image_cache().await.unwrap();
         assert!(pool.verify_stream(&memory).is_ok());
         assert!(pool.verify_object(&evidence_digest).is_ok());
+        for object in &boot_objects {
+            assert!(pool.verify_object(object).is_ok());
+        }
         snapshots
             .store
             .finish_stopped_operation(consumer.operation_id)
@@ -3019,6 +3044,9 @@ mod tests {
         snapshots.store.recover_image_cache().await.unwrap();
         assert!(!pool.stream_path(&memory).exists());
         assert!(!pool.object_path(&evidence_digest).exists());
+        for object in &boot_objects {
+            assert!(!pool.object_path(object).exists());
+        }
     }
 
     #[tokio::test]
@@ -3077,7 +3105,7 @@ mod tests {
             .unwrap();
         let crate::BootProfile::LinuxDirect {
             binding:
-                crate::BootBinding::Pinned {
+                binding @ crate::BootBinding::Pinned {
                     kernel,
                     base_initramfs,
                     agent,
@@ -3090,6 +3118,7 @@ mod tests {
         };
         let mut objects = vec![*kernel, *base_initramfs];
         objects.extend(agent.iter().copied());
+        objects.push(binding.digest().unwrap());
         fixture
             .snapshots
             .store

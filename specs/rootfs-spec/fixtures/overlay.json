@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "root": {
     "kind": "linux-flat-overlay-v1",
     "discovery": "virtio-block-serial",
@@ -9,5 +9,6 @@
     "overlayProfile": "silo-overlay-v1",
     "renderingAbi": "linux-overlayfs-mountinfo-v1",
     "temporaryDirectory": {"kind":"disk-backed"}
-  }
+  },
+  "rosetta": "disabled"
 }

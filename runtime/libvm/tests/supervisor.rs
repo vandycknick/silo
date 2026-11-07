@@ -46,7 +46,11 @@ fn write_runtime_root(root: &Path) -> PathBuf {
         .expect("install mock-enabled silo-vmm");
     std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755))
         .expect("make silo-vmm executable");
-    write_file(&root.join("assets/kernel-default"), b"kernel", 0o644);
+    write_file(
+        &root.join("assets/kernel-default"),
+        &test_utils::direct_kernel::host_kernel("kernel"),
+        0o644,
+    );
     write_file(&root.join("assets/initramfs"), b"initramfs", 0o644);
     write_file(&root.join("assets/agent"), b"agent", 0o755);
     root.to_path_buf()
@@ -170,7 +174,10 @@ async fn test_env_in(temp: tempfile::TempDir, name: &str, scenario: &Scenario) -
     scenario.write_to(&scenario_path).expect("write scenario");
 
     let disk = temp.path().join("rootfs.img");
-    std::fs::write(&disk, vec![0u8; 4096]).expect("write disk image");
+    disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+        .expect("create ext4 disk")
+        .close()
+        .expect("finish ext4 disk");
 
     let runtime = Runtime::new(
         RuntimeConfig::local(temp.path().join("home"))
@@ -195,7 +202,7 @@ async fn create_machine(env: &TestEnv, name: &str) -> Machine {
         .runtime
         .machine()
         .name(name)
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -444,7 +451,7 @@ async fn builder_and_update_persist_machine_forwards_and_vsock_while_stopped() {
         .runtime
         .machine()
         .name("integration-builder-forwards")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .forwards(vec![initial.clone()])
         .vsock(true)
@@ -554,7 +561,7 @@ async fn agent_disabled_rejects_agent_forward_immediately_while_raw_vsock_works(
         .runtime
         .machine()
         .name("integration-forward-raw")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .agent_mode(Some(MachineAgent::Disabled))
         .create()
@@ -801,7 +808,7 @@ async fn mux_and_forward_streams_share_public_capacity_and_leave_headroom() {
         .runtime
         .machine()
         .name("integration-forward-capacity")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .agent_mode(Some(MachineAgent::Disabled))
         .create()
@@ -1777,7 +1784,7 @@ async fn agent_disabled_machine_runs_without_public_vsock() {
         .runtime
         .machine()
         .name("integration-agent-disabled")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .agent_mode(Some(MachineAgent::Disabled))
         .create()
@@ -2319,7 +2326,7 @@ async fn machine_start_propagates_backend_boot_failure_and_leaves_machine_stoppe
         .runtime
         .machine()
         .name("mock-boot-failure")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -2357,7 +2364,7 @@ async fn machine_wait_reconciles_vmm_crash_and_marks_machine_stopped() {
         .runtime
         .machine()
         .name("mock-crash")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -2397,7 +2404,7 @@ async fn machine_start_reports_entrypoint_command_not_found() {
         .runtime
         .machine()
         .name("mock-startup-command")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -2509,7 +2516,7 @@ async fn machine_exec_reports_permission_denied_launch_failure() {
         .runtime
         .machine()
         .name("mock-execution-failure")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -2548,7 +2555,7 @@ async fn machine_exec_reports_guest_stream_lost_when_event_stream_disconnects() 
         .runtime
         .machine()
         .name("mock-execution-stream-loss")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -2585,7 +2592,7 @@ async fn get_file_entry_preserves_guest_permission_denied_code() {
         .runtime
         .machine()
         .name("mock-filesystem-error")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -2622,7 +2629,7 @@ async fn wait_ready_times_out_without_stopping_a_running_machine() {
         .runtime
         .machine()
         .name("mock-never-ready")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
@@ -2666,7 +2673,7 @@ async fn vmm_reconnects_after_agent_restart_and_preserves_boot_identity() {
         .runtime
         .machine()
         .name("mock-agent-restart")
-        .image_source(ImageSource::Disk(env.disk.clone()))
+        .image_source(ImageSource::disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await

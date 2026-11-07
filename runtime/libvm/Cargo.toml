@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
-disk-image = { path = "../../common/disk-image" }
+disk-image = { path = "../../common/disk-image", features = ["qcow2"] }
+disk-partition = { path = "../../common/disk-partition", features = ["std"] }
 forward-spec = { path = "../../specs/forward-spec" }
 silo_policy = { package = "policy", path = "../../common/policy" }
 silo_secrets = { package = "secrets", path = "../../common/secrets" }
@@ -48,6 +49,9 @@ x509-parser = "0.18.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", features = ["inotify"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+vz = { path = "../../virt/vz" }
 
 [dev-dependencies]
 test-utils = { path = "../test-utils" }

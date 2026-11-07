@@ -114,14 +114,27 @@ def ssh_material(directory: Path) -> str:
     return ca.with_suffix(".pub").read_text().strip()
 
 
-def composite_initramfs(assets: Path, directory: Path, agent_config: dict) -> Path:
-    """Staged Silo init initramfs plus the staged agent and this fixture's config."""
+def whole_disk_bootstrap(root: dict) -> dict:
+    """Schema-2 launch bootstrap selecting the `silo-root` attachment as an ext4 whole disk."""
+    assert root["blockId"] == "silo-root", root
+    geometry = root["geometry"]
+    return {"schemaVersion": 2, "rosetta": "disabled", "root": {
+        "kind": "opaque-raw-v1", "discovery": "virtio-block-serial",
+        "device": {"serial": "silo-root", "lengthBytes": geometry["length"],
+                   "logicalSectorSize": geometry["logicalSectorSize"], "readOnly": root["readOnly"]},
+        "selector": {"kind": "whole-disk"}, "filesystem": "ext4"}}
+
+
+def composite_initramfs(assets: Path, directory: Path, agent_config: dict, root: dict) -> Path:
+    """Staged Silo init initramfs plus the staged agent, this fixture's config and its root bootstrap."""
     base = (assets / "initramfs").read_bytes()
     composite = directory / "initramfs"
     composite.write_bytes(base + b"\0" * (-len(base) % 4) + cpio([
         ("agent", b"", 0o040700),
         ("agent/silo-agent", (assets / "agent").read_bytes(), 0o100700),
         ("agent/config.json", json.dumps(agent_config, separators=(",", ":")).encode(), 0o100600),
+        ("silo", b"", 0o040700),
+        ("silo/rootfs.json", json.dumps(whole_disk_bootstrap(root), separators=(",", ":")).encode(), 0o100600),
     ]))
     composite.chmod(0o600)
     return composite
@@ -147,7 +160,7 @@ def run(silo: Silo, image: str, *, unsupported: bool = False) -> dict:
         "storage_shutdown": {"version": 1, "machineId": machine, "runId": run_id, "manifest": manifest},
     }
     assets = silo.ws.config.runtime_dir / "assets"
-    composite = composite_initramfs(assets, directory, agent_config)
+    composite = composite_initramfs(assets, directory, agent_config, disk)
     kernel, kernel_source = private_kernel(assets, directory)
     fixture = {"kernel": str(kernel), "initramfs": str(composite), "directory": str(directory),
                "machine_id": machine, "run_id": run_id, "root": disk, "expect_unsupported": unsupported}

@@ -81,12 +81,11 @@ def test_info_unavailable_without_runtime(silo: Silo) -> None:
 
 
 def test_boot_failure_leaves_machine_stopped(
-    silo: Silo, workspace: Workspace, basic_image: str,
+    silo: Silo, basic_image: str,
 ) -> None:
-    kernel = workspace.root / "not-a-kernel"
-    kernel.write_bytes(b"")
     name = "failed-boot"
-    silo.create(name, basic_image, "--cpus", "1", "--memory", "512mb", "--vsock", "--network", "none", "--kernel", str(kernel))
+    # Admission accepts positive memory; this cannot hold the packaged kernel.
+    silo.create(name, basic_image, "--cpus", "1", "--memory", "1mib", "--vsock", "--network", "none")
     result = silo.run("start", name, expect=None)
     assert result.returncode != 0
     assert silo.info(name)["state"] == "stopped"

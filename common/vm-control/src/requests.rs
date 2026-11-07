@@ -1,27 +1,47 @@
-use crate::{invalid, path_from_wire, required, validate_uuid, ConversionError};
+use crate::{invalid, required, validate_uuid, ConversionError};
 use silod_spec::daemon::v1 as w;
-/// A prepared immutable identity or a caller-owned local disk, never a mutable OCI tag ticket.
+/// A selected immutable OCI identity, a typed local disk import, or a typed
+/// managed image/snapshot reference; never a mutable OCI tag ticket.
 #[derive(Debug, Clone)]
 pub enum CreateSource {
     Oci(crate::images::OciIdentity),
-    Disk(std::path::PathBuf),
+    Disk(libvm::DiskImportRequest),
+    Managed(libvm::ManagedSourceRef),
+}
+pub fn create_request_to_wire(
+    config: &crate::create::NormalizedMachineCreate,
+    source: &CreateSource,
+) -> Result<w::CreateMachineRequest, ConversionError> {
+    use w::create_machine_request::Source;
+    Ok(w::CreateMachineRequest {
+        configuration: Some(crate::updates::create_to_wire(config)?),
+        source: Some(match source {
+            CreateSource::Oci(identity) => {
+                Source::Oci(crate::images::oci_identity_to_wire(identity))
+            }
+            CreateSource::Disk(request) => {
+                Source::Disk(crate::boot::import_request_to_wire(request)?)
+            }
+            CreateSource::Managed(reference) => {
+                Source::Managed(crate::images::managed_ref_to_wire(reference)?)
+            }
+        }),
+    })
 }
 pub fn create_request_from_wire(
     v: w::CreateMachineRequest,
 ) -> Result<(crate::create::NormalizedMachineCreate, CreateSource), ConversionError> {
+    use w::create_machine_request::Source;
     let config =
         crate::updates::create_from_wire(required(v.configuration, "create.configuration")?)?;
     let source = match required(v.source, "create.source")? {
-        w::create_machine_request::Source::Oci(v) => {
-            CreateSource::Oci(crate::images::identity_from_wire(v)?)
+        Source::Oci(v) => {
+            let identity = crate::images::identity_from_wire(v)?;
+            crate::boot::platform_from_oci(&identity.platform)?;
+            CreateSource::Oci(identity)
         }
-        w::create_machine_request::Source::DiskPath(v) => {
-            let path = path_from_wire(v)?;
-            if !path.is_absolute() {
-                return Err(invalid("disk_path", "must be absolute"));
-            }
-            CreateSource::Disk(path)
-        }
+        Source::Disk(v) => CreateSource::Disk(crate::boot::import_request_from_wire(v)?),
+        Source::Managed(v) => CreateSource::Managed(crate::images::managed_ref_from_wire(v)?),
     };
     Ok((config, source))
 }

@@ -432,11 +432,11 @@ pub(crate) fn validate_common(config: &VmConfig) -> Result<(), VirtError> {
         && config
             .mounts
             .iter()
-            .any(|mount| mount.tag == agent_spec::ROSETTA_MOUNT_TAG)
+            .any(|mount| mount.tag == rootfs_spec::rosetta::SHARE_TAG)
     {
         return Err(invalid(format!(
             "mount tag {:?} is reserved for Rosetta",
-            agent_spec::ROSETTA_MOUNT_TAG
+            rootfs_spec::rosetta::SHARE_TAG
         )));
     }
 
@@ -600,7 +600,7 @@ mod tests {
             .rosetta(RosettaIntent::VzNative)
             .mount(SharedDirectory {
                 host_path: "/tmp/user-rosetta".into(),
-                tag: agent_spec::ROSETTA_MOUNT_TAG.to_string(),
+                tag: rootfs_spec::rosetta::SHARE_TAG.to_string(),
                 read_only: true,
             })
             .build();

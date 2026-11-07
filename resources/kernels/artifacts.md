@@ -166,7 +166,62 @@ Workload artifact metadata additionally carries a `rootRuntime` object:
 never a claim that a boot or conformance gate passed. `longterm5` is always
 opaque-raw-only, and `rprobe` is not a workload root candidate. Resolved config
 validation pins built-in ext4, ACL/security support, OverlayFS and its module
-defaults. No EROFS or partition support is added by this contract.
+defaults. The overlay contract itself does not add EROFS or partition support.
+
+### Workload Partition and Rosetta Configuration (Qualification Pending)
+
+The shared workload fragments additionally require built-in GPT and MBR
+partition discovery (`EFI_PARTITION=y`, `MSDOS_PARTITION=y`), VFAT/FAT and NLS
+(`VFAT_FS=y`, `FAT_FS=y`, `NLS=y`). The exact built-in codepages are
+`NLS_CODEPAGE_437=y`, `NLS_ISO8859_1=y` and `NLS_UTF8=y`, with
+`FAT_DEFAULT_CODEPAGE=437` and `FAT_DEFAULT_IOCHARSET="iso8859-1"`. This supports
+the declared default charset and explicit UTF-8 guest fstab requests, not every
+NLS codepage. Ext4, binfmt_misc and virtiofs remain built in. Partition discovery
+does not require EFI firmware boot or broaden the admitted root filesystem
+beyond ext4; arm64 EFI remains disabled.
+
+The arm64 workload fragment explicitly requires `ARM64_4K_PAGES=y` and
+`ARM64_PAGE_SHIFT=12` for Rosetta. The existing resolved-config validator checks
+these exact values, including numeric and quoted string defaults, against the
+selected workload fragments. Source settings and validator unit fixtures are
+not evidence of produced kernel page size or runtime boot success. The rprobe
+kernel uses independent fragments and is unchanged.
+
+The x86_64 stable and longterm configurations were generated and passed the
+resolved-config validator on 2026-11-06; retained evidence is under
+`.tmp/plan/evidence/phase-17/workload-{stable,longterm}-x86_64.config`.
+Arm64 resolved configuration, kernel builds and exact-byte guest qualification
+remain pending. Changed kernel or reusable initramfs bytes cannot reuse the
+observed overlay tuple below, even though the overlay algorithm is unchanged.
+Main must retain the actual resolved Kconfig and boot evidence for the new
+kernel/init tuple before refreshing admission. No qualified hashes are changed
+by this configuration update, and no partitioned-root, VFAT-mount or Rosetta
+runtime pass is claimed.
+
+### Raw-root Direct Kernel Admission
+
+Opaque raw roots do not use an exact-byte tuple table. libvm admits the pinned
+kernel from its own bytes, in the same bounded pass that hashes it, whenever a
+raw image is imported, a machine is created or its boot assets are updated, an
+exact bundle is selected, a packaged replacement is reported, a stopped capture
+resolves its boot or a pinned machine starts. A recorded or requested
+architecture is never accepted as evidence on its own.
+
+The bytes must be the host's direct-loader format from the architecture
+contract above: an x86-64 little-endian ELF64 executable with in-file `PT_LOAD`
+segments and program headers in the first 4 KiB, or a little-endian arm64
+`Image` whose header declares an effective image size at least as large as the
+file. Foreign, compressed and unknown images are rejected before publication.
+
+Admission checks format and architecture only. It does not read the embedded
+configuration, so custom kernels without `CONFIG_IKCONFIG` are accepted. A
+kernel lacking a filesystem, partition table, device or Rosetta capability that
+its root needs fails at boot, not at admission. The workload fragments above
+describe what Silo's own kernels build in; passing admission does not qualify a
+boot, and guest gates remain the evidence that a kernel actually boots.
+
+### Exact-byte Overlay Admission
+
 
 Production flat-overlay admission is owned by libvm's focused
 `boot_qualification` module, not package metadata or runtime discovery. Its
@@ -241,26 +296,25 @@ x86_64 KVM. The immutable boot-admission entry records exactly:
 
 | Identity | Value |
 | --- | --- |
-| Kernel | Linux `7.2.2`, SHA256 `ec6fee8b1885a71e78306fea384f4ff6687fd151b6f279c23117785027748f33` |
-| Reusable base initramfs | SHA256 `5c48f328014d102a1f07bc22865141b72bdcfa0a94cdd30f3e567d1815c84e67` |
-| Actual monitor and worker executable | SHA256 `292c645775c0637c9f4336c11e494a7261dabc663e5faed608ee78457752f8d6` |
-| Actual resolved Kconfig | SHA256 `f3dab6adffce7cadde5ce693f9403ce88d66ab9f4ec503f7860ce9020cb142e6` |
+| Kernel | Linux `7.2.2`, SHA256 `4c54fc038844b04d712bd4cdb8a9d6a945a5f3d7a8bb1db5a5d50d5271d5dddc` |
+| Reusable base initramfs | SHA256 `793730230b7fba3551a1f3b426e11cb343a916090380da87f35f06735dbf28ed` |
+| Actual monitor and worker executable | SHA256 `eebe7fa99623ccf292c25cbce2610da34ec356f5aa9a335c6174b67c30baecd7` |
+| Actual resolved Kconfig | SHA256 `7249a93adabeb4348fc902df83ed252be4c71762ac131cf003070431afdf68a9` |
 | Native source revision | `2606116528aaddbb5e87aeb045abed80456a822c` |
 | Guest / host lane | `amd64` / Linux `x86_64`, KVM |
 | Profiles | `linux-flat-overlay-v1`, `silo-upper-ext4-v1`, `silo-overlay-v1` |
 | Rendering / attachment | `linux-overlayfs-mountinfo-v1` / `krun-virtio-blk-v1` |
 
-Phase 16 refreshed this tuple after bounded two-lane capture authentication.
-The exact optimized monitor passed the real overlay boot gate in
-`.tmp/plan/evidence/phase-16/parallel-auth-release-overlay.xml`.
-Pause retains its previously qualified native binding.
+Phase 17 refreshed this tuple after the partition/bootstrap cutover and pause
+requalification. The exact optimized monitor passed the isolated real overlay
+boot gate in `.tmp/plan/evidence/phase-17/overlay-pause-binding-final.xml`.
 This boot qualification does not grant public capture, restore or fork admission.
 
 Retained candidate evidence:
-`.tmp/plan/evidence/phase-16/parallel-auth-release-guest-proof.log` and
-`.tmp/plan/evidence/phase-16/parallel-auth-release-boot-tuple.json`.
+`.tmp/plan/evidence/phase-17/overlay-pause-binding-proof.log` and
+`.tmp/plan/evidence/phase-17/overlay-pause-binding-tuple.json`.
 The tuple records native build identity
-`v2:path:clean:2606116528aaddbb5e87aeb045abed80456a822c:content=21a00aec6ce92e89eb74366fb510bfc306b045056c1e62f22646458136668927:inputs=08729bfbec57b6a7adb55a2c9d6fa075190eb3536ef7cf6588b0f8b7056eaac9`.
+`v2:path:clean:2606116528aaddbb5e87aeb045abed80456a822c:content=21a00aec6ce92e89eb74366fb510bfc306b045056c1e62f22646458136668927:inputs=44e9e307075b795ae0423c46318fa9ec2985c79325d457d3cef64eef9a32a357`.
 Main independently extracted the exact tested kernel's embedded IKCONFIG and
 verified byte equality with the supplied resolved `.config`, binding the
 configuration to the executable rather than trusting its pathname. The

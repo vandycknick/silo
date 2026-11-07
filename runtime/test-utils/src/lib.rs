@@ -10,7 +10,10 @@
 //! explicitly selected scenario file must exist and contain valid JSON. The machine boots
 //! immediately, the fake guest agent becomes ready, executions run real host
 //! subprocesses in a sandbox, and the filesystem service operates on a
-//! per-machine temp directory.
+//! per-machine temp directory. [`direct_kernel`] builds valid bounded native
+//! kernel images that libvm's direct-boot format admission accepts.
+
+pub mod direct_kernel;
 
 use std::collections::HashMap;
 use std::io;

@@ -16,6 +16,7 @@ pub(crate) struct PreparedRoot {
     pub(crate) descriptor: Option<String>,
     pub(crate) qualification: Option<crate::QualifiedOverlayBoot>,
     pub(crate) storage: MachineStorageRecord,
+    pub(crate) rosetta: rootfs_spec::RosettaMode,
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> LibVmError {
@@ -52,6 +53,14 @@ pub(crate) fn validate_spec(
     storage: &MachineStorageRecord,
     spec: &vm_spec::VmSpec,
 ) -> Result<(), LibVmError> {
+    let args = spec
+        .boot
+        .as_ref()
+        .and_then(|boot| boot.kernel.as_ref())
+        .map(|kernel| kernel.cmdline.as_slice())
+        .unwrap_or_default();
+    let overlay = matches!(&storage.root, MachineRoot::LinuxOverlay { .. });
+    validate_root_arguments(args, overlay)?;
     let MachineRoot::LinuxOverlay {
         lower: OverlayLower::FlatExt4 { geometry, .. },
         upper,
@@ -92,20 +101,72 @@ pub(crate) fn validate_spec(
         .and_then(|boot| boot.kernel.as_ref())
         .map(|kernel| &kernel.cmdline)
         .ok_or_else(|| invalid("overlay requires qualified direct kernel boot"))?;
-    let marker = "silo.rootfs=linux-flat-overlay-v1";
-    if args.iter().filter(|arg| arg.as_str() == marker).count() != 1
-        || args.iter().any(|arg| {
-            ["root=", "rootfstype=", "rootflags="]
-                .iter()
-                .any(|prefix| arg.starts_with(prefix))
-                || (arg.starts_with("silo.rootfs=") && arg != marker)
-        })
+    // The token checks above already refused selectors and conflicting
+    // markers; the builder-emitted marker must also be a whole argument.
+    if !args
+        .iter()
+        .any(|arg| arg.as_str() == "silo.rootfs=linux-flat-overlay-v1")
     {
         return Err(invalid(
-            "overlay requires its exact root marker without conflicting root-selection arguments",
+            "overlay requires its exact root marker as a whole kernel argument",
         ));
     }
     Ok(())
+}
+
+/// Root discovery is exclusively owned by the mandatory bootstrap and the first
+/// executable by the trusted `/init`. Both backends join the arguments with a
+/// space, so the joined line is read with the kernel's own tokenizer: quoting
+/// or kernel-only whitespace (VT, NBSP) cannot carry `root=`, `rootfstype=`,
+/// `rootflags=` or `rdinit=` past admission. `init=` stays the image handoff
+/// input. Only the overlay consistency marker is permitted.
+pub(crate) fn validate_root_arguments(args: &[String], overlay: bool) -> Result<(), LibVmError> {
+    // The kernel command line is a C string; a NUL would silently cut it.
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err(invalid("kernel arguments cannot contain NUL bytes"));
+    }
+    let cmdline = args.join(" ");
+    let mut markers = 0;
+    for param in rootfs_spec::kernel_cmdline::params(cmdline.as_bytes()) {
+        match param.reserved() {
+            Some(rootfs_spec::kernel_cmdline::Reserved::RootSelection) => {
+                return Err(invalid(
+                    "root-selection kernel arguments are reserved for the trusted bootstrap",
+                ));
+            }
+            Some(rootfs_spec::kernel_cmdline::Reserved::InitialExecutable) => {
+                return Err(invalid(
+                    "rdinit= is reserved; the trusted /init is the initial executable",
+                ));
+            }
+            None => {}
+        }
+        let Some(value) = param.value else {
+            continue;
+        };
+        if param.is(b"silo.rootfs") {
+            if !overlay || value != b"linux-flat-overlay-v1" {
+                return Err(invalid(
+                    "root profile marker conflicts with the persisted root",
+                ));
+            }
+            markers += 1;
+        }
+    }
+    if overlay && markers != 1 {
+        return Err(invalid("overlay requires exactly one root profile marker"));
+    }
+    Ok(())
+}
+
+pub(crate) fn allows_rootfs_resize(storage: &MachineStorageRecord) -> bool {
+    matches!(
+        &storage.boot,
+        crate::BootProfile::LinuxDirect {
+            root_selector: crate::RootSelector::WholeDisk | crate::RootSelector::ManagedOverlay,
+            ..
+        }
+    )
 }
 
 pub(crate) fn filesystem_uuid(path: &Path) -> Result<uuid::Uuid, LibVmError> {
@@ -149,7 +210,9 @@ pub(crate) fn prepare(
     images_dir: &Path,
     data_disks: u64,
     qualification: Option<crate::QualifiedOverlayBoot>,
+    rosetta: rootfs_spec::RosettaMode,
 ) -> Result<PreparedRoot, LibVmError> {
+    storage.validate()?;
     let mut descriptor = None;
     let (disks, root) = match &storage.root {
         MachineRoot::OpaqueRaw { path, geometry, .. } => {
@@ -166,7 +229,49 @@ pub(crate) fn prepare(
                     actual.len().max(geometry.length),
                     "silo-root".into(),
                 )?],
-                rootfs_spec::Root::Raw,
+                {
+                    let crate::BootProfile::LinuxDirect {
+                        root_selector,
+                        root_filesystem,
+                        ..
+                    } = &storage.boot
+                    else {
+                        return Err(invalid("opaque raw requires Linux direct boot"));
+                    };
+                    let selector = match root_selector {
+                        crate::RootSelector::WholeDisk => rootfs_spec::RawSelector::WholeDisk,
+                        crate::RootSelector::GptPartition { guid } => {
+                            rootfs_spec::RawSelector::GptPartition {
+                                guid: rootfs_spec::PartitionGuid::new(*guid.as_bytes())
+                                    .map_err(|error| invalid(error.to_string()))?,
+                            }
+                        }
+                        crate::RootSelector::MbrPartition { number } => {
+                            rootfs_spec::RawSelector::MbrPartition {
+                                number: rootfs_spec::MbrPartitionNumber::new(*number)
+                                    .map_err(|error| invalid(error.to_string()))?,
+                            }
+                        }
+                        crate::RootSelector::ManagedOverlay => {
+                            return Err(invalid("raw root has an overlay selector"))
+                        }
+                    };
+                    let filesystem = match root_filesystem {
+                        crate::store::models::storage::RootFilesystem::Ext4 => {
+                            rootfs_spec::RootFilesystem::Ext4
+                        }
+                    };
+                    rootfs_spec::Root::Raw(rootfs_spec::RawRoot {
+                        device: rootfs_spec::RawDeviceExpectation {
+                            serial: rootfs_spec::RawSerial::Root,
+                            length_bytes: actual.len().max(geometry.length),
+                            logical_sector_size: geometry.logical_sector_size,
+                            read_only: false,
+                        },
+                        selector,
+                        filesystem,
+                    })
+                },
             )
         }
         MachineRoot::LinuxOverlay {
@@ -262,8 +367,9 @@ pub(crate) fn prepare(
         _ => return Err(invalid("root family has not passed the launch gate")),
     };
     let mut bootstrap = vec![0; rootfs_spec::MAX_JSON_BYTES];
-    let count = rootfs_spec::encode_bootstrap(&rootfs_spec::Bootstrap { root }, &mut bootstrap)
-        .map_err(|e| invalid(e.to_string()))?;
+    let count =
+        rootfs_spec::encode_bootstrap(&rootfs_spec::Bootstrap { root, rosetta }, &mut bootstrap)
+            .map_err(|e| invalid(e.to_string()))?;
     bootstrap.truncate(count);
     Ok(PreparedRoot {
         disks,
@@ -271,6 +377,7 @@ pub(crate) fn prepare(
         descriptor,
         qualification,
         storage: storage.clone(),
+        rosetta,
     })
 }
 
@@ -409,8 +516,13 @@ mod tests {
             "root=/dev/vda",
             "rootfstype=ext4",
             "rootflags=rw",
+            "\"root=/dev/vda\"",
+            "rdinit=/agent/silo-agent",
+            "\"rdinit=/agent/silo-agent\"",
+            "rdinit=\"/agent/silo-agent\"",
             "silo.rootfs=other",
             "silo.rootfs=linux-flat-overlay-v1",
+            "\"silo.rootfs=linux-flat-overlay-v1\"",
         ] {
             let mut invalid = valid.clone();
             invalid
@@ -435,6 +547,17 @@ mod tests {
             .cmdline
             .clear();
         assert!(validate_spec(&storage, &missing_marker).is_err());
+        // One marker token, but not the builder-emitted whole argument.
+        let mut embedded_marker = valid.clone();
+        embedded_marker
+            .boot
+            .as_mut()
+            .unwrap()
+            .kernel
+            .as_mut()
+            .unwrap()
+            .cmdline = vec!["silo.rootfs=linux-flat-overlay-v1 quiet".into()];
+        assert!(validate_spec(&storage, &embedded_marker).is_err());
         let mut imported = valid.clone();
         imported.storage.as_mut().unwrap().disks[0].path = "/external/arbitrary.vmdk".into();
         assert!(validate_spec(&storage, &imported).is_err());
@@ -454,6 +577,7 @@ mod tests {
             &temp.path().join("missing-pool"),
             0,
             None,
+            rootfs_spec::RosettaMode::Disabled,
         ) {
             Ok(_) => panic!("unqualified root unexpectedly prepared"),
             Err(error) => error,
@@ -481,15 +605,141 @@ mod tests {
             &temp.path().join("missing-pool"),
             0,
             None,
+            rootfs_spec::RosettaMode::Disabled,
         )
         .unwrap();
         assert!(root.descriptor.is_none());
         assert_eq!(root.disks[0].role, DiskRole::Root);
         assert_eq!(root.disks[0].geometry.length, 512);
+        let bootstrap = rootfs_spec::decode_bootstrap(&root.bootstrap).unwrap();
+        assert_eq!(bootstrap.rosetta, rootfs_spec::RosettaMode::Disabled);
+        let rootfs_spec::Root::Raw(raw) = bootstrap.root else {
+            panic!("raw bootstrap expected")
+        };
+        assert_eq!(raw.device.serial, rootfs_spec::RawSerial::Root);
+        assert_eq!(raw.device.length_bytes, 512);
+        assert_eq!(raw.selector, rootfs_spec::RawSelector::WholeDisk);
+        assert_eq!(raw.filesystem, rootfs_spec::RootFilesystem::Ext4);
+    }
+
+    #[test]
+    fn partition_bootstrap_uses_persisted_disk_local_identity_and_disables_resize() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("root.raw"), [0; 4096]).unwrap();
+        let guid = uuid::Uuid::new_v4();
+        let mut storage = MachineStorageRecord::opaque_raw(
+            PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        if let MachineRoot::OpaqueRaw { layout, .. } = &mut storage.root {
+            *layout = crate::RawLayout::Partitioned {
+                table: crate::PartitionTable::Gpt,
+            };
+        }
+        if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
+            *root_selector = crate::RootSelector::GptPartition { guid };
+        }
+        let prepared = prepare(
+            &storage,
+            temp.path(),
+            &temp.path().join("images"),
+            0,
+            None,
+            rootfs_spec::RosettaMode::Required,
+        )
+        .unwrap();
+        let bootstrap = rootfs_spec::decode_bootstrap(&prepared.bootstrap).unwrap();
+        assert_eq!(bootstrap.rosetta, rootfs_spec::RosettaMode::Required);
+        let rootfs_spec::Root::Raw(raw) = bootstrap.root else {
+            panic!("raw bootstrap expected")
+        };
+        assert_eq!(raw.device.length_bytes, prepared.disks[0].geometry.length);
+        assert_eq!(raw.device.length_bytes, 4096);
         assert_eq!(
-            rootfs_spec::decode_bootstrap(&root.bootstrap).unwrap().root,
-            rootfs_spec::Root::Raw
+            raw.selector,
+            rootfs_spec::RawSelector::GptPartition {
+                guid: rootfs_spec::PartitionGuid::new(*guid.as_bytes()).unwrap(),
+            }
         );
+        assert!(!crate::machine::root_storage::allows_rootfs_resize(
+            &storage
+        ));
+    }
+
+    #[test]
+    fn raw_boot_rejects_hidden_and_duplicate_root_arguments() {
+        for argument in [
+            "root=/dev/vda",
+            "quiet rootflags=rw",
+            "rootfstype=ext4",
+            "\"root=/dev/vda\"",
+            "rootflags=\"rw\"",
+            "quiet\u{b}root=/dev/vda",
+            "silo.rootfs=linux-flat-overlay-v1",
+            "\"silo.rootfs=linux-flat-overlay-v1\"",
+        ] {
+            assert!(crate::machine::root_storage::validate_root_arguments(
+                &[argument.into()],
+                false
+            )
+            .is_err());
+        }
+        crate::machine::root_storage::validate_root_arguments(&["quiet".into()], false).unwrap();
+    }
+
+    #[test]
+    fn initial_executable_override_is_rejected_in_every_kernel_spelling() {
+        let rejected = |args: &[&str]| {
+            let args = args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>();
+            let error =
+                crate::machine::root_storage::validate_root_arguments(&args, false).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("rdinit= is reserved; the trusted /init is the initial executable"),
+                "{args:?}: {error}"
+            );
+        };
+        rejected(&["rdinit=/agent/silo-agent"]);
+        rejected(&["rdinit=/init"]);
+        // An empty value discards /init and falls through to kernel root mounting.
+        rejected(&["rdinit="]);
+        rejected(&["\"rdinit=/agent/silo-agent\""]);
+        rejected(&["rdinit=\"/agent/silo-agent\""]);
+        rejected(&["\"rdinit=\"/agent/silo-agent\"\""]);
+        rejected(&["init=/sbin/init", "rdinit=/agent/silo-agent"]);
+        // Kernel-only separators: VT, Latin-1 NBSP inside U+00A0 and U+00E0.
+        rejected(&["quiet\u{b}rdinit=/agent/silo-agent"]);
+        rejected(&["quiet\u{a0}rdinit=/agent/silo-agent"]);
+        rejected(&["x\u{e0}rdinit=/agent/silo-agent"]);
+        // Quoting spans arguments because backends join them with a space.
+        rejected(&["console=hvc0", "\"rdinit=/agent/silo-agent", "quiet\""]);
+        rejected(&["x=\"", "\"", "rdinit=/agent/silo-agent"]);
+
+        // The kernel reads these as other parameters; `init=` stays the
+        // image handoff input.
+        for args in [
+            vec!["init=/sbin/init"],
+            vec!["rdinit"],
+            vec!["xrdinit=/x", "rdinit_extra=/x"],
+            vec!["\"a rdinit=/agent/silo-agent\""],
+            vec!["a=\"b", "rdinit=/agent/silo-agent\""],
+            vec!["rd\"init\"=/agent/silo-agent"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            crate::machine::root_storage::validate_root_arguments(&args, false)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+        }
+        assert!(crate::machine::root_storage::validate_root_arguments(
+            &["quiet\0".into(), "rdinit=/agent/silo-agent".into()],
+            false
+        )
+        .is_err());
     }
 
     #[test]

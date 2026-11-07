@@ -35,6 +35,8 @@ service MachineService {
  rpc ForkExecution(LiveForkRequest) returns (LiveForkResult);
  rpc ForkStopped(StoppedForkRequest) returns (MachineSnapshot);
  rpc SnapshotStopped(CreateStorageSnapshotRequest) returns (StorageSnapshotInfo);
+ // Explicit stopped boot-bundle replacement; the root and its platform never change.
+ rpc UpdateBootAssets(UpdateBootAssetsRequest) returns (MachineSnapshot);
 }
 service NetworkService {
  rpc ListNetworkDefinitions(google.protobuf.Empty) returns (stream NetworkDefinition);
@@ -55,6 +57,13 @@ service RuntimeService {
  rpc ListStorageSnapshots(google.protobuf.Empty) returns (StorageSnapshotList);
  rpc ReleaseSnapshotRetention(StorageSnapshotRef) returns (google.protobuf.Empty);
  rpc RemoveImageAlias(Name) returns (google.protobuf.Empty);
+ rpc ImportImage(DiskImportRequest) returns (stream ManagedImageEvent);
+ rpc ConvertImage(ConvertImageRequest) returns (stream ManagedImageEvent);
+ rpc ResolveManagedDigest(ManagedDigest) returns (ManagedSourceId);
+ rpc InspectManagedImage(ManagedSourceRef) returns (ManagedSourceInfo);
+ rpc ListManagedImages(google.protobuf.Empty) returns (ManagedSourceList);
+ // Releases explicit retention only; aliases and consumers still retain bytes.
+ rpc ReleaseImageRetention(ManagedSourceRef) returns (google.protobuf.Empty);
  // Operation-scoped live fork observation and durable cancellation intent;
  // never resolved through a source machine, which may since have been removed.
  rpc GetFork(ForkOperationRef) returns (LiveForkResult);
@@ -99,19 +108,61 @@ message CreateNetworkDefinitionRequest { NetworkDefinition definition = 1; }
 message SetMachineNetworkRequest { MachineRef machine = 1; ResolvedNetwork network = 2; }
 enum RootProfile { ROOT_PROFILE_UNSPECIFIED = 0; ROOT_PROFILE_OPAQUE_RAW = 1; ROOT_PROFILE_LINUX_FLAT_OVERLAY_V1 = 2; }
 message TemporaryDirectoryPolicy { oneof backing { google.protobuf.Empty disk_backed = 1; uint64 tmpfs_capacity_bytes = 2; } }
-message NormalizedMachineCreate { optional string name = 1; optional string template_name = 2; map<string,string> labels = 3; ProcessConfig process = 4; Retention retention = 5; optional bytes kernel = 6; optional bytes initramfs = 7; repeated string kernel_args = 8; bool nested_virtualization = 9; bool rosetta = 10; repeated bytes disks = 11; repeated Mount mounts = 12; repeated Forward forwards = 13; optional bool vsock = 14; optional uint32 cpus = 15; optional uint64 memory_bytes = 16; optional uint64 root_disk_size_bytes = 17; optional string userdata = 18; ResolvedNetwork network = 19; Agent agent = 20; User provision_user = 21; optional RootProfile root_profile = 22; TemporaryDirectoryPolicy temporary_directory = 23; }
+message NormalizedMachineCreate { optional string name = 1; optional string template_name = 2; map<string,string> labels = 3; ProcessConfig process = 4; Retention retention = 5; optional bytes kernel = 6; optional bytes initramfs = 7; repeated string kernel_args = 8; bool nested_virtualization = 9; optional bool rosetta = 10; repeated bytes disks = 11; repeated Mount mounts = 12; repeated Forward forwards = 13; optional bool vsock = 14; optional uint32 cpus = 15; optional uint64 memory_bytes = 16; optional uint64 root_disk_size_bytes = 17; optional string userdata = 18; ResolvedNetwork network = 19; Agent agent = 20; User provision_user = 21; optional RootProfile root_profile = 22; TemporaryDirectoryPolicy temporary_directory = 23; LinuxPlatform platform = 24; }
 enum PullPolicy { PULL_POLICY_UNSPECIFIED = 0; PULL_POLICY_IF_MISSING = 1; PULL_POLICY_ALWAYS = 2; PULL_POLICY_NEVER = 3; }
 enum CacheState { CACHE_STATE_UNSPECIFIED = 0; CACHE_STATE_COMPLETE = 1; CACHE_STATE_MISSING = 2; }
 message OciIdentity { string requested_reference = 1; string selected_reference = 2; string platform = 3; string manifest_digest = 4; string config_digest = 5; PullPolicy pull_policy = 6; }
 message ResolvedImage { OciIdentity identity = 1; CacheState cache_state = 2; string oci_config_json = 3; }
-message CreateMachineRequest { NormalizedMachineCreate configuration = 1; oneof source { OciIdentity oci = 2; bytes disk_path = 3; } }
+// Absent rosetta is no explicit intent; false is an explicit disable.
+message CreateMachineRequest { NormalizedMachineCreate configuration = 1; oneof source { OciIdentity oci = 2; DiskImportRequest disk = 3; ManagedSourceRef managed = 4; } }
+enum GuestArchitecture { GUEST_ARCHITECTURE_UNSPECIFIED = 0; GUEST_ARCHITECTURE_AMD64 = 1; GUEST_ARCHITECTURE_ARM64 = 2; }
+message LinuxPlatform { GuestArchitecture architecture = 1; optional string variant = 2; }
+// Request-only selection. auto_gpt is never persisted; GUIDs are canonical
+// nonnil UUID text; MBR primary slots are 1..4 and checked before narrowing.
+message ImportRootSelection { oneof selection { google.protobuf.Empty whole_disk = 1; google.protobuf.Empty auto_gpt = 2; string gpt_partition = 3; uint32 mbr_partition = 4; } }
+// A concrete persisted selector: no auto selection and no host device path.
+message RootSelector { oneof selector { google.protobuf.Empty managed_overlay = 1; google.protobuf.Empty whole_disk = 2; string gpt_partition = 3; uint32 mbr_partition = 4; } }
+enum RootFilesystem { ROOT_FILESYSTEM_UNSPECIFIED = 0; ROOT_FILESYSTEM_EXT4 = 1; }
+enum Translation { TRANSLATION_UNSPECIFIED = 0; TRANSLATION_NONE = 1; TRANSLATION_ROSETTA = 2; }
+// A complete file tuple: an absent agent is explicit absence, never inheritance.
+message BootAssetFiles { bytes kernel = 1; bytes base_initramfs = 2; optional bytes agent = 3; }
+message BootAssetSelection { oneof selection { google.protobuf.Empty packaged = 1; BootAssetFiles files = 2; string exact_bundle = 3; } }
+message LinuxDirectImport { LinuxPlatform platform = 1; ImportRootSelection root = 2; BootAssetSelection assets = 3; }
+message DiskImportRequest { bytes path = 1; oneof boot { LinuxDirectImport linux_direct = 2; } optional string alias = 3; }
+// One typed image: namespace. A bare sha256 spelling is resolved first through
+// ResolveManagedDigest; it is never an untyped reference here.
+message ManagedSourceRef { oneof reference { string alias = 1; string image_id = 2; string snapshot_id = 3; } }
+message ManagedDigest { string digest = 1; }
+message ManagedSourceId { oneof id { string image_id = 1; string snapshot_id = 2; } }
+enum ImageContainerKind { IMAGE_CONTAINER_KIND_UNSPECIFIED = 0; IMAGE_CONTAINER_KIND_RAW = 1; IMAGE_CONTAINER_KIND_QCOW2 = 2; IMAGE_CONTAINER_KIND_OCI = 3; }
+// Observed import facts of a disk container; the selected candidate extent is
+// an observation, not a persisted device address.
+message DiskImportFacts { uint64 source_length = 1; uint64 decoded_length = 2; RootCandidate selected_root = 3; }
+// Diagnostic facts outside image identity; a source digest is not retention.
+// disk is present exactly for raw and qcow2 containers.
+message ImageProvenance { ImageContainerKind container = 1; string source_digest = 2; string source_spelling = 3; optional string source_manifest = 4; optional string source_config = 5; DiskImportFacts disk = 6; }
+// record is the canonical image record; receivers verify record_digest and id.
+message ManagedImageInfo { string id = 1; string record_digest = 2; bytes record = 3; repeated string aliases = 4; bool retained = 5; repeated ImageProvenance provenance = 6; }
+// Inspection is not a content lease.
+message ManagedSourceInfo { oneof info { ManagedImageInfo image = 1; StorageSnapshotInfo snapshot = 2; } }
+message ManagedSourceList { repeated ManagedSourceInfo values = 1; }
+message ManagedImageEvent { oneof event { ImageProgress progress = 1; ManagedImageInfo image = 2; } }
+// Converts exactly this selected immutable identity, never a mutable tag.
+message ConvertImageRequest { OciIdentity source = 1; optional string alias = 2; }
+message PinnedBootBundle { string digest = 1; string kernel = 2; string base_initramfs = 3; optional string agent = 4; GuestArchitecture architecture = 5; string abi = 6; }
+message LinuxDirectBoot { LinuxPlatform userspace_platform = 1; GuestArchitecture kernel_architecture = 2; PinnedBootBundle bundle = 3; RootSelector root_selector = 4; RootFilesystem root_filesystem = 5; Translation translation = 6; }
+// Current pinned boot meaning plus a newer locally admitted packaged bundle,
+// observed without mutation. Start never switches bundles implicitly.
+message MachineBoot { LinuxDirectBoot linux_direct = 1; optional string packaged_replacement = 2; }
+message UpdateBootAssetsRequest { MachineRef machine = 1; BootAssetSelection selection = 2; }
 message ImageReferenceProgress { string image_ref = 1; }
 message ManifestProgress { string image_ref = 1; string manifest_digest = 2; uint64 layer_count = 3; optional uint64 total_download_bytes = 4; }
 message LayerProgress { uint64 index = 1; uint64 total = 2; string digest = 3; optional uint64 size_bytes = 4; uint64 downloaded_bytes = 5; }
 message ApplyingLayerProgress { uint64 index = 1; uint64 total = 2; optional string digest = 3; }
 message ImageProgress { oneof event { ImageReferenceProgress resolving_manifest = 1; ManifestProgress resolved_manifest = 2; ImageReferenceProgress checking_cache = 3; ImageReferenceProgress cache_hit = 4; ImageReferenceProgress cache_miss = 5; ImageReferenceProgress using_local_disk = 6; LayerProgress layer_download_started = 7; LayerProgress layer_download_progress = 8; LayerProgress layer_download_verifying = 9; LayerProgress layer_download_finished = 10; LayerProgress layer_download_skipped = 11; ApplyingLayerProgress applying_layer = 12; google.protobuf.Empty materializing_rootfs = 13; google.protobuf.Empty publishing_rootfs = 14; google.protobuf.Empty complete = 15; } }
 message CreateMachineEvent { oneof event { ImageProgress progress = 1; MachineSnapshot machine = 2; } }
-message ResolveImageRequest { string reference = 1; PullPolicy pull_policy = 2; }
+// platform requests a Linux platform; the selected platform stays in the identity.
+message ResolveImageRequest { string reference = 1; PullPolicy pull_policy = 2; LinuxPlatform platform = 3; }
 message ResolveImageEvent { oneof event { ImageProgress progress = 1; ResolvedImage image = 2; } }
 message PullImageRequest { string reference = 1; }
 message EgressSecret { string slot = 1; bytes value = 2; }
@@ -135,7 +186,7 @@ message MachineIssue { IssueComponent component = 1; string message = 2; }
 message LifecycleDetail { optional string message = 1; }
 message RunningStatus { bool ready = 1; bool guest_ready = 2; optional string message = 3; }
 message MachineStatus { oneof status { google.protobuf.Empty stopped = 1; LifecycleDetail starting = 2; RunningStatus running = 3; LifecycleDetail stopping = 4; LifecycleDetail error = 5; LifecycleDetail pausing = 6; LifecycleDetail paused = 7; LifecycleDetail capturing = 8; LifecycleDetail restoring = 9; LifecycleDetail activating = 10; LifecycleDetail activation_failed = 11; } }
-enum ImageSourceKind { IMAGE_SOURCE_KIND_UNSPECIFIED = 0; IMAGE_SOURCE_KIND_OCI = 1; IMAGE_SOURCE_KIND_DISK = 2; }
+enum ImageSourceKind { IMAGE_SOURCE_KIND_UNSPECIFIED = 0; IMAGE_SOURCE_KIND_OCI = 1; IMAGE_SOURCE_KIND_DISK = 2; IMAGE_SOURCE_KIND_MANAGED = 3; }
 message Rootfs { ImageSourceKind source_kind = 1; string requested_reference = 2; optional string selected_reference = 3; optional string manifest_digest = 4; optional string config_digest = 5; optional string image_id = 6; bytes root_disk_path = 7; uint64 root_disk_size_bytes = 8; google.protobuf.Timestamp created_at = 9; }
 message MachineTailscale { bytes state_dir = 1; string hostname = 2; bool ephemeral = 3; }
 enum BootMode { BOOT_MODE_UNSPECIFIED = 0; BOOT_MODE_STANDARD = 1; BOOT_MODE_AGENT_PID1 = 2; BOOT_MODE_INIT_CHILD = 3; }
@@ -145,7 +196,7 @@ enum ProvisionStepStatus { PROVISION_STEP_STATUS_UNSPECIFIED = 0; PROVISION_STEP
 enum ProvisionFailurePolicy { PROVISION_FAILURE_POLICY_UNSPECIFIED = 0; PROVISION_FAILURE_POLICY_BEST_EFFORT = 1; PROVISION_FAILURE_POLICY_FAIL_BOOT = 2; }
 message ProvisionStepReport { string id = 1; ProvisionStepStatus status = 2; ProvisionFailurePolicy failure_policy = 3; bool changed = 4; optional string backend = 5; google.protobuf.Duration duration = 6; optional string message = 7; optional string error_chain = 8; }
 message ProvisionReport { ProvisionStatus status = 1; google.protobuf.Timestamp started_at = 2; google.protobuf.Timestamp finished_at = 3; google.protobuf.Duration duration = 4; repeated ProvisionStepReport steps = 5; optional string message = 6; }
-message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; LiveMachineReport live = 29; LiveHostReport prospective_live = 30; optional LiveEvidenceState live_evidence = 31; MachineLifecycle lifecycle = 32; repeated MachineCapture captures = 33; }
+message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; LiveMachineReport live = 29; LiveHostReport prospective_live = 30; optional LiveEvidenceState live_evidence = 31; MachineLifecycle lifecycle = 32; repeated MachineCapture captures = 33; MachineBoot boot = 34; }
 message MachineInventoryEntry { string id = 1; string name = 2; MachineSnapshot data = 3; repeated MachineIssue issues = 4; }
 message MachineStart { string run_id = 1; MachineSnapshot data = 2; }
 enum ReadinessOutcome { READINESS_OUTCOME_UNSPECIFIED = 0; READINESS_OUTCOME_READY = 1; READINESS_OUTCOME_TERMINAL = 2; READINESS_OUTCOME_TIMED_OUT = 3; }
@@ -172,8 +223,22 @@ enum PolicySecretsState { POLICY_SECRETS_STATE_UNSPECIFIED = 0; POLICY_SECRETS_S
 message SecretDiagnostic { string slot = 1; optional string key = 2; string code = 3; }
 message PolicySecretsResult { PolicySecretsState state = 1; repeated SecretDiagnostic diagnostics = 2; repeated SecretRequirement requirements = 3; repeated SecretSlot slots = 4; }
 enum ErrorKind { ERROR_KIND_UNSPECIFIED = 0; ERROR_KIND_INVALID = 1; ERROR_KIND_MISSING = 2; ERROR_KIND_DUPLICATE = 3; ERROR_KIND_CONFLICT = 4; ERROR_KIND_LIMIT = 5; ERROR_KIND_DENIED = 6; ERROR_KIND_UNAVAILABLE = 7; ERROR_KIND_INTERNAL = 8; }
-enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; ERROR_CODE_LIVE_OPERATION_UNSUPPORTED = 8; }
-message ErrorDetail { ErrorKind kind = 1; ErrorCode code = 2; string safe_message = 3; optional string reference = 4; optional string expected_run = 5; optional string current_run = 6; optional string program = 7; optional string native_variant = 8; optional LaunchFailureReason launch_failure_reason = 9; LiveOperationUnsupported live_unsupported = 10; }
+enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; ERROR_CODE_LIVE_OPERATION_UNSUPPORTED = 8; ERROR_CODE_BACKEND_ADMISSION_REJECTED = 9; ERROR_CODE_ROOT_SELECTION_FAILED = 10; ERROR_CODE_TRANSLATION_UNAVAILABLE = 11; ERROR_CODE_BOOT_ASSETS_ACQUISITION_REQUIRED = 12; ERROR_CODE_DISK_IMPORT_REJECTED = 13; ERROR_CODE_BOOT_BUNDLE_ABI_UNSUPPORTED = 14; }
+message ErrorDetail { ErrorKind kind = 1; ErrorCode code = 2; string safe_message = 3; optional string reference = 4; optional string expected_run = 5; optional string current_run = 6; optional string program = 7; optional string native_variant = 8; optional LaunchFailureReason launch_failure_reason = 9; LiveOperationUnsupported live_unsupported = 10; BackendAdmissionRejected backend_admission = 11; RootSelectionFailed root_selection = 12; DiskImportRejected disk_import = 13; BootBundleAbiUnsupported boot_bundle_abi = 14; }
+// A custom base initramfs whose bootstrap ABI is not the locally known packaged one.
+message BootBundleAbiUnsupported { string expected = 1; string actual = 2; }
+enum SourceFamily { SOURCE_FAMILY_UNSPECIFIED = 0; SOURCE_FAMILY_OCI = 1; SOURCE_FAMILY_LOCAL_DISK = 2; SOURCE_FAMILY_MANAGED_IMAGE = 3; SOURCE_FAMILY_SNAPSHOT = 4; }
+enum StorageProfile { STORAGE_PROFILE_UNSPECIFIED = 0; STORAGE_PROFILE_OPAQUE_RAW_V1 = 1; STORAGE_PROFILE_LINUX_OVERLAY_V1 = 2; }
+enum BackendRequirement { BACKEND_REQUIREMENT_UNSPECIFIED = 0; BACKEND_REQUIREMENT_RAW_BLOCK = 1; BACKEND_REQUIREMENT_KRUN_OVERLAY = 2; }
+enum AdmissionRemedy { ADMISSION_REMEDY_UNSPECIFIED = 0; ADMISSION_REMEDY_EXPLICIT_OCI_TO_RAW_CONVERSION = 1; ADMISSION_REMEDY_USE_KRUN = 2; ADMISSION_REMEDY_UNSUPPORTED_BOOT_PROFILE = 3; }
+message BackendAdmissionRejected { SourceFamily source_family = 1; StorageProfile root_profile = 2; BackendRequirement requirement = 3; LiveBackend effective_backend = 4; AdmissionRemedy remedy = 5; }
+// Candidate extents are import-time observations, not persisted device addresses.
+message RootCandidate { RootSelector selector = 1; uint64 first_lba = 2; uint64 length_lbas = 3; optional string gpt_type = 4; optional uint32 mbr_type = 5; uint64 attributes = 6; }
+message RootSelectionFailed { ImportRootSelection requested = 1; repeated RootCandidate candidates = 2; string reason = 3; }
+enum DiskImportFailure { DISK_IMPORT_FAILURE_UNSPECIFIED = 0; DISK_IMPORT_FAILURE_OPEN = 1; DISK_IMPORT_FAILURE_SYMBOLIC_LINK = 2; DISK_IMPORT_FAILURE_NOT_REGULAR_FILE = 3; DISK_IMPORT_FAILURE_UNSUPPORTED_CONTAINER = 4; DISK_IMPORT_FAILURE_RAW_GEOMETRY = 5; DISK_IMPORT_FAILURE_QCOW2 = 6; DISK_IMPORT_FAILURE_SOURCE_CHANGED = 7; DISK_IMPORT_FAILURE_PARTITION_TABLE = 8; DISK_IMPORT_FAILURE_DIRECT_TABLE = 9; DISK_IMPORT_FAILURE_ROOT_FILESYSTEM = 10; DISK_IMPORT_FAILURE_OUTPUT_LENGTH = 11; DISK_IMPORT_FAILURE_READ = 12; DISK_IMPORT_FAILURE_DECODED_GEOMETRY = 13; }
+enum ForeignContainer { FOREIGN_CONTAINER_UNSPECIFIED = 0; FOREIGN_CONTAINER_VMDK = 1; FOREIGN_CONTAINER_VHD = 2; FOREIGN_CONTAINER_VHDX = 3; FOREIGN_CONTAINER_VDI = 4; FOREIGN_CONTAINER_QED = 5; FOREIGN_CONTAINER_LUKS = 6; FOREIGN_CONTAINER_GZIP = 7; FOREIGN_CONTAINER_XZ = 8; FOREIGN_CONTAINER_ZSTD = 9; FOREIGN_CONTAINER_BZIP2 = 10; }
+// container is present exactly for unsupported-container failures.
+message DiskImportRejected { DiskImportFailure failure = 1; bytes path = 2; optional ForeignContainer container = 3; }
 enum LaunchFailureReason { LAUNCH_FAILURE_REASON_UNSPECIFIED = 0; LAUNCH_FAILURE_REASON_COMMAND_NOT_FOUND = 1; LAUNCH_FAILURE_REASON_INVALID_PROCESS_SPEC = 2; LAUNCH_FAILURE_REASON_WORKING_DIRECTORY_NOT_FOUND = 3; LAUNCH_FAILURE_REASON_WORKING_DIRECTORY_NOT_DIRECTORY = 4; LAUNCH_FAILURE_REASON_INVALID_IDENTITY = 5; LAUNCH_FAILURE_REASON_IDENTITY_NOT_FOUND = 6; LAUNCH_FAILURE_REASON_PERMISSION_DENIED = 7; LAUNCH_FAILURE_REASON_SPAWN_FAILED = 8; LAUNCH_FAILURE_REASON_CANCELLED_BEFORE_START = 9; }
 enum NodeState { NODE_STATE_UNSPECIFIED = 0; NODE_STATE_CONNECTING = 1; NODE_STATE_APPROVAL_REQUIRED = 2; NODE_STATE_READY = 3; NODE_STATE_DISCONNECTED = 4; NODE_STATE_FAILED = 5; NODE_STATE_STOPPED = 6; }
 message NodeStatus { string machine_id = 1; string run_id = 2; google.protobuf.Timestamp updated_at = 3; NodeState state = 4; optional string approval_url = 5; optional string dns_name = 6; optional string node_id = 7; repeated string tags = 8; repeated string addresses = 9; google.protobuf.Timestamp key_expiry = 10; optional string error_code = 11; bool key_expiry_known = 12; uint32 version = 13; }

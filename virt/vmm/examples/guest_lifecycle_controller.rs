@@ -145,12 +145,8 @@ async fn run(fixture: Fixture) -> eyre::Result<()> {
         .memory(512)
         .kernel(&fixture.kernel)
         .initramfs(&fixture.initramfs)
-        .kernel_cmdline(vec![
-            "root=/dev/vda".into(),
-            "rootfstype=ext4".into(),
-            "rw".into(),
-            "console=hvc0".into(),
-        ])
+        // Root selection comes only from the composite initramfs's bootstrap.
+        .kernel_cmdline(vec!["console=hvc0".into()])
         .no_network()
         .disk(fixture.root.clone())
         .build()

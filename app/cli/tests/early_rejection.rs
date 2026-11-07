@@ -84,7 +84,11 @@ fn install_runtime(root: &Path) {
         std::fs::copy(monitor, root.join(path))
             .expect("install actual monitor inside portable runtime");
     }
-    std::fs::write(root.join("assets/kernel-default"), b"scenario kernel").expect("kernel fixture");
+    std::fs::write(
+        root.join("assets/kernel-default"),
+        test_utils::direct_kernel::host_kernel("scenario kernel"),
+    )
+    .expect("kernel fixture");
     std::fs::write(root.join("assets/initramfs"), b"scenario initramfs")
         .expect("initramfs fixture");
     let agent = root.join("assets/agent");
@@ -328,7 +332,9 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
         .write_to(&scenario_path)
         .expect("write typed scenario");
         let disk = root.join("disk.raw");
-        std::fs::write(&disk, vec![0; 4096]).expect("disk fixture");
+        disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+            .and_then(|formatter| formatter.close())
+            .expect("admissible whole-disk ext4 fixture");
         let runtime = Runtime::new(
             RuntimeConfig::local(root.join("home"))
                 .with_run_root(root.join("run"))
@@ -340,7 +346,15 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
         let machine = runtime
             .machine()
             .name("source")
-            .image_source(ImageSource::Disk(disk))
+            .image_source(ImageSource::Disk(libvm::DiskImportRequest {
+                path: disk,
+                boot: libvm::DiskImportBoot::LinuxDirect {
+                    platform: silo_vm_control::boot::host_platform().expect("host platform"),
+                    root: libvm::ImportRootSelection::WholeDisk,
+                    assets: libvm::BootAssetSelection::Packaged,
+                },
+                alias: None,
+            }))
             .network(|network| network.none())
             .create()
             .await
@@ -412,6 +426,68 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
             );
         }
         machine.stop().await.expect("stop scenario monitor");
+    }
+}
+
+#[test]
+fn disk_import_structural_refusals_precede_writable_runtime_initialization() {
+    let temporary = tempfile::tempdir().expect("private fixture root");
+    let root = temporary.path();
+    let odd = root.join("odd.raw");
+    let empty = root.join("empty.raw");
+    let foreign = root.join("foreign.vmdk");
+    let qcow = root.join("malformed.qcow2");
+    let directory = root.join("directory");
+    let fifo = root.join("fifo");
+    let link = root.join("link.raw");
+    std::fs::write(&odd, [0; 513]).expect("odd geometry");
+    std::fs::write(&empty, []).expect("empty geometry");
+    let mut foreign_bytes = [0; 512];
+    foreign_bytes[..4].copy_from_slice(b"KDMV");
+    std::fs::write(&foreign, foreign_bytes).expect("foreign container");
+    std::fs::write(&qcow, b"QFI\xfb").expect("malformed qcow2");
+    std::fs::create_dir(&directory).expect("directory source");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("FIFO source");
+    symlink(&odd, &link).expect("source symlink");
+    let platform = if cfg!(target_arch = "aarch64") {
+        "linux/arm64"
+    } else {
+        "linux/amd64"
+    };
+    for path in [&odd, &empty, &foreign, &qcow, &directory, &fifo, &link] {
+        let before = snapshot(root);
+        let output = run(
+            root,
+            "krun",
+            &[
+                "image",
+                "import",
+                path.to_str().expect("fixture path"),
+                "--platform",
+                platform,
+                "--root",
+                "whole-disk",
+                "--boot",
+                "linux-direct",
+            ],
+        );
+        assert!(!output.status.success(), "{path:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("raw disk image")
+                || error.contains("qcow2")
+                || error.contains("convert")
+                || error.contains("not a regular file")
+                || error.contains("symbolic link"),
+            "{path:?}: {error}"
+        );
+        assert_eq!(snapshot(root), before, "{path:?}: {error}");
+        assert!(!root.join("home").exists());
+        assert!(!root.join("run").exists());
     }
 }
 

@@ -3,16 +3,19 @@ use std::path::Path;
 use ::oci::{MaterializeOptions, OciError, OciMaterializer, RootfsMetadata};
 
 use crate::image::{
-    progress::oci_progress_reporter, ImageCacheState, ImageProgressSender, ImageSourceKind,
-    MaterializedImage, ResolvedOciImage, ResolvedOciImageMaterialization,
+    progress::oci_progress_reporter, ImageCacheState, ImageProgress, ImageProgressSender,
+    ImageSourceKind, MaterializedImage, ResolvedOciImage, ResolvedOciImageMaterialization,
 };
-use crate::storage::pool::PublishedStream;
+use crate::storage::pool::{PublishedStream, StoragePool};
 use crate::store::models::{
     ImageConfigRecord, ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord,
     ImageRefRecord, ImageRootfsArtifactRecord, OciImageRecord,
 };
+use crate::store::ImageStore;
 use crate::LibVmError;
 
+/// The one flattener ABI. It is part of both the OCI rootfs cache identity and
+/// the explicit raw-conversion key, so changing the flattener invalidates both.
 pub(crate) const CONVERSION_ABI: &str = "flat-ext4-v2:normalized-phase2:minimum-size=536870912";
 
 pub(crate) fn image_error(reference: &str, source: OciError) -> LibVmError {
@@ -34,10 +37,12 @@ pub(crate) fn storage_error(error: crate::storage::StorageError) -> LibVmError {
     LibVmError::Storage(error)
 }
 
+/// Returns the map of the exact pool bytes hashed here, so callers never hash
+/// the retained stream a second time to describe it.
 pub(crate) fn verify_cached_image(
     image: &mut OciImageRecord,
     images_dir: &Path,
-) -> Result<crate::storage::identity_file::SourceFingerprint, LibVmError> {
+) -> Result<crate::storage::stream::StreamMap, LibVmError> {
     let artifact = &mut image.artifact;
     let slot = Path::new("images/streams/sha256").join(artifact.stream_id.hex());
     if !artifact.rootfs_path.is_absolute()
@@ -81,7 +86,7 @@ pub(crate) fn verify_cached_image(
             ),
         });
     }
-    Ok(before)
+    Ok(map)
 }
 
 pub(crate) fn cached_resolved_oci_image(
@@ -170,7 +175,152 @@ pub(crate) fn materialized_image(
             architecture: image.manifest.platform_architecture,
             variant: image.manifest.platform_variant,
         },
+        managed: None,
+        authenticated: None,
         _lease: Some(lease),
+    }
+}
+
+/// Byte key serializing flattening of one selected OCI identity into the
+/// rootfs cache. It is not the raw-conversion key, which names an image.
+fn rootfs_cache_key(
+    resolved: &ResolvedOciImage,
+) -> Result<crate::storage::identity::ObjectDigest, LibVmError> {
+    let bytes = serde_json::to_vec(&(
+        CONVERSION_ABI,
+        &resolved.manifest_digest,
+        &resolved.config_digest,
+        &resolved.platform,
+    ))
+    .map_err(|error| LibVmError::StateDecode {
+        field: "image.conversion-key",
+        message: error.to_string(),
+    })?;
+    Ok(crate::storage::identity::ObjectDigest::of_bytes(&bytes))
+}
+
+/// A retained, verified flattened rootfs and the map of its exact pool bytes.
+pub(crate) struct AcquiredRootfs {
+    pub(crate) record: OciImageRecord,
+    pub(crate) map: crate::storage::stream::StreamMap,
+}
+
+/// Acquire the one flattened rootfs stream for an already selected OCI
+/// identity, for any platform the caller resolved. The caller owns the
+/// registered `convert` operation and its lease; on return the stream is
+/// verified and retained by that operation until the lease is dropped.
+///
+/// Callers must run this inside a task that owns the lease (and any staging)
+/// until this future completes, never in a caller-cancellable future: its
+/// blocking verifier, flattener and publisher keep running after a drop, and
+/// a closed lease would let recovery retire the operation beneath them.
+///
+/// ```text
+/// lock(manifest, config, platform, ABI)
+///   ├─ cached row ─► retain into operation ─► rehash pool bytes ─► record
+///   └─ miss ───────► existing flattener ─► publish stream ─► retain ─► record
+/// ```
+pub(crate) async fn acquire_rootfs<S: ImageStore + ?Sized>(
+    store: &S,
+    images_dir: &Path,
+    producer: &OciMaterializer,
+    progress: Option<&ImageProgressSender>,
+    resolved: &ResolvedOciImage,
+    operation_id: uuid::Uuid,
+) -> Result<AcquiredRootfs, LibVmError> {
+    let key = rootfs_cache_key(resolved)?;
+    let pool = StoragePool::open(images_dir).map_err(storage_error)?;
+    let (pool, _flattening) = tokio::task::spawn_blocking(move || {
+        let lock = pool.lock_publication(&key)?;
+        Ok::<_, crate::storage::StorageError>((pool, lock))
+    })
+    .await?
+    .map_err(storage_error)?;
+    if let Some(mut image) = store
+        .cached_oci_image(&resolved.selected_reference, &resolved.platform)
+        .await?
+    {
+        store
+            .retain_storage_stream(&image.artifact.stream_id, operation_id)
+            .await?;
+        let images_dir = images_dir.to_path_buf();
+        let (mut image, map) = tokio::task::spawn_blocking(move || {
+            let map = verify_cached_image(&mut image, &images_dir)?;
+            Ok::<_, LibVmError>((image, map))
+        })
+        .await??;
+        ensure_resolved_oci_identity(resolved, &image)?;
+        emit_cached_image_progress(progress, &resolved.requested_reference);
+        image.reference.requested_reference = resolved.requested_reference.clone();
+        image.reference.last_used_at = Some(crate::utils::now_unix());
+        store.save_oci_image(&image).await?;
+        emit_image_progress_complete(progress);
+        return Ok(AcquiredRootfs { record: image, map });
+    }
+    if let Some(progress) = progress {
+        progress.send(ImageProgress::CheckingCache {
+            image_ref: resolved.requested_reference.clone(),
+        });
+        progress.send(ImageProgress::CacheMiss {
+            image_ref: resolved.requested_reference.clone(),
+        });
+    }
+    let ResolvedOciImageMaterialization::Registry(image) = &resolved.materialization else {
+        return Err(LibVmError::ImageNotFound {
+            reference: resolved.selected_reference.clone(),
+        });
+    };
+    let options = MaterializeOptions::new(resolved.platform.clone());
+    let staging_operation = ::oci::StagingOperation::try_from(operation_id.to_string())
+        .map_err(|error| image_error(&resolved.requested_reference, error))?;
+    let staged = producer
+        .materialize(
+            image,
+            &options,
+            &staging_operation,
+            oci_progress_reporter(progress.cloned()),
+        )
+        .await
+        .map_err(|error| image_error(&resolved.requested_reference, error))?;
+    if let Some(progress) = progress {
+        progress.send(ImageProgress::PublishingRootfs);
+    }
+    let (published, roots, staged) = tokio::task::spawn_blocking(move || {
+        let (published, roots) = pool.publish_stream_for_catalog(&staged.path)?;
+        Ok::<_, crate::storage::StorageError>((published, roots, staged))
+    })
+    .await?
+    .map_err(storage_error)?;
+    let record = oci_image_record(&published, &staged.metadata, &resolved.requested_reference)?;
+    ensure_resolved_oci_identity(resolved, &record)?;
+    store
+        .retain_storage_stream(&record.artifact.stream_id, operation_id)
+        .await?;
+    // The publication roots guard covers the stream until its catalog retention.
+    drop(roots);
+    store.save_oci_image(&record).await?;
+    emit_image_progress_complete(progress);
+    Ok(AcquiredRootfs {
+        record,
+        map: published.map,
+    })
+}
+
+pub(crate) fn emit_cached_image_progress(progress: Option<&ImageProgressSender>, image_ref: &str) {
+    let Some(progress) = progress else {
+        return;
+    };
+    progress.send(ImageProgress::CheckingCache {
+        image_ref: image_ref.to_string(),
+    });
+    progress.send(ImageProgress::CacheHit {
+        image_ref: image_ref.to_string(),
+    });
+}
+
+pub(crate) fn emit_image_progress_complete(progress: Option<&ImageProgressSender>) {
+    if let Some(progress) = progress {
+        progress.send(ImageProgress::Complete);
     }
 }
 

@@ -188,6 +188,7 @@ rustc --edition=2024 --target "$GUEST_TARGET" \
 
 SILO_TEST_KERNEL="$PWD/target/debug/assets/kernel-default" \
 SILO_TEST_INITRAMFS="$PWD/target/debug/assets/initramfs" \
+SILO_TEST_INIT="$PWD/target/$GUEST_TARGET/debug/init" \
 SILO_TEST_SHUTDOWN="$PWD/target/krun-guest-shutdown" \
   cargo test --locked -p silo-vmm --test krun_worker \
   native_guest_devices_shutdown_crash_and_new_generation -- --ignored --nocapture
@@ -208,15 +209,20 @@ first with `cargo test --locked -p silo-vmm --test krun_worker --no-run`, sign
 without changing build inputs. Native macOS execution remains a separate required
 qualification; Linux success does not establish it.
 
-The test boots the real Silo initramfs into its rescue shell, without a guest-agent
-stub, and runs these scenarios as consecutive generations in the same machine
+The test formats a whole-disk ext4 root carrying the multicall Silo binary
+(`SILO_TEST_INIT`) as `/bin/sh`, attaches it as `silo-root`, and appends a
+schema-2 whole-disk launch bootstrap to the real base initramfs, as libvm
+composes it. The real Silo init resolves that root only through the bootstrap,
+then hands off to `init=/bin/sh`; there is no kernel `root=` argument and no
+rescue-shell path. Without a guest-agent stub, it runs these scenarios as
+consecutive generations in the same machine
 directory: two intentional stops, an unexpected SIGKILL of the worker, a guest
 reboot, and a guest poweroff. Each generation exercises bidirectional serial RPC,
 block ordering/read-only flags, virtio-fs reads and read-only enforcement,
 vsock/balloon device enumeration, a single `krun` child whose argv is exactly
 `krun` (and whose executable is `silo-vmm` on Linux), the `backend` block
 of `vm.exit.json`, and reap. Guest reboot and poweroff follow libkrun's init
-convention and must end the worker cleanly, not restart it. A bare rescue guest
+convention and must end the worker cleanly, not restart it. A bare shell guest
 may also require macOS's forced fallback rather than acknowledging a graceful
 power-button request.
 

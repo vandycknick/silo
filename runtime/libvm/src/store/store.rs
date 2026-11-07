@@ -34,6 +34,9 @@ impl Store {
     pub(crate) fn home_path(&self) -> &Path {
         &self.home
     }
+    pub(crate) fn images_path(&self) -> &Path {
+        &self.images_dir
+    }
     #[cfg(test)]
     pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
         let store = Self::open(&paths.state_db_path()).await?;
@@ -45,6 +48,11 @@ impl Store {
     pub(crate) async fn execute_test_sql(&self, statement: &'static str) -> Result<(), LibVmError> {
         sqlx::raw_sql(statement).execute(&self.pool).await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -595,6 +603,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_direct_boot_refuses_transient_selection_without_replacing_old_bundle() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "pinned-only".into(), paths.machine(id).dir());
+        db.add_machine(&config, &machine_state(id, MachineRuntimeState::Stopped))
+            .await
+            .unwrap();
+        let original = db.machine_storage(id).await.unwrap().unwrap();
+        let mut transient = original.clone();
+        if let crate::BootProfile::LinuxDirect { binding, .. } = &mut transient.boot {
+            *binding = crate::BootBinding::RuntimeSelected;
+        }
+        assert!(db
+            .save_machine_config_with_storage(&config, &transient)
+            .await
+            .is_err());
+        assert_eq!(db.machine_storage(id).await.unwrap().unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn machine_rootfs_round_trips_oci_identity_and_local_disk_pin() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -623,16 +652,18 @@ mod tests {
             created_at: 7,
         };
 
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
+            crate::PrivatePath::new("root.raw").unwrap(),
+            rootfs.root_disk_size_bytes,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        let _boot = db.pin_test_boot(&mut storage).await.unwrap();
         db.add_machine_with_rootfs(
             &machine,
             &machine_state(id, MachineRuntimeState::Stopped),
             &rootfs,
-            &crate::MachineStorageRecord::opaque_raw(
-                crate::PrivatePath::new("root.raw").unwrap(),
-                rootfs.root_disk_size_bytes,
-                &oci::Platform::host().unwrap(),
-            )
-            .unwrap(),
+            &storage,
         )
         .await
         .expect("insert machine rootfs pin");
@@ -1703,6 +1734,7 @@ mod tests {
         let id = MachineId::new();
         let mut config = machine_from_path(id, "dependencies".to_string(), paths.machine(id).dir());
         std::fs::create_dir_all(&config.machine_dir).unwrap();
+        let _pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
         let candidate = paths.images_dir().join("streams/sha256/retained");
         std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
         std::fs::write(&candidate, [0x64; 512]).unwrap();
@@ -1937,7 +1969,9 @@ mod tests {
         let source = paths.home().join("source.raw");
         std::fs::write(&source, [0x64; 512]).unwrap();
         let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
-        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        // Deliberately leave this stream unrooted so recovery must discover the
+        // configured external dependency, not an active publication guard.
+        let stream = pool.publish_stream(&source).unwrap();
         let id = MachineId::new();
         let mut config =
             machine_from_path(id, "independent-root".to_string(), paths.machine(id).dir());
@@ -1977,7 +2011,6 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        drop(roots);
         db.close().await;
         let reopened = Store::open(&paths.state_db_path()).await.unwrap();
         assert_eq!(reopened.machine_config(id).await.unwrap(), Some(config));
@@ -2424,18 +2457,26 @@ mod tests {
                 base_initramfs: object.digest,
                 agent: Some(object.digest),
                 architecture: *kernel_architecture,
-                abi: "unit-bundle-v1".into(),
+                abi: crate::runtime::boot_assets::DIRECT_BOOT_ABI.into(),
             };
         } else {
             panic!("fixture must use LinuxDirect");
         }
+        let crate::BootProfile::LinuxDirect { binding, .. } = &storage.boot else {
+            panic!("direct fixture")
+        };
+        let bundle_input = paths.home().join("bundle");
+        std::fs::write(&bundle_input, binding.canonical_bytes().unwrap()).unwrap();
+        let (bundle, roots) = pool.publish_object_for_catalog(&bundle_input).unwrap();
         db.save_machine_config_with_storage(&config, &storage)
             .await
             .unwrap();
+        drop(roots);
         // Committed semantic roots protect the same projection before launch.
         db.prune_images().await.unwrap();
         assert!(object.path.exists());
         assert!(stream.path.exists());
+        assert!(bundle.path.exists());
         let owner = db
             .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
             .await
@@ -2451,6 +2492,7 @@ mod tests {
         db.prune_images().await.unwrap();
         assert_eq!(std::fs::read(&stream.path).unwrap(), [7; 512]);
         assert_eq!(std::fs::read(&object.path).unwrap(), [7; 512]);
+        assert!(bundle.path.exists());
         let links: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM storage_operation_object WHERE operation_id=?1",
         )
@@ -2458,7 +2500,7 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(links, 1);
+        assert_eq!(links, 2);
         drop(duplicate);
         // Launch roots remain until explicit terminal reconciliation, not EX alone.
         db.prune_images().await.unwrap();
@@ -2631,12 +2673,13 @@ mod tests {
         let disk = config.machine_dir.join("root.raw");
         std::fs::write(&disk, [0x51; 512]).unwrap();
         std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let storage = crate::MachineStorageRecord::opaque_raw(
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
             crate::PrivatePath::new("root.raw").unwrap(),
             512,
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
+        let _boot = store.pin_test_boot(&mut storage).await.unwrap();
         let rootfs = MachineRootfsRecord {
             machine_id: id,
             source_kind: crate::ImageSourceKind::Disk,
@@ -2656,6 +2699,12 @@ mod tests {
                 &rootfs,
                 &storage,
             )
+            .await
+            .unwrap();
+        drop(_boot);
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        store
+            .retire_abandoned_storage_operations(&pool)
             .await
             .unwrap();
         config

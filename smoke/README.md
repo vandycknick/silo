@@ -360,6 +360,57 @@ failed samples stay in the retained workspace. Per-file residency inventories
 are kept in each sample record.
 A median over its target fails the gate and blocks admission.
 
+### Raw/qcow2 import, cloud disks, boot pinning and conversion (Phase 17)
+
+`tests/test_cloud_disk.py` uses only the staged CLI and the staged monitor.
+Prerequisites: `make stage` with a runtime whose `assets/kernel-default` is the
+Phase 17 workload kernel (GPT/MBR scanning, `VFAT_FS`, `NLS_CODEPAGE_437`,
+`NLS_UTF8`; identity in Main's phase-17 evidence), plus `sfdisk`, `blkid`,
+`e2fsck`, `debugfs` and `sqlite3` on PATH. `SILO_SMOKE_QEMU_IMG` optionally
+names a `qemu-img` for an additional `check`/`compare` of every qcow2 fixture;
+when unset the log records that this cross-check was not exercised.
+
+```sh
+make stage
+make smoke SMOKE_ARGS='tests/test_cloud_disk.py -m "linux_only and not sdk"'
+make smoke SMOKE_ARGS='tests/test_cloud_disk.py --backend vz'   # macOS VZ lane only
+```
+
+A session fixture creates two never-booted whole-disk ext4 roots from the
+loopback registry (identical except `/etc/phase17-identity`, both carrying
+`/usr/local/bin/phase17-probe` and an ESP fstab line). Smoke-only bounded
+encoders then write GPT/MBR tables, a FAT16 ESP and qcow2 v2/v3 containers
+(allocated, DEFLATE-compressed, unallocated and v3 explicit-zero clusters, exact
+refcounts). Each table is read back by `sfdisk --json`, the ESP by `blkid`,
+ext4 partitions by `e2fsck -fn`/`debugfs` on byte-range extracts; no Silo
+parser is the oracle. The guest oracle is the probe: the mounted root's device
+number, partition number/start/size and its parent's virtio serial.
+
+Gates: raw and both qcow2 encodings import to one ImageId/stream with
+accumulated aliases/provenance, never-booted private roots equal the raw
+SHA-256, inputs stay unmodified; whole-disk, GPT (sparse slot 4) and MBR slot 4
+roots boot with the identical pinned kernel/initramfs/agent and stop clean
+(ESP never mounted); DPS auto refuses ambiguous/missing/wrong-ISA/no-auto/
+read-only and foreign platforms with candidates; unsupported containers,
+forbidden qcow2 features, special files, symlinks and incompatible layouts
+refuse before image/alias/machine publication; a cloned GPT on an attached
+disk never replaces the `silo-root` serial; fstab-mounted vfat reads with NLS
+options and a late ESP mount is never certified clean; opaque expansion keeps
+both GPT copies, the partition and the ext4 block count; pinned bundles survive
+source and packaged-asset removal and change only by `silo set
+boot-assets=packaged` while stopped; image/snapshot creation preserves
+semantic configuration and every snapshot disk; explicit conversion is cached
+per manifest/platform/flattener across packaged upgrades and boots.
+
+Shuffled attachment order cannot be produced by libvm (root is always first),
+so one test uses a disposable agentless candidate launch through the shipped
+monitor: the cloned GPT is the first attachment and the root the second. It
+writes no catalog or qualification state and is not product acceptance.
+Invalid bootstraps there must print the init fail-closed line, never run the
+probe, and leave both disks byte-identical. The VZ refusal/conversion test is
+`macos_only` and requires `--backend vz`; on Linux it is `pending-lane:macos`,
+never passed.
+
 ### Restored guest activation (Phase 12)
 
 `silo_smoke/guest_restored.py` joins the standalone `native-live-api` owner
@@ -993,37 +1044,33 @@ before archiving.
 `test_overlay_qualified_stage_replacement_uses_retained_triplet` uses only
 private complete runtime clones, never Main's stage. Its successor contains
 byte-identical kernel/base assets and the existing unqualified reordered
-fixture monitor. An owned CLI starts in its own process group. Real IN_OPEN
-events on the first post-admission `.lower-UUID.tmp` publication trigger
-SIGSTOP; the controller waits for the owned CLI's threads to stop and records
-its actual descriptors. It requires the three original kernel/base/native
-device/inode identities as read-only CLOEXEC descriptors, an actually held
-private output, no kernel/composite publication and no monitor exec. Earlier
-capability-query opens and native file cursor positions are not this proof.
-If interception misses that actual boundary it fails with descriptor/event
-evidence rather than proceeding with a weaker race oracle.
+fixture monitor. The existing child-only Linux x86_64 syscall tracer holds the
+first write to the private launch-kernel temporary file, after admission and
+before any kernel output or composite publication. It records the held syscall
+and requires the pinned kernel/base pool objects and qualified native executable
+as read-only CLOEXEC descriptors with independently checked device/inode/hash
+identities. Earlier capability-query opens are not this boundary.
 
 While those qualified files are held, it atomically swaps the whole private
-stage and unlinks the retired tree, then verifies all three old inodes have
-zero links and retain their exact bytes. After resume, the real guest must
+stage and unlinks the retired tree. The native executable must have zero links
+and retain its exact bytes; pinned kernel/base objects stay owned by the image
+pool, independently of the installed stage. After release, the real guest must
 start, its published kernel/base prefix must match, and both actual
 monitor/worker `/proc/PID/exe` must identify the old deleted inode and admitted
-SHA256 recorded by `overlay_stage.ADMITTED_NATIVE_SHA256` after Main's observed
-candidate review (currently the admitted shared-IRQ native build).
+SHA256 observed before replacement.
 A fresh start against the complete successor must reject its actual unknown
-native hash without allocating a new run. Cleanup always resumes and reaps
-the owned CLI, with bounded group termination only for that owned process;
-the existing workspace cleanup owns registered VM teardown.
+native hash without allocating a new run. The controller retains EXITKILL and
+bounded descendant cleanup; the workspace owns registered VM teardown.
 
 ```sh
 make smoke SMOKE_ARGS="-k overlay_qualified_stage_replacement_uses_retained_triplet --keep"
 ```
 
-Retained `overlay-stage-*` evidence includes events, stopped-process FD
-identities, unlinked asset hashes, actual monitor/worker executable identities,
-CLI stdout/stderr and the fresh-start refusal. The gate requires both guest
-asset copies to accept authenticated link removal; it must fail, not waive
-that boundary, if copying still compares stale link/ctime fingerprints.
+Retained `overlay-stage-*` and `boundary-*` evidence includes the exact held
+syscall, source and destination FD identities, retained asset hashes, actual
+monitor/worker executable identities, CLI output and the fresh-start refusal.
+The gate requires the native retained descriptor to survive stage unlink,
+without treating installed kernel paths as the source of pinned boot objects.
 
 Machine/run identity assertions compare parsed UUID values, not compact versus
 hyphenated serialization spellings. Malformed or different identities still
@@ -1297,8 +1344,9 @@ nondefault configuration before its first launch, under the actual source
 lifecycle lock. This is test construction, not an ownership-import API:
 ordinary `--disk PATH` still declares an external resource. The fixture compares
 root/Data bytes, geometry/order, null versus empty process settings, Unicode
-environment/labels, userdata, hardware and kernel arguments. It independently
-hashes exact pinned kernel/base-initramfs/agent objects. Both default-selected
+environment/labels, userdata, hardware and kernel arguments. Each child's full
+boot binding must equal the source binding, including its ABI, and independent
+hashes verify exact pinned kernel/base-initramfs/agent objects. Both default-selected
 and source-private custom boot paths are covered. Only a private copy of the
 staged runtime is replaced, never the shared staged installation. Children
 must restore/boot after source deletion, unrelated OCI root removal/GC, old

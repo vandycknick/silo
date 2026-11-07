@@ -721,7 +721,7 @@ fn rosetta_device(config: &crate::krun::RosettaLaunchConfig) -> Result<RosettaFs
         config.data().as_bytes(),
     )
     .map_err(|source| libkrun_error("configure Rosetta filesystem", source))?;
-    RosettaFsDevice::new("rosetta", config)
+    RosettaFsDevice::new(rootfs_spec::rosetta::SHARE_TAG, config)
         .map_err(|source| libkrun_error("create Rosetta filesystem", source))
 }
 

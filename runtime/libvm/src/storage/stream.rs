@@ -717,7 +717,7 @@ fn write_exact_at(file: &File, mut bytes: &[u8], mut offset: u64) -> io::Result<
     Ok(())
 }
 
-fn write_sparse_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+pub(crate) fn write_sparse_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
     // Bounded subchunk runs avoid materializing 8 MiB for a single tiny write.
     // Adjacent nonzero blocks share one write; allocation granularity remains
     // a host-filesystem fact, not part of logical stream identity.

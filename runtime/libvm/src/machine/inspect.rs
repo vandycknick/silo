@@ -163,6 +163,10 @@ pub struct MachineData {
     pub rootfs: Option<MachineRootfs>,
     /// Typed root, boot, storage and ownership meaning.
     pub storage: Option<crate::MachineStorageRecord>,
+    /// Pinned boot profile, also available through daemon inspection.
+    pub boot_profile: Option<crate::BootProfile>,
+    /// Distinct locally admitted packaged bundle, without changing the current pin.
+    pub boot_replacement: Option<crate::ObjectDigest>,
     /// External data disks and host shares, derived from the durable VM specification.
     /// These mappings are not copied into ownership or represented as self-contained.
     pub external_resources: Vec<crate::ExternalResource>,
@@ -231,6 +235,8 @@ impl MachineData {
             image_ref: String::new(),
             rootfs: None,
             storage: None,
+            boot_profile: None,
+            boot_replacement: None,
             external_resources,
             root_disk_size: None,
             labels: BTreeMap::new(),
@@ -293,6 +299,8 @@ impl MachineData {
             image_ref: config.image_ref,
             rootfs: rootfs.map(Into::into),
             storage: None,
+            boot_profile: None,
+            boot_replacement: None,
             external_resources,
             root_disk_size: config.root_disk_size,
             labels: config.labels,

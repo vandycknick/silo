@@ -1,11 +1,10 @@
 //! Managed root assembly. The static no_std init cannot link nix/std; libc is
 //! used here consistently with its existing syscall layer, with owned FDs.
-use crate::{applets, io};
+use crate::owned::{directory, path, pread_all, read_file, Fd};
+use crate::{applets, block, io};
 use ::init::{overlay_verify, root_checks};
 use alloc::vec::Vec;
-use rootfs_spec::{
-    DeviceExpectation, DeviceNumber, Observation, OverlayRoot, Root, TemporaryDirectory,
-};
+use rootfs_spec::{DeviceExpectation, Observation, OverlayRoot, TemporaryDirectory};
 
 const ROOT: &[u8] = b"/run/silo/rootfs";
 const LOWER: &[u8] = b"/run/silo/rootfs/lower";
@@ -15,114 +14,11 @@ const WORK_DIR: &[u8] = b"/run/silo/rootfs/upperfs/work";
 const TARGET: &[u8] = b"/mnt/root";
 const MAX_MOUNTINFO: usize = 256 * 1024;
 
-struct Fd(i32);
-impl Drop for Fd {
-    fn drop(&mut self) {
-        io::close(self.0);
-    }
-}
-impl Fd {
-    fn open(path: &[u8], flags: i32) -> Result<Self, &'static str> {
-        let fd = io::open(path, flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0);
-        if fd < 0 {
-            Err("overlay: open failed")
-        } else {
-            Ok(Self(fd))
-        }
-    }
-}
-
-pub(crate) fn bootstrap() -> Result<Option<Root>, &'static str> {
-    let fd = io::open(
-        rootfs_spec::BOOTSTRAP_PATH.as_bytes(),
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        0,
-    );
-    if fd < 0 {
-        return if io::errno() == libc::ENOENT {
-            Ok(None)
-        } else {
-            Err("overlay: bootstrap open failed")
-        };
-    }
-    let fd = Fd(fd);
-    let mut stat = io::stat_zeroed();
-    if unsafe { libc::fstat(fd.0, &mut stat) } != 0
-        || stat.st_uid != 0
-        || stat.st_gid != 0
-        || stat.st_mode & libc::S_IFMT != libc::S_IFREG
-        || stat.st_mode & 0o7777 != 0o600
-    {
-        return Err("overlay: bootstrap must be root-owned regular mode 0600");
-    }
-    let bytes = read_fd(&fd, rootfs_spec::MAX_JSON_BYTES)?;
-    let bootstrap =
-        rootfs_spec::decode_bootstrap(&bytes).map_err(|_| "overlay: invalid root bootstrap")?;
-    Ok(Some(bootstrap.root))
-}
-
-fn read_fd(fd: &Fd, maximum: usize) -> Result<Vec<u8>, &'static str> {
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 4096];
-    loop {
-        let count = io::read(fd.0, &mut buffer);
-        if count < 0 {
-            if io::errno() == libc::EINTR {
-                continue;
-            }
-            return Err("overlay: read failed");
-        }
-        if count == 0 {
-            return Ok(bytes);
-        }
-        let count = count as usize;
-        if count > maximum.saturating_sub(bytes.len()) {
-            return Err("overlay: input exceeds bound");
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-}
-fn read_file(path: &[u8], maximum: usize) -> Result<Vec<u8>, &'static str> {
-    read_fd(&Fd::open(path, libc::O_RDONLY)?, maximum)
-}
-fn path(prefix: &[u8], name: &[u8], suffix: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(prefix.len() + name.len() + suffix.len());
-    out.extend_from_slice(prefix);
-    out.extend_from_slice(name);
-    out.extend_from_slice(suffix);
-    out
-}
-
 struct Device {
     fd: Fd,
     path: Vec<u8>,
     facts: root_checks::DeviceFacts,
     span: u64,
-}
-fn pread_all(fd: &Fd, offset: u64, bytes: &mut [u8]) -> Result<(), &'static str> {
-    let mut done = 0;
-    while done < bytes.len() {
-        let at = offset
-            .checked_add(done as u64)
-            .and_then(|value| libc::off_t::try_from(value).ok())
-            .ok_or("overlay: device read offset overflow")?;
-        let read = unsafe {
-            libc::pread(
-                fd.0,
-                bytes[done..].as_mut_ptr().cast(),
-                bytes.len() - done,
-                at,
-            )
-        };
-        if read < 0 && io::errno() == libc::EINTR {
-            continue;
-        }
-        if read <= 0 {
-            return Err("overlay: truncated filesystem metadata");
-        }
-        done += read as usize;
-    }
-    Ok(())
 }
 fn superblock(fd: &Fd) -> Result<[u8; 1024], &'static str> {
     let mut bytes = [0; 1024];
@@ -194,63 +90,13 @@ fn check_journal(
     Ok(())
 }
 fn measure(name: &[u8], expected: &DeviceExpectation, upper: bool) -> Result<Device, &'static str> {
-    let prefix = path(b"/sys/block/", name, b"");
-    let number = read_file(&path(&prefix, b"", b"/dev"), 64)?;
-    let number = number.strip_suffix(b"\n").unwrap_or(&number);
-    let at = number
-        .iter()
-        .position(|byte| *byte == b':')
-        .ok_or("overlay: invalid sysfs device number")?;
-    let major = u32::try_from(root_checks::decimal(&number[..at])?)
-        .map_err(|_| "overlay: device major overflow")?;
-    let minor = u32::try_from(root_checks::decimal(&number[at + 1..])?)
-        .map_err(|_| "overlay: device minor overflow")?;
-    let device_path = path(b"/dev/", name, b"");
-    let fd = Fd::open(
-        &device_path,
-        if upper { libc::O_RDWR } else { libc::O_RDONLY },
-    )?;
-    let mut stat = io::stat_zeroed();
-    if unsafe { libc::fstat(fd.0, &mut stat) } != 0
-        || stat.st_mode & libc::S_IFMT != libc::S_IFBLK
-        || libc::major(stat.st_rdev) != major
-        || libc::minor(stat.st_rdev) != minor
-    {
-        return Err("overlay: block-special identity mismatch");
-    }
-    let sectors = root_checks::decimal(&read_file(&path(&prefix, b"", b"/size"), 64)?)?;
-    let length = sectors
-        .checked_mul(512)
-        .ok_or("overlay: device size overflow")?;
-    let sector_size = root_checks::decimal(&read_file(
-        &path(&prefix, b"", b"/queue/logical_block_size"),
-        64,
-    )?)?;
-    let ro = root_checks::decimal(&read_file(&path(&prefix, b"", b"/ro"), 64)?)?;
-    if ro > 1 {
-        return Err("overlay: invalid read-only state");
-    }
-    let mut ioctl_length = 0u64;
-    let mut ioctl_sector = 0i32;
-    let mut ioctl_ro = 0i32;
-    // GNU uses an unsigned-long request, musl an int. Infer libc's target
-    // type from ioctl while preserving the Linux request's u32 bit pattern.
-    if unsafe { libc::ioctl(fd.0, 0x80081272u32 as _, &mut ioctl_length) } != 0
-        || unsafe { libc::ioctl(fd.0, 0x1268u32 as _, &mut ioctl_sector) } != 0
-        || unsafe { libc::ioctl(fd.0, 0x125eu32 as _, &mut ioctl_ro) } != 0
-        || ioctl_length != length
-        || u64::try_from(ioctl_sector).ok() != Some(sector_size)
-        || u64::try_from(ioctl_ro).ok() != Some(ro)
-    {
-        return Err("overlay: kernel block geometry disagreement");
-    }
-    let facts = root_checks::DeviceFacts {
-        number: DeviceNumber { major, minor },
-        length_bytes: length,
-        logical_sector_size: u32::try_from(sector_size)
-            .map_err(|_| "overlay: sector size overflow")?,
-        read_only: ro != 0,
-    };
+    let sysfs = path(b"/sys/block/", name, b"");
+    let queue = path(&sysfs, b"/queue", b"");
+    let block::Block {
+        fd,
+        path: device_path,
+        facts,
+    } = block::measure(&sysfs, name, &queue, upper)?;
     root_checks::check_device(expected, facts)?;
     let sb = superblock(&fd)?;
     let span = root_checks::check_superblock(&sb, expected, upper)?;
@@ -266,96 +112,30 @@ fn measure(name: &[u8], expected: &DeviceExpectation, upper: bool) -> Result<Dev
 }
 
 fn discover(root: &OverlayRoot) -> Result<(Device, Device), &'static str> {
-    let dir = io::opendir(b"/sys/block");
-    if dir.is_null() {
-        return Err("overlay: cannot enumerate block devices");
-    }
-    // Close the directory on every failure, including duplicate identities.
-    let result = (|| {
-        let mut lower = None;
-        let mut upper = None;
-        let mut count = 0usize;
-        let mut identities = root_checks::SerialDiscovery::default();
-        loop {
-            unsafe {
-                *libc::__errno_location() = 0;
+    let mut lower = None;
+    let mut upper = None;
+    let mut identities = root_checks::SerialDiscovery::default();
+    block::for_each_serial(|name, serial| {
+        match identities.observe(serial)? {
+            Some(rootfs_spec::RootSerial::Lower) => {
+                io::write(io::STDERR, "init: overlay: validating lower device\n");
+                lower = Some(measure(name, &root.lower, false)?);
             }
-            let entry = io::readdir(dir);
-            if entry.is_null() {
-                if io::errno() != 0 {
-                    return Err("overlay: block enumeration failed");
-                }
-                break;
+            Some(rootfs_spec::RootSerial::Upper) => {
+                io::write(io::STDERR, "init: overlay: validating upper device\n");
+                upper = Some(measure(name, &root.upper, true)?);
             }
-            count += 1;
-            if count > 4096 {
-                return Err("overlay: too many block devices");
-            }
-            let name = unsafe { &(*entry).d_name };
-            let end = name
-                .iter()
-                .position(|byte| *byte == 0)
-                .ok_or("overlay: unterminated block name")?;
-            let name = unsafe { core::slice::from_raw_parts(name.as_ptr().cast::<u8>(), end) };
-            if name == b"." || name == b".." {
-                continue;
-            }
-            if name.is_empty() || name.contains(&b'/') {
-                return Err("overlay: invalid block name");
-            }
-            let serial_path = path(b"/sys/block/", name, b"/serial");
-            let serial_fd = io::open(
-                &serial_path,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            );
-            if serial_fd < 0 {
-                if io::errno() == libc::ENOENT {
-                    continue;
-                }
-                return Err("overlay: cannot read block serial");
-            }
-            let serial = read_fd(&Fd(serial_fd), 64)?;
-            match identities.observe(&serial)? {
-                Some(rootfs_spec::RootSerial::Lower) => {
-                    io::write(io::STDERR, "init: overlay: validating lower device\n");
-                    lower = Some(measure(name, &root.lower, false)?);
-                }
-                Some(rootfs_spec::RootSerial::Upper) => {
-                    io::write(io::STDERR, "init: overlay: validating upper device\n");
-                    upper = Some(measure(name, &root.upper, true)?);
-                }
-                None => {}
-            }
+            None => {}
         }
-        identities.finish()?;
-        let lower = lower.ok_or("overlay: missing lower serial")?;
-        let upper = upper.ok_or("overlay: missing upper serial")?;
-        if lower.facts.number == upper.facts.number {
-            return Err("overlay: root devices alias");
-        }
-        Ok((lower, upper))
-    })();
-    if io::closedir(dir) != 0 && result.is_ok() {
-        return Err("overlay: block directory close failed");
+        Ok(())
+    })?;
+    identities.finish()?;
+    let lower = lower.ok_or("overlay: missing lower serial")?;
+    let upper = upper.ok_or("overlay: missing upper serial")?;
+    if lower.facts.number == upper.facts.number {
+        return Err("overlay: root devices alias");
     }
-    result
-}
-
-fn directory(path: &[u8], mode: u32) -> Result<(), &'static str> {
-    if io::mkdir(path, mode) != 0 && io::errno() != libc::EEXIST {
-        return Err("overlay: cannot create maintenance directory");
-    }
-    let fd = Fd::open(path, libc::O_RDONLY | libc::O_DIRECTORY)?;
-    let mut stat = io::stat_zeroed();
-    if unsafe { libc::fstat(fd.0, &mut stat) } != 0
-        || stat.st_uid != 0
-        || stat.st_gid != 0
-        || stat.st_mode & 0o7777 != mode
-    {
-        return Err("overlay: unsafe maintenance directory");
-    }
-    Ok(())
+    Ok((lower, upper))
 }
 fn upper_directories() -> Result<(), &'static str> {
     let root = Fd::open(UPPER, libc::O_RDONLY | libc::O_DIRECTORY)?;

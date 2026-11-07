@@ -6,10 +6,13 @@ use crate::LibVmError;
 
 pub(crate) fn storage_pool_dependencies(
     storage: &crate::MachineStorageRecord,
-) -> (
-    std::collections::BTreeSet<crate::storage::identity::StreamId>,
-    std::collections::BTreeSet<crate::storage::identity::ObjectDigest>,
-) {
+) -> Result<
+    (
+        std::collections::BTreeSet<crate::storage::identity::StreamId>,
+        std::collections::BTreeSet<crate::storage::identity::ObjectDigest>,
+    ),
+    LibVmError,
+> {
     let mut streams = std::collections::BTreeSet::new();
     let mut objects = std::collections::BTreeSet::new();
     if let crate::MachineRoot::LinuxOverlay {
@@ -26,7 +29,7 @@ pub(crate) fn storage_pool_dependencies(
     }
     if let crate::BootProfile::LinuxDirect {
         binding:
-            crate::BootBinding::Pinned {
+            binding @ crate::BootBinding::Pinned {
                 kernel,
                 base_initramfs,
                 agent,
@@ -38,8 +41,9 @@ pub(crate) fn storage_pool_dependencies(
         objects.insert(*kernel);
         objects.insert(*base_initramfs);
         objects.extend(agent.iter().copied());
+        objects.insert(binding.digest()?);
     }
-    (streams, objects)
+    Ok((streams, objects))
 }
 
 pub(crate) async fn retained_machine_objects(
@@ -48,7 +52,7 @@ pub(crate) async fn retained_machine_objects(
     let records = sqlx::query_scalar::<_,String>("SELECT CASE WHEN json_valid(record_json,8) THEN json(record_json) ELSE '{}' END FROM machine_storage").fetch_all(connection).await?;
     let mut objects = std::collections::BTreeSet::new();
     for json in records {
-        objects.extend(storage_pool_dependencies(&crate::MachineStorageRecord::decode(&json)?).1);
+        objects.extend(storage_pool_dependencies(&crate::MachineStorageRecord::decode(&json)?)?.1);
     }
     Ok(objects)
 }
@@ -62,7 +66,7 @@ pub(crate) async fn retained_machine_streams(
     let mut streams = std::collections::HashSet::new();
     for json in records {
         let record = crate::MachineStorageRecord::decode(&json)?;
-        streams.extend(storage_pool_dependencies(&record).0);
+        streams.extend(storage_pool_dependencies(&record)?.0);
     }
     Ok(streams)
 }

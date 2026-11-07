@@ -10,7 +10,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use crate::{
@@ -21,6 +21,7 @@ mod tests {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use sqlx::{Connection, SqliteConnection};
+    use test_utils::direct_kernel::host_kernel;
 
     struct Fixture {
         _files: tempfile::TempDir,
@@ -161,13 +162,16 @@ mod tests {
             let kernel = files.path().join("kernel");
             let initramfs = files.path().join("base-initramfs");
             let agent = files.path().join("agent");
-            std::fs::write(&kernel, b"exact kernel bytes, never executed")
+            std::fs::write(&kernel, host_kernel("exact kernel bytes, never executed"))
                 .expect("write inert byte fixture");
             std::fs::write(&initramfs, b"exact base initramfs bytes, never booted")
                 .expect("write init fixture");
             std::fs::write(&agent, b"exact agent bytes, never executed")
                 .expect("write agent fixture");
-            use std::os::unix::fs::PermissionsExt;
+            for asset in [&kernel, &initramfs] {
+                std::fs::set_permissions(asset, std::fs::Permissions::from_mode(0o600))
+                    .expect("private boot asset mode");
+            }
             std::fs::set_permissions(run.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("private run-root mode");
             std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700))
@@ -202,14 +206,18 @@ mod tests {
             .await
             .expect("real runtime/catalog without host discovery");
             let disk = files.path().join("input.raw");
+            disk_image::ext4::Formatter::new(&disk, 4096, 16 * 1024 * 1024)
+                .expect("real ext4 root")
+                .close()
+                .expect("finish ext4 root");
+            std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))
+                .expect("private raw input mode");
             let mut file = OpenOptions::new()
-                .create_new(true)
                 .write(true)
-                .mode(0o600)
                 .open(&disk)
                 .expect("private raw input");
-            file.write_all(&[0x59; 4096]).expect("nonzero root prefix");
-            file.set_len(16 * 1024 * 1024 + 512)
+            let filesystem_length = file.metadata().expect("ext4 geometry").len();
+            file.set_len(filesystem_length + 512)
                 .expect("short final stream chunk/trailing hole");
             file.seek(SeekFrom::End(-512)).expect("root tail");
             file.write_all(&[0xa3; 512]).expect("nonzero root tail");
@@ -231,7 +239,7 @@ mod tests {
             let mut builder = runtime
                 .machine()
                 .name("source")
-                .image_source(ImageSource::Disk(disk))
+                .image_source(ImageSource::disk(disk))
                 .network(|network| network.none())
                 .cpus(2)
                 .process(process)
@@ -372,8 +380,11 @@ mod tests {
                 .remove()
                 .await
                 .expect("remove source machine");
-            std::fs::write(fixture.components.kernel(), b"replaced runtime kernel")
-                .expect("replace old default kernel bytes");
+            std::fs::write(
+                fixture.components.kernel(),
+                host_kernel("replaced runtime kernel"),
+            )
+            .expect("replace old default kernel bytes");
             std::fs::write(
                 fixture.components.initramfs(),
                 b"replaced runtime base initramfs",

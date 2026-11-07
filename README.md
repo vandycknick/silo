@@ -120,9 +120,53 @@ Run a temporary workload from an image:
 silo run ubuntu:24.04 -- uname -a
 ```
 
-Image operands are OCI registry references, or local disk images written as
-`disk:PATH`. Without `--name`, `run` creates a generated ephemeral machine and
-removes it after the workload finishes.
+Image operands are parsed in this order: `image:NAME` or `image:sha256:HEX`
+managed images and snapshots, then local disk images written as `disk:PATH`,
+then OCI registry references. Without `--name`, `run` creates a generated
+ephemeral machine and removes it after the workload finishes.
+
+A `disk:PATH` source is a quiesced regular raw or qcow2 file (never a symlink),
+booted directly with the host-native Linux platform, the whole disk as root and
+the packaged boot assets pinned at creation. The plan shows these assumptions.
+Select a partitioned root or another userspace explicitly:
+
+```bash
+silo create disk:./cloud.qcow2 --root gpt:01234567-89ab-cdef-0123-456789abcdef
+silo create disk:./cloud.raw --root auto --platform linux/amd64 --rosetta
+silo create ubuntu:24.04 --platform linux/arm64 --rosetta=false
+```
+
+`--root` accepts `whole-disk`, `auto` (GPT discoverable partitions for the
+declared platform), `gpt:GUID` or `mbr:1..4`; a partition is never guessed.
+`--rosetta` requests Rosetta, `--rosetta=false` explicitly disables it, and
+omitting it leaves no intent. An amd64 userspace on an arm64 host requires
+Rosetta, so it conflicts with `--rosetta=false`.
+
+Import a reusable disk image, or flatten one selected OCI manifest into a
+raw image (required before an OCI root can run on VZ):
+
+```bash
+silo image import ./cloud.qcow2 --platform linux/amd64 --root auto --boot linux-direct --name cloud
+silo image convert ubuntu:24.04 --platform linux/arm64 --name ubuntu-raw
+silo create image:cloud --name web
+silo image inspect image:cloud
+silo image list
+silo image remove image:cloud     # removes the alias only
+silo image release image:sha256:HEX  # releases explicit retention only
+```
+
+Aliases share one `image:` namespace with snapshots. Creating from a snapshot
+performs the full stopped restore of its captured configuration; only `--name`
+applies.
+
+A machine never changes kernel or initramfs on its own. `silo info` shows the
+pinned bundle and a newer locally admitted packaged bundle when one exists;
+replace it explicitly on a stopped machine:
+
+```bash
+silo set dev boot-assets=packaged
+silo set dev boot-assets=files boot-kernel=/abs/vmlinux boot-initramfs=/abs/initramfs boot-agent=none
+```
 
 Detached mode runs the workload in the background. It does not make the VM
 independent of that workload: the VM still stops when the workload exits.

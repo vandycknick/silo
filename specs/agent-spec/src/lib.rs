@@ -11,15 +11,6 @@ pub const SSH_VSOCK_PORT: u32 = 22;
 /// Maximum serialized configuration accepted by host composition and the guest agent.
 pub const MAX_AGENT_CONFIG_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Virtio-fs tag reserved for the host-provided Rosetta share.
-pub const ROSETTA_MOUNT_TAG: &str = "rosetta";
-
-/// Guest mount point for the host-provided Rosetta share.
-pub const ROSETTA_MOUNT_PATH: &str = "/mnt/rosetta";
-
-/// Guest interpreter registered for x86-64 ELF binaries.
-pub const ROSETTA_INTERPRETER_PATH: &str = "/mnt/rosetta/rosetta";
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -91,32 +82,6 @@ impl AgentConfig {
             network.validate()?;
         }
         normalized_mount_plan(&self.provision.mounts)?;
-        if self.provision.rosetta.enabled {
-            if !self.provision.enabled {
-                return Err(AgentConfigError::new(
-                    "enabled rosetta requires provision.enabled to be true",
-                ));
-            }
-            if self.provision.rosetta.mount_tag != ROSETTA_MOUNT_TAG {
-                return Err(AgentConfigError::new(format!(
-                    "enabled rosetta mount tag must be {ROSETTA_MOUNT_TAG:?}"
-                )));
-            }
-            if self.provision.rosetta.mount_path != ROSETTA_MOUNT_PATH {
-                return Err(AgentConfigError::new(format!(
-                    "enabled rosetta mount path must be {ROSETTA_MOUNT_PATH:?}"
-                )));
-            }
-            if self.provision.mounts.iter().any(|mount| {
-                mount.tag == ROSETTA_MOUNT_TAG
-                    || normalize_mount_target(&mount.path)
-                        .is_ok_and(|path| paths_overlap(&path, ROSETTA_MOUNT_PATH))
-            }) {
-                return Err(AgentConfigError::new(format!(
-                    "mount tag {ROSETTA_MOUNT_TAG:?} and path {ROSETTA_MOUNT_PATH:?} are reserved for enabled rosetta"
-                )));
-            }
-        }
         if let Some(userdata) = &self.provision.userdata {
             validate_nonempty(&userdata.content, "userdata content")?;
         }
@@ -331,8 +296,6 @@ pub struct ProvisionConfig {
     pub certificate_authority: Option<CertificateAuthorityConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
-    #[serde(default)]
-    pub rosetta: AgentRosettaConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -380,35 +343,6 @@ impl NetworkConfig {
     pub fn validate(&self) -> Result<(), AgentConfigError> {
         validate_network_config(self)
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRosettaConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_rosetta_mount_tag")]
-    pub mount_tag: String,
-    #[serde(default = "default_rosetta_mount_path")]
-    pub mount_path: String,
-}
-
-impl Default for AgentRosettaConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mount_tag: default_rosetta_mount_tag(),
-            mount_path: default_rosetta_mount_path(),
-        }
-    }
-}
-
-fn default_rosetta_mount_tag() -> String {
-    ROSETTA_MOUNT_TAG.to_string()
-}
-
-fn default_rosetta_mount_path() -> String {
-    ROSETTA_MOUNT_PATH.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -465,6 +399,15 @@ pub fn normalized_mount_plan(
     mounts: &[MountConfig],
 ) -> Result<Vec<PlannedMount<'_>>, AgentConfigError> {
     validate_unique_nonempty(mounts.iter().map(|mount| mount.tag.as_str()), "mount tag")?;
+    if mounts
+        .iter()
+        .any(|mount| mount.tag == rootfs_spec::rosetta::SHARE_TAG)
+    {
+        return Err(AgentConfigError::new(format!(
+            "mount tag {:?} is reserved for the init-owned Rosetta share",
+            rootfs_spec::rosetta::SHARE_TAG
+        )));
+    }
     let mut plan = Vec::with_capacity(mounts.len());
     for mount in mounts {
         validate_nonempty(&mount.fstype, "mount fstype")?;
@@ -575,10 +518,9 @@ pub enum UserdataRunPolicy {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AgentConfig, AgentRosettaConfig, AgentSshConfig, CertificateAuthorityConfig, MountConfig,
-        NetworkConfig, NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config,
-        ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
-        UserdataRunPolicy,
+        AgentConfig, AgentSshConfig, CertificateAuthorityConfig, MountConfig, NetworkConfig,
+        NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config, ProvisionConfig,
+        ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
     };
 
     fn launch_config() -> AgentConfig {
@@ -703,14 +645,56 @@ mod tests {
     }
 
     #[test]
-    fn mount_plan_cannot_hide_enabled_rosetta_through_parent_or_normalization() {
-        for target in ["/mnt", "/mnt//rosetta/./", "/mnt/rosetta/child"] {
-            let mut config = AgentConfig::default();
-            config.provision.enabled = true;
-            config.provision.rosetta.enabled = true;
-            config.provision.mounts.push(mount_config("other", target));
-            assert!(config.validate().is_err(), "{target:?}");
+    fn mount_plan_cannot_hide_the_init_owned_rosetta_mount() {
+        for target in [
+            "/run/silo/rosetta",
+            "/run//silo/rosetta/./",
+            "/run/silo/rosetta/child",
+        ] {
+            assert!(
+                crate::normalized_mount_plan(&[mount_config("other", target)]).is_err(),
+                "{target:?}"
+            );
         }
+        assert!(rootfs_spec::rosetta::MOUNT_PATH.starts_with("/run/silo/"));
+    }
+
+    #[test]
+    fn rosetta_share_tag_is_reserved_without_any_agent_setting() {
+        let mut config = AgentConfig::default();
+        config.provision.mounts.push(MountConfig {
+            tag: rootfs_spec::rosetta::SHARE_TAG.to_string(),
+            path: "/workspace".to_string(),
+            fstype: "virtiofs".to_string(),
+            options: Vec::new(),
+        });
+        let error = config.validate().expect_err("reject reserved mount tag");
+        assert!(error
+            .to_string()
+            .contains("reserved for the init-owned Rosetta share"));
+        config.provision.enabled = true;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn agent_configuration_has_no_rosetta_setting() {
+        let raw = r#"
+storage_shutdown:
+  version: 1
+  machineId: 11111111-1111-4111-8111-111111111111
+  runId: 22222222-2222-4222-8222-222222222222
+  manifest: {kind: unsupported, reason: fixture}
+provision:
+  enabled: true
+  rosetta:
+    enabled: true
+"#;
+        assert!(serde_yaml_ng::from_str::<AgentConfig>(raw).is_err());
+        assert!(
+            serde_json::to_value(AgentConfig::default()).expect("encode")["provision"]
+                .get("rosetta")
+                .is_none()
+        );
     }
 
     #[test]
@@ -732,19 +716,9 @@ mod tests {
 
         assert!(!config.provision.enabled);
         assert!(!config.provision.resize_rootfs.enabled);
-        assert!(!config.provision.rosetta.enabled);
-        assert_eq!(config.provision.rosetta.mount_tag, crate::ROSETTA_MOUNT_TAG);
-        assert_eq!(
-            config.provision.rosetta.mount_path,
-            crate::ROSETTA_MOUNT_PATH
-        );
         assert!(config.provision.users.is_empty());
         assert!(config.provision.network.is_none());
         assert!(config.ssh.trusted_ca.is_none());
-        assert_eq!(
-            format!("{}/rosetta", crate::ROSETTA_MOUNT_PATH),
-            crate::ROSETTA_INTERPRETER_PATH
-        );
     }
 
     #[test]
@@ -760,8 +734,6 @@ provision:
   hostname: demo
   resize_rootfs:
     enabled: true
-  rosetta:
-    enabled: true
   userdata:
     content: |
       #!/bin/sh
@@ -775,81 +747,9 @@ provision:
         assert!(config.provision.enabled);
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
         assert!(config.provision.resize_rootfs.enabled);
-        assert!(config.provision.rosetta.enabled);
-        assert_eq!(config.provision.rosetta.mount_tag, crate::ROSETTA_MOUNT_TAG);
-        assert_eq!(
-            config.provision.rosetta.mount_path,
-            crate::ROSETTA_MOUNT_PATH
-        );
         let userdata = config.provision.userdata.expect("userdata");
         assert_eq!(userdata.content_type, UserdataContentType::ShellScript);
         assert_eq!(userdata.run, UserdataRunPolicy::Always);
-    }
-
-    #[test]
-    fn enabled_rosetta_rejects_disabled_provisioning() {
-        let mut config = AgentConfig::default();
-        config.provision.rosetta.enabled = true;
-
-        let error = config
-            .validate()
-            .expect_err("reject Rosetta without provisioning");
-        assert!(error
-            .to_string()
-            .contains("requires provision.enabled to be true"));
-        assert!(config.provision.rosetta.enabled);
-    }
-
-    #[test]
-    fn enabled_rosetta_rejects_custom_and_legacy_contract_values() {
-        for (mount_tag, mount_path, expected) in [
-            ("custom", "/mnt/rosetta", "mount tag"),
-            ("silo-rosetta", "/mnt/silo-rosetta", "mount tag"),
-            ("rosetta", "/custom/rosetta", "mount path"),
-        ] {
-            let mut config = AgentConfig::default();
-            config.provision.enabled = true;
-            config.provision.rosetta = AgentRosettaConfig {
-                enabled: true,
-                mount_tag: mount_tag.to_string(),
-                mount_path: mount_path.to_string(),
-            };
-
-            let error = config.validate().expect_err("reject unsupported contract");
-            assert!(error.to_string().contains(expected));
-        }
-    }
-
-    #[test]
-    fn enabled_rosetta_reserves_its_mount_tag_from_user_mounts() {
-        let mut config = AgentConfig::default();
-        config.provision.enabled = true;
-        config.provision.rosetta.enabled = true;
-        config.provision.mounts.push(MountConfig {
-            tag: "rosetta".to_string(),
-            path: "/workspace".to_string(),
-            fstype: "virtiofs".to_string(),
-            options: Vec::new(),
-        });
-
-        let error = config.validate().expect_err("reject reserved mount tag");
-        assert!(error.to_string().contains("reserved for enabled rosetta"));
-    }
-
-    #[test]
-    fn enabled_rosetta_reserves_its_mount_path_from_user_mounts() {
-        let mut config = AgentConfig::default();
-        config.provision.enabled = true;
-        config.provision.rosetta.enabled = true;
-        config.provision.mounts.push(MountConfig {
-            tag: "workspace".to_string(),
-            path: "/mnt/rosetta".to_string(),
-            fstype: "virtiofs".to_string(),
-            options: Vec::new(),
-        });
-
-        let error = config.validate().expect_err("reject reserved mount path");
-        assert!(error.to_string().contains("reserved for enabled rosetta"));
     }
 
     #[test]
@@ -915,10 +815,6 @@ provision:
                         },
                     }],
                 }),
-                rosetta: AgentRosettaConfig {
-                    enabled: true,
-                    ..AgentRosettaConfig::default()
-                },
                 mounts: vec![MountConfig {
                     tag: "workspace".to_string(),
                     path: "/workspace".to_string(),

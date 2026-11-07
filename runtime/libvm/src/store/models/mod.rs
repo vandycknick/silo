@@ -7,7 +7,7 @@
 //! `machine` and `network` and are converted at the crate boundary.
 
 mod db_config;
-mod image;
+pub(crate) mod image;
 mod machine;
 mod machine_id;
 mod network;

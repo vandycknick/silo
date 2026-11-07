@@ -1,0 +1,1 @@
+{"schemaVersion":2,"root":{"kind":"opaque-raw-v1","discovery":"virtio-block-serial","device":{"serial":"silo-root","lengthBytes":8589934592,"logicalSectorSize":512,"readOnly":false},"selector":{"kind":"gpt-partition","guid":"01234567-89ab-cdef-0123-456789abcdef"},"filesystem":"ext4"},"rosetta":"required"}

@@ -142,7 +142,7 @@ pub(crate) async fn acquire(
     });
     let platform = GenericPlatform::new();
     platform.set_nested_virtualization_enabled(false);
-    let mut filesystem = VirtioFileSystemDeviceConfiguration::new(agent_spec::ROSETTA_MOUNT_TAG)
+    let mut filesystem = VirtioFileSystemDeviceConfiguration::new(rootfs_spec::rosetta::SHARE_TAG)
         .wrap_err("construct Rosetta probe filesystem")?;
     filesystem.set_rosetta_share(
         LinuxRosettaDirectoryShare::new().wrap_err("construct Rosetta probe share")?,

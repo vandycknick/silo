@@ -145,9 +145,9 @@ def build_fixture(silo: Silo, image: str) -> tuple[SourceFixture, Path]:
         output.truncate(64 * MIB)
     data.chmod(0o600)
     subprocess.run(["mkfs.ext4", "-F", "-q", "-L", "silo-restored", str(data)], check=True, timeout=60, capture_output=True)
-    # Exact native inventory: the entry exposes disk0 (root) and disk1 (data), never
-    # the catalog's original block ID.
-    disks = [dict(disk, blockId="disk0"),
+    # Exact native inventory: the entry exposes the root as silo-root (the only
+    # identity the Silo init resolves) and disk1 (data).
+    disks = [dict(disk, blockId="silo-root"),
              {"path": str(data), "role": "data", "format": "raw",
               "geometry": {"length": data.stat().st_size, "logicalSectorSize": 512},
               "blockId": "disk1", "readOnly": False}]
@@ -163,7 +163,7 @@ def build_fixture(silo: Silo, image: str) -> tuple[SourceFixture, Path]:
         "storage_shutdown": {"version": 1, "machineId": role.machine_id, "runId": role.run_id, "manifest": manifest},
     }
     assets = silo.ws.config.runtime_dir / "assets"
-    initramfs = guest_lifecycle.composite_initramfs(assets, directory, agent_config)
+    initramfs = guest_lifecycle.composite_initramfs(assets, directory, agent_config, disks[0])
     kernel, kernel_source = guest_lifecycle.private_kernel(assets, directory)
     (directory / "agent-config.json").write_text(json.dumps(agent_config, indent=2, sort_keys=True) + "\n")
     return SourceFixture(directory, root, data, manifest, role, kernel, kernel_source, initramfs), directory

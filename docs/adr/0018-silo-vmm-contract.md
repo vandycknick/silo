@@ -117,12 +117,22 @@ identities (1 through 20 bytes, no whitespace), and at most 16 attachments.
 VZ rejects VMDK/managed overlay before attachment. The worker preserves supplied
 geometry/identity/access rather than reconstructing them from device positions.
 
-Each managed-overlay launch carries an independently injected root bootstrap
-`silo/rootfs.json` in the initramfs, uid/gid 0, mode 0600, at most 64 KiB,
-regardless of agent injection. A single core-only `rootfs-spec` current-schema
-codec serves host and init. Its fixed profiles and two device expectations
-contain no host paths or caller mount flags. Missing/invalid managed bootstrap
-fails closed. Schema support never grants production boot qualification.
+Every Silo direct launch, raw or managed overlay, carries an independently
+injected root bootstrap `silo/rootfs.json` in the initramfs, uid/gid 0, mode
+0600, at most 64 KiB, regardless of agent injection. A single core-only
+`rootfs-spec` codec serves host and init and accepts only `schemaVersion: 2`
+with a mandatory `rosetta` mode (`disabled`, `optional`, `required`). An
+`opaque-raw-v1` root names the `silo-root` attachment (effective length,
+512-byte sectors, access), a concrete `whole-disk`, unique `gpt-partition`
+GUID or `mbr-partition` slot 1 through 4 selector, and `ext4`; an overlay root
+names its two fixed device expectations and profiles. Neither contains host
+paths or caller mount flags. The root attachment's block identity therefore
+must reach the guest as its virtio-blk serial on every backend; kernel
+`root=`, `rootfstype=`, `rootflags=` and `rdinit=` arguments, in any spelling
+Linux `next_arg` recognizes (including double quotes), are rejected rather
+than honored, so the trusted `/init` is always the initial executable.
+Missing/invalid bootstrap fails closed. Schema support never grants
+production boot qualification.
 
 Inherited descriptors are named by environment variables. Scalar roles hold a
 descriptor number; the generation lease uses the bounded JSON array below:

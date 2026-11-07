@@ -4,7 +4,7 @@ use nix::unistd::{access, AccessFlags};
 use oci::{MaterializeOptions, OciMaterializer};
 
 use crate::image::{
-    local_disk::resolve_local_disk,
+    local_disk::OpenDiskSource,
     oci::{
         cached_resolved_oci_image, image_error, resolve_oci_image_from_registry,
         verify_cached_image,
@@ -58,17 +58,61 @@ impl ReadOnlyRuntime {
         crate::planning::propose_machine_name()
     }
 
+    /// Inspects an existing managed source without acquiring or publishing it.
+    pub async fn inspect_managed(
+        &self,
+        source: &crate::ManagedSourceRef,
+    ) -> Result<crate::ManagedSourceInfo, LibVmError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| LibVmError::ImageNotFound {
+                reference: source.to_string(),
+            })?;
+        store.inspect_managed(source).await
+    }
+
+    /// Resolves a digest in the existing image/snapshot namespace.
+    pub async fn resolve_managed_digest(
+        &self,
+        digest: &crate::ObjectDigest,
+    ) -> Result<crate::ManagedSourceId, LibVmError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| LibVmError::ImageNotFound {
+                reference: digest.to_string(),
+            })?;
+        store.resolve_managed_digest(digest).await
+    }
+
     /// Resolves OCI metadata without writing cache or durable state.
     pub async fn resolve_oci_image(
         &self,
         reference: String,
         policy: ImagePullPolicy,
+        platform: Option<&crate::LinuxPlatform>,
     ) -> Result<ResolvedOciImage, LibVmError> {
         let producer =
             OciMaterializer::open(self.home.join("images"), self.registry_policy.clone())
                 .map_err(|error| image_error(&reference, error))?;
-        let options =
-            MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?;
+        let options = match platform {
+            Some(platform) => {
+                platform.validate()?;
+                MaterializeOptions::new(oci::Platform {
+                    os: "linux".into(),
+                    architecture: match platform.architecture {
+                        crate::GuestArchitecture::Amd64 => "amd64",
+                        crate::GuestArchitecture::Arm64 => "arm64",
+                    }
+                    .into(),
+                    variant: platform.variant.clone(),
+                })
+            }
+            None => {
+                MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?
+            }
+        };
         if policy != ImagePullPolicy::Always {
             if let Some(image) = self.cached_oci_image(&reference, &options.platform).await? {
                 return Ok(image);
@@ -124,7 +168,7 @@ impl ReadOnlyRuntime {
     /// Validates that a disk can be read and that its future machine parent can be created.
     pub fn validate_disk_source(&self, path: &Path) -> Result<PathBuf, LibVmError> {
         validate_create_parent(&self.home.join("machines"))?;
-        Ok(resolve_local_disk(path)?.canonical_path)
+        Ok(OpenDiskSource::open(path)?.into_diagnostic_path())
     }
 }
 
@@ -232,7 +276,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
         let disk = temp.path().join("disk.img");
-        std::fs::write(&disk, b"disk").expect("write disk");
+        std::fs::write(&disk, [0; 4096]).expect("write disk");
         let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
             .await
             .expect("open read-only runtime");
@@ -387,7 +431,7 @@ mod tests {
             .expect("open read-only runtime");
 
         let image = runtime
-            .resolve_oci_image(reference.clone(), ImagePullPolicy::Never)
+            .resolve_oci_image(reference.clone(), ImagePullPolicy::Never, None)
             .await
             .expect("resolve cached image");
 
@@ -409,6 +453,7 @@ mod tests {
             .resolve_oci_image(
                 "example.test/missing:latest".to_string(),
                 ImagePullPolicy::Never,
+                None,
             )
             .await
             .is_err());

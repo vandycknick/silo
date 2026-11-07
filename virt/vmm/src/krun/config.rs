@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::krun::error::{KrunBackendError, Result};
-use crate::krun::rosetta::{RosettaLaunchConfig, ROSETTA_MOUNT_TAG};
+use crate::krun::rosetta::RosettaLaunchConfig;
 use protocol::shutdown::WorkerStorageContext;
+use rootfs_spec::rosetta::SHARE_TAG;
 use vm_spec::Disk;
 
 pub const DEFAULT_ID: &str = "anonymous-instance";
@@ -140,14 +141,9 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "standalone vsock and the vsock mux cannot be used together".to_string(),
         ));
     }
-    if config.rosetta.is_some()
-        && config
-            .mounts
-            .iter()
-            .any(|mount| mount.tag == ROSETTA_MOUNT_TAG)
-    {
+    if config.rosetta.is_some() && config.mounts.iter().any(|mount| mount.tag == SHARE_TAG) {
         return Err(KrunBackendError::InvalidConfig(format!(
-            "mount tag {ROSETTA_MOUNT_TAG:?} is reserved for Rosetta"
+            "mount tag {SHARE_TAG:?} is reserved for Rosetta"
         )));
     }
     if config

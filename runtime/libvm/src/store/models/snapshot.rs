@@ -270,7 +270,8 @@ impl SnapshotRecord {
                     },
                 kernel_architecture,
                 ..
-            } if architecture == kernel_architecture && abi == "silo-direct-v1" => {}
+            } if architecture == kernel_architecture
+                && abi == crate::runtime::boot_assets::DIRECT_BOOT_ABI => {}
             _ => {
                 return Err(invalid(
                     "snapshot requires an exact pinned Linux direct boot bundle",
@@ -338,14 +339,16 @@ impl SnapshotRecord {
     #[cfg(test)]
     pub fn dependencies(&self) -> Result<(BTreeSet<StreamId>, BTreeSet<ObjectDigest>), LibVmError> {
         let canonical = self.canonical_bytes()?;
-        let (streams, mut objects) = self.content_dependencies();
+        let (streams, mut objects) = self.content_dependencies()?;
         objects.insert(ObjectDigest::of_bytes(&canonical));
         Ok((streams, objects))
     }
 
     /// Typed content edges only. Catalog root traversal adds the separately
     /// authenticated record ObjectDigest without hashing under coordination.
-    pub(crate) fn content_dependencies(&self) -> (BTreeSet<StreamId>, BTreeSet<ObjectDigest>) {
+    pub(crate) fn content_dependencies(
+        &self,
+    ) -> Result<(BTreeSet<StreamId>, BTreeSet<ObjectDigest>), LibVmError> {
         let mut streams = BTreeSet::new();
         let mut objects = BTreeSet::new();
         for stream in self.streams() {
@@ -355,7 +358,7 @@ impl SnapshotRecord {
         }
         if let BootProfile::LinuxDirect {
             binding:
-                BootBinding::Pinned {
+                binding @ BootBinding::Pinned {
                     kernel,
                     base_initramfs,
                     agent,
@@ -367,12 +370,13 @@ impl SnapshotRecord {
             objects.insert(*kernel);
             objects.insert(*base_initramfs);
             objects.extend(agent.iter().copied());
+            objects.insert(binding.digest()?);
         }
         objects.extend(self.platform_files.iter().map(|file| file.object));
         if let SnapshotCaptureKind::LiveExecution { execution } = &self.capture {
             objects.extend([execution.layout, execution.execution, execution.devices]);
         }
-        (streams, objects)
+        Ok((streams, objects))
     }
 }
 
@@ -540,7 +544,10 @@ fn validate_configured_closure(record: &SnapshotRecord) -> Result<(), LibVmError
     Ok(())
 }
 
-fn validate_geometry(stream: &SnapshotStream, geometry: &DiskGeometry) -> Result<(), LibVmError> {
+pub(crate) fn validate_geometry(
+    stream: &SnapshotStream,
+    geometry: &DiskGeometry,
+) -> Result<(), LibVmError> {
     if stream.length != geometry.length
         || geometry.logical_sector_size != 512
         || geometry.length == 0
@@ -558,7 +565,7 @@ fn validate_geometry(stream: &SnapshotStream, geometry: &DiskGeometry) -> Result
 
 /// RFC 8785 for the admitted JSON subset: no floating point, safe integers,
 /// UTF-16 property ordering, no Unicode normalization, ECMAScript string escapes.
-fn canonical_value(value: &Value) -> Result<Vec<u8>, LibVmError> {
+pub(crate) fn canonical_value(value: &Value) -> Result<Vec<u8>, LibVmError> {
     fn emit(value: &Value, out: &mut Vec<u8>) -> Result<(), LibVmError> {
         match value {
             Value::Null => out.extend_from_slice(b"null"),
@@ -741,9 +748,10 @@ pub(crate) mod tests {
                     base_initramfs: kernel,
                     agent: None,
                     architecture: GuestArchitecture::Amd64,
-                    abi: "silo-direct-v1".into(),
+                    abi: crate::runtime::boot_assets::DIRECT_BOOT_ABI.into(),
                 },
                 root_selector: RootSelector::WholeDisk,
+                root_filesystem: crate::store::models::storage::RootFilesystem::Ext4,
                 translation: Translation::None,
             },
             external_requirements: Vec::new(),

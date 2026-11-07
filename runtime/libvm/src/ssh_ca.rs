@@ -150,24 +150,62 @@ mod tests {
     use crate::store::models::MachineId;
     use silo_secrets::{FileStore, Secret, SecretBytes, SecretName, SecretStore};
     use ssh_key::{Certificate, HashAlg, PrivateKey};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    async fn runtime(home: &std::path::Path) -> crate::Runtime {
+        let runtime = crate::Runtime::open(
+            crate::paths::LocalPaths::new(home),
+            crate::RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .unwrap();
+        let components = crate::runtime::components::test_components(home);
+        std::fs::create_dir_all(components.asset_dir()).unwrap();
+        let kernel = test_utils::direct_kernel::host_kernel("private packaged test boot asset");
+        for (asset, contents) in [
+            (components.kernel(), kernel.as_slice()),
+            (
+                components.initramfs(),
+                b"private packaged test boot asset".as_slice(),
+            ),
+            (
+                components.agent(),
+                b"private packaged test boot asset".as_slice(),
+            ),
+        ] {
+            std::fs::write(asset, contents).unwrap();
+            std::fs::set_permissions(asset, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        runtime
+    }
+
+    fn disk_without_agent(runtime: &crate::Runtime, path: &std::path::Path) -> crate::ImageSource {
+        let mut source = crate::ImageSource::disk(path);
+        if let crate::ImageSource::Disk(request) = &mut source {
+            let crate::DiskImportBoot::LinuxDirect { assets, .. } = &mut request.boot;
+            *assets = crate::BootAssetSelection::Files {
+                kernel: runtime.asset_directory().join("kernel-default"),
+                base_initramfs: runtime.asset_directory().join("initramfs"),
+                agent: None,
+            };
+        }
+        source
+    }
 
     #[tokio::test]
     async fn actual_machine_create_remove_and_failed_create_own_ca_scope() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
-        let runtime = crate::Runtime::open(
-            crate::paths::LocalPaths::new(home.path().join("silo")),
-            crate::RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .unwrap();
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
+        let runtime = runtime(&home.path().join("silo")).await;
         let machine = runtime
             .machine()
             .name("ca-lifecycle")
-            .image_source(crate::ImageSource::disk(&disk))
-            .agent_mode(Some(crate::MachineAgent::Disabled))
+            .image_source(disk_without_agent(&runtime, &disk))
             .create()
             .await
             .unwrap();
@@ -198,16 +236,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
         let selected =
             Arc::new(FileStore::with_store_file(external.path().join("custom.json")).unwrap());
-        let runtime = crate::Runtime::open(
-            crate::paths::LocalPaths::new(home.path().join("silo")),
-            crate::RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .unwrap()
-        .with_secret_store(selected.clone());
+        let runtime = runtime(&home.path().join("silo"))
+            .await
+            .with_secret_store(selected.clone());
         let machine = runtime
             .machine()
             .name("external-ca")
@@ -345,6 +382,7 @@ mod tests {
                 &uuid::Uuid::from(config.id).to_string(),
                 &uuid::Uuid::new_v4().to_string(),
                 &config.spec,
+                rootfs_spec::RosettaMode::Disabled,
             )
             .unwrap(),
         })
@@ -403,15 +441,14 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let external = tempfile::tempdir().unwrap();
             let disk = home.path().join("root.raw");
-            std::fs::write(&disk, [0x64; 512]).unwrap();
+            disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+                .unwrap()
+                .close()
+                .unwrap();
             let selected = Arc::new(FileStore::new(external.path()));
-            let runtime = crate::Runtime::open(
-                crate::paths::LocalPaths::new(home.path().join("silo")),
-                crate::RuntimeNetworkingConfig::default(),
-            )
-            .await
-            .unwrap()
-            .with_secret_store(selected.clone());
+            let runtime = runtime(&home.path().join("silo"))
+                .await
+                .with_secret_store(selected.clone());
             let retention = if ephemeral {
                 crate::MachineRetention::Ephemeral
             } else {
@@ -420,8 +457,7 @@ mod tests {
             let machine = runtime
                 .machine()
                 .name("cleanup-error")
-                .image_source(crate::ImageSource::disk(&disk))
-                .agent_mode(Some(crate::MachineAgent::Disabled))
+                .image_source(disk_without_agent(&runtime, &disk))
                 .retention(retention)
                 .create()
                 .await

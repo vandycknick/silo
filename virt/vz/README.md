@@ -27,9 +27,17 @@ Current scope focuses on the Linux guest path supported today:
 
 ## Requirements
 
-- macOS 11 or later
+- macOS 12.3 or later for guest-visible virtio block identifiers
 - `com.apple.security.virtualization` entitlement
 - Apple `Virtualization.framework`
+
+Storage device construction requires an explicit block identifier. The wrapper
+checks the [Apple API's ASCII/20-byte limit](https://developer.apple.com/documentation/virtualization/vzvirtioblockdeviceconfiguration/blockdeviceidentifier)
+and calls the framework's identifier validator before setting
+`blockDeviceIdentifier`, since an invalid setter value can terminate the process.
+Silo passes each disk's existing `block_id` unchanged, rather than deriving
+identity from attachment order. Actual guest serial visibility and partition
+discovery still require macOS guest verification.
 
 ## Example
 
@@ -73,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_storage_device(StorageDeviceConfiguration::new(
             PathBuf::from("/path/to/rootfs.img"),
             false,
+            "silo-root",
         )?)
         .add_directory_share(fs_config)
         .build()?;

@@ -22,7 +22,6 @@ mod locale;
 mod mounts;
 pub(crate) mod network;
 mod resize;
-mod rosetta;
 pub(crate) mod ssh;
 mod timezone;
 mod user;
@@ -30,7 +29,6 @@ mod userdata;
 
 #[derive(Debug, Default)]
 pub(crate) struct EarlyProvisioning {
-    rosetta: Option<ProvisionOutcome>,
     mounts: Option<ProvisionOutcome>,
 }
 
@@ -40,11 +38,10 @@ pub(crate) fn prepare_early_provisioning(
 ) -> eyre::Result<EarlyProvisioning> {
     let context = ProvisionContext::new(ProcessSupervisor::default());
     let mounts = Some(mounts::prepare_early(&context, &config.mounts, storage)?);
-    let rosetta = rosetta::prepare_early(&config.rosetta)?;
     storage
         .register_current(false)
         .context("retain required early mounts before handoff")?;
-    Ok(EarlyProvisioning { rosetta, mounts })
+    Ok(EarlyProvisioning { mounts })
 }
 
 pub(crate) fn validate_early_mounts(config: &ProvisionConfig) -> eyre::Result<()> {
@@ -133,10 +130,6 @@ fn provisioners<'a>(
             &config.mounts,
             early.mounts.as_ref(),
         )),
-        Box::new(rosetta::Rosetta::with_early_outcome(
-            &config.rosetta,
-            early.rosetta.as_ref(),
-        )),
         Box::new(userdata::Userdata::init(&config.userdata)),
     ]);
     ProvisionerPlan::new(provisioners)
@@ -153,7 +146,6 @@ impl ProvisionerId {
     const CERTIFICATE_AUTHORITY: Self = Self("certificate_authority");
     const RESIZE_ROOTFS: Self = Self("resize_rootfs");
     const MOUNTS: Self = Self("mounts");
-    const ROSETTA: Self = Self("rosetta");
     const NETWORK: Self = Self("network");
     const USERDATA: Self = Self("userdata");
 

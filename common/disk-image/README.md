@@ -133,6 +133,44 @@ assert_eq!(probe(std::path::Path::new("rootfs.ext4"))?, ProbeResult::Ext4);
 `probe` checks only the ext4 superblock magic. It reports short files and magic
 mismatches as `ProbeResult::NotExt4`; it does not validate the filesystem.
 
+### Inspect a partition table
+
+Partition facts are provided by the sibling [`disk-partition`](../disk-partition)
+crate, independently of this crate's ext4 and qcow2 code. It is `no_std + alloc`
+by default, with an opt-in `std` feature for a held `Read + Seek` source:
+
+```toml
+[dependencies]
+disk-partition = { path = "common/disk-partition", features = ["std"] }
+```
+
+```rust
+use disk_partition::{Geometry, ReadMode, read_table, validate_linux_direct_table};
+
+let mut source = std::fs::File::open("root.raw")?;
+let geometry = Geometry::new(source.metadata()?.len())?;
+let table = read_table(&mut source, geometry, ReadMode::StrictImport)?;
+validate_linux_direct_table(&table)?;
+```
+
+Guest callers implement `ReadAt` on their held block-device descriptor, with
+their own associated error type. `read_table` returns `Error<R::Error>` and
+preserves the failing byte offset and source error without allocating strings.
+`Geometry::new` performs no I/O and returns `Error<core::convert::Infallible>`,
+so its error type never needs a caller-supplied generic argument.
+
+The shared parser bounds disks to 1 TiB with 512-byte sectors, GPT to 128 entries
+and 128–4096-byte power-of-two strides, and MBR to four primary slots. It checks
+both GPT copies, CRCs, reserved fields, overlaps and duplicate GUIDs. Strict
+import requires GPT at current capacity; guest boot can retain matching
+original GPT copies after opaque disk growth. Corrupt or unsupported tables
+never become a whole-disk fallback.
+
+Linux direct boot additionally requires 128-byte GPT entries, enforced by
+`validate_linux_direct_table`; wider entries remain inspectable. This helper
+does not select a root or admit a filesystem. A `PartitionTable::None` result
+is suitable only for an explicit whole-disk selector.
+
 ### Create a private managed upper
 
 ```rust

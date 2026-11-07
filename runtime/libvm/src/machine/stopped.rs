@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::machine::root_storage::invalid;
 use crate::paths::OwnedDirectory;
-use crate::runtime::boot_assets::{capture_boot, preflight_captured_boot, BootSelectionContext};
+use crate::runtime::boot_assets::{
+    capture_boot, preflight_captured_boot, BootSelectionContext, CaptureLane,
+};
 use crate::storage::locks::StorageLock;
 use crate::storage::pool::StoragePool;
 use crate::store::models::snapshot::{
@@ -286,7 +288,11 @@ async fn preflight_boot(
         let selection = crate::runtime::capabilities::ResolvedBackendSelection::resolve(
             config.virt_backend.as_ref(),
         )?;
-        crate::runtime::boot_assets::validate_captured_boot_lane(&storage, selection.backend)?;
+        crate::runtime::boot_assets::validate_captured_boot_lane(
+            &storage,
+            selection.backend,
+            CaptureLane::Stopped,
+        )?;
         let pool = StoragePool::open_existing(&config.resolve_home()?.join("images"))?
             .ok_or_else(|| invalid("source immutable pool is missing"))?;
         crate::runtime::boot_assets::preflight_boot_selection(
@@ -301,6 +307,7 @@ async fn preflight_boot(
                 native_executable: components.supervisor(),
                 backend: selection.backend,
             },
+            CaptureLane::Stopped,
         )
     })
     .await?
@@ -426,7 +433,7 @@ async fn admit_stopped(
     runtime
         .preflight_stopped_generation_locked(&config, &initial_storage)
         .await?;
-    runtime.preflight_captured_lane(&initial_storage)?;
+    runtime.preflight_captured_lane(&initial_storage, CaptureLane::Stopped)?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let store = runtime.native_store()?;
     let context = runtime.captured_boot_context(&pool, &store, Uuid::nil());
@@ -435,6 +442,7 @@ async fn admit_stopped(
         &config.spec,
         &config.guest.agent,
         &context,
+        CaptureLane::Stopped,
     )?;
     let mut ids = initial_storage
         .disks
@@ -841,7 +849,7 @@ async fn fork_owned(
     let mut source = admit_stopped(&runtime, id, false, &options.external_resources).await?;
     let store = runtime.native_store()?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
-    let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage);
+    let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage)?;
     let streams = streams.into_iter().collect::<Vec<_>>();
     let objects = objects.into_iter().collect::<Vec<_>>();
     let (operation_id, lease) = store
@@ -857,6 +865,7 @@ async fn fork_owned(
         &source.config.spec,
         &source.config.guest.agent,
         runtime.captured_boot_context(&pool, &store, operation_id),
+        CaptureLane::Stopped,
     )
     .await?;
     let mut configuration = SnapshotConfiguration::capture(&source.config)?;
@@ -898,7 +907,7 @@ async fn snapshot_owned(
     let mut source = admit_stopped(&runtime, id, true, &options.external_resources).await?;
     let store = runtime.native_store()?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
-    let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage);
+    let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage)?;
     let streams = streams.into_iter().collect::<Vec<_>>();
     let objects = objects.into_iter().collect::<Vec<_>>();
     let (operation_id, lease) = store
@@ -913,6 +922,7 @@ async fn snapshot_owned(
         &source.config.spec,
         &source.config.guest.agent,
         runtime.captured_boot_context(&pool, &store, operation_id),
+        CaptureLane::Stopped,
     )
     .await?;
     let requirements = external_requirements(&source.config.spec, &source.storage)?;
@@ -1116,7 +1126,7 @@ async fn restore_owned(
         ));
     }
     check_policy(&preview.external_requirements, &options.external_resources)?;
-    runtime.preflight_captured_lane(&storage_from_snapshot(&preview)?)?;
+    runtime.preflight_captured_lane(&storage_from_snapshot(&preview)?, CaptureLane::Stopped)?;
     let _names = runtime.lock_machine_names().await?;
     let name =
         crate::machine::builder::stopped_child_name(&runtime, options.name.as_deref()).await?;
@@ -1137,6 +1147,7 @@ async fn restore_owned(
         &configuration.spec,
         &configuration.guest.agent,
         &runtime.captured_boot_context(&pool, &store, consumer.operation_id),
+        CaptureLane::Stopped,
     )?;
     let writable = consumer
         .record
@@ -1336,6 +1347,8 @@ mod tests {
         check_policy, ExternalResourceKey, ExternalResourceMapping, ExternalResourcePolicy,
         ExternalResourceRequirement,
     };
+    #[cfg(target_os = "linux")]
+    use test_utils::direct_kernel::host_kernel;
 
     #[test]
     fn stopped_external_policy_requires_explicit_complete_destination_mapping() {
@@ -1409,24 +1422,38 @@ mod tests {
     async fn raw_source(name: &str) -> (tempfile::TempDir, crate::Runtime, crate::Machine) {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("input.raw");
-        let kernel = home.path().join("kernel");
-        let init = home.path().join("base-init");
-        std::fs::write(&disk, [0x63; 512]).unwrap();
-        std::fs::write(&kernel, b"exact configured kernel bytes").unwrap();
-        std::fs::write(&init, b"exact configured base-init bytes").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
         let runtime = crate::Runtime::open(
             crate::paths::LocalPaths::new(home.path().join("silo")),
             crate::RuntimeNetworkingConfig::default(),
         )
         .await
         .unwrap();
+        std::fs::create_dir_all(runtime.asset_directory()).unwrap();
+        let kernel = runtime.asset_directory().join("kernel-default");
+        let init = runtime.asset_directory().join("initramfs");
+        std::fs::write(&kernel, host_kernel("exact configured kernel bytes")).unwrap();
+        std::fs::write(&init, b"exact configured base-init bytes").unwrap();
+        for asset in [&kernel, &init] {
+            std::fs::set_permissions(asset, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut image = crate::ImageSource::disk(&disk);
+        if let crate::ImageSource::Disk(request) = &mut image {
+            let crate::DiskImportBoot::LinuxDirect { assets, .. } = &mut request.boot;
+            *assets = crate::BootAssetSelection::Files {
+                kernel,
+                base_initramfs: init,
+                agent: None,
+            };
+        }
         let machine = runtime
             .machine()
             .name(name)
-            .image_source(crate::ImageSource::disk(&disk))
-            .kernel(kernel)
-            .initramfs(init)
-            .guest(|guest| guest.agent(None))
+            .image_source(image)
             .create()
             .await
             .unwrap();
@@ -1524,6 +1551,7 @@ mod tests {
     async fn stopped_fork_preserves_configured_process_and_managed_data_without_parent_paths() {
         use crate::store::MachineStore;
         use crate::{DiskStorage, ForkOptions, IncludedDisk, PrivatePath, StorageStopOutcome};
+        use sha2::Digest;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let (_home, runtime, source) = raw_source("source").await;
         let mut config = runtime
@@ -1535,6 +1563,8 @@ mod tests {
             .machine_storage_record(source.machine_id())
             .await
             .unwrap();
+        let root_before =
+            sha2::Sha256::digest(std::fs::read(config.machine_dir.join("root.raw")).unwrap());
         let data = config.machine_dir.join("data.raw");
         std::fs::write(&data, [0x91; 1024]).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1626,6 +1656,10 @@ mod tests {
         assert_ne!(config.lock_id, child_config.lock_id);
         assert_eq!(config.process, child_config.process);
         assert_eq!(config.metadata, child_config.metadata);
+        assert_eq!(
+            sha2::Sha256::digest(std::fs::read(child_config.machine_dir.join("root.raw")).unwrap()),
+            root_before
+        );
         assert_eq!(child_storage.stop_outcome, StorageStopOutcome::Unknown);
         assert!(runtime
             .native_store()
@@ -1647,8 +1681,8 @@ mod tests {
         );
         assert_ne!(storage.disks[0].id, child_storage.disks[0].id);
         assert_eq!(
-            std::fs::read(config.machine_dir.join("root.raw")).unwrap(),
-            [0x63; 512]
+            sha2::Sha256::digest(std::fs::read(config.machine_dir.join("root.raw")).unwrap()),
+            root_before
         );
         assert!(matches!(
             child_storage.boot,
@@ -1666,12 +1700,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stopped_sql_rejection_cleans_only_owned_uncommitted_child() {
+        use sha2::Digest;
         let (_home, runtime, source) = raw_source("source").await;
         let source_config = runtime
             .machine_config(source.machine_id())
             .await
             .unwrap()
             .unwrap();
+        let root_before = sha2::Sha256::digest(
+            std::fs::read(source_config.machine_dir.join("root.raw")).unwrap(),
+        );
         let machines = source_config.machine_dir.parent().unwrap();
         runtime.native_store().unwrap().execute_test_sql(
             "CREATE TRIGGER reject_stopped_child BEFORE INSERT ON machine_config WHEN NEW.name='rejected' BEGIN SELECT RAISE(ABORT,'real stopped child SQL rejection'); END",
@@ -1696,8 +1734,10 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_dir(machines).unwrap().count(), 1);
         assert_eq!(
-            std::fs::read(source_config.machine_dir.join("root.raw")).unwrap(),
-            [0x63; 512]
+            sha2::Sha256::digest(
+                std::fs::read(source_config.machine_dir.join("root.raw")).unwrap()
+            ),
+            root_before
         );
     }
 

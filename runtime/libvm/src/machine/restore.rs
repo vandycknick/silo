@@ -975,6 +975,8 @@ async fn launch_restored(
         &Uuid::from(config.id).to_string(),
         &run.to_string(),
         &spec,
+        crate::runtime::boot_assets::effective_boot(storage, &spec, runtime.effective_backend())?
+            .rosetta,
     )
     .map_err(|error| invalid(error.to_string()))?;
     let provenance = crate::guest_agent::build_config(crate::guest_agent::GuestAgentConfigInput {

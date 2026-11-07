@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod convert;
+pub(crate) mod ext4_admission;
+pub(crate) mod import;
+pub(crate) mod import_types;
 pub(crate) mod local_disk;
 pub(crate) mod oci;
 pub(crate) mod progress;
@@ -42,11 +46,10 @@ pub use progress::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 pub enum ImageSource {
     /// Pull and materialize an OCI image reference.
     Oci(String),
-    /// Clone or copy an existing caller-owned local disk image into the machine directory.
-    ///
-    /// The source path is resolved when creation is planned, but its mutable file
-    /// contents remain owned by the caller until materialization begins.
-    Disk(PathBuf),
+    /// Import a quiesced caller-owned disk with explicit boot metadata.
+    Disk(import_types::DiskImportRequest),
+    /// Acquire an immutable managed image or complete snapshot.
+    Managed(import_types::ManagedSourceRef),
 }
 
 impl ImageSource {
@@ -57,7 +60,22 @@ impl ImageSource {
 
     /// Creates a local disk image source.
     pub fn disk(path: impl Into<PathBuf>) -> Self {
-        Self::Disk(path.into())
+        Self::Disk(import_types::DiskImportRequest {
+            path: path.into(),
+            boot: import_types::DiskImportBoot::LinuxDirect {
+                platform: crate::LinuxPlatform {
+                    architecture: if cfg!(target_arch = "aarch64") {
+                        crate::GuestArchitecture::Arm64
+                    } else {
+                        crate::GuestArchitecture::Amd64
+                    },
+                    variant: None,
+                },
+                root: import_types::ImportRootSelection::WholeDisk,
+                assets: import_types::BootAssetSelection::Packaged,
+            },
+            alias: None,
+        })
     }
 }
 
@@ -69,6 +87,8 @@ pub enum ImageSourceKind {
     Oci,
     /// The machine was created from a caller-owned local disk image.
     Disk,
+    /// The machine was created from an immutable managed image.
+    Managed,
 }
 
 impl ImageSourceKind {
@@ -76,6 +96,7 @@ impl ImageSourceKind {
         match self {
             Self::Oci => "oci",
             Self::Disk => "disk",
+            Self::Managed => "managed",
         }
     }
 }
@@ -132,6 +153,8 @@ pub struct ImagePullOptions {
 pub struct ImageResolveOptions {
     /// Optional policy override for this operation.
     pub policy: Option<ImagePullPolicy>,
+    /// Requested Linux userspace platform; absence selects the host platform.
+    pub platform: Option<crate::LinuxPlatform>,
 }
 
 /// Whether the resolved immutable image already has a complete local rootfs.
@@ -269,6 +292,59 @@ impl Images {
         Self { runtime }
     }
 
+    fn managed_store(
+        &self,
+    ) -> Result<crate::store::managed_image_store::ManagedImageStore, LibVmError> {
+        Ok(
+            crate::store::managed_image_store::ManagedImageStore::from_store(std::sync::Arc::new(
+                self.runtime.native_store()?,
+            )),
+        )
+    }
+
+    /// Resolves an untyped digest without preferring images over snapshots.
+    pub async fn resolve_managed_digest(
+        &self,
+        digest: &crate::ObjectDigest,
+    ) -> Result<crate::ManagedSourceId, LibVmError> {
+        self.managed_store()?.resolve_digest(*digest).await
+    }
+
+    /// Inspects canonical managed metadata without changing retention.
+    pub async fn inspect_managed(
+        &self,
+        source: &crate::ManagedSourceRef,
+    ) -> Result<crate::ManagedSourceInfo, LibVmError> {
+        self.managed_store()?.inspect(source).await
+    }
+
+    /// Lists retained managed image and snapshot metadata.
+    pub async fn list_managed(&self) -> Result<Vec<crate::ManagedSourceInfo>, LibVmError> {
+        self.managed_store()?.list().await
+    }
+
+    /// Names an existing managed source in the shared alias namespace.
+    pub async fn add_alias(
+        &self,
+        source: &crate::ManagedSourceRef,
+        alias: &str,
+    ) -> Result<crate::ManagedSourceInfo, LibVmError> {
+        self.managed_store()?.add_alias(source, alias).await
+    }
+
+    /// Removes an alias without releasing its target's independent retention.
+    pub async fn remove_alias(&self, alias: &str) -> Result<bool, LibVmError> {
+        self.managed_store()?.remove_alias(alias).await
+    }
+
+    /// Releases explicit retention; other aliases, machines and consumers remain roots.
+    pub async fn release_retention(
+        &self,
+        source: &crate::ManagedSourceRef,
+    ) -> Result<bool, LibVmError> {
+        self.managed_store()?.release_retention(source).await
+    }
+
     /// Pulls or reuses an OCI image reference according to the runtime policy.
     pub async fn pull(&self, reference: impl Into<String>) -> Result<ImageHandle, LibVmError> {
         self.pull_with(reference, ImagePullOptions::default()).await
@@ -315,7 +391,7 @@ impl Images {
     ) -> Result<ResolvedOciImage, LibVmError> {
         let policy = options.policy.unwrap_or(self.runtime.image_pull_policy());
         self.runtime
-            .resolve_oci_image(reference.into(), policy)
+            .resolve_oci_image(reference.into(), policy, options.platform.as_ref())
             .await
     }
 
@@ -366,5 +442,7 @@ pub(crate) struct MaterializedImage {
     pub(crate) config_digest: Option<String>,
     pub(crate) size_bytes: u64,
     pub(crate) platform: Platform,
+    pub(crate) managed: Option<crate::store::managed_image_store::ManagedImageConsumer>,
+    pub(crate) authenticated: Option<crate::storage::stream::AuthenticatedStream>,
     pub(crate) _lease: Option<crate::storage::locks::StorageLock>,
 }

@@ -1,8 +1,7 @@
 use agent_spec::{
-    AgentConfig, AgentRosettaConfig, AgentSshConfig, CertificateAuthorityConfig,
-    MountConfig as ProvisionMountConfig, NetworkConfig as ProvisionNetworkConfig,
-    NetworkInterfaceConfig, ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig,
-    UserdataContentType, UserdataRunPolicy,
+    AgentConfig, AgentSshConfig, CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
+    NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, ProvisionConfig,
+    ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
 };
 use utils::format_mac;
 use vm_spec::VmSpec;
@@ -84,6 +83,7 @@ pub(crate) fn storage_shutdown_context(
     machine_id: &str,
     run_id: &str,
     spec: &VmSpec,
+    effective_rosetta: rootfs_spec::RosettaMode,
 ) -> eyre::Result<protocol::shutdown::StorageShutdownContext> {
     use protocol::shutdown::{StorageAttachment, StorageManifest, StorageShutdownContext};
     let disks = spec
@@ -91,11 +91,7 @@ pub(crate) fn storage_shutdown_context(
         .as_ref()
         .map_or(&[][..], |storage| storage.disks.as_slice());
     let mounts = vm_spec::project_mounts(&spec.mounts).map_err(eyre::Report::msg)?;
-    let rosetta = spec
-        .hardware
-        .as_ref()
-        .and_then(|hardware| hardware.rosetta)
-        .unwrap_or(false);
+    let rosetta = effective_rosetta != rootfs_spec::RosettaMode::Disabled;
     let count = disks.len() + mounts.len() + usize::from(rosetta);
     let manifest = if count > protocol::shutdown::MAX_MANIFEST_ENTRIES {
         StorageManifest::Unsupported {
@@ -120,7 +116,7 @@ pub(crate) fn storage_shutdown_context(
         }));
         if rosetta {
             attachments.push(StorageAttachment::Share {
-                tag: agent_spec::ROSETTA_MOUNT_TAG.into(),
+                tag: rootfs_spec::rosetta::SHARE_TAG.into(),
                 read_only: true,
             });
         }
@@ -185,14 +181,6 @@ fn build_provision_config(
             .collect(),
         certificate_authority,
         network: build_provision_network_config(network)?,
-        rosetta: AgentRosettaConfig {
-            enabled: spec
-                .hardware
-                .as_ref()
-                .and_then(|hardware| hardware.rosetta)
-                .unwrap_or(false),
-            ..AgentRosettaConfig::default()
-        },
         mounts: provision_mount_entries(spec)?,
         userdata: provision_userdata(spec)?,
     })
@@ -355,6 +343,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
             "22222222-2222-4222-8222-222222222222",
             &sample_spec(Vec::new()),
+            rootfs_spec::RosettaMode::Disabled,
         )
         .unwrap()
     }
@@ -534,10 +523,6 @@ mod tests {
         assert!(decoded.provision.enabled);
         assert!(decoded.provision.resize_rootfs.enabled);
         assert_eq!(
-            decoded.provision.rosetta.mount_tag,
-            agent_spec::ROSETTA_MOUNT_TAG
-        );
-        assert_eq!(
             decoded
                 .provision
                 .network
@@ -650,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn provision_config_enables_rosetta_from_vm_settings() {
+    fn provision_config_never_owns_rosetta_even_when_requested() {
         let mut spec = sample_spec(Vec::new());
         hardware_mut(&mut spec).rosetta = Some(true);
 
@@ -663,9 +648,10 @@ mod tests {
         )
         .expect("resolve provision config");
 
-        assert!(provision.rosetta.enabled);
-        assert_eq!(provision.rosetta.mount_tag, agent_spec::ROSETTA_MOUNT_TAG);
-        assert_eq!(provision.rosetta.mount_path, agent_spec::ROSETTA_MOUNT_PATH);
+        assert!(serde_json::to_value(provision)
+            .unwrap()
+            .get("rosetta")
+            .is_none());
     }
 
     #[test]
@@ -712,14 +698,15 @@ mod tests {
             tag: "data-share".into(),
             read_only: false,
         });
-        hardware_mut(&mut spec).rosetta = Some(true);
+        hardware_mut(&mut spec).rosetta = None;
         let context = crate::guest_agent::storage_shutdown_context(
             &uuid::Uuid::new_v4().to_string(),
             &uuid::Uuid::new_v4().to_string(),
             &spec,
+            rootfs_spec::RosettaMode::Required,
         )
         .unwrap();
-        let StorageManifest::Complete { ref attachments } = context.manifest else {
+        let StorageManifest::Complete { attachments } = &context.manifest else {
             panic!("inventory must not be narrowed")
         };
         assert_eq!(attachments.len(), 4);
@@ -745,7 +732,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(&attachments[3], StorageAttachment::Share { tag, read_only: true } if tag == agent_spec::ROSETTA_MOUNT_TAG)
+            matches!(&attachments[3], StorageAttachment::Share { tag, read_only: true } if tag == rootfs_spec::rosetta::SHARE_TAG)
         );
         assert!(context.manifest.unsupported_reason().is_some());
     }
@@ -764,6 +751,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             &uuid::Uuid::new_v4().to_string(),
             &spec,
+            rootfs_spec::RosettaMode::Disabled,
         )
         .unwrap();
         assert!(matches!(

@@ -1,5 +1,6 @@
 //! Native adapters for the typed, same-user daemon management contract.
 //! This crate owns no runtime or session implementation.
+pub mod boot;
 pub mod capture;
 pub mod create;
 pub mod errors;

@@ -390,10 +390,17 @@ impl SupervisorFixture {
             .as_mut()
             .expect("kernel");
         kernel.path = Some(asset("SILO_TEST_KERNEL"));
-        kernel.initramfs = Some(asset("SILO_TEST_INITRAMFS"));
+        // The root is selected only by the launch bootstrap; its harness shell
+        // is the multicall Silo binary, run as the image init.
+        let root = fixture.0.join("root.raw");
+        let root_length = native_root(&root, &asset("SILO_TEST_INIT"));
+        let initramfs = fixture.0.join("initramfs");
+        compose_initramfs(&asset("SILO_TEST_INITRAMFS"), root_length, &initramfs);
+        kernel.initramfs = Some(initramfs);
         kernel.cmdline = vec![
             "loglevel=4".to_string(),
             "silo.qualification=krun-worker".to_string(),
+            "init=/bin/sh".to_string(),
         ];
         spec.hardware.as_mut().expect("hardware").memory = Some(256);
         let share = fixture.0.join("share");
@@ -412,22 +419,34 @@ impl SupervisorFixture {
             tag: "acceptance".to_string(),
             read_only: true,
         });
+        let data = fixture.0.join("data.raw");
+        std::fs::File::create(&data)
+            .expect("disk")
+            .set_len(8 * 1024 * 1024)
+            .expect("disk size");
         let mut disks = Vec::new();
-        for (name, block_id, role, read_only) in [
-            ("first.raw", "native-root", vm_spec::DiskRole::Root, false),
-            ("second.raw", "native-data", vm_spec::DiskRole::Data, true),
+        for (path, length, block_id, role, read_only) in [
+            (
+                root,
+                root_length,
+                "silo-root",
+                vm_spec::DiskRole::Root,
+                false,
+            ),
+            (
+                data,
+                8 * 1024 * 1024,
+                "native-data",
+                vm_spec::DiskRole::Data,
+                true,
+            ),
         ] {
-            let path = fixture.0.join(name);
-            std::fs::File::create(&path)
-                .expect("disk")
-                .set_len(8 * 1024 * 1024)
-                .expect("disk size");
             disks.push(vm_spec::Disk {
                 path,
                 role,
                 format: vm_spec::DiskFormat::Raw,
                 geometry: vm_spec::DiskGeometry {
-                    length: 8 * 1024 * 1024,
+                    length,
                     logical_sector_size: 512,
                 },
                 block_id: vm_spec::BlockId::new(block_id).expect("valid native ID"),
@@ -447,7 +466,11 @@ impl SupervisorFixture {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let console = std::fs::read_to_string(self.0.join("serial.log")).unwrap_or_default();
-            if console.matches("starting rescue shell").count() > previous_generations {
+            if console
+                .matches("init: raw: verified bootstrap-selected root")
+                .count()
+                > previous_generations
+            {
                 return;
             }
             assert!(
@@ -495,6 +518,111 @@ impl Drop for SupervisorFixture {
         }
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Formats the whole-disk ext4 root: the multicall Silo binary as `/bin/sh`,
+/// applet links for the harness commands, and an empty `/mnt`.
+fn native_root(path: &std::path::Path, init: &std::path::Path) -> u64 {
+    use disk_image::ext4::constants::{file_mode, make_mode};
+    let mut root =
+        disk_image::ext4::Formatter::new(path, 4096, 64 * 1024 * 1024).expect("format native root");
+    let mut binary = std::fs::File::open(init).expect("open multicall Silo binary");
+    root.create(
+        "/bin/sh",
+        make_mode(file_mode::S_IFREG, 0o755),
+        None,
+        None,
+        Some(disk_image::ext4::FileData::Dense(&mut binary)),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("root shell");
+    for applet in ["cat", "echo", "mount"] {
+        root.create(
+            format!("/bin/{applet}"),
+            make_mode(file_mode::S_IFLNK, 0o777),
+            Some(b"sh".as_slice()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("applet link");
+    }
+    root.create(
+        "/mnt",
+        make_mode(file_mode::S_IFDIR, 0o755),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("mount point");
+    root.close().expect("finish native root");
+    let length = std::fs::metadata(path).expect("root length").len();
+    assert_eq!(length % 512, 0, "root attachment is sector aligned");
+    length
+}
+
+/// Appends the launch-only schema-2 whole-disk bootstrap to the base
+/// initramfs, as libvm composes it: a 4-byte aligned uncompressed newc tail.
+fn compose_initramfs(base: &std::path::Path, root_length: u64, destination: &std::path::Path) {
+    let bootstrap = rootfs_spec::Bootstrap {
+        root: rootfs_spec::Root::Raw(rootfs_spec::RawRoot {
+            device: rootfs_spec::RawDeviceExpectation {
+                serial: rootfs_spec::RawSerial::Root,
+                length_bytes: root_length,
+                logical_sector_size: 512,
+                read_only: false,
+            },
+            selector: rootfs_spec::RawSelector::WholeDisk,
+            filesystem: rootfs_spec::RootFilesystem::Ext4,
+        }),
+        rosetta: rootfs_spec::RosettaMode::Disabled,
+    };
+    let mut encoded = vec![0; rootfs_spec::MAX_JSON_BYTES];
+    let length = rootfs_spec::encode_bootstrap(&bootstrap, &mut encoded).expect("bootstrap");
+    encoded.truncate(length);
+    let mut output = std::fs::read(base).expect("base initramfs");
+    output.resize(output.len().next_multiple_of(4), 0);
+    let entry = |name: &str, inode: u32, mode: u32, file_type: cpio::newc::ModeFileType| {
+        cpio::NewcBuilder::new(name)
+            .ino(inode)
+            .uid(0)
+            .gid(0)
+            .nlink(
+                if matches!(file_type, cpio::newc::ModeFileType::Directory) {
+                    2
+                } else {
+                    1
+                },
+            )
+            .mode(mode)
+            .mtime(0)
+            .set_mode_file_type(file_type)
+    };
+    entry("silo", 1, 0o700, cpio::newc::ModeFileType::Directory)
+        .write(&mut output, 0)
+        .finish()
+        .expect("bootstrap directory");
+    let mut member = entry(
+        "silo/rootfs.json",
+        2,
+        0o600,
+        cpio::newc::ModeFileType::Regular,
+    )
+    .write(&mut output, u32::try_from(encoded.len()).expect("bounded"));
+    member.write_all(&encoded).expect("bootstrap bytes");
+    member.finish().expect("bootstrap member");
+    cpio::newc::trailer(&mut output).expect("archive trailer");
+    std::fs::write(destination, output).expect("composite initramfs");
 }
 
 #[test]
@@ -1361,7 +1489,7 @@ enum NativeExit {
 }
 
 #[tokio::test]
-#[ignore = "requires native hypervisor and SILO_TEST_KERNEL/INITRAMFS/SHUTDOWN; macOS silo-vmm must be signed"]
+#[ignore = "requires native hypervisor and SILO_TEST_KERNEL/INITRAMFS/INIT/SHUTDOWN; macOS silo-vmm must be signed"]
 async fn native_guest_devices_shutdown_crash_and_new_generation() {
     native_guest_cases(&[
         NativeExit::Stop,
@@ -1429,7 +1557,7 @@ async fn native_guest_cases(scenarios: &[NativeExit]) {
         let mut input =
             "echo DISKS_BEGIN; cat /sys/block/vda/ro /sys/block/vdb/ro; echo DISKS_END; "
                 .to_string();
-        // The rescue shell does not expand globs. Enumerate the console, two
+        // The harness shell does not expand globs. Enumerate the console, two
         // block devices, filesystem, vsock, RNG, and balloon explicitly.
         for index in 0..7 {
             input.push_str(&format!(

@@ -152,6 +152,7 @@ impl Cmd {
                 self.image.as_deref(),
                 &template.template,
                 self.pull.map(Pull::policies),
+                &machine.source,
             )
             .await
             .map_err(execution_infrastructure)?;
@@ -191,6 +192,7 @@ impl Cmd {
                     self.image.as_deref(),
                     &template.template,
                     self.pull.map(Pull::policies),
+                    &machine.source,
                     image_progress.clone(),
                 )
                 .await

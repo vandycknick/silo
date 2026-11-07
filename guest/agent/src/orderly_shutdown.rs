@@ -426,6 +426,41 @@ mod tests {
     }
 
     #[test]
+    fn partition_completion_needs_clean_coverage_and_every_storage_step() {
+        use protocol::v1::ShutdownCompletionResult;
+        for failure in [
+            "root syncfs failed",
+            "ESP syncfs failed",
+            "data unmount failed",
+            "root read-only verification failed",
+            "ESP final syncfs failed",
+        ] {
+            let mut result = crate::root_storage::ShutdownResult::default();
+            result.record(Err(eyre::eyre!(failure)));
+            result.record(Ok(()));
+            let completed = crate::orderly_shutdown::completion(result.finish(), None);
+            assert_eq!(
+                completed.result,
+                Some(ShutdownCompletionResult::Failed as i32)
+            );
+            assert_eq!(completed.diagnostic.as_deref(), Some(failure));
+        }
+        let uncovered = crate::orderly_shutdown::completion(
+            Ok(()),
+            Some("ESP has no retained mount error cursor".into()),
+        );
+        assert_eq!(
+            uncovered.result,
+            Some(ShutdownCompletionResult::Unsupported as i32)
+        );
+        let completed = crate::orderly_shutdown::completion(Ok(()), None);
+        assert_eq!(
+            completed.result,
+            Some(ShutdownCompletionResult::Succeeded as i32)
+        );
+    }
+
+    #[test]
     fn diagnostic_bound_preserves_utf8() {
         let text = crate::orderly_shutdown::bounded_diagnostic("界".repeat(4096));
         assert!(text.len() <= protocol::shutdown::MAX_DIAGNOSTIC_BYTES);

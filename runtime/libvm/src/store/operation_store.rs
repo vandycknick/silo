@@ -210,6 +210,7 @@ pub(crate) fn preflight_launch_storage(
 struct StoppedCommitCandidate {
     candidate_machine_id: Option<MachineId>,
     candidate_snapshot_id: Option<crate::storage::identity::SnapshotId>,
+    candidate_image_id: Option<crate::storage::identity::ImageId>,
     directory: Option<CandidateDirectory>,
 }
 
@@ -240,12 +241,34 @@ fn commit_candidate(json: &str) -> Result<StoppedCommitCandidate, LibVmError> {
     match (
         &candidate.candidate_machine_id,
         &candidate.candidate_snapshot_id,
+        &candidate.candidate_image_id,
         &candidate.directory,
     ) {
-        (Some(machine), None, Some(_)) if !Uuid::from(*machine).is_nil() => Ok(candidate),
-        (None, Some(_), None) => Ok(candidate),
+        (Some(machine), None, None, Some(_)) if !Uuid::from(*machine).is_nil() => Ok(candidate),
+        (None, Some(_), None, None) | (None, None, Some(_), None) => Ok(candidate),
         _ => Err(invalid("committing operation must name exactly one result")),
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BootUpdateCandidate {
+    machine_id: MachineId,
+    generation: u64,
+    bundle: crate::storage::identity::ObjectDigest,
+}
+
+fn boot_update_candidate(json: &str) -> Result<BootUpdateCandidate, LibVmError> {
+    let candidate: BootUpdateCandidate = serde_json::from_str(json).map_err(invalid)?;
+    if Uuid::from(candidate.machine_id).is_nil() || candidate.generation == 0 {
+        return Err(invalid(
+            "boot update candidate requires machine and target generation",
+        ));
+    }
+    crate::storage::limits::Resource::JsonInteger
+        .check(candidate.generation)
+        .map_err(crate::storage::StorageError::from)?;
+    Ok(candidate)
 }
 
 /// A cleanup namespace is operation-owned, not a mutable machine slot. The
@@ -616,7 +639,7 @@ impl Store {
         streams: &[StreamId],
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(Uuid, StorageLock), LibVmError> {
-        if !matches!(kind, "snapshot" | "fork" | "import") {
+        if !matches!(kind, "snapshot" | "fork" | "import" | "update-boot-assets") {
             return Err(invalid("unsupported stopped operation kind"));
         }
         let id = Uuid::new_v4();
@@ -637,7 +660,7 @@ impl Store {
         streams: &[StreamId],
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError> {
-        if id.is_nil() || !matches!(kind, "snapshot" | "fork" | "import") {
+        if id.is_nil() || !matches!(kind, "snapshot" | "fork" | "import" | "update-boot-assets") {
             return Err(invalid("invalid stopped operation"));
         }
         let (device, inode) = lease.file_identity()?;
@@ -689,12 +712,157 @@ impl Store {
         .await
     }
 
+    pub(crate) async fn preserve_image_operation(
+        &self,
+        id: Uuid,
+        destination: crate::storage::identity::ImageId,
+    ) -> Result<(), LibVmError> {
+        self.preserve_stopped_candidate(
+            id,
+            &serde_json::json!({"candidateImageId": destination}).to_string(),
+        )
+        .await
+    }
+
+    /// Existing machine update authority is never destination-directory cleanup
+    /// authority. Retain the precise target for uncertain atomic storage saves.
+    pub(crate) async fn preserve_boot_update_operation(
+        &self,
+        operation: Uuid,
+        machine: MachineId,
+        generation: u64,
+        bundle: crate::storage::identity::ObjectDigest,
+    ) -> Result<(), LibVmError> {
+        let json = serde_json::to_string(&BootUpdateCandidate {
+            machine_id: machine,
+            generation,
+            bundle,
+        })
+        .map_err(invalid)?;
+        boot_update_candidate(&json)?;
+        crate::store::snapshot_store::require_operation_closure(
+            self,
+            operation,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::from([bundle]),
+            None,
+        )
+        .await?;
+        let pool = StoragePool::open(&self.images_dir)?;
+        let binding = crate::BootBinding::decode(&pool.read_object(
+            &bundle,
+            crate::storage::limits::Resource::MetadataPageBytes.maximum(),
+        )?)?;
+        if binding.digest()? != bundle {
+            return Err(invalid("boot update bundle identity contradiction"));
+        }
+        let _roots = pool.lock_roots()?;
+        let changed = sqlx::query("UPDATE storage_operation SET state='committing',machine_id=?2,storage_generation=?3,record_json=jsonb(?4) WHERE operation_id=?1 AND kind='update-boot-assets' AND state='staging'")
+            .bind(operation.to_string()).bind(machine.to_string()).bind(i64::try_from(generation).map_err(invalid)?).bind(json).execute(&self.pool).await?;
+        if changed.rows_affected() != 1 {
+            return Err(invalid("boot update operation is not staging"));
+        }
+        Ok(())
+    }
+
+    async fn retire_boot_update_operations(&self, pool: &StoragePool) -> Result<(), LibVmError> {
+        let mut cursor = String::new();
+        loop {
+            let rows = sqlx::query("SELECT operation_id,state,json(record_json) AS record_json FROM storage_operation WHERE kind='update-boot-assets' AND operation_id>?1 ORDER BY operation_id LIMIT 256")
+                .bind(&cursor).fetch_all(&self.pool).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                cursor = row.try_get("operation_id")?;
+                let operation = cursor.parse().map_err(invalid)?;
+                let state: String = row.try_get("state")?;
+                let json: String = row.try_get("record_json")?;
+                let candidate = if state == "committing" {
+                    Some(boot_update_candidate(&json)?)
+                } else {
+                    None
+                };
+                // Metadata authentication, including bundle hashing, stays
+                // outside roots and the write transaction.
+                let observed: Option<String> = if let Some(candidate) = &candidate {
+                    let bytes: Option<String> = sqlx::query_scalar(
+                        "SELECT CAST(record_json AS TEXT) FROM machine_storage WHERE machine_id=?1",
+                    )
+                    .bind(candidate.machine_id.to_string())
+                    .fetch_optional(&self.pool)
+                    .await?;
+                    if let Some(bytes) = &bytes {
+                        let storage = MachineStorageRecord::decode(bytes)?;
+                        if storage.storage_generation < candidate.generation.saturating_sub(1) {
+                            return Err(invalid(
+                                "boot update recovery found an older unrelated generation",
+                            ));
+                        }
+                        if storage.storage_generation == candidate.generation {
+                            let crate::BootProfile::LinuxDirect { binding, .. } = &storage.boot
+                            else {
+                                return Err(invalid("boot update committed a different profile"));
+                            };
+                            if binding.digest()? != candidate.bundle {
+                                return Err(invalid(
+                                    "boot update committed a contradictory bundle",
+                                ));
+                            }
+                        }
+                    }
+                    bytes
+                } else {
+                    None
+                };
+                let _roots = pool.lock_roots()?;
+                let Some(lease) = pool.try_exclusive_lease(operation)? else {
+                    continue;
+                };
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                let current = sqlx::query("SELECT state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1 AND kind='update-boot-assets'")
+                    .bind(operation.to_string()).fetch_optional(&mut *tx).await?;
+                let Some(current) = current else {
+                    tx.commit().await?;
+                    continue;
+                };
+                validate_lease_identity(&current, &lease)?;
+                if current.try_get::<String, _>("state")? != state
+                    || current.try_get::<String, _>("record_json")? != json
+                {
+                    tx.commit().await?;
+                    continue;
+                }
+                if let Some(candidate) = candidate {
+                    let actual: Option<String> = sqlx::query_scalar(
+                        "SELECT CAST(record_json AS TEXT) FROM machine_storage WHERE machine_id=?1",
+                    )
+                    .bind(candidate.machine_id.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if actual != observed {
+                        tx.commit().await?;
+                        continue;
+                    }
+                }
+                sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+                    .bind(operation.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn preserve_stopped_candidate(&self, id: Uuid, json: &str) -> Result<(), LibVmError> {
-        let snapshot = commit_candidate(json)?.candidate_snapshot_id.is_some();
+        let candidate = commit_candidate(json)?;
+        let snapshot = candidate.candidate_snapshot_id.is_some();
+        let image = candidate.candidate_image_id.is_some();
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
-        let result = sqlx::query("UPDATE storage_operation SET state='committing',record_json=jsonb(?2) WHERE operation_id=?1 AND ((?3 AND kind='snapshot') OR (NOT ?3 AND kind IN ('fork','import'))) AND state='staging'")
-            .bind(id.to_string()).bind(json).bind(snapshot).execute(&self.pool).await?;
+        let result = sqlx::query("UPDATE storage_operation SET state='committing',record_json=jsonb(?2) WHERE operation_id=?1 AND ((?3 AND kind='snapshot') OR (?4 AND kind IN ('import','convert')) OR (NOT ?3 AND NOT ?4 AND kind IN ('fork','import'))) AND state='staging'")
+            .bind(id.to_string()).bind(json).bind(snapshot).bind(image).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(invalid("stopped operation is not staging"));
         }
@@ -823,7 +991,7 @@ impl Store {
     pub(crate) async fn finish_stopped_operation(&self, id: Uuid) -> Result<(), LibVmError> {
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
-        let result = sqlx::query("UPDATE storage_operation SET state='committed',record_json=jsonb('{}') WHERE operation_id=?1 AND kind IN ('snapshot','fork','import') AND state IN ('staging','committing','committed')")
+        let result = sqlx::query("UPDATE storage_operation SET state='committed',record_json=jsonb('{}') WHERE operation_id=?1 AND kind IN ('snapshot','fork','import','update-boot-assets') AND state IN ('staging','committing','committed')")
             .bind(id.to_string()).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(invalid("stopped operation is not active"));
@@ -858,7 +1026,7 @@ impl Store {
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','capture','fork','import') AND state='staging')")
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','capture','fork','import','update-boot-assets') AND state='staging')")
             .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
         if !active {
             return Err(invalid(
@@ -883,6 +1051,7 @@ impl Store {
         pool: &StoragePool,
     ) -> Result<crate::store::models::CacheRecoveryReport, LibVmError> {
         self.check_operation_recovery(pool).await?;
+        self.retire_boot_update_operations(pool).await?;
         let mut report = crate::store::models::CacheRecoveryReport::default();
         let mut cursor = String::new();
         loop {
@@ -908,7 +1077,7 @@ impl Store {
                     validate_lease_identity(&row, &_lease)?;
                     let kind: String = row.try_get("kind")?;
                     let state: String = row.try_get("state")?;
-                    if kind == "live-fork" {
+                    if matches!(kind.as_str(), "live-fork" | "update-boot-assets") {
                         // Retire parents after all producers in this sweep.
                         // Otherwise UUID ordering would require a second prune.
                         tx.commit().await?;
@@ -1092,9 +1261,9 @@ impl Store {
                                 removed_machine = Some((machine, cleanup));
                             }
                         }
-                        // Snapshot candidates contain only immutable pool output.
-                        // Presence and absence both reconcile safely; there is no
-                        // private destination requiring uncommitted cleanup.
+                        // Image/snapshot candidates contain only immutable pool
+                        // output. Presence and absence both reconcile safely;
+                        // neither grants private destination cleanup authority.
                     }
                     if let Some((machine, cleanup)) = removed_machine {
                         let candidate_json: String = row.try_get("record_json")?;
@@ -1218,6 +1387,7 @@ impl Store {
         let json = encode(&record)?;
         let generation = i64::try_from(record.storage_generation)
             .map_err(|_| invalid("storage generation exceeds SQL range"))?;
+        let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(storage)?;
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
         let lease = pool.lease(record.operation_id)?;
@@ -1262,7 +1432,6 @@ impl Store {
         }
         sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,machine_id,run_id,storage_generation,file_device,file_inode,record_json) VALUES(?1,1,'launch','prepared',?2,?3,?4,?5,?6,jsonb(?7))")
             .bind(record.operation_id.to_string()).bind(machine_id.to_string()).bind(run_id.to_string()).bind(generation).bind(device.to_string()).bind(inode.to_string()).bind(json).execute(&mut *tx).await?;
-        let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(storage);
         for stream in streams {
             insert_stream(&mut tx, record.operation_id, &stream).await?;
             // Reuse semantic layer dependencies. No parsing of generated VMDK paths.
@@ -1546,7 +1715,19 @@ impl Store {
                             return Err(invalid("nonterminal capture has cleanup authority"));
                         }
                     }
+                    "update-boot-assets" if state == "committing" => {
+                        let candidate =
+                            boot_update_candidate(&row.try_get::<String, _>("record_json")?)?;
+                        if row.try_get::<String, _>("machine_id")?
+                            != candidate.machine_id.to_string()
+                            || row.try_get::<i64, _>("storage_generation")?
+                                != i64::try_from(candidate.generation).map_err(invalid)?
+                        {
+                            return Err(invalid("boot update candidate contradicts indexed owner"));
+                        }
+                    }
                     "live-fork" | "convert" | "snapshot" | "fork" | "import"
+                    | "update-boot-assets"
                         if matches!(state.as_str(), "staging" | "committed") =>
                     {
                         let json: String = row.try_get("record_json")?;
@@ -1554,7 +1735,7 @@ impl Store {
                             return Err(invalid("malformed staging operation"));
                         }
                     }
-                    "snapshot" | "fork" | "import"
+                    "convert" | "snapshot" | "fork" | "import"
                         if matches!(state.as_str(), "committing" | "cleaning") =>
                     {
                         let candidate =
@@ -1563,6 +1744,12 @@ impl Store {
                             return Err(invalid(
                                 "operation kind contradicts its snapshot candidate",
                             ));
+                        }
+                        if candidate.candidate_image_id.is_some()
+                            && !matches!(kind.as_str(), "import" | "convert")
+                            || kind == "convert" && candidate.candidate_image_id.is_none()
+                        {
+                            return Err(invalid("operation kind contradicts its image candidate"));
                         }
                         if state == "cleaning" && candidate.candidate_machine_id.is_none() {
                             return Err(invalid("only a machine candidate can enter cleanup"));
@@ -1604,6 +1791,92 @@ mod tests {
         MachineCleanup,
     };
     use crate::store::Store;
+
+    #[test]
+    fn image_candidates_are_exactly_one_typed_result_without_directory_authority() {
+        let image = crate::storage::identity::ImageId::from_sha256([1; 32]);
+        let snapshot = crate::storage::identity::SnapshotId::from_sha256([1; 32]);
+        let valid = serde_json::json!({"candidateImageId": image}).to_string();
+        let candidate = crate::store::operation_store::commit_candidate(&valid).unwrap();
+        assert_eq!(candidate.candidate_image_id, Some(image));
+        assert!(candidate.candidate_machine_id.is_none());
+        for value in [
+            serde_json::json!({"candidateImageId": image, "candidateSnapshotId": snapshot}),
+            serde_json::json!({"candidateImageId": image, "directory": {"device": "1", "inode": "2"}}),
+            serde_json::json!({}),
+        ] {
+            assert!(crate::store::operation_store::commit_candidate(&value.to_string()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_boot_update_never_grants_machine_directory_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temp.path().join("home")))
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("update-boot-assets", &[], &[])
+            .await
+            .unwrap();
+        pool.create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        let object = crate::storage::identity::ObjectDigest::of_bytes(b"kernel");
+        let binding = crate::BootBinding::Pinned {
+            kernel: object,
+            base_initramfs: object,
+            agent: None,
+            architecture: crate::GuestArchitecture::Amd64,
+            abi: crate::runtime::boot_assets::DIRECT_BOOT_ABI.into(),
+        };
+        let input = crate::store::snapshot_store::RecordInput::new(
+            &store.images_dir,
+            operation,
+            &binding.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let (bundle, roots) = pool.publish_object_for_catalog(&input.path()).unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[bundle.digest])
+            .await
+            .unwrap();
+        drop(roots);
+        let machine = crate::store::models::MachineId::from(uuid::Uuid::new_v4());
+        let directory = crate::paths::machine_data_dir_in(&store.home, machine);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("root.raw"),
+            b"unrelated existing machine data",
+        )
+        .unwrap();
+        store
+            .preserve_boot_update_operation(operation, machine, 1, bundle.digest)
+            .await
+            .unwrap();
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        drop(lease);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1)",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(!retained);
+        assert_eq!(
+            std::fs::read(directory.join("root.raw")).unwrap(),
+            b"unrelated existing machine data"
+        );
+    }
 
     #[tokio::test]
     async fn stopped_retirement_rejects_exclusive_replacement_ofd_after_pathname_aba() {
