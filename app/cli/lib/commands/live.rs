@@ -712,8 +712,8 @@ fn root_arg(value: &str) -> Result<libvm::ImportRootSelection, String> {
     silo_vm_control::boot::parse_import_root(value).map_err(|error| error.to_string())
 }
 
-#[derive(Debug, Args)]
-struct ExternalResources {
+#[derive(Debug, Args, Default)]
+pub(crate) struct ExternalResources {
     /// Omit external files from capture and retain explicit required destination mappings.
     #[arg(long, conflicts_with_all = ["map_disk", "map_share"])]
     external_requirements: bool,
@@ -725,7 +725,7 @@ struct ExternalResources {
     map_share: Vec<libvm::ExternalResourceMapping>,
 }
 impl ExternalResources {
-    fn policy(self) -> eyre::Result<libvm::ExternalResourcePolicy> {
+    pub(crate) fn policy(self) -> eyre::Result<libvm::ExternalResourcePolicy> {
         if self.external_requirements {
             return Ok(libvm::ExternalResourcePolicy::RequireMappings);
         }

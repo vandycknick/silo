@@ -4,6 +4,7 @@ mod boot_qualification;
 mod constants;
 mod error;
 mod guest_agent;
+pub mod handoff;
 pub mod host;
 pub mod host_input;
 mod image;
@@ -59,11 +60,11 @@ pub use crate::store::live_store::MachineLifecycle;
 pub use crate::store::models::image::{ImageRecord, ImageRecordKind};
 pub use crate::store::models::storage::{
     BackendRequirement, BootBinding, BootFileRole, BootProfile, DirectCommandLinePolicy,
-    DiskOwnership, DiskStorage, EfiFirmware, Ext4Profile, ExternalResource, FenceRecord,
-    FenceState, GuestArchitecture, IncludedDisk, LinuxPlatform, MachineRoot, MachineStorageRecord,
-    OverlayLower, OverlayProfile, PartitionTable, PrivatePath, RawLayout, RootFilesystem,
-    RootSelector, StorageOperationKind, StorageOperationRecord, StorageOperationState,
-    StorageProfile, StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
+    DiskOwnership, DiskStorage, EfiFirmware, Ext4Profile, ExternalResource, GuestArchitecture,
+    IncludedDisk, LinuxPlatform, MachineOwnership, MachineRoot, MachineStorageRecord, OverlayLower,
+    OverlayProfile, PartitionTable, PrivatePath, RawLayout, RootFilesystem, RootSelector,
+    StorageOperationKind, StorageOperationRecord, StorageOperationState, StorageProfile,
+    StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
 };
 pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{

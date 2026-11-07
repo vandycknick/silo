@@ -1,9 +1,71 @@
 CREATE TABLE db_config (
     id                  INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
     os                  TEXT NOT NULL,
+    runtime_id          TEXT NOT NULL UNIQUE,
     created_at          INTEGER NOT NULL,
     modified_at         INTEGER NOT NULL
 );
+CREATE TRIGGER runtime_identity_immutable
+BEFORE UPDATE OF runtime_id ON db_config
+BEGIN SELECT RAISE(ABORT, 'runtime identity is immutable'); END;
+
+-- Replay guards deliberately have no foreign keys to disposable machine or
+-- storage-operation rows. Terminal decisions survive both kinds of cleanup.
+CREATE TABLE handoff_operation (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    schema INTEGER NOT NULL CHECK(schema=1),
+    role TEXT NOT NULL CHECK(role IN ('source','destination')),
+    mode TEXT NOT NULL CHECK(mode IN ('fork','relocate')),
+    source_runtime TEXT NOT NULL,
+    destination_runtime TEXT NOT NULL CHECK(destination_runtime != source_runtime),
+    from_epoch INTEGER NOT NULL CHECK(from_epoch BETWEEN 0 AND 9007199254740991),
+    next_epoch INTEGER NOT NULL CHECK(next_epoch BETWEEN 0 AND 9007199254740991),
+    source_machine TEXT NOT NULL,
+    destination_machine TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('intended','reserved','captured','fenced','receiving','prepared','committed','aborted')),
+    terminal INTEGER NOT NULL CHECK(terminal IN (0,1)),
+    record_json BLOB NOT NULL,
+    CHECK(json_valid(record_json,8)),
+    CHECK(json_extract(record_json,'$.schema') IS schema),
+    CHECK(json_extract(record_json,'$.role') IS role),
+    CHECK(json_extract(record_json,'$.phase') IS phase),
+    CHECK(json_extract(record_json,'$.intent.mode') IS mode),
+    CHECK(json_extract(record_json,'$.intent.operation') IS operation_id),
+    CHECK(json_extract(record_json,'$.intent.sourceRuntime') IS source_runtime),
+    CHECK(json_extract(record_json,'$.intent.destinationRuntime') IS destination_runtime),
+    CHECK(json_extract(record_json,'$.intent.sourceMachine') IS source_machine),
+    CHECK(json_extract(record_json,'$.intent.destinationMachine') IS destination_machine),
+    CHECK(json_extract(record_json,'$.intent.fromEpoch') IS from_epoch),
+    CHECK((mode='relocate' AND destination_machine=source_machine AND next_epoch=from_epoch+1) OR
+          (mode='fork' AND destination_machine!=source_machine AND next_epoch=0)),
+    CHECK(terminal = (phase IN ('committed','aborted'))),
+    CHECK((role='source' AND phase IN ('intended','reserved','captured','fenced','committed','aborted')) OR
+          (role='destination' AND phase IN ('receiving','prepared','committed','aborted')))
+);
+CREATE UNIQUE INDEX handoff_outgoing_active ON handoff_operation(source_machine)
+WHERE role='source' AND terminal=0;
+CREATE UNIQUE INDEX handoff_incoming_active ON handoff_operation(destination_machine)
+WHERE role='destination' AND terminal=0;
+CREATE TRIGGER handoff_terminal_immutable BEFORE UPDATE ON handoff_operation
+WHEN OLD.terminal=1
+BEGIN SELECT RAISE(ABORT, 'terminal handoff decision is immutable'); END;
+CREATE TRIGGER handoff_ledger_retained BEFORE DELETE ON handoff_operation
+BEGIN SELECT RAISE(ABORT, 'handoff replay guards cannot be deleted'); END;
+CREATE TRIGGER handoff_binding_immutable BEFORE UPDATE ON handoff_operation
+WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.schema IS NOT OLD.schema OR
+     NEW.role IS NOT OLD.role OR NEW.mode IS NOT OLD.mode OR
+     NEW.source_machine IS NOT OLD.source_machine OR NEW.destination_machine IS NOT OLD.destination_machine OR
+     NEW.source_runtime IS NOT OLD.source_runtime OR NEW.destination_runtime IS NOT OLD.destination_runtime OR
+     NEW.from_epoch IS NOT OLD.from_epoch OR NEW.next_epoch IS NOT OLD.next_epoch OR
+     json_extract(NEW.record_json,'$.intent') IS NOT json_extract(OLD.record_json,'$.intent') OR
+     (json_type(OLD.record_json,'$.binding') != 'null' AND
+      json_extract(NEW.record_json,'$.binding') IS NOT json_extract(OLD.record_json,'$.binding')) OR
+     (json_type(OLD.record_json,'$.prepared') != 'null' AND
+      json_extract(NEW.record_json,'$.prepared') IS NOT json_extract(OLD.record_json,'$.prepared')) OR
+     (json_type(OLD.record_json,'$.authorization') != 'null' AND
+      json_extract(NEW.record_json,'$.authorization') IS NOT json_extract(OLD.record_json,'$.authorization'))
+BEGIN SELECT RAISE(ABORT, 'handoff binding is immutable'); END;
+
 
 -- Current machine_config JSON has no machineDir field. Private machine paths
 -- are derived from this catalog's current home and its indexed machine ID.
@@ -290,6 +352,9 @@ CREATE TABLE storage_operation (
     CHECK (kind != 'launch' OR (machine_id IS NOT NULL AND run_id IS NOT NULL AND storage_generation IS NOT NULL AND storage_generation >= 0))
 );
 CREATE INDEX storage_operation_machine_idx ON storage_operation(machine_id);
+CREATE TRIGGER handoff_payload_roots_retained BEFORE DELETE ON storage_operation
+WHEN EXISTS(SELECT 1 FROM handoff_operation h WHERE h.operation_id=OLD.operation_id AND h.terminal=0)
+BEGIN SELECT RAISE(ABORT, 'unresolved handoff payload roots cannot be deleted'); END;
 CREATE TABLE restore_memory_reservation (
     operation_id TEXT PRIMARY KEY NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
     budget_id TEXT UNIQUE NOT NULL,

@@ -80,6 +80,25 @@ not a hardcoded ABI version.
 uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow
 ```
 
+### Stopped handoff between runtimes
+
+`test_handoff.py` drives two real daemons with independent Homes, runtime IDs,
+config directories and run roots. It covers raw relocation and growth, a
+deliberately stopped running-source fork, stale-plan refusal without catalog
+mutation, destination crash/recovery, and repeated flat-overlay return cycles.
+Read-only catalog queries, private-file hashes and guest markers verify the
+result independently of the coordinator's reports. The old owner must refuse
+start, and terminal recovery must work after payload cleanup.
+
+```sh
+uv run --project smoke pytest smoke/tests/test_handoff.py
+```
+
+All five Linux cases passed against the staged runtime in 207.63 s
+(`.tmp/plan/evidence/phase-19/handoff-smoke-freshness.xml`). This qualifies the
+two-local-runtime stopped protocol, not remote transport or live execution
+relocation. The cases are included in the default non-slow suite.
+
 
 ### Guest lifecycle controller (Phase 12)
 

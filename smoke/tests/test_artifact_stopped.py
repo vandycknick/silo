@@ -43,18 +43,27 @@ def artifact_registry(config: SmokeConfig, request: pytest.FixtureRequest) -> It
         registry.close(retain=config.keep or request.session.testsfailed > failures)
 
 
+@pytest.fixture(scope="session")
+def artifact_runtime(config: SmokeConfig, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Share only read-only runtime bytes, never producer or consumer state."""
+    runtime = tmp_path_factory.mktemp("artifact-runtime") / "runtime"
+    overlay.copy_runtime(config.runtime_dir, runtime)
+    # Successful boots must use the pinned closure received from the registry,
+    # not these deliberately unusable packaged assets.
+    cloud_disk.break_assets(runtime / "assets")
+    for path in runtime.rglob("*"):
+        path.chmod(path.stat().st_mode & ~0o222)
+    runtime.chmod(runtime.stat().st_mode & ~0o222)
+    return runtime
+
+
 @pytest.fixture
 def artifact_destination(config: SmokeConfig, artifact_registry: DistributionRegistry,
-                         request: pytest.FixtureRequest) -> Iterator[Silo]:
-    workspace = Workspace(config, artifact_registry.ca_path)
+                         artifact_runtime: Path, request: pytest.FixtureRequest) -> Iterator[Silo]:
+    workspace = Workspace(replace(config, runtime_dir=artifact_runtime), artifact_registry.ca_path)
     failures = request.session.testsfailed
     try:
-        # Make packaged assets unusable, not merely different: successful boots
-        # must use the complete pinned boot closure received from the registry.
-        runtime = workspace.root / "private-runtime"
-        overlay.copy_runtime(config.runtime_dir, runtime)
-        cloud_disk.break_assets(runtime / "assets")
-        workspace.config = replace(config, runtime_dir=runtime)
+        workspace.record("artifact-runtime", f"read-only broken-assets fixture: {artifact_runtime}\n")
         consumer = Silo(workspace)
         consumer.run("image", "list")
         assert consumer.ls() == []

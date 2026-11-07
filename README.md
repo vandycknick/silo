@@ -56,8 +56,8 @@ reported unusable short-group tail reduce usable capacity. A small growth can
 increase backing length without adding usable space. Resize requires a stopped
 machine; the next boot replays and grows the upper in the guest.
 The profile requires an exactly qualified kernel/init tuple on libkrun and is
-never silently substituted for raw. It is not a reusable published image or a
-stopped-snapshot source. Live execution checkpoints remain separately gated.
+never silently substituted for raw. Stopped snapshots and VM artifacts preserve
+the profile and exact boot closure. Live execution checkpoints remain separately gated.
 The profile will be removed rather than migrated when EROFS replaces it.
 
 `/tmp` remains persistent and disk-backed by default. With the overlay profile,
@@ -76,6 +76,48 @@ tmpfs_size: 64mib
 ```
 
 See [ADR 0014](docs/adr/0014-layered-oci-image-storage.md) for the storage model.
+
+## Stopped handoff
+
+`silo handoff` coordinates two already-running, same-user daemons selected by
+their Home, config and run-root paths. The CLI currently connects through local
+Unix sockets; it does not provision a cloud host or establish remote transport.
+It transfers verified missing objects and chunks rather than uploading a lower
+already present on the destination.
+
+Review the plan before approving its exact digest. Use one stable operation UUID
+for the entire transfer and any recovery:
+
+```sh
+operation="$(uuidgen)"
+destination=(--destination-home /srv/silo/cloud/state
+             --destination-config /srv/silo/cloud/config/silo
+             --destination-run-root /run/user/1000/silo-cloud)
+silo handoff plan dev --mode relocate --operation "$operation" "${destination[@]}"
+# Set approved_digest to the digest of the reviewed plan.
+silo handoff transfer dev --mode relocate --operation "$operation" \
+  --approve-plan "${approved_digest:?set the reviewed plan digest}" "${destination[@]}"
+silo handoff status "$operation" "${destination[@]}"
+```
+
+The source uses the ordinary `SILO_HOME`, `XDG_CONFIG_HOME` and `SILO_RUN_ROOT`
+selection; `--destination-config` names the destination's Silo config directory
+(`$XDG_CONFIG_HOME/silo`), not its parent. `relocate` preserves the machine ID,
+advances its ownership epoch and
+fences the prior owner. `--mode fork --name child` gives the destination a fresh
+machine ID. Both modes require a stopped cut; `--stop-running` explicitly permits
+stopping the source. Neither mode starts a guest or generalizes guest identities.
+Changed stopped bytes or a replacement source run require a new approved plan.
+
+The default preserves the exact boot bundle. `--boot-bundle sha256:…` approves
+one complete destination bundle, including any required architecture/translation
+change, rather than choosing new assets silently. External resources require
+explicit destination mappings.
+
+After interruption, use `silo handoff recover "$operation" "${destination[@]}"`.
+`handoff abort` obtains a durable destination decision before releasing the
+source reservation. An unknown or unreachable destination is not an abort.
+Terminal receipts survive payload cleanup and daemon restarts.
 
 ## Development tests
 

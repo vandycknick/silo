@@ -255,6 +255,7 @@ impl MachineStore for Store {
     async fn save_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
         let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_machine_owned(&mut tx, config.id).await?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
         let result = sqlx::query(
             "UPDATE machine_config
@@ -385,7 +386,8 @@ impl MachineStore for Store {
     }
 
     async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_machine_owned(&mut tx, machine.id).await?;
         sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")
             .bind(machine.id.to_string())
             .execute(&mut *tx)
@@ -541,6 +543,8 @@ impl Store {
             .map(|pool| pool.lock_roots_shared())
             .transpose()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_machine_owned(&mut tx, config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
         let result =
             sqlx::query("UPDATE machine_config SET name=?1, config_json=jsonb(?2) WHERE id=?3")
@@ -556,6 +560,22 @@ impl Store {
         }
         Self::write_machine_storage(&mut tx, config.id, storage).await?;
         tx.commit().await?;
+        Ok(())
+    }
+    pub(crate) async fn ensure_machine_owned(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        machine_id: MachineId,
+    ) -> Result<(), LibVmError> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT json(record_json) FROM machine_storage WHERE machine_id=?1")
+                .bind(machine_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some(json) = json {
+            crate::MachineStorageRecord::decode(&json)?
+                .ownership
+                .ensure_owned(machine_id)?;
+        }
         Ok(())
     }
     pub(crate) async fn write_machine_storage(

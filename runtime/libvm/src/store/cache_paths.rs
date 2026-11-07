@@ -15,6 +15,11 @@ pub(crate) fn storage_pool_dependencies(
 > {
     let mut streams = std::collections::BTreeSet::new();
     let mut objects = std::collections::BTreeSet::new();
+    // A prior-owner record is a replay/collision guard, not a bulk retention
+    // request. Unresolved reservations/fences still retain the complete closure.
+    if matches!(storage.ownership, crate::MachineOwnership::Relocated { .. }) {
+        return Ok((streams, objects));
+    }
     if let crate::MachineRoot::LinuxOverlay {
         lower: crate::OverlayLower::FlatExt4 { stream, .. },
         ..

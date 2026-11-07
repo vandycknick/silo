@@ -6,6 +6,7 @@ pub mod capture;
 pub mod create;
 pub mod errors;
 pub mod fork;
+pub mod handoff;
 pub mod images;
 pub mod lifecycle;
 pub mod live;

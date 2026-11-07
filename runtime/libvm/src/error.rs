@@ -5,6 +5,8 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
+    #[error(transparent)]
+    Handoff(#[from] crate::handoff::types::HandoffError),
     #[error("{operation} unsupported: {reason} (backend={backend}, lane={lane})")]
     LiveOperationUnsupported {
         operation: vm_spec::live::LiveOperation,
@@ -342,6 +344,7 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::Handoff(_) => "Handoff",
             Self::LiveOperationUnsupported { .. } => "LiveOperationUnsupported",
             Self::LiveDiscovery { .. } => "LiveDiscovery",
             Self::LiveProtocol { .. } => "LiveProtocol",

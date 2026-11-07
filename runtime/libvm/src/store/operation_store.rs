@@ -1049,7 +1049,7 @@ impl Store {
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','capture','fork','import','update-boot-assets') AND state='staging')")
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','capture','fork','import','relocate','update-boot-assets') AND state='staging')")
             .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
         if !active {
             return Err(invalid(
@@ -1095,6 +1095,14 @@ impl Store {
                     continue;
                 };
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                // A vanished producer lease says nothing about the peer's
+                // decision. Preserve every payload root until durable resolution.
+                let unresolved: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM handoff_operation WHERE operation_id=?1 AND terminal=0)")
+                    .bind(&cursor).fetch_one(&mut *tx).await?;
+                if unresolved {
+                    tx.commit().await?;
+                    continue;
+                }
                 let row = sqlx::query("SELECT kind,state,json(record_json) AS record_json,file_device,file_inode FROM storage_operation WHERE operation_id=?1").bind(&cursor).fetch_optional(&mut *tx).await?;
                 if let Some(row) = row {
                     validate_lease_identity(&row, &_lease)?;
@@ -1377,6 +1385,7 @@ impl Store {
         restore: Option<&crate::store::restore::RestoreIntent>,
     ) -> Result<LaunchStorageLease, LibVmError> {
         storage.validate_for_machine(machine_id.into())?;
+        storage.ownership.ensure_owned(machine_id)?;
         preflight_launch_storage(storage, spec, &self.images_dir)?;
         let machine_directory = crate::paths::machine_data_dir_in(&self.home, machine_id);
         if !machine_directory.is_absolute() {
@@ -1749,7 +1758,7 @@ impl Store {
                             return Err(invalid("boot update candidate contradicts indexed owner"));
                         }
                     }
-                    "live-fork" | "convert" | "snapshot" | "fork" | "import"
+                    "live-fork" | "convert" | "snapshot" | "fork" | "import" | "relocate"
                     | "update-boot-assets"
                         if matches!(state.as_str(), "staging" | "committed") =>
                     {

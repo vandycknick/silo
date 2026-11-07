@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod default;
 pub mod exec;
 pub mod forward;
+pub mod handoff;
 pub mod info;
 pub mod list;
 pub mod live;
@@ -54,6 +55,7 @@ pub enum Command {
     Fork(live::Fork),
     Restore(live::Restore),
     Image(live::Image),
+    Handoff(handoff::Cmd),
     Logs(logs::Cmd),
     Network(network::Cmd),
     Template(template::Cmd),
@@ -97,6 +99,7 @@ impl Command {
             Self::Fork(command) => command.run(context).await,
             Self::Restore(command) => command.run(context).await,
             Self::Image(command) => command.run(context).await,
+            Self::Handoff(command) => command.run(context).await,
             Self::Logs(command) => command.run(context).await,
             Self::Network(command) => command.run(context).await,
             Self::Template(command) => command.run(context).await,

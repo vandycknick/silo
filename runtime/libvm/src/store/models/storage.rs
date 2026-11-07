@@ -525,8 +525,7 @@ pub struct MachineStorageRecord {
     pub storage_generation: u64,
     pub ownership_epoch: u64,
     pub stop_outcome: StorageStopOutcome,
-    pub relocation_operation: Option<uuid::Uuid>,
-    pub fence: Option<FenceRecord>,
+    pub ownership: MachineOwnership,
     pub operation: Option<StorageOperationRecord>,
     pub image: Option<ImageId>,
     pub snapshot: Option<SnapshotId>,
@@ -560,8 +559,7 @@ impl MachineStorageRecord {
             storage_generation: 0,
             ownership_epoch: 0,
             stop_outcome: StorageStopOutcome::Unknown,
-            relocation_operation: None,
-            fence: None,
+            ownership: MachineOwnership::Owned,
             operation: None,
             image: None,
             snapshot: None,
@@ -683,36 +681,7 @@ impl MachineStorageRecord {
                 ));
             }
         }
-        if let Some(id) = self.relocation_operation {
-            if !self.operation.as_ref().is_some_and(|operation| {
-                operation.id == id && operation.kind == StorageOperationKind::Relocate
-            }) {
-                return Err(invalid("relocation operation has no matching typed record"));
-            }
-        }
-        if let Some(fence) = &self.fence {
-            let operation = self
-                .operation
-                .as_ref()
-                .ok_or_else(|| invalid("fence has no matching operation record"))?;
-            if self.relocation_operation != Some(fence.operation)
-                || self.ownership_epoch != fence.ownership_epoch
-                || operation.id != fence.operation
-                || operation.kind != StorageOperationKind::Relocate
-                || !matches!(
-                    (fence.state, operation.state),
-                    (
-                        FenceState::Prepared,
-                        StorageOperationState::Prepared | StorageOperationState::Staging
-                    ) | (FenceState::Committed, StorageOperationState::Committed)
-                        | (FenceState::Released, StorageOperationState::Aborted)
-                )
-            {
-                return Err(invalid(
-                    "fence does not match relocation operation and ownership epoch",
-                ));
-            }
-        }
+        self.ownership.validate(self.ownership_epoch)?;
         Ok(())
     }
 
@@ -810,19 +779,71 @@ pub struct StorageOperationRecord {
     pub machine_id: Option<uuid::Uuid>,
     pub ownership_epoch: u64,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum FenceState {
-    Prepared,
-    Committed,
-    Released,
-}
+/// Current local start authority, separate from generic storage operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FenceRecord {
-    pub operation: uuid::Uuid,
-    pub ownership_epoch: u64,
-    pub state: FenceState,
+#[serde(
+    tag = "state",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum MachineOwnership {
+    Owned,
+    Reserved {
+        operation: crate::handoff::types::OperationId,
+    },
+    Fenced {
+        operation: crate::handoff::types::OperationId,
+        destination_runtime: crate::handoff::types::RuntimeId,
+        next_epoch: crate::handoff::types::OwnershipEpoch,
+    },
+    Relocated {
+        operation: crate::handoff::types::OperationId,
+        successor_runtime: crate::handoff::types::RuntimeId,
+        successor_epoch: crate::handoff::types::OwnershipEpoch,
+    },
+}
+impl MachineOwnership {
+    pub fn is_owned(&self) -> bool {
+        matches!(self, Self::Owned)
+    }
+    pub(crate) fn validate(&self, epoch: u64) -> Result<(), LibVmError> {
+        let epoch = crate::handoff::types::OwnershipEpoch::new(epoch)?;
+        let successor = match self {
+            Self::Fenced { next_epoch, .. } => Some(*next_epoch),
+            Self::Relocated {
+                successor_epoch, ..
+            } => Some(*successor_epoch),
+            _ => None,
+        };
+        if successor.is_some_and(|next| epoch.next().ok() != Some(next)) {
+            return Err(invalid(
+                "ownership successor must be exactly the next epoch",
+            ));
+        }
+        Ok(())
+    }
+    pub fn ensure_owned(&self, machine: crate::MachineId) -> Result<(), LibVmError> {
+        use crate::handoff::types::HandoffError;
+        match self {
+            Self::Owned => Ok(()),
+            Self::Reserved { operation } => Err(HandoffError::OwnershipReserved {
+                machine,
+                operation: *operation,
+            }
+            .into()),
+            Self::Fenced { operation, .. } => Err(HandoffError::OwnershipFenced {
+                machine,
+                operation: *operation,
+            }
+            .into()),
+            Self::Relocated { operation, .. } => Err(HandoffError::MachineRelocated {
+                machine,
+                operation: *operation,
+            }
+            .into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1000,11 +1021,9 @@ mod tests {
     }
 
     #[test]
-    fn embedded_operations_and_fences_validate_identity_epoch_and_closed_states() {
-        use crate::{
-            FenceRecord, FenceState, StorageOperationKind, StorageOperationRecord,
-            StorageOperationState,
-        };
+    fn embedded_operations_and_ownership_validate_identity_epoch_and_closed_states() {
+        use crate::handoff::types::{OperationId, OwnershipEpoch, RuntimeId};
+        use crate::{StorageOperationKind, StorageOperationRecord, StorageOperationState};
         let mut record = MachineStorageRecord::opaque_raw(
             PrivatePath::new("root.raw").unwrap(),
             512,
@@ -1021,12 +1040,11 @@ mod tests {
             machine_id: Some(machine),
             ownership_epoch: 0,
         });
-        record.relocation_operation = Some(operation);
-        record.fence = Some(FenceRecord {
-            operation,
-            ownership_epoch: 0,
-            state: FenceState::Prepared,
-        });
+        record.ownership = crate::MachineOwnership::Fenced {
+            operation: OperationId::new(operation).unwrap(),
+            destination_runtime: RuntimeId::new(uuid::Uuid::new_v4()).unwrap(),
+            next_epoch: OwnershipEpoch::new(1).unwrap(),
+        };
         record.validate_for_machine(machine).unwrap();
         assert!(record.validate_for_machine(uuid::Uuid::new_v4()).is_err());
         let value = serde_json::to_value(&record).unwrap();
@@ -1034,7 +1052,7 @@ mod tests {
             MachineStorageRecord::decode(&value.to_string()).unwrap(),
             record
         );
-        for pointer in ["/operation/kind", "/operation/state", "/fence/state"] {
+        for pointer in ["/operation/kind", "/operation/state", "/ownership/state"] {
             let mut changed = value.clone();
             *changed.pointer_mut(pointer).unwrap() = serde_json::json!("unsupported");
             assert!(matches!(
@@ -1045,7 +1063,11 @@ mod tests {
         record.ownership_epoch = 1;
         assert!(record.validate().is_err());
         record.ownership_epoch = 0;
-        record.fence.as_mut().unwrap().operation = uuid::Uuid::new_v4();
+        record.ownership = crate::MachineOwnership::Fenced {
+            operation: OperationId::new(operation).unwrap(),
+            destination_runtime: RuntimeId::new(uuid::Uuid::new_v4()).unwrap(),
+            next_epoch: OwnershipEpoch::new(2).unwrap(),
+        };
         assert!(record.validate().is_err());
     }
 

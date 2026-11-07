@@ -128,10 +128,13 @@ impl Machine {
                     &run_id,
                     &options.egress_credentials,
                 )?;
-                let resize = if prepared_root.descriptor.is_some() {
-                    RootDiskResizeOutcome::OfflineComplete
-                } else {
-                    reconcile_root_disk_size(&config)?
+                let resize = match &storage_lease.storage_record().root {
+                    crate::MachineRoot::OpaqueRaw { path, .. } => {
+                        reconcile_root_disk_size(&config, path.as_path())?
+                    }
+                    crate::MachineRoot::LinuxOverlay { .. } => {
+                        RootDiskResizeOutcome::OfflineComplete
+                    }
                 };
                 Ok((resize, secrets))
             })() {
@@ -720,6 +723,7 @@ impl Machine {
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
         let storage = runtime.machine_storage_record(config.id).await?;
+        storage.ownership.ensure_owned(config.id)?;
         runtime
             .preflight_stopped_generation_locked(&config, &storage)
             .await?;
