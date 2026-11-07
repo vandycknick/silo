@@ -23,9 +23,18 @@ mod supervisor;
 mod utils;
 
 pub use crate::boot_qualification::{
-    OverlayBootQualificationError, QualifiedOverlayBoot, UnqualifiedOverlayBootIdentity,
+    DirectKernelRejected, DirectKernelRejection, OverlayBootQualificationError,
+    QualifiedOverlayBoot, UnqualifiedOverlayBootIdentity,
 };
 pub use crate::error::LibVmError;
+pub use crate::image::ext4_admission::Ext4Rejection;
+pub use crate::image::import::{AdmittedDiskImport, DiskImportError, ForeignContainer};
+pub use crate::image::import_types::{
+    BootAssetSelection, BootAssetsUpdate, DiskImportBoot, DiskImportFacts, DiskImportRequest,
+    ImageContainerKind, ImageProvenance, ImportRootSelection, ManagedImageInfo, ManagedSourceId,
+    ManagedSourceInfo, ManagedSourceRef, RawConversionKey, RawConversionOptions, RootCandidate,
+    RootSelectionFailed,
+};
 pub use crate::machine::live_fork::{
     ForkCaptureOutcome, ForkChildOutcome, ForkChildResult, ForkDestination, ForkFailurePhase,
     ForkSourceOutcome, ForkStage, LiveForkChild, LiveForkOptions, LiveForkResult,
@@ -41,17 +50,20 @@ pub use crate::machine::{
     require_live_operation, LiveCaptureSource, LiveCaptureSummary, LiveObservationReader,
     LiveSnapshot, LiveSnapshotOptions, MachineCapture, MachineCaptureStage, MachineLiveObservation,
 };
+pub use crate::runtime::boot_assets::{AdmissionRemedy, SourceFamily};
 pub use crate::runtime::{
     require_host_live_operation, LiveCapabilityQuery, ResolvedBackendSelection,
 };
+pub use crate::storage::identity::{ImageId, ObjectDigest, SnapshotId};
 pub use crate::store::live_store::MachineLifecycle;
+pub use crate::store::models::image::{ImageRecord, ImageRecordKind};
 pub use crate::store::models::storage::{
     BackendRequirement, BootBinding, BootFileRole, BootProfile, DirectCommandLinePolicy,
     DiskOwnership, DiskStorage, EfiFirmware, Ext4Profile, ExternalResource, FenceRecord,
     FenceState, GuestArchitecture, IncludedDisk, LinuxPlatform, MachineRoot, MachineStorageRecord,
-    OverlayLower, OverlayProfile, PartitionTable, PrivatePath, RawLayout, RootSelector,
-    StorageOperationKind, StorageOperationRecord, StorageOperationState, StorageProfile,
-    StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
+    OverlayLower, OverlayProfile, PartitionTable, PrivatePath, RawLayout, RootFilesystem,
+    RootSelector, StorageOperationKind, StorageOperationRecord, StorageOperationState,
+    StorageProfile, StorageStopOutcome, TemporaryDirectoryPolicy, Translation,
 };
 pub use crate::store::models::{MachineId, MachineIdParseError};
 pub use crate::store::snapshot_store::{

@@ -184,6 +184,7 @@ async fn invalid_mutations_fail_before_runtime_or_admission() {
         .resolve_image(Request::new(w::ResolveImageRequest {
             reference: "valid".into(),
             pull_policy: 0,
+            platform: None,
         }))
         .await;
     assert!(matches!(&result, Err(e) if e.code() == tonic::Code::InvalidArgument));
@@ -1072,7 +1073,12 @@ async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters()
     let binary = test_utils::mock_vmm_binary();
     for name in ["kernel", "initramfs", "agent"] {
         let path = root.path().join(name);
-        std::fs::write(&path, b"scenario-asset").unwrap();
+        let bytes = if name == "kernel" {
+            test_utils::direct_kernel::host_kernel("pause-api")
+        } else {
+            b"scenario-asset".to_vec()
+        };
+        std::fs::write(&path, bytes).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let supported = LiveCapability {
@@ -1111,11 +1117,15 @@ async fn pause_local_and_daemon_routes_share_durable_authority_across_adapters()
         .with_mock_vmm(&scenario_path);
     let runtime = libvm::Runtime::new(config.clone()).await.unwrap();
     let disk = root.path().join("root.raw");
-    std::fs::write(&disk, vec![0; 4096]).unwrap();
+    disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+        .and_then(|formatter| formatter.close())
+        .unwrap();
     let machine = runtime
         .machine()
         .name("pause-api")
-        .image_source(libvm::ImageSource::Disk(disk))
+        .image_source(libvm::ImageSource::Disk(
+            crate::commands::create::disk_create_request(disk, &Default::default()).unwrap(),
+        ))
         .network(|network| network.none())
         .create()
         .await

@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use crate::daemon::control::{conversion, id, native, Service, Stream};
 use silo_vm_control::{images, policy, values};
 use silod_spec::daemon::v1 as w;
@@ -11,11 +13,165 @@ fn image_reference(value: &str) -> Result<(), Status> {
     }
 }
 
+impl Service {
+    /// Runs one managed-image publication to completion independently of the
+    /// response consumer: progress first, then exactly one terminal image.
+    async fn managed_image_operation<R, F, Fut>(
+        &self,
+        r: &Request<R>,
+        work: F,
+    ) -> Result<Response<Stream<w::ManagedImageEvent>>, Status>
+    where
+        F: FnOnce(Service, libvm::ImageProgressSender) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<libvm::ManagedImageInfo, Status>> + Send + 'static,
+    {
+        let permit = self.admit(r, true).await?;
+        let state = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (progress, mut events) = libvm::ImageProgressSender::channel(8);
+        let events_tx = tx.clone();
+        let forwarding = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let event = images::managed_event_progress(&event).map_err(conversion);
+                if events_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let result = async {
+                let image = work(state, progress).await?;
+                images::managed_event_image(&image).map_err(conversion)
+            }
+            .await;
+            // Drain counts native work, not a slow or canceled response consumer.
+            drop(permit);
+            let _ = forwarding.await;
+            let _ = tx.send(result).await;
+        });
+        Ok(Response::new(self.response_stream(rx)))
+    }
+}
+
 #[tonic::async_trait]
 impl w::runtime_service_server::RuntimeService for Service {
     type ResolveImageStream = Stream<w::ResolveImageEvent>;
     type PullImageStream = Stream<w::ImageProgress>;
+    type ImportImageStream = Stream<w::ManagedImageEvent>;
+    type ConvertImageStream = Stream<w::ManagedImageEvent>;
 
+    async fn import_image(
+        &self,
+        r: Request<w::DiskImportRequest>,
+    ) -> Result<Response<Self::ImportImageStream>, Status> {
+        let request = silo_vm_control::boot::import_request_from_wire(r.get_ref().clone())
+            .map_err(conversion)?;
+        self.managed_image_operation(&r, move |state, progress| async move {
+            let admitted = request.admit().await.map_err(native)?;
+            let runtime = state.runtime().await?.with_image_progress(progress);
+            runtime
+                .images()
+                .import_admitted_disk(admitted)
+                .await
+                .map_err(native)
+        })
+        .await
+    }
+
+    /// Converts exactly the selected immutable identity: re-resolution must
+    /// reproduce manifest, config and platform, never follow a moved tag.
+    async fn convert_image(
+        &self,
+        r: Request<w::ConvertImageRequest>,
+    ) -> Result<Response<Self::ConvertImageStream>, Status> {
+        let (identity, options) =
+            images::convert_request_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        image_reference(&identity.selected_reference)?;
+        let resolve = identity.resolve_options().map_err(conversion)?;
+        self.managed_image_operation(&r, move |state, progress| async move {
+            let runtime = state.runtime().await?.with_image_progress(progress);
+            let images = runtime
+                .with_image_pull_policy(identity.pull_policy)
+                .images();
+            let mut image = images
+                .resolve_with(identity.selected_reference.clone(), resolve)
+                .await
+                .map_err(native)?;
+            identity.verify(&image).map_err(conversion)?;
+            image.requested_reference = identity.requested_reference;
+            images.convert(&image, options).await.map_err(native)
+        })
+        .await
+    }
+
+    async fn resolve_managed_digest(
+        &self,
+        r: Request<w::ManagedDigest>,
+    ) -> Result<Response<w::ManagedSourceId>, Status> {
+        let digest = images::managed_digest_from_wire(r.into_inner()).map_err(conversion)?;
+        let id = self
+            .runtime()
+            .await?
+            .images()
+            .resolve_managed_digest(&digest)
+            .await
+            .map_err(native)?;
+        Ok(Response::new(images::managed_id_to_wire(&id)))
+    }
+
+    /// Inspection is observation, not a content lease.
+    async fn inspect_managed_image(
+        &self,
+        r: Request<w::ManagedSourceRef>,
+    ) -> Result<Response<w::ManagedSourceInfo>, Status> {
+        let reference = images::managed_ref_from_wire(r.into_inner()).map_err(conversion)?;
+        let info = self
+            .runtime()
+            .await?
+            .images()
+            .inspect_managed(&reference)
+            .await
+            .map_err(native)?;
+        Ok(Response::new(
+            images::managed_info_to_wire(&info).map_err(conversion)?,
+        ))
+    }
+
+    async fn list_managed_images(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<w::ManagedSourceList>, Status> {
+        let infos = self
+            .runtime()
+            .await?
+            .images()
+            .list_managed()
+            .await
+            .map_err(native)?;
+        Ok(Response::new(
+            images::managed_list_to_wire(&infos).map_err(conversion)?,
+        ))
+    }
+
+    async fn release_image_retention(
+        &self,
+        r: Request<w::ManagedSourceRef>,
+    ) -> Result<Response<()>, Status> {
+        let reference = images::managed_ref_from_wire(r.get_ref().clone()).map_err(conversion)?;
+        let state = self.clone();
+        self.mutate(&r, true, async move {
+            state
+                .runtime()
+                .await?
+                .images()
+                .release_retention(&reference)
+                .await
+                .map_err(native)?;
+            Ok(())
+        })
+        .await?;
+        Ok(Response::new(()))
+    }
     async fn restore_snapshot(
         &self,
         r: Request<w::RestoreStorageSnapshotRequest>,
@@ -118,14 +274,16 @@ impl w::runtime_service_server::RuntimeService for Service {
         Ok(Response::new(()))
     }
 
+    /// Removes one name from the single image/snapshot namespace; explicit
+    /// retention of its target is unaffected.
     async fn remove_image_alias(&self, r: Request<w::Name>) -> Result<Response<()>, Status> {
         let alias = silo_vm_control::stopped::alias(&r.get_ref().name).map_err(conversion)?;
         let state = self.clone();
         self.mutate(&r, true, async move {
-            let runtime = state.runtime().await?;
-            libvm::SnapshotStore::open(runtime.local_home())
-                .await
-                .map_err(native)?
+            state
+                .runtime()
+                .await?
+                .images()
                 .remove_alias(&alias)
                 .await
                 .map_err(native)?;
@@ -182,6 +340,7 @@ impl w::runtime_service_server::RuntimeService for Service {
     ) -> Result<Response<Self::ResolveImageStream>, Status> {
         let v = r.get_ref().clone();
         image_reference(&v.reference)?;
+        let options = images::resolve_options_from_wire(&v).map_err(conversion)?;
         let policy = images::pull_policy_from_wire(v.pull_policy).map_err(conversion)?;
         // Resolution can fetch/cache artifacts. It has the same lifetime and admission
         // rules as other mutations, even when the progress consumer disconnects.
@@ -207,12 +366,7 @@ impl w::runtime_service_server::RuntimeService for Service {
                 let runtime = state.runtime().await?.with_image_progress(progress);
                 let image = runtime
                     .images()
-                    .resolve_with(
-                        v.reference,
-                        libvm::ImageResolveOptions {
-                            policy: Some(policy),
-                        },
-                    )
+                    .resolve_with(v.reference, options)
                     .await
                     .map_err(native)?;
                 images::resolved_image_to_wire(&image, policy).map_err(conversion)

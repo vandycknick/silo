@@ -61,7 +61,11 @@ pub struct NormalizedMachineCreate {
     pub initramfs: Option<PathBuf>,
     pub kernel_args: Vec<String>,
     pub nested_virtualization: bool,
-    pub rosetta: bool,
+    /// Explicit Rosetta intent: absence is no intent, `Some(false)` disables.
+    pub rosetta: Option<bool>,
+    /// Requested Linux userspace platform; absent leaves selection to the
+    /// source. libvm rejects a resolved source on another platform.
+    pub platform: Option<libvm::LinuxPlatform>,
     pub disks: Vec<PathBuf>,
     pub mounts: Vec<Mount>,
     pub forwards: Vec<Forward>,
@@ -95,6 +99,7 @@ impl NormalizedMachineCreate {
             .kernel_args(self.kernel_args)
             .nested_virtualization(self.nested_virtualization)
             .rosetta(self.rosetta)
+            .platform(self.platform)
             .root_profile(self.root_profile)
             .temporary_directory(self.temporary_directory)
             .disks(self.disks)

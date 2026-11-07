@@ -477,27 +477,148 @@ fn activation_hook(value: &str) -> Result<libvm::RestoreHook, String> {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Manage shared image aliases")]
+#[command(about = "Import, convert and manage immutable images in the shared image: namespace")]
 pub struct Image {
     #[command(subcommand)]
     command: ImageCommand,
 }
 #[derive(Debug, Subcommand)]
 enum ImageCommand {
-    /// Remove only an image: alias, never release a snapshot's explicit retention.
+    /// Import a quiesced raw or qcow2 disk as a reusable direct-boot image.
+    /// Platform and root selection are required; the boot bundle is pinned now.
+    Import {
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Linux userspace platform of the disk (linux/amd64, linux/arm64[/v8]).
+        #[arg(long, value_name = "PLATFORM", value_parser = platform_arg)]
+        platform: libvm::LinuxPlatform,
+        /// Root selection: whole-disk, auto, gpt:GUID or mbr:N.
+        #[arg(long, value_name = "SELECTION", value_parser = root_arg)]
+        root: libvm::ImportRootSelection,
+        /// Boot profile. Only linux-direct is admitted.
+        #[arg(long, value_enum)]
+        boot: ImportBootProfile,
+        /// Optional alias in the shared image: namespace.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Flatten exactly one selected OCI manifest into a reusable raw image.
+    /// Cached per manifest, platform and flattener; never performed at start.
+    Convert {
+        #[arg(value_name = "OCI_REFERENCE")]
+        reference: String,
+        /// Linux platform to select from an OCI index; host-native when absent.
+        #[arg(long, value_name = "PLATFORM", value_parser = platform_arg)]
+        platform: Option<libvm::LinuxPlatform>,
+        /// Image pull policy for selecting the manifest.
+        #[arg(long, value_enum)]
+        pull: Option<crate::commands::create::Pull>,
+        /// Optional alias in the shared image: namespace.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Inspect an image or snapshot by image:NAME or image:sha256:HEX. Not a lease.
+    Inspect {
+        #[arg(value_name = "IMAGE")]
+        reference: String,
+    },
+    /// List managed images and snapshots in the shared namespace.
+    List,
+    /// Release explicit retention of an image or snapshot. Aliases and other
+    /// consumers still retain its bytes.
+    Release {
+        #[arg(value_name = "IMAGE")]
+        reference: String,
+    },
+    /// Remove only an image: alias, never release explicit retention.
     Remove {
         #[arg(value_name = "IMAGE_ALIAS")]
         alias: String,
     },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ImportBootProfile {
+    LinuxDirect,
+}
 impl Image {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         match self.command {
+            ImageCommand::Import {
+                path,
+                platform,
+                root,
+                boot: ImportBootProfile::LinuxDirect,
+                name,
+            } => {
+                let path = crate::commands::create::disk_source_path("image import", &path)?;
+                let request = libvm::DiskImportRequest {
+                    path,
+                    boot: libvm::DiskImportBoot::LinuxDirect {
+                        platform,
+                        root,
+                        assets: libvm::BootAssetSelection::Packaged,
+                    },
+                    alias: name
+                        .map(|name| silo_vm_control::stopped::alias(&name))
+                        .transpose()?,
+                };
+                let (progress, events) = libvm::ImageProgressSender::default_channel();
+                let watcher = crate::ui::watch_image_progress("image import", events);
+                let result = context
+                    .app_api()
+                    .await?
+                    .import_image(request, progress)
+                    .await;
+                let _ = watcher.await;
+                print_json(&result?)
+            }
+            ImageCommand::Convert {
+                reference,
+                platform,
+                pull,
+                name,
+            } => {
+                let options = libvm::RawConversionOptions {
+                    alias: name
+                        .map(|name| silo_vm_control::stopped::alias(&name))
+                        .transpose()?,
+                };
+                let pull = pull.map_or(libvm::ImagePullPolicy::IfMissing, |pull| pull.policy());
+                let (progress, events) = libvm::ImageProgressSender::default_channel();
+                let watcher = crate::ui::watch_image_progress(&reference, events);
+                let result = context
+                    .app_api()
+                    .await?
+                    .convert_image(reference, pull, platform, options, progress)
+                    .await;
+                let _ = watcher.await;
+                print_json(&result?)
+            }
+            ImageCommand::Inspect { reference } => {
+                print_json(&context.app_api().await?.inspect_managed(&reference).await?)
+            }
+            ImageCommand::List => print_json(&context.app_api().await?.list_managed().await?),
+            ImageCommand::Release { reference } => {
+                context.app_api().await?.release_image(&reference).await
+            }
             ImageCommand::Remove { alias } => {
                 context.app_api().await?.remove_image_alias(&alias).await
             }
         }
     }
+}
+
+fn print_json(value: &impl serde::Serialize) -> eyre::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn platform_arg(value: &str) -> Result<libvm::LinuxPlatform, String> {
+    silo_vm_control::boot::parse_platform(value).map_err(|error| error.to_string())
+}
+
+fn root_arg(value: &str) -> Result<libvm::ImportRootSelection, String> {
+    silo_vm_control::boot::parse_import_root(value).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Args)]

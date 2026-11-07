@@ -269,6 +269,7 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     # exact capture does not upgrade a previously unsupported shape to Clean.
     stopped.stop(silo, "snapshot-source", require_clean=False)
     source = stopped.backing(silo, "snapshot-source", "before-snapshot")
+    source_binding = stopped.record(silo, "snapshot-source")["boot"]["binding"]
     assert set(source) == {"root", "data:1"}
     captured = json.loads(silo.run("snapshot", "create", "snapshot-source", "--name", "stopped-checkpoint", timeout=240).stdout)
     assert captured["retained"] is True and "stopped-checkpoint" in captured["aliases"]
@@ -290,7 +291,7 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     for child in ("snapshot-first", "boot-pinned-fork"):
         assert stopped.configured_semantics(stopped.configuration(silo, child)) == expected_config
         pinned = stopped.record(silo, child)["boot"]["binding"]
-        assert pinned["kind"] == "pinned" and pinned["abi"] == "silo-direct-v1"
+        assert pinned == source_binding
         for role, expected in expected_boot.items():
             object_path = silo.ws.silo_home / "images/objects/sha256" / pinned[role].removeprefix("sha256:")
             assert overlay.digest(object_path) == expected

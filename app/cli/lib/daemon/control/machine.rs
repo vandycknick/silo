@@ -296,17 +296,18 @@ impl w::machine_service_server::MachineService for Service {
         let work = async move {
             let runtime = state.runtime().await?.with_image_progress(progress);
             let builder = match source {
-                requests::CreateSource::Disk(path) => runtime
+                requests::CreateSource::Disk(request) => runtime
                     .machine()
-                    .image_source(libvm::ImageSource::disk(path)),
+                    .image_source(libvm::ImageSource::Disk(request)),
+                requests::CreateSource::Managed(reference) => runtime
+                    .machine()
+                    .image_source(libvm::ImageSource::Managed(reference)),
                 requests::CreateSource::Oci(identity) => {
                     let mut image = runtime
                         .images()
                         .resolve_with(
                             identity.selected_reference.clone(),
-                            libvm::ImageResolveOptions {
-                                policy: Some(identity.pull_policy),
-                            },
+                            identity.resolve_options().map_err(conversion)?,
                         )
                         .await
                         .map_err(native)?;
@@ -447,6 +448,30 @@ impl w::machine_service_server::MachineService for Service {
                         .machine(&reference)
                         .await?
                         .update(update)
+                        .await
+                        .map_err(native)?,
+                )
+            })
+            .await?,
+        ))
+    }
+    /// Explicit stopped boot-bundle replacement under the machine's own
+    /// configuration lock; root bytes and userspace platform never change.
+    async fn update_boot_assets(
+        &self,
+        r: Request<w::UpdateBootAssetsRequest>,
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let (reference, update) =
+            silo_vm_control::boot::update_boot_assets_from_wire(r.get_ref().clone())
+                .map_err(conversion)?;
+        let state = self.clone();
+        Ok(Response::new(
+            self.mutate(&r, true, async move {
+                snapshot(
+                    &state
+                        .machine(&reference)
+                        .await?
+                        .update_boot_assets(update)
                         .await
                         .map_err(native)?,
                 )

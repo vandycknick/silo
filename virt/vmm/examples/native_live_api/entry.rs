@@ -235,10 +235,6 @@ pub(crate) fn main() -> eyre::Result<()> {
     };
     let result = if let Some(directory) = &launch.restore {
         let files = state_files.ok_or_else(|| eyre::eyre!("restore state roles missing"))?;
-        let mac = launch
-            .silo_fixture
-            .as_ref()
-            .map_or([2, 0, 0, 0, 0, 2], |fixture| fixture.mac);
         let (inputs, resources) = restored_inputs(
             directory,
             files,
@@ -246,7 +242,7 @@ pub(crate) fn main() -> eyre::Result<()> {
             &console,
             mux,
             endpoints,
-            mac,
+            launch.silo_fixture.as_ref(),
         )?;
         let build_deadline = if launch.proof == Some(RestoreProof::InstallTimeout) {
             Instant::now() + Duration::from_millis(1500)
@@ -308,13 +304,14 @@ pub(crate) fn main() -> eyre::Result<()> {
                     length: File::from(fd.try_clone()?).metadata()?.len(),
                     logical_sector_size: 512,
                 },
-                block_id: vm_spec::BlockId::new(format!("disk{index}"))
+                block_id: vm_spec::BlockId::new(disk_id(index, launch.silo_fixture.is_some()))
                     .map_err(|error| eyre::eyre!("{error}"))?,
                 read_only: false,
             });
         }
         let mut cmdline = if launch.silo_fixture.is_some() {
-            "root=/dev/vda rootfstype=ext4 rw console=hvc0".to_string()
+            // Root selection comes only from the composite initramfs's bootstrap.
+            "console=hvc0".to_string()
         } else {
             format!(
                 "console=hvc0 rdinit=/init panic=-1 probe.echo_port={}",
@@ -516,6 +513,17 @@ fn settle_prepared_failure(reason: String, owner: FailedRestore<'_>) -> eyre::Re
     }
 }
 
+/// The real Silo init resolves its root only by the `silo-root` serial, so a
+/// real-guest fixture names its root attachment accordingly. Restore must use
+/// the same configured identity as the captured cold launch.
+fn disk_id(index: usize, silo_fixture: bool) -> String {
+    if index == 0 && silo_fixture {
+        "silo-root".to_string()
+    } else {
+        format!("disk{index}")
+    }
+}
+
 fn restored_inputs(
     directory: &Path,
     files: RestoreStateFiles,
@@ -523,8 +531,9 @@ fn restored_inputs(
     console: &std::os::fd::OwnedFd,
     mux: std::os::fd::OwnedFd,
     endpoints: StandaloneEndpoints,
-    mac: [u8; 6],
+    silo_fixture: Option<&SiloFixture>,
 ) -> eyre::Result<(RestoreInputs, RestoreResources)> {
+    let mac = silo_fixture.map_or([2, 0, 0, 0, 0, 2], |fixture| fixture.mac);
     let manifest = load(&directory.join("api-capture.json"))?;
     let binding = parse_binding(&manifest["binding"])?;
     let expected = RestoreIdentity {
@@ -559,7 +568,7 @@ fn restored_inputs(
     let mut resources = RestoreResources::default();
     for (index, fd) in disks.iter().enumerate() {
         resources.blocks.push(RestoreBlock::raw(
-            attachment(&format!("disk{index}"))?,
+            attachment(&disk_id(index, silo_fixture.is_some()))?,
             File::from(fd.try_clone()?),
             false,
         ));

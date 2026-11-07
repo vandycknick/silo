@@ -8,6 +8,7 @@ mod image_store;
 pub(crate) mod layer_store;
 pub(crate) mod live_store;
 pub(crate) mod machine_store;
+pub(crate) mod managed_image_store;
 #[cfg(test)]
 mod mock_store;
 pub(crate) mod models;

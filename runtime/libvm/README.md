@@ -59,6 +59,68 @@ The main shapes are:
 `MachineBuilder::image` always accepts an OCI reference. Use
 `image_source(ImageSource::disk(path))` for a local disk. `create` materializes
 the selected root disk and persists a stopped machine; it never starts the VM.
+Every new machine pins a complete kernel, base initramfs and explicit optional
+agent tuple, plus its canonical bundle object. Start authenticates only these
+owned objects and regenerates launch-only bootstrap data. Package upgrades,
+removed source files and changed defaults never silently change an existing VM.
+
+`MachineBuilder::platform(Some(LinuxPlatform { .. }))` selects OCI userspace
+before materialization. Native kernels must match the host architecture; there
+is no CPU emulation. Rosetta intent is tri-state: `rosetta(None)` omits an
+optional request, `Some(false)` explicitly disables it, and `Some(true)` requests
+it. Foreign amd64 userspace on an arm64 macOS host derives required translation,
+which cannot be explicitly disabled and requires actual installed host support.
+Trusted init prepares both required and optional Rosetta before any workload
+execution, independently of guest-agent injection.
+
+The frozen effective backend governs both admission and the monitor request.
+Direct OCI creation on VZ refuses before materialization and names explicit
+OCI-to-raw conversion; VZ also refuses managed overlay roots. Stopped snapshots
+and forks admit raw whole-disk and GPT/MBR partition roots on the Linux krun
+lane (same architecture, no translation); live capture keeps its narrower
+whole-disk/flat-overlay root set. Neither lane is broadened by boot admission.
+
+Managed aliases resolve to typed immutable targets. Image roots are copied from
+their authenticated stream capability. A snapshot source uses full snapshot
+restoration, preserving captured configuration and included disks rather than
+copying only its root. Snapshot creation accepts a new name; other nondefault
+create settings are refused and require explicit stopped updates after restore.
+
+Use `Machine::update_boot_assets(BootAssetsUpdate { selection })` for an explicit
+stopped replacement. It requires exclusive stopped-generation ownership and
+atomically commits the complete tuple, dependent agent configuration and next
+storage generation. `Packaged`, a complete `Files` tuple and an owned `Exact`
+bundle are distinct selections; omitted members never inherit old assets.
+Fresh custom file tuples currently require the base initramfs to match the
+locally packaged schema-2 bootstrap bytes. Unknown custom base ABIs receive
+`BootBundleAbiUnsupported`, not an unsupported boot claim. Previously admitted
+exact bundles remain usable after packages change. Ordinary configuration
+replacement cannot change kernel/initramfs or agent selection behind the pin.
+Inspection reports the current tuple and, when it can be locally admitted, a
+different packaged replacement without publishing or applying it.
+
+Raw roots admit their kernel by its own bytes, never by a declared or recorded
+architecture alone. While the selected kernel is hashed, libvm keeps its first
+4 KiB and requires the host's native direct-loader format for the pinned
+kernel architecture: an x86-64 little-endian ELF64 executable `vmlinux` with
+in-file loadable segments, or a little-endian arm64 `Image` whose declared size
+covers the file. Import, creation, updates, exact bundles, replacement
+reporting, capture and every pinned start apply this check to the
+authenticated bytes before publication or launch. Arbitrary data and
+wrong-architecture kernels fail with `DirectKernelRejected`, carrying the
+kernel digest and exact reason. Admission deliberately does not inspect kernel
+configuration: custom kernels need no embedded IKCONFIG, and a kernel missing a
+required filesystem, partition, device or Rosetta capability fails at boot.
+Overlay roots keep their exact reviewed tuple admission instead.
+
+The mandatory schema-2 root bootstrap carries the named root attachment,
+effective geometry, concrete disk-local selector, ext4 filesystem and effective
+Rosetta mode. Kernel `root=`, `rootfstype=` and `rootflags=` overrides are
+reserved for trusted bootstrap selection, and `rdinit=` is reserved because
+the trusted `/init` is the only initial executable; create, configuration
+replacement and start refuse them in any spelling the kernel recognizes,
+quoted or not. `init=` remains the image init handoff. Partitioned roots do
+not receive automatic partition or filesystem resizing.
 
 `Machine::start` and `Machine::stop` manage a persisted machine. A normal start
 creates an idle VM. `Machine::start_with` can instead set one
@@ -134,6 +196,100 @@ operations still require exclusive-lease admission and atomic durable
 reconciliation. Force stop waits within its timeout for that complete
 holder/lease reconciliation after monitor termination, rather than treating the
 monitor's death as completion or reporting a live retained generation as absent.
+
+## Managed Raw Images
+
+A managed image is an immutable creation source, not a captured machine or an
+OCI filesystem-cache row. Its schema-1 `ImageRecord` includes the opaque raw
+root stream and map, 512-byte geometry, disk layout, concrete root selector,
+ext4 filesystem, Linux userspace platform, complete pinned direct-boot bundle
+and process defaults. `ImageId` is SHA-256 of `silo:image:v1\n` followed by the
+RFC 8785 canonical record. The record's ordinary byte-object digest is separate.
+Changing boot or process semantics changes the image identity even when the
+root bytes do not. Source paths, container encoding and original OCI spelling
+are appendable provenance, not image identity or retained source-container bytes.
+Partition provenance encodes the full GPT attribute bitmask as sixteen lowercase
+hex digits in JSON, preserving DPS flags above the exact JSON integer range.
+
+Images and snapshots share one `image:NAME` alias namespace. Each name targets
+exactly one typed image or snapshot; collisions, corrupt dependencies and
+ambiguous cross-kind digest lookups fail closed. Explicit image retention is
+independent of aliases. Releasing retention leaves aliases rooted; removing an
+alias does not release explicit retention. Catalog removal never recursively
+unlinks shared content. Stream and object collectors account for image maps,
+canonical records, bundle records and every exact boot member.
+
+`Images::import_disk` imports a quiesced caller-owned regular file. The path is
+opened once with `O_NOFOLLOW`; a final-component symlink, directory, FIFO or
+device is rejected, and every later read uses that held descriptor. Format is
+classified by bytes, never by name: qcow2 v2/v3 is admitted by the bounded
+`disk-image` decoder (no backing, external data, encryption or zstd); VMDK,
+VHD/VHDX, VDI, QED, LUKS and compressed archives need offline conversion; any
+other content is raw and must be a positive 512-byte multiple up to 1 TiB. Raw
+bytes copy directly into the pool; qcow2 decodes into sparse operation staging
+with the exact virtual length. Partition, root and filesystem facts come from
+those owned bytes: the shared `disk-partition` parser in strict import mode,
+Linux direct-table admission (128-byte GPT entries), then exactly one root. A
+whole-disk selection requires no table; `auto` takes the single DPS root for the
+declared userspace (never no-auto or read-only); a GPT unique GUID or original
+MBR slot 1..4 names one partition. Refusals carry every disk-local candidate.
+The selected range must hold an ext4 superblock the pinned kernel mounts
+writable: revision 1, 1-4 KiB blocks, admitted feature allowlist, clean state,
+valid metadata checksum and a size inside the range. Nothing is mounted or
+traversed. A source fingerprint change at any point fails the import. Raw and
+qcow2 imports of the same decoded bytes and semantics produce the same
+`ImageId`; provenance records the container SHA-256, spelling, lengths and the
+observed selected partition.
+
+Import admits its pool-space peak before decoding or copying, through the same
+cross-home resource ledger as capture and restore. Raw charges the immutable
+publication copy plus map staging; qcow2 also charges the simultaneously retained
+decoded staging file. Charges use conservative logical lengths, not sparse
+allocation, deduplication or reflink assumptions. Insufficient capacity reports
+required and available bytes independently of the unchanged 1 TiB format bound.
+The real blocking worker retains the operation lease and reservation even if its
+caller is canceled; completion releases the peak, and abandoned-operation
+recovery retires charges left by process loss. Machine creation separately
+reserves the later private root copy on its destination filesystem through
+publication, including an explicitly enlarged root disk. Ordinary failures
+after reservation roll back the private machine directory before releasing
+capacity and retiring the copy operation; they do not require a later runtime
+open to reclaim the charge. Uncertain publication keeps its recovery authority.
+
+`DiskImportRequest::admit` returns an opaque `AdmittedDiskImport` retaining the
+single source descriptor and fingerprint. Local and daemon adapters use this
+prepare/consume boundary before writable runtime initialization, so structurally
+invalid geometry, containers and special files cannot trigger initialization or
+recovery effects. `Images::import_admitted_disk` consumes it without reopening
+the source; `Images::import_disk` performs both steps for an existing runtime.
+
+The conversion catalog maps the canonical `(manifest digest, Linux platform,
+flattener ABI)` key to an immutable image. The manifest binds its config, so the
+config digest is checked provenance, not another key dimension. Conversion is
+explicit (`Images::convert` on an already selected OCI identity); creation and
+start never convert implicitly, on any backend. Conversions serialize on the key
+and recheck the mapping under that lock, so identical concurrent requests yield
+one image. A miss reuses the one OCI flattener and rootfs cache for the selected
+platform, publishes that exact immutable stream as a whole-disk ext4
+`LinuxDirect` root, pins the then-packaged kernel, base initramfs and agent, and
+preserves the OCI entrypoint, command, environment, working directory and user
+as process defaults. A retained hit authenticates the original complete
+closure, including its original bundle, rather than flattening again after a
+runtime upgrade; a new alias names that same image. Missing or corrupt hit
+content is an error, not a cache miss. Collection of the image removes the
+conversion mapping.
+
+Import/conversion work registers the existing operation journal and original
+shared OFD before protected reads. Prepared stream/map and boot-member outputs
+remain rooted until publication completes. The actual blocking publisher owns
+the lease and writable catalog capability even if its caller is cancelled.
+It authenticates content outside roots coordination, records the exact image
+candidate before an uncertain commit, then atomically commits image identity,
+exact dependencies, retention, provenance, optional alias and conversion key.
+Consumers resolve and recheck the typed public target and register its entire
+closure in one roots-coordinated transaction before opening artifact bytes.
+Inspection is not a lease. Abandoned operation recovery and GC use the existing
+journal and lease machinery; there is no second cleanup or alias namespace.
 
 ## Stopped Snapshot Retention And Identity
 
@@ -558,21 +714,20 @@ Existing state still requires an explicit user wipe.
 
 The initial stream hash of a private root describes its creation bytes only.
 It does not certify current contents after writable execution or resizing.
-Cached source streams are separately verified immutable files. Ordinary creation
-still selects installed boot assets. Stopped fork and snapshot capture resolve the
-configured **next** boot once and ingest the exact kernel, base initramfs and optional
-agent into the immutable object pool. Already pinned bundles retain their exact
-closure. Capture does not change source boot selection or claim the assets used by
-an earlier run. Captured children launch from authenticated pinned objects even if
-source-private files or installed defaults are replaced or removed; missing or
-incompatible pins fail rather than selecting new defaults. Authenticated source
-descriptors remain owned through qualification and checked kernel/composite
-generation; launch never reopens a verified pool pathname to read its kernel,
-base initramfs or agent. Each launch regenerates
-the composite bootstrap with the child's fresh machine/run configuration, never
-copies the source composite. Only the admitted same-host Linux krun direct-boot
-profiles are supported; EFI, macOS and cross-lane bundles are refused before
-staging. This does not add global boot-asset updates or enable another backend.
+Cached source streams are separately verified immutable files. Creation already
+owns the exact complete next-boot tuple; stopped fork and snapshot capture retain
+that closure without reselecting installed defaults. Capture does not change
+source boot selection or claim the assets used by an earlier run. Captured
+children launch from authenticated pinned objects even if source-private files
+or installed defaults are replaced or removed; missing or incompatible pins
+fail rather than selecting new defaults. Authenticated source descriptors remain
+owned through qualification and checked kernel/composite generation; launch
+never reopens a verified pool pathname to read its kernel, base initramfs or
+agent. Each launch regenerates the composite bootstrap with the child's fresh
+machine/run configuration, never copies the source composite. Capture retains
+its independently admitted same-host Linux krun direct-boot profiles. General
+raw/cloud boot support does not qualify EFI, macOS, translation or partitioned
+roots for stopped/live capture.
 
 Acknowledged catalog writes use SQLite WAL with synchronous `FULL` and
 `fullfsync` enabled. Database identity checks use path metadata, never a raw
@@ -894,6 +1049,10 @@ if you need the terminal outcome. `session.cancel()` or dropping the session
 also releases its response stream, so no further result can be received.
 Neither operation is a reconnect API.
 
+The CLI drains execution responses when sending pipe EOF races process exit.
+A received terminal result remains authoritative; a closed request stream
+alone is never evidence of successful execution.
+
 ```rust,no_run
 # async fn example(machine: &libvm::Machine) -> Result<(), libvm::LibVmError> {
 let mut session = machine.spawn("/bin/sleep", ["60"]).await?;
@@ -906,10 +1065,6 @@ println!("{outcome:?}");
 
 `wait()` consumes and discards subsequent output. `collect()` buffers it in
 memory. Use `recv()` for bounded streaming or external sinks.
-
-The CLI drains execution responses when sending pipe EOF races process exit.
-A received terminal result remains authoritative; a closed request stream
-alone is never evidence of successful execution.
 
 ### Local SSH login
 
@@ -1179,11 +1334,11 @@ unlink attempts must therefore tolerate an already-removed path. See the
 [hybrid vsock guide](../../docs/hybrid-vsock.md) for protocol examples, retries,
 security, limits, and shutdown behavior.
 
-Machine kernel, initramfs, and agent overrides remain independent. An omitted
-asset always uses its matching file from the resolved installation set, so one
-launch never combines defaults from separate installations. `libvm` performs
-all component environment and controlled PATH resolution while opening the
-runtime; launched helpers do not repeat discovery.
+Creation-time kernel, initramfs and agent selections are resolved together from
+one installation and pinned before publication. Subsequent changes require the
+explicit complete boot-assets update; launch does not repeat selection.
+`libvm` performs component environment and controlled PATH resolution while
+opening the runtime; launched helpers do not repeat discovery.
 
 ## Lifecycle States
 

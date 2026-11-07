@@ -23,7 +23,6 @@ use crate::LibVmError;
 
 const DEFAULT_IMAGE_CPUS: u8 = 1;
 const DEFAULT_IMAGE_MEMORY_MIB: u32 = 512;
-const ROOT_DISK_KERNEL_ARG: &str = "root=/dev/vda";
 const GENERATED_NAME_ATTEMPTS: u32 = 3;
 
 /// Explicit root materialization choice. Flat overlay is development-only.
@@ -39,6 +38,7 @@ pub enum RootProfile {
 struct MachineCreateRequest {
     image_source: Option<ImageSource>,
     resolved_oci_image: Option<ResolvedOciImage>,
+    platform: Option<crate::LinuxPlatform>,
     name: Option<String>,
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
@@ -51,7 +51,7 @@ struct MachineCreateRequest {
     root_profile: RootProfile,
     temporary_directory: crate::TemporaryDirectoryPolicy,
     nested_virtualization: bool,
-    rosetta: bool,
+    rosetta: Option<bool>,
     userdata: Option<String>,
     disks: Vec<PathBuf>,
     mounts: Vec<Mount>,
@@ -64,6 +64,42 @@ struct MachineCreateRequest {
     process: ProcessConfig,
     template_name: Option<String>,
     agent_mode: Option<MachineAgent>,
+}
+
+fn snapshot_creation_has_overrides(request: &MachineCreateRequest) -> bool {
+    request.platform.is_some()
+        || !request.labels.is_empty()
+        || !request.metadata.is_empty()
+        || request.cpus.is_some()
+        || request.memory.is_some()
+        || request.kernel.is_some()
+        || request.initramfs.is_some()
+        || !request.kernel_args.is_empty()
+        || request.disk_size_bytes.is_some()
+        || request.root_profile != RootProfile::OpaqueRaw
+        || request.temporary_directory != crate::TemporaryDirectoryPolicy::DiskBacked
+        || request.nested_virtualization
+        || request.rosetta.is_some()
+        || request.userdata.is_some()
+        || !request.disks.is_empty()
+        || !request.mounts.is_empty()
+        || !request.forwards.is_empty()
+        || request.vsock.is_some()
+        || request.network.is_some()
+        || request.guest != MachineGuestConfig::default()
+        || request.retention != MachineRetention::Persistent
+        || request.process != ProcessConfig::default()
+        || request.template_name.is_some()
+        || request
+            .agent_mode
+            .as_ref()
+            .is_some_and(|mode| *mode != MachineAgent::Default)
+}
+
+#[derive(Default)]
+struct SourceOwnership {
+    _lease: Option<crate::storage::locks::StorageLock>,
+    _managed: Option<crate::store::managed_image_store::ManagedImageConsumer>,
 }
 
 struct MachineCreatePlan {
@@ -140,6 +176,7 @@ impl MachineBuilder {
             request: MachineCreateRequest {
                 image_source: None,
                 resolved_oci_image: None,
+                platform: None,
                 name: None,
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
@@ -152,7 +189,7 @@ impl MachineBuilder {
                 root_profile: RootProfile::OpaqueRaw,
                 temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
                 nested_virtualization: false,
-                rosetta: false,
+                rosetta: None,
                 userdata: None,
                 disks: Vec::new(),
                 mounts: Vec::new(),
@@ -200,6 +237,12 @@ impl MachineBuilder {
     pub fn resolved_image(mut self, image: ResolvedOciImage) -> Self {
         self.request.image_source = Some(ImageSource::oci(image.requested_reference.clone()));
         self.request.resolved_oci_image = Some(image);
+        self
+    }
+
+    /// Requests OCI userspace selection before acquisition and materialization.
+    pub fn platform(mut self, platform: Option<crate::LinuxPlatform>) -> Self {
+        self.request.platform = platform;
         self
     }
 
@@ -329,8 +372,11 @@ impl MachineBuilder {
         self
     }
 
-    /// Records an explicit agent mode independently of current guest launch behavior.
+    /// Selects the agent member of the complete creation-time boot tuple.
     pub fn agent_mode(mut self, agent_mode: Option<MachineAgent>) -> Self {
+        if let Some(agent) = &agent_mode {
+            self.request.guest.agent = agent.clone();
+        }
         self.request.agent_mode = agent_mode;
         self
     }
@@ -347,8 +393,8 @@ impl MachineBuilder {
         self
     }
 
-    /// Enables or disables Rosetta support.
-    pub fn rosetta(mut self, enabled: bool) -> Self {
+    /// Preserves explicit enable/disable separately from omitted local intent.
+    pub fn rosetta(mut self, enabled: Option<bool>) -> Self {
         self.request.rosetta = enabled;
         self
     }
@@ -454,14 +500,82 @@ async fn create_machine_config_with_name(
             reason: "cpus must be greater than 0".to_string(),
         });
     }
-    let Some(image_source) = request.image_source.clone() else {
+    let resolved_memory = request
+        .memory
+        .map(|memory| memory.to_vm_spec_mebibytes(&name))
+        .transpose()?
+        .unwrap_or(DEFAULT_IMAGE_MEMORY_MIB);
+    let Some(mut image_source) = request.image_source.clone() else {
         return Err(LibVmError::InvalidCreateRequest {
             name,
             reason: "machine image source is required".to_string(),
         });
     };
-    if let Some(reason) = request.network_error {
-        return Err(LibVmError::InvalidCreateRequest { name, reason });
+    let overlay = request.root_profile == RootProfile::LinuxFlatOverlayV1;
+    let source_family = match &image_source {
+        ImageSource::Oci(_) => crate::runtime::boot_assets::SourceFamily::Oci,
+        ImageSource::Disk(_) => crate::runtime::boot_assets::SourceFamily::LocalDisk,
+        ImageSource::Managed(crate::ManagedSourceRef::Snapshot(_)) => {
+            crate::runtime::boot_assets::SourceFamily::Snapshot
+        }
+        ImageSource::Managed(_) => crate::runtime::boot_assets::SourceFamily::ManagedImage,
+    };
+    crate::runtime::boot_assets::admit_create_source(
+        source_family,
+        if overlay {
+            crate::StorageProfile::LinuxOverlayV1
+        } else {
+            crate::StorageProfile::OpaqueRawV1
+        },
+        if overlay {
+            crate::BackendRequirement::KrunOverlay
+        } else {
+            crate::BackendRequirement::RawBlock
+        },
+        runtime.effective_backend(),
+    )?;
+    crate::machine::root_storage::validate_root_arguments(&request.kernel_args, false).map_err(
+        |error| LibVmError::InvalidCreateRequest {
+            name: name.clone(),
+            reason: error.to_string(),
+        },
+    )?;
+    if let Some(reason) = &request.network_error {
+        return Err(LibVmError::InvalidCreateRequest {
+            name,
+            reason: reason.clone(),
+        });
+    }
+    if let ImageSource::Managed(reference) = &image_source {
+        let collection = crate::store::managed_image_store::ManagedImageStore::from_store(
+            std::sync::Arc::new(runtime.native_store()?),
+        );
+        match collection.resolve(reference).await? {
+            crate::ManagedSourceId::Image(id) => {
+                image_source = ImageSource::Managed(crate::ManagedSourceRef::Image(id));
+            }
+            crate::ManagedSourceId::Snapshot(id) => {
+                if snapshot_creation_has_overrides(&request) {
+                    return Err(LibVmError::InvalidCreateRequest {
+                        name,
+                        reason: "snapshot creation preserves the complete captured configuration; only name may be set, use stopped updates after restoration for other changes".into(),
+                    });
+                }
+                let machine = runtime
+                    .restore_snapshot(
+                        crate::SnapshotRef::Id(id),
+                        crate::RestoreOptions {
+                            name: Some(name.clone()),
+                            ..crate::RestoreOptions::default()
+                        },
+                    )
+                    .await?;
+                return runtime
+                    .machine_config(machine.machine_id())
+                    .await?
+                    .ok_or_else(|| LibVmError::MachineNotFound { reference: name });
+            }
+        }
     }
     if let Some(user) = &request.guest.user {
         user.validate()
@@ -477,7 +591,45 @@ async fn create_machine_config_with_name(
             initramfs: request.initramfs.as_deref(),
         },
     )?;
+    if request
+        .agent_mode
+        .as_ref()
+        .is_some_and(|mode| mode != &request.guest.agent)
+    {
+        return Err(LibVmError::InvalidCreateRequest {
+            name,
+            reason: "agent mode and guest boot-bundle selection disagree".into(),
+        });
+    }
     request.guest = crate::runtime::boot_assets::canonicalize_guest_config(request.guest)?;
+    if request.agent_mode.is_some() {
+        request.agent_mode = Some(request.guest.agent.clone());
+    }
+    if let ImageSource::Disk(disk) = &mut image_source {
+        let crate::DiskImportBoot::LinuxDirect { assets, .. } = &mut disk.boot;
+        if kernel.is_some() || initramfs.is_some() || request.guest.agent != MachineAgent::Default {
+            if *assets != crate::BootAssetSelection::Packaged {
+                return Err(LibVmError::InvalidCreateRequest {
+                    name,
+                    reason: "disk boot assets and machine boot overrides cannot be combined".into(),
+                });
+            }
+            let resolved = runtime.resolve_boot_assets(kernel.as_deref(), initramfs.as_deref())?;
+            *assets = crate::BootAssetSelection::Files {
+                kernel: resolved.kernel,
+                base_initramfs: resolved.initramfs,
+                agent: runtime.resolve_agent_path(&request.guest.agent)?,
+            };
+        }
+    } else if matches!(&image_source, ImageSource::Managed(_))
+        && (kernel.is_some() || initramfs.is_some())
+    {
+        return Err(LibVmError::InvalidCreateRequest {
+            name,
+            reason: "managed boot assets are immutable; create first, then use update_boot_assets"
+                .into(),
+        });
+    }
     if let Some(userdata) = request.userdata.as_deref() {
         if userdata.trim().is_empty() {
             return Err(LibVmError::InvalidCreateRequest {
@@ -490,28 +642,12 @@ async fn create_machine_config_with_name(
     let disk_paths = canonicalize_existing_paths(&request.disks, "disk")?;
 
     let resolved_cpus = request.cpus.unwrap_or(DEFAULT_IMAGE_CPUS);
-    let resolved_memory = request
-        .memory
-        .map(|memory| memory.to_vm_spec_mebibytes(&name))
-        .transpose()?
-        .unwrap_or(DEFAULT_IMAGE_MEMORY_MIB);
 
-    let overlay = request.root_profile == RootProfile::LinuxFlatOverlayV1;
     if overlay {
         if !matches!(&image_source, ImageSource::Oci(_)) {
             return Err(LibVmError::InvalidCreateRequest {
                 name,
                 reason: "flat overlay requires an OCI image source".into(),
-            });
-        }
-        if request.kernel_args.iter().any(|arg| {
-            ["root=", "rootfstype=", "rootflags=", "silo.rootfs="]
-                .iter()
-                .any(|key| arg.starts_with(key))
-        }) {
-            return Err(LibVmError::InvalidCreateRequest {
-                name,
-                reason: "flat overlay forbids conflicting root-selection arguments".into(),
             });
         }
         rootfs_spec::upper_geometry::UpperCapacity::new(
@@ -538,7 +674,7 @@ async fn create_machine_config_with_name(
             .chain(request.kernel_args)
             .collect()
     } else {
-        build_kernel_cmdline(request.kernel_args)
+        request.kernel_args
     };
     let mut disks = if overlay {
         vec![
@@ -573,7 +709,7 @@ async fn create_machine_config_with_name(
         )?);
     }
 
-    let spec = VmSpec {
+    let mut spec = VmSpec {
         guest: Some(Guest {
             os: Some(GuestOs::Linux),
         }),
@@ -589,7 +725,7 @@ async fn create_machine_config_with_name(
             cpus: Some(resolved_cpus),
             memory: Some(resolved_memory),
             nested_virtualization: Some(request.nested_virtualization),
-            rosetta: Some(request.rosetta),
+            rosetta: request.rosetta,
         }),
         storage: Some(Storage { disks }),
         mounts,
@@ -606,10 +742,119 @@ async fn create_machine_config_with_name(
     let network = request.network.unwrap_or_default().into();
     runtime.validate_machine_network_config(&network).await?;
     let tailscale = runtime.validate_tailscale_vsock(&network, &spec)?;
+    if request.resolved_oci_image.is_none() {
+        if let ImageSource::Oci(reference) = &image_source {
+            request.resolved_oci_image = Some(
+                runtime
+                    .resolve_oci_image(
+                        reference.clone(),
+                        runtime.image_pull_policy(),
+                        request.platform.as_ref(),
+                    )
+                    .await?,
+            );
+        }
+    }
+    let userspace = match (&request.resolved_oci_image, &image_source) {
+        (Some(image), _) => Some(crate::LinuxPlatform::from_oci(&image.platform)?),
+        (_, ImageSource::Disk(disk)) => {
+            let crate::DiskImportBoot::LinuxDirect { platform, .. } = &disk.boot;
+            Some(platform.clone())
+        }
+        _ => None,
+    };
+    if let Some(requested) = &request.platform {
+        requested.validate()?;
+        if userspace.as_ref().is_some_and(|selected| {
+            selected.architecture != requested.architecture
+                || requested
+                    .variant
+                    .as_ref()
+                    .is_some_and(|variant| selected.variant.as_ref() != Some(variant))
+        }) {
+            return Err(LibVmError::InvalidCreateRequest {
+                name,
+                reason: "requested platform differs from selected source identity".into(),
+            });
+        }
+    }
+    if let Some(platform) = userspace {
+        let boot = crate::runtime::boot_assets::direct_boot_profile(
+            &platform,
+            crate::RootSelector::WholeDisk,
+        )?;
+        crate::runtime::boot_assets::effective_boot_profile(
+            &boot,
+            &spec,
+            runtime.effective_backend(),
+        )?;
+    }
     let materialized = match request.resolved_oci_image.as_ref() {
         Some(image) => runtime.materialize_resolved_oci_image(image).await?,
         None => runtime.materialize_image(&image_source).await?,
     };
+    if materialized.managed.is_some() {
+        if let Some(kernel) = spec.boot.as_mut().and_then(|boot| boot.kernel.as_mut()) {
+            kernel.path = None;
+            kernel.initramfs = None;
+        }
+    }
+    let mut admitted_storage = crate::MachineStorageRecord::opaque_raw(
+        crate::PrivatePath::new("root.raw")?,
+        materialized.size_bytes,
+        &materialized.platform,
+    )?;
+    if let Some(record) = materialized
+        .managed
+        .as_ref()
+        .map(|consumer| &consumer.info.record)
+    {
+        admitted_storage.boot = record.boot.clone();
+        if let crate::BootProfile::LinuxDirect {
+            binding: crate::BootBinding::Pinned { agent, .. },
+            ..
+        } = &record.boot
+        {
+            if request.agent_mode.as_ref().is_some_and(|mode| {
+                mode != &MachineAgent::Default && mode.enabled() != agent.is_some()
+            }) || (matches!(&image_source, ImageSource::Managed(_))
+                && (matches!(&request.guest.agent, MachineAgent::Custom { .. })
+                    || (request.guest.agent == MachineAgent::Disabled && agent.is_some())))
+            {
+                return Err(LibVmError::InvalidCreateRequest {
+                    name,
+                    reason: "agent changes require the explicit complete boot-assets update".into(),
+                });
+            }
+            if !matches!(&request.guest.agent, MachineAgent::Custom { .. }) {
+                request.guest.agent = if agent.is_some() {
+                    MachineAgent::Default
+                } else {
+                    MachineAgent::Disabled
+                };
+            }
+            request.agent_mode = Some(request.guest.agent.clone());
+        }
+        admitted_storage.profile = crate::StorageProfile::OpaqueRawV1;
+        admitted_storage.backend = crate::BackendRequirement::RawBlock;
+        if let crate::MachineRoot::OpaqueRaw {
+            layout,
+            initial_content,
+            ..
+        } = &mut admitted_storage.root
+        {
+            *layout = record.root.layout.clone();
+            *initial_content = Some(record.root.stream.stream);
+        }
+        if request.process == ProcessConfig::default() {
+            request.process = record.process.clone();
+        }
+    }
+    crate::runtime::boot_assets::effective_boot(
+        &admitted_storage,
+        &spec,
+        runtime.effective_backend(),
+    )?;
     let _name_lock = runtime.lock_machine_names().await?;
     let mut create = create_machine_guard(
         runtime,
@@ -639,111 +884,191 @@ async fn create_machine_config_with_name(
     });
     crate::storage::limits::validate_disk_length(root_disk_size)
         .map_err(crate::storage::StorageError::from)?;
-    let (rootfs_path, storage) = if overlay {
-        let stream = materialized.stream.ok_or_else(|| {
-            crate::machine::root_storage::invalid(
-                "materialized OCI base has no retained stream identity",
-            )
-        })?;
-        let lower_uuid = crate::machine::root_storage::filesystem_uuid(&materialized.rootfs_path)?;
-        let rootfs_path = create.dir().join("upper.raw");
-        let capacity = rootfs_spec::upper_geometry::UpperCapacity::new(root_disk_size)
-            .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
-        let formatted = disk_image::ext4::upper::format_upper(&rootfs_path, capacity)?;
-        let mut storage = crate::MachineStorageRecord::opaque_raw(
-            crate::PrivatePath::new("upper.raw")?,
-            root_disk_size,
-            &materialized.platform,
-        )?;
-        storage.root = crate::MachineRoot::LinuxOverlay {
-            lower: crate::OverlayLower::FlatExt4 {
-                stream,
-                geometry: vm_spec::DiskGeometry {
-                    length: materialized.size_bytes,
-                    logical_sector_size: 512,
-                },
-                filesystem_uuid: lower_uuid,
-            },
-            upper: crate::PrivatePath::new("upper.raw")?,
-            upper_uuid: formatted.uuid,
-            capacity: root_disk_size,
-            ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
-            overlay_profile: crate::OverlayProfile::SiloOverlayV1,
-            temporary_directory: request.temporary_directory,
-        };
-        storage.profile = crate::StorageProfile::LinuxOverlayV1;
-        storage.backend = crate::BackendRequirement::KrunOverlay;
-        if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
-            *root_selector = crate::RootSelector::ManagedOverlay;
-        }
-        storage.validate()?;
-        (rootfs_path, Some(storage))
-    } else {
-        let rootfs_path = create.dir().join(root_disk_relative_path());
-        let source = crate::storage::stream::open_regular_source(&materialized.rootfs_path)?;
-        source.sync_all()?;
+    // The immutable import has its own, completed capacity phase. Reserve the
+    // later private machine copy separately, on its actual destination device.
+    // This worker keeps the original OFD until machine publication has settled.
+    let copy_reservation = if !overlay {
+        let store = runtime.native_store()?;
         let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
             crate::machine::root_storage::invalid("new machine directory disappeared")
         })?;
-        let stage_name = format!(".copy-{}", uuid::Uuid::new_v4());
-        let stage = directory.create_dir(&stage_name)?.ok_or_else(|| {
-            crate::machine::root_storage::invalid("private copy staging collision")
-        })?;
-        let mut qualification = CopyQualification::new(32);
-        let mut prepared = copy_private(
-            crate::machine::root_disk::CopySource::Unscanned {
-                file: &source,
-                length: materialized.size_bytes,
-            },
-            stage,
-            "content",
-            &mut qualification,
-        )?;
-        tracing::debug!(
-            method = ?prepared.method(),
-            verification = ?prepared.verification(),
-            file = ?prepared.file(),
-            length = materialized.size_bytes,
-            "prepared private root copy",
-        );
-        prepared.publish(directory.try_clone()?, "root.raw")?;
-        prepared.retain();
-        directory.remove_tree(&stage_name)?;
-        directory.sync()?;
-        if let Some(size_bytes) = request.disk_size_bytes {
-            resize_raw_disk(&rootfs_path, size_bytes)?;
-        }
-        (rootfs_path, None)
+        let (operation, lease) = store.begin_stopped_operation("import", &[], &[]).await?;
+        Some((store, operation, lease, directory))
+    } else {
+        None
     };
-    if let Some(disks) = create
-        .spec
-        .storage
-        .as_mut()
-        .map(|storage| &mut storage.disks)
-    {
-        for disk in disks {
-            match disk.role {
-                vm_spec::DiskRole::RootLower => disk.geometry.length = materialized.size_bytes,
-                vm_spec::DiskRole::Root | vm_spec::DiskRole::RootUpper => {
-                    disk.geometry.length = root_disk_size
+    // Move the guard into this result boundary so every ordinary failure
+    // rolls back its private tree before the stopped producer releases space.
+    // Publication still owns its own guard and preserves uncertain commits.
+    let reservation = copy_reservation.as_ref();
+    let result = async move {
+        if let Some((store, operation, _, directory)) = reservation {
+            store
+                .reserve_copy_space(
+                    *operation,
+                    materialized.size_bytes.max(root_disk_size),
+                    directory,
+                )
+                .await?;
+        }
+        let (rootfs_path, storage) = if overlay {
+            let stream = materialized.stream.ok_or_else(|| {
+                crate::machine::root_storage::invalid(
+                    "materialized OCI base has no retained stream identity",
+                )
+            })?;
+            let lower_uuid =
+                crate::machine::root_storage::filesystem_uuid(&materialized.rootfs_path)?;
+            let rootfs_path = create.dir().join("upper.raw");
+            let capacity = rootfs_spec::upper_geometry::UpperCapacity::new(root_disk_size)
+                .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
+            let formatted = disk_image::ext4::upper::format_upper(&rootfs_path, capacity)?;
+            let mut storage = crate::MachineStorageRecord::opaque_raw(
+                crate::PrivatePath::new("upper.raw")?,
+                root_disk_size,
+                &materialized.platform,
+            )?;
+            storage.root = crate::MachineRoot::LinuxOverlay {
+                lower: crate::OverlayLower::FlatExt4 {
+                    stream,
+                    geometry: vm_spec::DiskGeometry {
+                        length: materialized.size_bytes,
+                        logical_sector_size: 512,
+                    },
+                    filesystem_uuid: lower_uuid,
+                },
+                upper: crate::PrivatePath::new("upper.raw")?,
+                upper_uuid: formatted.uuid,
+                capacity: root_disk_size,
+                ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
+                overlay_profile: crate::OverlayProfile::SiloOverlayV1,
+                temporary_directory: request.temporary_directory,
+            };
+            storage.profile = crate::StorageProfile::LinuxOverlayV1;
+            storage.backend = crate::BackendRequirement::KrunOverlay;
+            if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
+                *root_selector = crate::RootSelector::ManagedOverlay;
+            }
+            storage.validate()?;
+            (rootfs_path, Some(storage))
+        } else {
+            let rootfs_path = create.dir().join(root_disk_relative_path());
+            let source_file;
+            let source = match &materialized.authenticated {
+                Some(stream) => crate::machine::root_disk::CopySource::Authenticated(stream),
+                None => {
+                    source_file =
+                        crate::storage::stream::open_regular_source(&materialized.rootfs_path)?;
+                    source_file.sync_all()?;
+                    crate::machine::root_disk::CopySource::Unscanned {
+                        file: &source_file,
+                        length: materialized.size_bytes,
+                    }
                 }
-                vm_spec::DiskRole::Data => {}
+            };
+            let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
+                crate::machine::root_storage::invalid("new machine directory disappeared")
+            })?;
+            let stage_name = format!(".copy-{}", uuid::Uuid::new_v4());
+            let stage = directory.create_dir(&stage_name)?.ok_or_else(|| {
+                crate::machine::root_storage::invalid("private copy staging collision")
+            })?;
+            let mut qualification = CopyQualification::new(32);
+            let mut prepared = copy_private(source, stage, "content", &mut qualification)?;
+            tracing::debug!(
+                method = ?prepared.method(),
+                verification = ?prepared.verification(),
+                file = ?prepared.file(),
+                length = materialized.size_bytes,
+                "prepared private root copy",
+            );
+            prepared.publish(directory.try_clone()?, "root.raw")?;
+            prepared.retain();
+            directory.remove_tree(&stage_name)?;
+            directory.sync()?;
+            if let Some(size_bytes) = request.disk_size_bytes {
+                resize_raw_disk(&rootfs_path, size_bytes)?;
+            }
+            if let crate::MachineRoot::OpaqueRaw {
+                geometry,
+                initial_content,
+                ..
+            } = &mut admitted_storage.root
+            {
+                geometry.length = root_disk_size;
+                *initial_content = if root_disk_size == materialized.size_bytes {
+                    materialized.stream
+                } else {
+                    None
+                };
+            }
+            (rootfs_path, Some(admitted_storage))
+        };
+        if let Some(disks) = create
+            .spec
+            .storage
+            .as_mut()
+            .map(|storage| &mut storage.disks)
+        {
+            for disk in disks {
+                match disk.role {
+                    vm_spec::DiskRole::RootLower => disk.geometry.length = materialized.size_bytes,
+                    vm_spec::DiskRole::Root | vm_spec::DiskRole::RootUpper => {
+                        disk.geometry.length = root_disk_size
+                    }
+                    vm_spec::DiskRole::Data => {}
+                }
             }
         }
-    }
-    write_machine_config(create.dir(), &create.name, &create.spec)?;
+        write_machine_config(create.dir(), &create.name, &create.spec)?;
 
-    let rootfs = machine_rootfs_record(&create, &materialized, rootfs_path, root_disk_size);
-    create
-        .commit(
-            runtime,
-            rootfs,
-            materialized.requested_reference,
-            &materialized.platform,
-            storage,
-            materialized._lease,
-        )
-        .await
+        let rootfs = machine_rootfs_record(&create, &materialized, rootfs_path, root_disk_size);
+        create
+            .commit(
+                runtime,
+                rootfs,
+                materialized.requested_reference,
+                &materialized.platform,
+                storage,
+                SourceOwnership {
+                    _lease: materialized._lease,
+                    _managed: materialized.managed,
+                },
+            )
+            .await
+    }
+    .await;
+    if let Some((store, operation, lease, _directory)) = copy_reservation {
+        let cleanup = async {
+            store.release_import_space(operation).await?;
+            if result.is_ok() {
+                store.finish_stopped_operation(operation).await?;
+            }
+            Ok::<_, LibVmError>(())
+        }
+        .await;
+        // The real copy/configuration/publication owner has now stopped.
+        // Close the original OFD before exclusive-lease retirement, and retain
+        // the journal for recovery if releasing its charge or completion fails.
+        drop(lease);
+        let cleanup = match cleanup {
+            Ok(()) => match crate::storage::pool::StoragePool::open(runtime.local_images_dir()) {
+                Ok(pool) => store
+                    .retire_abandoned_storage_operations(&pool)
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error.into()),
+            },
+            Err(error) => Err(error),
+        };
+        if let Err(error) = cleanup {
+            if result.is_ok() {
+                return Err(error);
+            }
+            tracing::warn!(%operation, %error, "private copy cleanup requires recovery");
+        }
+    }
+    result
 }
 
 async fn create_machine_guard(
@@ -834,12 +1159,6 @@ fn assign_mount_tags(mounts: Vec<Mount>) -> Vec<Mount> {
         .collect()
 }
 
-fn build_kernel_cmdline(kernel_args: Vec<String>) -> Vec<String> {
-    let mut cmdline = vec![ROOT_DISK_KERNEL_ARG.to_string()];
-    cmdline.extend(kernel_args);
-    cmdline
-}
-
 fn canonicalize_existing_paths(paths: &[PathBuf], kind: &str) -> Result<Vec<PathBuf>, LibVmError> {
     paths
         .iter()
@@ -897,13 +1216,21 @@ impl MachineCreateGuard {
         image_ref: String,
         platform: &oci::Platform,
         storage: Option<crate::MachineStorageRecord>,
-        lease: Option<crate::storage::locks::StorageLock>,
+        source: SourceOwnership,
     ) -> Result<MachineConfig, LibVmError> {
         let config = self.config(image_ref, Some(rootfs.root_disk_size_bytes))?;
         let root_path = rootfs.root_disk_path.clone();
         let map = tokio::task::spawn_blocking(move || {
             use std::os::unix::fs::OpenOptionsExt;
-            let map = if storage.is_none() {
+            let map = if storage.as_ref().is_none_or(|storage| {
+                matches!(
+                    &storage.root,
+                    crate::MachineRoot::OpaqueRaw {
+                        initial_content: None,
+                        ..
+                    }
+                )
+            }) {
                 Some(crate::storage::stream::StreamHasher::new().hash_file(&root_path)?)
             } else {
                 None
@@ -926,7 +1253,16 @@ impl MachineCreateGuard {
             }
         })?;
         directory.sync()?;
-        let storage = match (storage, map) {
+        let mut storage = match (storage, map) {
+            (Some(mut storage), Some(map)) => {
+                if let crate::MachineRoot::OpaqueRaw {
+                    initial_content, ..
+                } = &mut storage.root
+                {
+                    *initial_content = Some(map.id());
+                }
+                storage
+            }
             (Some(storage), _) => storage,
             (None, Some(map)) => {
                 let mut storage = crate::MachineStorageRecord::opaque_raw(
@@ -948,8 +1284,48 @@ impl MachineCreateGuard {
                 ))
             }
         };
-        self.publish_owned(runtime.clone(), config, rootfs, storage, lease)
-            .await?
+        let store = runtime.native_store()?;
+        let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
+        let (boot_operation, boot_lease) =
+            store.begin_stopped_operation("import", &[], &[]).await?;
+        let boot_operation_paths = pool.create_operation_with_lease(boot_operation, boot_lease)?;
+        let context = runtime.captured_boot_context(&pool, &store, boot_operation);
+        let selection = match &storage.boot {
+            crate::BootProfile::LinuxDirect {
+                binding: crate::BootBinding::Pinned { .. },
+                ..
+            } => {
+                let crate::BootProfile::LinuxDirect { binding, .. } = &storage.boot else {
+                    return Err(crate::machine::root_storage::invalid(
+                        "creation requires direct boot",
+                    ));
+                };
+                crate::BootAssetSelection::Exact {
+                    bundle: binding.digest()?,
+                }
+            }
+            _ => crate::runtime::boot_assets::configured_boot_selection(
+                &config.spec,
+                &config.guest.agent,
+                &context,
+            ),
+        };
+        storage.boot =
+            crate::runtime::boot_assets::pin_boot_selection(&storage, &selection, context).await?;
+        crate::runtime::boot_assets::effective_boot(
+            &storage,
+            &config.spec,
+            runtime.effective_backend(),
+        )?;
+        self.publish_owned(
+            runtime.clone(),
+            config,
+            rootfs,
+            storage,
+            source,
+            Some(boot_operation_paths),
+        )
+        .await?
     }
 
     fn publish_owned(
@@ -958,34 +1334,44 @@ impl MachineCreateGuard {
         config: MachineConfig,
         rootfs: MachineRootfsRecord,
         storage: crate::MachineStorageRecord,
-        lease: Option<crate::storage::locks::StorageLock>,
+        source: SourceOwnership,
+        boot_operation: Option<crate::storage::pool::OperationPaths>,
     ) -> tokio::task::JoinHandle<Result<MachineConfig, LibVmError>> {
         let initial_state = stopped_machine_state(config.id, None);
         // The whole guard, not just its Copy preservation flag, moves into
         // this task before its caller can lose the publication JoinHandle.
-        tokio::spawn(async move {
-            let mut guard = self;
-            let _lease = lease;
-            // Runtime shutdown can abort this task after SQLite commits but
-            // before its future reports completion. Preserve owned state until
-            // a completed result or reread proves that publication rolled back.
-            guard.preserve = true;
-            if let Err(error) = runtime
-                .add_machine_record_with_rootfs(&config, &initial_state, &rootfs, &storage)
-                .await
-            {
-                if matches!(
-                    &error,
-                    LibVmError::MachineAlreadyExists { .. }
-                        | LibVmError::InvalidCreateRequest { .. }
-                        | LibVmError::InvalidStorageRecord { .. }
-                ) || matches!(runtime.machine_config(config.id).await, Ok(None))
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                let mut guard = self;
+                let _source = source;
+                // Retain every source closure and the private tree through the real
+                // publication worker, including requester cancellation. An uncertain
+                // catalog commit retains state until a reread proves rollback.
+                guard.preserve = true;
+                if let Err(error) = runtime
+                    .add_machine_record_with_rootfs(&config, &initial_state, &rootfs, &storage)
+                    .await
                 {
-                    guard.preserve = false;
+                    if matches!(
+                        &error,
+                        LibVmError::MachineAlreadyExists { .. }
+                            | LibVmError::InvalidCreateRequest { .. }
+                            | LibVmError::InvalidStorageRecord { .. }
+                    ) || matches!(runtime.machine_config(config.id).await, Ok(None))
+                    {
+                        guard.preserve = false;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            Ok::<_, LibVmError>(config)
+                if let Some(operation) = boot_operation {
+                    runtime
+                        .native_store()?
+                        .finish_stopped_operation(operation.id)
+                        .await?;
+                }
+                Ok::<_, LibVmError>(config)
+            })
         })
     }
 
@@ -1267,11 +1653,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use test_utils::direct_kernel::host_kernel;
     use vm_spec::{Boot, Guest, GuestOs, Hardware, Kernel, Mount, VmSpec};
 
     use crate::machine::builder::{
-        assign_mount_tags, build_kernel_cmdline, create_machine_config, create_machine_guard,
-        MachineCreateGuard, MachineCreatePlan, MachineCreateRequest, ROOT_DISK_KERNEL_ARG,
+        assign_mount_tags, create_machine_config, create_machine_guard, MachineCreateGuard,
+        MachineCreatePlan, MachineCreateRequest,
     };
     use crate::paths::{root_disk_relative_path, LocalPaths};
     use crate::runtime::Runtime;
@@ -1338,6 +1725,22 @@ mod tests {
     async fn runtime_with_sqlite_store(paths: LocalPaths) -> (Runtime, Arc<Store>) {
         let store = Arc::new(Store::new(&paths).await.expect("open sqlite store"));
         let components = crate::runtime::components::test_components(paths.home());
+        std::fs::create_dir_all(components.asset_dir()).unwrap();
+        let kernel = host_kernel("unit-test packaged boot asset");
+        for (path, bytes) in [
+            (components.kernel(), kernel.as_slice()),
+            (
+                components.initramfs(),
+                b"unit-test packaged boot asset".as_slice(),
+            ),
+            (
+                components.agent(),
+                b"unit-test packaged boot asset".as_slice(),
+            ),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let runtime = Runtime::from_store(
             paths,
             store.clone(),
@@ -1382,12 +1785,13 @@ mod tests {
         std::fs::create_dir_all(&boot_dir).expect("create boot assets dir");
         let kernel = boot_dir.join("kernel-default");
         let initramfs = boot_dir.join("initramfs");
-        std::fs::write(&kernel, b"kernel").expect("write kernel");
-        std::fs::write(&initramfs, b"initramfs").expect("write initramfs");
+        std::fs::write(&kernel, host_kernel("kernel")).expect("write kernel");
+        std::fs::write(&initramfs, b"unit-test packaged boot asset").expect("write initramfs");
 
         MachineCreateRequest {
             image_source: Some(ImageSource::disk(base_rootfs_path)),
             resolved_oci_image: None,
+            platform: None,
             name: Some(name.to_string()),
             labels: std::collections::BTreeMap::new(),
             metadata: std::collections::BTreeMap::new(),
@@ -1400,7 +1804,7 @@ mod tests {
             root_profile: crate::RootProfile::OpaqueRaw,
             temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
             nested_virtualization: false,
-            rosetta: false,
+            rosetta: None,
             userdata: None,
             disks: Vec::new(),
             mounts: Vec::new(),
@@ -1435,16 +1839,10 @@ mod tests {
         let image_dir = data_dir.join("fixtures");
         std::fs::create_dir_all(&image_dir).expect("image dir should be created");
         let base_rootfs_path = image_dir.join("root.raw");
-        std::fs::write(&base_rootfs_path, [0x64; 512]).expect("rootfs should be written");
-        base_rootfs_path
-    }
-
-    fn write_base_rootfs_with_size(data_dir: &Path, size: u64) -> PathBuf {
-        let image_dir = data_dir.join("fixtures");
-        std::fs::create_dir_all(&image_dir).expect("image dir should be created");
-        let base_rootfs_path = image_dir.join("root.raw");
-        let file = std::fs::File::create(&base_rootfs_path).expect("rootfs should be created");
-        file.set_len(size).expect("rootfs size should be set");
+        disk_image::ext4::Formatter::new(&base_rootfs_path, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
         base_rootfs_path
     }
 
@@ -1452,19 +1850,9 @@ mod tests {
     async fn create_machine_config_clones_root_disk_and_sets_defaults() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .withf(|name| name == "devbox")
-            .once()
-            .returning(|_| Ok(None));
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|_, _, _, _| Ok(()));
-        let runtime = runtime_with_mock_store(paths, store).await;
+        let (runtime, store) = runtime_with_sqlite_store(paths).await;
         let base_rootfs_path = write_base_rootfs(temp.path());
+        let source_length = std::fs::metadata(&base_rootfs_path).unwrap().len();
 
         let mut request = create_request(base_rootfs_path, "devbox");
         request.kernel = None;
@@ -1478,13 +1866,119 @@ mod tests {
         assert_eq!(machine.name, "devbox");
         assert_eq!(spec_hardware(&machine.spec).cpus, Some(1));
         assert_eq!(spec_hardware(&machine.spec).memory, Some(512));
-        assert_eq!(
-            spec_kernel(&machine.spec).cmdline,
-            vec![ROOT_DISK_KERNEL_ARG.to_string()]
-        );
+        assert_eq!(spec_hardware(&machine.spec).rosetta, None);
+        assert!(spec_kernel(&machine.spec).cmdline.is_empty());
         assert!(spec_kernel(&machine.spec).path.is_none());
         assert!(spec_kernel(&machine.spec).initramfs.is_none());
-        assert_eq!(machine.root_disk_size, Some(512));
+        assert_eq!(machine.root_disk_size, Some(source_length));
+        assert_eq!(std::fs::metadata(root_disk).unwrap().len(), source_length);
+        let operations: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM storage_operation WHERE kind='import'")
+                .fetch_one(store.test_pool())
+                .await
+                .unwrap();
+        let reservations: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM capture_resource_reservation")
+                .fetch_one(store.test_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            operations, 0,
+            "successful create retires its closed copy/import owners"
+        );
+        assert_eq!(
+            reservations, 0,
+            "successful create releases its private-copy capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_private_copy_shrink_failures_release_capacity_and_retire_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
+        let source = write_base_rootfs(temp.path());
+        let source_length = std::fs::metadata(&source).unwrap().len();
+        let ImageSource::Disk(request) = ImageSource::disk(source) else {
+            panic!("disk constructor must return a disk import request");
+        };
+        let image = runtime.images().import_disk(request).await.unwrap();
+        assert!(matches!(
+            image.record.root.layout,
+            crate::RawLayout::WholeDisk
+        ));
+
+        // Keep the same runtime and managed source throughout. No explicit
+        // recovery may hide a leak between failures or before valid creation.
+        for attempt in 0..4 {
+            let shrinking = attempt < 3;
+            let result = runtime
+                .machine()
+                .name("private-copy-retry")
+                .image_source(ImageSource::Managed(crate::ManagedSourceRef::Image(
+                    image.id,
+                )))
+                .root_disk_size(if shrinking {
+                    source_length / 2
+                } else {
+                    source_length
+                })
+                .create()
+                .await;
+            if shrinking {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(&error, LibVmError::RootDisk { message }
+                        if message.contains("refusing to shrink raw disk")),
+                    "{error}"
+                );
+                assert!(store
+                    .machine_config_by_name("private-copy-retry")
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(
+                    std::fs::read_dir(paths.home().join("machines"))
+                        .unwrap()
+                        .next()
+                        .is_none(),
+                    "failed private copy must remove its machine directory"
+                );
+            } else {
+                let machine = result.expect("failed attempts must not charge valid creation");
+                let config = store
+                    .machine_config(machine.machine_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    std::fs::metadata(config.machine_dir.join(root_disk_relative_path()))
+                        .unwrap()
+                        .len(),
+                    source_length
+                );
+            }
+
+            let reservations: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM capture_resource_reservation")
+                    .fetch_one(store.test_pool())
+                    .await
+                    .unwrap();
+            assert_eq!(reservations, 0, "attempt {attempt} leaked a reservation");
+            let operations: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM storage_operation WHERE kind='import'")
+                    .fetch_one(store.test_pool())
+                    .await
+                    .unwrap();
+            assert_eq!(operations, 0, "attempt {attempt} left a stopped copy owner");
+            for entry in std::fs::read_dir(paths.home().join("resource-budget")).unwrap() {
+                assert_ne!(
+                    entry.unwrap().path().extension(),
+                    Some(std::ffi::OsStr::new("json")),
+                    "attempt {attempt} left a budget document"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1635,37 +2129,22 @@ mod tests {
     }
 
     #[test]
-    fn kernel_cmdline_appends_args_after_root_disk() {
-        assert_eq!(
-            build_kernel_cmdline(vec![
-                "systemd.firstboot=off".to_string(),
-                "quiet".to_string(),
-                "quiet".to_string(),
-            ]),
-            [
-                ROOT_DISK_KERNEL_ARG,
-                "systemd.firstboot=off",
-                "quiet",
-                "quiet",
-            ]
+    fn root_discovery_is_not_generated_as_a_kernel_argument() {
+        assert!(
+            crate::machine::root_storage::validate_root_arguments(&["quiet".into()], false).is_ok()
         );
+        assert!(crate::machine::root_storage::validate_root_arguments(
+            &["root=/dev/vda".into()],
+            false
+        )
+        .is_err());
     }
 
     #[tokio::test]
     async fn create_machine_config_generates_name_when_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .once()
-            .returning(|_| Ok(None));
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|_, _, _, _| Ok(()));
-        let runtime = runtime_with_mock_store(paths, store).await;
+        let (runtime, _store) = runtime_with_sqlite_store(paths).await;
         let base_rootfs_path = write_base_rootfs(temp.path());
         let mut request = create_request(base_rootfs_path, "ignored");
         request.name = None;
@@ -1678,79 +2157,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_machine_config_retries_generated_name_conflicts() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    async fn create_machine_config_rejects_actual_name_conflict_and_generates_distinct_names() {
+        let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .times(2)
-            .returning(|name| {
-                if name.contains("-") {
-                    static SEEN: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if !SEEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        return Ok(Some(crate::store::models::MachineConfig {
-                            id: MachineId::new(),
-                            lock_id: crate::lock_manager::LockId::from(0),
-                            name: name.to_string(),
-                            spec: VmSpec::current(),
-                            machine_dir: PathBuf::from("/tmp/existing"),
-                            created_at: 1,
-                            modified_at: 1,
-                            image_ref: "image".to_string(),
-                            root_disk_size: None,
-                            labels: std::collections::BTreeMap::new(),
-                            metadata: std::collections::BTreeMap::new(),
-                            network: MachineNetworkConfig::default(),
-                            guest: crate::machine::MachineGuestConfig::default(),
-                            retention: MachineRetention::Persistent,
-                            process: ProcessConfig::default(),
-                            template_name: None,
-                            agent_mode: None,
-                        }));
-                    }
-                }
-                Ok(None)
-            });
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|_, _, _, _| Ok(()));
-        let runtime = runtime_with_mock_store(paths, store).await;
-        let base_rootfs_path = write_base_rootfs(temp.path());
-        let mut request = create_request(base_rootfs_path, "ignored");
-        request.name = None;
-
-        let config = create_machine_config(&runtime, request)
+        let (runtime, _store) = runtime_with_sqlite_store(paths).await;
+        let source = write_base_rootfs(temp.path());
+        create_machine_config(&runtime, create_request(source.clone(), "occupied"))
             .await
-            .expect("machine should be created after retry");
-
-        crate::machine::validate_machine_name(&config.name).expect("generated name is valid");
+            .unwrap();
+        assert!(matches!(
+            create_machine_config(&runtime, create_request(source.clone(), "occupied")).await,
+            Err(LibVmError::MachineAlreadyExists { .. })
+        ));
+        let mut request = create_request(source, "ignored");
+        request.name = None;
+        let generated = create_machine_config(&runtime, request).await.unwrap();
+        assert_ne!(generated.name, "occupied");
+        crate::machine::validate_machine_name(&generated.name).unwrap();
     }
 
     #[tokio::test]
     async fn create_machine_config_respects_requested_resources() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .once()
-            .returning(|_| Ok(None));
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|_, _, _, _| Ok(()));
-        let runtime = runtime_with_mock_store(paths, store).await;
+        let (runtime, _store) = runtime_with_sqlite_store(paths).await;
         let base_rootfs_path = write_base_rootfs(temp.path());
         let mut request = create_request(base_rootfs_path, "devbox");
         request.cpus = Some(4);
         request.memory = Some(Memory::gibibytes(8));
         request.nested_virtualization = true;
-        request.rosetta = true;
+        request.rosetta = Some(false);
 
         let config = create_machine_config(&runtime, request)
             .await
@@ -1760,24 +2196,14 @@ mod tests {
         assert_eq!(hardware.cpus, Some(4));
         assert_eq!(hardware.memory, Some(8192));
         assert_eq!(hardware.nested_virtualization, Some(true));
-        assert_eq!(hardware.rosetta, Some(true));
+        assert_eq!(hardware.rosetta, Some(false));
     }
 
     #[tokio::test]
     async fn create_machine_config_rounds_memory_bytes_up_to_mebibytes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .once()
-            .returning(|_| Ok(None));
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|_, _, _, _| Ok(()));
-        let runtime = runtime_with_mock_store(paths, store).await;
+        let (runtime, _store) = runtime_with_sqlite_store(paths).await;
         let base_rootfs_path = write_base_rootfs(temp.path());
         let mut request = create_request(base_rootfs_path, "devbox");
         request.memory = Some(Memory::bytes(1));
@@ -1804,7 +2230,9 @@ mod tests {
             .await
             .expect_err("zero memory should be rejected");
 
-        assert!(matches!(err, LibVmError::InvalidCreateRequest { .. }));
+        assert!(
+            matches!(err, LibVmError::InvalidCreateRequest { reason, .. } if reason.contains("memory"))
+        );
     }
 
     #[tokio::test]
@@ -1847,20 +2275,11 @@ mod tests {
     async fn create_machine_config_resizes_root_disk_when_requested() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .once()
-            .returning(|_| Ok(None));
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|_, _, _, _| Ok(()));
-        let runtime = runtime_with_mock_store(paths, store).await;
-        let base_rootfs_path = write_base_rootfs_with_size(temp.path(), 512);
+        let (runtime, _store) = runtime_with_sqlite_store(paths).await;
+        let base_rootfs_path = write_base_rootfs(temp.path());
+        let requested_length = std::fs::metadata(&base_rootfs_path).unwrap().len() + 1024 * 1024;
         let mut request = create_request(base_rootfs_path, "devbox");
-        request.disk_size_bytes = Some(1024);
+        request.disk_size_bytes = Some(requested_length);
 
         let config = create_machine_config(&runtime, request)
             .await
@@ -1871,31 +2290,16 @@ mod tests {
             std::fs::metadata(root_disk)
                 .expect("root disk metadata")
                 .len(),
-            1024
+            requested_length
         );
-        assert_eq!(config.root_disk_size, Some(1024));
+        assert_eq!(config.root_disk_size, Some(requested_length));
     }
 
     #[tokio::test]
     async fn create_guard_and_commit_write_vm_spec_and_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .once()
-            .returning(|_| Ok(None));
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|config, state, rootfs, _| {
-                assert_eq!(config.name, "devbox");
-                assert_eq!(state.machine_id, config.id);
-                assert_eq!(rootfs.machine_id, config.id);
-                Ok(())
-            });
-        let runtime = runtime_with_mock_store(paths, store).await;
+        let (runtime, store) = runtime_with_sqlite_store(paths).await;
 
         let create = create_guard_sample(&runtime, "devbox")
             .await
@@ -1922,7 +2326,7 @@ mod tests {
                 "test-image:latest".to_string(),
                 &oci::Platform::host().unwrap(),
                 None,
-                None,
+                crate::machine::builder::SourceOwnership::default(),
             )
             .await
             .expect("commit should succeed");
@@ -1930,6 +2334,19 @@ mod tests {
         assert!(config.machine_dir.exists());
         assert_eq!(config.machine_dir, machine_dir);
         assert!(config_path.exists());
+        assert_eq!(
+            store.machine_config(config.id).await.unwrap().unwrap(),
+            config
+        );
+        assert_eq!(
+            store
+                .machine_rootfs(config.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .machine_id,
+            config.id
+        );
     }
 
     #[tokio::test]
@@ -1995,24 +2412,7 @@ mod tests {
     async fn create_guard_commit_failure_removes_machine_dir_root_disk_and_frees_lock() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = LocalPaths::new(temp.path().join("silo"));
-        let mut store = MockDataStore::new();
-        expect_empty_refresh(&mut store);
-        store
-            .expect_machine_config_by_name()
-            .once()
-            .returning(|_| Ok(None));
-        store
-            .expect_add_machine_with_rootfs()
-            .once()
-            .returning(|config, state, rootfs, _| {
-                assert_eq!(config.name, "devbox");
-                assert_eq!(state.machine_id, config.id);
-                assert_eq!(rootfs.machine_id, config.id);
-                Err(LibVmError::MachineAlreadyExists {
-                    name: config.name.clone(),
-                })
-            });
-        let runtime = runtime_with_mock_store(paths, store).await;
+        let (runtime, _store) = runtime_with_sqlite_store(paths).await;
 
         let create = create_guard_sample(&runtime, "devbox")
             .await
@@ -2026,6 +2426,10 @@ mod tests {
             .id();
         let lock_path = runtime.local_paths().locks_dir().join(lock_id.to_string());
         std::fs::write(&root_disk_path, [0x64; 512]).expect("write root disk");
+        let source = write_base_rootfs(temp.path());
+        create_machine_config(&runtime, create_request(source, "devbox"))
+            .await
+            .unwrap();
 
         let rootfs = rootfs_record(&create);
         let err = create
@@ -2035,15 +2439,12 @@ mod tests {
                 "test-image:latest".to_string(),
                 &oci::Platform::host().unwrap(),
                 None,
-                None,
+                crate::machine::builder::SourceOwnership::default(),
             )
             .await
             .expect_err("commit should fail");
 
-        assert!(matches!(
-            err,
-            LibVmError::MachineAlreadyExists { ref name } if name == "devbox"
-        ));
+        assert!(matches!(err, LibVmError::MachineAlreadyExists { name } if name == "devbox"));
         assert!(!machine_dir.exists());
         assert!(!root_disk_path.exists());
         assert!(!lock_path.exists());
@@ -2067,6 +2468,7 @@ mod tests {
         let paths = LocalPaths::new(temp.path().join("silo"));
         let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
         let source = write_base_rootfs(temp.path());
+        let requested_length = std::fs::metadata(&source).unwrap().len() + 1024 * 1024;
         let source_id = crate::storage::stream::StreamHasher::new()
             .hash_file(&source)
             .unwrap()
@@ -2075,7 +2477,7 @@ mod tests {
             .machine()
             .name("typed-root")
             .image_source(ImageSource::disk(source))
-            .root_disk_size(1024)
+            .root_disk_size(requested_length)
             .create()
             .await
             .unwrap();
@@ -2089,7 +2491,7 @@ mod tests {
         assert_ne!(initial_id, source_id);
         assert!(
             matches!(&storage.root, crate::MachineRoot::OpaqueRaw { path, geometry, layout: crate::RawLayout::WholeDisk, initial_content: Some(identity) }
-            if path.as_path() == Path::new("root.raw") && geometry.length == 1024 && *identity == initial_id)
+            if path.as_path() == Path::new("root.raw") && geometry.length == requested_length && *identity == initial_id)
         );
         assert_eq!(storage.stop_outcome, crate::StorageStopOutcome::Unknown);
         assert_eq!(
@@ -2201,6 +2603,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_init_override_is_refused_before_any_machine_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
+        let source = write_base_rootfs(temp.path());
+        let expected = std::fs::read(&source).unwrap();
+        let machines = paths.home().join("machines");
+        for kernel_args in [
+            vec!["rdinit=/agent/silo-agent"],
+            vec!["\"rdinit=/agent/silo-agent\""],
+            vec!["rdinit=\"/agent/silo-agent\""],
+            vec!["rdinit="],
+            vec!["quiet\u{b}rdinit=/agent/silo-agent"],
+            vec!["console=hvc0", "\"rdinit=/agent/silo-agent", "quiet\""],
+        ] {
+            let mut request = create_request(source.clone(), "trusted-init");
+            request.kernel_args = kernel_args.iter().map(|arg| (*arg).to_string()).collect();
+            let error = create_machine_config(&runtime, request).await.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    LibVmError::InvalidCreateRequest { reason, .. }
+                        if reason.contains("rdinit= is reserved")
+                ),
+                "{kernel_args:?}: {error}"
+            );
+            assert!(store
+                .machine_config_by_name("trusted-init")
+                .await
+                .unwrap()
+                .is_none());
+            if machines.exists() {
+                assert!(std::fs::read_dir(&machines).unwrap().next().is_none());
+            }
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), expected);
+
+        // The identical request publishes once the override is gone; `init=`
+        // remains the image handoff and quoted text naming rdinit is inert.
+        let mut request = create_request(source, "trusted-init");
+        request.kernel_args = vec!["init=/sbin/init".into(), "\"a rdinit=/x\"".into()];
+        let config = create_machine_config(&runtime, request).await.unwrap();
+        assert_eq!(
+            spec_kernel(&config.spec).cmdline,
+            ["init=/sbin/init", "\"a rdinit=/x\""]
+        );
+        assert!(store
+            .machine_config_by_name("trusted-init")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn vmdk_real_create_keeps_published_directory_and_root_after_guard_drop() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
@@ -2238,17 +2694,37 @@ mod tests {
         let config = create.config("local-test".into(), Some(512)).unwrap();
         let id = config.id;
         let directory = config.machine_dir.clone();
-        let storage = crate::MachineStorageRecord::opaque_raw(
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
             crate::PrivatePath::new(root_disk_relative_path()).unwrap(),
             512,
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
-        let requester = create.publish_owned(runtime, config, rootfs, storage, None);
+        let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir()).unwrap();
+        let catalog = runtime.native_store().unwrap();
+        let (operation, lease) = catalog
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let operation_paths = pool.create_operation_with_lease(operation, lease).unwrap();
+        storage.boot = crate::runtime::boot_assets::pin_boot_selection(
+            &storage,
+            &crate::BootAssetSelection::Packaged,
+            runtime.captured_boot_context(&pool, &catalog, operation),
+        )
+        .await
+        .unwrap();
+        let requester = create.publish_owned(
+            runtime,
+            config,
+            rootfs,
+            storage,
+            crate::machine::builder::SourceOwnership::default(),
+            Some(operation_paths),
+        );
         let completion = requester.abort_handle();
-        // On this current-thread runtime there is no await between spawn and
-        // dropping the requester, so publication has not yet been polled.
-        // Losing its JoinHandle must detach the task, not drop the create guard.
+        // Losing the requester must not drop the actual blocking publication
+        // owner or any part of its machine/source/storage capabilities.
         drop(requester);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !completion.is_finished() {
@@ -2263,6 +2739,117 @@ mod tests {
         assert_eq!(
             std::fs::read(directory.join(root_disk_relative_path())).unwrap(),
             [0x64; 512]
+        );
+    }
+
+    #[tokio::test]
+    async fn vz_oci_rejection_happens_before_asset_or_registry_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let store = Arc::new(Store::new(&paths).await.unwrap());
+        let components = crate::runtime::components::test_components(paths.home());
+        let runtime = Runtime::from_store(
+            paths.clone(),
+            store.clone(),
+            RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            components,
+            Some(crate::VirtBackendOverride::Vz),
+        )
+        .await
+        .unwrap();
+        let images_existed = paths.images_dir().exists();
+        let error = runtime
+            .machine()
+            .name("vz-oci")
+            .image("invalid.invalid/not-contacted:latest")
+            .kernel(temp.path().join("missing-kernel"))
+            .create()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LibVmError::BackendAdmissionRejected {
+                remedy: crate::AdmissionRemedy::ExplicitOciToRawConversion,
+                ..
+            }
+        ));
+        assert!(store.list_machine_configs().await.unwrap().is_empty());
+        assert_eq!(paths.images_dir().exists(), images_existed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_snapshot_source_restores_complete_configuration_and_rejects_hidden_overrides()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let (runtime, store) = runtime_with_sqlite_store(paths).await;
+        let source = write_base_rootfs(temp.path());
+        let mut request = create_request(source, "snapshot-source");
+        request.cpus = Some(3);
+        request.process = ProcessConfig {
+            command: Some(vec!["/bin/true".into()]),
+            ..ProcessConfig::default()
+        };
+        let source = create_machine_config(&runtime, request).await.unwrap();
+        let source_storage = store.machine_storage(source.id).await.unwrap().unwrap();
+        let source_stream = crate::storage::stream::StreamHasher::new()
+            .hash_file(&source.machine_dir.join("root.raw"))
+            .unwrap()
+            .id();
+        let machine = crate::machine::Machine::new(runtime.clone(), source.id);
+        let snapshot = machine
+            .snapshot_stopped(crate::SnapshotOptions {
+                name: Some("complete-snapshot".into()),
+                ..crate::SnapshotOptions::default()
+            })
+            .await
+            .unwrap();
+        let child = runtime
+            .machine()
+            .name("snapshot-child")
+            .image_source(ImageSource::Managed(crate::ManagedSourceRef::Alias(
+                "complete-snapshot".into(),
+            )))
+            .create()
+            .await
+            .unwrap();
+        let config = store
+            .machine_config(child.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.process, source.process);
+        assert_eq!(config.spec.hardware, source.spec.hardware);
+        assert_eq!(config.guest, source.guest);
+        let child_storage = store.machine_storage(config.id).await.unwrap().unwrap();
+        assert_eq!(child_storage.boot, source_storage.boot);
+        assert!(matches!(
+            child_storage.root,
+            crate::MachineRoot::OpaqueRaw { initial_content: Some(stream), .. }
+                if stream == source_stream
+        ));
+        assert_eq!(
+            crate::storage::stream::StreamHasher::new()
+                .hash_file(&config.machine_dir.join("root.raw"))
+                .unwrap()
+                .id(),
+            source_stream
+        );
+        assert_ne!(config.machine_dir, source.machine_dir);
+        let error = runtime
+            .machine()
+            .name("snapshot-override")
+            .image_source(ImageSource::Managed(crate::ManagedSourceRef::Snapshot(
+                snapshot.id,
+            )))
+            .cpus(7)
+            .create()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, LibVmError::InvalidCreateRequest { reason, .. } if reason.contains("complete captured configuration"))
         );
     }
 }

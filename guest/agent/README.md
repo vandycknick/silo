@@ -199,8 +199,14 @@ unmounted or remounted read-only, the resulting state is verified, and final
 cleanup.
 
 Certification additionally compares every manifest block serial, geometry and
-access mode against sysfs and retained mount identities. Writable Data must
-have a retained filesystem error cursor and still be in the mount inventory.
+access mode against sysfs and retained mount identities. Partition filesystems
+are covered only through actual children of that exact parent attachment, with
+kernel slot/range/device/access facts checked against the shared GPT/MBR parser
+and held block-device measurements (including expanded-disk GPT policy).
+Whole-disk ext4, partition ext4 and mounted vfat ESP/data filesystems each need
+their own retained mount error cursor; covering the root does not cover its ESP.
+Writable Data must still be mounted and covered. Every retained mount is synced
+and unmounted or verified read-only before completion can succeed.
 Writable virtiofs, unknown mount namespaces, raw block-device workload access,
 unqualified external/concurrent writers, unmounted writable Data and unsupported
 filesystem/device stacks are explicitly noncertifying, not removed VM features.

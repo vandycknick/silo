@@ -199,6 +199,29 @@ pub struct LinuxPlatform {
     pub architecture: GuestArchitecture,
     pub variant: Option<String>,
 }
+
+impl LinuxPlatform {
+    pub fn from_oci(platform: &oci::Platform) -> Result<Self, LibVmError> {
+        if platform.os != "linux" {
+            return Err(invalid("direct boot requires Linux userspace"));
+        }
+        let platform = Self {
+            architecture: GuestArchitecture::parse(&platform.architecture)?,
+            variant: platform.variant.clone(),
+        };
+        platform.validate()?;
+        Ok(platform)
+    }
+    pub fn validate(&self) -> Result<(), LibVmError> {
+        if !matches!(
+            (self.architecture, self.variant.as_deref()),
+            (GuestArchitecture::Amd64, None) | (GuestArchitecture::Arm64, None | Some("v8"))
+        ) {
+            return Err(invalid("unsupported Linux platform variant"));
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DirectCommandLinePolicy {
@@ -225,6 +248,40 @@ pub enum RootSelector {
     MbrPartition { number: u8 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RootFilesystem {
+    Ext4,
+}
+
+/// A concrete selector must agree with the recorded disk table, never an
+/// auto-selection request or a host device spelling.
+pub(crate) fn validate_root_selection(
+    layout: &RawLayout,
+    selector: &RootSelector,
+) -> Result<(), LibVmError> {
+    let matches = match (layout, selector) {
+        (RawLayout::WholeDisk, RootSelector::WholeDisk) => true,
+        (
+            RawLayout::Partitioned {
+                table: PartitionTable::Gpt,
+            },
+            RootSelector::GptPartition { guid },
+        ) => !guid.is_nil(),
+        (
+            RawLayout::Partitioned {
+                table: PartitionTable::Mbr,
+            },
+            RootSelector::MbrPartition { number },
+        ) => (1..=4).contains(number),
+        _ => false,
+    };
+    if !matches {
+        return Err(invalid("root selector contradicts disk layout"));
+    }
+    Ok(())
+}
+
 /// Runtime-selected local boot assets are not claimed to be content-pinned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -243,6 +300,44 @@ pub enum BootBinding {
         abi: String,
     },
 }
+
+impl BootBinding {
+    /// The bundle object is exactly the existing complete pinned tuple.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, LibVmError> {
+        let Self::Pinned { abi, .. } = self else {
+            return Err(invalid("boot bundle must be pinned before publication"));
+        };
+        if abi.is_empty() {
+            return Err(invalid("boot bundle ABI is empty"));
+        }
+        let bytes = crate::store::models::snapshot::canonical_value(
+            &serde_json::to_value(self).map_err(|error| invalid(error.to_string()))?,
+        )?;
+        crate::storage::limits::Resource::MetadataPageBytes
+            .check(bytes.len() as u64)
+            .map_err(crate::storage::StorageError::from)?;
+        Ok(bytes)
+    }
+
+    pub fn digest(&self) -> Result<ObjectDigest, LibVmError> {
+        Ok(ObjectDigest::of_bytes(&self.canonical_bytes()?))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, LibVmError> {
+        crate::storage::limits::Resource::MetadataPageBytes
+            .check(bytes.len() as u64)
+            .map_err(crate::storage::StorageError::from)?;
+        let value = crate::store::models::snapshot::decode_identity_value(bytes)?;
+        let binding: Self =
+            serde_json::from_value(value.clone()).map_err(|error| invalid(error.to_string()))?;
+        if binding.canonical_bytes()? != bytes
+            || serde_json::to_value(&binding).map_err(|error| invalid(error.to_string()))? != value
+        {
+            return Err(invalid("boot bundle is not the closed canonical tuple"));
+        }
+        Ok(binding)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -257,6 +352,7 @@ pub enum BootProfile {
         command_line_policy: DirectCommandLinePolicy,
         binding: BootBinding,
         root_selector: RootSelector,
+        root_filesystem: RootFilesystem,
         translation: Translation,
     },
     LinuxEfi {
@@ -278,10 +374,21 @@ impl BootProfile {
             userspace_platform,
             kernel_architecture,
             translation,
+            root_selector,
             binding,
             ..
         } = self
         {
+            userspace_platform.validate()?;
+            match root_selector {
+                RootSelector::GptPartition { guid } if guid.is_nil() => {
+                    return Err(invalid("GPT root partition GUID is nil"));
+                }
+                RootSelector::MbrPartition { number } if !(1..=4).contains(number) => {
+                    return Err(invalid("MBR root partition number must be 1..4"));
+                }
+                _ => {}
+            }
             let translated = matches!(
                 (
                     userspace_platform.architecture,
@@ -431,22 +538,9 @@ impl MachineStorageRecord {
         length: u64,
         platform: &oci::Platform,
     ) -> Result<Self, LibVmError> {
-        if platform.os != "linux" {
-            return Err(invalid("direct boot requires Linux userspace"));
-        }
-        let userspace = GuestArchitecture::parse(&platform.architecture)?;
-        let kernel = GuestArchitecture::parse(std::env::consts::ARCH)?;
-        let translation = match (userspace, kernel) {
-            (GuestArchitecture::Amd64, GuestArchitecture::Arm64) if cfg!(target_os = "macos") => {
-                Translation::Rosetta
-            }
-            (left, right) if left == right => Translation::None,
-            _ => {
-                return Err(invalid(
-                    "userspace and kernel architectures have no admitted translation",
-                ))
-            }
-        };
+        let platform = LinuxPlatform::from_oci(platform)?;
+        let boot =
+            crate::runtime::boot_assets::direct_boot_profile(&platform, RootSelector::WholeDisk)?;
         let record = Self {
             schema: 1,
             root: MachineRoot::OpaqueRaw {
@@ -458,17 +552,7 @@ impl MachineStorageRecord {
                 layout: RawLayout::WholeDisk,
                 initial_content: None,
             },
-            boot: BootProfile::LinuxDirect {
-                userspace_platform: LinuxPlatform {
-                    architecture: userspace,
-                    variant: platform.variant.clone(),
-                },
-                kernel_architecture: kernel,
-                command_line_policy: DirectCommandLinePolicy::SiloDirectV1,
-                binding: BootBinding::RuntimeSelected,
-                root_selector: RootSelector::WholeDisk,
-                translation,
-            },
+            boot,
             profile: StorageProfile::OpaqueRawV1,
             backend: BackendRequirement::RawBlock,
             disks: Vec::new(),
@@ -495,8 +579,25 @@ impl MachineStorageRecord {
                 record: "machine-storage",
                 message: error.to_string(),
             })?;
-        record.validate()?;
+        record.validate_persistent()?;
         Ok(record)
+    }
+
+    /// Selection intent may exist during preparation, never in persisted state.
+    pub fn validate_persistent(&self) -> Result<(), LibVmError> {
+        self.validate()?;
+        if let BootProfile::LinuxDirect { binding, .. } = &self.boot {
+            match binding {
+                BootBinding::Pinned { abi, .. }
+                    if abi == crate::runtime::boot_assets::DIRECT_BOOT_ABI => {}
+                _ => {
+                    return Err(invalid(
+                        "persistent Linux direct boot requires the current complete pinned bundle",
+                    ))
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), LibVmError> {
@@ -524,22 +625,7 @@ impl MachineStorageRecord {
                 BootProfile::LinuxDirect { root_selector, .. },
                 StorageProfile::OpaqueRawV1,
                 BackendRequirement::RawBlock,
-            ) => matches!(
-                (layout, root_selector),
-                (RawLayout::WholeDisk, RootSelector::WholeDisk)
-                    | (
-                        RawLayout::Partitioned {
-                            table: PartitionTable::Gpt
-                        },
-                        RootSelector::GptPartition { .. }
-                    )
-                    | (
-                        RawLayout::Partitioned {
-                            table: PartitionTable::Mbr
-                        },
-                        RootSelector::MbrPartition { number: 1..=4 }
-                    )
-            ),
+            ) => validate_root_selection(layout, root_selector).is_ok(),
             (
                 MachineRoot::OpaqueRaw { .. },
                 BootProfile::LinuxEfi { .. } | BootProfile::MacOs { .. },
@@ -744,15 +830,64 @@ mod tests {
     use crate::store::models::storage::{MachineStorageRecord, PrivatePath};
     use crate::LibVmError;
 
+    fn pin(record: &mut MachineStorageRecord) {
+        if let crate::BootProfile::LinuxDirect {
+            binding,
+            kernel_architecture,
+            ..
+        } = &mut record.boot
+        {
+            let object =
+                crate::storage::identity::ObjectDigest::of_bytes(b"unit model boot object");
+            *binding = crate::BootBinding::Pinned {
+                kernel: object,
+                base_initramfs: object,
+                agent: None,
+                architecture: *kernel_architecture,
+                abi: crate::runtime::boot_assets::DIRECT_BOOT_ABI.into(),
+            };
+        }
+    }
+
     #[test]
-    fn invalid_closed_variants_and_combinations_are_typed_errors() {
-        let record = MachineStorageRecord::opaque_raw(
+    fn persistent_decode_refuses_transient_or_old_boot_abi() {
+        let mut record = MachineStorageRecord::opaque_raw(
             PrivatePath::new("root.raw").unwrap(),
             512,
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
+        assert!(record.validate().is_ok());
+        assert!(MachineStorageRecord::decode(&serde_json::to_string(&record).unwrap()).is_err());
+        pin(&mut record);
+        assert_eq!(
+            MachineStorageRecord::decode(&serde_json::to_string(&record).unwrap()).unwrap(),
+            record
+        );
+        if let crate::BootProfile::LinuxDirect {
+            binding: crate::BootBinding::Pinned { abi, .. },
+            ..
+        } = &mut record.boot
+        {
+            *abi = "silo-direct-v1".into();
+        }
+        assert!(MachineStorageRecord::decode(&serde_json::to_string(&record).unwrap()).is_err());
+    }
+
+    #[test]
+    fn invalid_closed_variants_and_combinations_are_typed_errors() {
+        let mut record = MachineStorageRecord::opaque_raw(
+            PrivatePath::new("root.raw").unwrap(),
+            512,
+            &oci::Platform::host().unwrap(),
+        )
+        .unwrap();
+        pin(&mut record);
         let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            MachineStorageRecord::decode(&value.to_string()).unwrap(),
+            record
+        );
         for (field, invalid) in [
             ("root", serde_json::json!({"kind":"legacy"})),
             ("boot", serde_json::json!({"kind":"bios"})),
@@ -850,6 +985,18 @@ mod tests {
             };
         }
         assert!(record.validate().is_err());
+        if let BootProfile::LinuxDirect { root_selector, .. } = &mut record.boot {
+            *root_selector = RootSelector::GptPartition {
+                guid: uuid::Uuid::nil(),
+            };
+        }
+        assert!(record.validate().is_err());
+        if let BootProfile::LinuxDirect { root_selector, .. } = &mut record.boot {
+            *root_selector = RootSelector::GptPartition {
+                guid: uuid::Uuid::new_v4(),
+            };
+        }
+        record.validate().unwrap();
     }
 
     #[test]
@@ -864,6 +1011,7 @@ mod tests {
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
+        pin(&mut record);
         let operation = uuid::Uuid::new_v4();
         let machine = uuid::Uuid::new_v4();
         record.operation = Some(StorageOperationRecord {
@@ -882,6 +1030,10 @@ mod tests {
         record.validate_for_machine(machine).unwrap();
         assert!(record.validate_for_machine(uuid::Uuid::new_v4()).is_err());
         let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            MachineStorageRecord::decode(&value.to_string()).unwrap(),
+            record
+        );
         for pointer in ["/operation/kind", "/operation/state", "/fence/state"] {
             let mut changed = value.clone();
             *changed.pointer_mut(pointer).unwrap() = serde_json::json!("unsupported");
@@ -911,6 +1063,7 @@ mod tests {
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
+        pin(&mut record);
         let disk = IncludedDisk {
             id: uuid::Uuid::new_v4(),
             role: DiskRole::Data,
@@ -1153,6 +1306,7 @@ mod tests {
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
+        pin(&mut record);
         let stream = crate::storage::stream::StreamHasher::new()
             .hash_reader(std::io::Cursor::new([0; 512]))
             .unwrap()
@@ -1180,6 +1334,10 @@ mod tests {
         }
         record.validate().unwrap();
         let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            MachineStorageRecord::decode(&value.to_string()).unwrap(),
+            record
+        );
         for (parent, field) in [
             ("/root", "temporaryDirectory"),
             ("/root/lower", "geometry"),

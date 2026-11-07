@@ -115,7 +115,7 @@ pub fn format(workspace_root: &Path, target_dir: &Path) -> Result<(), command::C
 
 // Native diagnostic probes are qualified separately and must never change the
 // production lane exercised by the ordinary host suite.
-const HOST_TEST_FEATURES: &str = "silo-vmm/mock-backend,forward-spec/tokio";
+const HOST_TEST_FEATURES: &str = "silo-vmm/mock-backend,forward-spec/tokio,disk-image/qcow2";
 
 pub fn clippy(
     workspace_root: &Path,

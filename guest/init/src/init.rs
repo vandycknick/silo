@@ -7,7 +7,6 @@ use crate::io;
 #[path = "freezer.rs"]
 mod freezer;
 
-const DEFAULT_ROOT: &[u8] = b"/dev/vda";
 pub(crate) const DEFAULT_INIT: &[u8] = b"/sbin/init";
 const MNT_ROOT: &[u8] = b"/mnt/root";
 const AGENT_PAYLOAD_DIR: &[u8] = b"/agent";
@@ -21,35 +20,44 @@ const AGENT_INIT_ARG: &[u8] = b"--init";
 const AGENT_HANDOFF_ARG_PREFIX: &[u8] = b"--handoff=";
 
 struct BootConfig {
-    root: Vec<u8>,
     init: Vec<u8>,
     init_explicit: bool,
-    rootfstype: Option<Vec<u8>>,
+}
+
+/// What a failure before image execution may expose on the console.
+#[derive(Clone, Copy)]
+enum Failure {
+    /// The trusted root contract governs this boot: no workload, no shell.
+    FailClosed(&'static str),
+    /// A verified raw root and effective Rosetta are in place; only payload
+    /// or handoff preparation failed. The initramfs shell may diagnose it.
+    Rescue,
 }
 
 pub(crate) fn init(_argc: i32, _argv: *const *const u8) -> i32 {
-    // Until the root contract is decoded, failure is managed/fail-closed.
-    let mut managed = true;
-    if let Err(message) = run_init(&mut managed) {
+    // Every boot is governed by the mandatory bootstrap until it is verified.
+    let mut failure = Failure::FailClosed("root");
+    if let Err(message) = run_init(&mut failure) {
         io::write(io::STDERR, "init: ");
         io::write(io::STDERR, message);
         io::write(io::STDERR, "\n");
-        if managed {
-            io::write(
-                io::STDERR,
-                "init: overlay: boot failed; workload prohibited\n",
-            );
-            // PID 1 must not return (kernel panic) or expose a rescue shell.
-            loop {
-                io::sleep(3600);
+        match failure {
+            Failure::FailClosed(label) => {
+                io::write(io::STDERR, "init: ");
+                io::write(io::STDERR, label);
+                io::write(io::STDERR, ": boot failed; workload prohibited\n");
+                // PID 1 must not return (kernel panic) or expose a rescue shell.
+                loop {
+                    io::sleep(3600);
+                }
             }
+            Failure::Rescue => rescue_shell(),
         }
-        rescue_shell();
     }
     0
 }
 
-fn run_init(managed: &mut bool) -> Result<(), &'static str> {
+fn run_init(failure: &mut Failure) -> Result<(), &'static str> {
     if io::getpid() != 1 {
         return Err("refusing to run init outside PID 1");
     }
@@ -66,42 +74,36 @@ fn run_init(managed: &mut bool) -> Result<(), &'static str> {
     install(b"/bin");
     install(b"/sbin");
 
-    let config = read_boot_config();
-    let marker = read_cmdline();
-    let overlay_requested =
-        cmdline_value(&marker, b"silo.rootfs=") == Some(b"linux-flat-overlay-v1");
-    match crate::overlay::bootstrap()? {
-        Some(rootfs_spec::Root::FlatOverlay(root)) => {
-            if !overlay_requested {
+    let cmdline = read_cmdline();
+    let args = ::init::boot_args::parse(&cmdline)?;
+    if args.marker.is_some() {
+        *failure = Failure::FailClosed("overlay");
+    }
+    let bootstrap = crate::bootstrap::load()?;
+    match bootstrap.root {
+        rootfs_spec::Root::FlatOverlay(root) => {
+            *failure = Failure::FailClosed("overlay");
+            if args.marker != Some(::init::boot_args::RootMarker::FlatOverlay) {
                 return Err("overlay: missing managed kernel marker");
-            }
-            if cmdline_value(&marker, b"root=").is_some()
-                || cmdline_value(&marker, b"rootfstype=").is_some()
-                || cmdline_value(&marker, b"rootflags=").is_some()
-            {
-                return Err("overlay: conflicting raw root selection");
             }
             crate::overlay::assemble(root)?;
         }
-        root => {
-            if overlay_requested || cmdline_value(&marker, b"silo.rootfs=").is_some() {
-                return Err("overlay: missing managed bootstrap");
+        rootfs_spec::Root::Raw(root) => {
+            if args.marker.is_some() {
+                return Err("raw: managed overlay marker on a raw root");
             }
-            if !matches!(root, None | Some(rootfs_spec::Root::Raw)) {
-                return Err("overlay: unsupported root contract");
-            }
-            *managed = false;
-            if !config.root.starts_with(b"/") {
-                return Err("root= must be an absolute device path");
-            }
-            if !is_block_device(&config.root) {
-                return Err("root= does not point at a block device");
-            }
-            if mount_root(&config) != 0 {
-                return Err("failed to mount root filesystem");
-            }
+            crate::raw::mount(&root)?;
         }
     }
+    // Before either switch_root branch, with or without an injected agent.
+    crate::rosetta::prepare(bootstrap.rosetta)?;
+    if matches!(bootstrap.root, rootfs_spec::Root::Raw(_)) {
+        *failure = Failure::Rescue;
+    }
+    let config = BootConfig {
+        init: args.init.unwrap_or(DEFAULT_INIT).to_vec(),
+        init_explicit: args.init.is_some(),
+    };
 
     if prepare_agent_boot()? {
         let handoff_arg = agent_handoff_arg(&config);
@@ -180,21 +182,6 @@ fn mount_ignore_busy(source: &[u8], target: &[u8], fstype: &[u8]) -> Result<(), 
     Err("failed to mount initramfs filesystem")
 }
 
-fn read_boot_config() -> BootConfig {
-    let cmdline = read_cmdline();
-
-    let init = cmdline_value(&cmdline, b"init=");
-
-    BootConfig {
-        root: cmdline_value(&cmdline, b"root=")
-            .unwrap_or(DEFAULT_ROOT)
-            .to_vec(),
-        init: init.unwrap_or(DEFAULT_INIT).to_vec(),
-        init_explicit: init.is_some(),
-        rootfstype: cmdline_value(&cmdline, b"rootfstype=").map(|value| value.to_vec()),
-    }
-}
-
 fn read_cmdline() -> Vec<u8> {
     let fd = io::open(b"/proc/cmdline", libc::O_RDONLY, 0);
     if fd < 0 {
@@ -203,36 +190,6 @@ fn read_cmdline() -> Vec<u8> {
     let bytes = io::read_all(fd);
     io::close(fd);
     bytes
-}
-
-fn cmdline_value<'a>(cmdline: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let mut start = 0;
-    for index in 0..=cmdline.len() {
-        if index == cmdline.len() || cmdline[index].is_ascii_whitespace() {
-            let token = &cmdline[start..index];
-            if token.starts_with(key) {
-                return Some(&token[key.len()..]);
-            }
-            start = index + 1;
-        }
-    }
-    None
-}
-
-fn is_block_device(path: &[u8]) -> bool {
-    let mut stat = io::stat_zeroed();
-    if io::stat(path, &mut stat) != 0 {
-        return false;
-    }
-    (stat.st_mode & libc::S_IFMT) == libc::S_IFBLK
-}
-
-fn mount_root(config: &BootConfig) -> i32 {
-    if let Some(fstype) = config.rootfstype.as_deref() {
-        applets::system::mount_one(&config.root, MNT_ROOT, Some(fstype), 0, None)
-    } else {
-        applets::system::mount_block_auto(&config.root, MNT_ROOT)
-    }
 }
 
 fn prepare_agent_boot() -> Result<bool, &'static str> {

@@ -245,14 +245,21 @@ impl Fixture {
         let binary = test_utils::mock_vmm_binary();
         let kernel = temp.path().join("kernel");
         let initramfs = temp.path().join("initramfs");
-        std::fs::write(&kernel, b"scenario-kernel").expect("write kernel fixture");
+        std::fs::write(
+            &kernel,
+            test_utils::direct_kernel::host_kernel("scenario-kernel"),
+        )
+        .expect("write kernel fixture");
         std::fs::write(&initramfs, b"scenario-initramfs").expect("write initramfs fixture");
         let agent = temp.path().join("agent");
         std::fs::write(&agent, b"scenario-agent-fixture").expect("write inert guest agent fixture");
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
             .expect("agent fixture mode");
         let disk = temp.path().join("disk.raw");
-        std::fs::write(&disk, vec![0; 4096]).expect("write disk");
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .expect("create ext4 disk")
+            .close()
+            .expect("finish ext4 disk");
         let components = ResolvedRuntimeComponents::from_paths(
             binary.to_path_buf(),
             binary.to_path_buf(),
@@ -272,7 +279,7 @@ impl Fixture {
         let machine = runtime
             .machine()
             .name("source")
-            .image_source(ImageSource::Disk(disk))
+            .image_source(ImageSource::disk(disk))
             .network(|network| network.none())
             .create()
             .await
@@ -1683,12 +1690,15 @@ async fn live_capabilities_wrong_machine_evidence_fails_before_unsupported_reaso
         .await
         .expect("source observation");
     let other_disk = fixture.temp.path().join("other.raw");
-    std::fs::write(&other_disk, vec![0; 4096]).expect("other disk");
+    disk_image::ext4::Formatter::new(&other_disk, 4096, 64 * 1024 * 1024)
+        .expect("create other ext4 disk")
+        .close()
+        .expect("finish other ext4 disk");
     let other = fixture
         .runtime
         .machine()
         .name("other")
-        .image_source(ImageSource::Disk(other_disk))
+        .image_source(ImageSource::disk(other_disk))
         .network(|network| network.none())
         .create()
         .await

@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use eyre::bail;
 use libvm::{
-    Forward, MachineAgent, MachineRetention, MachineUserConfig, OciImageConfigMetadata, Platform,
-    ProcessConfig, PublishBind,
+    DiskImportBoot, Forward, MachineAgent, MachineRetention, MachineUserConfig, ManagedSourceId,
+    OciImageConfigMetadata, Platform, ProcessConfig, PublishBind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +44,14 @@ pub(crate) enum ResolvedImage {
         identity: OciImageIdentity,
         metadata: Box<OciImageConfigMetadata>,
     },
-    Disk {
-        path: PathBuf,
+    /// Complete direct-boot metadata. `disk:` convenience assumptions
+    /// (host-native platform, whole disk, packaged assets) are explicit here.
+    Disk { path: PathBuf, boot: DiskImportBoot },
+    /// A managed image or snapshot, already resolved to its typed identity.
+    Managed {
+        requested_reference: String,
+        source: ManagedSourceId,
+        metadata: Option<Box<OciImageConfigMetadata>>,
     },
 }
 
@@ -63,7 +69,16 @@ pub(crate) enum PullPolicy {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ImageIdentity {
     Oci(OciImageIdentity),
-    Disk { path: PathBuf },
+    #[serde(rename_all = "camelCase")]
+    Disk {
+        path: PathBuf,
+        boot: DiskImportBoot,
+    },
+    #[serde(rename_all = "camelCase")]
+    Managed {
+        requested_reference: String,
+        source: ManagedSourceId,
+    },
 }
 
 /// Explicit machine values, kept independent from the current CLI command structs.
@@ -120,7 +135,12 @@ pub(crate) struct MachineCreationSettings {
     pub(crate) initramfs: Option<PathBuf>,
     pub(crate) kernel_args: Vec<String>,
     pub(crate) nested_virtualization: bool,
-    pub(crate) rosetta: bool,
+    /// Explicit Rosetta intent; absence is not an explicit disable.
+    pub(crate) rosetta: Option<bool>,
+    /// Requested Linux userspace platform; the source identity records the
+    /// selected one. Absent means no explicit request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) platform: Option<libvm::LinuxPlatform>,
     pub(crate) disks: Vec<PathBuf>,
     pub(crate) agent: MachineAgent,
     pub(crate) provision_user: Option<MachineUserConfig>,
@@ -285,10 +305,23 @@ pub(crate) fn resolve(request: ResolveRequest) -> eyre::Result<Plan> {
         )
     };
     let machine = resolve_machine(&request.template, request.machine_overrides)?;
-    if machine.root_profile == crate::commands::create::RootProfileArg::LinuxFlatOverlayV1
-        && matches!(image, ImageIdentity::Disk { .. })
+    if matches!(request.kind, PlanKind::Run(_))
+        && matches!(
+            image,
+            ImageIdentity::Managed {
+                source: ManagedSourceId::Snapshot(_),
+                ..
+            }
+        )
     {
-        bail!("linux-flat-overlay-v1 requires an OCI image, not disk: input");
+        bail!(
+            "a snapshot keeps its captured configuration; use `silo restore` and then `silo start`"
+        );
+    }
+    if machine.root_profile == crate::commands::create::RootProfileArg::LinuxFlatOverlayV1
+        && !matches!(image, ImageIdentity::Oci(_))
+    {
+        bail!("linux-flat-overlay-v1 requires an OCI image source");
     }
     let process = resolve_process(
         metadata.as_ref(),
@@ -354,8 +387,18 @@ fn validate_image(image: &ResolvedImage) -> eyre::Result<&ResolvedImage> {
             }
             validate_oci_metadata(metadata)?;
         }
-        ResolvedImage::Disk { path } => {
+        ResolvedImage::Disk { path, .. } => {
             validate_no_nul(&path.to_string_lossy(), "disk image path")?;
+        }
+        ResolvedImage::Managed {
+            requested_reference,
+            metadata,
+            ..
+        } => {
+            validate_no_nul(requested_reference, "image reference")?;
+            if let Some(metadata) = metadata {
+                validate_oci_metadata(metadata)?;
+            }
         }
     }
     Ok(image)
@@ -526,6 +569,10 @@ impl ResolvedImage {
         match self {
             Self::Oci { identity, .. } => identity.requested_reference.clone(),
             Self::Disk { path, .. } => format!("disk:{}", path.display()),
+            Self::Managed {
+                requested_reference,
+                ..
+            } => requested_reference.clone(),
         }
     }
 
@@ -533,14 +580,45 @@ impl ResolvedImage {
         match self {
             Self::Oci { metadata, .. } => Some(metadata),
             Self::Disk { .. } => None,
+            Self::Managed { metadata, .. } => metadata.as_deref(),
         }
     }
 
     fn identity(&self) -> ImageIdentity {
         match self {
             Self::Oci { identity, .. } => ImageIdentity::Oci(identity.clone()),
-            Self::Disk { path, .. } => ImageIdentity::Disk { path: path.clone() },
+            Self::Disk { path, boot } => ImageIdentity::Disk {
+                path: path.clone(),
+                boot: boot.clone(),
+            },
+            Self::Managed {
+                requested_reference,
+                source,
+                ..
+            } => ImageIdentity::Managed {
+                requested_reference: requested_reference.clone(),
+                source: *source,
+            },
         }
+    }
+}
+
+/// Image execution defaults of a managed image, in the shape planning uses
+/// for OCI configuration. Snapshots carry their own captured configuration.
+pub(crate) fn managed_image_metadata(process: &ProcessConfig) -> OciImageConfigMetadata {
+    OciImageConfigMetadata {
+        entrypoint: process.entrypoint.clone(),
+        cmd: process.command.clone(),
+        env: Some(
+            process
+                .environment
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect(),
+        ),
+        working_dir: Some(process.working_directory.clone()),
+        user: process.user.clone(),
+        ..OciImageConfigMetadata::default()
     }
 }
 
@@ -821,18 +899,67 @@ mod tests {
         assert_eq!(plan.machine.tmpfs_size.as_deref(), Some("16mib"));
     }
 
+    fn disk(path: &str) -> ResolvedImage {
+        ResolvedImage::Disk {
+            path: PathBuf::from(path),
+            boot: libvm::DiskImportBoot::LinuxDirect {
+                platform: libvm::LinuxPlatform {
+                    architecture: libvm::GuestArchitecture::Amd64,
+                    variant: None,
+                },
+                root: libvm::ImportRootSelection::WholeDisk,
+                assets: libvm::BootAssetSelection::Packaged,
+            },
+        }
+    }
+
+    fn managed(metadata: Option<OciImageConfigMetadata>) -> ResolvedImage {
+        ResolvedImage::Managed {
+            requested_reference: "image:base".into(),
+            source: libvm::ManagedSourceId::Image(
+                format!("sha256:{}", "ab".repeat(32)).parse().unwrap(),
+            ),
+            metadata: metadata.map(Box::new),
+        }
+    }
+
     #[test]
-    fn overlay_profile_rejects_disk_sources() {
+    fn overlay_profile_rejects_disk_and_managed_sources() {
+        for source in [disk("/tmp/source.raw"), managed(None)] {
+            let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
+            input.machine_overrides.root_profile =
+                Some(crate::commands::create::RootProfileArg::LinuxFlatOverlayV1);
+            input.positional_image = Some(source);
+            assert!(resolve(input)
+                .expect_err("overlay non-OCI source")
+                .to_string()
+                .contains("requires an OCI image"));
+        }
+    }
+
+    #[test]
+    fn managed_image_execution_defaults_seed_the_plan_and_keep_typed_identity() {
+        let mut process = libvm::ProcessConfig::new();
+        process.entrypoint = Some(vec!["/bin/app".into()]);
+        process.command = Some(Vec::new());
+        process.working_directory = "/srv".into();
+        process.environment = BTreeMap::from([("A".into(), "1".into())]);
         let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
-        input.machine_overrides.root_profile =
-            Some(crate::commands::create::RootProfileArg::LinuxFlatOverlayV1);
-        input.positional_image = Some(ResolvedImage::Disk {
-            path: "/tmp/source.raw".into(),
-        });
-        assert!(resolve(input)
-            .expect_err("overlay disk source")
-            .to_string()
-            .contains("requires an OCI image"));
+        input.positional_image = Some(managed(Some(crate::planning::managed_image_metadata(
+            &process,
+        ))));
+        let plan = create_plan(resolve(input).expect("resolve managed plan"));
+        assert_eq!(plan.process.entrypoint, process.entrypoint);
+        assert_eq!(plan.process.command, Some(Vec::new()));
+        assert_eq!(plan.process.working_directory, "/srv");
+        assert_eq!(
+            plan.process.environment.get("A").map(String::as_str),
+            Some("1")
+        );
+        let ImageIdentity::Managed { source, .. } = plan.image else {
+            panic!("expected managed identity");
+        };
+        assert!(matches!(source, libvm::ManagedSourceId::Image(_)));
     }
 
     #[test]
@@ -946,7 +1073,8 @@ mod tests {
                 initramfs: None,
                 kernel_args: Vec::new(),
                 nested_virtualization: false,
-                rosetta: false,
+                rosetta: None,
+                platform: None,
                 disks: Vec::new(),
                 agent: MachineAgent::Default,
                 provision_user: None,
@@ -1171,9 +1299,7 @@ mod tests {
     #[test]
     fn disk_has_no_oci_metadata() {
         let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
-        input.positional_image = Some(ResolvedImage::Disk {
-            path: PathBuf::from("rootfs.img"),
-        });
+        input.positional_image = Some(disk("rootfs.img"));
         let plan = create_plan(resolve(input).expect("resolve disk plan"));
         assert_eq!(plan.process.entrypoint, None);
         assert_eq!(plan.process.command, None);
@@ -1471,18 +1597,22 @@ mod tests {
     }
 
     #[test]
-    fn disk_plan_serde_snapshot_has_no_oci_or_registry_state() {
+    fn disk_plan_serde_snapshot_displays_boot_assumptions_without_registry_state() {
         let mut input = request(PlanKind::Create, OciImageConfigMetadata::default());
-        input.positional_image = Some(ResolvedImage::Disk {
-            path: PathBuf::from("rootfs.img"),
-        });
+        input.positional_image = Some(disk("rootfs.img"));
         let output = json(resolve(input).expect("resolve disk plan"));
 
         assert_eq!(
             output["image"],
             serde_json::json!({
                 "kind": "disk",
-                "path": "rootfs.img"
+                "path": "rootfs.img",
+                "boot": {
+                    "kind": "linux-direct",
+                    "platform": {"architecture": "amd64", "variant": null},
+                    "root": {"kind": "whole-disk"},
+                    "assets": {"kind": "packaged"}
+                }
             })
         );
     }

@@ -478,7 +478,12 @@ fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguratio
 
     for disk in config.disks() {
         builder = builder.add_storage_device(
-            StorageDeviceConfiguration::new(disk.path.clone(), disk.read_only).map_err(vz_error)?,
+            StorageDeviceConfiguration::new(
+                disk.path.clone(),
+                disk.read_only,
+                disk.block_id.as_str(),
+            )
+            .map_err(vz_error)?,
         );
     }
 
@@ -493,7 +498,7 @@ fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguratio
 
     if config.rosetta() == crate::virt::RosettaIntent::VzNative {
         let mut rosetta_config =
-            VirtioFileSystemDeviceConfiguration::new(agent_spec::ROSETTA_MOUNT_TAG)
+            VirtioFileSystemDeviceConfiguration::new(rootfs_spec::rosetta::SHARE_TAG)
                 .map_err(vz_error)?;
         rosetta_config.set_rosetta_share(LinuxRosettaDirectoryShare::new().map_err(vz_error)?);
         builder = builder.add_directory_share(rosetta_config);

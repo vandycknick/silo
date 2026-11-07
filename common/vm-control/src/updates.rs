@@ -174,6 +174,7 @@ pub fn create_to_wire(
         kernel_args: v.kernel_args.clone(),
         nested_virtualization: v.nested_virtualization,
         rosetta: v.rosetta,
+        platform: v.platform.as_ref().map(crate::boot::platform_to_wire),
         disks: v.disks.iter().map(|v| path_to_wire(v)).collect(),
         mounts: v.mounts.iter().map(mount_to_wire).collect(),
         forwards: v.forwards.iter().map(forward_to_wire).collect(),
@@ -206,6 +207,10 @@ pub fn create_from_wire(
         kernel_args: v.kernel_args,
         nested_virtualization: v.nested_virtualization,
         rosetta: v.rosetta,
+        platform: v
+            .platform
+            .map(crate::boot::platform_from_wire)
+            .transpose()?,
         disks: v
             .disks
             .into_iter()

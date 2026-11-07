@@ -47,26 +47,26 @@ struct AdmittedBoot {
 const ADMITTED_BOOTS: &[AdmittedBoot] = &[AdmittedBoot {
     identity: BootIdentity {
         kernel_sha256: [
-            0xec, 0x6f, 0xee, 0x8b, 0x18, 0x85, 0xa7, 0x1e, 0x78, 0x30, 0x6f, 0xea, 0x38, 0x4f,
-            0x4f, 0xf6, 0x68, 0x7f, 0xd1, 0x51, 0xb6, 0xf2, 0x79, 0xc2, 0x31, 0x17, 0x78, 0x50,
-            0x27, 0x74, 0x8f, 0x33,
+            0x4c, 0x54, 0xfc, 0x03, 0x88, 0x44, 0xb0, 0x4d, 0x71, 0x2b, 0xd4, 0xcd, 0xb8, 0xa9,
+            0xd6, 0xa9, 0x45, 0xa5, 0xf3, 0xd7, 0xa8, 0xbb, 0x1d, 0xb5, 0xa5, 0xd5, 0x0d, 0x52,
+            0x71, 0xd5, 0xdd, 0xdc,
         ],
         initramfs_sha256: [
-            0x5c, 0x48, 0xf3, 0x28, 0x01, 0x4d, 0x10, 0x2a, 0x1f, 0x07, 0xbc, 0x22, 0x86, 0x51,
-            0x41, 0xb7, 0x2b, 0xdc, 0xfa, 0x0a, 0x94, 0xcd, 0xd3, 0x0f, 0x3e, 0x56, 0x7d, 0x18,
-            0x15, 0xc8, 0x4e, 0x67,
+            0x79, 0x37, 0x30, 0x23, 0x0b, 0x7f, 0xba, 0x35, 0x51, 0xa1, 0xf3, 0xb4, 0x26, 0xe1,
+            0x1c, 0xb3, 0x43, 0xa9, 0x16, 0x09, 0x03, 0x80, 0xda, 0x87, 0xf3, 0x5f, 0x06, 0x73,
+            0x5d, 0xbf, 0x28, 0xed,
         ],
         native_sha256: [
-            0x29, 0x2c, 0x64, 0x57, 0x75, 0xc0, 0x63, 0x7c, 0x9f, 0x43, 0x36, 0xc1, 0x1e, 0x49,
-            0x4a, 0x72, 0x61, 0xda, 0xbc, 0x66, 0x3e, 0x5f, 0xae, 0xd6, 0x08, 0xee, 0x78, 0x45,
-            0x77, 0x52, 0xf8, 0xd6,
+            0xee, 0xbe, 0x7f, 0xa9, 0x96, 0x23, 0xcc, 0xf2, 0x92, 0xc2, 0x5c, 0xbc, 0xe2, 0x61,
+            0x0d, 0xa3, 0x4e, 0xc3, 0x56, 0xf5, 0xaa, 0x9a, 0x33, 0x5c, 0x61, 0x74, 0xb6, 0x7c,
+            0x30, 0xba, 0xec, 0xd7,
         ],
         architecture: GuestArchitecture::Amd64,
     },
     resolved_config_sha256: [
-        0xf3, 0xda, 0xb6, 0xad, 0xff, 0xce, 0x7c, 0xad, 0xde, 0x5c, 0xe6, 0x93, 0xf9, 0x40, 0x3c,
-        0xe8, 0x8d, 0x66, 0xab, 0x9f, 0x4e, 0xc5, 0x03, 0xf7, 0x86, 0x0c, 0xe9, 0x02, 0x0c, 0xb1,
-        0x42, 0xe6,
+        0x72, 0x49, 0xa9, 0x3a, 0xda, 0xbe, 0xb4, 0x34, 0x8f, 0xc9, 0x02, 0xdf, 0x83, 0xed, 0x25,
+        0x2b, 0xe4, 0xc7, 0x17, 0x62, 0xac, 0x13, 0x1c, 0xf0, 0x03, 0x07, 0x04, 0x31, 0xaf, 0xdf,
+        0x68, 0xa9,
     ],
     kernel_version: (7, 2, 2),
     host_os: "linux",
@@ -355,8 +355,17 @@ impl QualifiedAsset {
     }
 
     pub(crate) fn from_open_file(
+        file: File,
+        path: &Path,
+    ) -> Result<Self, OverlayBootQualificationError> {
+        Self::from_open_file_observed(file, path, &mut std::io::sink())
+    }
+
+    /// `observer` receives exactly the bytes whose digest this asset records.
+    fn from_open_file_observed(
         mut file: File,
         path: &Path,
+        observer: &mut impl Write,
     ) -> Result<Self, OverlayBootQualificationError> {
         let read_error = |source| OverlayBootQualificationError::Read {
             path: path.to_path_buf(),
@@ -375,7 +384,7 @@ impl QualifiedAsset {
             });
         }
         let fingerprint = AssetFingerprint::from_metadata(&metadata);
-        let digest = copy_asset(&file, path, fingerprint, &mut std::io::sink())?;
+        let digest = copy_asset(&file, path, fingerprint, observer)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -503,19 +512,232 @@ fn hex_digest(digest: [u8; 32]) -> String {
     output
 }
 
+// Linux direct-boot kernel admission for raw roots. The kernel is admitted by
+// its own bytes: the host's native direct-loader format and architecture from
+// its boot header. The header is captured while the bytes are hashed, so
+// admission never rereads a path or parses bytes other than the authenticated
+// ones. Filesystem and device capabilities are not inspected; a kernel missing
+// them fails at boot, not here.
+//
+//   hash pass ──► header prefix (≤ 4 KiB) ──► ELF/Image format + architecture
+
+/// ELF program headers must lie in this prefix, as in every linked vmlinux.
+const KERNEL_HEADER_BYTES: usize = 4096;
+const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+const PT_LOAD: u32 = 1;
+const ARM64_IMAGE_MAGIC: &[u8; 4] = b"ARM\x64";
+/// The arm64 boot protocol header: flags at byte 24, magic at byte 56, ending
+/// with the 32-bit `res5` field at byte 60.
+const ARM64_IMAGE_HEADER_BYTES: usize = 64;
+const ARM64_IMAGE_FLAGS_OFFSET: usize = 24;
+
+#[derive(Debug, Error)]
+#[error("kernel sha256:{kernel_sha256} is not an admissible {architecture:?} Linux direct-boot kernel: {reason}")]
+pub struct DirectKernelRejected {
+    pub kernel_sha256: String,
+    pub architecture: GuestArchitecture,
+    pub reason: DirectKernelRejection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum DirectKernelRejection {
+    #[error("bytes are neither an x86-64 ELF vmlinux nor an arm64 Image")]
+    UnrecognizedFormat,
+    #[error("{actual} is not the native direct-boot kernel format for this host")]
+    ForeignImage { actual: String },
+    #[error("malformed kernel header: {detail}")]
+    MalformedHeader { detail: &'static str },
+}
+
+/// A kernel asset plus the bounded header prefix observed while hashing it.
+#[derive(Debug)]
+pub(crate) struct InspectedKernel {
+    asset: QualifiedAsset,
+    header: KernelHeader,
+}
+
+impl InspectedKernel {
+    pub(crate) fn from_open_file(
+        file: File,
+        path: &Path,
+    ) -> Result<Self, OverlayBootQualificationError> {
+        let mut header = KernelHeader::default();
+        let asset = QualifiedAsset::from_open_file_observed(file, path, &mut header)?;
+        Ok(Self { asset, header })
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.asset.digest
+    }
+
+    /// Overlay roots are admitted by their exact reviewed tuple instead.
+    pub(crate) fn into_asset(self) -> QualifiedAsset {
+        self.asset
+    }
+
+    pub(crate) fn admit_direct(
+        self,
+        architecture: GuestArchitecture,
+    ) -> Result<QualifiedAsset, Box<DirectKernelRejected>> {
+        match native_kernel_image(&self.header.0, self.asset.length(), architecture) {
+            Ok(()) => Ok(self.asset),
+            Err(reason) => Err(Box::new(DirectKernelRejected {
+                kernel_sha256: hex_digest(self.asset.digest),
+                architecture,
+                reason,
+            })),
+        }
+    }
+}
+
+/// The first `KERNEL_HEADER_BYTES` of the hashed stream.
+#[derive(Debug, Default)]
+struct KernelHeader(Vec<u8>);
+
+impl Write for KernelHeader {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let wanted = KERNEL_HEADER_BYTES
+            .saturating_sub(self.0.len())
+            .min(bytes.len());
+        self.0.extend_from_slice(&bytes[..wanted]);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn le_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], DirectKernelRejection> {
+    offset
+        .checked_add(N)
+        .and_then(|end| bytes.get(offset..end))
+        .and_then(|field| field.try_into().ok())
+        .ok_or(DirectKernelRejection::MalformedHeader {
+            detail: "truncated kernel header",
+        })
+}
+
+fn native_kernel_image(
+    header: &[u8],
+    length: u64,
+    architecture: GuestArchitecture,
+) -> Result<(), DirectKernelRejection> {
+    let malformed = |detail| DirectKernelRejection::MalformedHeader { detail };
+    let foreign = |actual: &str| DirectKernelRejection::ForeignImage {
+        actual: actual.to_owned(),
+    };
+    if header.starts_with(ELF_MAGIC) {
+        let ident: [u8; 3] = le_bytes(header, 4)?;
+        if ident != [2, 1, 1] {
+            return Err(foreign("an ELF image that is not little-endian ELF64"));
+        }
+        match (u16::from_le_bytes(le_bytes(header, 18)?), architecture) {
+            (EM_X86_64, GuestArchitecture::Amd64) => {}
+            (EM_X86_64, GuestArchitecture::Arm64) => return Err(foreign("an x86-64 ELF vmlinux")),
+            (EM_AARCH64, _) => return Err(foreign("an arm64 ELF vmlinux")),
+            (machine, _) => {
+                return Err(DirectKernelRejection::ForeignImage {
+                    actual: format!("an ELF image for machine {machine}"),
+                })
+            }
+        }
+        return validate_elf_executable(header, length);
+    }
+    if header.get(56..60) == Some(ARM64_IMAGE_MAGIC.as_slice()) {
+        if architecture != GuestArchitecture::Arm64 {
+            return Err(foreign("an arm64 Image"));
+        }
+        if header.len() < ARM64_IMAGE_HEADER_BYTES {
+            return Err(malformed("truncated arm64 Image header"));
+        }
+        let image_size = u64::from_le_bytes(le_bytes(header, 16)?);
+        let flags = u64::from_le_bytes(le_bytes(header, ARM64_IMAGE_FLAGS_OFFSET)?);
+        if flags & 1 != 0 {
+            return Err(malformed("big-endian arm64 Image"));
+        }
+        if image_size == 0 {
+            return Err(malformed(
+                "arm64 Image header declares no effective image size",
+            ));
+        }
+        if image_size < length {
+            return Err(malformed(
+                "arm64 Image is longer than its declared image size",
+            ));
+        }
+        return Ok(());
+    }
+    Err(DirectKernelRejection::UnrecognizedFormat)
+}
+
+fn validate_elf_executable(header: &[u8], length: u64) -> Result<(), DirectKernelRejection> {
+    let malformed = |detail| DirectKernelRejection::MalformedHeader { detail };
+    if u16::from_le_bytes(le_bytes(header, 16)?) != 2 {
+        return Err(malformed("ELF kernel is not an executable"));
+    }
+    if u32::from_le_bytes(le_bytes(header, 20)?) != 1 {
+        return Err(malformed("unsupported ELF version"));
+    }
+    if u16::from_le_bytes(le_bytes(header, 52)?) != 64
+        || u16::from_le_bytes(le_bytes(header, 54)?) != 56
+    {
+        return Err(malformed("unexpected ELF64 header or program-header size"));
+    }
+    let count = usize::from(u16::from_le_bytes(le_bytes(header, 56)?));
+    if count == 0 {
+        return Err(malformed("ELF kernel has no program headers"));
+    }
+    let start = usize::try_from(u64::from_le_bytes(le_bytes(header, 32)?))
+        .ok()
+        .filter(|start| *start >= 64)
+        .ok_or_else(|| malformed("ELF program headers overlap the file header"))?;
+    if start
+        .checked_add(count * 56)
+        .is_none_or(|end| end > header.len())
+    {
+        return Err(malformed(
+            "ELF program headers lie outside the bounded kernel header",
+        ));
+    }
+    let mut loads = 0;
+    for entry in (0..count).map(|index| start + index * 56) {
+        if u32::from_le_bytes(le_bytes(header, entry)?) != PT_LOAD {
+            continue;
+        }
+        let offset = u64::from_le_bytes(le_bytes(header, entry + 8)?);
+        let file_size = u64::from_le_bytes(le_bytes(header, entry + 32)?);
+        let memory_size = u64::from_le_bytes(le_bytes(header, entry + 40)?);
+        if offset.checked_add(file_size).is_none_or(|end| end > length) || file_size > memory_size {
+            return Err(malformed("ELF loadable segment exceeds the kernel file"));
+        }
+        loads += 1;
+    }
+    if loads == 0 {
+        return Err(malformed("ELF kernel has no loadable segment"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
     use crate::boot_qualification::QualifiedOverlayBoot;
     use crate::boot_qualification::{
-        admit_flat_overlay, admitted_boot, AdmittedBoot, BootIdentity,
-        OverlayBootQualificationError, QualifiedAsset,
+        admit_flat_overlay, admitted_boot, native_kernel_image, AdmittedBoot, BootIdentity,
+        DirectKernelRejection, InspectedKernel, KernelHeader, OverlayBootQualificationError,
+        QualifiedAsset,
     };
     use crate::GuestArchitecture;
     use rootfs_spec::{OverlayProfile, OverlayRenderingAbi, UpperProfile};
+    use std::io::Write;
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
+    use test_utils::direct_kernel as direct_kernel_fixture;
+    use test_utils::direct_kernel::KernelArchitecture;
     use vm_spec::live::LiveBackend;
 
     fn entry() -> AdmittedBoot {
@@ -851,5 +1073,264 @@ mod tests {
             asset.recheck(),
             Err(OverlayBootQualificationError::AssetChanged { .. })
         ));
+    }
+
+    const ARCHITECTURES: [(KernelArchitecture, GuestArchitecture); 2] = [
+        (KernelArchitecture::Amd64, GuestArchitecture::Amd64),
+        (KernelArchitecture::Arm64, GuestArchitecture::Arm64),
+    ];
+
+    fn header(bytes: &[u8]) -> KernelHeader {
+        let mut header = KernelHeader::default();
+        header.write_all(bytes).unwrap();
+        header
+    }
+
+    fn admit(bytes: &[u8], architecture: GuestArchitecture) -> Result<(), DirectKernelRejection> {
+        native_kernel_image(&header(bytes).0, bytes.len() as u64, architecture)
+    }
+
+    fn patch(bytes: &mut [u8], offset: usize, value: &[u8]) {
+        bytes[offset..offset + value.len()].copy_from_slice(value);
+    }
+
+    fn foreign(actual: &str) -> Result<(), DirectKernelRejection> {
+        Err(DirectKernelRejection::ForeignImage {
+            actual: actual.into(),
+        })
+    }
+
+    fn malformed(detail: &'static str) -> Result<(), DirectKernelRejection> {
+        Err(DirectKernelRejection::MalformedHeader { detail })
+    }
+
+    #[test]
+    fn direct_kernel_admits_native_images_without_inspecting_capabilities() {
+        for (fixture, architecture) in ARCHITECTURES {
+            // Custom kernels need no embedded configuration; missing devices or
+            // filesystems are discovered at boot.
+            assert_eq!(
+                admit(
+                    &direct_kernel_fixture::kernel(fixture, "custom"),
+                    architecture
+                ),
+                Ok(())
+            );
+            let large = direct_kernel_fixture::image(fixture, &vec![0x5a; 3 * 65536 + 17]);
+            assert_eq!(admit(&large, architecture), Ok(()));
+        }
+        // The arm64 page-size flags (bits 1-2) are not a format requirement.
+        let mut pages = direct_kernel_fixture::kernel(KernelArchitecture::Arm64, "pages");
+        for page_size in [0u64, 1, 2, 3] {
+            patch(&mut pages, 24, &(page_size << 1).to_le_bytes());
+            assert_eq!(admit(&pages, GuestArchitecture::Arm64), Ok(()));
+        }
+    }
+
+    #[test]
+    fn direct_kernel_rejects_non_kernel_and_foreign_architecture_images() {
+        for (_, architecture) in ARCHITECTURES {
+            for bytes in [
+                b"exact custom kernel".as_slice(),
+                b"\x7fEL".as_slice(),
+                [0u8; 128].as_slice(),
+            ] {
+                assert_eq!(
+                    admit(bytes, architecture),
+                    Err(DirectKernelRejection::UnrecognizedFormat)
+                );
+            }
+        }
+        let amd64 = direct_kernel_fixture::kernel(KernelArchitecture::Amd64, "foreign");
+        let arm64 = direct_kernel_fixture::kernel(KernelArchitecture::Arm64, "foreign");
+        assert_eq!(
+            admit(&amd64, GuestArchitecture::Arm64),
+            foreign("an x86-64 ELF vmlinux")
+        );
+        assert_eq!(
+            admit(&arm64, GuestArchitecture::Amd64),
+            foreign("an arm64 Image")
+        );
+        let mut aarch64_elf = amd64.clone();
+        patch(&mut aarch64_elf, 18, &183u16.to_le_bytes());
+        for (_, architecture) in ARCHITECTURES {
+            assert_eq!(
+                admit(&aarch64_elf, architecture),
+                foreign("an arm64 ELF vmlinux")
+            );
+        }
+        let mut other = amd64.clone();
+        patch(&mut other, 18, &40u16.to_le_bytes());
+        assert_eq!(
+            admit(&other, GuestArchitecture::Amd64),
+            foreign("an ELF image for machine 40")
+        );
+        for (offset, value) in [(4, 1), (5, 2), (6, 0)] {
+            let mut elf32 = amd64.clone();
+            elf32[offset] = value;
+            assert_eq!(
+                admit(&elf32, GuestArchitecture::Amd64),
+                foreign("an ELF image that is not little-endian ELF64")
+            );
+        }
+    }
+
+    #[test]
+    fn direct_kernel_rejects_malformed_native_headers() {
+        let amd64 = direct_kernel_fixture::kernel(KernelArchitecture::Amd64, "header");
+        let requirement = GuestArchitecture::Amd64;
+        let length = amd64.len() as u64;
+        let cases: [(usize, Vec<u8>, &'static str); 8] = [
+            (
+                16,
+                1u16.to_le_bytes().to_vec(),
+                "ELF kernel is not an executable",
+            ),
+            (20, 2u32.to_le_bytes().to_vec(), "unsupported ELF version"),
+            (
+                54,
+                32u16.to_le_bytes().to_vec(),
+                "unexpected ELF64 header or program-header size",
+            ),
+            (
+                56,
+                0u16.to_le_bytes().to_vec(),
+                "ELF kernel has no program headers",
+            ),
+            (
+                32,
+                8u64.to_le_bytes().to_vec(),
+                "ELF program headers overlap the file header",
+            ),
+            (
+                32,
+                4096u64.to_le_bytes().to_vec(),
+                "ELF program headers lie outside the bounded kernel header",
+            ),
+            (
+                64 + 32,
+                (length + 1).to_le_bytes().to_vec(),
+                "ELF loadable segment exceeds the kernel file",
+            ),
+            (
+                64,
+                4u32.to_le_bytes().to_vec(),
+                "ELF kernel has no loadable segment",
+            ),
+        ];
+        for (offset, value, detail) in cases {
+            let mut bytes = amd64.clone();
+            patch(&mut bytes, offset, &value);
+            assert_eq!(admit(&bytes, requirement), malformed(detail), "{detail}");
+        }
+        let mut overflowing = amd64.clone();
+        patch(&mut overflowing, 64 + 8, &u64::MAX.to_le_bytes());
+        assert_eq!(
+            admit(&overflowing, requirement),
+            malformed("ELF loadable segment exceeds the kernel file")
+        );
+        let mut memory_smaller = amd64.clone();
+        patch(&mut memory_smaller, 64 + 40, &1u64.to_le_bytes());
+        assert_eq!(
+            admit(&memory_smaller, requirement),
+            malformed("ELF loadable segment exceeds the kernel file")
+        );
+        assert_eq!(
+            admit(&amd64[..40], requirement),
+            malformed("truncated kernel header")
+        );
+
+        let arm64 = direct_kernel_fixture::kernel(KernelArchitecture::Arm64, "header");
+        let requirement = GuestArchitecture::Arm64;
+        // Bit 0 of the flags at byte 24 selects big-endian; the reserved word
+        // at byte 48 stays zero so only the real flags field can reject it.
+        let mut big_endian = arm64.clone();
+        patch(&mut big_endian, 24, &0b011u64.to_le_bytes());
+        assert_eq!(&big_endian[48..56], &[0; 8]);
+        assert_eq!(
+            admit(&big_endian, requirement),
+            malformed("big-endian arm64 Image")
+        );
+        let mut unsized_image = arm64.clone();
+        patch(&mut unsized_image, 16, &0u64.to_le_bytes());
+        assert_eq!(
+            admit(&unsized_image, requirement),
+            malformed("arm64 Image header declares no effective image size")
+        );
+        let mut short_size = arm64.clone();
+        patch(&mut short_size, 16, &(arm64.len() as u64 - 1).to_le_bytes());
+        assert_eq!(
+            admit(&short_size, requirement),
+            malformed("arm64 Image is longer than its declared image size")
+        );
+        // Every prefix of the 64-byte header is refused, including those that
+        // already carry the magic and a declared size covering the prefix.
+        for length in 0..64 {
+            let truncated = &arm64[..length];
+            let expected = if length >= 60 {
+                malformed("truncated arm64 Image header")
+            } else {
+                Err(DirectKernelRejection::UnrecognizedFormat)
+            };
+            assert_eq!(admit(truncated, requirement), expected, "{length}");
+        }
+        assert_eq!(admit(&arm64[..64], requirement), Ok(()));
+        assert_eq!(admit(&arm64, requirement), Ok(()));
+    }
+
+    #[test]
+    fn kernel_header_capture_is_bounded_and_independent_of_write_boundaries() {
+        for (fixture, _) in ARCHITECTURES {
+            let kernel = direct_kernel_fixture::image(fixture, &vec![0x33; 2 * 4096 + 5]);
+            let expected = header(&kernel).0;
+            assert_eq!(expected, kernel[..4096]);
+            for split in [0, 1, 63, 64, 4095, 4096, 4097, kernel.len()] {
+                let mut observed = KernelHeader::default();
+                observed.write_all(&kernel[..split]).unwrap();
+                observed.write_all(&kernel[split..]).unwrap();
+                assert_eq!(observed.0, expected, "split at {split}");
+            }
+            for chunk in [1, 7, 4095, 65536] {
+                let mut chunked = KernelHeader::default();
+                for part in kernel.chunks(chunk) {
+                    chunked.write_all(part).unwrap();
+                }
+                assert_eq!(chunked.0, expected, "chunk {chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn inspected_kernel_admits_the_authenticated_file_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kernel");
+        let (fixture, architecture) = ARCHITECTURES[0];
+        let bytes = direct_kernel_fixture::kernel(fixture, "file");
+        std::fs::write(&path, &bytes).unwrap();
+        let kernel =
+            InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path).unwrap();
+        let digest = kernel.digest();
+        let asset = kernel.admit_direct(architecture).unwrap();
+        assert_eq!(asset.digest(), digest);
+        let mut copy = Vec::new();
+        asset.copy_into(&mut copy).unwrap();
+        assert_eq!(copy, bytes);
+
+        std::fs::write(&path, b"exact custom kernel").unwrap();
+        let rejected = InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path)
+            .unwrap()
+            .admit_direct(architecture)
+            .unwrap_err();
+        assert_eq!(rejected.reason, DirectKernelRejection::UnrecognizedFormat);
+        assert_eq!(
+            rejected.kernel_sha256,
+            crate::boot_qualification::hex_digest(sha256(b"exact custom kernel"))
+        );
+        assert!(rejected.to_string().contains(&rejected.kernel_sha256));
+    }
+
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes).into()
     }
 }

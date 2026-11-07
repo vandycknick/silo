@@ -128,6 +128,12 @@ impl StreamId {
     }
 }
 
+impl ImageId {
+    pub(crate) fn from_sha256(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl SnapshotId {
     pub(crate) fn from_sha256(bytes: [u8; 32]) -> Self {
         Self(bytes)

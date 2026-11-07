@@ -121,19 +121,22 @@ impl MachineStore for Store {
             });
         }
 
-        let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        self.check_cleaning_dependencies(&mut tx, &paths).await?;
-        Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
         let platform = oci::Platform::host().map_err(|error| LibVmError::InvalidStorageRecord {
             record: "machine-storage",
             message: error.to_string(),
         })?;
-        let storage = crate::MachineStorageRecord::opaque_raw(
+        let mut storage = crate::MachineStorageRecord::opaque_raw(
             crate::PrivatePath::new(crate::paths::root_disk_relative_path())?,
             512,
             &platform,
         )?;
+        let _boot = self.pin_test_boot(&mut storage).await?;
+        let paths = crate::store::cache_paths::ConfigurationPaths::new(config, &self.home)?;
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let _roots = pool.lock_roots_shared()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_cleaning_dependencies(&mut tx, &paths).await?;
+        Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
         Self::write_machine_storage(&mut tx, config.id, &storage).await?;
         tx.commit().await?;
         Ok(())
@@ -397,6 +400,53 @@ impl MachineStore for Store {
 }
 
 impl Store {
+    /// Unit-store fixtures own real immutable objects and a real operation OFD.
+    /// The caller keeps this lease until its machine publication commits.
+    #[cfg(test)]
+    pub(crate) async fn pin_test_boot(
+        &self,
+        storage: &mut crate::MachineStorageRecord,
+    ) -> Result<crate::storage::locks::StorageLock, LibVmError> {
+        let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
+        let (operation, lease) = self.begin_stopped_operation("import", &[], &[]).await?;
+        pool.create_operation_with_lease(operation, lease.duplicate()?)?;
+        let input = crate::store::snapshot_store::RecordInput::new(
+            &self.images_dir,
+            operation,
+            &test_utils::direct_kernel::host_kernel("unit-store"),
+        )?;
+        let (object, roots) = pool.publish_object_for_catalog(&input.path())?;
+        self.pin_published_storage_dependencies(operation, &[], &[object.digest])
+            .await?;
+        drop(roots);
+        let crate::BootProfile::LinuxDirect {
+            kernel_architecture,
+            binding,
+            ..
+        } = &mut storage.boot
+        else {
+            return Err(LibVmError::InvalidStorageRecord {
+                record: "test-storage",
+                message: "fixture requires direct boot".into(),
+            });
+        };
+        *binding = crate::BootBinding::Pinned {
+            kernel: object.digest,
+            base_initramfs: object.digest,
+            agent: None,
+            architecture: *kernel_architecture,
+            abi: crate::runtime::boot_assets::DIRECT_BOOT_ABI.into(),
+        };
+        let bytes = binding.canonical_bytes()?;
+        let input =
+            crate::store::snapshot_store::RecordInput::new(&self.images_dir, operation, &bytes)?;
+        let (bundle, roots) = pool.publish_object_for_catalog(&input.path())?;
+        self.pin_published_storage_dependencies(operation, &[], &[bundle.digest])
+            .await?;
+        drop(roots);
+        self.finish_stopped_operation(operation).await?;
+        Ok(lease)
+    }
     async fn add_machine_with_rootfs_inner(
         &self,
         config: &MachineConfig,
@@ -514,6 +564,7 @@ impl Store {
         storage: &crate::MachineStorageRecord,
     ) -> Result<(), LibVmError> {
         storage.validate_for_machine(machine_id.into())?;
+        storage.validate_persistent()?;
         let json = Self::serialize("machine_storage.record_json", storage)?;
         crate::storage::limits::Resource::MetadataPageBytes
             .check(json.len() as u64)
@@ -638,6 +689,7 @@ fn machine_rootfs_from_row(
     let source_kind = match source_kind.as_str() {
         "oci" => crate::ImageSourceKind::Oci,
         "disk" => crate::ImageSourceKind::Disk,
+        "managed" => crate::ImageSourceKind::Managed,
         _ => {
             return Err(LibVmError::StateDecode {
                 field: "machine_rootfs.source_kind",

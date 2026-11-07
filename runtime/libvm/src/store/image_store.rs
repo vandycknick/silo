@@ -383,6 +383,7 @@ impl Store {
         loop {
             self.check_operation_recovery(&pool).await?;
             crate::store::snapshot_store::check_snapshot_catalog(self).await?;
+            crate::store::managed_image_store::check_image_catalog(self).await?;
             let discovered = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
             let scan_finished = discovered.is_empty();
             let _roots = pool.lock_roots()?;
@@ -393,7 +394,7 @@ impl Store {
                 if machine_streams.contains(&id) {
                     continue;
                 }
-                sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) SELECT ?1,?2 WHERE NOT EXISTS(SELECT 1 FROM image_rootfs_artifact WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM layer_result WHERE pack_stream=?1) ON CONFLICT(stream_id) DO NOTHING")
+                sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) SELECT ?1,?2 WHERE NOT EXISTS(SELECT 1 FROM image_rootfs_artifact WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM layer_result WHERE pack_stream=?1) ON CONFLICT(stream_id) DO NOTHING")
                     .bind(id.to_string()).bind(i64_from_u64(length)?).execute(&mut *tx).await?;
             }
             let artifacts = sqlx::query("SELECT image_id,rootfs_path,size_bytes,stream_id FROM image_rootfs_artifact a WHERE ?1 AND NOT EXISTS(SELECT 1 FROM image_ref r WHERE r.manifest_digest=a.manifest_digest) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream p WHERE p.stream_id=a.stream_id) LIMIT 256")
@@ -429,7 +430,7 @@ impl Store {
             if !scan_finished || artifact_count > 0 {
                 pending_cursor.clear();
             }
-            let pending = sqlx::query("SELECT stream_id,size_bytes FROM image_stream_gc g WHERE stream_id>?1 AND NOT EXISTS(SELECT 1 FROM image_rootfs_artifact a WHERE a.stream_id=g.stream_id) AND NOT EXISTS(SELECT 1 FROM layer_result l WHERE l.pack_stream=g.stream_id) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream p WHERE p.stream_id=g.stream_id) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency s WHERE s.stream_id=g.stream_id) ORDER BY stream_id LIMIT 256").bind(&pending_cursor).fetch_all(&mut *tx).await?;
+            let pending = sqlx::query("SELECT stream_id,size_bytes FROM image_stream_gc g WHERE stream_id>?1 AND NOT EXISTS(SELECT 1 FROM image_rootfs_artifact a WHERE a.stream_id=g.stream_id) AND NOT EXISTS(SELECT 1 FROM layer_result l WHERE l.pack_stream=g.stream_id) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream p WHERE p.stream_id=g.stream_id) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency s WHERE s.stream_id=g.stream_id) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency i WHERE i.stream_id=g.stream_id) ORDER BY stream_id LIMIT 256").bind(&pending_cursor).fetch_all(&mut *tx).await?;
             let pending_count = pending.len();
             let mut deletions = Vec::new();
             for row in pending {

@@ -623,6 +623,119 @@ impl crate::store::Store {
     }
 }
 
+impl crate::store::Store {
+    /// Import and private-copy peaks share capture/restore's existing cross-home
+    /// disk ledger. The real producer owns the registered operation's OFD.
+    pub(crate) async fn reserve_import_space(
+        &self,
+        operation: Uuid,
+        bytes: u64,
+    ) -> Result<(), LibVmError> {
+        let disk = crate::paths::OwnedDirectory::open_existing_root(&self.images_dir)?
+            .ok_or_else(|| invalid("import pool is missing"))?;
+        self.reserve_copy_space(operation, bytes, &disk).await
+    }
+
+    pub(crate) async fn reserve_copy_space(
+        &self,
+        operation: Uuid,
+        bytes: u64,
+        disk: &crate::paths::OwnedDirectory,
+    ) -> Result<(), LibVmError> {
+        if operation.is_nil() || bytes == 0 {
+            return Err(invalid(
+                "copy space requires an exact owner and nonzero charge",
+            ));
+        }
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        let stat = nix::sys::stat::fstat(disk.fd()).map_err(std::io::Error::from)?;
+        let inventory = CaptureBudgetInventory {
+            capture_id: operation,
+            capture_memory: 0,
+            baseline: None,
+            capture_disks: vec![crate::store::snapshot_store::CaptureSpaceCharge {
+                device: stat.st_dev as u64,
+                bytes,
+            }],
+            pending: Vec::new(),
+            bound: Vec::new(),
+            descriptor_owner: None,
+            descriptors: 0,
+        };
+        let mut budget = RestoreBudget::read(&directory)?;
+        budget.add_capture(&inventory)?;
+        let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
+        let available = filesystem
+            .blocks_available()
+            .checked_mul(filesystem.fragment_size())
+            .ok_or_else(|| invalid("copy disk availability overflow"))?;
+        let required = budget
+            .disks
+            .get(&(stat.st_dev as u64))
+            .copied()
+            .unwrap_or_default();
+        if required > available {
+            return Err(crate::image::import::DiskImportError::Capacity {
+                required,
+                available,
+            }
+            .into());
+        }
+        let json = serde_json::to_string(&inventory).map_err(invalid)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='import' AND state='staging')",
+        )
+        .bind(operation.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !active {
+            return Err(invalid("copy space has no staging operation owner"));
+        }
+        sqlx::query(
+            "INSERT INTO capture_resource_reservation(operation_id,charge_json) VALUES(?1,jsonb(?2))",
+        )
+        .bind(operation.to_string())
+        .bind(&json)
+        .execute(&mut *tx)
+        .await?;
+        publish_budget(
+            tx,
+            &directory,
+            &budget_name(self, operation)?,
+            &json,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Called after the producer has stopped using all simultaneous copies.
+    /// SQL-first removal is conservative on interruption: reconciliation removes
+    /// the old ledger entry only after the journal confirms release/retirement.
+    pub(crate) async fn release_import_space(&self, operation: Uuid) -> Result<(), LibVmError> {
+        let directory = budget_directory(self)?;
+        let _admission = crate::storage::locks::blocking(
+            &directory,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )?;
+        sqlx::query(
+            "DELETE FROM capture_resource_reservation WHERE operation_id=?1 AND EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='import')",
+        )
+        .bind(operation.to_string())
+        .execute(&self.pool)
+        .await?;
+        directory.remove_tree(&budget_name(self, operation)?)?;
+        directory.sync()?;
+        Ok(())
+    }
+}
+
 /// A single authenticated user authority coordinates all of its runtime homes.
 /// No user-owned file is represented as host-global or cross-user authority.
 fn budget_directory(
@@ -1108,7 +1221,7 @@ impl crate::store::Store {
         .fetch_one(&self.pool)
         .await?;
         let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
-        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='capture')").bind(inventory.capture_id.to_string()).fetch_one(&self.pool).await?;
+        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('capture','import'))").bind(inventory.capture_id.to_string()).fetch_one(&self.pool).await?;
         if !retained {
             inventory.capture_memory = 0;
             inventory.baseline = None;
@@ -1498,6 +1611,151 @@ impl crate::store::Store {
 #[cfg(test)]
 mod tests {
     use crate::store::restore::{RestoreBudget, RestoreMemoryCharge};
+
+    #[tokio::test]
+    async fn import_capacity_is_shared_and_detached_workers_keep_their_charge_until_recovery() {
+        use crate::paths::{LocalPaths, OwnedDirectory};
+        use crate::store::restore::{budget_directory, CaptureBudgetInventory};
+        use crate::store::Store;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temporary.path().join("home")))
+            .await
+            .unwrap();
+        let _pool = crate::storage::pool::StoragePool::open(&store.images_dir).unwrap();
+        let disk = OwnedDirectory::open_existing_root(&store.images_dir)
+            .unwrap()
+            .unwrap();
+        let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).unwrap();
+        let available = filesystem
+            .blocks_available()
+            .checked_mul(filesystem.fragment_size())
+            .unwrap();
+        // Real capacity, no test admission override or allocation of a huge
+        // payload: either charge fits, but their simultaneous peak cannot.
+        let bytes = available / 4 * 3;
+        assert!(bytes > 0);
+        let (outcomes_tx, mut outcomes) = tokio::sync::mpsc::channel(2);
+        let (done_tx, mut done) = tokio::sync::mpsc::channel(2);
+        let mut workers = Vec::new();
+        let mut releases = Vec::new();
+        let mut operations = Vec::new();
+        for _ in 0..2 {
+            let (operation, lease) = store
+                .begin_stopped_operation("import", &[], &[])
+                .await
+                .unwrap();
+            operations.push(operation);
+            let owner = store.clone();
+            let outcomes = outcomes_tx.clone();
+            let done = done_tx.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let runtime = tokio::runtime::Handle::current();
+            workers.push(tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
+                    let result = runtime.block_on(owner.reserve_import_space(operation, bytes));
+                    runtime
+                        .block_on(outcomes.send((operation, result)))
+                        .unwrap();
+                    release_rx.recv().unwrap();
+                    // Process/worker loss deliberately leaves the durable
+                    // reservation, exactly as an interrupted import does.
+                    drop(lease);
+                    runtime.block_on(done.send(())).unwrap();
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        let first = outcomes.recv().await.unwrap();
+        let second = outcomes.recv().await.unwrap();
+        let (winner, refusal) = match (first, second) {
+            ((winner, Ok(())), (_, Err(error))) | ((_, Err(error)), (winner, Ok(()))) => {
+                (winner, error)
+            }
+            other => panic!("expected one admitted owner and one capacity refusal: {other:?}"),
+        };
+        assert!(matches!(
+            refusal,
+            crate::LibVmError::DiskImport(error)
+                if matches!(*error, crate::DiskImportError::Capacity { required, available }
+                    if required == bytes * 2 && required > available)
+        ));
+        let winner_index = operations.iter().position(|id| *id == winner).unwrap();
+        workers[winner_index].abort();
+        store.recover_image_cache().await.unwrap();
+        store.reconcile_restore_budget().await.unwrap();
+        let document = store.capture_budget_document(winner).await.unwrap();
+        let inventory: CaptureBudgetInventory = serde_json::from_str(&document).unwrap();
+        assert_eq!(inventory.capture_disks.len(), 1);
+        assert_eq!(inventory.capture_disks[0].bytes, bytes);
+        let ledger = budget_directory(&store).unwrap();
+        assert_eq!(
+            RestoreBudget::read(&ledger)
+                .unwrap()
+                .disks
+                .values()
+                .sum::<u64>(),
+            bytes,
+            "recovery must not release a live detached blocking owner's reservation"
+        );
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        done.recv().await.unwrap();
+        done.recv().await.unwrap();
+        store.recover_image_cache().await.unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM capture_resource_reservation")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(RestoreBudget::read(&ledger).unwrap().disks.is_empty());
+        for worker in workers {
+            let _ = worker.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_capacity_refusal_and_completion_leave_no_reservation() {
+        use crate::paths::LocalPaths;
+        use crate::store::restore::budget_directory;
+        use crate::store::Store;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temporary.path().join("home")))
+            .await
+            .unwrap();
+        let (operation, _lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let result = store.reserve_import_space(operation, u64::MAX).await;
+        assert!(matches!(
+            result,
+            Err(crate::LibVmError::DiskImport(error))
+                if matches!(*error, crate::DiskImportError::Capacity { required: u64::MAX, .. })
+        ));
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM capture_resource_reservation")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "refused admission never owns capacity");
+        store
+            .reserve_import_space(operation, 1 << 20)
+            .await
+            .unwrap();
+        store.release_import_space(operation).await.unwrap();
+        let ledger = budget_directory(&store).unwrap();
+        assert!(RestoreBudget::read(&ledger).unwrap().disks.is_empty());
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM capture_resource_reservation")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
 
     fn charge(inode: u64, disk_device: u64) -> RestoreMemoryCharge {
         let bytes = 1 << 20;

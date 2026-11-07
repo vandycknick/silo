@@ -431,10 +431,10 @@ struct Qualification<'a> {
 
 // Supervisor-verified real CLI/guest pause, ClockOnly resume and paused stop.
 const QUALIFICATIONS: &[Qualification<'static>] = &[Qualification {
-    binding: "v2:native=9cf385b61cb89d00324047c75453d541ea0c57c6bbdbc5803b2331513316cf04:binding=29c5522210b49efc8f9106c8f03d50c350fe73b8e89e0d0cd10d7aa6d7abbbbc:eligible=true",
+    binding: "v2:native=9cf385b61cb89d00324047c75453d541ea0c57c6bbdbc5803b2331513316cf04:binding=c63be6ffdc486400258719cc3b29be5461ec8dc76574787186ea5499ca8ee836:eligible=true",
     lane: LiveLane::KvmX86_64,
     operations: &[LiveOperation::Pause],
-    evidence: "phase-16/pause-release-08-requalification.xml; exact release CLI/guest pause, resume, paused stop and profile refusal",
+    evidence: "phase-17/pause-candidate-final.xml; exact release CLI/guest pause, resume, paused stop and profile refusal",
 }];
 
 fn qualification_matches(

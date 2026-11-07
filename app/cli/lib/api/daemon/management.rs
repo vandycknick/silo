@@ -7,6 +7,7 @@ use libvm::{
     MachineStopOptions, MachineUpdate, MachineWaitOptions, NetworkDefinition, NetworkDriver,
     NetworkTopology,
 };
+use silo_vm_control::requests::{self, CreateSource};
 use silo_vm_control::{
     duration_to_wire, images, lifecycle, network, readiness, snapshots, updates,
 };
@@ -15,7 +16,8 @@ use silod_spec::daemon::v1 as w;
 use crate::api::daemon::{invalid_response, native_status, DaemonVmService};
 use crate::api::machine::AppMachine;
 use crate::api::start_options::AppStartOptions;
-use crate::api::types::{ResolvedSource, SourceResolution};
+use crate::api::types::{ResolvedSource, SourceOptions, SourceResolution};
+use crate::commands::create::{parse_source, validate_source_options, SourceSpelling};
 use crate::machine_defaults::ResolvedMachineNetwork;
 use crate::planning::{self, CreatePlan, PullPolicy, ResolvedImage};
 use crate::template::Template;
@@ -585,30 +587,67 @@ impl DaemonVmService {
         positional: Option<&str>,
         template: &Template,
         pull: Option<(ImagePullPolicy, PullPolicy)>,
+        options: &SourceOptions,
         progress: ImageProgressSender,
     ) -> eyre::Result<SourceResolution> {
         let requested = crate::commands::create::selected_image_reference(positional, template)?;
-        if let Some(path) = requested.strip_prefix("disk:") {
-            eyre::ensure!(
-                pull.is_none(),
-                "--pull is only supported for OCI image sources"
-            );
-            let path = crate::commands::create::canonical_disk_source(&requested, path)?;
-            return Ok(SourceResolution {
-                plan_image: ResolvedImage::Disk { path: path.clone() },
-                is_positional: positional.is_some(),
-                source: ResolvedSource::Disk(path),
-            });
-        }
+        let spelling = parse_source(&requested)?;
+        validate_source_options(&spelling, options, pull.is_some())?;
+        let is_positional = positional.is_some();
+        let reference = match spelling {
+            SourceSpelling::Managed(spelling) => {
+                let reference = self.managed_reference(spelling).await?;
+                let info = self.inspect_managed(&reference).await?;
+                return Ok(crate::api::local::managed_resolution(
+                    requested,
+                    &info,
+                    is_positional,
+                ));
+            }
+            SourceSpelling::Disk(path) => {
+                return crate::api::local::disk_resolution(path, options, is_positional)
+            }
+            SourceSpelling::Oci(reference) => reference,
+        };
         let (policy, plan_policy) =
             pull.unwrap_or((ImagePullPolicy::IfMissing, PullPolicy::IfMissing));
+        let image = self
+            .resolve_oci(reference, policy, options.platform.as_ref(), &progress)
+            .await?;
+        let identity = &image.identity;
+        let plan_image = ResolvedImage::Oci {
+            identity: planning::OciImageIdentity {
+                requested_reference: identity.requested_reference.clone(),
+                selected_reference: identity.selected_reference.clone(),
+                platform: identity.platform.clone(),
+                manifest_digest: identity.manifest_digest.clone(),
+                config_digest: identity.config_digest.clone(),
+                cache_state: match image.cache_state {
+                    libvm::ImageCacheState::Complete => planning::ImageCacheState::Complete,
+                    libvm::ImageCacheState::Missing => planning::ImageCacheState::Missing,
+                },
+                pull_policy: plan_policy,
+            },
+            metadata: Box::new(image.config),
+        };
+        Ok(SourceResolution {
+            plan_image,
+            is_positional,
+            source: ResolvedSource::DaemonOciIdentity(image.identity),
+        })
+    }
+
+    async fn resolve_oci(
+        &self,
+        reference: String,
+        policy: ImagePullPolicy,
+        platform: Option<&libvm::LinuxPlatform>,
+        progress: &ImageProgressSender,
+    ) -> eyre::Result<images::ResolvedImage> {
         let mut stream = self
             .runtime
             .clone()
-            .resolve_image(w::ResolveImageRequest {
-                reference: requested,
-                pull_policy: images::pull_policy_to_wire(policy),
-            })
+            .resolve_image(images::resolve_request_to_wire(reference, policy, platform))
             .await
             .map_err(native_status)?
             .into_inner();
@@ -632,28 +671,15 @@ impl DaemonVmService {
         }
         let image = terminal
             .ok_or_else(|| eyre::eyre!("daemon image stream ended without resolved image"))?;
-        let identity = &image.identity;
-        let plan_image = ResolvedImage::Oci {
-            identity: planning::OciImageIdentity {
-                requested_reference: identity.requested_reference.clone(),
-                selected_reference: identity.selected_reference.clone(),
-                platform: identity.platform.clone(),
-                manifest_digest: identity.manifest_digest.clone(),
-                config_digest: identity.config_digest.clone(),
-                cache_state: match image.cache_state {
-                    libvm::ImageCacheState::Complete => planning::ImageCacheState::Complete,
-                    libvm::ImageCacheState::Missing => planning::ImageCacheState::Missing,
-                },
-                pull_policy: plan_policy,
-            },
-            metadata: Box::new(image.config),
-        };
-        Ok(SourceResolution {
-            plan_image,
-            is_positional: positional.is_some(),
-            source: ResolvedSource::DaemonOciIdentity(image.identity),
-        })
+        if let Some(platform) = platform {
+            eyre::ensure!(
+                &silo_vm_control::boot::platform_from_oci(&image.identity.platform)? == platform,
+                "daemon selected a platform other than the requested one"
+            );
+        }
+        Ok(image)
     }
+
     pub(crate) async fn create_machine(
         &self,
         plan: &CreatePlan,
@@ -664,19 +690,9 @@ impl DaemonVmService {
         crate::api::local::ensure_source_matches_plan(plan, &source)?;
         let configuration = crate::api::local::normalize_plan(plan, policy_config_dir)?;
         let source = match source.source {
-            ResolvedSource::DaemonOciIdentity(identity) => {
-                w::create_machine_request::Source::Oci(w::OciIdentity {
-                    requested_reference: identity.requested_reference,
-                    selected_reference: identity.selected_reference,
-                    platform: identity.platform.to_string(),
-                    manifest_digest: identity.manifest_digest,
-                    config_digest: identity.config_digest,
-                    pull_policy: images::pull_policy_to_wire(identity.pull_policy),
-                })
-            }
-            ResolvedSource::Disk(path) => {
-                w::create_machine_request::Source::DiskPath(silo_vm_control::path_to_wire(&path))
-            }
+            ResolvedSource::DaemonOciIdentity(identity) => CreateSource::Oci(identity),
+            ResolvedSource::Disk(request) => CreateSource::Disk(request),
+            ResolvedSource::Managed(reference) => CreateSource::Managed(reference),
             ResolvedSource::LocalResolvedOci(_) => {
                 eyre::bail!("local OCI source cannot be created through daemon management")
             }
@@ -684,10 +700,7 @@ impl DaemonVmService {
         let mut stream = self
             .machines
             .clone()
-            .create_machine(w::CreateMachineRequest {
-                configuration: Some(updates::create_to_wire(&configuration)?),
-                source: Some(source),
-            })
+            .create_machine(requests::create_request_to_wire(&configuration, &source)?)
             .await
             .map_err(native_status)?
             .into_inner();
@@ -715,4 +728,167 @@ impl DaemonVmService {
             )
         })
     }
+
+    pub(crate) async fn managed_reference(
+        &self,
+        spelling: images::ManagedSpelling,
+    ) -> eyre::Result<libvm::ManagedSourceRef> {
+        Ok(match spelling {
+            images::ManagedSpelling::Reference(reference) => reference,
+            images::ManagedSpelling::Digest(digest) => {
+                images::managed_id_to_ref(images::managed_id_from_wire(
+                    self.runtime
+                        .clone()
+                        .resolve_managed_digest(images::managed_digest_to_wire(&digest))
+                        .await
+                        .map_err(native_status)?
+                        .into_inner(),
+                )?)
+            }
+        })
+    }
+
+    pub(crate) async fn inspect_managed(
+        &self,
+        reference: &libvm::ManagedSourceRef,
+    ) -> eyre::Result<libvm::ManagedSourceInfo> {
+        let info = images::managed_info_from_wire(
+            self.runtime
+                .clone()
+                .inspect_managed_image(images::managed_ref_to_wire(reference)?)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?;
+        let answers = match (reference, &info) {
+            (libvm::ManagedSourceRef::Image(id), libvm::ManagedSourceInfo::Image(image)) => {
+                image.id == *id
+            }
+            (
+                libvm::ManagedSourceRef::Snapshot(id),
+                libvm::ManagedSourceInfo::Snapshot(snapshot),
+            ) => snapshot.id == *id,
+            (libvm::ManagedSourceRef::Alias(alias), libvm::ManagedSourceInfo::Image(image)) => {
+                image.aliases.contains(alias)
+            }
+            (
+                libvm::ManagedSourceRef::Alias(alias),
+                libvm::ManagedSourceInfo::Snapshot(snapshot),
+            ) => snapshot.aliases.contains(alias),
+            _ => false,
+        };
+        eyre::ensure!(
+            answers,
+            "daemon inspection does not answer the requested reference"
+        );
+        Ok(info)
+    }
+
+    pub(crate) async fn list_managed(&self) -> eyre::Result<Vec<libvm::ManagedSourceInfo>> {
+        Ok(images::managed_list_from_wire(
+            self.runtime
+                .clone()
+                .list_managed_images(())
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+
+    pub(crate) async fn release_image(
+        &self,
+        reference: &libvm::ManagedSourceRef,
+    ) -> eyre::Result<()> {
+        self.runtime
+            .clone()
+            .release_image_retention(images::managed_ref_to_wire(reference)?)
+            .await
+            .map_err(native_status)?;
+        Ok(())
+    }
+
+    /// The daemon owns the import once submitted; a lost reply is not cancellation.
+    pub(crate) async fn import_image(
+        &self,
+        request: libvm::DiskImportRequest,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ManagedImageInfo> {
+        let stream = self
+            .runtime
+            .clone()
+            .import_image(silo_vm_control::boot::import_request_to_wire(&request)?)
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        managed_image_stream(stream, &progress).await
+    }
+
+    /// Resolves the mutable spelling once, then converts exactly that selected
+    /// immutable manifest/platform identity.
+    pub(crate) async fn convert_image(
+        &self,
+        reference: String,
+        pull: ImagePullPolicy,
+        platform: Option<libvm::LinuxPlatform>,
+        options: libvm::RawConversionOptions,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ManagedImageInfo> {
+        let image = self
+            .resolve_oci(reference, pull, platform.as_ref(), &progress)
+            .await?;
+        let stream = self
+            .runtime
+            .clone()
+            .convert_image(images::convert_request_to_wire(&image.identity, &options)?)
+            .await
+            .map_err(native_status)?
+            .into_inner();
+        managed_image_stream(stream, &progress).await
+    }
+
+    pub(crate) async fn update_boot_assets(
+        &self,
+        value: &str,
+        update: libvm::BootAssetsUpdate,
+    ) -> eyre::Result<MachineData> {
+        Ok(snapshots::snapshot_from_wire(
+            self.machines
+                .clone()
+                .update_boot_assets(silo_vm_control::boot::update_boot_assets_to_wire(
+                    &libvm::MachineRef::parse(value)?,
+                    &update,
+                )?)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?)
+    }
+}
+
+/// Exactly one terminal managed image ends the stream; progress precedes it.
+async fn managed_image_stream(
+    mut stream: tonic::Streaming<w::ManagedImageEvent>,
+    progress: &ImageProgressSender,
+) -> eyre::Result<libvm::ManagedImageInfo> {
+    let mut terminal = None;
+    while let Some(event) = stream.message().await.map_err(native_status)? {
+        eyre::ensure!(
+            terminal.is_none(),
+            "daemon image stream continued after terminal image"
+        );
+        match event
+            .event
+            .ok_or_else(|| eyre::eyre!("daemon image stream omitted event"))?
+        {
+            w::managed_image_event::Event::Progress(value) => {
+                progress.send(images::progress_from_wire(value)?)
+            }
+            w::managed_image_event::Event::Image(value) => {
+                terminal = Some(images::managed_image_from_wire(value)?)
+            }
+        }
+    }
+    terminal.ok_or_else(|| {
+        eyre::eyre!("daemon image stream ended without a managed image; inspect before retrying")
+    })
 }

@@ -191,6 +191,80 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = message.clone();
             tonic::Code::InvalidArgument
         }
+        E::BackendAdmissionRejected {
+            source_family,
+            root_profile,
+            requirement,
+            effective_backend,
+            remedy,
+        } => {
+            d.kind = 4;
+            d.code = 9;
+            d.safe_message = v.to_string();
+            d.backend_admission = Some(admission_to_wire(
+                *source_family,
+                *root_profile,
+                *requirement,
+                *effective_backend,
+                *remedy,
+            ));
+            tonic::Code::FailedPrecondition
+        }
+        E::RootSelectionFailed(failure) => match root_selection_to_wire(failure) {
+            Ok(wire) => {
+                d.kind = 1;
+                d.code = 10;
+                d.safe_message = failure.reason.clone();
+                d.root_selection = Some(wire);
+                tonic::Code::InvalidArgument
+            }
+            Err(error) => {
+                d.safe_message = format!("invalid root selection diagnostics: {error}");
+                tonic::Code::Internal
+            }
+        },
+        E::TranslationUnavailable { reason } => {
+            d.kind = 4;
+            d.code = 11;
+            d.safe_message = reason.clone();
+            tonic::Code::FailedPrecondition
+        }
+        E::BootBundleAbiUnsupported { expected, actual } => {
+            d.kind = 4;
+            d.code = 14;
+            d.safe_message = v.to_string();
+            d.boot_bundle_abi = Some(w::BootBundleAbiUnsupported {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            });
+            tonic::Code::FailedPrecondition
+        }
+        E::DirectKernelRejected(_) => {
+            d.kind = 4;
+            d.safe_message = v.to_string();
+            tonic::Code::FailedPrecondition
+        }
+        E::BootAssetsAcquisitionRequired { missing } => {
+            d.kind = 2;
+            d.code = 12;
+            d.reference = Some(missing.to_string());
+            d.safe_message = v.to_string();
+            tonic::Code::FailedPrecondition
+        }
+        E::DiskImport(failure) => match disk_import_to_wire(failure) {
+            Some(wire) => {
+                d.kind = 1;
+                d.code = 13;
+                d.safe_message = failure.to_string();
+                d.disk_import = Some(wire);
+                tonic::Code::InvalidArgument
+            }
+            None => {
+                d.kind = 1;
+                d.safe_message = failure.to_string();
+                tonic::Code::InvalidArgument
+            }
+        },
         E::InvalidMachineName { .. }
         | E::InvalidMachineIdPrefix { .. }
         | E::InvalidCreateRequest { .. }
@@ -258,10 +332,71 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         return Err(invalid("error.kind", "invalid enum"));
     }
     use libvm::LibVmError as E;
-    if d.code != 8 && d.live_unsupported.is_some() {
-        return Err(invalid("error.live_unsupported", "unexpected live detail"));
+    if (d.code != 8 && d.live_unsupported.is_some())
+        || (d.code != 9 && d.backend_admission.is_some())
+        || (d.code != 10 && d.root_selection.is_some())
+        || (d.code != 13 && d.disk_import.is_some())
+        || (d.code != 14 && d.boot_bundle_abi.is_some())
+    {
+        return Err(invalid(
+            "error.detail",
+            "typed payload does not match the code",
+        ));
     }
+    let (status_code, detail_kind) = (v.code(), d.kind);
+    let category = |code: tonic::Code, kind: i32, field: &'static str| {
+        if status_code != code || detail_kind != kind {
+            Err(invalid(field, "unexpected status category"))
+        } else {
+            Ok(())
+        }
+    };
     Ok(match d.code {
+        9 => {
+            category(
+                tonic::Code::FailedPrecondition,
+                4,
+                "error.backend_admission",
+            )?;
+            admission_from_wire(required(d.backend_admission, "error.backend_admission")?)?
+        }
+        10 => {
+            category(tonic::Code::InvalidArgument, 1, "error.root_selection")?;
+            E::RootSelectionFailed(Box::new(root_selection_from_wire(required(
+                d.root_selection,
+                "error.root_selection",
+            )?)?))
+        }
+        11 => {
+            category(tonic::Code::FailedPrecondition, 4, "error.translation")?;
+            E::TranslationUnavailable {
+                reason: d.safe_message,
+            }
+        }
+        12 => {
+            category(tonic::Code::FailedPrecondition, 2, "error.boot_assets")?;
+            E::BootAssetsAcquisitionRequired {
+                missing: crate::boot::digest_from_wire(
+                    &required(d.reference, "error.reference")?,
+                    "error.reference",
+                )?,
+            }
+        }
+        14 => {
+            category(tonic::Code::FailedPrecondition, 4, "error.boot_bundle_abi")?;
+            let value = required(d.boot_bundle_abi, "error.boot_bundle_abi")?;
+            E::BootBundleAbiUnsupported {
+                expected: crate::boot::digest_from_wire(&value.expected, "error.expected")?,
+                actual: crate::boot::digest_from_wire(&value.actual, "error.actual")?,
+            }
+        }
+        13 => {
+            category(tonic::Code::InvalidArgument, 1, "error.disk_import")?;
+            E::DiskImport(Box::new(disk_import_from_wire(required(
+                d.disk_import,
+                "error.disk_import",
+            )?)?))
+        }
         8 => {
             if v.code() != tonic::Code::FailedPrecondition || d.kind != 4 {
                 return Err(invalid(
@@ -374,6 +509,239 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
             }
         },
         _ => return Err(invalid("error.code", "invalid enum")),
+    })
+}
+
+/// Bounded by the partition parser: at most 128 GPT entries or 4 MBR slots.
+const MAX_ROOT_CANDIDATES: usize = 128;
+const MAX_REASON_BYTES: usize = 4096;
+
+fn admission_to_wire(
+    source_family: libvm::SourceFamily,
+    root_profile: libvm::StorageProfile,
+    requirement: libvm::BackendRequirement,
+    effective_backend: vm_spec::live::LiveBackend,
+    remedy: libvm::AdmissionRemedy,
+) -> w::BackendAdmissionRejected {
+    w::BackendAdmissionRejected {
+        source_family: match source_family {
+            libvm::SourceFamily::Oci => w::SourceFamily::Oci,
+            libvm::SourceFamily::LocalDisk => w::SourceFamily::LocalDisk,
+            libvm::SourceFamily::ManagedImage => w::SourceFamily::ManagedImage,
+            libvm::SourceFamily::Snapshot => w::SourceFamily::Snapshot,
+        } as i32,
+        root_profile: match root_profile {
+            libvm::StorageProfile::OpaqueRawV1 => w::StorageProfile::OpaqueRawV1,
+            libvm::StorageProfile::LinuxOverlayV1 => w::StorageProfile::LinuxOverlayV1,
+        } as i32,
+        requirement: match requirement {
+            libvm::BackendRequirement::RawBlock => w::BackendRequirement::RawBlock,
+            libvm::BackendRequirement::KrunOverlay => w::BackendRequirement::KrunOverlay,
+        } as i32,
+        effective_backend: crate::live::backend_to_wire(effective_backend),
+        remedy: match remedy {
+            libvm::AdmissionRemedy::ExplicitOciToRawConversion => {
+                w::AdmissionRemedy::ExplicitOciToRawConversion
+            }
+            libvm::AdmissionRemedy::UseKrun => w::AdmissionRemedy::UseKrun,
+            libvm::AdmissionRemedy::UnsupportedBootProfile => {
+                w::AdmissionRemedy::UnsupportedBootProfile
+            }
+        } as i32,
+    }
+}
+
+fn admission_from_wire(
+    value: w::BackendAdmissionRejected,
+) -> Result<libvm::LibVmError, ConversionError> {
+    Ok(libvm::LibVmError::BackendAdmissionRejected {
+        source_family: match w::SourceFamily::try_from(value.source_family) {
+            Ok(w::SourceFamily::Oci) => libvm::SourceFamily::Oci,
+            Ok(w::SourceFamily::LocalDisk) => libvm::SourceFamily::LocalDisk,
+            Ok(w::SourceFamily::ManagedImage) => libvm::SourceFamily::ManagedImage,
+            Ok(w::SourceFamily::Snapshot) => libvm::SourceFamily::Snapshot,
+            _ => return Err(invalid("error.source_family", "unknown source family")),
+        },
+        root_profile: match w::StorageProfile::try_from(value.root_profile) {
+            Ok(w::StorageProfile::OpaqueRawV1) => libvm::StorageProfile::OpaqueRawV1,
+            Ok(w::StorageProfile::LinuxOverlayV1) => libvm::StorageProfile::LinuxOverlayV1,
+            _ => return Err(invalid("error.root_profile", "unknown storage profile")),
+        },
+        requirement: match w::BackendRequirement::try_from(value.requirement) {
+            Ok(w::BackendRequirement::RawBlock) => libvm::BackendRequirement::RawBlock,
+            Ok(w::BackendRequirement::KrunOverlay) => libvm::BackendRequirement::KrunOverlay,
+            _ => return Err(invalid("error.requirement", "unknown backend requirement")),
+        },
+        effective_backend: crate::live::backend_from_wire(value.effective_backend)?,
+        remedy: match w::AdmissionRemedy::try_from(value.remedy) {
+            Ok(w::AdmissionRemedy::ExplicitOciToRawConversion) => {
+                libvm::AdmissionRemedy::ExplicitOciToRawConversion
+            }
+            Ok(w::AdmissionRemedy::UseKrun) => libvm::AdmissionRemedy::UseKrun,
+            Ok(w::AdmissionRemedy::UnsupportedBootProfile) => {
+                libvm::AdmissionRemedy::UnsupportedBootProfile
+            }
+            _ => return Err(invalid("error.remedy", "unknown admission remedy")),
+        },
+    })
+}
+
+fn root_selection_to_wire(
+    value: &libvm::RootSelectionFailed,
+) -> Result<w::RootSelectionFailed, ConversionError> {
+    if value.candidates.len() > MAX_ROOT_CANDIDATES || value.reason.len() > MAX_REASON_BYTES {
+        return Err(invalid(
+            "error.root_selection",
+            "diagnostics exceed parser bounds",
+        ));
+    }
+    Ok(w::RootSelectionFailed {
+        requested: Some(crate::boot::import_root_to_wire(&value.requested)?),
+        candidates: value
+            .candidates
+            .iter()
+            .map(crate::boot::root_candidate_to_wire)
+            .collect::<Result<_, _>>()?,
+        reason: value.reason.clone(),
+    })
+}
+
+fn root_selection_from_wire(
+    value: w::RootSelectionFailed,
+) -> Result<libvm::RootSelectionFailed, ConversionError> {
+    if value.candidates.len() > MAX_ROOT_CANDIDATES || value.reason.len() > MAX_REASON_BYTES {
+        return Err(invalid(
+            "error.root_selection",
+            "diagnostics exceed parser bounds",
+        ));
+    }
+    Ok(libvm::RootSelectionFailed {
+        requested: crate::boot::import_root_from_wire(required(
+            value.requested,
+            "error.root_selection.requested",
+        )?)?,
+        candidates: value
+            .candidates
+            .into_iter()
+            .map(crate::boot::root_candidate_from_wire)
+            .collect::<Result<_, _>>()?,
+        reason: value.reason,
+    })
+}
+
+fn container_to_wire(value: libvm::ForeignContainer) -> w::ForeignContainer {
+    match value {
+        libvm::ForeignContainer::Vmdk => w::ForeignContainer::Vmdk,
+        libvm::ForeignContainer::Vhd => w::ForeignContainer::Vhd,
+        libvm::ForeignContainer::Vhdx => w::ForeignContainer::Vhdx,
+        libvm::ForeignContainer::Vdi => w::ForeignContainer::Vdi,
+        libvm::ForeignContainer::Qed => w::ForeignContainer::Qed,
+        libvm::ForeignContainer::Luks => w::ForeignContainer::Luks,
+        libvm::ForeignContainer::Gzip => w::ForeignContainer::Gzip,
+        libvm::ForeignContainer::Xz => w::ForeignContainer::Xz,
+        libvm::ForeignContainer::Zstd => w::ForeignContainer::Zstd,
+        libvm::ForeignContainer::Bzip2 => w::ForeignContainer::Bzip2,
+    }
+}
+
+fn container_from_wire(value: i32) -> Result<libvm::ForeignContainer, ConversionError> {
+    Ok(match w::ForeignContainer::try_from(value) {
+        Ok(w::ForeignContainer::Vmdk) => libvm::ForeignContainer::Vmdk,
+        Ok(w::ForeignContainer::Vhd) => libvm::ForeignContainer::Vhd,
+        Ok(w::ForeignContainer::Vhdx) => libvm::ForeignContainer::Vhdx,
+        Ok(w::ForeignContainer::Vdi) => libvm::ForeignContainer::Vdi,
+        Ok(w::ForeignContainer::Qed) => libvm::ForeignContainer::Qed,
+        Ok(w::ForeignContainer::Luks) => libvm::ForeignContainer::Luks,
+        Ok(w::ForeignContainer::Gzip) => libvm::ForeignContainer::Gzip,
+        Ok(w::ForeignContainer::Xz) => libvm::ForeignContainer::Xz,
+        Ok(w::ForeignContainer::Zstd) => libvm::ForeignContainer::Zstd,
+        Ok(w::ForeignContainer::Bzip2) => libvm::ForeignContainer::Bzip2,
+        _ => return Err(invalid("error.disk_import.container", "unknown container")),
+    })
+}
+
+/// Every admitted refusal keeps its typed failure kind; the source path (when
+/// the failure has one) and unsupported-container identity are reconstructible.
+/// A future native kind falls back to the generic native detail.
+fn disk_import_to_wire(value: &libvm::DiskImportError) -> Option<w::DiskImportRejected> {
+    use libvm::DiskImportError as D;
+    use w::DiskImportFailure as F;
+    let (failure, path, container) = match value {
+        D::Open { path, .. } => (F::Open, Some(path), None),
+        D::SymbolicLink { path } => (F::SymbolicLink, Some(path), None),
+        D::NotRegularFile { path } => (F::NotRegularFile, Some(path), None),
+        D::UnsupportedContainer { path, container } => {
+            (F::UnsupportedContainer, Some(path), Some(*container))
+        }
+        D::RawGeometry { path, .. } => (F::RawGeometry, Some(path), None),
+        D::Qcow2 { path, .. } => (F::Qcow2, Some(path), None),
+        D::SourceChanged { path } => (F::SourceChanged, Some(path), None),
+        D::PartitionTable(_) => (F::PartitionTable, None, None),
+        D::DirectTable(_) => (F::DirectTable, None, None),
+        D::RootFilesystem(_) => (F::RootFilesystem, None, None),
+        D::OutputLength { .. } => (F::OutputLength, None, None),
+        D::Read { path, .. } => (F::Read, Some(path), None),
+        D::DecodedGeometry { .. } => (F::DecodedGeometry, None, None),
+        _ => return None,
+    };
+    Some(w::DiskImportRejected {
+        failure: failure as i32,
+        path: path
+            .map(|path| crate::path_to_wire(path))
+            .unwrap_or_default(),
+        container: container.map(|container| container_to_wire(container) as i32),
+    })
+}
+
+/// Reconstructs refusals whose complete native meaning travels on the wire.
+/// Failures carrying a native source error (qcow2, partition table, I/O) keep
+/// their original RPC status instead of a fabricated source.
+fn disk_import_from_wire(
+    value: w::DiskImportRejected,
+) -> Result<libvm::DiskImportError, ConversionError> {
+    use libvm::DiskImportError as D;
+    use w::DiskImportFailure as F;
+    let failure = F::try_from(value.failure)
+        .map_err(|_| invalid("error.disk_import.failure", "unknown failure"))?;
+    if (failure == F::UnsupportedContainer) != value.container.is_some() {
+        return Err(invalid(
+            "error.disk_import.container",
+            "container is present exactly for unsupported containers",
+        ));
+    }
+    let path = || -> Result<std::path::PathBuf, ConversionError> {
+        let path = crate::path_from_wire(value.path.clone())?;
+        if !path.is_absolute() {
+            return Err(invalid("error.disk_import.path", "must be absolute"));
+        }
+        Ok(path)
+    };
+    Ok(match failure {
+        F::SymbolicLink => D::SymbolicLink { path: path()? },
+        F::NotRegularFile => D::NotRegularFile { path: path()? },
+        F::SourceChanged => D::SourceChanged { path: path()? },
+        F::UnsupportedContainer => D::UnsupportedContainer {
+            path: path()?,
+            container: container_from_wire(required(
+                value.container,
+                "error.disk_import.container",
+            )?)?,
+        },
+        F::Unspecified => return Err(invalid("error.disk_import.failure", "unknown failure")),
+        F::Open
+        | F::RawGeometry
+        | F::Qcow2
+        | F::PartitionTable
+        | F::DirectTable
+        | F::RootFilesystem
+        | F::OutputLength
+        | F::Read
+        | F::DecodedGeometry => {
+            return Err(invalid(
+                "error.disk_import",
+                "retain original typed RPC status; native source cannot be reconstructed",
+            ))
+        }
     })
 }
 
@@ -538,5 +906,136 @@ mod tests {
         let detail = w::ErrorDetail::decode(rich.details[0].value.as_slice()).unwrap();
         assert_eq!(detail.code, 7);
         assert!(detail.live_unsupported.is_none());
+    }
+
+    #[test]
+    fn admission_selection_translation_and_acquisition_refusals_stay_typed() {
+        let admission = libvm::LibVmError::BackendAdmissionRejected {
+            source_family: libvm::SourceFamily::Oci,
+            root_profile: libvm::StorageProfile::OpaqueRawV1,
+            requirement: libvm::BackendRequirement::RawBlock,
+            effective_backend: LiveBackend::Vz,
+            remedy: libvm::AdmissionRemedy::ExplicitOciToRawConversion,
+        };
+        let status_value = native_error_to_status(&admission);
+        assert_eq!(status_value.code(), tonic::Code::FailedPrecondition);
+        assert!(matches!(
+            status_to_native_error(&status_value).unwrap(),
+            libvm::LibVmError::BackendAdmissionRejected {
+                source_family: libvm::SourceFamily::Oci,
+                effective_backend: LiveBackend::Vz,
+                remedy: libvm::AdmissionRemedy::ExplicitOciToRawConversion,
+                ..
+            }
+        ));
+        let failure = libvm::RootSelectionFailed {
+            requested: libvm::ImportRootSelection::AutoGpt,
+            candidates: vec![libvm::RootCandidate {
+                selector: libvm::RootSelector::GptPartition {
+                    guid: "01234567-89ab-cdef-0123-456789abcdef".parse().unwrap(),
+                },
+                first_lba: 2048,
+                length_lbas: 2048,
+                gpt_type: Some("4f68bce3-e8cd-4db1-96e7-fbcaf984b709".parse().unwrap()),
+                mbr_type: None,
+                attributes: 0,
+            }],
+            reason: "multiple root candidates".into(),
+        };
+        let status_value = native_error_to_status(&libvm::LibVmError::RootSelectionFailed(
+            Box::new(failure.clone()),
+        ));
+        assert_eq!(status_value.code(), tonic::Code::InvalidArgument);
+        match status_to_native_error(&status_value).unwrap() {
+            libvm::LibVmError::RootSelectionFailed(actual) => assert_eq!(*actual, failure),
+            error => panic!("lost typed candidates: {error:?}"),
+        }
+        let missing: libvm::storage::identity::ObjectDigest =
+            format!("sha256:{}", "aa".repeat(32)).parse().unwrap();
+        let status_value =
+            native_error_to_status(&libvm::LibVmError::BootAssetsAcquisitionRequired { missing });
+        assert!(matches!(
+            status_to_native_error(&status_value).unwrap(),
+            libvm::LibVmError::BootAssetsAcquisitionRequired { missing: actual } if actual == missing
+        ));
+        let status_value = native_error_to_status(&libvm::LibVmError::TranslationUnavailable {
+            reason: "explicit --rosetta=false conflicts with amd64 userspace".into(),
+        });
+        assert!(matches!(
+            status_to_native_error(&status_value).unwrap(),
+            libvm::LibVmError::TranslationUnavailable { reason } if reason.contains("rosetta=false")
+        ));
+
+        let actual: libvm::storage::identity::ObjectDigest =
+            format!("sha256:{}", "bb".repeat(32)).parse().unwrap();
+        let status_value = native_error_to_status(&libvm::LibVmError::BootBundleAbiUnsupported {
+            expected: missing,
+            actual,
+        });
+        assert_eq!(status_value.code(), tonic::Code::FailedPrecondition);
+        assert!(matches!(
+            status_to_native_error(&status_value).unwrap(),
+            libvm::LibVmError::BootBundleAbiUnsupported { expected, actual: observed }
+                if expected == missing && observed == actual
+        ));
+        let rejected = w::ErrorDetail {
+            kind: 4,
+            code: 9,
+            backend_admission: Some(w::BackendAdmissionRejected {
+                source_family: w::SourceFamily::Oci as i32,
+                root_profile: w::StorageProfile::OpaqueRawV1 as i32,
+                requirement: w::BackendRequirement::RawBlock as i32,
+                effective_backend: 2,
+                remedy: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            status_to_native_error(&status(rejected.clone(), tonic::Code::FailedPrecondition))
+                .is_err(),
+            "unspecified remedy"
+        );
+        let mut wrong_category = rejected.clone();
+        wrong_category.backend_admission.as_mut().unwrap().remedy = 1;
+        assert!(status_to_native_error(&status(wrong_category, tonic::Code::Internal)).is_err());
+        let mut stray = rejected;
+        stray.code = 10;
+        stray.kind = 1;
+        assert!(status_to_native_error(&status(stray, tonic::Code::InvalidArgument)).is_err());
+    }
+
+    #[test]
+    fn disk_import_refusals_keep_kind_path_and_container() {
+        for error in [
+            libvm::DiskImportError::SymbolicLink {
+                path: "/images/link.raw".into(),
+            },
+            libvm::DiskImportError::UnsupportedContainer {
+                path: "/images/disk.vmdk".into(),
+                container: libvm::ForeignContainer::Vmdk,
+            },
+        ] {
+            let status_value =
+                native_error_to_status(&libvm::LibVmError::DiskImport(Box::new(error)));
+            assert_eq!(status_value.code(), tonic::Code::InvalidArgument);
+            assert!(matches!(
+                status_to_native_error(&status_value).unwrap(),
+                libvm::LibVmError::DiskImport(_)
+            ));
+        }
+        let detail = w::ErrorDetail {
+            kind: 1,
+            code: 13,
+            disk_import: Some(w::DiskImportRejected {
+                failure: w::DiskImportFailure::SymbolicLink as i32,
+                path: b"/images/link.raw".to_vec(),
+                container: Some(w::ForeignContainer::Vmdk as i32),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            status_to_native_error(&status(detail, tonic::Code::InvalidArgument)).is_err(),
+            "container only belongs to unsupported-container failures"
+        );
     }
 }

@@ -199,7 +199,7 @@ CREATE TABLE image_rootfs_artifact (
 
 CREATE TABLE machine_rootfs (
     machine_id              TEXT PRIMARY KEY REFERENCES machine_config(id) ON DELETE CASCADE,
-    source_kind             TEXT NOT NULL CHECK (source_kind IN ('oci', 'disk')),
+    source_kind             TEXT NOT NULL CHECK (source_kind IN ('oci', 'disk', 'managed')),
     requested_reference     TEXT NOT NULL,
     selected_reference      TEXT,
     manifest_digest         TEXT,
@@ -433,11 +433,62 @@ CREATE TABLE storage_snapshot (
     retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
     created_at INTEGER NOT NULL
 );
+CREATE TABLE storage_image (
+    id TEXT PRIMARY KEY NOT NULL,
+    record_digest TEXT NOT NULL,
+    record_bytes BLOB NOT NULL,
+    retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE image_stream_dependency (
+    image_id TEXT NOT NULL REFERENCES storage_image(id) ON DELETE CASCADE,
+    stream_id TEXT NOT NULL,
+    PRIMARY KEY(image_id, stream_id)
+);
+CREATE INDEX image_stream_reverse_idx ON image_stream_dependency(stream_id, image_id);
+CREATE TABLE image_object_dependency (
+    image_id TEXT NOT NULL REFERENCES storage_image(id) ON DELETE CASCADE,
+    object_digest TEXT NOT NULL,
+    PRIMARY KEY(image_id, object_digest)
+);
+CREATE INDEX image_object_reverse_idx ON image_object_dependency(object_digest, image_id);
+CREATE TABLE image_provenance (
+    image_id TEXT NOT NULL REFERENCES storage_image(id) ON DELETE CASCADE,
+    digest TEXT NOT NULL,
+    record_bytes BLOB NOT NULL,
+    PRIMARY KEY(image_id, digest)
+);
+CREATE TABLE raw_conversion_result (
+    key_digest TEXT PRIMARY KEY NOT NULL,
+    key_bytes BLOB NOT NULL,
+    image_id TEXT NOT NULL REFERENCES storage_image(id) ON DELETE CASCADE
+);
+CREATE INDEX raw_conversion_image_idx ON raw_conversion_result(image_id, key_digest);
+CREATE TRIGGER storage_image_identity_immutable
+BEFORE UPDATE OF id, record_digest, record_bytes, created_at ON storage_image
+BEGIN SELECT RAISE(ABORT, 'image identity is immutable'); END;
+CREATE TRIGGER image_stream_dependency_immutable BEFORE UPDATE ON image_stream_dependency
+BEGIN SELECT RAISE(ABORT, 'image stream dependency is immutable'); END;
+CREATE TRIGGER image_object_dependency_immutable BEFORE UPDATE ON image_object_dependency
+BEGIN SELECT RAISE(ABORT, 'image object dependency is immutable'); END;
+CREATE TRIGGER image_provenance_immutable BEFORE UPDATE ON image_provenance
+BEGIN SELECT RAISE(ABORT, 'image provenance is immutable'); END;
+CREATE TRIGGER raw_conversion_result_immutable BEFORE UPDATE ON raw_conversion_result
+BEGIN SELECT RAISE(ABORT, 'raw conversion result is immutable'); END;
+CREATE TRIGGER image_kind_collision BEFORE INSERT ON storage_image
+WHEN EXISTS(SELECT 1 FROM storage_snapshot WHERE id=NEW.id)
+BEGIN SELECT RAISE(ABORT, 'managed identity has conflicting record kinds'); END;
+CREATE TRIGGER snapshot_kind_collision BEFORE INSERT ON storage_snapshot
+WHEN EXISTS(SELECT 1 FROM storage_image WHERE id=NEW.id)
+BEGIN SELECT RAISE(ABORT, 'managed identity has conflicting record kinds'); END;
 CREATE TABLE image_alias (
     name TEXT PRIMARY KEY NOT NULL,
-    snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE RESTRICT
+    snapshot_id TEXT REFERENCES storage_snapshot(id) ON DELETE RESTRICT,
+    image_id TEXT REFERENCES storage_image(id) ON DELETE RESTRICT,
+    CHECK ((snapshot_id IS NOT NULL) + (image_id IS NOT NULL) = 1)
 );
 CREATE INDEX image_alias_snapshot_idx ON image_alias(snapshot_id);
+CREATE INDEX image_alias_image_idx ON image_alias(image_id, name);
 CREATE TABLE snapshot_stream_dependency (
     snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
     stream_id TEXT NOT NULL,

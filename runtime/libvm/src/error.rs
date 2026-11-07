@@ -34,8 +34,34 @@ pub enum LibVmError {
     Storage(#[from] crate::storage::StorageError),
     #[error(transparent)]
     OverlayBootQualification(#[from] crate::boot_qualification::OverlayBootQualificationError),
+    /// A raw root's selected kernel bytes do not establish its direct profile.
+    #[error(transparent)]
+    DirectKernelRejected(#[from] Box<crate::boot_qualification::DirectKernelRejected>),
     #[error("backend {backend:?} does not support development flat overlay roots")]
     OverlayBackendUnsupported { backend: vm_spec::live::LiveBackend },
+    #[error("boot admission rejected {source_family:?}/{root_profile:?} on {effective_backend:?}: requires {requirement:?}; remedy: {remedy:?}")]
+    BackendAdmissionRejected {
+        source_family: crate::runtime::boot_assets::SourceFamily,
+        root_profile: crate::StorageProfile,
+        requirement: crate::BackendRequirement,
+        effective_backend: vm_spec::live::LiveBackend,
+        remedy: crate::runtime::boot_assets::AdmissionRemedy,
+    },
+    #[error("required translation is unavailable: {reason}")]
+    TranslationUnavailable { reason: String },
+    #[error("boot assets require acquisition of immutable object {missing}")]
+    BootAssetsAcquisitionRequired {
+        missing: crate::storage::identity::ObjectDigest,
+    },
+    #[error("base initramfs {actual} has no admitted schema-2 bootstrap ABI; select the packaged base {expected}")]
+    BootBundleAbiUnsupported {
+        expected: crate::storage::identity::ObjectDigest,
+        actual: crate::storage::identity::ObjectDigest,
+    },
+    #[error("root selection {:?} failed: {}", .0.requested, .0.reason)]
+    RootSelectionFailed(Box<crate::image::import_types::RootSelectionFailed>),
+    #[error(transparent)]
+    DiskImport(#[from] Box<crate::image::import::DiskImportError>),
     #[error("development flat overlay roots cannot be published or snapshotted")]
     FlatOverlayPublicationUnsupported,
     #[error("format private overlay upper: {0}")]
@@ -120,30 +146,6 @@ pub enum LibVmError {
     ImagePullPolicyUnsupported {
         policy: crate::ImagePullPolicy,
         source_kind: crate::ImageSourceKind,
-    },
-
-    #[error("could not canonicalize local disk {path}")]
-    LocalDiskCanonicalize {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("could not inspect local disk {path}")]
-    LocalDiskMetadata {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("local disk {path} is invalid: path must point to a regular file")]
-    LocalDiskNotRegularFile { path: PathBuf },
-
-    #[error("could not read local disk {path}")]
-    LocalDiskUnreadable {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
     },
 
     #[error("image operation for {reference} failed")]
@@ -334,7 +336,14 @@ impl LibVmError {
             Self::LiveForkNotFound { .. } => "LiveForkNotFound",
             Self::Storage(_) => "Storage",
             Self::OverlayBootQualification(_) => "OverlayBootQualification",
+            Self::DirectKernelRejected(_) => "DirectKernelRejected",
             Self::OverlayBackendUnsupported { .. } => "OverlayBackendUnsupported",
+            Self::BackendAdmissionRejected { .. } => "BackendAdmissionRejected",
+            Self::TranslationUnavailable { .. } => "TranslationUnavailable",
+            Self::BootAssetsAcquisitionRequired { .. } => "BootAssetsAcquisitionRequired",
+            Self::BootBundleAbiUnsupported { .. } => "BootBundleAbiUnsupported",
+            Self::RootSelectionFailed(_) => "RootSelectionFailed",
+            Self::DiskImport(_) => "DiskImport",
             Self::FlatOverlayPublicationUnsupported => "FlatOverlayPublicationUnsupported",
             Self::UpperFormat(_) => "UpperFormat",
             Self::Changeset(_) => "Changeset",
@@ -359,10 +368,6 @@ impl LibVmError {
             Self::ImageNotFound { .. } => "ImageNotFound",
             Self::ImageInUse { .. } => "ImageInUse",
             Self::ImagePullPolicyUnsupported { .. } => "ImagePullPolicyUnsupported",
-            Self::LocalDiskCanonicalize { .. } => "LocalDiskCanonicalize",
-            Self::LocalDiskMetadata { .. } => "LocalDiskMetadata",
-            Self::LocalDiskNotRegularFile { .. } => "LocalDiskNotRegularFile",
-            Self::LocalDiskUnreadable { .. } => "LocalDiskUnreadable",
             Self::Image { .. } => "Image",
             Self::ImageReferenceRejected { .. } => "ImageReferenceRejected",
             Self::MachineIdAlreadyExists { .. } => "MachineIdAlreadyExists",

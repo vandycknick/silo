@@ -137,6 +137,7 @@ fn rootfs_to_wire(v: &libvm::MachineRootfs) -> Result<w::Rootfs, ConversionError
         source_kind: match v.source_kind {
             libvm::ImageSourceKind::Oci => 1,
             libvm::ImageSourceKind::Disk => 2,
+            libvm::ImageSourceKind::Managed => 3,
         },
         requested_reference: v.requested_reference.clone(),
         selected_reference: v.selected_reference.clone(),
@@ -153,6 +154,7 @@ fn rootfs_from_wire(v: w::Rootfs) -> Result<libvm::MachineRootfs, ConversionErro
         match v.source_kind {
             1 => libvm::ImageSourceKind::Oci,
             2 => libvm::ImageSourceKind::Disk,
+            3 => libvm::ImageSourceKind::Managed,
             _ => return Err(invalid("rootfs.source_kind", "invalid enum")),
         },
         v.requested_reference,
@@ -241,6 +243,10 @@ pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, Co
             .iter()
             .map(crate::capture::machine_capture_to_wire)
             .collect::<Result<_, _>>()?,
+        boot: crate::boot::machine_boot_to_wire(
+            v.boot_profile.as_ref(),
+            v.boot_replacement.as_ref(),
+        )?,
     })
 }
 pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, ConversionError> {
@@ -342,6 +348,7 @@ pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, C
         .into_iter()
         .map(crate::capture::machine_capture_from_wire)
         .collect::<Result<_, _>>()?;
+    (out.boot_profile, out.boot_replacement) = crate::boot::machine_boot_from_wire(v.boot)?;
     if let Some(live) = &out.live {
         if !crate::live::same_machine_identity(&live.machine_id, &out.id)
             || Some(live.run_id.as_str())

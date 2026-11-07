@@ -94,6 +94,19 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
             .map(rootfs_summary)
             .unwrap_or_else(|| "none".to_string()),
     ));
+    if let Some(boot) = &view.boot {
+        rows.push(("Platform".to_string(), platform_summary(boot)));
+        rows.push(("Boot bundle".to_string(), bundle_summary(boot)));
+        if let Some(replacement) = &boot.packaged_replacement {
+            rows.push((
+                "Boot update".to_string(),
+                format!(
+                    "{replacement} available; apply with `silo set {} boot-assets=packaged`",
+                    view.name
+                ),
+            ));
+        }
+    }
     rows.push((
         "User".to_string(),
         view.guest
@@ -207,6 +220,28 @@ fn process_summary(process: &libvm::ProcessConfig) -> String {
         "entrypoint={:?} command={:?} cwd={:?} user={:?}",
         process.entrypoint, process.command, process.working_directory, process.user
     )
+}
+
+fn platform_summary(boot: &crate::view::MachineBootView) -> String {
+    let rosetta = match boot.rosetta_intent {
+        Some(true) => ", rosetta requested",
+        Some(false) => ", rosetta disabled",
+        None => "",
+    };
+    format!(
+        "{} on {} kernel, translation {}{rosetta}; root {} ({})",
+        boot.platform, boot.kernel_architecture, boot.translation, boot.root, boot.root_filesystem
+    )
+}
+
+fn bundle_summary(boot: &crate::view::MachineBootView) -> String {
+    match (&boot.bundle, &boot.abi) {
+        (Some(bundle), Some(abi)) => {
+            let agent = boot.agent.as_deref().unwrap_or("none");
+            format!("{bundle} ({abi}; agent {agent})")
+        }
+        _ => "not pinned".to_string(),
+    }
 }
 
 fn rootfs_summary(rootfs: &crate::view::MachineRootfsView) -> String {

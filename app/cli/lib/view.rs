@@ -74,6 +74,100 @@ pub struct MachineView {
     pub metadata: BTreeMap<String, String>,
     pub dir: PathBuf,
     pub spec: VmSpec,
+    /// Pinned direct-boot meaning; start never switches bundles implicitly.
+    pub boot: Option<MachineBootView>,
+}
+
+/// The machine's pinned boot bundle and platform, plus a newer locally
+/// admitted packaged bundle when one exists. Observation only, no mutation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineBootView {
+    pub platform: String,
+    pub kernel_architecture: String,
+    pub translation: String,
+    /// Explicit Rosetta intent; absent is no intent, false is an explicit disable.
+    pub rosetta_intent: Option<bool>,
+    pub root: String,
+    pub root_filesystem: String,
+    pub bundle: Option<String>,
+    pub kernel: Option<String>,
+    pub base_initramfs: Option<String>,
+    pub agent: Option<String>,
+    pub abi: Option<String>,
+    pub packaged_replacement: Option<String>,
+}
+
+impl MachineBootView {
+    fn new(data: &MachineData) -> Option<Self> {
+        let libvm::BootProfile::LinuxDirect {
+            userspace_platform,
+            kernel_architecture,
+            binding,
+            root_selector,
+            root_filesystem,
+            translation,
+            ..
+        } = data.boot_profile.as_ref()?
+        else {
+            return None;
+        };
+        let architecture = |value: &libvm::GuestArchitecture| match value {
+            libvm::GuestArchitecture::Amd64 => "amd64",
+            libvm::GuestArchitecture::Arm64 => "arm64",
+        };
+        let mut platform = format!("linux/{}", architecture(&userspace_platform.architecture));
+        if let Some(variant) = &userspace_platform.variant {
+            platform.push('/');
+            platform.push_str(variant);
+        }
+        let (bundle, kernel, base_initramfs, agent, abi) = match binding {
+            libvm::BootBinding::Pinned {
+                kernel,
+                base_initramfs,
+                agent,
+                abi,
+                ..
+            } => (
+                binding.digest().ok().map(|digest| digest.to_string()),
+                Some(kernel.to_string()),
+                Some(base_initramfs.to_string()),
+                agent.map(|agent| agent.to_string()),
+                Some(abi.clone()),
+            ),
+            libvm::BootBinding::RuntimeSelected => (None, None, None, None, None),
+        };
+        Some(Self {
+            platform,
+            kernel_architecture: architecture(kernel_architecture).to_string(),
+            translation: match translation {
+                libvm::Translation::None => "none",
+                libvm::Translation::Rosetta => "rosetta",
+            }
+            .to_string(),
+            rosetta_intent: data
+                .spec
+                .hardware
+                .as_ref()
+                .and_then(|hardware| hardware.rosetta),
+            root: match root_selector {
+                libvm::RootSelector::ManagedOverlay => "managed-overlay".to_string(),
+                libvm::RootSelector::WholeDisk => "whole-disk".to_string(),
+                libvm::RootSelector::GptPartition { guid } => format!("gpt:{guid}"),
+                libvm::RootSelector::MbrPartition { number } => format!("mbr:{number}"),
+            },
+            root_filesystem: match root_filesystem {
+                libvm::RootFilesystem::Ext4 => "ext4",
+            }
+            .to_string(),
+            bundle,
+            kernel,
+            base_initramfs,
+            agent,
+            abi,
+            packaged_replacement: data.boot_replacement.map(|digest| digest.to_string()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -190,6 +284,7 @@ impl MachineView {
             metadata: data.metadata.clone(),
             dir: data.machine_dir.clone(),
             spec: data.spec.clone(),
+            boot: MachineBootView::new(data),
         }
     }
 }
@@ -280,6 +375,7 @@ fn image_source_kind_label(source: ImageSourceKind) -> &'static str {
     match source {
         ImageSourceKind::Oci => "oci",
         ImageSourceKind::Disk => "disk",
+        ImageSourceKind::Managed => "managed",
     }
 }
 
@@ -332,5 +428,47 @@ mod tests {
         assert_eq!(retention_label(MachineRetention::Persistent), "persistent");
         assert_eq!(agent_label(Some(&MachineAgent::Default)), "default");
         assert_eq!(agent_label(Some(&MachineAgent::Disabled)), "disabled");
+    }
+
+    #[test]
+    fn pinned_bundle_platform_and_replacement_are_visible() {
+        let digest = |byte: &str| -> libvm::storage::identity::ObjectDigest {
+            format!("sha256:{}", byte.repeat(32)).parse().unwrap()
+        };
+        let binding = libvm::BootBinding::Pinned {
+            kernel: digest("01"),
+            base_initramfs: digest("02"),
+            agent: Some(digest("03")),
+            architecture: libvm::GuestArchitecture::Arm64,
+            abi: "silo-direct-v1".into(),
+        };
+        let mut data = libvm::MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "dev".into(),
+            vm_spec::VmSpec::current(),
+        );
+        data.boot_profile = Some(libvm::BootProfile::LinuxDirect {
+            userspace_platform: libvm::LinuxPlatform {
+                architecture: libvm::GuestArchitecture::Amd64,
+                variant: None,
+            },
+            kernel_architecture: libvm::GuestArchitecture::Arm64,
+            command_line_policy: libvm::DirectCommandLinePolicy::SiloDirectV1,
+            binding: binding.clone(),
+            root_selector: libvm::RootSelector::MbrPartition { number: 2 },
+            root_filesystem: libvm::RootFilesystem::Ext4,
+            translation: libvm::Translation::Rosetta,
+        });
+        data.boot_replacement = Some(digest("04"));
+        let boot = crate::view::MachineView::new(&data, false)
+            .boot
+            .expect("pinned boot view");
+        assert_eq!(boot.platform, "linux/amd64");
+        assert_eq!(boot.kernel_architecture, "arm64");
+        assert_eq!(boot.translation, "rosetta");
+        assert_eq!(boot.root, "mbr:2");
+        assert_eq!(boot.bundle, Some(binding.digest().unwrap().to_string()));
+        assert_eq!(boot.agent, Some(digest("03").to_string()));
+        assert_eq!(boot.packaged_replacement, Some(digest("04").to_string()));
     }
 }

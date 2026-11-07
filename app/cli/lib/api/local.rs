@@ -8,11 +8,14 @@ use libvm::{
     NetworkDriver, NetworkTopology, ReadOnlyRuntime, Runtime, RuntimeConfig,
 };
 use silo_vm_control::create::{NormalizedMachineCreate, ResolvedNetwork};
+use silo_vm_control::images::ManagedSpelling;
 
 use crate::api::machine::AppMachine;
 use crate::api::types::{
-    ReadOnlyCreationResolution, ReadOnlySourceResolution, ResolvedSource, SourceResolution,
+    ReadOnlyCreationResolution, ReadOnlySourceResolution, ResolvedSource, SourceOptions,
+    SourceResolution,
 };
+use crate::commands::create::{parse_source, validate_source_options, SourceSpelling};
 use crate::machine_defaults::{
     disk_size_bytes, memory_mib, resolve_machine_mounts, ResolvedMachineNetwork,
 };
@@ -344,11 +347,10 @@ impl LocalVmService {
         Ok(())
     }
 
+    /// Removes one name from the single image/snapshot namespace. Explicit
+    /// retention of the target is never released here.
     pub(crate) async fn remove_image_alias(&mut self, alias: String) -> eyre::Result<()> {
-        libvm::SnapshotStore::open(self.runtime().await?.local_home())
-            .await?
-            .remove_alias(&alias)
-            .await?;
+        self.runtime().await?.images().remove_alias(&alias).await?;
         Ok(())
     }
 
@@ -503,54 +505,65 @@ impl LocalVmService {
         Ok(())
     }
 
+    /// Resolves an `image:` spelling to a typed reference. A bare digest is
+    /// resolved by kind; an impossible cross-kind collision is refused by libvm.
+    pub(crate) async fn managed_reference(
+        &mut self,
+        spelling: ManagedSpelling,
+    ) -> eyre::Result<libvm::ManagedSourceRef> {
+        Ok(match spelling {
+            ManagedSpelling::Reference(reference) => reference,
+            ManagedSpelling::Digest(digest) => silo_vm_control::images::managed_id_to_ref(
+                self.runtime()
+                    .await?
+                    .images()
+                    .resolve_managed_digest(&digest)
+                    .await?,
+            ),
+        })
+    }
+
     pub(crate) async fn resolve_source(
         &mut self,
         positional: Option<&str>,
         template: &Template,
         pull: Option<(ImagePullPolicy, PullPolicy)>,
+        options: &SourceOptions,
         progress: ImageProgressSender,
     ) -> eyre::Result<SourceResolution> {
-        let runtime = self.runtime().await?.clone().with_image_progress(progress);
-        let reference = crate::commands::create::selected_image_reference(positional, template)?;
-        if let Some(path) = reference.strip_prefix("disk:") {
-            if pull.is_some() {
-                eyre::bail!("--pull is only supported for OCI image sources");
+        let requested = crate::commands::create::selected_image_reference(positional, template)?;
+        let spelling = parse_source(&requested)?;
+        validate_source_options(&spelling, options, pull.is_some())?;
+        let is_positional = positional.is_some();
+        match spelling {
+            SourceSpelling::Managed(spelling) => {
+                let reference = self.managed_reference(spelling).await?;
+                let info = self.inspect_managed(&reference).await?;
+                Ok(managed_resolution(requested, &info, is_positional))
             }
-            let path = crate::commands::create::canonical_disk_source(&reference, path)?;
-            return Ok(SourceResolution {
-                plan_image: ResolvedImage::Disk { path: path.clone() },
-                is_positional: positional.is_some(),
-                source: ResolvedSource::Disk(path),
-            });
+            SourceSpelling::Disk(path) => Ok(disk_resolution(path, options, is_positional)?),
+            SourceSpelling::Oci(reference) => {
+                let runtime = self.runtime().await?.clone().with_image_progress(progress);
+                let (runtime_pull, plan_pull) =
+                    pull.unwrap_or((ImagePullPolicy::IfMissing, PullPolicy::IfMissing));
+                let resolved = runtime
+                    .images()
+                    .resolve_with(
+                        reference.clone(),
+                        ImageResolveOptions {
+                            policy: Some(runtime_pull),
+                            platform: options.platform.clone(),
+                        },
+                    )
+                    .await?;
+                let plan_image = oci_plan_image(reference, &resolved, plan_pull);
+                Ok(SourceResolution {
+                    plan_image,
+                    is_positional,
+                    source: ResolvedSource::LocalResolvedOci(resolved),
+                })
+            }
         }
-        let (runtime_pull, plan_pull) =
-            pull.unwrap_or((ImagePullPolicy::IfMissing, PullPolicy::IfMissing));
-        let resolved = runtime
-            .images()
-            .resolve_with(
-                reference.clone(),
-                ImageResolveOptions {
-                    policy: Some(runtime_pull),
-                },
-            )
-            .await?;
-        let plan_image = ResolvedImage::Oci {
-            identity: planning::OciImageIdentity {
-                requested_reference: reference,
-                selected_reference: resolved.selected_reference.clone(),
-                platform: resolved.platform.clone(),
-                manifest_digest: resolved.manifest_digest.clone(),
-                config_digest: resolved.config_digest.clone(),
-                cache_state: image_cache_state(resolved.cache_state),
-                pull_policy: plan_pull,
-            },
-            metadata: Box::new(resolved.config.clone()),
-        };
-        Ok(SourceResolution {
-            plan_image,
-            is_positional: positional.is_some(),
-            source: ResolvedSource::LocalResolvedOci(resolved),
-        })
     }
 
     pub(crate) async fn resolve_read_only_creation(
@@ -559,7 +572,11 @@ impl LocalVmService {
         positional: Option<&str>,
         template: &Template,
         pull: Option<(ImagePullPolicy, PullPolicy)>,
+        options: &SourceOptions,
     ) -> eyre::Result<ReadOnlyCreationResolution> {
+        let requested = crate::commands::create::selected_image_reference(positional, template)?;
+        let spelling = parse_source(&requested)?;
+        validate_source_options(&spelling, options, pull.is_some())?;
         let runtime = ReadOnlyRuntime::open(config).await?;
         let name = match requested_name {
             Some(name) => {
@@ -571,40 +588,38 @@ impl LocalVmService {
             }
             None => runtime.propose_machine_name()?,
         };
-        let reference = crate::commands::create::selected_image_reference(positional, template)?;
-        let source = if let Some(path) = reference.strip_prefix("disk:") {
-            if pull.is_some() {
-                eyre::bail!("--pull is only supported for OCI image sources");
+        let is_positional = positional.is_some();
+        let plan_image = match spelling {
+            SourceSpelling::Managed(spelling) => {
+                let reference = match spelling {
+                    ManagedSpelling::Reference(reference) => reference,
+                    ManagedSpelling::Digest(digest) => silo_vm_control::images::managed_id_to_ref(
+                        runtime.resolve_managed_digest(&digest).await?,
+                    ),
+                };
+                let info = runtime.inspect_managed(&reference).await?;
+                managed_resolution(requested, &info, is_positional).plan_image
             }
-            let path = crate::commands::create::canonical_disk_source(&reference, path)?;
-            let path = runtime.validate_disk_source(&path)?;
-            ReadOnlySourceResolution {
-                plan_image: ResolvedImage::Disk { path: path.clone() },
-                is_positional: positional.is_some(),
+            SourceSpelling::Disk(path) => {
+                runtime.validate_disk_source(&path)?;
+                disk_resolution(path, options, is_positional)?.plan_image
             }
-        } else {
-            let (runtime_pull, plan_pull) =
-                pull.unwrap_or((ImagePullPolicy::IfMissing, PullPolicy::IfMissing));
-            let resolved = runtime
-                .resolve_oci_image(reference.clone(), runtime_pull)
-                .await?;
-            ReadOnlySourceResolution {
-                plan_image: ResolvedImage::Oci {
-                    identity: planning::OciImageIdentity {
-                        requested_reference: reference,
-                        selected_reference: resolved.selected_reference.clone(),
-                        platform: resolved.platform,
-                        manifest_digest: resolved.manifest_digest,
-                        config_digest: resolved.config_digest,
-                        cache_state: image_cache_state(resolved.cache_state),
-                        pull_policy: plan_pull,
-                    },
-                    metadata: Box::new(resolved.config),
-                },
-                is_positional: positional.is_some(),
+            SourceSpelling::Oci(reference) => {
+                let (runtime_pull, plan_pull) =
+                    pull.unwrap_or((ImagePullPolicy::IfMissing, PullPolicy::IfMissing));
+                let resolved = runtime
+                    .resolve_oci_image(reference.clone(), runtime_pull, options.platform.as_ref())
+                    .await?;
+                oci_plan_image(reference, &resolved, plan_pull)
             }
         };
-        Ok(ReadOnlyCreationResolution { name, source })
+        Ok(ReadOnlyCreationResolution {
+            name,
+            source: ReadOnlySourceResolution {
+                plan_image,
+                is_positional,
+            },
+        })
     }
 
     pub(crate) async fn ensure_name_available(&mut self, name: &str) -> eyre::Result<()> {
@@ -629,7 +644,10 @@ impl LocalVmService {
         // Source materialization remains native; normalization never selects an image.
         builder = match source.source {
             ResolvedSource::LocalResolvedOci(image) => builder.resolved_image(image),
-            ResolvedSource::Disk(path) => builder.image_source(ImageSource::disk(path)),
+            ResolvedSource::Disk(request) => builder.image_source(ImageSource::Disk(request)),
+            ResolvedSource::Managed(reference) => {
+                builder.image_source(ImageSource::Managed(reference))
+            }
             ResolvedSource::DaemonOciIdentity(_) => {
                 eyre::bail!("daemon-resolved source cannot be materialized by the local backend")
             }
@@ -639,6 +657,163 @@ impl LocalVmService {
             .create()
             .await?;
         Ok(machine.inspect().await?)
+    }
+
+    pub(crate) async fn import_image(
+        &mut self,
+        request: libvm::DiskImportRequest,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ManagedImageInfo> {
+        silo_vm_control::boot::import_request_to_wire(&request)?;
+        let admitted = request.admit().await?;
+        Ok(self
+            .runtime()
+            .await?
+            .clone()
+            .with_image_progress(progress)
+            .images()
+            .import_admitted_disk(admitted)
+            .await?)
+    }
+
+    /// Resolves a mutable OCI spelling once, then converts exactly the
+    /// selected immutable manifest/platform identity.
+    pub(crate) async fn convert_image(
+        &mut self,
+        reference: String,
+        pull: ImagePullPolicy,
+        platform: Option<libvm::LinuxPlatform>,
+        options: libvm::RawConversionOptions,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ManagedImageInfo> {
+        if let Some(alias) = &options.alias {
+            silo_vm_control::stopped::alias(alias)?;
+        }
+        let images = self
+            .runtime()
+            .await?
+            .clone()
+            .with_image_progress(progress)
+            .images();
+        let resolved = images
+            .resolve_with(
+                reference,
+                ImageResolveOptions {
+                    policy: Some(pull),
+                    platform,
+                },
+            )
+            .await?;
+        silo_vm_control::boot::platform_from_oci(&resolved.platform)?;
+        Ok(images.convert(&resolved, options).await?)
+    }
+
+    pub(crate) async fn inspect_managed(
+        &mut self,
+        reference: &libvm::ManagedSourceRef,
+    ) -> eyre::Result<libvm::ManagedSourceInfo> {
+        Ok(self
+            .runtime()
+            .await?
+            .images()
+            .inspect_managed(reference)
+            .await?)
+    }
+
+    pub(crate) async fn list_managed(&mut self) -> eyre::Result<Vec<libvm::ManagedSourceInfo>> {
+        Ok(self.runtime().await?.images().list_managed().await?)
+    }
+
+    pub(crate) async fn release_image(
+        &mut self,
+        reference: &libvm::ManagedSourceRef,
+    ) -> eyre::Result<()> {
+        self.runtime()
+            .await?
+            .images()
+            .release_retention(reference)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn update_boot_assets(
+        &mut self,
+        reference: &str,
+        update: libvm::BootAssetsUpdate,
+    ) -> eyre::Result<MachineData> {
+        let reference = MachineRef::parse(reference)?;
+        silo_vm_control::boot::update_boot_assets_to_wire(&reference, &update)?;
+        Ok(self
+            .runtime()
+            .await?
+            .get_machine(&reference)
+            .await?
+            .update_boot_assets(update)
+            .await?)
+    }
+}
+
+/// Binds a managed spelling to the typed identity observed now, so a later
+/// alias move cannot change what the planned creation materializes.
+pub(crate) fn managed_resolution(
+    requested_reference: String,
+    info: &libvm::ManagedSourceInfo,
+    is_positional: bool,
+) -> SourceResolution {
+    let (source, metadata) = match info {
+        libvm::ManagedSourceInfo::Image(image) => (
+            libvm::ManagedSourceId::Image(image.id),
+            Some(Box::new(planning::managed_image_metadata(
+                &image.record.process,
+            ))),
+        ),
+        libvm::ManagedSourceInfo::Snapshot(snapshot) => {
+            (libvm::ManagedSourceId::Snapshot(snapshot.id), None)
+        }
+    };
+    SourceResolution {
+        plan_image: ResolvedImage::Managed {
+            requested_reference,
+            source,
+            metadata,
+        },
+        is_positional,
+        source: ResolvedSource::Managed(silo_vm_control::images::managed_id_to_ref(source)),
+    }
+}
+
+pub(crate) fn disk_resolution(
+    path: std::path::PathBuf,
+    options: &SourceOptions,
+    is_positional: bool,
+) -> eyre::Result<SourceResolution> {
+    let request = crate::commands::create::disk_create_request(path, options)?;
+    Ok(SourceResolution {
+        plan_image: ResolvedImage::Disk {
+            path: request.path.clone(),
+            boot: request.boot.clone(),
+        },
+        is_positional,
+        source: ResolvedSource::Disk(request),
+    })
+}
+
+fn oci_plan_image(
+    requested_reference: String,
+    resolved: &libvm::ResolvedOciImage,
+    pull_policy: PullPolicy,
+) -> ResolvedImage {
+    ResolvedImage::Oci {
+        identity: planning::OciImageIdentity {
+            requested_reference,
+            selected_reference: resolved.selected_reference.clone(),
+            platform: resolved.platform.clone(),
+            manifest_digest: resolved.manifest_digest.clone(),
+            config_digest: resolved.config_digest.clone(),
+            cache_state: image_cache_state(resolved.cache_state),
+            pull_policy,
+        },
+        metadata: Box::new(resolved.config.clone()),
     }
 }
 
@@ -695,6 +870,7 @@ pub(crate) fn normalize_plan(
         kernel_args: plan.machine_settings.kernel_args.clone(),
         nested_virtualization: plan.machine_settings.nested_virtualization,
         rosetta: plan.machine_settings.rosetta,
+        platform: plan.machine_settings.platform.clone(),
         disks: plan
             .machine_settings
             .disks
@@ -761,14 +937,40 @@ pub(crate) fn ensure_source_matches_plan(
                                     | (ImagePullPolicy::Never, PullPolicy::Never)
                             )
                     }
-                    ResolvedSource::Disk(_) => false,
+                    ResolvedSource::Disk(_) | ResolvedSource::Managed(_) => false,
                 }
         }
         (
-            planning::ImageIdentity::Disk { path: plan },
-            ResolvedImage::Disk { path },
-            ResolvedSource::Disk(resolved),
-        ) => plan == path && resolved == path && path.is_absolute(),
+            planning::ImageIdentity::Disk { path: plan, boot },
+            ResolvedImage::Disk {
+                path,
+                boot: resolved_boot,
+            },
+            ResolvedSource::Disk(request),
+        ) => {
+            plan == path
+                && boot == resolved_boot
+                && &request.path == path
+                && &request.boot == boot
+                && request.alias.is_none()
+                && path.is_absolute()
+        }
+        (
+            planning::ImageIdentity::Managed {
+                requested_reference,
+                source: plan,
+            },
+            ResolvedImage::Managed {
+                requested_reference: resolved_reference,
+                source: resolved,
+                ..
+            },
+            ResolvedSource::Managed(reference),
+        ) => {
+            requested_reference == resolved_reference
+                && plan == resolved
+                && *reference == silo_vm_control::images::managed_id_to_ref(*plan)
+        }
         _ => false,
     };
     if matches {
@@ -891,7 +1093,8 @@ mod tests {
                 initramfs: None,
                 kernel_args: Vec::new(),
                 nested_virtualization: false,
-                rosetta: false,
+                rosetta: None,
+                platform: None,
                 disks: Vec::new(),
                 agent: libvm::MachineAgent::Default,
                 provision_user: None,
@@ -945,6 +1148,118 @@ mod tests {
         assert!(ensure_source_matches_plan(&plan, &source).is_err());
     }
 
+    fn disk_boot() -> libvm::DiskImportBoot {
+        libvm::DiskImportBoot::LinuxDirect {
+            platform: libvm::LinuxPlatform {
+                architecture: libvm::GuestArchitecture::Amd64,
+                variant: None,
+            },
+            root: libvm::ImportRootSelection::WholeDisk,
+            assets: libvm::BootAssetSelection::Packaged,
+        }
+    }
+
+    #[test]
+    fn disk_and_managed_sources_must_match_the_planned_typed_identity() {
+        let path = std::path::PathBuf::from("/images/root.raw");
+        let request = libvm::DiskImportRequest {
+            path: path.clone(),
+            boot: disk_boot(),
+            alias: None,
+        };
+        let plan_disk = plan(ImageIdentity::Disk {
+            path: path.clone(),
+            boot: disk_boot(),
+        });
+        let disk = |request: libvm::DiskImportRequest| SourceResolution {
+            plan_image: ResolvedImage::Disk {
+                path: path.clone(),
+                boot: disk_boot(),
+            },
+            is_positional: true,
+            source: ResolvedSource::Disk(request),
+        };
+        ensure_source_matches_plan(&plan_disk, &disk(request.clone())).expect("same disk");
+        let mut other_root = request.clone();
+        other_root.boot = libvm::DiskImportBoot::LinuxDirect {
+            platform: libvm::LinuxPlatform {
+                architecture: libvm::GuestArchitecture::Amd64,
+                variant: None,
+            },
+            root: libvm::ImportRootSelection::AutoGpt,
+            assets: libvm::BootAssetSelection::Packaged,
+        };
+        assert!(ensure_source_matches_plan(&plan_disk, &disk(other_root)).is_err());
+        let mut aliased = request;
+        aliased.alias = Some("published".into());
+        assert!(ensure_source_matches_plan(&plan_disk, &disk(aliased)).is_err());
+
+        let image: libvm::storage::identity::ImageId =
+            format!("sha256:{}", "cd".repeat(32)).parse().unwrap();
+        let snapshot: libvm::storage::identity::SnapshotId =
+            format!("sha256:{}", "cd".repeat(32)).parse().unwrap();
+        let plan_managed = plan(ImageIdentity::Managed {
+            requested_reference: "image:base".into(),
+            source: libvm::ManagedSourceId::Image(image),
+        });
+        let managed =
+            |source: libvm::ManagedSourceId, reference: libvm::ManagedSourceRef| SourceResolution {
+                plan_image: ResolvedImage::Managed {
+                    requested_reference: "image:base".into(),
+                    source,
+                    metadata: None,
+                },
+                is_positional: true,
+                source: ResolvedSource::Managed(reference),
+            };
+        ensure_source_matches_plan(
+            &plan_managed,
+            &managed(
+                libvm::ManagedSourceId::Image(image),
+                libvm::ManagedSourceRef::Image(image),
+            ),
+        )
+        .expect("same managed image");
+        // Same digest, other kind: never interchangeable.
+        assert!(ensure_source_matches_plan(
+            &plan_managed,
+            &managed(
+                libvm::ManagedSourceId::Snapshot(snapshot),
+                libvm::ManagedSourceRef::Snapshot(snapshot),
+            ),
+        )
+        .is_err());
+        // A movable alias is never the creation source.
+        assert!(ensure_source_matches_plan(
+            &plan_managed,
+            &managed(
+                libvm::ManagedSourceId::Image(image),
+                libvm::ManagedSourceRef::Alias("base".into()),
+            ),
+        )
+        .is_err());
+        assert!(ensure_source_matches_plan(
+            &plan_disk,
+            &managed(
+                libvm::ManagedSourceId::Image(image),
+                libvm::ManagedSourceRef::Image(image),
+            )
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn normalization_preserves_tri_state_rosetta_intent() {
+        for intent in [None, Some(false), Some(true)] {
+            let mut plan = plan(ImageIdentity::Disk {
+                path: "/images/root.raw".into(),
+                boot: disk_boot(),
+            });
+            plan.machine_settings.rosetta = intent;
+            assert_eq!(normalize_plan(&plan, None).unwrap().rosetta, intent);
+        }
+    }
+
     #[test]
     fn normalization_canonicalizes_host_files_and_uncreated_socket_paths() {
         let temp = tempfile::tempdir_in(".").expect("relative temp directory");
@@ -953,6 +1268,7 @@ mod tests {
         let canonical = std::fs::canonicalize(&file).expect("canonical asset");
         let mut plan = plan(ImageIdentity::Disk {
             path: canonical.clone(),
+            boot: disk_boot(),
         });
         plan.machine_settings.kernel = Some(file.clone());
         plan.machine_settings.initramfs = Some(file.clone());

@@ -22,14 +22,14 @@ pub fn operation_from_wire(v: i32) -> Result<LiveOperation, ConversionError> {
         _ => Err(invalid("live.operation", "unknown enum")),
     }
 }
-fn backend_to_wire(v: LiveBackend) -> i32 {
+pub(crate) fn backend_to_wire(v: LiveBackend) -> i32 {
     match v {
         LiveBackend::Krun => 1,
         LiveBackend::Vz => 2,
         LiveBackend::Mock => 3,
     }
 }
-fn backend_from_wire(v: i32) -> Result<LiveBackend, ConversionError> {
+pub(crate) fn backend_from_wire(v: i32) -> Result<LiveBackend, ConversionError> {
     match v {
         1 => Ok(LiveBackend::Krun),
         2 => Ok(LiveBackend::Vz),

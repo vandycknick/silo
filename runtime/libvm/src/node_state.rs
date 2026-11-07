@@ -86,17 +86,42 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use crate::{ImageSource, MachineUpdate, Runtime, RuntimeNetworkingConfig};
-    #[tokio::test]
-    async fn lease_excludes_native_mutations_without_blocking_inspect() {
-        let home = tempfile::tempdir().unwrap();
-        let disk = home.path().join("root.raw");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+
+    async fn runtime(home: &std::path::Path) -> Runtime {
         let runtime = Runtime::open(
-            crate::paths::LocalPaths::new(home.path().join("home")),
+            crate::paths::LocalPaths::new(home),
             RuntimeNetworkingConfig::default(),
         )
         .await
         .unwrap();
+        let components = crate::runtime::components::test_components(home);
+        std::fs::create_dir_all(components.asset_dir()).unwrap();
+        for asset in [
+            components.kernel(),
+            components.initramfs(),
+            components.agent(),
+        ] {
+            let bytes = if asset == components.kernel() {
+                test_utils::direct_kernel::host_kernel("node-state")
+            } else {
+                b"private packaged test boot asset".to_vec()
+            };
+            std::fs::write(asset, bytes).unwrap();
+            std::fs::set_permissions(asset, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        runtime
+    }
+
+    #[tokio::test]
+    async fn lease_excludes_native_mutations_without_blocking_inspect() {
+        let home = tempfile::tempdir().unwrap();
+        let disk = home.path().join("root.raw");
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
+        let runtime = runtime(&home.path().join("home")).await;
         let machine = runtime
             .machine()
             .name("leased")
@@ -138,13 +163,11 @@ mod tests {
     async fn recovery_artifacts_fence_mutations_but_not_inspection_or_recovery_leases() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
-        let runtime = Runtime::open(
-            crate::paths::LocalPaths::new(home.path().join("home")),
-            RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .unwrap();
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
+        let runtime = runtime(&home.path().join("home")).await;
         let machine = runtime
             .machine()
             .name("fenced")

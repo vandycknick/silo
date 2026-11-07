@@ -596,13 +596,14 @@ impl Store {
                 if batch.is_empty() {break;}
                 runtime.block_on(store.check_operation_recovery(&pool))?;
                 runtime.block_on(crate::store::snapshot_store::check_snapshot_catalog(&store))?;
+                runtime.block_on(crate::store::managed_image_store::check_image_catalog(&store))?;
                 let _roots=pool.lock_roots()?;
                 runtime.block_on(async {
                     let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
                     let machine_objects=crate::store::cache_paths::retained_machine_objects(&mut tx).await?;
                     let mut orphaned=Vec::new();
                     for digest in batch {
-                        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_capture_provenance WHERE evidence_digest=?1)").bind(digest.to_string()).fetch_one(&mut *tx).await?;
+                        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM image_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_capture_provenance WHERE evidence_digest=?1)").bind(digest.to_string()).fetch_one(&mut *tx).await?;
                         if !retained && !machine_objects.contains(&digest) {orphaned.push(digest);}
                     }
                     let candidates=orphaned.iter().map(|digest|pool.object_path(digest)).collect::<Vec<_>>();

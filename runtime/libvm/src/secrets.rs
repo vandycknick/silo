@@ -300,6 +300,50 @@ mod tests {
         FileStore, MachineScopeId, OAuthSecret, Secret, SecretBytes, SecretError, SecretName,
         SecretScope, SecretStore,
     };
+    use std::os::unix::fs::PermissionsExt;
+
+    async fn runtime(home: &std::path::Path) -> crate::Runtime {
+        let runtime = crate::Runtime::open(
+            crate::paths::LocalPaths::new(home),
+            crate::RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .unwrap();
+        let components = crate::runtime::components::test_components(home);
+        std::fs::create_dir_all(components.asset_dir()).unwrap();
+        let kernel = test_utils::direct_kernel::host_kernel("private packaged test boot asset");
+        for (asset, contents) in [
+            (components.kernel(), kernel.as_slice()),
+            (
+                components.initramfs(),
+                b"private packaged test boot asset".as_slice(),
+            ),
+            (
+                components.agent(),
+                b"private packaged test boot asset".as_slice(),
+            ),
+        ] {
+            std::fs::write(asset, contents).unwrap();
+            std::fs::set_permissions(asset, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        runtime
+    }
+
+    fn disk_without_agent(
+        runtime: &crate::Runtime,
+        path: std::path::PathBuf,
+    ) -> crate::ImageSource {
+        let mut source = crate::ImageSource::disk(path);
+        if let crate::ImageSource::Disk(request) = &mut source {
+            let crate::DiskImportBoot::LinuxDirect { assets, .. } = &mut request.boot;
+            *assets = crate::BootAssetSelection::Files {
+                kernel: runtime.asset_directory().join("kernel-default"),
+                base_initramfs: runtime.asset_directory().join("initramfs"),
+                agent: None,
+            };
+        }
+        source
+    }
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
     fn machine() -> SecretScope {
@@ -373,14 +417,12 @@ mod tests {
         crate::store::models::MachineConfig,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = crate::Runtime::open(
-            crate::paths::LocalPaths::new(dir.path().join("runtime-home")),
-            crate::RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .unwrap();
-        let disk = dir.path().join("rootfs.img");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
+        let runtime = runtime(&dir.path().join("runtime-home")).await;
+        let disk = dir.path().join("root.raw");
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
         let MachineNetworkConfig::Private {
             policy: Some(policy),
             ..
@@ -392,8 +434,7 @@ mod tests {
             .machine()
             .name("external-store")
             .vsock(true)
-            .image_source(crate::ImageSource::disk(disk))
-            .agent_mode(Some(crate::MachineAgent::Disabled))
+            .image_source(disk_without_agent(&runtime, disk))
             .network(|network| network.private().policy(policy.clone()))
             .create()
             .await
@@ -1061,17 +1102,17 @@ mod tests {
         let (dir, _, network) = fixture("bearer_token");
         let home = dir.path().join("runtime-home");
         let paths = crate::paths::LocalPaths::new(home.clone());
-        let runtime =
-            crate::Runtime::open(paths.clone(), crate::RuntimeNetworkingConfig::default())
-                .await
-                .unwrap();
+        let runtime = runtime(&home).await;
         assert!(runtime
             .secret_store()
             .list(&SecretScope::Home)
             .unwrap()
             .is_empty());
-        let disk = dir.path().join("rootfs.img");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
+        let disk = dir.path().join("root.raw");
+        disk_image::ext4::Formatter::new(&disk, 4096, 64 * 1024 * 1024)
+            .unwrap()
+            .close()
+            .unwrap();
         let MachineNetworkConfig::Private {
             policy: Some(policy),
             ..
@@ -1083,8 +1124,7 @@ mod tests {
             .machine()
             .name("missing-secret")
             .vsock(true)
-            .image_source(crate::ImageSource::disk(disk))
-            .agent_mode(Some(crate::MachineAgent::Disabled))
+            .image_source(disk_without_agent(&runtime, disk))
             .network(|network| network.private().policy(policy))
             .create()
             .await

@@ -34,12 +34,21 @@ const SETTINGS: &[(&str, &str)] = &[
         "user=none|auto|NAME:UID:GID:HOME",
         "Experimental: configure guest-user provisioning",
     ),
+    (
+        "boot-assets=packaged|sha256:HEX|files",
+        "Explicitly replace the pinned boot bundle of a stopped VM; never combined with other settings",
+    ),
+    (
+        "boot-kernel=PATH boot-initramfs=PATH boot-agent=PATH|none",
+        "The complete file tuple for boot-assets=files; the agent is never inherited",
+    ),
 ];
 
 const EXAMPLES: &[&str] = &[
     "silo set cpus=4 memory=8G",
     "silo set dev name=ubuntu disk=64G",
     "silo set dev network=private rosetta=true",
+    "silo set dev boot-assets=packaged",
 ];
 
 #[derive(Debug, Args)]
@@ -68,8 +77,21 @@ impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let parsed = ParsedSet::parse(&self.args)?;
         let reference = context.resolve_machine_name(parsed.machine.as_deref())?;
+        let update = match parsed.operation {
+            SetOperation::BootAssets(update) => {
+                let data = context
+                    .app_api()
+                    .await?
+                    .update_boot_assets(&reference, update)
+                    .await
+                    .map_err(stopped_hint)?;
+                ui::success(format!("updated boot assets of {}", data.name));
+                return Ok(());
+            }
+            SetOperation::Update(update) => *update,
+        };
         let existing = context.app_api().await?.inspect_machine(&reference).await?;
-        let old_name = if parsed.update.name.is_some() {
+        let old_name = if update.name.is_some() {
             Some(existing.name)
         } else {
             None
@@ -79,13 +101,12 @@ impl Cmd {
             .as_deref()
             .is_some_and(|name| default_machine.as_deref() == Some(name));
 
-        let data = context.app_api().await?.update_machine(&reference, parsed.update).await.map_err(|err| match err.downcast::<libvm::LibVmError>() {
-            Ok(libvm::LibVmError::MachineAlreadyRunning { reference }) => eyre::eyre!(
-                "{reference} is running\n\nhint: stop it with `silo stop {reference}` before changing settings"
-            ),
-            Ok(other) => eyre::Report::from(other),
-            Err(other) => other,
-        })?;
+        let data = context
+            .app_api()
+            .await?
+            .update_machine(&reference, update)
+            .await
+            .map_err(stopped_hint)?;
 
         if update_default {
             GlobalConfig::write_default_machine(Some(data.name.as_str()))?;
@@ -95,9 +116,26 @@ impl Cmd {
     }
 }
 
+fn stopped_hint(err: eyre::Report) -> eyre::Report {
+    match err.downcast::<libvm::LibVmError>() {
+        Ok(libvm::LibVmError::MachineAlreadyRunning { reference }) => eyre::eyre!(
+            "{reference} is running\n\nhint: stop it with `silo stop {reference}` before changing settings"
+        ),
+        Ok(other) => eyre::Report::from(other),
+        Err(other) => other,
+    }
+}
+
+/// Ordinary settings form one atomic update; a boot-bundle replacement is its
+/// own explicit operation and is never mixed with them.
+enum SetOperation {
+    Update(Box<MachineUpdate>),
+    BootAssets(libvm::BootAssetsUpdate),
+}
+
 struct ParsedSet {
     machine: Option<String>,
-    update: MachineUpdate,
+    operation: SetOperation,
 }
 
 impl ParsedSet {
@@ -118,6 +156,7 @@ impl ParsedSet {
 
         let mut update = MachineUpdate::new();
         let mut seen = Vec::new();
+        let mut boot = BootSettings::default();
         for setting in settings {
             let (key, value) = setting
                 .split_once('=')
@@ -176,12 +215,83 @@ impl ParsedSet {
                         ),
                     };
                 }
+                "boot-assets" => boot.assets = Some(value.to_owned()),
+                "boot-kernel" => boot.kernel = Some(host_file(value)?),
+                "boot-initramfs" => boot.initramfs = Some(host_file(value)?),
+                "boot-agent" => {
+                    boot.agent = Some(match value {
+                        "none" => None,
+                        path => Some(host_file(path)?),
+                    })
+                }
                 other => eyre::bail!("unsupported setting {other:?}"),
             }
         }
 
-        Ok(Self { machine, update })
+        let boot_keys = seen.iter().filter(|key| key.starts_with("boot-")).count();
+        let operation = if boot_keys == 0 {
+            SetOperation::Update(Box::new(update))
+        } else if boot_keys != seen.len() {
+            eyre::bail!(
+                "boot-assets is an explicit boot-bundle replacement; apply other settings separately"
+            );
+        } else {
+            SetOperation::BootAssets(boot.selection()?)
+        };
+        Ok(Self { machine, operation })
     }
+}
+
+#[derive(Default)]
+struct BootSettings {
+    assets: Option<String>,
+    kernel: Option<PathBuf>,
+    initramfs: Option<PathBuf>,
+    agent: Option<Option<PathBuf>>,
+}
+
+impl BootSettings {
+    fn selection(self) -> eyre::Result<libvm::BootAssetsUpdate> {
+        let files = self.kernel.is_some() || self.initramfs.is_some() || self.agent.is_some();
+        let selection = match self.assets.as_deref() {
+            Some("files") => match (self.kernel, self.initramfs, self.agent) {
+                (Some(kernel), Some(base_initramfs), Some(agent)) => {
+                    libvm::BootAssetSelection::Files {
+                        kernel,
+                        base_initramfs,
+                        agent,
+                    }
+                }
+                _ => eyre::bail!(
+                    "boot-assets=files requires boot-kernel, boot-initramfs and boot-agent=PATH|none together"
+                ),
+            },
+            Some(_) if files => {
+                eyre::bail!("boot-kernel, boot-initramfs and boot-agent require boot-assets=files")
+            }
+            Some("packaged") => libvm::BootAssetSelection::Packaged,
+            Some(digest) if digest.starts_with("sha256:") => libvm::BootAssetSelection::Exact {
+                bundle: silo_vm_control::boot::digest_from_wire(digest, "boot-assets")?,
+            },
+            Some(other) => eyre::bail!(
+                "invalid boot-assets {other:?}; use packaged, sha256:HEX or files"
+            ),
+            None => eyre::bail!("boot file settings require boot-assets=files"),
+        };
+        Ok(libvm::BootAssetsUpdate { selection })
+    }
+}
+
+/// Boot files are absolute, existing host files; the daemon never interprets
+/// the client's working directory.
+fn host_file(value: &str) -> eyre::Result<PathBuf> {
+    let path = crate::machine_defaults::resolve_host_path(std::path::Path::new(value))?;
+    let path = std::fs::canonicalize(&path)
+        .map_err(|error| eyre::eyre!("resolve boot file {}: {error}", path.display()))?;
+    if !path.is_file() {
+        eyre::bail!("boot file is not a regular file: {}", path.display());
+    }
+    Ok(path)
 }
 
 fn normalize_key(key: &str) -> eyre::Result<&'static str> {
@@ -196,8 +306,12 @@ fn normalize_key(key: &str) -> eyre::Result<&'static str> {
         "rosetta" => Ok("rosetta"),
         "agent" => Ok("agent"),
         "user" => Ok("user"),
+        "boot-assets" => Ok("boot-assets"),
+        "boot-kernel" => Ok("boot-kernel"),
+        "boot-initramfs" => Ok("boot-initramfs"),
+        "boot-agent" => Ok("boot-agent"),
         _ => Err(eyre::eyre!(
-            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, tmpfs-size, network, nested-virtualization, rosetta, agent, user"
+            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, tmpfs-size, network, nested-virtualization, rosetta, agent, user, boot-assets, boot-kernel, boot-initramfs, boot-agent"
         )),
     }
 }
@@ -243,26 +357,36 @@ fn parse_bool(value: &str) -> eyre::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use libvm::{MachineUserUpdate, Memory};
+    use libvm::{MachineUpdate, MachineUserUpdate, Memory};
 
-    use crate::commands::set::ParsedSet;
+    use crate::commands::set::{ParsedSet, SetOperation};
+
+    fn update(args: &[&str]) -> MachineUpdate {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        match ParsedSet::parse(&args).expect("parse set args").operation {
+            SetOperation::Update(update) => *update,
+            SetOperation::BootAssets(_) => panic!("expected an ordinary update"),
+        }
+    }
+
+    fn boot(args: &[&str]) -> eyre::Result<libvm::BootAssetSelection> {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        match ParsedSet::parse(&args)?.operation {
+            SetOperation::BootAssets(update) => Ok(update.selection),
+            SetOperation::Update(_) => panic!("expected a boot-assets operation"),
+        }
+    }
 
     #[test]
     fn tmpfs_policy_is_sized_or_explicitly_removed() {
         assert_eq!(
-            ParsedSet::parse(&["dev".into(), "tmpfs-size=8mib".into()])
-                .expect("sized tmpfs")
-                .update
-                .temporary_directory,
+            update(&["dev", "tmpfs-size=8mib"]).temporary_directory,
             Some(libvm::TemporaryDirectoryPolicy::Tmpfs {
                 capacity_bytes: 8 * 1024 * 1024
             })
         );
         assert_eq!(
-            ParsedSet::parse(&["dev".into(), "tmpfs-size=off".into()])
-                .expect("disk backed")
-                .update
-                .temporary_directory,
+            update(&["dev", "tmpfs-size=off"]).temporary_directory,
             Some(libvm::TemporaryDirectoryPolicy::DiskBacked)
         );
         assert!(ParsedSet::parse(&["tmpfs-size=0".into()]).is_err());
@@ -276,31 +400,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_default_machine_settings() {
+    fn parses_default_and_named_machine_settings() {
         let parsed = ParsedSet::parse(&["cpus=4".to_string(), "memory=8G".to_string()])
             .expect("parse set args");
-
         assert_eq!(parsed.machine, None);
-        assert_eq!(parsed.update.cpus, Some(4));
-        assert_eq!(parsed.update.memory, Some(Memory::mebibytes(8192)));
-    }
-
-    #[test]
-    fn parses_named_machine_settings() {
+        let update = update(&["cpus=4", "memory=8G"]);
+        assert_eq!(update.cpus, Some(4));
+        assert_eq!(update.memory, Some(Memory::mebibytes(8192)));
         let parsed =
             ParsedSet::parse(&["dev".to_string(), "disk=64G".to_string()]).expect("parse set args");
-
         assert_eq!(parsed.machine.as_deref(), Some("dev"));
-        assert_eq!(parsed.update.root_disk_size, Some(64 * 1024 * 1024 * 1024));
-    }
-
-    #[test]
-    fn parses_rename_setting() {
-        let parsed = ParsedSet::parse(&["dev".to_string(), "name=ubuntu".to_string()])
-            .expect("parse set args");
-
-        assert_eq!(parsed.machine.as_deref(), Some("dev"));
-        assert_eq!(parsed.update.name.as_deref(), Some("ubuntu"));
+        assert_eq!(
+            self::update(&["dev", "disk=64G"]).root_disk_size,
+            Some(64 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            self::update(&["dev", "name=ubuntu"]).name.as_deref(),
+            Some("ubuntu")
+        );
     }
 
     #[test]
@@ -310,19 +427,69 @@ mod tests {
 
     #[test]
     fn parses_explicit_and_disabled_user_settings() {
-        let parsed = ParsedSet::parse(&[
-            "dev".to_string(),
-            "user=alice:1000:2000:/home/alice".to_string(),
-        ])
-        .expect("parse explicit user");
-        let Some(MachineUserUpdate::Set(user)) = parsed.update.user else {
+        let Some(MachineUserUpdate::Set(user)) =
+            update(&["dev", "user=alice:1000:2000:/home/alice"]).user
+        else {
             panic!("expected user update");
         };
         assert_eq!(user.name, "alice");
         assert_eq!(user.gid, 2000);
+        assert!(matches!(
+            update(&["dev", "user=none"]).user,
+            Some(MachineUserUpdate::Clear)
+        ));
+    }
 
-        let parsed = ParsedSet::parse(&["dev".to_string(), "user=none".to_string()])
-            .expect("parse disabled user");
-        assert!(matches!(parsed.update.user, Some(MachineUserUpdate::Clear)));
+    #[test]
+    fn boot_assets_are_an_explicit_complete_operation_never_mixed() {
+        assert_eq!(
+            boot(&["dev", "boot-assets=packaged"]).unwrap(),
+            libvm::BootAssetSelection::Packaged
+        );
+        let digest = format!("sha256:{}", "ef".repeat(32));
+        assert_eq!(
+            boot(&["dev", &format!("boot-assets={digest}")]).unwrap(),
+            libvm::BootAssetSelection::Exact {
+                bundle: digest.parse().unwrap()
+            }
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let kernel = temp.path().join("kernel");
+        let initramfs = temp.path().join("initramfs");
+        std::fs::write(&kernel, b"k").unwrap();
+        std::fs::write(&initramfs, b"i").unwrap();
+        let kernel_arg = format!("boot-kernel={}", kernel.display());
+        let initramfs_arg = format!("boot-initramfs={}", initramfs.display());
+        assert_eq!(
+            boot(&[
+                "dev",
+                "boot-assets=files",
+                &kernel_arg,
+                &initramfs_arg,
+                "boot-agent=none"
+            ])
+            .unwrap(),
+            libvm::BootAssetSelection::Files {
+                kernel: kernel.canonicalize().unwrap(),
+                base_initramfs: initramfs.canonicalize().unwrap(),
+                agent: None,
+            }
+        );
+        // The agent is never inherited: a file tuple must state it.
+        assert!(boot(&["dev", "boot-assets=files", &kernel_arg, &initramfs_arg]).is_err());
+        assert!(boot(&["dev", "boot-assets=packaged", &kernel_arg]).is_err());
+        assert!(boot(&["dev", &kernel_arg]).is_err());
+        assert!(boot(&["dev", "boot-assets=sha256:ABC"]).is_err());
+        assert!(boot(&["dev", "boot-assets=latest"]).is_err());
+        for mixed in [
+            ["boot-assets=packaged", "cpus=2"],
+            ["rosetta=false", "boot-assets=packaged"],
+        ] {
+            let args: Vec<String> = std::iter::once("dev")
+                .chain(mixed)
+                .map(str::to_string)
+                .collect();
+            assert!(ParsedSet::parse(&args).is_err(), "{mixed:?}");
+        }
     }
 }

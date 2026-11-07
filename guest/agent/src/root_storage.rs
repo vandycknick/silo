@@ -2,7 +2,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use eyre::Context;
@@ -241,6 +241,11 @@ impl StorageShutdown {
     ) -> eyre::Result<()> {
         verify_mount_namespaces()?;
         let devices = discover_blocks(Path::new("/sys/block"))?;
+        for device in &devices {
+            if !device.partitions.is_empty() {
+                verify_partition_devices(device)?;
+            }
+        }
         let mounts = fs::read_to_string("/proc/self/mountinfo")?;
         self.coverage_inventory(manifest, &devices, &mounts)
     }
@@ -251,6 +256,28 @@ impl StorageShutdown {
         devices: &[DiscoveredBlock],
         mounts: &str,
     ) -> eyre::Result<()> {
+        let retained = self
+            .mounts
+            .iter()
+            .map(|mount| {
+                let metadata = mount.file.metadata()?;
+                Ok((
+                    mount.mount_id,
+                    format!("{}:{}", major(metadata.dev()), minor(metadata.dev())),
+                ))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        self.coverage_with_retained(manifest, devices, mounts, &retained)
+    }
+
+    /// Pure inventory comparison, after the held descriptors have been measured.
+    fn coverage_with_retained(
+        &self,
+        manifest: &protocol::shutdown::StorageManifest,
+        devices: &[DiscoveredBlock],
+        mounts: &str,
+        retained: &[(u64, String)],
+    ) -> eyre::Result<()> {
         manifest.validate().map_err(eyre::Report::msg)?;
         if let Some(reason) = manifest.unsupported_reason() {
             eyre::bail!("{reason}");
@@ -259,6 +286,7 @@ impl StorageShutdown {
             eyre::bail!("complete storage inventory unavailable");
         };
         let mut covered = std::collections::HashSet::new();
+        let mut partition_numbers = std::collections::HashSet::new();
         for attachment in attachments {
             match attachment {
                 protocol::shutdown::StorageAttachment::Block {
@@ -288,17 +316,29 @@ impl StorageShutdown {
                             block_id.as_str()
                         );
                     }
-                    covered.insert(device.number.as_str());
-                    if !read_only
-                        && !self.mounts.iter().any(|mount| {
-                            mount.file.metadata().is_ok_and(|metadata| {
-                                format!("{}:{}", major(metadata.dev()), minor(metadata.dev()))
-                                    == device.number
-                                    && mount_target(mounts, mount.mount_id)
-                                        .is_ok_and(|target| target.is_some())
-                            })
-                        })
+                    validate_child_inventory(device)?;
+                    for number in std::iter::once(device.number.as_str())
+                        .chain(device.partitions.iter().map(|child| child.number.as_str()))
                     {
+                        if !covered.insert(number) {
+                            eyre::bail!("duplicate block device identity {number}");
+                        }
+                    }
+                    partition_numbers
+                        .extend(device.partitions.iter().map(|child| child.number.as_str()));
+                    let mut mounted = false;
+                    for (mount_id, number) in retained {
+                        if (number == &device.number
+                            || device
+                                .partitions
+                                .iter()
+                                .any(|child| &child.number == number))
+                            && mount_device(mounts, *mount_id)? == Some(number.as_str())
+                        {
+                            mounted = true;
+                        }
+                    }
+                    if !read_only && !mounted {
                         eyre::bail!(
                             "writable block {} is not covered by a retained filesystem",
                             block_id.as_str()
@@ -326,10 +366,13 @@ impl StorageShutdown {
                 }
             }
         }
-        if devices
-            .iter()
-            .any(|device| !covered.contains(device.number.as_str()))
-        {
+        if devices.iter().any(|device| {
+            !attachments.iter().any(|attachment| {
+                matches!(attachment,
+                    protocol::shutdown::StorageAttachment::Block { block_id, .. }
+                        if block_id.as_str() == device.serial.as_str())
+            })
+        }) {
             eyre::bail!("discovered block attachment is absent from trusted manifest");
         }
         for line in mounts.lines() {
@@ -337,8 +380,12 @@ impl StorageShutdown {
                 .split_once(" - ")
                 .ok_or_else(|| eyre::eyre!("malformed mountinfo"))?;
             let mut fields = mount.split_whitespace();
+            let mount_id = fields
+                .next()
+                .ok_or_else(|| eyre::eyre!("mount identity missing"))?
+                .parse::<u64>()?;
             let number = fields
-                .nth(2)
+                .nth(1)
                 .ok_or_else(|| eyre::eyre!("mount device missing"))?;
             let target = fields
                 .nth(1)
@@ -362,9 +409,27 @@ impl StorageShutdown {
                     eyre::bail!("virtiofs mount {source} is absent from trusted manifest");
                 }
             }
+            if covered.contains(number) {
+                if devices
+                    .iter()
+                    .any(|device| device.number == number && !device.partitions.is_empty())
+                {
+                    eyre::bail!("whole-attachment filesystem overlaps its partition layout");
+                }
+                if fstype != "ext4" && !(fstype == "vfat" && partition_numbers.contains(number)) {
+                    eyre::bail!("unqualified block filesystem {fstype} {number}");
+                }
+                if !retained
+                    .iter()
+                    .any(|(id, device)| *id == mount_id && device == number)
+                {
+                    eyre::bail!("block filesystem {number} has no retained mount error cursor");
+                }
+            }
             if flags.split(',').any(|flag| flag == "rw") {
                 match fstype {
                     "ext4" if covered.contains(number) => {}
+                    "vfat" if partition_numbers.contains(number) => {}
                     "overlay" if self.overlay && target == "/" => {}
                     "tmpfs" | "ramfs" | "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup2"
                     | "mqueue" | "securityfs" | "debugfs" | "tracefs" | "configfs" | "pstore"
@@ -459,11 +524,26 @@ struct DiscoveredBlock {
     length: u64,
     sector_size: u32,
     read_only: bool,
+    path: PathBuf,
+    partitions: Vec<DiscoveredPartition>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredPartition {
+    slot: u32,
+    start: u64,
+    number: String,
+    length: u64,
+    read_only: bool,
+    path: PathBuf,
 }
 
 fn discover_blocks(root: &Path) -> eyre::Result<Vec<DiscoveredBlock>> {
     let mut devices = Vec::new();
-    for entry in fs::read_dir(root)? {
+    for (index, entry) in fs::read_dir(root)?.enumerate() {
+        if index == 4096 {
+            eyre::bail!("block sysfs directory exceeds entry limit");
+        }
         let entry = entry?;
         let path = entry.path();
         let serial = match fs::read_to_string(path.join("serial")) {
@@ -475,6 +555,7 @@ fn discover_blocks(root: &Path) -> eyre::Result<Vec<DiscoveredBlock>> {
             eyre::bail!("discovered block inventory exceeds the sixteen-attachment contract");
         }
         let number = fs::read_to_string(path.join("dev"))?.trim().to_owned();
+        validate_device_number(&number)?;
         let sectors = fs::read_to_string(path.join("size"))?
             .trim()
             .parse::<u64>()?;
@@ -495,14 +576,208 @@ fn discover_blocks(root: &Path) -> eyre::Result<Vec<DiscoveredBlock>> {
             length,
             sector_size,
             read_only,
+            path: Path::new("/dev").join(entry.file_name()),
+            partitions: discover_partitions(&path)?,
         });
     }
     Ok(devices)
 }
 
+fn validate_device_number(number: &str) -> eyre::Result<()> {
+    let (major, minor) = number
+        .split_once(':')
+        .ok_or_else(|| eyre::eyre!("invalid block device number"))?;
+    for value in [major, minor] {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            eyre::bail!("invalid block device number");
+        }
+        let parsed = value.parse::<u32>()?;
+        if parsed.to_string() != value {
+            eyre::bail!("noncanonical block device number");
+        }
+    }
+    Ok(())
+}
+
+fn discover_partitions(parent: &Path) -> eyre::Result<Vec<DiscoveredPartition>> {
+    let mut partitions = Vec::new();
+    for (index, entry) in fs::read_dir(parent)?.enumerate() {
+        if index == 4096 {
+            eyre::bail!("block sysfs directory exceeds entry limit");
+        }
+        let entry = entry?;
+        // Kernel partition children are actual directories under this parent.
+        // In particular, do not follow device/subsystem links or guess names.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let slot = match fs::read_to_string(path.join("partition")) {
+            Ok(slot) => slot.trim().parse::<u32>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("read kernel partition identity"),
+        };
+        if partitions.len() == disk_partition::MAX_GPT_ENTRIES as usize {
+            eyre::bail!("kernel partition inventory exceeds shared parser limit");
+        }
+        let number = fs::read_to_string(path.join("dev"))?.trim().to_owned();
+        validate_device_number(&number)?;
+        let start = fs::read_to_string(path.join("start"))?.trim().parse()?;
+        let length = fs::read_to_string(path.join("size"))?
+            .trim()
+            .parse::<u64>()?
+            .checked_mul(512)
+            .ok_or_else(|| eyre::eyre!("partition size overflow"))?;
+        let read_only = match fs::read_to_string(path.join("ro"))?.trim() {
+            "0" => false,
+            "1" => true,
+            _ => eyre::bail!("invalid partition access mode"),
+        };
+        partitions.push(DiscoveredPartition {
+            slot,
+            start,
+            number,
+            length,
+            read_only,
+            path: Path::new("/dev").join(entry.file_name()),
+        });
+    }
+    Ok(partitions)
+}
+
+fn validate_child_inventory(parent: &DiscoveredBlock) -> eyre::Result<()> {
+    validate_device_number(&parent.number)?;
+    for (index, child) in parent.partitions.iter().enumerate() {
+        validate_device_number(&child.number)?;
+        let end = child
+            .start
+            .checked_mul(512)
+            .and_then(|start| start.checked_add(child.length))
+            .ok_or_else(|| eyre::eyre!("partition range overflow"))?;
+        if child.slot == 0
+            || child.slot > disk_partition::MAX_GPT_ENTRIES
+            || child.start == 0
+            || child.length == 0
+            || !child.length.is_multiple_of(512)
+            || end > parent.length
+            || child.number == parent.number
+            || child.read_only != parent.read_only
+        {
+            eyre::bail!("partition differs from owned parent geometry/access");
+        }
+        if parent.partitions[..index].iter().any(|other| {
+            other.slot == child.slot
+                || other.number == child.number
+                || (other.start < end / 512 && child.start < other.start + other.length / 512)
+        }) {
+            eyre::bail!("duplicate or overlapping kernel partition identity");
+        }
+    }
+    Ok(())
+}
+
+fn validate_partition_table(
+    parent: &DiscoveredBlock,
+    table: &disk_partition::PartitionTable,
+) -> eyre::Result<()> {
+    validate_child_inventory(parent)?;
+    disk_partition::validate_linux_direct_table(table).map_err(eyre::Report::msg)?;
+    let expected_count = match table {
+        disk_partition::PartitionTable::None => 0,
+        disk_partition::PartitionTable::Gpt(table) => table.partitions().len(),
+        disk_partition::PartitionTable::Mbr(table) => table.partitions().len(),
+    };
+    if expected_count != parent.partitions.len()
+        || parent.partitions.iter().any(|child| {
+            let extent = match table {
+                disk_partition::PartitionTable::None => None,
+                disk_partition::PartitionTable::Gpt(table) => table
+                    .partitions()
+                    .iter()
+                    .find(|partition| partition.slot() == child.slot)
+                    .map(|partition| partition.extent()),
+                disk_partition::PartitionTable::Mbr(table) => table
+                    .partitions()
+                    .iter()
+                    .find(|partition| u32::from(partition.slot()) == child.slot)
+                    .map(|partition| partition.extent()),
+            };
+            !extent.is_some_and(|extent| {
+                extent.first_lba() == child.start && extent.byte_length() == child.length
+            })
+        })
+    {
+        eyre::bail!("kernel children disagree with the owned attachment partition table");
+    }
+    Ok(())
+}
+
+fn open_measured_block(
+    path: &Path,
+    number: &str,
+    length: u64,
+    sector_size: u32,
+    read_only: bool,
+) -> eyre::Result<File> {
+    use rustix::ioctl::{Getter, Opcode};
+    const BLKGETSIZE64: Opcode = 0x80081272;
+    const BLKSSZGET: Opcode = 0x1268;
+    const BLKROGET: Opcode = 0x125e;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let actual = format!("{}:{}", major(metadata.rdev()), minor(metadata.rdev()));
+    if !metadata.file_type().is_block_device() || actual != number {
+        eyre::bail!("block-special identity differs from sysfs");
+    }
+    // SAFETY: Linux writes u64 for BLKGETSIZE64 and int for BLKSSZGET/BLKROGET.
+    // The descriptor was checked as block-special and stays held during parsing.
+    let (actual_length, actual_sector, actual_ro) = unsafe {
+        (
+            rustix::ioctl::ioctl(&file, Getter::<BLKGETSIZE64, u64>::new())?,
+            rustix::ioctl::ioctl(&file, Getter::<BLKSSZGET, i32>::new())?,
+            rustix::ioctl::ioctl(&file, Getter::<BLKROGET, i32>::new())?,
+        )
+    };
+    if actual_length != length
+        || u32::try_from(actual_sector).ok() != Some(sector_size)
+        || actual_ro != i32::from(read_only)
+    {
+        eyre::bail!("block ioctl geometry/access differs from sysfs");
+    }
+    Ok(file)
+}
+
+fn verify_partition_devices(parent: &DiscoveredBlock) -> eyre::Result<()> {
+    let mut file = open_measured_block(
+        &parent.path,
+        &parent.number,
+        parent.length,
+        parent.sector_size,
+        parent.read_only,
+    )?;
+    let geometry = disk_partition::Geometry::new(parent.length).map_err(eyre::Report::msg)?;
+    let table =
+        disk_partition::read_table(&mut file, geometry, disk_partition::ReadMode::GuestBoot)
+            .map_err(eyre::Report::msg)?;
+    validate_partition_table(parent, &table)?;
+    for child in &parent.partitions {
+        open_measured_block(
+            &child.path,
+            &child.number,
+            child.length,
+            parent.sector_size,
+            child.read_only,
+        )?;
+    }
+    Ok(())
+}
+
 /// Namespace and raw-device writers cannot be hidden behind the root syncfs.
 pub(crate) fn verify_mount_namespaces() -> eyre::Result<()> {
-    use std::os::unix::fs::FileTypeExt;
     let own = fs::metadata("/proc/self/ns/mnt")?;
     for process in fs::read_dir("/proc")? {
         let process = process?;
@@ -599,6 +874,24 @@ fn remount_read_only(mountpoint: &RetainedMount, result: &mut ShutdownResult) {
         tracing::info!(path = %mountpoint.path.display(), "guest storage shutdown verified read-only");
         Ok(())
     })());
+}
+
+fn mount_device(contents: &str, mount_id: u64) -> eyre::Result<Option<&str>> {
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let id = fields
+            .next()
+            .ok_or_else(|| eyre::eyre!("malformed mountinfo"))?
+            .parse::<u64>()?;
+        if id == mount_id {
+            return Ok(Some(
+                fields
+                    .nth(1)
+                    .ok_or_else(|| eyre::eyre!("mount device missing"))?,
+            ));
+        }
+    }
+    Ok(None)
 }
 
 fn mount_target(contents: &str, mount_id: u64) -> eyre::Result<Option<PathBuf>> {
@@ -745,6 +1038,8 @@ mod tests {
             length: 67108864,
             sector_size: 512,
             read_only: false,
+            path: "/dev/root".into(),
+            partitions: Vec::new(),
         }];
         (storage, manifest, blocks, mounts)
     }
@@ -770,6 +1065,8 @@ mod tests {
             length: 67108864,
             sector_size: 512,
             read_only: false,
+            path: "/dev/data".into(),
+            partitions: Vec::new(),
         });
         assert!(storage
             .coverage_inventory(&manifest, &blocks, &mounts)
@@ -794,6 +1091,8 @@ mod tests {
             length: 67108864,
             sector_size: 512,
             read_only: false,
+            path: "/dev/duplicate".into(),
+            partitions: Vec::new(),
         });
         assert!(storage
             .coverage_inventory(&manifest, &blocks, &mounts)
@@ -801,6 +1100,13 @@ mod tests {
             .to_string()
             .contains("duplicate"));
         blocks[1].serial = "unlisted".into();
+        assert!(storage
+            .coverage_inventory(&manifest, &blocks, &mounts)
+            .unwrap_err()
+            .to_string()
+            .contains("absent from trusted manifest"));
+        // An unlisted parent cannot borrow another attachment's device number.
+        blocks[1].number = blocks[0].number.clone();
         assert!(storage
             .coverage_inventory(&manifest, &blocks, &mounts)
             .unwrap_err()
@@ -1002,5 +1308,313 @@ mod tests {
         assert!(root_is_overlay("42 1 0:12 / / rw - overlay overlay rw\n").unwrap());
         assert!(!root_is_overlay("42 1 252:0 / / rw - ext4 /dev/vda rw\n").unwrap());
         assert!(root_is_overlay("malformed").is_err());
+    }
+
+    fn partition_inventory_fixture() -> (tempfile::TempDir, crate::root_storage::DiscoveredBlock) {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("attachment-with-no-disk-prefix");
+        std::fs::create_dir_all(parent.join("queue")).unwrap();
+        for (name, value) in [
+            ("serial", "root\n"),
+            ("dev", "252:10\n"),
+            ("size", "131072\n"),
+            ("queue/logical_block_size", "512\n"),
+            ("ro", "0\n"),
+        ] {
+            std::fs::write(parent.join(name), value).unwrap();
+        }
+        for (name, slot, start, sectors, number) in [
+            ("independent-root-name", 1, 2048, 32768, "252:11"),
+            ("arbitrary-esp-name", 2, 34816, 8192, "252:12"),
+            ("data-without-parent-prefix", 3, 43008, 32768, "252:13"),
+        ] {
+            let child = parent.join(name);
+            std::fs::create_dir(&child).unwrap();
+            for (attribute, value) in [
+                ("partition", slot.to_string()),
+                ("start", start.to_string()),
+                ("size", sectors.to_string()),
+                ("dev", number.to_owned()),
+                ("ro", "0".to_owned()),
+            ] {
+                std::fs::write(child.join(attribute), format!("{value}\n")).unwrap();
+            }
+        }
+        let mut devices = crate::root_storage::discover_blocks(root.path()).unwrap();
+        assert_eq!(devices.len(), 1);
+        let mut parent = devices.remove(0);
+        parent.partitions.sort_by_key(|child| child.slot);
+        (root, parent)
+    }
+
+    fn table_file(gpt: bool) -> std::fs::File {
+        use std::os::unix::fs::FileExt;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(67108864).unwrap();
+        let mut mbr = [0u8; 512];
+        mbr[510..].copy_from_slice(&[0x55, 0xaa]);
+        if !gpt {
+            for (index, (kind, start, sectors)) in [
+                (0x83, 2048u32, 32768u32),
+                (0xef, 34816, 8192),
+                (0x83, 43008, 32768),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let entry = &mut mbr[446 + index * 16..462 + index * 16];
+                entry[4] = kind;
+                entry[8..12].copy_from_slice(&start.to_le_bytes());
+                entry[12..16].copy_from_slice(&sectors.to_le_bytes());
+            }
+            file.write_all_at(&mbr, 0).unwrap();
+            return file;
+        }
+        mbr[450] = 0xee;
+        mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
+        mbr[458..462].copy_from_slice(&131071u32.to_le_bytes());
+        file.write_all_at(&mbr, 0).unwrap();
+        let mut entries = vec![0u8; 128 * 128];
+        for (index, (start, sectors)) in [(2048u64, 32768u64), (34816, 8192), (43008, 32768)]
+            .into_iter()
+            .enumerate()
+        {
+            let entry = &mut entries[index * 128..(index + 1) * 128];
+            entry[..16].fill(1);
+            entry[16..32].fill(u8::try_from(index + 2).unwrap());
+            entry[32..40].copy_from_slice(&start.to_le_bytes());
+            entry[40..48].copy_from_slice(&(start + sectors - 1).to_le_bytes());
+        }
+        let entries_crc = crc32(&entries);
+        for (current, backup, array) in [(1u64, 131071u64, 2u64), (131071, 1, 131039)] {
+            let mut header = [0u8; 512];
+            header[..8].copy_from_slice(b"EFI PART");
+            header[8..12].copy_from_slice(&0x10000u32.to_le_bytes());
+            header[12..16].copy_from_slice(&92u32.to_le_bytes());
+            header[24..32].copy_from_slice(&current.to_le_bytes());
+            header[32..40].copy_from_slice(&backup.to_le_bytes());
+            header[40..48].copy_from_slice(&34u64.to_le_bytes());
+            header[48..56].copy_from_slice(&131038u64.to_le_bytes());
+            header[56..72].fill(7);
+            header[72..80].copy_from_slice(&array.to_le_bytes());
+            header[80..84].copy_from_slice(&128u32.to_le_bytes());
+            header[84..88].copy_from_slice(&128u32.to_le_bytes());
+            header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+            let checksum = crc32(&header[..92]);
+            header[16..20].copy_from_slice(&checksum.to_le_bytes());
+            file.write_all_at(&header, current * 512).unwrap();
+            file.write_all_at(&entries, array * 512).unwrap();
+        }
+        file
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn partition_root_esp_and_data_require_individual_retained_mounts() {
+        let (_sysfs, parent) = partition_inventory_fixture();
+        let (_, manifest, _, _) = coverage_fixture();
+        let storage = crate::root_storage::StorageShutdown {
+            mounts: Vec::new(),
+            overlay: false,
+        };
+        let mounts = "42 1 252:11 / / rw - ext4 /dev/root rw\n\
+                      43 42 252:12 / /boot/efi rw - vfat /dev/esp rw\n\
+                      44 42 252:13 / /data rw - ext4 /dev/data rw\n";
+        // Pure facts: production derives these only from the retained FDs.
+        let retained = vec![
+            (42, "252:11".to_owned()),
+            (43, "252:12".to_owned()),
+            (44, "252:13".to_owned()),
+        ];
+        for gpt in [false, true] {
+            let mut file = table_file(gpt);
+            let table = disk_partition::read_table(
+                &mut file,
+                disk_partition::Geometry::new(parent.length).unwrap(),
+                disk_partition::ReadMode::GuestBoot,
+            )
+            .unwrap();
+            crate::root_storage::validate_partition_table(&parent, &table).unwrap();
+            storage
+                .coverage_with_retained(&manifest, std::slice::from_ref(&parent), mounts, &retained)
+                .unwrap();
+        }
+        for missing in 0..retained.len() {
+            let mut incomplete = retained.clone();
+            incomplete.remove(missing);
+            assert!(storage
+                .coverage_with_retained(
+                    &manifest,
+                    std::slice::from_ref(&parent),
+                    mounts,
+                    &incomplete
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("no retained mount error cursor"));
+        }
+        let read_only_esp = mounts.replace("/boot/efi rw", "/boot/efi ro");
+        assert!(storage
+            .coverage_with_retained(
+                &manifest,
+                std::slice::from_ref(&parent),
+                &read_only_esp,
+                &retained[..1],
+            )
+            .is_err());
+        // A retained mount ID whose current device changed cannot certify an
+        // otherwise unmounted attachment.
+        assert!(storage
+            .coverage_with_retained(
+                &manifest,
+                std::slice::from_ref(&parent),
+                "42 1 0:55 / / rw - tmpfs tmpfs rw\n",
+                &retained,
+            )
+            .is_err());
+        // A replacement mount on the same partition is not the retained mount.
+        let replaced = mounts.replace("43 42", "45 42");
+        assert!(storage
+            .coverage_with_retained(
+                &manifest,
+                std::slice::from_ref(&parent),
+                &replaced,
+                &retained
+            )
+            .is_err());
+        for adverse in [
+            mounts.replace("252:12", "253:12"),
+            mounts.replace(" - vfat ", " - btrfs "),
+            mounts.replace(" - ext4 ", " - xfs "),
+            mounts.replace("42 1 252:11", "42 1 252:10"),
+        ] {
+            assert!(storage
+                .coverage_with_retained(
+                    &manifest,
+                    std::slice::from_ref(&parent),
+                    &adverse,
+                    &retained
+                )
+                .is_err());
+        }
+        // Retaining an absent mount, even with a matching partition number,
+        // cannot cover an unmounted writable attachment.
+        assert!(storage
+            .coverage_with_retained(&manifest, &[parent], "", &retained)
+            .is_err());
+    }
+
+    #[test]
+    fn partition_table_and_kernel_identity_disagreements_refuse_coverage() {
+        let (_sysfs, mut parent) = partition_inventory_fixture();
+        let mut file = table_file(false);
+        let table = disk_partition::read_table(
+            &mut file,
+            disk_partition::Geometry::new(parent.length).unwrap(),
+            disk_partition::ReadMode::GuestBoot,
+        )
+        .unwrap();
+        let original = parent.partitions.clone();
+        for adverse in 0..12 {
+            parent.partitions.clone_from(&original);
+            match adverse {
+                0 => parent.partitions[0].start += 1,
+                1 => parent.partitions[0].length -= 512,
+                2 => parent.partitions[0].slot = 4,
+                3 => parent.partitions[0].read_only = true,
+                4 => parent.partitions[0].number.clone_from(&parent.number),
+                5 => parent.partitions.push(original[0].clone()),
+                6 => parent.partitions[1].start = original[0].start,
+                7 => parent.partitions[0].start = u64::MAX,
+                8 => {
+                    parent.partitions.remove(0);
+                }
+                9 => parent.partitions[1].number.clone_from(&original[0].number),
+                10 => parent.partitions[0].start = parent.length / 512,
+                11 => parent.partitions[0].length = 0,
+                _ => unreachable!(),
+            }
+            assert!(crate::root_storage::validate_partition_table(&parent, &table).is_err());
+        }
+        parent.partitions = original;
+        assert!(crate::root_storage::validate_partition_table(
+            &parent,
+            &disk_partition::PartitionTable::None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn partition_inventory_preserves_expanded_disk_guest_boot_policy() {
+        let (_sysfs, mut parent) = partition_inventory_fixture();
+        let mut file = table_file(true);
+        parent.length += 4096 * 512;
+        file.set_len(parent.length).unwrap();
+        let geometry = disk_partition::Geometry::new(parent.length).unwrap();
+        let table =
+            disk_partition::read_table(&mut file, geometry, disk_partition::ReadMode::GuestBoot)
+                .unwrap();
+        crate::root_storage::validate_partition_table(&parent, &table).unwrap();
+        assert!(disk_partition::read_table(
+            &mut file,
+            geometry,
+            disk_partition::ReadMode::StrictImport,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn partition_discovery_uses_real_parent_children_and_refuses_attribute_errors() {
+        let (root, parent) = partition_inventory_fixture();
+        assert_eq!(parent.partitions.len(), 3);
+        assert_eq!(
+            parent.partitions[0].path,
+            std::path::Path::new("/dev/independent-root-name")
+        );
+        let directory = root.path().join("attachment-with-no-disk-prefix");
+        let other = tempfile::tempdir().unwrap();
+        // A link to a different device directory never becomes this parent's
+        // child, even when it exposes the desired slot and a plausible name.
+        std::os::unix::fs::symlink(other.path(), directory.join("looks-like-a-child")).unwrap();
+        assert_eq!(
+            crate::root_storage::discover_partitions(&directory)
+                .unwrap()
+                .len(),
+            3
+        );
+        let attribute = directory.join("arbitrary-esp-name/size");
+        std::fs::write(&attribute, "18446744073709551615\n").unwrap();
+        assert!(crate::root_storage::discover_blocks(root.path()).is_err());
+        std::fs::write(&attribute, "8192\n").unwrap();
+        std::fs::remove_file(directory.join("arbitrary-esp-name/dev")).unwrap();
+        assert!(crate::root_storage::discover_blocks(root.path()).is_err());
+    }
+
+    #[test]
+    fn partition_block_measurement_rejects_regular_files_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("not-a-device");
+        std::fs::write(&path, [0; 512]).unwrap();
+        assert!(
+            crate::root_storage::open_measured_block(&path, "252:11", 512, 512, false).is_err()
+        );
+        let link = root.path().join("device-link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            crate::root_storage::open_measured_block(&link, "252:11", 512, 512, false).is_err()
+        );
+        for invalid in ["", "1", "1:2:3", "x:1", "1:-1", "01:1", "1:4294967296"] {
+            assert!(crate::root_storage::validate_device_number(invalid).is_err());
+        }
     }
 }

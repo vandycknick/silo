@@ -5,6 +5,7 @@ members = [
     "common/policy",
     "common/secrets",
     "common/disk-image",
+    "common/disk-partition",
     "xtask",
     "common/utils",
     "guest/agent",

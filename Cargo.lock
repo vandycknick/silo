@@ -52,6 +52,7 @@ dependencies = [
  "agent-spec",
  "bytes",
  "clap",
+ "disk-partition",
  "eyre",
  "flate2",
  "forward-spec",
@@ -83,6 +84,7 @@ name = "agent-spec"
 version = "0.1.0"
 dependencies = [
  "protocol",
+ "rootfs-spec",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -1176,9 +1178,17 @@ dependencies = [
 name = "disk-image"
 version = "0.1.2"
 dependencies = [
+ "imago",
  "rootfs-spec",
  "tempfile",
  "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
+name = "disk-partition"
+version = "0.1.0"
+dependencies = [
  "uuid",
 ]
 
@@ -2139,8 +2149,10 @@ dependencies = [
 name = "init"
 version = "0.1.0"
 dependencies = [
+ "disk-partition",
  "libc",
  "rootfs-spec",
+ "uuid",
 ]
 
 [[package]]
@@ -2639,6 +2651,7 @@ dependencies = [
  "chrono",
  "cpio",
  "disk-image",
+ "disk-partition",
  "eyre",
  "forward-spec",
  "getrandom 0.4.3",
@@ -2674,6 +2687,7 @@ dependencies = [
  "utils",
  "uuid",
  "vm-spec",
+ "vz",
  "x509-parser",
  "zeroize",
 ]
@@ -4715,6 +4729,8 @@ dependencies = [
  "bzip2",
  "chrono",
  "clap",
+ "cpio",
+ "disk-image",
  "eyre",
  "forward-spec",
  "futures",
@@ -4727,6 +4743,7 @@ dependencies = [
  "prost-types",
  "protocol",
  "rand",
+ "rootfs-spec",
  "rprobe",
  "russh",
  "serde",

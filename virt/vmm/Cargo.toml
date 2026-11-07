@@ -34,6 +34,7 @@ restore-irq-probe = ["libkrun/native-device-probe"]
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
 forward-spec = { path = "../../specs/forward-spec", features = ["tokio"] }
+rootfs-spec = { path = "../../specs/rootfs-spec" }
 async-trait = "0.1"
 base64 = "0.23.0"
 chrono = "0.4.45"
@@ -83,3 +84,9 @@ vz = { path = "../../virt/vz" }
 
 [build-dependencies]
 sha2 = "0.11.0"
+
+[dev-dependencies]
+# Native guest fixture: whole-disk ext4 root and its schema-2 launch bootstrap,
+# composed with the same newc crate as libvm.
+cpio = "0.4.1"
+disk-image = { path = "../../common/disk-image" }

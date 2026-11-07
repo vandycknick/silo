@@ -19,7 +19,6 @@ const AFTER: &[ProvisionerId] = &[
     ProvisionerId::CERTIFICATE_AUTHORITY,
     ProvisionerId::RESIZE_ROOTFS,
     ProvisionerId::MOUNTS,
-    ProvisionerId::ROSETTA,
 ];
 
 pub(crate) struct Userdata<'a> {

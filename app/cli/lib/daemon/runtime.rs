@@ -108,6 +108,7 @@ impl SystemRuntime {
                 reference.to_string(),
                 ImageResolveOptions {
                     policy: Some(policy),
+                    platform: None,
                 },
             )
             .await?)
@@ -152,7 +153,7 @@ impl SystemRuntime {
             .memory(Memory::bytes(config.memory_bytes))
             .root_disk_size(config.root_size_bytes)
             .disks(vec![data_image.to_path_buf()])
-            .rosetta(config.rosetta)
+            .rosetta(config.rosetta_explicit.then_some(config.rosetta))
             .mounts(mounts)
             .forwards(vec![forward])
             .network(|network| network.private().publish(config.publish_bind))

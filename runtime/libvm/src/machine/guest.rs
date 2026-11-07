@@ -77,10 +77,10 @@ impl MachineGuestConfig {
 #[serde(tag = "mode", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MachineAgent {
-    /// Resolve the installed default agent when the machine starts.
+    /// Pin the installed default agent during creation or explicit boot update.
     #[default]
     Default,
-    /// Inject a caller-provided agent executable.
+    /// Pin a caller-provided agent executable as part of a complete boot tuple.
     Custom { path: PathBuf },
     /// Do not inject an agent or require guest-agent readiness.
     Disabled,

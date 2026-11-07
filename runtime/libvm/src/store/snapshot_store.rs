@@ -172,17 +172,17 @@ pub(crate) struct SnapshotConsumer {
 /// inputs. A held descriptor pins its device/inode pair, so a fresh descriptor
 /// with an equal fingerprint is that authenticated inode with unchanged bytes.
 /// Restore uses this instead of opening and hashing the same members again.
-struct AuthenticatedClosure {
-    streams: BTreeMap<StreamId, AuthenticatedStream>,
-    objects: BTreeMap<ObjectDigest, AuthenticatedObject>,
+pub(crate) struct AuthenticatedClosure {
+    pub(crate) streams: BTreeMap<StreamId, AuthenticatedStream>,
+    pub(crate) objects: BTreeMap<ObjectDigest, AuthenticatedObject>,
     /// Measured from live RAM during this closure's stream authentication,
     /// never copied from capture inventory. The stream entry pins its inode.
     ram_sha256: Option<(StreamId, vm_spec::capture::Sha256Digest)>,
 }
 
-struct AuthenticatedObject {
-    file: File,
-    fingerprint: SourceFingerprint,
+pub(crate) struct AuthenticatedObject {
+    pub(crate) file: File,
+    pub(crate) fingerprint: SourceFingerprint,
 }
 
 impl SnapshotConsumer {
@@ -292,7 +292,7 @@ impl SnapshotConsumer {
     }
 }
 
-fn bind_held(held: &File, fingerprint: SourceFingerprint) -> Result<(), LibVmError> {
+pub(crate) fn bind_held(held: &File, fingerprint: SourceFingerprint) -> Result<(), LibVmError> {
     if SourceFingerprint::new(&held.metadata()?) != fingerprint {
         return Err(invalid(
             "authenticated snapshot closure member was modified",
@@ -301,7 +301,10 @@ fn bind_held(held: &File, fingerprint: SourceFingerprint) -> Result<(), LibVmErr
     Ok(())
 }
 
-fn bind_reopened(reopened: &File, fingerprint: SourceFingerprint) -> Result<(), LibVmError> {
+pub(crate) fn bind_reopened(
+    reopened: &File,
+    fingerprint: SourceFingerprint,
+) -> Result<(), LibVmError> {
     if SourceFingerprint::new(&reopened.metadata()?) != fingerprint {
         return Err(invalid(
             "authenticated snapshot closure member was replaced or modified",
@@ -313,15 +316,17 @@ fn bind_reopened(reopened: &File, fingerprint: SourceFingerprint) -> Result<(), 
 /// Closure members whose authenticated descriptors a consumer holds. Map roots
 /// and pages are consumed through digest-checked reads only, so retention
 /// stays bounded by record roles rather than stream length.
-fn retained_members(record: &SnapshotRecord) -> (BTreeSet<StreamId>, BTreeSet<ObjectDigest>) {
-    let (streams, mut objects) = record.content_dependencies();
+fn retained_members(
+    record: &SnapshotRecord,
+) -> Result<(BTreeSet<StreamId>, BTreeSet<ObjectDigest>), LibVmError> {
+    let (streams, mut objects) = record.content_dependencies()?;
     for stream in record.streams() {
         objects.remove(&stream.map);
         for page in &stream.map_pages {
             objects.remove(page);
         }
     }
-    (streams, objects)
+    Ok((streams, objects))
 }
 
 pub(crate) fn validate_alias(name: &str) -> Result<(), LibVmError> {
@@ -386,31 +391,11 @@ impl SnapshotStore {
         Ok(snapshots)
     }
 
-    /// Unbinding an image name never releases an independently retained snapshot.
+    /// Unbinding a name leaves its independently retained image/snapshot intact.
     pub async fn remove_alias(&self, name: &str) -> Result<bool, LibVmError> {
-        validate_alias(name)?;
-        let collection = self.clone();
-        let name = name.to_owned();
-        let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || runtime.block_on(collection.remove_alias_owned(&name)))
-            .await?
-    }
-
-    async fn remove_alias_owned(&self, name: &str) -> Result<bool, LibVmError> {
-        let pool = StoragePool::open(&self.store.images_dir)?;
-        let _roots = pool.lock_roots()?;
-        let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let id = sqlx::query_scalar::<_, String>(
-            "DELETE FROM image_alias WHERE name=?1 RETURNING snapshot_id",
-        )
-        .bind(name)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(id) = &id {
-            remove_unrooted(&mut tx, id).await?;
-        }
-        tx.commit().await?;
-        Ok(id.is_some())
+        crate::store::managed_image_store::ManagedImageStore::from_store(self.store.clone())
+            .remove_alias(name)
+            .await
     }
 
     /// Release only the unnamed explicit retention root. Aliases keep rooting
@@ -428,7 +413,7 @@ impl SnapshotStore {
     async fn release_retention_owned(&self, reference: &SnapshotRef) -> Result<bool, LibVmError> {
         let (record, observed) = self.load_observed(reference).await?;
         let bytes = record.canonical_bytes()?;
-        let (streams, mut objects) = record.content_dependencies();
+        let (streams, mut objects) = record.content_dependencies()?;
         objects.insert(observed.record_digest);
         let pool = StoragePool::open(&self.store.images_dir)?;
         let _roots = pool.lock_roots()?;
@@ -478,7 +463,7 @@ impl SnapshotStore {
         let bytes = record.canonical_bytes()?;
         let id = crate::store::models::snapshot::snapshot_id(&bytes);
         let digest = ObjectDigest::of_bytes(&bytes);
-        let (streams, mut objects) = record.content_dependencies();
+        let (streams, mut objects) = record.content_dependencies()?;
         objects.insert(digest);
         let pool = StoragePool::open(&self.store.images_dir)?;
         let capture = if matches!(
@@ -589,20 +574,12 @@ impl SnapshotStore {
             }
         }
         if let Some(alias) = alias {
-            let current = sqlx::query_scalar::<_, String>(
-                "SELECT snapshot_id FROM image_alias WHERE name=?1",
+            crate::store::managed_image_store::insert_alias(
+                &mut tx,
+                alias,
+                crate::image::import_types::ManagedSourceId::Snapshot(id),
             )
-            .bind(alias)
-            .fetch_optional(&mut *tx)
             .await?;
-            if current
-                .as_deref()
-                .is_some_and(|current| current != id.to_string())
-            {
-                return Err(invalid("image alias already names a different artifact"));
-            }
-            sqlx::query("INSERT INTO image_alias(name,snapshot_id) VALUES(?1,?2) ON CONFLICT(name) DO NOTHING")
-                .bind(alias).bind(id.to_string()).execute(&mut *tx).await?;
         }
         if let Some((evidence_digest, evidence)) = capture {
             let existing = sqlx::query("SELECT snapshot_id,evidence_digest,evidence_bytes FROM snapshot_capture_provenance WHERE capture_id=?1")
@@ -656,7 +633,7 @@ impl SnapshotStore {
         let store = self.store.clone();
         let (record, observed) = self.load_observed(reference).await?;
         let bytes = record.canonical_bytes()?;
-        let (streams, mut objects) = record.content_dependencies();
+        let (streams, mut objects) = record.content_dependencies()?;
         objects.insert(observed.record_digest);
         let reference = reference.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -787,6 +764,24 @@ pub(crate) async fn fetch_catalog(
     reference: &SnapshotRef,
 ) -> Result<CatalogSnapshotFacts, LibVmError> {
     let (id, alias) = reference_parts(reference)?;
+    let target = crate::store::managed_image_store::resolve_target(
+        connection,
+        &match reference {
+            SnapshotRef::Id(id) => crate::image::import_types::ManagedSourceRef::Snapshot(*id),
+            SnapshotRef::Image(alias) => {
+                crate::image::import_types::ManagedSourceRef::Alias(alias.clone())
+            }
+        },
+    )
+    .await?;
+    if !matches!(
+        target,
+        crate::image::import_types::ManagedSourceId::Snapshot(_)
+    ) {
+        return Err(invalid(
+            "image requires image creation, not snapshot restore",
+        ));
+    }
     let row = sqlx::query("SELECT id,record_digest,record_bytes,retained,created_at,EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) AS capture_owned FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
         .bind(id).bind(alias).fetch_optional(&mut *connection).await?
         .ok_or_else(|| invalid(format!("snapshot {reference} does not exist")))?;
@@ -832,7 +827,7 @@ pub(crate) fn authenticate_catalog(
     {
         return Err(invalid("snapshot catalog identity contradiction"));
     }
-    let (streams, mut objects) = record.content_dependencies();
+    let (streams, mut objects) = record.content_dependencies()?;
     objects.insert(digest);
     let actual_streams = facts
         .streams
@@ -1002,6 +997,21 @@ async fn recheck_catalog(
     streams: &BTreeSet<StreamId>,
     objects: &BTreeSet<ObjectDigest>,
 ) -> Result<(), LibVmError> {
+    let target = crate::store::managed_image_store::resolve_target(
+        connection,
+        &match reference {
+            SnapshotRef::Id(id) => crate::image::import_types::ManagedSourceRef::Snapshot(*id),
+            SnapshotRef::Image(alias) => {
+                crate::image::import_types::ManagedSourceRef::Alias(alias.clone())
+            }
+        },
+    )
+    .await?;
+    if target != crate::image::import_types::ManagedSourceId::Snapshot(observed.id) {
+        return Err(invalid(
+            "snapshot root changed before consumer registration",
+        ));
+    }
     let (id, alias) = reference_parts(reference)?;
     let row = sqlx::query("SELECT id,record_digest,record_bytes FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
         .bind(id).bind(alias).fetch_optional(&mut *connection).await?
@@ -1048,7 +1058,7 @@ pub(crate) async fn check_snapshot_catalog(store: &Store) -> Result<(), LibVmErr
     Ok(())
 }
 
-async fn remove_unrooted(
+pub(crate) async fn remove_unrooted(
     connection: &mut sqlx::SqliteConnection,
     id: &str,
 ) -> Result<(), LibVmError> {
@@ -1056,7 +1066,7 @@ async fn remove_unrooted(
         .bind(id).execute(connection).await?;
     Ok(())
 }
-async fn require_operation_closure(
+pub(crate) async fn require_operation_closure(
     store: &Store,
     operation: Uuid,
     streams: &BTreeSet<StreamId>,
@@ -1064,7 +1074,7 @@ async fn require_operation_closure(
     pending: Option<ObjectDigest>,
 ) -> Result<(), LibVmError> {
     let mut tx = store.pool.begin().await?;
-    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('snapshot','capture') AND state IN ('staging','committing'))")
+    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('import','convert','snapshot','capture','update-boot-assets') AND state IN ('staging','committing'))")
         .bind(operation.to_string()).fetch_one(&mut *tx).await?;
     if !active {
         return Err(invalid("snapshot has no active retained operation"));
@@ -1090,9 +1100,9 @@ async fn require_operation_closure(
     Ok(())
 }
 
-type ClosureFingerprints = Vec<(std::path::PathBuf, SourceFingerprint)>;
+pub(crate) type ClosureFingerprints = Vec<(std::path::PathBuf, SourceFingerprint)>;
 
-fn recheck_closure(fingerprints: &ClosureFingerprints) -> Result<(), LibVmError> {
+pub(crate) fn recheck_closure(fingerprints: &ClosureFingerprints) -> Result<(), LibVmError> {
     for (path, before) in fingerprints {
         if SourceFingerprint::new(&std::fs::symlink_metadata(path)?) != *before {
             return Err(invalid(
@@ -1114,12 +1124,49 @@ fn verify_closure(
     retain: bool,
 ) -> Result<(ClosureFingerprints, AuthenticatedClosure), LibVmError> {
     let bytes = record.canonical_bytes()?;
-    let record_digest = ObjectDigest::of_bytes(&bytes);
-    let (streams, mut objects) = record.content_dependencies();
+    let (_, objects) = record.content_dependencies()?;
+    let (_, retained_objects) = retained_members(record)?;
+    let ram = match &record.capture {
+        crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution }
+            if retain =>
+        {
+            Some(execution.memory.stream)
+        }
+        _ => None,
+    };
+    verify_artifact_closure(
+        pool,
+        &bytes,
+        &record.streams().collect::<Vec<_>>(),
+        objects,
+        retained_objects,
+        digest,
+        retain,
+        ram,
+    )
+}
+
+/// Shared image/snapshot byte authentication. Callers supply already-validated
+/// semantic content; this binds exact maps, backing streams and object inodes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_artifact_closure(
+    pool: &StoragePool,
+    bytes: &[u8],
+    contents: &[&SnapshotStream],
+    mut objects: BTreeSet<ObjectDigest>,
+    retained_objects: BTreeSet<ObjectDigest>,
+    digest: Option<ObjectDigest>,
+    retain: bool,
+    ram_stream: Option<StreamId>,
+) -> Result<(ClosureFingerprints, AuthenticatedClosure), LibVmError> {
+    let record_digest = ObjectDigest::of_bytes(bytes);
+    let streams = contents
+        .iter()
+        .map(|content| content.stream)
+        .collect::<BTreeSet<_>>();
     if digest.is_some() {
         objects.insert(record_digest);
     }
-    let (_, retained_objects) = retained_members(record);
     if retain {
         // Every held stream/object plus the one transient verification
         // descriptor open at any time.
@@ -1158,16 +1205,8 @@ fn verify_closure(
         objects: BTreeMap::new(),
         ram_sha256: None,
     };
-    let ram_stream = match &record.capture {
-        crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution }
-            if retain =>
-        {
-            Some(execution.memory.stream)
-        }
-        _ => None,
-    };
     let mut verified_streams = BTreeSet::new();
-    for content in record.streams() {
+    for content in contents {
         let root = crate::storage::map::StreamMapRoot::decode(
             &pool.read_object(&content.map, Resource::MetadataPageBytes.maximum())?,
         )?;
@@ -1198,8 +1237,8 @@ fn verify_closure(
             }
         }
     }
-    let maps = record
-        .streams()
+    let maps = contents
+        .iter()
         .map(|stream| stream.map)
         .collect::<BTreeSet<_>>();
     for object in objects {
@@ -1233,13 +1272,13 @@ fn bind_hashed(
     Ok(current)
 }
 
-struct RecordInput {
+pub(crate) struct RecordInput {
     parent: OwnedDirectory,
     directory: OwnedDirectory,
     name: String,
 }
 impl RecordInput {
-    fn new(images: &Path, operation: Uuid, bytes: &[u8]) -> Result<Self, LibVmError> {
+    pub(crate) fn new(images: &Path, operation: Uuid, bytes: &[u8]) -> Result<Self, LibVmError> {
         let parent =
             OwnedDirectory::open_existing_root(&images.join("tmp").join(operation.to_string()))?
                 .ok_or_else(|| invalid("registered snapshot operation staging is missing"))?;
@@ -1255,7 +1294,7 @@ impl RecordInput {
         input.directory.write_file("record", bytes)?;
         Ok(input)
     }
-    fn path(&self) -> std::path::PathBuf {
+    pub(crate) fn path(&self) -> std::path::PathBuf {
         self.directory.path().join("record")
     }
 }
@@ -1366,6 +1405,21 @@ mod tests {
         drop(roots);
         let mut record = record(stream.id, map.map, kernel.digest);
         record.root.stream = map;
+        let crate::BootProfile::LinuxDirect { binding, .. } = &record.boot else {
+            panic!("direct fixture")
+        };
+        let input = crate::store::snapshot_store::RecordInput::new(
+            &store.images_dir,
+            operation,
+            &binding.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let (bundle, roots) = pool.publish_object_for_catalog(&input.path()).unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[bundle.digest])
+            .await
+            .unwrap();
+        drop(roots);
         (
             temp,
             SnapshotStore::from_store(Arc::new(store)),
@@ -1534,11 +1588,11 @@ mod tests {
         let consumer = snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap();
         let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
         let stream = record.root.stream.stream;
-        // One root stream and one pinned boot object (kernel and initramfs share
-        // a digest); map roots, pages and the record hold no descriptor.
-        assert_eq!(consumer.retained_descriptors(), 2);
+        // One root stream, one shared kernel/initramfs object, and its complete
+        // canonical bundle; map roots, pages and record hold no descriptor.
+        assert_eq!(consumer.retained_descriptors(), 3);
         // The pre-open descriptor admission counts exactly what is retained.
-        let (streams, objects) = crate::store::snapshot_store::retained_members(&record);
+        let (streams, objects) = crate::store::snapshot_store::retained_members(&record).unwrap();
         assert_eq!(
             (streams.len() + objects.len()) as u64,
             consumer.retained_descriptors()
@@ -2311,7 +2365,7 @@ mod tests {
         snapshots.release_retention(&reference).await.unwrap();
         let (record, observed) = crate::store::snapshot_store::authenticate_catalog(facts).unwrap();
         let bytes = record.canonical_bytes().unwrap();
-        let (streams, mut objects) = record.content_dependencies();
+        let (streams, mut objects) = record.content_dependencies().unwrap();
         objects.insert(observed.record_digest);
         let pool = StoragePool::open_existing(&snapshots.store.images_dir)
             .unwrap()

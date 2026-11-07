@@ -707,11 +707,11 @@ explicit optional request also fails until the caller clears it in the prepared
 destination configuration. Defaults do not become portable user intent.
 `inspect` displays `platform: linux/amd64 (translated: rosetta)`.
 
-Translation registration moves from agent provisioning into the trusted
-`/init`, driven by the root bootstrap record and performed before
-`switch_root` with the `F` flag so the interpreter is bound at registration.
-Today the agent registers it as PID 1; with an image-owned PID 1 the first
-exec after `switch_root` is already foreign, so init must own this step.
+Translation registration is owned by the trusted `/init`, driven by the root
+bootstrap record and performed before `switch_root` with the `F` flag so the
+interpreter is bound at registration. With an image-owned PID 1 the first exec
+after `switch_root` is already foreign, so the agent has no Rosetta
+configuration or registration path.
 
 Portability follows from the split: a `linux/amd64` machine built on a Mac
 carries an amd64 lower and an amd64-written upper. On an x86_64 Linux host the
@@ -1657,36 +1657,76 @@ positions are not substitutes for the expected identity. A backend that cannot
 expose these serials fails managed-overlay admission; the conformance gate
 covers guest-visible behavior, not just acceptance of a host API argument.
 
-Each overlay launch appends `silo/rootfs.json`, mode `0600`, at most 64 KiB, to
-the base initramfs independently of agent injection. It carries schema/root kind,
-device discovery method, expected UUIDs, magic, lengths, permissions and profiles.
-It contains no arbitrary mount flags or host paths. Managed overlay roots require
-an admitted Silo `/init`; an arbitrary custom initramfs cannot bypass this contract.
-Non-root kernel arguments remain configurable, but conflicting root-selection
-arguments fail planning.
-The overlay kernel command line requires the explicit
-`silo.rootfs=linux-flat-overlay-v1` marker as well as its bootstrap and rejects
-`root=`, `rootfstype=` and `rootflags=` conflicts. Init enforces uid/gid 0,
-mode 0600 on bootstrap/observation and mode 0700 on maintenance parents.
+Every Silo direct boot, raw or overlay, appends `silo/rootfs.json`, mode
+`0600`, at most 64 KiB, to the base initramfs independently of agent injection.
+It carries schema/root kind, device discovery method, expected attachment
+identities and geometry, root selector, filesystem, expected UUIDs, profiles
+and the effective Rosetta mode. It contains no arbitrary mount flags or host
+paths. A Silo direct boot requires an admitted Silo `/init`; an arbitrary
+custom initramfs cannot bypass this contract, and a missing or invalid
+bootstrap fails closed before any image code runs.
+Non-root kernel arguments remain configurable. `root=`, `rootfstype=` and
+`rootflags=` are reserved for every root kind, and so is `rdinit=`: Linux
+executes `rdinit=` instead of `/init`, so honoring it would skip the bootstrap,
+root checks and translation setup entirely. Planning, configuration updates
+and launch reject them, and init refuses to boot when any is present, as it
+does for a duplicate `init=` or `silo.rootfs=`. `init=` remains the image
+handoff input. Both sides read the joined command line with Linux `next_arg`
+tokenization and `isspace` (including VT and byte 0xA0), so double-quoted
+spellings such as `"rdinit=/x"` or `rdinit="/x"` are recognized exactly as the
+kernel recognizes them; NUL bytes are refused. The overlay kernel command line
+additionally requires the explicit `silo.rootfs=linux-flat-overlay-v1` marker
+as a consistency guard,
+and a raw root forbids it. Init enforces uid/gid 0, mode 0600 on
+bootstrap/observation and mode 0700 on maintenance parents.
 
-Opaque raw roots continue to use their explicit existing `root=` whole-disk
-contract. The current raw bootstrap selects that boot family; it does not carry
-a host path or infer a root from attachment position. Partition-selector import
-and bootstrap forms are later-stage work, not admitted by this phase's codec.
+An opaque raw root is selected only by its bootstrap, never by `root=`,
+device order, a global PARTUUID search or filesystem auto-detection. Init finds
+exactly one whole block device whose serial is exactly `silo-root`, checks its
+length, 512-byte logical sectors and access against the bootstrap, and feeds
+that same held descriptor to the shared `disk-partition` parser in guest-boot
+mode plus the Linux direct-table policy. The selector must agree with the
+table: `whole-disk` requires no table; `gpt-partition` resolves the unique
+partition GUID within that disk's own GPT; `mbr-partition` resolves the
+original one-based primary slot 1 through 4. A selected partition is the
+kernel child enumerated under that parent's sysfs directory whose partition
+number, start and size match the parsed table, with its own block-special and
+ioctl geometry checked. Init mounts it as the recorded `ext4` and verifies the
+mounted device before handoff. Identical identities on other attachments are
+irrelevant; a duplicate root serial, a corrupt or unsupported table, or any
+disagreement fails closed.
 
 The shared current bootstrap/retained-observation codec lives in internal
 `specs/rootfs-spec`. It is `no_std`, core-only and allocation-free, with one
 bounded fixed-schema JSON implementation for host and init, no external JSON
-parser and no host-path fields. Bootstrap has `schemaVersion: 1` and a closed
-`root`: `opaque-raw-v1` or `linux-flat-overlay-v1`. Overlay records exactly two
+parser and no host-path fields. Bootstrap has `schemaVersion: 2` only, a
+mandatory top-level `rosetta` of `disabled`, `optional` or `required`, and a
+closed `root`. An `opaque-raw-v1` root carries `discovery`
+(`virtio-block-serial`), `device` (`serial` `silo-root`, `lengthBytes` of the
+effective launch attachment, `logicalSectorSize` 512, `readOnly`), `selector`
+(`{"kind":"whole-disk"}`, `{"kind":"gpt-partition","guid":…}` with a nonzero
+canonical lowercase GUID in RFC 4122 byte order, or
+`{"kind":"mbr-partition","number":1..4}`) and `filesystem` `ext4`. A
+`linux-flat-overlay-v1` root records exactly two
 serial/length/sector/access/ext4-UUID expectations, fixed upper/overlay profiles,
 the qualified rendering ABI and an explicit disk-backed or sized-tmpfs temporary
 directory policy. Archive ownership is uid/gid 0 and mode 0600. Duplicate,
-unknown and missing members, malformed or overflowing integers/UUIDs, bytes over
-64 KiB and trailing content reject. Managed overlay bootstrap failure never
-falls back to raw or an automatic writable rescue shell.
+unknown and missing members, members of the other root kind, other schema
+versions, malformed or overflowing integers/UUIDs, nil GUIDs, invalid slots or
+geometry, bytes over 64 KiB and trailing content reject. There is no schema-1
+reader. Managed bootstrap failure never falls back to raw, `/dev/vda` or an
+automatic writable rescue shell.
 
-Init retains the corresponding bounded root-only observation at
+An enabled Rosetta mode makes init mount the reserved `rosetta` virtio-fs share
+read-only, nosuid and nodev (never noexec) at `/run/silo/rosetta`, admit
+`/run/silo/rosetta/rosetta` as an executable regular file on that share, and
+register the fixed `OCF` x86-64 ELF handler in one write before either
+`switch_root` branch, with or without an injected agent. It requires the exact
+kernel readback; a disabled global binfmt_misc, or a conflicting or disabled
+handler, fails the boot. No agent setting registers or repairs it.
+
+For overlay roots, init retains the corresponding bounded root-only observation
+(its own `schemaVersion: 1`, independent of the bootstrap schema) at
 `/run/silo/rootfs/observation.json`, preserving resolved block-special major/minor,
 expected identities, actual upper filesystem span and tail, requested/effective
 fixed profile, and temporary-directory selection. This feeds existing lifecycle

@@ -32,6 +32,7 @@ impl Machine {
         runtime
             .preflight_stopped_generation_locked(&config, &storage)
             .await?;
+        reject_boot_path_change(&config.spec, &spec, &config.name)?;
         let _node_state = crate::node_state::acquire(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if status.is_active() {
@@ -45,6 +46,7 @@ impl Machine {
                 reason: error.to_string(),
             })?;
         crate::machine::root_storage::validate_spec(&storage, &spec)?;
+        crate::runtime::boot_assets::effective_boot(&storage, &spec, runtime.effective_backend())?;
 
         let previous_spec = config.spec.clone();
         runtime.validate_tailscale_vsock(&config.network, &spec)?;
@@ -187,6 +189,15 @@ impl Machine {
                 reference: config.name.clone(),
             });
         }
+        if let Some(guest) = &replacement_guest {
+            if guest.agent != config.guest.agent {
+                return Err(LibVmError::InvalidMachineUpdate {
+                    reference: config.name.clone(),
+                    reason: "agent changes alter the pinned boot bundle; use update_boot_assets"
+                        .into(),
+                });
+            }
+        }
 
         if let Some(new_name) = update.name {
             if new_name != config.name {
@@ -309,6 +320,11 @@ impl Machine {
                 MachineUserUpdate::Clear => None,
             };
         }
+        crate::runtime::boot_assets::effective_boot(
+            &storage,
+            &config.spec,
+            runtime.effective_backend(),
+        )?;
 
         if runtime.validate_tailscale_vsock(&config.network, &config.spec)? {
             runtime.ensure_tailscale_directory(config.id)?;
@@ -440,6 +456,136 @@ impl Machine {
         }
         runtime.machine_inspect_data(config).await
     }
+
+    /// Atomically replaces the entire pinned next-boot tuple for a stopped
+    /// machine. The blocking owner survives cancellation of the requesting task.
+    pub async fn update_boot_assets(
+        &self,
+        update: crate::BootAssetsUpdate,
+    ) -> Result<MachineData, LibVmError> {
+        let machine = self.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(machine.update_boot_assets_stopped(update))
+        })
+        .await?
+    }
+
+    async fn update_boot_assets_stopped(
+        &self,
+        update: crate::BootAssetsUpdate,
+    ) -> Result<MachineData, LibVmError> {
+        let runtime = self.runtime();
+        let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
+        runtime.validate_machine_data_dir(&config)?;
+        let mut storage = runtime.machine_storage_record(config.id).await?;
+        runtime
+            .preflight_stopped_generation_locked(&config, &storage)
+            .await?;
+        let _node_state = crate::node_state::acquire(&config).await?;
+        let status = runtime.reconcile_machine_runtime_locked(&config).await?;
+        if status.is_active() {
+            return Err(LibVmError::MachineAlreadyRunning {
+                reference: config.name.clone(),
+            });
+        }
+        runtime.local_paths().ensure_machine_run_dir(config.id)?;
+        let _lifetime = crate::lock_manager::MachineLifetimeLock::try_acquire(
+            &runtime.machine_paths(config.id).vmm_lock_path(),
+        )?
+        .ok_or_else(|| LibVmError::MachineAlreadyRunning {
+            reference: config.name.clone(),
+        })?;
+        let store = runtime.native_store()?;
+        let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
+        let (operation, lease) = store
+            .begin_stopped_operation("update-boot-assets", &[], &[])
+            .await?;
+        let _operation_paths = pool.create_operation_with_lease(operation, lease)?;
+        let boot = crate::runtime::boot_assets::pin_boot_selection(
+            &storage,
+            &update.selection,
+            runtime.captured_boot_context(&pool, &store, operation),
+        )
+        .await?;
+        let crate::BootProfile::LinuxDirect { binding, .. } = &boot else {
+            return Err(crate::machine::root_storage::invalid(
+                "boot update requires direct boot",
+            ));
+        };
+        let crate::BootBinding::Pinned { agent, .. } = binding else {
+            return Err(crate::machine::root_storage::invalid(
+                "boot update did not pin a complete tuple",
+            ));
+        };
+        config.guest.agent = if agent.is_some() {
+            crate::machine::MachineAgent::Default
+        } else {
+            crate::machine::MachineAgent::Disabled
+        };
+        config.agent_mode = Some(config.guest.agent.clone());
+        let bundle = binding.digest()?;
+        storage.boot = boot;
+        storage.storage_generation = storage
+            .storage_generation
+            .checked_add(1)
+            .ok_or_else(|| crate::machine::root_storage::invalid("storage generation overflow"))?;
+        crate::runtime::boot_assets::effective_boot(
+            &storage,
+            &config.spec,
+            runtime.effective_backend(),
+        )?;
+        config.modified_at = now_unix();
+        // Only the semantic tuple is authoritative. Clear obsolete mutable asset
+        // paths in the same catalog transaction, not as a second ordered save.
+        if let Some(kernel) = config
+            .spec
+            .boot
+            .as_mut()
+            .and_then(|boot| boot.kernel.as_mut())
+        {
+            kernel.path = None;
+            kernel.initramfs = None;
+        }
+        crate::machine::root_storage::validate_spec(&storage, &config.spec)?;
+        store
+            .preserve_boot_update_operation(
+                operation,
+                config.id,
+                storage.storage_generation,
+                bundle,
+            )
+            .await?;
+        // Preserve both generations' roots when COMMIT's outcome is unknown.
+        // The journal candidate identifies the exact target bundle/generation.
+        runtime
+            .save_machine_config_with_storage(&config, &storage)
+            .await?;
+        store.finish_stopped_operation(operation).await?;
+        runtime.machine_inspect_data(config).await
+    }
+}
+
+fn reject_boot_path_change(
+    current: &VmSpec,
+    replacement: &VmSpec,
+    reference: &str,
+) -> Result<(), LibVmError> {
+    let paths = |spec: &VmSpec| {
+        spec.boot
+            .as_ref()
+            .and_then(|boot| boot.kernel.as_ref())
+            .map(|kernel| (kernel.path.clone(), kernel.initramfs.clone()))
+            .unwrap_or_default()
+    };
+    if paths(current) != paths(replacement) {
+        return Err(LibVmError::InvalidMachineUpdate {
+            reference: reference.to_owned(),
+            reason: "kernel/initramfs changes require the explicit update_boot_assets operation"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 fn apply_network_policy_update(
@@ -495,17 +641,50 @@ mod tests {
     use crate::{ImageSource, MachineUpdate, Runtime, RuntimeNetworkingConfig};
     use std::collections::BTreeMap;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use test_utils::direct_kernel::host_kernel;
+
+    const ROOT_MINIMUM_LENGTH: u64 = 64 * 1024 * 1024;
+
+    async fn test_runtime(path: &std::path::Path) -> Runtime {
+        let paths = crate::paths::LocalPaths::new(path);
+        let store = std::sync::Arc::new(crate::store::Store::new(&paths).await.unwrap());
+        let components = crate::runtime::components::test_components(paths.home());
+        std::fs::create_dir_all(components.asset_dir()).unwrap();
+        let kernel = host_kernel("known unit test packaged boot");
+        for (path, bytes) in [
+            (components.kernel(), kernel.as_slice()),
+            (
+                components.initramfs(),
+                b"known unit test packaged boot".as_slice(),
+            ),
+            (
+                components.agent(),
+                b"known unit test packaged boot".as_slice(),
+            ),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        Runtime::from_store(
+            paths,
+            store,
+            RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            components,
+            None,
+        )
+        .await
+        .unwrap()
+    }
 
     async fn stopped_storage_machine(name: &str) -> (tempfile::TempDir, Runtime, crate::Machine) {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("source.raw");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
-        let runtime = Runtime::open(
-            crate::paths::LocalPaths::new(home.path().join("silo")),
-            RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .unwrap();
+        disk_image::ext4::Formatter::new(&disk, 4096, ROOT_MINIMUM_LENGTH)
+            .unwrap()
+            .close()
+            .unwrap();
+        let runtime = test_runtime(&home.path().join("silo")).await;
         let machine = runtime
             .machine()
             .name(name)
@@ -521,7 +700,15 @@ mod tests {
         let (_home, runtime, machine) = stopped_storage_machine("private-run-update").await;
         let id = machine.machine_id();
         let run = runtime.machine_paths(id).machine_run_dir().to_owned();
-        for length in [1024, 1536] {
+        let root = runtime
+            .machine_config(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .machine_dir
+            .join("root.raw");
+        let initial_length = std::fs::metadata(&root).unwrap().len();
+        for length in [initial_length + 512, initial_length + 1024] {
             runtime.local_paths().ensure_machine_run_dir(id).unwrap();
             runtime.local_paths().remove_machine_run_tree(id).unwrap();
             assert!(
@@ -557,8 +744,12 @@ mod tests {
         let before = runtime.machine_config(id).await.unwrap().unwrap();
         let storage = runtime.machine_storage_record(id).await.unwrap();
         let root = std::fs::read(before.machine_dir.join("root.raw")).unwrap();
+        let requested_length = std::fs::metadata(before.machine_dir.join("root.raw"))
+            .unwrap()
+            .len()
+            + 512;
         let result = machine
-            .update(MachineUpdate::new().root_disk_size(1024))
+            .update(MachineUpdate::new().root_disk_size(requested_length))
             .await;
         assert!(matches!(
             result,
@@ -576,17 +767,60 @@ mod tests {
             root
         );
     }
+
+    #[tokio::test]
+    async fn configuration_update_refuses_trusted_init_override_without_changing_the_machine() {
+        let (_home, runtime, machine) = stopped_storage_machine("trusted-init-update").await;
+        let id = machine.machine_id();
+        let before = runtime.machine_config(id).await.unwrap().unwrap();
+        let storage = runtime.machine_storage_record(id).await.unwrap();
+        let path = before.machine_dir.join("config.json");
+        let file = std::fs::read(&path).unwrap();
+        let with_args = |args: Vec<&str>| {
+            let mut spec = before.spec.clone();
+            spec.boot
+                .as_mut()
+                .and_then(|boot| boot.kernel.as_mut())
+                .expect("direct boot kernel")
+                .cmdline = args.into_iter().map(String::from).collect();
+            spec
+        };
+        for args in [
+            vec!["rdinit=/agent/silo-agent"],
+            vec!["\"rdinit=/agent/silo-agent\""],
+            vec!["rdinit=\"/agent/silo-agent\""],
+            vec!["quiet\u{a0}rdinit=/agent/silo-agent"],
+            vec!["console=hvc0", "\"rdinit=/agent/silo-agent", "quiet\""],
+        ] {
+            let error = machine
+                .replace_config(with_args(args.clone()))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("rdinit= is reserved"),
+                "{args:?}: {error}"
+            );
+            assert_eq!(runtime.machine_config(id).await.unwrap().unwrap(), before);
+            assert_eq!(runtime.machine_storage_record(id).await.unwrap(), storage);
+            assert_eq!(std::fs::read(&path).unwrap(), file);
+        }
+
+        let accepted = with_args(vec!["init=/sbin/init", "\"a rdinit=/x\""]);
+        machine.replace_config(accepted.clone()).await.unwrap();
+        assert_eq!(
+            runtime.machine_config(id).await.unwrap().unwrap().spec,
+            accepted
+        );
+    }
     #[tokio::test]
     async fn stopped_tailscale_update_and_exact_atomic_name_contract() {
         let home = tempfile::tempdir().unwrap();
         let disk = home.path().join("root.raw");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
-        let runtime = Runtime::open(
-            crate::paths::LocalPaths::new(home.path().join("silo")),
-            RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .unwrap();
+        disk_image::ext4::Formatter::new(&disk, 4096, ROOT_MINIMUM_LENGTH)
+            .unwrap()
+            .close()
+            .unwrap();
+        let runtime = test_runtime(&home.path().join("silo")).await;
         let policy =
             crate::NetworkPolicy::from_hcl_str("tailscale \"vm\" { ephemeral = true }").unwrap();
         let missing = runtime
@@ -666,5 +900,160 @@ mod tests {
             .unwrap();
         machine.remove().await.unwrap();
         assert!(!state.state_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn boot_update_publishes_the_complete_tuple_and_generation_without_touching_disks() {
+        let (home, runtime, machine) = stopped_storage_machine("boot-update").await;
+        let before = runtime
+            .machine_storage_record(machine.machine_id())
+            .await
+            .unwrap();
+        let config = runtime
+            .machine_config(machine.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let root = crate::storage::stream::StreamHasher::new()
+            .hash_file(&config.machine_dir.join("root.raw"))
+            .unwrap()
+            .id();
+        let source = crate::storage::stream::StreamHasher::new()
+            .hash_file(&home.path().join("source.raw"))
+            .unwrap()
+            .id();
+        let kernel = home.path().join("replacement-kernel");
+        let kernel_bytes = host_kernel("explicit new kernel");
+        std::fs::write(&kernel, &kernel_bytes).unwrap();
+        let updated = machine
+            .update_boot_assets(crate::BootAssetsUpdate {
+                selection: crate::BootAssetSelection::Files {
+                    kernel,
+                    base_initramfs: runtime.asset_directory().join("initramfs"),
+                    agent: None,
+                },
+            })
+            .await
+            .unwrap();
+        let after = runtime
+            .machine_storage_record(machine.machine_id())
+            .await
+            .unwrap();
+        assert_eq!(after.storage_generation, before.storage_generation + 1);
+        assert_eq!(after.root, before.root);
+        assert_ne!(after.boot, before.boot);
+        assert_eq!(updated.guest.agent, crate::machine::MachineAgent::Disabled);
+        let crate::BootProfile::LinuxDirect {
+            binding: crate::BootBinding::Pinned { kernel, agent, .. },
+            ..
+        } = after.boot
+        else {
+            panic!("complete pinned tuple");
+        };
+        assert_eq!(
+            kernel,
+            crate::storage::identity::ObjectDigest::of_bytes(&kernel_bytes)
+        );
+        assert!(agent.is_none());
+        assert_eq!(
+            crate::storage::stream::StreamHasher::new()
+                .hash_file(&config.machine_dir.join("root.raw"))
+                .unwrap()
+                .id(),
+            root
+        );
+        assert_eq!(
+            crate::storage::stream::StreamHasher::new()
+                .hash_file(&home.path().join("source.raw"))
+                .unwrap()
+                .id(),
+            source
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_boot_selection_and_ordinary_agent_changes_preserve_the_previous_tuple() {
+        let (home, runtime, machine) = stopped_storage_machine("boot-rollback").await;
+        let before = runtime
+            .machine_storage_record(machine.machine_id())
+            .await
+            .unwrap();
+        let config = runtime
+            .machine_config(machine.machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let result = machine
+            .update_boot_assets(crate::BootAssetsUpdate {
+                selection: crate::BootAssetSelection::Files {
+                    kernel: runtime.asset_directory().join("kernel-default"),
+                    base_initramfs: runtime.asset_directory().join("initramfs"),
+                    agent: Some(home.path().join("missing-agent")),
+                },
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            runtime
+                .machine_storage_record(machine.machine_id())
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            runtime
+                .machine_config(machine.machine_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            config
+        );
+        let mut update = MachineUpdate::new();
+        let mut guest = config.guest.clone();
+        guest.agent = crate::machine::MachineAgent::Disabled;
+        update.guest = Some(guest);
+        assert!(
+            matches!(machine.update(update).await, Err(crate::LibVmError::InvalidMachineUpdate { reason, .. }) if reason.contains("update_boot_assets"))
+        );
+        assert_eq!(
+            runtime
+                .machine_storage_record(machine.machine_id())
+                .await
+                .unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_update_refuses_a_real_lifetime_owner_before_replacing_assets() {
+        let (_home, runtime, machine) = stopped_storage_machine("boot-owned").await;
+        let before = runtime
+            .machine_storage_record(machine.machine_id())
+            .await
+            .unwrap();
+        runtime
+            .local_paths()
+            .ensure_machine_run_dir(machine.machine_id())
+            .unwrap();
+        let _owner = crate::lock_manager::MachineLifetimeLock::try_acquire(
+            &runtime.machine_paths(machine.machine_id()).vmm_lock_path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            machine
+                .update_boot_assets(crate::BootAssetsUpdate {
+                    selection: crate::BootAssetSelection::Packaged
+                })
+                .await,
+            Err(crate::LibVmError::MachineAlreadyRunning { .. })
+        ));
+        assert_eq!(
+            runtime
+                .machine_storage_record(machine.machine_id())
+                .await
+                .unwrap(),
+            before
+        );
     }
 }

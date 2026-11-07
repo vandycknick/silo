@@ -12,9 +12,14 @@
 extern crate alloc;
 
 mod applets;
+mod block;
+mod bootstrap;
 mod init;
 mod io;
 mod overlay;
+mod owned;
+mod raw;
+mod rosetta;
 mod sys;
 
 use crate::applets::{get_arg, run_applet};

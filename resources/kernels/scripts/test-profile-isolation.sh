@@ -137,27 +137,50 @@ for track in stable longterm longterm5; do
     fi
 done
 
-# Unit boundary for emitted-config validation: a fragment requesting built-in
-# support is not proof when the emitted file omits it, disables it or uses m.
-printf 'CONFIG_VIRTIO_SILO_VMGENID=y\nCONFIG_VMGENID=y\n' > "$temp_dir/required.config"
+# Unit boundary for emitted-config validation. Check the actual workload
+# fragments against the contract before testing missing or changed settings.
+cat > "$temp_dir/required.config" <<'EOF'
+CONFIG_VIRTIO_SILO_VMGENID=y
+CONFIG_VMGENID=y
+CONFIG_BINFMT_MISC=y
+CONFIG_EXT4_FS=y
+CONFIG_VIRTIO_FS=y
+CONFIG_EFI_PARTITION=y
+CONFIG_MSDOS_PARTITION=y
+CONFIG_VFAT_FS=y
+CONFIG_FAT_FS=y
+CONFIG_NLS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_NLS_UTF8=y
+CONFIG_FAT_DEFAULT_CODEPAGE=437
+CONFIG_FAT_DEFAULT_IOCHARSET="iso8859-1"
+CONFIG_ARM64_4K_PAGES=y
+CONFIG_ARM64_PAGE_SHIFT=12
+EOF
+cat "$kernel_root/configs/common.config" "$kernel_root/configs/arm64.config" > "$temp_dir/workload.config"
+"$kernel_root/scripts/validate-config.sh" "$temp_dir/workload.config" "$temp_dir/required.config"
 cp "$temp_dir/required.config" "$temp_dir/emitted.config"
 "$kernel_root/scripts/validate-config.sh" "$temp_dir/emitted.config" "$temp_dir/required.config"
-for symbol in VIRTIO_SILO_VMGENID VMGENID; do
-    for setting in missing n m; do
-        : > "$temp_dir/emitted.config"
-        for emitted_symbol in VIRTIO_SILO_VMGENID VMGENID; do
-            if [ "$emitted_symbol" != "$symbol" ]; then
-                printf 'CONFIG_%s=y\n' "$emitted_symbol" >> "$temp_dir/emitted.config"
-            elif [ "$setting" != missing ]; then
-                printf 'CONFIG_%s=%s\n' "$symbol" "$setting" >> "$temp_dir/emitted.config"
-            fi
-        done
+while IFS='=' read -r symbol expected; do
+    case "$expected" in
+        y) settings='missing n m' ;;
+        437) settings='missing 850' ;;
+        '"iso8859-1"') settings='missing "utf8"' ;;
+        12) settings='missing 14 16' ;;
+        *) printf 'unhandled config expectation: %s=%s\n' "$symbol" "$expected" >&2; exit 1 ;;
+    esac
+    for setting in $settings; do
+        awk -F= -v symbol="$symbol" -v setting="$setting" '
+            $1 != symbol { print; next }
+            setting != "missing" { print symbol "=" setting }
+        ' "$temp_dir/required.config" > "$temp_dir/emitted.config"
         if "$kernel_root/scripts/validate-config.sh" "$temp_dir/emitted.config" "$temp_dir/required.config" > /dev/null 2>&1; then
-            printf 'emitted config accepted non-built-in %s: %s\n' "$symbol" "$setting" >&2
+            printf 'emitted config accepted incorrect %s: %s\n' "$symbol" "$setting" >&2
             exit 1
         fi
     done
-done
+done < "$temp_dir/required.config"
 
 if make -s -C "$kernel_root" HOST_ARCH=x86_64 KERNEL_PROFILE=rprobe kernel-identities > /dev/null 2>&1; then
     printf 'x86_64 rprobe profile was not rejected\n' >&2

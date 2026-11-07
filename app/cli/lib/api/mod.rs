@@ -24,7 +24,7 @@ use crate::template::Template;
 
 use crate::api::machine::AppMachine;
 use crate::api::start_options::AppStartOptions;
-use crate::api::types::{ReadOnlyCreationResolution, SourceResolution};
+use crate::api::types::{ReadOnlyCreationResolution, SourceOptions, SourceResolution};
 
 #[derive(Debug)]
 pub(crate) enum AppApi {
@@ -194,16 +194,105 @@ impl AppApi {
         }
     }
 
+    /// Removes only an `image:NAME` alias in the single image/snapshot namespace,
+    /// never an explicit retention.
     pub(crate) async fn remove_image_alias(&mut self, reference: &str) -> eyre::Result<()> {
-        let alias = match reference.parse::<libvm::SnapshotRef>()? {
-            libvm::SnapshotRef::Image(alias) => alias,
-            libvm::SnapshotRef::Id(_) => {
+        let alias = match silo_vm_control::images::parse_managed(reference)? {
+            silo_vm_control::images::ManagedSpelling::Reference(
+                libvm::ManagedSourceRef::Alias(alias),
+            ) => alias,
+            _ => {
                 eyre::bail!("image remove requires an image:NAME alias, not an immutable identity")
             }
         };
         match self {
             Self::Local(service) => service.remove_image_alias(alias).await,
             Self::Daemon(service) => service.remove_image_alias(alias).await,
+        }
+    }
+
+    /// Resolves any `image:` spelling to a typed reference in either transport.
+    pub(crate) async fn managed_reference(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::ManagedSourceRef> {
+        let spelling = silo_vm_control::images::parse_managed(reference)?;
+        match self {
+            Self::Local(service) => service.managed_reference(spelling).await,
+            Self::Daemon(service) => service.managed_reference(spelling).await,
+        }
+    }
+
+    pub(crate) async fn inspect_managed(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::ManagedSourceInfo> {
+        let reference = self.managed_reference(reference).await?;
+        match self {
+            Self::Local(service) => service.inspect_managed(&reference).await,
+            Self::Daemon(service) => service.inspect_managed(&reference).await,
+        }
+    }
+
+    pub(crate) async fn list_managed(&mut self) -> eyre::Result<Vec<libvm::ManagedSourceInfo>> {
+        match self {
+            Self::Local(service) => service.list_managed().await,
+            Self::Daemon(service) => service.list_managed().await,
+        }
+    }
+
+    /// Releases explicit retention of an image or snapshot; aliases and other
+    /// consumers still retain its bytes.
+    pub(crate) async fn release_image(&mut self, reference: &str) -> eyre::Result<()> {
+        let reference = self.managed_reference(reference).await?;
+        match self {
+            Self::Local(service) => service.release_image(&reference).await,
+            Self::Daemon(service) => service.release_image(&reference).await,
+        }
+    }
+
+    pub(crate) async fn import_image(
+        &mut self,
+        request: libvm::DiskImportRequest,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ManagedImageInfo> {
+        match self {
+            Self::Local(service) => service.import_image(request, progress).await,
+            Self::Daemon(service) => service.import_image(request, progress).await,
+        }
+    }
+
+    pub(crate) async fn convert_image(
+        &mut self,
+        reference: String,
+        pull: ImagePullPolicy,
+        platform: Option<libvm::LinuxPlatform>,
+        options: libvm::RawConversionOptions,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<libvm::ManagedImageInfo> {
+        match self {
+            Self::Local(service) => {
+                service
+                    .convert_image(reference, pull, platform, options, progress)
+                    .await
+            }
+            Self::Daemon(service) => {
+                service
+                    .convert_image(reference, pull, platform, options, progress)
+                    .await
+            }
+        }
+    }
+
+    /// Explicit stopped boot-bundle replacement; never combined with other settings.
+    pub(crate) async fn update_boot_assets(
+        &mut self,
+        reference: &str,
+        update: libvm::BootAssetsUpdate,
+    ) -> eyre::Result<MachineData> {
+        match self {
+            Self::Local(service) => service.update_boot_assets(reference, update).await,
+            Self::Daemon(service) => service.update_boot_assets(reference, update).await,
         }
     }
 
@@ -352,17 +441,18 @@ impl AppApi {
         positional: Option<&str>,
         template: &Template,
         pull: Option<(ImagePullPolicy, PullPolicy)>,
+        options: &SourceOptions,
         progress: ImageProgressSender,
     ) -> eyre::Result<SourceResolution> {
         match self {
             Self::Local(service) => {
                 service
-                    .resolve_source(positional, template, pull, progress)
+                    .resolve_source(positional, template, pull, options, progress)
                     .await
             }
             Self::Daemon(service) => {
                 service
-                    .resolve_source(positional, template, pull, progress)
+                    .resolve_source(positional, template, pull, options, progress)
                     .await
             }
         }
@@ -374,6 +464,7 @@ impl AppApi {
         positional: Option<&str>,
         template: &Template,
         pull: Option<(ImagePullPolicy, PullPolicy)>,
+        options: &SourceOptions,
     ) -> eyre::Result<ReadOnlyCreationResolution> {
         local::LocalVmService::resolve_read_only_creation(
             config,
@@ -381,6 +472,7 @@ impl AppApi {
             positional,
             template,
             pull,
+            options,
         )
         .await
     }
@@ -483,13 +575,21 @@ mod tests {
             &temp.path().join("home"),
         ));
         let disk = temp.path().join("rootfs.img");
-        std::fs::write(&disk, [0x64; 512]).expect("write local disk");
+        disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+            .and_then(|formatter| formatter.close())
+            .expect("format admissible whole-disk ext4");
         let reference = format!("disk:{}", disk.display());
         let template: Template =
             serde_json::from_str(r#"{"version":"1"}"#).expect("parse minimal template");
         let (progress, mut events) = ImageProgressSender::default_channel();
         let source = api
-            .resolve_source(Some(&reference), &template, None, progress.clone())
+            .resolve_source(
+                Some(&reference),
+                &template,
+                None,
+                &crate::api::types::SourceOptions::default(),
+                progress.clone(),
+            )
             .await
             .expect("resolve local disk");
         assert!(
@@ -553,9 +653,12 @@ mod tests {
         for name in ["netd", "krun"] {
             executable_fixture(&bin, name);
         }
-        for name in ["kernel-default", "initramfs"] {
-            std::fs::write(assets.join(name), b"fixture").expect("write asset fixture");
-        }
+        std::fs::write(
+            assets.join("kernel-default"),
+            test_utils::direct_kernel::host_kernel("fixture"),
+        )
+        .expect("write asset fixture");
+        std::fs::write(assets.join("initramfs"), b"fixture").expect("write asset fixture");
         executable_fixture(&assets, "agent");
         RuntimeConfig::local(home)
             .with_runtime_root(&components)
@@ -568,7 +671,9 @@ mod tests {
         let home = temp.path().join("home");
         let mut api = AppApi::local(isolated_runtime_config(temp.path(), &home));
         let disk = temp.path().join("disk.img");
-        std::fs::write(&disk, [0x64; 512]).unwrap();
+        disk_image::ext4::Formatter::new(&disk, 4096, 256 * 1024)
+            .and_then(|formatter| formatter.close())
+            .unwrap();
         let policy = libvm::NetworkPolicy::from_json_str(r#"{"version":1,"endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],"credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"}]}"#).unwrap();
         let AppApi::Local(service) = &mut api else {
             unreachable!("explicit local fixture")
@@ -579,7 +684,9 @@ mod tests {
             .unwrap()
             .machine()
             .name("secret-hint")
-            .image_source(libvm::ImageSource::disk(disk))
+            .image_source(libvm::ImageSource::Disk(
+                crate::commands::create::disk_create_request(disk, &Default::default()).unwrap(),
+            ))
             .agent_mode(Some(libvm::MachineAgent::Disabled))
             .network(|network| network.private().policy(policy))
             .create()

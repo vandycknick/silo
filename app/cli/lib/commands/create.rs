@@ -97,9 +97,24 @@ pub(crate) struct VmOverrideArgs {
     /// Enable nested virtualization for supported VZ guests.
     #[arg(long)]
     pub(crate) nested_virtualization: bool,
-    /// Enable Rosetta for x86_64 Linux binaries on a supported backend and host.
-    #[arg(long)]
-    pub(crate) rosetta: bool,
+    /// Rosetta intent: `--rosetta` enables, `--rosetta=false` explicitly disables,
+    /// absence leaves no intent. Required translation is derived from the platform.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub(crate) rosetta: Option<bool>,
+    /// Linux userspace platform: OCI manifest selection or disk import metadata
+    /// (linux/amd64, linux/arm64[/v8]). Defaults to the host-native platform.
+    #[arg(long, value_name = "PLATFORM", value_parser = parse_platform_arg)]
+    pub(crate) platform: Option<libvm::LinuxPlatform>,
+    /// Root of a disk: source: whole-disk (default), auto (GPT discoverable
+    /// partitions), gpt:GUID or mbr:N. Never inferred from a partitioned disk.
+    #[arg(long, value_name = "SELECTION", value_parser = parse_root_arg)]
+    pub(crate) root: Option<libvm::ImportRootSelection>,
     /// Path to userdata file.
     #[arg(long, value_name = "PATH")]
     pub(crate) userdata: Option<PathBuf>,
@@ -152,8 +167,9 @@ pub(crate) struct MachineCliOptions {
     pub(crate) initramfs: Option<PathBuf>,
     pub(crate) kernel_args: Vec<String>,
     pub(crate) nested_virtualization: bool,
-    pub(crate) rosetta: bool,
+    pub(crate) rosetta: Option<bool>,
     pub(crate) disks: Vec<PathBuf>,
+    pub(crate) source: crate::api::types::SourceOptions,
     pub(crate) agent: Option<PathBuf>,
     pub(crate) no_agent: bool,
     pub(crate) provision_user: Option<MachineUserConfig>,
@@ -206,6 +222,10 @@ impl VmOverrideArgs {
             nested_virtualization: self.nested_virtualization,
             rosetta: self.rosetta,
             disks: self.disks.clone(),
+            source: crate::api::types::SourceOptions {
+                platform: self.platform.clone(),
+                root: self.root.clone(),
+            },
             agent: None,
             no_agent: false,
             provision_user: self
@@ -272,6 +292,7 @@ impl Cmd {
                 self.image.as_deref(),
                 &template.template,
                 self.pull.map(Pull::policies),
+                &machine.source,
             )
             .await?;
             let settings = machine_settings(&machine);
@@ -310,9 +331,29 @@ impl Cmd {
                     self.image.as_deref(),
                     &template.template,
                     self.pull.map(Pull::policies),
+                    &machine.source,
                     image_progress.clone(),
                 )
                 .await?;
+            // A snapshot restores its complete captured configuration through the
+            // existing restore path; nothing implicit is synthesized over it.
+            if let crate::api::types::ResolvedSource::Managed(libvm::ManagedSourceRef::Snapshot(
+                id,
+            )) = &source.source
+            {
+                ensure_snapshot_has_no_overrides(&machine, &template)?;
+                let options = libvm::RestoreOptions {
+                    name: requested_name,
+                    external_resources: libvm::ExternalResourcePolicy::Reject,
+                    activation_hook: None,
+                    resources: Default::default(),
+                };
+                return context
+                    .app_api()
+                    .await?
+                    .restore_snapshot(&format!("image:{id}"), options)
+                    .await;
+            }
             let settings = machine_settings(&machine);
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Create,
@@ -373,6 +414,110 @@ pub(crate) fn selected_image_reference(
         .ok_or_else(|| eyre::eyre!("an image is required when the template does not provide one"))
 }
 
+/// A source spelling, parsed in the same order by both transports: `image:`
+/// managed references first, then `disk:` paths, then OCI references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceSpelling {
+    Managed(silo_vm_control::images::ManagedSpelling),
+    Disk(PathBuf),
+    Oci(String),
+}
+
+pub(crate) fn parse_source(reference: &str) -> eyre::Result<SourceSpelling> {
+    if reference.starts_with("image:") {
+        return Ok(SourceSpelling::Managed(
+            silo_vm_control::images::parse_managed(reference)?,
+        ));
+    }
+    if let Some(path) = reference.strip_prefix("disk:") {
+        return Ok(SourceSpelling::Disk(disk_source_path(reference, path)?));
+    }
+    Ok(SourceSpelling::Oci(reference.to_owned()))
+}
+
+/// Source options belong to the selected source family; they are never
+/// silently ignored for another one.
+pub(crate) fn validate_source_options(
+    spelling: &SourceSpelling,
+    options: &crate::api::types::SourceOptions,
+    pull: bool,
+) -> eyre::Result<()> {
+    match spelling {
+        SourceSpelling::Oci(_) => {
+            if options.root.is_some() {
+                eyre::bail!("--root selects a partition of a disk: source only");
+            }
+        }
+        SourceSpelling::Disk(_) => {
+            if pull {
+                eyre::bail!("--pull is only supported for OCI image sources");
+            }
+        }
+        SourceSpelling::Managed(_) => {
+            if pull {
+                eyre::bail!("--pull is only supported for OCI image sources");
+            }
+            if options.platform.is_some() || options.root.is_some() {
+                eyre::bail!(
+                    "--platform and --root cannot change a managed image; its boot metadata is immutable"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot creation is a full stopped restore: only the new name applies.
+/// Explicit settings are refused rather than silently ignored; implicit
+/// defaults are never sent.
+pub(crate) fn ensure_snapshot_has_no_overrides(
+    options: &MachineCliOptions,
+    template: &crate::template::NamedTemplate,
+) -> eyre::Result<()> {
+    let explicit = options.overrides != MachineOverrides::default()
+        || options.kernel.is_some()
+        || options.initramfs.is_some()
+        || !options.kernel_args.is_empty()
+        || options.nested_virtualization
+        || options.rosetta.is_some()
+        || !options.disks.is_empty()
+        || options.agent.is_some()
+        || options.no_agent
+        || options.provision_user.is_some()
+        || !template.name.is_empty();
+    if explicit {
+        eyre::bail!(
+            "a snapshot restores its complete captured configuration; only --name applies (use `silo restore` options, or `silo set` after creation)"
+        );
+    }
+    Ok(())
+}
+
+/// `disk:` convenience: host-native userspace, whole-disk direct boot and
+/// packaged assets pinned at creation, unless explicitly selected. The
+/// assumption is complete and visible in the plan; creation publishes no alias.
+pub(crate) fn disk_create_request(
+    path: PathBuf,
+    options: &crate::api::types::SourceOptions,
+) -> eyre::Result<libvm::DiskImportRequest> {
+    let platform = match &options.platform {
+        Some(platform) => platform.clone(),
+        None => silo_vm_control::boot::host_platform()?,
+    };
+    Ok(libvm::DiskImportRequest {
+        path,
+        boot: libvm::DiskImportBoot::LinuxDirect {
+            platform,
+            root: options
+                .root
+                .clone()
+                .unwrap_or(libvm::ImportRootSelection::WholeDisk),
+            assets: libvm::BootAssetSelection::Packaged,
+        },
+        alias: None,
+    })
+}
+
 fn disk_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     if path.trim().is_empty() {
         eyre::bail!("local image source path cannot be empty in {reference}");
@@ -380,18 +525,40 @@ fn disk_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-pub(crate) fn canonical_disk_source(reference: &str, path: &str) -> eyre::Result<PathBuf> {
+/// Absolute source path with canonical parent directories. The final component
+/// is never resolved: libvm opens it without following symbolic links, so a
+/// symlinked source is refused rather than silently replaced by its target.
+pub(crate) fn disk_source_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     let path = resolve_host_path(&disk_path(reference, path)?)?;
-    let path = std::fs::canonicalize(&path)
-        .with_context(|| format!("resolve local image disk {}", path.display()))?;
-    let metadata = std::fs::metadata(&path)
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        eyre::bail!("local image disk path has no file name: {}", path.display());
+    };
+    let path = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve local image disk directory {}", parent.display()))?
+        .join(name);
+    let metadata = std::fs::symlink_metadata(&path)
         .with_context(|| format!("inspect local image disk {}", path.display()))?;
-    if !metadata.is_file() {
-        eyre::bail!("local image disk path is not a file: {}", path.display());
+    if metadata.file_type().is_symlink() {
+        eyre::bail!(
+            "local image disk is a symbolic link; pass the quiesced regular file itself: {}",
+            path.display()
+        );
     }
-    std::fs::File::open(&path)
-        .with_context(|| format!("read local image disk {}", path.display()))?;
+    if !metadata.is_file() {
+        eyre::bail!(
+            "local image disk path is not a regular file: {}",
+            path.display()
+        );
+    }
     Ok(path)
+}
+
+fn parse_platform_arg(value: &str) -> Result<libvm::LinuxPlatform, String> {
+    silo_vm_control::boot::parse_platform(value).map_err(|error| error.to_string())
+}
+
+fn parse_root_arg(value: &str) -> Result<libvm::ImportRootSelection, String> {
+    silo_vm_control::boot::parse_import_root(value).map_err(|error| error.to_string())
 }
 
 pub(crate) struct PlanInputs {
@@ -468,6 +635,7 @@ pub(crate) fn machine_settings(options: &MachineCliOptions) -> MachineCreationSe
         kernel_args: options.kernel_args.clone(),
         nested_virtualization: options.nested_virtualization,
         rosetta: options.rosetta,
+        platform: options.source.platform.clone(),
         disks: options.disks.clone(),
         agent,
         provision_user: options.provision_user.clone(),
@@ -518,11 +686,14 @@ pub(crate) fn preflight_create(
             .as_deref()
             .or(template.tmpfs_size.as_deref()),
     )?;
+    let reference = selected_image_reference(positional_image, template)?;
     if root_profile == Some(RootProfileArg::LinuxFlatOverlayV1)
-        && selected_image_reference(positional_image, template)?.starts_with("disk:")
+        && (reference.starts_with("image:") || reference.starts_with("disk:"))
     {
-        eyre::bail!("linux-flat-overlay-v1 requires an OCI image, not disk: input");
+        eyre::bail!("linux-flat-overlay-v1 requires an OCI image source");
     }
+    let spelling = parse_source(&reference)?;
+    validate_source_options(&spelling, &options.source, false)?;
     for (label, path) in [
         ("custom guest agent", options.agent.as_ref()),
         ("kernel", options.kernel.as_ref()),
@@ -535,12 +706,8 @@ pub(crate) fn preflight_create(
     for disk in &options.disks {
         validate_readable_file(disk, "extra disk")?;
     }
-    if let Some(path) = selected_image_reference(positional_image, template)?.strip_prefix("disk:")
-    {
-        validate_readable_file(
-            &disk_path(&format!("disk:{path}"), path)?,
-            "local image disk",
-        )?;
+    if let SourceSpelling::Disk(path) = &spelling {
+        validate_readable_file(path, "local image disk")?;
     }
 
     let mounts = template
@@ -766,10 +933,123 @@ mod tests {
     use crate::app::Cli;
     use crate::commands::Command;
 
+    use crate::api::types::SourceOptions;
     use crate::commands::create::{
-        canonical_disk_source, empty_template, preflight_create, validate_process_overrides, Pull,
-        VmOverrideArgs,
+        disk_create_request, disk_source_path, empty_template, parse_source, preflight_create,
+        validate_process_overrides, validate_source_options, Pull, SourceSpelling, VmOverrideArgs,
     };
+
+    #[test]
+    fn rosetta_intent_is_tri_state_and_platform_root_are_typed() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["silo", "create", "disk:rootfs.img"];
+            argv.extend_from_slice(args);
+            let Command::Create(create) = Cli::try_parse_from(argv).expect("parse").command else {
+                panic!("expected create")
+            };
+            create.overrides
+        };
+        assert_eq!(parse(&[]).rosetta, None);
+        assert_eq!(parse(&["--rosetta"]).rosetta, Some(true));
+        assert_eq!(parse(&["--rosetta=false"]).rosetta, Some(false));
+        assert_eq!(parse(&["--rosetta=true"]).rosetta, Some(true));
+        let overrides = parse(&["--platform", "linux/arm64/v8", "--root", "mbr:4"]);
+        assert_eq!(
+            overrides.platform,
+            Some(libvm::LinuxPlatform {
+                architecture: libvm::GuestArchitecture::Arm64,
+                variant: Some("v8".into()),
+            })
+        );
+        assert_eq!(
+            overrides.root,
+            Some(libvm::ImportRootSelection::MbrPartition { number: 4 })
+        );
+        for invalid in [
+            ["--platform", "linux/riscv64"],
+            ["--platform", "linux/amd64/v3"],
+            ["--platform", "windows/amd64"],
+            ["--root", "mbr:0"],
+            ["--root", "mbr:5"],
+            ["--root", "mbr:256"],
+            ["--root", "gpt:00000000-0000-0000-0000-000000000000"],
+            ["--root", "largest"],
+        ] {
+            let mut argv = vec!["silo", "create", "disk:rootfs.img"];
+            argv.extend_from_slice(&invalid);
+            assert!(Cli::try_parse_from(argv).is_err(), "{invalid:?}");
+        }
+        assert!(Cli::try_parse_from(["silo", "create", "x", "--rosetta=maybe"]).is_err());
+    }
+
+    #[test]
+    fn managed_image_spelling_is_parsed_before_oci_and_options_follow_the_family() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(
+            parse_source("image:base").unwrap(),
+            SourceSpelling::Managed(silo_vm_control::images::ManagedSpelling::Reference(
+                libvm::ManagedSourceRef::Alias("base".into())
+            ))
+        );
+        assert_eq!(
+            parse_source(&format!("image:{digest}")).unwrap(),
+            SourceSpelling::Managed(silo_vm_control::images::ManagedSpelling::Digest(
+                digest.parse().unwrap()
+            ))
+        );
+        assert!(parse_source("image:sha256:ABC").is_err());
+        assert!(parse_source("image:").is_err());
+        assert!(parse_source("image:has space").is_err());
+        assert_eq!(
+            parse_source("ubuntu:24.04").unwrap(),
+            SourceSpelling::Oci("ubuntu:24.04".into())
+        );
+        let root = SourceOptions {
+            platform: None,
+            root: Some(libvm::ImportRootSelection::AutoGpt),
+        };
+        let platform = SourceOptions {
+            platform: Some(silo_vm_control::boot::parse_platform("arm64").unwrap()),
+            root: None,
+        };
+        let oci = SourceSpelling::Oci("ubuntu".into());
+        let managed = parse_source("image:base").unwrap();
+        let disk = SourceSpelling::Disk("/disk.raw".into());
+        assert!(validate_source_options(&oci, &root, false).is_err());
+        assert!(validate_source_options(&oci, &platform, true).is_ok());
+        assert!(validate_source_options(&managed, &platform, false).is_err());
+        assert!(validate_source_options(&managed, &root, false).is_err());
+        assert!(validate_source_options(&managed, &SourceOptions::default(), true).is_err());
+        assert!(validate_source_options(&disk, &root, false).is_ok());
+        assert!(validate_source_options(&disk, &platform, true).is_err());
+    }
+
+    #[test]
+    fn disk_convenience_is_complete_host_native_whole_disk_packaged_without_alias() {
+        let request = disk_create_request("/disk.raw".into(), &SourceOptions::default()).unwrap();
+        assert_eq!(
+            request,
+            libvm::DiskImportRequest {
+                path: "/disk.raw".into(),
+                boot: libvm::DiskImportBoot::LinuxDirect {
+                    platform: silo_vm_control::boot::host_platform().unwrap(),
+                    root: libvm::ImportRootSelection::WholeDisk,
+                    assets: libvm::BootAssetSelection::Packaged,
+                },
+                alias: None,
+            }
+        );
+        let explicit = SourceOptions {
+            platform: Some(silo_vm_control::boot::parse_platform("linux/amd64").unwrap()),
+            root: Some(libvm::ImportRootSelection::AutoGpt),
+        };
+        let libvm::DiskImportBoot::LinuxDirect { platform, root, .. } =
+            disk_create_request("/disk.raw".into(), &explicit)
+                .unwrap()
+                .boot;
+        assert_eq!(Some(platform), explicit.platform);
+        assert_eq!(root, libvm::ImportRootSelection::AutoGpt);
+    }
 
     #[test]
     fn overlay_create_and_run_flags_are_explicit() {
@@ -963,21 +1243,28 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
         let disk = temp.path().join("disk.img");
-        std::fs::write(&disk, b"disk").expect("write disk");
+        std::fs::write(&disk, [0u8; 512]).expect("write disk");
         let disk_source = AppApi::resolve_read_only_creation(
             RuntimeConfig::local(&data_root),
             None,
             Some(&format!("disk:{}", disk.display())),
             &empty_template(),
             None,
+            &SourceOptions::default(),
         )
         .await
         .expect("resolve disk source")
         .source;
-        let crate::planning::ResolvedImage::Disk { path } = &disk_source.plan_image else {
+        let crate::planning::ResolvedImage::Disk { path, boot } = &disk_source.plan_image else {
             panic!("expected disk source")
         };
         assert_eq!(path, &std::fs::canonicalize(&disk).expect("canonical disk"));
+        assert_eq!(
+            boot,
+            &disk_create_request(path.clone(), &SourceOptions::default())
+                .unwrap()
+                .boot
+        );
 
         let oci_result = AppApi::resolve_read_only_creation(
             RuntimeConfig::local(&data_root),
@@ -985,6 +1272,7 @@ mod tests {
             Some("example.test/missing:latest"),
             &empty_template(),
             Some(Pull::Never.policies()),
+            &SourceOptions::default(),
         )
         .await;
         let Err(oci_error) = oci_result else {
@@ -1008,6 +1296,7 @@ mod tests {
                 Some(&format!("disk:{}", disk.display())),
                 &empty_template(),
                 Some(pull.policies()),
+                &SourceOptions::default(),
             )
             .await
             .expect_err("explicit disk pull policy must fail");
@@ -1018,23 +1307,24 @@ mod tests {
     }
 
     #[test]
-    fn disk_source_is_canonicalized_before_planning() {
+    fn disk_source_keeps_the_final_component_and_refuses_symlinks_and_special_files() {
         let temp = tempfile::tempdir().expect("create temp root");
         let disk = temp.path().join("disk.img");
         let alias = temp.path().join("alias.img");
         std::fs::write(&disk, b"disk").expect("write disk");
         std::os::unix::fs::symlink(&disk, &alias).expect("create disk alias");
-
-        let canonical = canonical_disk_source(
-            &format!("disk:{}", alias.display()),
-            alias.to_str().expect("alias path is UTF-8"),
-        )
-        .expect("canonicalize disk source");
-
+        let spelled = temp.path().join("sub").join("..").join("disk.img");
+        std::fs::create_dir(temp.path().join("sub")).expect("subdirectory");
         assert_eq!(
-            canonical,
+            disk_source_path("disk:", spelled.to_str().unwrap()).expect("regular disk"),
             std::fs::canonicalize(&disk).expect("canonical disk")
         );
+        let error = disk_source_path("disk:", alias.to_str().unwrap()).expect_err("symlink");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        let error =
+            disk_source_path("disk:", temp.path().to_str().unwrap()).expect_err("directory");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(disk_source_path("disk:", " ").is_err());
     }
 
     #[test]

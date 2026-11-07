@@ -7,7 +7,6 @@ const VERSION: u64 = 1;
 const MAX_HOST_ROOT_LEN: usize = 4_096;
 const DIGEST_LEN: usize = 32;
 const RESPONSE_LEN: usize = 1_024;
-pub(crate) const ROSETTA_MOUNT_TAG: &str = "rosetta";
 
 /// Wire shape of [`RosettaLaunchConfig`] inside the worker's `KrunConfig`.
 #[derive(Deserialize, Serialize)]

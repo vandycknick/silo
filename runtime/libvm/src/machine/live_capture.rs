@@ -311,6 +311,7 @@ impl Machine {
                 &config.spec,
                 &config.guest.agent,
                 runtime.captured_boot_context(&pool, &store, request_id),
+                crate::runtime::boot_assets::CaptureLane::Live,
             )
             .await?;
             snapshots.bind_capture_boot(request_id, boot).await?;
