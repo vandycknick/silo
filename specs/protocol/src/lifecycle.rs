@@ -1294,6 +1294,7 @@ mod tests {
             ram_bytes: configuration.ram_bytes(),
             configuration,
             policy: domain::CapturePolicy::Full,
+            dirty_crossover_percent: 60,
             resume_policy: domain::CaptureResumePolicy::ResumeIfAcquired,
             pause: CapturePauseAuthority::Acquire,
             disks: Vec::new(),

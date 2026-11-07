@@ -3,6 +3,37 @@ use clap::{Args, Subcommand};
 
 const EXACT_BYTES_WARNING: &str = "Copies exact storage bytes, including credentials, guest keys, dirty journals and deleted-data remnants. No sanitization, journal replay, implicit stop or implicit start is performed. External resources require explicit policy; snapshots support opaque raw roots only.";
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CapturePolicyArgument {
+    Full,
+    Incremental,
+}
+
+#[derive(Debug, Args)]
+struct CapturePolicyArgs {
+    /// RAM capture policy (default full). Incremental requires an admitted backend.
+    #[arg(long, requires = "live", value_enum)]
+    capture_policy: Option<CapturePolicyArgument>,
+    /// Fall back to full RAM capture at this dirty percentage (1..=60, default 60).
+    #[arg(long, requires = "live", value_parser = clap::value_parser!(u8).range(1..=60))]
+    dirty_crossover_percent: Option<u8>,
+}
+
+impl CapturePolicyArgs {
+    fn policy(&self) -> vm_spec::lifecycle::CapturePolicy {
+        match self.capture_policy {
+            Some(CapturePolicyArgument::Incremental) => {
+                vm_spec::lifecycle::CapturePolicy::Incremental
+            }
+            Some(CapturePolicyArgument::Full) | None => vm_spec::lifecycle::CapturePolicy::Full,
+        }
+    }
+
+    fn crossover(&self) -> u8 {
+        self.dirty_crossover_percent.unwrap_or(60)
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(about = "Pause a running VM (requires live capability admission)")]
 pub struct Pause {
@@ -60,6 +91,8 @@ enum SnapshotCommand {
         /// the source is already paused; without it a running source is resumed.
         #[arg(long, requires = "live")]
         preserve: bool,
+        #[command(flatten)]
+        capture: CapturePolicyArgs,
         /// Omit external resources and record required mappings for a later restore.
         #[arg(long)]
         external_requirements: bool,
@@ -90,6 +123,7 @@ impl Snapshot {
                 name,
                 live: true,
                 preserve,
+                capture,
                 ..
             } => {
                 let resume_policy = if preserve {
@@ -103,6 +137,8 @@ impl Snapshot {
                         libvm::LiveSnapshotOptions {
                             name,
                             resume_policy,
+                            policy: capture.policy(),
+                            dirty_crossover_percent: capture.crossover(),
                         },
                     )
                     .await?;
@@ -180,6 +216,8 @@ pub struct Fork {
     /// already paused; without it a running source is resumed.
     #[arg(long, requires = "live")]
     preserve: bool,
+    #[command(flatten)]
+    capture: CapturePolicyArgs,
     /// Reserve this percentage of RAM per child for private writes (0..=100, default 25),
     /// rounded up to native pages.
     #[arg(long, value_name = "PERCENT", requires = "live", value_parser = private_write_allowance)]
@@ -200,6 +238,7 @@ pub struct Fork {
             "machine", "name", "live", "children_json", "max_children", "preserve",
             "private_write_percent", "memory_overcommit", "operation_id",
             "external_requirements", "map_disk", "map_share",
+            "capture_policy", "dirty_crossover_percent",
         ]
     )]
     operation: Option<uuid::Uuid>,
@@ -209,6 +248,7 @@ pub struct Fork {
         "machine", "name", "live", "children_json", "max_children", "preserve",
         "private_write_percent", "memory_overcommit", "operation_id",
         "external_requirements", "map_disk", "map_share",
+        "capture_policy", "dirty_crossover_percent",
     ])]
     cancel: bool,
     #[command(flatten)]
@@ -281,6 +321,8 @@ impl Fork {
         let options = libvm::LiveForkOptions {
             operation_id: self.operation_id.unwrap_or_else(uuid::Uuid::new_v4),
             children,
+            policy: self.capture.policy(),
+            dirty_crossover_percent: self.capture.crossover(),
             max_children: self
                 .max_children
                 .unwrap_or(libvm::DEFAULT_LIVE_FORK_MAX_CHILDREN),
@@ -453,6 +495,34 @@ impl Restore {
             resources,
         };
         let machine = api.restore_snapshot(&self.checkpoint, options).await?;
+        crate::ui::warn(EXACT_BYTES_WARNING);
+        println!("{}", machine.id);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Recover only a live checkpoint's disks into a new stopped machine", long_about = "Explicitly recover a live checkpoint's captured disks and boot configuration into a new stopped private child. RAM and execution state are discarded, no activation is performed, and the disks may contain dirty journals. This never runs implicitly after a failed execution restore.", after_help = EXACT_BYTES_WARNING)]
+pub struct RecoverDisks {
+    #[arg(value_name = "IMAGE")]
+    checkpoint: String,
+    #[arg(long, value_name = "CHILD")]
+    name: Option<String>,
+    #[command(flatten)]
+    external: ExternalResources,
+}
+
+impl RecoverDisks {
+    pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        let options = libvm::RecoverDisksOptions {
+            name: self.name,
+            external_resources: self.external.policy()?,
+        };
+        let machine = context
+            .app_api()
+            .await?
+            .recover_checkpoint_disks(&self.checkpoint, options)
+            .await?;
         crate::ui::warn(EXACT_BYTES_WARNING);
         println!("{}", machine.id);
         Ok(())
@@ -782,6 +852,71 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(["silo", "fork"].iter().chain(args).copied())
+    }
+
+    #[test]
+    fn incremental_options_require_live_mode_and_bounded_crossover() {
+        for command in ["snapshot", "fork"] {
+            let prefix = if command == "snapshot" {
+                vec!["silo", "snapshot", "create", "vm"]
+            } else {
+                vec!["silo", "fork", "vm", "--name", "child"]
+            };
+            for flags in [
+                vec!["--capture-policy", "incremental"],
+                vec!["--dirty-crossover-percent", "60"],
+            ] {
+                assert!(Cli::try_parse_from(prefix.iter().chain(flags.iter()).copied()).is_err());
+            }
+            for percent in ["0", "61", "256", "-1", "1.5"] {
+                let flags = [
+                    "--live",
+                    "--capture-policy",
+                    "incremental",
+                    "--dirty-crossover-percent",
+                    percent,
+                ];
+                assert!(Cli::try_parse_from(prefix.iter().chain(flags.iter()).copied()).is_err());
+            }
+        }
+        let (_, options) = live(&[
+            "vm",
+            "--name",
+            "child",
+            "--live",
+            "--capture-policy",
+            "incremental",
+            "--dirty-crossover-percent",
+            "1",
+        ]);
+        assert_eq!(
+            options.policy,
+            vm_spec::lifecycle::CapturePolicy::Incremental
+        );
+        assert_eq!(options.dirty_crossover_percent, 1);
+        options.validate().unwrap();
+    }
+
+    #[test]
+    fn disk_recovery_never_accepts_execution_activation_options() {
+        for option in ["--activation-hook", "--memory-overcommit", "--live"] {
+            assert!(
+                Cli::try_parse_from(["silo", "recover-disks", "image:checkpoint", option]).is_err()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "silo",
+            "recover-disks",
+            "image:checkpoint",
+            "--name",
+            "recovered",
+        ])
+        .unwrap();
+        let Command::RecoverDisks(command) = cli.command else {
+            panic!("disk recovery command");
+        };
+        assert_eq!(command.checkpoint, "image:checkpoint");
+        assert_eq!(command.name.as_deref(), Some("recovered"));
     }
 
     fn fork_mode(args: &[&str]) -> eyre::Result<ForkMode> {

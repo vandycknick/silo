@@ -137,12 +137,17 @@ impl LocalVmService {
         reference: &str,
         mut options: libvm::LiveSnapshotOptions,
     ) -> eyre::Result<libvm::LiveSnapshot> {
+        options.validate()?;
         options.name = options
             .name
             .map(|name| silo_vm_control::stopped::alias(&name))
             .transpose()?;
         self.require_machine_live(reference, vm_spec::live::LiveOperation::Capture)
             .await?;
+        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
+            self.require_machine_live(reference, vm_spec::live::LiveOperation::Incremental)
+                .await?;
+        }
         let reference = MachineRef::parse(reference)?;
         let observation = self.observe_machine_live(&reference).await?;
         let machine = self.runtime().await?.get_machine(&reference).await?;
@@ -162,6 +167,10 @@ impl LocalVmService {
         options.validate()?;
         self.require_machine_live(reference, vm_spec::live::LiveOperation::Fork)
             .await?;
+        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
+            self.require_machine_live(reference, vm_spec::live::LiveOperation::Incremental)
+                .await?;
+        }
         let observation = self.observe_machine_live(&machine_ref).await?;
         let machine = self.runtime().await?.get_machine(&machine_ref).await?;
         Ok(machine.fork_live(&observation, options).await?)
@@ -310,6 +319,33 @@ impl LocalVmService {
             .runtime()
             .await?
             .restore_snapshot(reference, options)
+            .await?
+            .inspect()
+            .await?)
+    }
+
+    pub(crate) async fn recover_checkpoint_disks(
+        &mut self,
+        reference: libvm::SnapshotRef,
+        mut options: libvm::RecoverDisksOptions,
+    ) -> eyre::Result<MachineData> {
+        options.name = silo_vm_control::stopped::name(options.name)?;
+        if let Self::Uninitialized {
+            config: Some(config),
+            ..
+        } = self
+        {
+            libvm::preflight_recover_checkpoint_disks(
+                config,
+                &reference,
+                &options.external_resources,
+            )
+            .await?;
+        }
+        Ok(self
+            .runtime()
+            .await?
+            .recover_checkpoint_disks(reference, options)
             .await?
             .inspect()
             .await?)

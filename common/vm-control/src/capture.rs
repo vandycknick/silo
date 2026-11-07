@@ -3,10 +3,167 @@
 use std::path::{Component, Path, PathBuf};
 
 use silod_spec::daemon::v1 as w;
-use vm_spec::capture::CapturePauseDisposition;
-use vm_spec::lifecycle::{CaptureResumePolicy, Diagnostic, LiveId};
+use vm_spec::capture::{
+    CaptureFullReason, CaptureMemoryEvidence, CaptureMemoryStats, CapturePauseDisposition,
+    CaptureStateBinding, Sha256Digest,
+};
+use vm_spec::lifecycle::{CapturePolicy, CaptureResumePolicy, Diagnostic, LiveId};
 
 use crate::{invalid, required, ConversionError};
+
+pub fn policy_to_wire(value: CapturePolicy) -> i32 {
+    (match value {
+        CapturePolicy::Full => w::CapturePolicy::Full,
+        CapturePolicy::Incremental => w::CapturePolicy::Incremental,
+    }) as i32
+}
+
+pub fn policy_from_wire(value: i32) -> Result<CapturePolicy, ConversionError> {
+    match w::CapturePolicy::try_from(value) {
+        Ok(w::CapturePolicy::Full) => Ok(CapturePolicy::Full),
+        Ok(w::CapturePolicy::Incremental) => Ok(CapturePolicy::Incremental),
+        _ => Err(invalid("capture.policy", "unknown or unspecified enum")),
+    }
+}
+
+pub fn crossover_from_wire(value: u32) -> Result<u8, ConversionError> {
+    if !(1..=60).contains(&value) {
+        return Err(invalid(
+            "capture.dirty_crossover_percent",
+            "expected 1..=60",
+        ));
+    }
+    u8::try_from(value).map_err(|_| invalid("capture.dirty_crossover_percent", "expected 1..=60"))
+}
+
+fn full_reason_to_wire(value: CaptureFullReason) -> i32 {
+    (match value {
+        CaptureFullReason::Requested => w::CaptureFullReason::Requested,
+        CaptureFullReason::NoBaseline => w::CaptureFullReason::NoBaseline,
+        CaptureFullReason::BaselineToken => w::CaptureFullReason::BaselineToken,
+        CaptureFullReason::CoverageLost => w::CaptureFullReason::CoverageLost,
+        CaptureFullReason::DirtyCrossover => w::CaptureFullReason::DirtyCrossover,
+    }) as i32
+}
+
+fn full_reason_from_wire(value: i32) -> Result<CaptureFullReason, ConversionError> {
+    match w::CaptureFullReason::try_from(value) {
+        Ok(w::CaptureFullReason::Requested) => Ok(CaptureFullReason::Requested),
+        Ok(w::CaptureFullReason::NoBaseline) => Ok(CaptureFullReason::NoBaseline),
+        Ok(w::CaptureFullReason::BaselineToken) => Ok(CaptureFullReason::BaselineToken),
+        Ok(w::CaptureFullReason::CoverageLost) => Ok(CaptureFullReason::CoverageLost),
+        Ok(w::CaptureFullReason::DirtyCrossover) => Ok(CaptureFullReason::DirtyCrossover),
+        _ => Err(invalid(
+            "capture.memory.full_reason",
+            "unknown or unspecified enum",
+        )),
+    }
+}
+
+fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
+    let binding = &value.binding;
+    let stats = &value.stats;
+    w::CaptureMemoryEvidence {
+        packed_length: value.packed_length,
+        page_granule: value.page_granule,
+        regions: value.regions,
+        ram_stream: value.ram_stream.to_string(),
+        binding: Some(w::CaptureStateBinding {
+            native_producer: binding.native_producer.clone(),
+            silo_producer: binding.silo_producer.to_string(),
+            profile: binding.profile.to_string(),
+            topology: binding.topology.to_string(),
+            ram_layout: binding.ram_layout.to_string(),
+            source_run: binding.source_run.to_string(),
+            pause_generation: binding.pause_generation.get(),
+            capture: binding.capture.to_string(),
+        }),
+        mode: policy_to_wire(value.mode),
+        baseline: value.baseline.as_ref().map(ToString::to_string),
+        full_reason: value.full_reason.map(full_reason_to_wire),
+        dirty_chunks: value.dirty_chunks.clone(),
+        stats: Some(w::CaptureMemoryStats {
+            logical_bytes: stats.logical_bytes,
+            live_bytes_read: stats.live_bytes_read,
+            baseline_bytes_read: stats.baseline_bytes_read,
+            baseline_bytes_written: stats.baseline_bytes_written,
+            overlay_bytes_written: stats.overlay_bytes_written,
+            full_bytes_written: stats.full_bytes_written,
+            layout_bytes_written: stats.layout_bytes_written,
+            baseline_hole_bytes: stats.baseline_hole_bytes,
+            zero_bytes_omitted: stats.zero_bytes_omitted,
+            explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+            extent_queries: stats.extent_queries,
+            identity_bytes_hashed: stats.identity_bytes_hashed,
+            whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
+        }),
+    }
+}
+
+fn digest(value: String, field: &'static str) -> Result<Sha256Digest, ConversionError> {
+    value
+        .parse()
+        .map_err(|_| invalid(field, "invalid SHA-256 digest"))
+}
+
+fn memory_from_wire(
+    value: w::CaptureMemoryEvidence,
+) -> Result<CaptureMemoryEvidence, ConversionError> {
+    let binding = required(value.binding, "capture.memory.binding")?;
+    let stats = required(value.stats, "capture.memory.stats")?;
+    let memory = CaptureMemoryEvidence {
+        packed_length: value.packed_length,
+        page_granule: value.page_granule,
+        regions: value.regions,
+        ram_stream: digest(value.ram_stream, "capture.memory.ram_stream")?,
+        binding: CaptureStateBinding {
+            native_producer: binding.native_producer,
+            silo_producer: digest(
+                binding.silo_producer,
+                "capture.memory.binding.silo_producer",
+            )?,
+            profile: digest(binding.profile, "capture.memory.binding.profile")?,
+            topology: digest(binding.topology, "capture.memory.binding.topology")?,
+            ram_layout: digest(binding.ram_layout, "capture.memory.binding.ram_layout")?,
+            source_run: id(binding.source_run, "capture.memory.binding.source_run")?,
+            pause_generation: std::num::NonZeroU64::new(binding.pause_generation).ok_or_else(
+                || {
+                    invalid(
+                        "capture.memory.binding.pause_generation",
+                        "expected nonzero generation",
+                    )
+                },
+            )?,
+            capture: id(binding.capture, "capture.memory.binding.capture")?,
+        },
+        mode: policy_from_wire(value.mode)?,
+        baseline: value
+            .baseline
+            .map(|value| digest(value, "capture.memory.baseline"))
+            .transpose()?,
+        full_reason: value.full_reason.map(full_reason_from_wire).transpose()?,
+        dirty_chunks: value.dirty_chunks,
+        stats: CaptureMemoryStats {
+            logical_bytes: stats.logical_bytes,
+            live_bytes_read: stats.live_bytes_read,
+            baseline_bytes_read: stats.baseline_bytes_read,
+            baseline_bytes_written: stats.baseline_bytes_written,
+            overlay_bytes_written: stats.overlay_bytes_written,
+            full_bytes_written: stats.full_bytes_written,
+            layout_bytes_written: stats.layout_bytes_written,
+            baseline_hole_bytes: stats.baseline_hole_bytes,
+            zero_bytes_omitted: stats.zero_bytes_omitted,
+            explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+            extent_queries: stats.extent_queries,
+            identity_bytes_hashed: stats.identity_bytes_hashed,
+            whole_file_bytes_hashed: stats.whole_file_bytes_hashed,
+        },
+    };
+    memory
+        .validate_capture()
+        .map_err(|_| invalid("capture.memory", "invalid memory receipt"))?;
+    Ok(memory)
+}
 
 pub fn resume_policy_to_wire(value: CaptureResumePolicy) -> i32 {
     (match value {
@@ -107,6 +264,7 @@ fn summary_to_wire(
         source_error: value.source_error.as_ref().map(ToString::to_string),
         released: value.released,
         staging: staging_to_wire(&value.staging)?,
+        memory: Some(memory_to_wire(&value.memory)),
     })
 }
 
@@ -141,7 +299,7 @@ fn summary_from_wire(
             "continuation contradicts pause ownership",
         ));
     }
-    Ok(libvm::LiveCaptureSummary {
+    let summary = libvm::LiveCaptureSummary {
         capture_id: id(value.capture_id, "capture.capture_id")?,
         machine_id: id(value.machine_id, "capture.machine_id")?,
         run_id: id(value.run_id, "capture.run_id")?,
@@ -151,7 +309,17 @@ fn summary_from_wire(
         source_error,
         released: value.released,
         staging: staging_from_wire(value.staging)?,
-    })
+        memory: memory_from_wire(required(value.memory, "capture.memory")?)?,
+    };
+    if summary.memory.binding.source_run != summary.run_id
+        || summary.memory.binding.capture != summary.capture_id
+    {
+        return Err(invalid(
+            "capture.memory.binding",
+            "receipt belongs to another capture or run",
+        ));
+    }
+    Ok(summary)
 }
 
 pub fn live_snapshot_to_wire(
@@ -286,6 +454,40 @@ mod tests {
         }
     }
 
+    fn memory() -> vm_spec::capture::CaptureMemoryEvidence {
+        let digest: vm_spec::capture::Sha256Digest =
+            format!("sha256:{}", "d".repeat(64)).parse().unwrap();
+        let length = vm_spec::capture::STREAM_CHUNK_BYTES;
+        vm_spec::capture::CaptureMemoryEvidence {
+            packed_length: length,
+            page_granule: 4096,
+            regions: 1,
+            ram_stream: digest,
+            binding: vm_spec::capture::CaptureStateBinding {
+                native_producer: "native-test-producer".into(),
+                silo_producer: digest,
+                profile: digest,
+                topology: digest,
+                ram_layout: digest,
+                source_run: LiveId::parse(RUN).unwrap(),
+                pause_generation: std::num::NonZeroU64::new(1).unwrap(),
+                capture: LiveId::parse(CAPTURE).unwrap(),
+            },
+            mode: vm_spec::lifecycle::CapturePolicy::Full,
+            baseline: None,
+            full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
+            dirty_chunks: vec![1],
+            stats: vm_spec::capture::CaptureMemoryStats {
+                logical_bytes: length,
+                live_bytes_read: length,
+                full_bytes_written: length,
+                identity_bytes_hashed: length,
+                whole_file_bytes_hashed: length,
+                ..Default::default()
+            },
+        }
+    }
+
     fn live() -> libvm::LiveSnapshot {
         libvm::LiveSnapshot {
             snapshot: snapshot(),
@@ -299,8 +501,62 @@ mod tests {
                 source_error: None,
                 released: true,
                 staging: format!("machines/{MACHINE}/captures/{CAPTURE}").into(),
+                memory: memory(),
             },
         }
+    }
+
+    #[test]
+    fn capture_policy_and_crossover_reject_unspecified_or_out_of_range_requests() {
+        for policy in [0, -1, 3, i32::MAX] {
+            assert!(crate::capture::policy_from_wire(policy).is_err());
+        }
+        for crossover in [0, 61, 256, u32::MAX] {
+            assert!(crate::capture::crossover_from_wire(crossover).is_err());
+        }
+        for crossover in [1, 60] {
+            assert_eq!(
+                u32::from(crate::capture::crossover_from_wire(crossover).unwrap()),
+                crossover
+            );
+        }
+    }
+
+    #[test]
+    fn capture_receipt_rejects_foreign_binding_and_incoherent_memory_evidence() {
+        let wire = live_snapshot_to_wire(&live()).unwrap();
+        for case in 0..12 {
+            let mut changed = wire.clone();
+            let capture = changed.capture.as_mut().unwrap();
+            let memory = capture.memory.as_mut().unwrap();
+            match case {
+                0 => memory.mode = w::CapturePolicy::Unspecified as i32,
+                1 => memory.full_reason = Some(w::CaptureFullReason::Unspecified as i32),
+                2 => memory.full_reason = None,
+                3 => memory.baseline = Some(memory.ram_stream.clone()),
+                4 => memory.dirty_chunks = vec![0],
+                5 => memory.dirty_chunks = vec![3],
+                6 => memory.stats.as_mut().unwrap().logical_bytes -= 1,
+                7 => memory.stats.as_mut().unwrap().identity_bytes_hashed += 1,
+                8 => memory.binding.as_mut().unwrap().source_run = MACHINE.into(),
+                9 => memory.binding.as_mut().unwrap().capture = MACHINE.into(),
+                10 => memory.binding.as_mut().unwrap().pause_generation = 0,
+                11 => capture.memory = None,
+                _ => unreachable!(),
+            }
+            assert!(live_snapshot_from_wire(changed).is_err(), "case {case}");
+        }
+        let mut incremental = wire;
+        let memory = incremental
+            .capture
+            .as_mut()
+            .unwrap()
+            .memory
+            .as_mut()
+            .unwrap();
+        memory.mode = w::CapturePolicy::Incremental as i32;
+        memory.full_reason = None;
+        assert!(live_snapshot_from_wire(incremental).is_err());
     }
 
     #[test]

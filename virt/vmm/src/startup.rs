@@ -664,6 +664,11 @@ pub async fn init(
             .map_err(|error| tracing::warn!(%error, "live capture cannot bind plans for this run"))
             .ok()
     });
+    if let (Some(context), Some(restore)) = (&capture_context, machine_config.config.restore()) {
+        context
+            .inherit(restore)
+            .map_err(|error| eyre::eyre!("inherit authenticated capture map: {error}"))?;
+    }
     let store = Arc::new(InstanceStore::new(
         machine_uuid.hyphenated().to_string(),
         name.to_string(),

@@ -146,6 +146,9 @@ pub(crate) fn main() -> eyre::Result<()> {
         Some(command) if command == std::ffi::OsStr::new("inspect-execution") => {
             return crate::entry::mutate::inspect(arguments.collect());
         }
+        Some(command) if command == std::ffi::OsStr::new("inspect-devices") => {
+            return crate::entry::mutate::inspect_devices(arguments.collect());
+        }
         _ => {}
     }
     let restore = std::env::args().any(|arg| arg == "--restore");
@@ -545,6 +548,26 @@ fn restored_inputs(
         devices_object: object_identity(&files.devices, &manifest["devices"])?,
         binding,
     };
+    let map_identity = object_identity(&files.ram_map, &manifest["ram_map"])?;
+    ensure!(
+        map_identity.length <= vm_spec::capture::MAX_RAM_MAP_BYTES as u64,
+        "complete map bound"
+    );
+    let mut map_bytes = vec![0; map_identity.length as usize];
+    std::os::unix::fs::FileExt::read_exact_at(&files.ram_map, &mut map_bytes, 0)?;
+    ensure!(
+        map_bytes.len() as u64 == map_identity.length
+            && <[u8; 32]>::from(Sha256::digest(&map_bytes)) == map_identity.sha256,
+        "complete map file SHA"
+    );
+    let map =
+        vm_spec::capture::StreamMap::decode(&map_bytes).map_err(|error| eyre::eyre!(error))?;
+    ensure!(
+        map.length() == files.ram.metadata()?.len()
+            && map.id().as_bytes() == &expected.ram_image.stream
+            && map.canonical_bytes().map_err(|error| eyre::eyre!(error))? == map_bytes,
+        "exact canonical restored map authority"
+    );
     let attachment = |id: &str| -> eyre::Result<RestoreAttachment> {
         let values = manifest["attachments"]
             .as_array()
@@ -768,6 +791,30 @@ impl Commands {
             },
         )?;
         ensure!(memory.ram.writers_closed(), "native RAM writers still open");
+        // The raw native harness uses the same mandatory complete-map restore
+        // role as managed launches. This reads immutable output, never live RAM.
+        let mut input = File::open(output_directory.join("memory.ram"))?;
+        let length = input.metadata()?.len();
+        let mut chunks = Vec::new();
+        let mut scratch = vec![0; vm_spec::capture::STREAM_CHUNK_BYTES as usize];
+        let mut offset = 0;
+        while offset < length {
+            let span = (length - offset).min(scratch.len() as u64) as usize;
+            input.read_exact(&mut scratch[..span])?;
+            chunks.push(if scratch[..span].iter().all(|byte| *byte == 0) {
+                None
+            } else {
+                Some(vm_spec::capture::Sha256Digest::of_bytes(&scratch[..span]))
+            });
+            offset += span as u64;
+        }
+        let map =
+            vm_spec::capture::StreamMap::new(length, chunks).map_err(|error| eyre::eyre!(error))?;
+        let mut map_output = new_output(&directory.join(vm_spec::capture::CAPTURE_RAM_MAP_FILE))?;
+        map.write_canonical(&mut map_output)?;
+        map_output.sync_all()?;
+        let map_length = map_output.metadata()?.len();
+        drop(map_output);
         let attachments: Vec<Value> = flush.attachments.iter().map(|item|json!({"configured_id":item.configured_id,"address":item.address,"irq":item.irq})).collect();
         let object = |path: &Path, length: u64| -> eyre::Result<Value> {
             let bytes = bounded(path, 32 * 1024 * 1024)?;
@@ -781,6 +828,7 @@ impl Commands {
             "execution_evidence":execution_evidence(&directory.join("execution.state"))?,
             "execution":object(&directory.join("execution.state"), execution.execution.length)?,
             "devices":object(&directory.join("devices.state"), execution.devices.length)?,
+            "ram_map":object(&directory.join(vm_spec::capture::CAPTURE_RAM_MAP_FILE), map_length)?,
             "writers_closed":memory.ram.writers_closed(),"mode":format!("{:?}",memory.ram.mode()),
             "full_reason":format!("{:?}",memory.full_reason),"memory_generation":memory.memory_generation,
             "output_identities":memory.ram.output_identities(),"affected_chunks":memory.ram.affected_chunks().collect::<Vec<_>>(),

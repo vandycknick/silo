@@ -406,8 +406,8 @@ absence means `unknown`. The manager never issues a resume because the file
 is absent.
 
 **Restore inputs** extend the start request with an optional, capability-gated
-`restore` object: `checkpointId`; `memory` (RAM file and layout), `execution`
-and `devices` state, each as an inherited read-only descriptor named by an
+`restore` object: `checkpointId`; `memory` (RAM file and layout), its authenticated
+complete `ram-map`, `execution` and `devices` state, each as an inherited read-only descriptor named by an
 environment variable in the same way as the descriptors above; the private
 disk roles as paths under `--data-dir`; `compatibilityProfile`; `activation`
 (the new identity, network configuration, guest-side listeners for the

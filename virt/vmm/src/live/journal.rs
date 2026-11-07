@@ -69,8 +69,8 @@ pub(crate) struct AdmissionView {
     pub(crate) pause: Result<(), LiveOperationUnsupported>,
     /// `Err` with the live vector's exact reason when Capture is unsupported.
     pub(crate) capture: Result<(), LiveOperationUnsupported>,
-    /// Incremental capture is not delivered in this phase.
-    pub(crate) incremental: LiveOperationUnsupported,
+    /// Exact incremental capability admission for this build/lane.
+    pub(crate) incremental: Result<(), LiveOperationUnsupported>,
     /// Present whenever the monitor can bind a capture plan.
     pub(crate) capture_binding: Option<CaptureBinding>,
     /// Fresh, ready, exact guest identity is present.
@@ -432,14 +432,16 @@ impl Journal {
         }
         let plan = &capture.plan;
         if plan.policy == CapturePolicy::Incremental {
-            return self.reject(
-                command,
-                LiveRejectionReason::Unsupported {
-                    unsupported: view.incremental.clone(),
-                },
-                view.state,
-                "incremental capture is not delivered",
-            );
+            if let Err(unsupported) = &view.incremental {
+                return self.reject(
+                    command,
+                    LiveRejectionReason::Unsupported {
+                        unsupported: unsupported.clone(),
+                    },
+                    view.state,
+                    "incremental capture is not qualified",
+                );
+            }
         }
         let Some(binding) = &view.capture_binding else {
             return self.reject(
@@ -951,7 +953,10 @@ mod tests {
             lifecycle: LiveLifecycle::default(),
             pause: Ok(()),
             capture: Ok(()),
-            incremental: unsupported(LiveOperation::Incremental, LiveReasonCode::NotDelivered),
+            incremental: Err(unsupported(
+                LiveOperation::Incremental,
+                LiveReasonCode::NotDelivered,
+            )),
             capture_binding: Some(binding()),
             guest_ready: true,
         }
@@ -968,6 +973,7 @@ mod tests {
             configuration_digest: binding.configuration_digest,
             configuration: binding.configuration,
             policy: CapturePolicy::Full,
+            dirty_crossover_percent: 60,
             resume_policy: match pause {
                 CapturePauseAuthority::Acquire => CaptureResumePolicy::ResumeIfAcquired,
                 CapturePauseAuthority::Borrow { .. } => CaptureResumePolicy::Preserve,

@@ -618,21 +618,27 @@ fn next_extent(source: &File, offset: u64, length: u64) -> io::Result<Option<(u6
 
 /// Whole-file SHA-256 plus, for RAM, the ADR 0014 stream identity, in one
 /// bounded sequential pass (8 MiB RAM scratch, 1 MiB for other roles).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HashedFile {
     pub(crate) length: u64,
     pub(crate) sha256: Sha256Digest,
     pub(crate) stream: Option<Sha256Digest>,
+    pub(crate) map: Option<vm_spec::capture::StreamMap>,
+    pub(crate) identity_bytes_hashed: u64,
 }
 
 pub(crate) struct Hasher {
     buffer: Vec<u8>,
+    baseline: Option<std::sync::Arc<vm_spec::capture::StreamMap>>,
+    dirty_chunks: Option<Vec<u8>>,
 }
 
 impl Hasher {
     pub(crate) fn new() -> Self {
         Self {
             buffer: vec![0u8; STREAM_CHUNK_BYTES as usize],
+            baseline: None,
+            dirty_chunks: None,
         }
     }
 
@@ -640,9 +646,19 @@ impl Hasher {
     pub(crate) fn whole_file() -> Self {
         Self {
             buffer: vec![0u8; WHOLE_FILE_HASH_BUFFER_BYTES],
+            baseline: None,
+            dirty_chunks: None,
         }
     }
 
+    pub(crate) fn reuse(
+        &mut self,
+        baseline: std::sync::Arc<vm_spec::capture::StreamMap>,
+        dirty_chunks: Vec<u8>,
+    ) {
+        self.baseline = Some(baseline);
+        self.dirty_chunks = Some(dirty_chunks);
+    }
     pub(crate) fn hash(
         &mut self,
         file: &File,
@@ -656,6 +672,22 @@ impl Hasher {
         }
         let mut whole = sha2::Sha256::new();
         let mut identity = stream.then(StreamIdentity::new);
+        if stream {
+            if let Some(baseline) = &self.baseline {
+                if baseline.length() != length {
+                    return Err(invalid("baseline map length differs from candidate"));
+                }
+                vm_spec::capture::validate_dirty_chunks(
+                    length,
+                    self.dirty_chunks
+                        .as_deref()
+                        .ok_or_else(|| invalid("baseline lacks affected coverage"))?,
+                )
+                .map_err(invalid)?;
+            }
+        }
+        let mut chunks = Vec::new();
+        let mut identity_bytes_hashed = 0;
         let mut offset = 0u64;
         while offset < length {
             if cancel.is_cancelled() {
@@ -670,7 +702,27 @@ impl Hasher {
             file.read_exact_at(chunk, offset)?;
             whole.update(&*chunk);
             if let Some(identity) = identity.as_mut() {
-                identity.push_chunk(chunk).map_err(invalid)?;
+                let index = chunks.len();
+                let reused = self.baseline.as_ref().filter(|_| {
+                    self.dirty_chunks
+                        .as_ref()
+                        .is_some_and(|bits| bits[index / 8] & (1 << (index % 8)) == 0)
+                });
+                let digest = if let Some(baseline) = reused {
+                    *baseline
+                        .chunks()
+                        .get(index)
+                        .ok_or_else(|| invalid("baseline chunk is missing"))?
+                } else {
+                    identity_bytes_hashed += span as u64;
+                    if chunk.iter().all(|byte| *byte == 0) {
+                        None
+                    } else {
+                        Some(Sha256Digest::of_bytes(chunk))
+                    }
+                };
+                identity.push_digest(span as u64, digest).map_err(invalid)?;
+                chunks.push(digest);
             }
             offset += span as u64;
         }
@@ -681,6 +733,12 @@ impl Hasher {
             length,
             sha256: Sha256Digest::from_bytes(whole.finalize().into()),
             stream: identity.map(StreamIdentity::finish),
+            map: if stream {
+                Some(vm_spec::capture::StreamMap::new(length, chunks).map_err(invalid)?)
+            } else {
+                None
+            },
+            identity_bytes_hashed,
         })
     }
 }
@@ -769,7 +827,7 @@ pub(crate) fn parse_layout(bytes: &[u8]) -> io::Result<LayoutGeometry> {
 #[cfg(test)]
 mod tests {
     use std::fs::{File, OpenOptions};
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
@@ -1267,5 +1325,69 @@ mod tests {
             .path()
             .join(CAPTURE_EVIDENCE_TEMPORARY_FILE)
             .exists());
+    }
+
+    #[test]
+    fn incremental_identity_reuses_clean_chunks_and_resolves_explicit_zero_and_short_tail() {
+        use std::sync::Arc;
+        let root = root();
+        let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        let file = staging.create_output(&CaptureRole::Ram).unwrap();
+        let length = 2 * STREAM_CHUNK_BYTES + 4096;
+        file.set_len(length).unwrap();
+        let data = vec![0x51; STREAM_CHUNK_BYTES as usize];
+        file.write_all_at(&data, 0).unwrap();
+        file.write_all_at(&data, STREAM_CHUNK_BYTES).unwrap();
+        file.write_all_at(&[0x19; 4096], 2 * STREAM_CHUNK_BYTES)
+            .unwrap();
+        let full = Hasher::new()
+            .hash(&file, length, true, &CancellationToken::new())
+            .unwrap();
+        let baseline = Arc::new(full.map.unwrap());
+        file.write_all_at(&vec![0; STREAM_CHUNK_BYTES as usize], STREAM_CHUNK_BYTES)
+            .unwrap();
+        file.write_all_at(&[0; 4096], 2 * STREAM_CHUNK_BYTES)
+            .unwrap();
+        file.write_all_at(&[3], length - 1).unwrap();
+        let mut hasher = Hasher::new();
+        hasher.reuse(baseline.clone(), vec![0b110]);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            hasher
+                .hash(&file, length, true, &cancelled)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        let incremental = hasher
+            .hash(&file, length, true, &CancellationToken::new())
+            .unwrap();
+        let independently_full = Hasher::new()
+            .hash(&file, length, true, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(incremental.stream, independently_full.stream);
+        assert_eq!(incremental.sha256, independently_full.sha256);
+        assert_eq!(incremental.map, independently_full.map);
+        assert_eq!(incremental.identity_bytes_hashed, STREAM_CHUNK_BYTES + 4096);
+        let map = incremental.map.unwrap();
+        assert_eq!(map.chunks()[0], baseline.chunks()[0]);
+        assert_eq!(map.chunks()[1], None);
+        assert!(map.chunks()[2].is_some());
+        let mut unchanged = Hasher::new();
+        unchanged.reuse(Arc::new(map), vec![0]);
+        let reused = unchanged
+            .hash(&file, length, true, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(reused.identity_bytes_hashed, 0);
+        assert_eq!(reused.sha256, independently_full.sha256);
+        let mut bad = Hasher::new();
+        bad.reuse(baseline, vec![0x80]);
+        assert_eq!(
+            bad.hash(&file, length, true, &CancellationToken::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

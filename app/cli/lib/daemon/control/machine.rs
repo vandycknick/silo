@@ -77,10 +77,20 @@ impl w::machine_service_server::MachineService for Service {
                 .map_err(conversion)?,
             resume_policy: silo_vm_control::capture::resume_policy_from_wire(value.resume_policy)
                 .map_err(conversion)?,
+            policy: silo_vm_control::capture::policy_from_wire(value.policy).map_err(conversion)?,
+            dirty_crossover_percent: silo_vm_control::capture::crossover_from_wire(
+                value.dirty_crossover_percent,
+            )
+            .map_err(conversion)?,
         };
+        options.validate().map_err(native)?;
         // Capability refusal precedes every lock, reservation and journal row.
         self.require_machine_live(&reference, vm_spec::live::LiveOperation::Capture)
             .await?;
+        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
+            self.require_machine_live(&reference, vm_spec::live::LiveOperation::Incremental)
+                .await?;
+        }
         let observation = self.observe_machine_live(&reference).await?;
         let state = self.clone();
         let result = self
@@ -107,6 +117,10 @@ impl w::machine_service_server::MachineService for Service {
         // Capability refusal precedes every lock, reservation and journal row.
         self.require_machine_live(&reference, vm_spec::live::LiveOperation::Fork)
             .await?;
+        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
+            self.require_machine_live(&reference, vm_spec::live::LiveOperation::Incremental)
+                .await?;
+        }
         let observation = self.observe_machine_live(&reference).await?;
         let state = self.clone();
         // The spawned mutation owns the operation: a client disconnect is not cancellation.

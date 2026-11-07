@@ -200,6 +200,7 @@ def main() -> None:
         "capture-disk-sync": {74, 75},
         "capture-execution-sync": {74, 75},
         "capture-ram-sync": {74, 75},
+        "capture-dirty-harvest": {16},
         "capture-seal-publish": {265},
         "capture-seal-sync": {74, 75, 265},
         "capture-source-sync": {74, 75},
@@ -271,7 +272,14 @@ def main() -> None:
             return False
 
     def publication_capture() -> Path | None:
+        excluded = set()
+        if "excludeCapturesFile" in request:
+            exclusion_file = Path(request["excludeCapturesFile"])
+            assert exclusion_file.stat().st_size <= 4096, "bounded exact prior-capture list"
+            excluded = set(json.loads(exclusion_file.read_bytes()))
         for seal_path in sorted((Path(request["target"]).parent / "captures").glob("*/vm.capture.json")):
+            if seal_path.parent.name in excluded:
+                continue
             seal = json.loads(seal_path.read_bytes())
             if seal["captureOutcome"] == "coherent":
                 return seal_path.parent
@@ -417,13 +425,33 @@ def main() -> None:
             if info.op == 2 and tid in pending_injection:
                 registers = Registers()
                 ptrace(12, tid, 0, ctypes.byref(registers))
-                assert ctypes.c_longlong(registers.rax).value == -errno.ENOSYS
                 injected = pending_injection[tid]
+                if injected.get("afterEffect"):
+                    actual = ctypes.c_longlong(registers.rax).value
+                    assert actual == 0, "post-effect dirty fault requires an actual successful GET_DIRTY_LOG"
+                    with Path(f"/proc/{tid}/mem").open("rb", buffering=0) as memory:
+                        memory.seek(injected["argument"])
+                        header = memory.read(16)
+                        assert len(header) == 16
+                        slot, padding, bitmap_address = struct.unpack("=IIQ", header)
+                        assert padding == 0 and bitmap_address != 0
+                        memory.seek(bitmap_address)
+                        prefix = memory.read(8)
+                        assert len(prefix) == 8
+                    injected.update(realReturn=actual, slot=slot, dirtyBitmapPrefixHex=prefix.hex())
+                else:
+                    assert ctypes.c_longlong(registers.rax).value == -errno.ENOSYS
                 registers.rax = (-injected["errno"]) & 0xffffffffffffffff
                 ptrace(13, tid, 0, ctypes.byref(registers))
                 injected_result = -injected["errno"]
                 (evidence / "boundary-injected.json").write_text(json.dumps(injected) + "\n")
                 del pending_injection[tid]
+                if injected.get("afterEffect"):
+                    held, matched = tid, True
+                    record = evidence / "boundary-held.json.tmp"
+                    record.write_text(json.dumps(injected) + "\n")
+                    record.replace(evidence / "boundary-held.json")
+                    return
             if info.op == 2 and tid in copy_pending:
                 key, observation = copy_pending.pop(tid)
                 result = (injected_result if injected_result is not None
@@ -455,9 +483,24 @@ def main() -> None:
                 net_egress.append(observation)
                 with (evidence / "net-egress.jsonl").open("a") as output:
                     output.write(json.dumps(observation) + "\n")
-            if info.op == 1 and not matched:
+            if (info.op == 1 and not matched
+                    and ("arm" not in request or Path(request["arm"]).is_file())):
                 syscall = int(info.data[0])
                 syscall_counts[syscall] += 1
+                if (boundary == "capture-dirty-harvest" and syscall == 16
+                        and int(info.data[2]) == 0x4010AE42 and not pending_injection):
+                    # GET_DIRTY_LOG actually harvests and reprotects. Observe
+                    # its success at EXIT before substituting only -EIO; leave
+                    # the kernel-returned bitmap and every real effect intact.
+                    fd = int(info.data[1])
+                    owner = os.readlink(f"/proc/{tid}/fd/{fd}")
+                    assert "kvm-vm" in owner and thread_name(group) == "krun"
+                    assert request.get("errno") in (None, errno.EIO)
+                    pending_injection[tid] = {
+                        "pid": group, "tid": tid, "fd": fd, "syscall": syscall,
+                        "ioctl": int(info.data[2]), "argument": int(info.data[3]),
+                        "target": owner, "errno": errno.EIO, "afterEffect": True,
+                        "injectedReturn": True, "kind": "post-effect GET_DIRTY_LOG error, never injected success"}
                 if (boundary == "capture-guest-transport" and publication_seen
                         and thread_name(tid) == "vsock muxer"):
                     directory = publication_capture()

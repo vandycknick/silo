@@ -1107,6 +1107,7 @@ impl Harness {
             configuration_digest: binding.configuration_digest,
             configuration: binding.configuration,
             policy: CapturePolicy::Full,
+            dirty_crossover_percent: 60,
             resume_policy,
             pause,
             disks: vec![CaptureDiskPlan {

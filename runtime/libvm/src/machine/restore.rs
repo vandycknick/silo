@@ -2,14 +2,12 @@
 //! repair, resize, bootstrap execution or fallback is part of this path.
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 use vm_spec::capture::{CaptureConfiguration, Sha256Digest};
@@ -135,7 +133,7 @@ async fn restore_consumer(
         SnapshotCaptureKind::LiveExecution { execution } => execution,
         _ => return Err(invalid("checkpoint capture kind changed")),
     };
-    let transfer_roles = 4 + if matches!(
+    let transfer_roles = 5 + if matches!(
         consumer.record.root.profile,
         SnapshotRootProfile::LinuxOverlay { .. }
     ) {
@@ -157,19 +155,38 @@ async fn restore_consumer(
     // Object digests already are whole-byte SHA-256 identities.
     let (ram, ram_sha256) =
         consumer.open_ram(&pool, &execution.memory.stream, execution.memory.length)?;
+    let ram_map_bytes = consumer
+        .authenticated_stream(&execution.memory.stream, execution.memory.length)?
+        .map()
+        .canonical_bytes()?;
+    let map_stage = crate::machine::stopped::OperationStaging::new(
+        &pool,
+        consumer.operation_id,
+        &consumer.lease,
+    )?;
+    let map_input = crate::store::snapshot_store::RecordInput::new(
+        runtime.local_images_dir(),
+        consumer.operation_id,
+        &ram_map_bytes,
+    )?;
+    let (ram_map, roots) = pool.publish_object_for_catalog(&map_input.path())?;
+    store_ram_map_pin(runtime, consumer.operation_id, ram_map.digest).await?;
+    drop(roots);
     let objects = [
         ram,
         consumer.open_object(&pool, &execution.layout)?,
         consumer.open_object(&pool, &execution.execution)?,
         consumer.open_object(&pool, &execution.devices)?,
+        pool.open_object(&ram_map.digest)?,
     ];
     let digests = [
         ram_sha256,
         Sha256Digest::from_bytes(*execution.layout.as_bytes()),
         Sha256Digest::from_bytes(*execution.execution.as_bytes()),
         Sha256Digest::from_bytes(*execution.devices.as_bytes()),
+        Sha256Digest::from_bytes(*ram_map.digest.as_bytes()),
     ];
-    let mut descriptors = Vec::with_capacity(4);
+    let mut descriptors = Vec::with_capacity(5);
     for ((file, role), sha256) in objects.iter().zip(RestoreObjectRole::ALL).zip(digests) {
         let metadata = file.metadata()?;
         if metadata.mode() & 0o7777 != 0o400
@@ -189,7 +206,7 @@ async fn restore_consumer(
             sha256,
         });
     }
-    let lower_inputs = prepare_lower(&pool, consumer)?;
+    let lower_inputs = prepare_lower(&pool, consumer, map_stage)?;
     let request = RestoreRequest {
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
         checkpoint: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
@@ -205,7 +222,7 @@ async fn restore_consumer(
         evidence,
         objects: descriptors
             .try_into()
-            .map_err(|_| invalid("restore requires exactly four descriptors"))?,
+            .map_err(|_| invalid("restore requires exactly five descriptors"))?,
         lowers: lower_inputs
             .as_ref()
             .map(|lower| vec![lower.request.clone()])
@@ -223,8 +240,9 @@ async fn restore_consumer(
         consumer.record.configuration.network,
         crate::store::models::MachineNetworkConfig::None
     );
-    let inspected_executable =
-        crate::storage::identity::ObjectDigest::from_sha256(*hash_file(&executable)?.as_bytes());
+    let inspected_executable = crate::storage::identity::ObjectDigest::from_sha256(
+        *crate::storage::stream::whole_file_sha256(&executable)?.as_bytes(),
+    );
     let inspection = inspect(&executable, &request, network).await?;
     if inspection.lane != host_report.lane {
         return Err(invalid(
@@ -339,7 +357,7 @@ struct PreparedRestore {
     sources: Vec<PrivateSource>,
     intent: RestoreIntent,
     request: RestoreRequest,
-    objects: [File; 4],
+    objects: [File; 5],
     executable: File,
     executable_identity: crate::storage::identity_file::SourceFingerprint,
     lower_inputs: Option<LowerInputs>,
@@ -567,6 +585,7 @@ struct LowerInputs {
 fn prepare_lower(
     pool: &StoragePool,
     consumer: &crate::store::snapshot_store::SnapshotConsumer,
+    stage: crate::machine::stopped::OperationStaging,
 ) -> Result<Option<LowerInputs>, LibVmError> {
     let SnapshotRootProfile::LinuxOverlay {
         lower,
@@ -588,7 +607,7 @@ fn prepare_lower(
         &consumer.record.configuration,
         authenticated,
     )?;
-    prepare_lower_descriptor(pool, &verified, consumer.operation_id, &consumer.lease).map(Some)
+    prepare_lower_descriptor(&verified, stage).map(Some)
 }
 
 pub(crate) struct VerifiedLower {
@@ -702,17 +721,14 @@ pub(crate) fn verify_local_lower(
 }
 
 fn prepare_lower_descriptor(
-    pool: &StoragePool,
     verified: &VerifiedLower,
-    operation: Uuid,
-    lease: &crate::storage::locks::StorageLock,
+    stage: crate::machine::stopped::OperationStaging,
 ) -> Result<LowerInputs, LibVmError> {
     if crate::storage::identity_file::SourceFingerprint::new(&verified.backing.metadata()?)
         != verified.fingerprint
     {
         return Err(invalid("verified lower changed before descriptor handoff"));
     }
-    let stage = crate::machine::stopped::OperationStaging::new(pool, operation, lease)?;
     let directory = stage.directory()?;
     directory.write_file("lower.vmdk", verified.descriptor.as_bytes())?;
     let descriptor = directory
@@ -752,7 +768,7 @@ fn prepare_lower_descriptor(
     })
 }
 
-fn storage_from_snapshot(
+pub(crate) fn storage_from_snapshot(
     record: &SnapshotRecord,
     checkpoint: crate::storage::identity::SnapshotId,
 ) -> Result<MachineStorageRecord, LibVmError> {
@@ -1051,19 +1067,15 @@ async fn launch_restored(
     Ok((pending, lifetime))
 }
 
-pub(crate) fn hash_file(file: &File) -> Result<Sha256Digest, LibVmError> {
-    let mut offset = 0;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 << 10];
-    loop {
-        let count = file.read_at(&mut buffer, offset)?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-        offset += count as u64;
-    }
-    Ok(Sha256Digest::from_bytes(hash.finalize().into()))
+async fn store_ram_map_pin(
+    runtime: &Runtime,
+    operation: Uuid,
+    digest: crate::storage::identity::ObjectDigest,
+) -> Result<(), LibVmError> {
+    runtime
+        .native_store()?
+        .pin_published_storage_dependencies(operation, &[], &[digest])
+        .await
 }
 
 async fn inspect(
@@ -1131,8 +1143,19 @@ async fn inspect(
         }
     };
     if !status.success() {
+        if stdout.ends_with(b"\n") && !stdout[..stdout.len().saturating_sub(1)].contains(&b'\n') {
+            if let Ok(failure) =
+                serde_json::from_slice::<vm_spec::restore::RestoreInspectionFailure>(&stdout)
+            {
+                failure.validate().map_err(invalid)?;
+                return Err(LibVmError::CheckpointPortability {
+                    checkpoint: restore.checkpoint.to_string(),
+                    refusal: Box::new(failure.refusal),
+                });
+            }
+        }
         return Err(invalid(format!(
-            "native restore compatibility refused: {}",
+            "native restore inspection failed without a typed refusal: {}",
             String::from_utf8_lossy(&stderr)
         )));
     }
@@ -1143,6 +1166,13 @@ async fn inspect(
     }
     let report: vm_spec::restore::RestoreInspectionReport =
         serde_json::from_slice(&stdout).map_err(|error| invalid(error.to_string()))?;
+    if let Some(refusal) = report.portability_refusal(&request) {
+        refusal.validate().map_err(invalid)?;
+        return Err(LibVmError::CheckpointPortability {
+            checkpoint: restore.checkpoint.to_string(),
+            refusal: Box::new(refusal),
+        });
+    }
     report.validate_against(&bytes, &request).map_err(invalid)?;
     Ok(report)
 }
@@ -1186,8 +1216,9 @@ pub(crate) async fn prepare_fork_restore(
         crate::storage::stream::open_regular_source(runtime.supervisor().executable())?;
     let executable_identity =
         crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?);
-    let inspected_executable =
-        crate::storage::identity::ObjectDigest::from_sha256(*hash_file(&executable)?.as_bytes());
+    let inspected_executable = crate::storage::identity::ObjectDigest::from_sha256(
+        *crate::storage::stream::whole_file_sha256(&executable)?.as_bytes(),
+    );
     if crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?)
         != executable_identity
     {
@@ -1290,10 +1321,17 @@ pub(crate) async fn restore_reserved_fork_child(
     let lower_inputs = cut
         .lower
         .as_ref()
-        .map(|lower| prepare_lower_descriptor(&pool, lower, child.consumer_id, &consumer_lease))
+        .map(|lower| {
+            let stage = crate::machine::stopped::OperationStaging::new(
+                &pool,
+                child.consumer_id,
+                &consumer_lease,
+            )?;
+            prepare_lower_descriptor(lower, stage)
+        })
         .transpose()?;
-    let mut files = Vec::with_capacity(4);
-    let mut descriptors = Vec::with_capacity(4);
+    let mut files = Vec::with_capacity(5);
+    let mut descriptors = Vec::with_capacity(5);
     for role in RestoreObjectRole::ALL {
         let index = cut
             .record
@@ -1335,7 +1373,7 @@ pub(crate) async fn restore_reserved_fork_child(
         evidence: cut.record.evidence.clone(),
         objects: descriptors
             .try_into()
-            .map_err(|_| invalid("fork restore needs four objects"))?,
+            .map_err(|_| invalid("fork restore needs five objects"))?,
         lowers: lower_inputs
             .as_ref()
             .map(|lower| vec![lower.request.clone()])
@@ -1380,7 +1418,7 @@ pub(crate) async fn restore_reserved_fork_child(
             request,
             objects: files
                 .try_into()
-                .map_err(|_| invalid("fork restore needs four files"))?,
+                .map_err(|_| invalid("fork restore needs five files"))?,
             executable,
             executable_identity,
             lower_inputs,
@@ -1395,14 +1433,14 @@ pub(crate) async fn restore_reserved_fork_child(
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::restore::hash_file;
+    use crate::storage::stream::whole_file_sha256;
     #[test]
     fn restore_full_byte_hash_preserves_descriptor_position_for_receiver() {
         use std::io::{Seek, Write};
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"checkpoint state").unwrap();
         let expected = vm_spec::capture::Sha256Digest::of_bytes(b"checkpoint state");
-        assert_eq!(hash_file(&file).unwrap(), expected);
+        assert_eq!(whole_file_sha256(&file).unwrap(), expected);
         assert_eq!(
             file.stream_position().unwrap(),
             b"checkpoint state".len() as u64
@@ -1435,6 +1473,27 @@ mod tests {
             block_id: vm_spec::BlockId::new(id).unwrap(),
             read_only,
         }
+    }
+
+    #[test]
+    fn portability_refusal_preserves_exact_pin_and_checkpoint() {
+        let refusal = vm_spec::restore::RestorePortabilityRefusal {
+            pin: "cpu.cpuid".into(),
+            expected: "leaf 0x7 subleaf 0: ebx.avx2".into(),
+            actual: "destination leaf 0x7 subleaf 0 lacks ebx.avx2".into(),
+            stage: "restore-preflight".into(),
+        };
+        refusal.validate().unwrap();
+        let error = crate::LibVmError::CheckpointPortability {
+            checkpoint: "sha256:captured-checkpoint".into(),
+            refusal: Box::new(refusal),
+        };
+        let message = error.to_string();
+        assert!(message.contains("cpu.cpuid"));
+        assert!(message.contains("restore-preflight"));
+        assert!(message.contains("leaf 0x7 subleaf 0"));
+        assert!(message.contains("sha256:captured-checkpoint"));
+        assert!(message.contains("no execution child was started"));
     }
 
     #[test]

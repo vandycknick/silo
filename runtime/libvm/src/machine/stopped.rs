@@ -149,6 +149,13 @@ pub struct RestoreOptions {
     pub resources: RestoreResourcePolicy,
 }
 
+/// Explicit cold-boot recovery, never execution restore or a restore fallback.
+#[derive(Debug, Clone, Default)]
+pub struct RecoverDisksOptions {
+    pub name: Option<String>,
+    pub external_resources: ExternalResourcePolicy,
+}
+
 /// Configured semantics only. Host identity, run state and secret scopes are absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -273,6 +280,33 @@ pub async fn preflight_restore_snapshot(
     .await
 }
 
+pub async fn preflight_recover_checkpoint_disks(
+    config: &RuntimeConfig,
+    reference: &SnapshotRef,
+    policy: &ExternalResourcePolicy,
+) -> Result<(), LibVmError> {
+    let record = crate::store::snapshot_store::observe_snapshot_record(config, reference).await?;
+    require_live_recovery(&record)?;
+    check_policy(&record.external_requirements, policy)?;
+    let storage = crate::machine::restore::storage_from_snapshot(&record, record.id()?)?;
+    preflight_boot(
+        config,
+        &storage,
+        &record.configuration.spec,
+        &record.configuration.guest.agent,
+    )
+    .await
+}
+
+fn require_live_recovery(record: &SnapshotRecord) -> Result<(), LibVmError> {
+    if !matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+        return Err(invalid(
+            "disk recovery requires an explicit live execution checkpoint",
+        ));
+    }
+    Ok(())
+}
+
 async fn preflight_boot(
     config: &RuntimeConfig,
     storage: &MachineStorageRecord,
@@ -347,7 +381,29 @@ impl Runtime {
         let runtime = self.clone();
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            handle.block_on(restore_owned(runtime, reference, options))
+            handle.block_on(restore_owned(runtime, reference, options, false))
+        })
+        .await?
+    }
+
+    pub async fn recover_checkpoint_disks(
+        &self,
+        reference: SnapshotRef,
+        options: RecoverDisksOptions,
+    ) -> Result<Machine, LibVmError> {
+        let runtime = self.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(restore_owned(
+                runtime,
+                reference,
+                RestoreOptions {
+                    name: options.name,
+                    external_resources: options.external_resources,
+                    ..RestoreOptions::default()
+                },
+                true,
+            ))
         })
         .await?
     }
@@ -1127,6 +1183,7 @@ async fn restore_owned(
     runtime: Runtime,
     reference: SnapshotRef,
     options: RestoreOptions,
+    recovery: bool,
 ) -> Result<Machine, LibVmError> {
     runtime.require_recoverable_child_scopes()?;
     if let Some(name) = &options.name {
@@ -1138,7 +1195,9 @@ async fn restore_owned(
     let preview = crate::store::observation::ObservationStore::existing(&store)
         .snapshot_record(&reference)
         .await?;
-    if matches!(preview.capture, SnapshotCaptureKind::LiveExecution { .. }) {
+    if recovery {
+        require_live_recovery(&preview)?;
+    } else if matches!(preview.capture, SnapshotCaptureKind::LiveExecution { .. }) {
         return crate::machine::restore::restore_owned(runtime, reference, options, preview).await;
     }
     if options.activation_hook.is_some() {
@@ -1152,16 +1211,28 @@ async fn restore_owned(
         ));
     }
     check_policy(&preview.external_requirements, &options.external_resources)?;
-    runtime.preflight_captured_lane(&storage_from_snapshot(&preview)?, CaptureLane::Stopped)?;
+    let preview_storage = if recovery {
+        crate::machine::restore::storage_from_snapshot(&preview, preview.id()?)?
+    } else {
+        storage_from_snapshot(&preview)?
+    };
+    runtime.preflight_captured_lane(&preview_storage, CaptureLane::Stopped)?;
     let _names = runtime.lock_machine_names().await?;
     let name =
         crate::machine::builder::stopped_child_name(&runtime, options.name.as_deref()).await?;
     let snapshots = SnapshotStore::from_store(std::sync::Arc::new(store.clone()));
-    let mut consumer = snapshots.consume(&reference).await?;
+    let mut consumer = if recovery {
+        snapshots.consume_disks(&reference).await?
+    } else {
+        snapshots.consume(&reference).await?
+    };
+    if consumer.record != preview {
+        return Err(invalid("checkpoint alias changed after recovery preflight"));
+    }
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let mut staging = OperationStaging::new(&pool, consumer.operation_id, &consumer.lease)?;
     tracing::debug!(snapshot = %consumer.info.id, operation = %consumer.operation_id, "restoring stopped snapshot");
-    let mut storage = storage_from_snapshot(&consumer.record)?;
+    let mut storage = preview_storage;
     let mut configuration = consumer.record.configuration.clone();
     storage.external_requirements = apply_resources(
         &mut configuration,
@@ -1186,7 +1257,10 @@ async fn restore_owned(
     crate::storage::limits::preflight_fd_budget(consumer.retained_descriptors() + 1 + writable)
         .map_err(crate::storage::StorageError::from)?;
     let mut sources = vec![PrivateSource::Authenticated {
-        path: crate::PrivatePath::new("root.raw")?,
+        path: crate::PrivatePath::new(match storage.root {
+            MachineRoot::OpaqueRaw { .. } => "root.raw",
+            _ => "upper.raw",
+        })?,
         stream: consumer.open_copy_source(
             &pool,
             &consumer.record.root.stream.stream,

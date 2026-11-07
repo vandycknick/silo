@@ -795,18 +795,45 @@ def refuse_before_publication(silo: Silo, *args: str, sources: tuple[Path, ...] 
     return result
 
 
+class EarlyRefusals:
+    """Serialized early rejections with no intervening fixture or guest writes.
+
+    Prepare every input before constructing this batch. Each request gets a
+    fresh full catalog/Home/run-root inventory and full source fingerprints.
+    Only a successfully verified after-state can become the next before-state;
+    never retain a batch across a successful operation or other writer.
+    Evidence logs are outside all three inventoried roots.
+    """
+
+    def __init__(self, silo: Silo) -> None:
+        assert silo.ws.state_db().is_file(), "initialize the Home before a refusal oracle"
+        self.silo = silo
+        self.before = self._state()
+        self.inputs: dict[Path, Fingerprint] = {}
+
+    def _state(self) -> tuple:
+        return (stopped.catalog(self.silo), stopped.inventory(self.silo.ws.silo_home), stopped.inventory(self.silo.ws.run_root))
+
+    def refuse(self, *args: str, sources: tuple[Path, ...] = ()) -> Result:
+        for path in sources:
+            if path not in self.inputs:
+                self.inputs[path] = fingerprint(path)
+        inputs = [self.inputs[path] for path in sources]
+        result = self.silo.run(*args, expect=None, timeout=60)
+        after = self._state()
+        after_inputs = [fingerprint(path) for path in sources]
+        self.silo.ws.record("phase17-early-refusal", json.dumps({"args": args, "exit": result.returncode, "stderr": result.stderr[-4000:]}, sort_keys=True) + "\n")
+        assert result.returncode != 0, (args, result.stdout, result.stderr)
+        assert after == self.before, ("refusal had catalog or file effects", args)
+        assert after_inputs == inputs, "refused input was modified"
+        self.before = after
+        self.inputs.update(zip(sources, after_inputs))
+        return result
+
+
 def refuse_without_effects(silo: Silo, *args: str, sources: tuple[Path, ...] = ()) -> Result:
-    """Refusal before any operation: full logical catalog and owned files unchanged."""
-    assert silo.ws.state_db().is_file(), "initialize the Home before a refusal oracle"
-    inputs = [fingerprint(path) for path in sources]
-    before = (stopped.catalog(silo), stopped.inventory(silo.ws.silo_home), stopped.inventory(silo.ws.run_root))
-    result = silo.run(*args, expect=None, timeout=60)
-    after = (stopped.catalog(silo), stopped.inventory(silo.ws.silo_home), stopped.inventory(silo.ws.run_root))
-    silo.ws.record("phase17-early-refusal", json.dumps({"args": args, "exit": result.returncode, "stderr": result.stderr[-4000:]}, sort_keys=True) + "\n")
-    assert result.returncode != 0, (args, result.stdout, result.stderr)
-    assert after == before, ("refusal had catalog or file effects", args)
-    assert [fingerprint(path) for path in sources] == inputs, "refused input was modified"
-    return result
+    """Single early refusal; use EarlyRefusals only for a no-writer batch."""
+    return EarlyRefusals(silo).refuse(*args, sources=sources)
 
 
 def bundle_digest(binding: dict) -> str:

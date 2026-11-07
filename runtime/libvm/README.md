@@ -86,6 +86,23 @@ restoration, preserving captured configuration and included disks rather than
 copying only its root. Snapshot creation accepts a new name; other nondefault
 create settings are refused and require explicit stopped updates after restore.
 
+`LiveSnapshotOptions` defaults to `CapturePolicy::Full`. Explicit incremental
+capture (including live-fork capture) accepts `dirty_crossover_percent` in
+`1..=60`, with 60 as the default. Normal capability admission still applies.
+Successful capture summaries carry actual mode, baseline identity, fallback
+reason, affected identity chunks and separate native I/O/whole-file hashing
+facts. Each checkpoint owns a complete canonical RAM map and complete closure;
+its predecessor is not a replay dependency.
+
+Execution restore reports `LibVmError::CheckpointPortability` with the exact
+failed pin and captured/destination values at `restore-preflight`, before a
+child is allocated. Compatibility is not required to import or retain an
+authenticated artifact. `Runtime::recover_checkpoint_disks` is a separate,
+explicit operation with `RecoverDisksOptions`: it authenticates storage and
+captured boot, creates new private disks and a stopped machine with unknown
+stop outcome and source-checkpoint provenance, and installs no RAM. An
+ordinary explicit start cold-boots it. Restore never falls back to recovery.
+
 Use `Machine::update_boot_assets(BootAssetsUpdate { selection })` for an explicit
 stopped replacement. It requires exclusive stopped-generation ownership and
 atomically commits the complete tuple, dependent agent configuration and next

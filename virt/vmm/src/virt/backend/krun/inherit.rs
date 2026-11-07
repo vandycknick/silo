@@ -5,12 +5,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-/// Fixed roles, sixteen Raw attachments, four restore state objects, the
+/// Fixed roles, sixteen Raw attachments, five restore state objects, the
 /// lifecycle endpoint and sixteen lower descriptors plus 1536 extents.
 pub(crate) const MAX_LOWER_FDS: usize = 16 + 1536;
-const MAX_CHILD_FDS: usize = 7 + 16 + 4 + MAX_LOWER_FDS;
+const MAX_CHILD_FDS: usize = 7 + 16 + 5 + MAX_LOWER_FDS;
 const LAST_RAW_CHILD_FD: i32 = 24;
-pub(crate) const FIRST_LOWER_CHILD_FD: i32 = 33;
+pub(crate) const FIRST_LOWER_CHILD_FD: i32 = 34;
 const LAST_CHILD_FD: i32 = FIRST_LOWER_CHILD_FD + MAX_LOWER_FDS as i32 - 1;
 /// The worker's lifecycle role. Kept literal so this policy compiles standalone
 /// in the real-executable tests; the owner asserts it equals the worker table.
@@ -20,6 +20,7 @@ fn child_target(target: i32) -> bool {
     (3..=LAST_RAW_CHILD_FD).contains(&target)
         || (25..=28).contains(&target)
         || target == LIFECYCLE_CHILD_FD
+        || target == 33
         || (FIRST_LOWER_CHILD_FD..=LAST_CHILD_FD).contains(&target)
 }
 

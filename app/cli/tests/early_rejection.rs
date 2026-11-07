@@ -153,16 +153,8 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
                 live[operation.as_str()]["availability"]["reason"]["code"],
                 if backend == "vz" {
                     "backend-excluded"
-                } else if matches!(
-                    operation,
-                    LiveOperation::Pause
-                        | LiveOperation::Capture
-                        | LiveOperation::Restore
-                        | LiveOperation::Fork
-                ) {
-                    "lane-not-qualified"
                 } else {
-                    "not-delivered"
+                    "lane-not-qualified"
                 }
             );
         }

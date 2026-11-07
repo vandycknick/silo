@@ -726,6 +726,58 @@ impl StoragePool {
         ))
     }
 
+    /// Publish complete RAM using the monitor's authenticated canonical map.
+    /// Whole-file authentication is independent of reused chunk identities.
+    pub(crate) fn publish_sealed_ram_for_catalog(
+        &self,
+        input: &File,
+        map: &StreamMap,
+        expected_sha256: vm_spec::capture::Sha256Digest,
+    ) -> Result<(StreamId, StorageLock), StorageError> {
+        use std::os::unix::fs::FileExt;
+        let before = SourceFingerprint::new(&input.metadata()?);
+        if input.metadata()?.len() != map.length() {
+            return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+        }
+        let (staging, file) = self.stage()?;
+        let mut buffer = vec![0u8; crate::storage::limits::CHUNK_SIZE];
+        let mut offset = 0;
+        while offset < map.length() {
+            let length = (map.length() - offset).min(buffer.len() as u64) as usize;
+            input.read_exact_at(&mut buffer[..length], offset)?;
+            crate::storage::stream::write_sparse_at(&file, &buffer[..length], offset)?;
+            offset += length as u64;
+        }
+        file.set_len(map.length())?;
+        if crate::storage::stream::whole_file_sha256(&file)? != expected_sha256
+            || SourceFingerprint::new(&input.metadata()?) != before
+        {
+            return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
+        }
+        seal(&file)?;
+        let id = map.id();
+        let name = id.hex();
+        let _publication = locks::blocking(
+            &self.publication,
+            &format!("stream-{name}.lock"),
+            FlockArg::LockExclusive,
+        )?;
+        let verified = if let Some(existing) = existing(&self.streams, &name)? {
+            let fingerprint = SourceFingerprint::new(&existing.metadata()?);
+            if existing.metadata()?.len() != map.length()
+                || crate::storage::stream::whole_file_sha256(&existing)? != expected_sha256
+                || SourceFingerprint::new(&existing.metadata()?) != fingerprint
+            {
+                return Err(StorageError::ContentMismatch(self.stream_path(&id)));
+            }
+            Some(fingerprint)
+        } else {
+            None
+        };
+        let roots = self.finish_publication(&self.streams, &staging, &name, verified)?;
+        Ok((id, roots))
+    }
+
     #[cfg(test)]
     pub(crate) fn publish_object(&self, source: &Path) -> Result<PublishedObject, StorageError> {
         self.publish_object_for_catalog(source)
@@ -1468,6 +1520,54 @@ mod tests {
         symlink(&source, &published.path).unwrap();
         assert!(pool.publish_stream(&source).is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"bytes");
+    }
+
+    #[test]
+    fn sealed_ram_map_preserves_explicit_zero_and_short_final_chunk() {
+        use crate::storage::stream::{Chunk, StreamMap};
+        use vm_spec::capture::Sha256Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&dir.path().join("images")).unwrap();
+        let chunk_size = crate::storage::limits::CHUNK_SIZE;
+        let mut old = vec![0x61; 2 * chunk_size + 3];
+        let old_path = dir.path().join("baseline");
+        std::fs::write(&old_path, &old).unwrap();
+        let baseline = pool.publish_stream(&old_path).unwrap();
+        old[chunk_size..2 * chunk_size].fill(0);
+        old[2 * chunk_size..].copy_from_slice(&[0, 0, 7]);
+        let candidate = dir.path().join("candidate");
+        std::fs::write(&candidate, &old).unwrap();
+        let map = StreamMap::new(
+            old.len() as u64,
+            vec![
+                baseline.map.chunks()[0],
+                Chunk::Zero,
+                Chunk::Data(crate::storage::identity::ObjectDigest::of_bytes(&[0, 0, 7])),
+            ],
+        )
+        .unwrap();
+        let (published, roots) = pool
+            .publish_sealed_ram_for_catalog(
+                &std::fs::File::open(&candidate).unwrap(),
+                &map,
+                Sha256Digest::of_bytes(&old),
+            )
+            .unwrap();
+        drop(roots);
+        std::fs::remove_file(&baseline.path).unwrap();
+        assert_eq!(pool.verify_stream(&published).unwrap(), map);
+        assert_eq!(std::fs::read(pool.stream_path(&published)).unwrap(), old);
+        assert_eq!(map.chunks()[1], Chunk::Zero);
+        let mut corrupt = old;
+        corrupt[0] ^= 1;
+        std::fs::write(&candidate, &corrupt).unwrap();
+        assert!(pool
+            .publish_sealed_ram_for_catalog(
+                &std::fs::File::open(&candidate).unwrap(),
+                &map,
+                Sha256Digest::of_bytes(b"wrong bytes"),
+            )
+            .is_err());
     }
 
     #[test]

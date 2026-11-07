@@ -39,6 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     LiveSnapshotOptions {
                         name: None,
                         resume_policy,
+                        policy: vm_spec::lifecycle::CapturePolicy::Full,
+                        dirty_crossover_percent: 60,
                     },
                 )
                 .await?;

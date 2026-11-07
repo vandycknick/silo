@@ -64,6 +64,28 @@ pub struct LiveSnapshotOptions {
     /// `resume-if-acquired` needs a Running source; a Paused source requires
     /// `preserve` and borrows the user pause without ever resuming it.
     pub resume_policy: CaptureResumePolicy,
+    pub policy: CapturePolicy,
+    pub dirty_crossover_percent: u8,
+}
+
+impl Default for LiveSnapshotOptions {
+    fn default() -> Self {
+        Self {
+            name: None,
+            resume_policy: CaptureResumePolicy::ResumeIfAcquired,
+            policy: CapturePolicy::Full,
+            dirty_crossover_percent: 60,
+        }
+    }
+}
+
+impl LiveSnapshotOptions {
+    pub fn validate(&self) -> Result<(), LibVmError> {
+        if !(1..=60).contains(&self.dirty_crossover_percent) {
+            return Err(protocol("dirty crossover percent must be between 1 and 60"));
+        }
+        Ok(())
+    }
 }
 
 /// Source continuation as libvm knows it. `Unknown` means the run ended
@@ -86,6 +108,7 @@ pub struct LiveCaptureSummary {
     pub machine_id: LiveId,
     pub run_id: LiveId,
     pub resume_policy: CaptureResumePolicy,
+    pub memory: vm_spec::capture::CaptureMemoryEvidence,
     pub pause: CapturePauseDisposition,
     pub source_outcome: LiveCaptureSource,
     pub source_error: Option<Diagnostic>,
@@ -236,10 +259,14 @@ impl Machine {
         request_id: Uuid,
         options: LiveSnapshotOptions,
     ) -> Result<LiveCommandResult, LibVmError> {
+        options.validate()?;
         if request_id.is_nil() {
             return Err(protocol("nil capture identity"));
         }
         self.require_observation(observation)?;
+        if options.policy == CapturePolicy::Incremental {
+            require_live_operation(observation, LiveOperation::Incremental)?;
+        }
         let runtime = self.runtime();
         let store = runtime.native_store()?;
         let run = Uuid::parse_str(&observation.report().run_id)
@@ -255,6 +282,8 @@ impl Machine {
                 .capture_reservation(request_id)
                 .await?;
             if command.plan.resume_policy != options.resume_policy
+                || command.plan.policy != options.policy
+                || command.plan.dirty_crossover_percent != options.dirty_crossover_percent
                 || reservation.is_none_or(|record| record.alias != options.name)
             {
                 return conflict(observation);
@@ -268,6 +297,9 @@ impl Machine {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
             require_same_observation(observation, &fresh)?;
+            if options.policy == CapturePolicy::Incremental {
+                require_live_operation(&fresh, LiveOperation::Incremental)?;
+            }
             if admission(&fresh, options.resume_policy)? != pause {
                 return Err(protocol("pause authority changed since capture admission"));
             }
@@ -294,7 +326,8 @@ impl Machine {
                     capture_id: request_id,
                     configuration,
                     alias: options.name.clone(),
-                    policy: CapturePolicy::Full,
+                    policy: options.policy,
+                    dirty_crossover_percent: options.dirty_crossover_percent,
                     resume_policy: options.resume_policy,
                     pause,
                 })
@@ -1122,6 +1155,16 @@ fn summary(runtime: &Runtime, record: &CaptureRecord) -> Result<LiveCaptureSumma
         machine_id: record.plan.machine_id.clone(),
         run_id: record.plan.run_id.clone(),
         resume_policy: record.plan.resume_policy,
+        memory: CaptureEvidence::decode(
+            record
+                .evidence
+                .as_deref()
+                .ok_or_else(|| protocol("published capture has no evidence"))?
+                .as_bytes(),
+        )
+        .map_err(protocol)?
+        .memory
+        .ok_or_else(|| protocol("published capture has no memory evidence"))?,
         pause: pause_disposition(&record.plan),
         source_outcome,
         source_error,
@@ -1310,6 +1353,27 @@ mod tests {
                 freeze_epoch: NonZeroU64::new(4).unwrap(),
             }),
             ..LiveLifecycle::default()
+        }
+    }
+
+    #[test]
+    fn capture_options_validate_crossover_before_any_operation() {
+        let mut options = crate::LiveSnapshotOptions::default();
+        assert_eq!(options.policy, vm_spec::lifecycle::CapturePolicy::Full);
+        assert_eq!(options.dirty_crossover_percent, 60);
+        for policy in [
+            vm_spec::lifecycle::CapturePolicy::Full,
+            vm_spec::lifecycle::CapturePolicy::Incremental,
+        ] {
+            options.policy = policy;
+            for percent in [1, 59, 60] {
+                options.dirty_crossover_percent = percent;
+                options.validate().unwrap();
+            }
+            for percent in [0, 61, u8::MAX] {
+                options.dirty_crossover_percent = percent;
+                assert!(options.validate().is_err());
+            }
         }
     }
 

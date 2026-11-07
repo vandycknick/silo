@@ -1489,6 +1489,7 @@ const (
 	RuntimeService_NormalizePolicy_FullMethodName          = "/silo.daemon.v1.RuntimeService/NormalizePolicy"
 	RuntimeService_CheckPolicySecrets_FullMethodName       = "/silo.daemon.v1.RuntimeService/CheckPolicySecrets"
 	RuntimeService_RestoreSnapshot_FullMethodName          = "/silo.daemon.v1.RuntimeService/RestoreSnapshot"
+	RuntimeService_RecoverCheckpointDisks_FullMethodName   = "/silo.daemon.v1.RuntimeService/RecoverCheckpointDisks"
 	RuntimeService_InspectStorageSnapshot_FullMethodName   = "/silo.daemon.v1.RuntimeService/InspectStorageSnapshot"
 	RuntimeService_ListStorageSnapshots_FullMethodName     = "/silo.daemon.v1.RuntimeService/ListStorageSnapshots"
 	RuntimeService_ReleaseSnapshotRetention_FullMethodName = "/silo.daemon.v1.RuntimeService/ReleaseSnapshotRetention"
@@ -1517,6 +1518,7 @@ type RuntimeServiceClient interface {
 	NormalizePolicy(ctx context.Context, in *NormalizePolicyRequest, opts ...grpc.CallOption) (*PolicyDocument, error)
 	CheckPolicySecrets(ctx context.Context, in *CheckPolicySecretsRequest, opts ...grpc.CallOption) (*PolicySecretsResult, error)
 	RestoreSnapshot(ctx context.Context, in *RestoreStorageSnapshotRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
+	RecoverCheckpointDisks(ctx context.Context, in *RecoverCheckpointDisksRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
 	InspectStorageSnapshot(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*StorageSnapshotInfo, error)
 	ListStorageSnapshots(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StorageSnapshotList, error)
 	ReleaseSnapshotRetention(ctx context.Context, in *StorageSnapshotRef, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -1627,6 +1629,16 @@ func (c *runtimeServiceClient) RestoreSnapshot(ctx context.Context, in *RestoreS
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MachineSnapshot)
 	err := c.cc.Invoke(ctx, RuntimeService_RestoreSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) RecoverCheckpointDisks(ctx context.Context, in *RecoverCheckpointDisksRequest, opts ...grpc.CallOption) (*MachineSnapshot, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSnapshot)
+	err := c.cc.Invoke(ctx, RuntimeService_RecoverCheckpointDisks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1812,6 +1824,7 @@ type RuntimeServiceServer interface {
 	NormalizePolicy(context.Context, *NormalizePolicyRequest) (*PolicyDocument, error)
 	CheckPolicySecrets(context.Context, *CheckPolicySecretsRequest) (*PolicySecretsResult, error)
 	RestoreSnapshot(context.Context, *RestoreStorageSnapshotRequest) (*MachineSnapshot, error)
+	RecoverCheckpointDisks(context.Context, *RecoverCheckpointDisksRequest) (*MachineSnapshot, error)
 	InspectStorageSnapshot(context.Context, *StorageSnapshotRef) (*StorageSnapshotInfo, error)
 	ListStorageSnapshots(context.Context, *emptypb.Empty) (*StorageSnapshotList, error)
 	ReleaseSnapshotRetention(context.Context, *StorageSnapshotRef) (*emptypb.Empty, error)
@@ -1860,6 +1873,9 @@ func (UnimplementedRuntimeServiceServer) CheckPolicySecrets(context.Context, *Ch
 }
 func (UnimplementedRuntimeServiceServer) RestoreSnapshot(context.Context, *RestoreStorageSnapshotRequest) (*MachineSnapshot, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
+}
+func (UnimplementedRuntimeServiceServer) RecoverCheckpointDisks(context.Context, *RecoverCheckpointDisksRequest) (*MachineSnapshot, error) {
+	return nil, status.Error(codes.Unimplemented, "method RecoverCheckpointDisks not implemented")
 }
 func (UnimplementedRuntimeServiceServer) InspectStorageSnapshot(context.Context, *StorageSnapshotRef) (*StorageSnapshotInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method InspectStorageSnapshot not implemented")
@@ -2035,6 +2051,24 @@ func _RuntimeService_RestoreSnapshot_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RuntimeServiceServer).RestoreSnapshot(ctx, req.(*RestoreStorageSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_RecoverCheckpointDisks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecoverCheckpointDisksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).RecoverCheckpointDisks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_RecoverCheckpointDisks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).RecoverCheckpointDisks(ctx, req.(*RecoverCheckpointDisksRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2321,6 +2355,10 @@ var RuntimeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RestoreSnapshot",
 			Handler:    _RuntimeService_RestoreSnapshot_Handler,
+		},
+		{
+			MethodName: "RecoverCheckpointDisks",
+			Handler:    _RuntimeService_RecoverCheckpointDisks_Handler,
 		},
 		{
 			MethodName: "InspectStorageSnapshot",

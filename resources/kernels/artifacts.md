@@ -298,23 +298,26 @@ x86_64 KVM. The immutable boot-admission entry records exactly:
 | --- | --- |
 | Kernel | Linux `7.2.2`, SHA256 `4c54fc038844b04d712bd4cdb8a9d6a945a5f3d7a8bb1db5a5d50d5271d5dddc` |
 | Reusable base initramfs | SHA256 `793730230b7fba3551a1f3b426e11cb343a916090380da87f35f06735dbf28ed` |
-| Actual monitor and worker executable | SHA256 `eebe7fa99623ccf292c25cbce2610da34ec356f5aa9a335c6174b67c30baecd7` |
+| Actual monitor and worker executable | SHA256 `b44276251676c0b1b1076b096cc67b88a10e8455064a283fe7e4ab9fc1930bbb` |
 | Actual resolved Kconfig | SHA256 `7249a93adabeb4348fc902df83ed252be4c71762ac131cf003070431afdf68a9` |
-| Native source revision | `2606116528aaddbb5e87aeb045abed80456a822c` |
+| Native source revision | `8babb9fd9b4a0413ea79ce160e5cc5fab5dea384` |
 | Guest / host lane | `amd64` / Linux `x86_64`, KVM |
 | Profiles | `linux-flat-overlay-v1`, `silo-upper-ext4-v1`, `silo-overlay-v1` |
 | Rendering / attachment | `linux-overlayfs-mountinfo-v1` / `krun-virtio-blk-v1` |
 
-Phase 17 refreshed this tuple after the partition/bootstrap cutover and pause
-requalification. The exact optimized monitor passed the isolated real overlay
-boot gate in `.tmp/plan/evidence/phase-17/overlay-pause-binding-final.xml`.
-This boot qualification does not grant public capture, restore or fork admission.
+Phase 20 refreshed this tuple after incremental capture and guarded uncertain
+dirty-harvest recovery. The exact optimized production monitor passed
+`test_overlay_candidate_qualification`, recorded in
+`.tmp/plan/evidence/phase-20/exact-final-production-overlay-boot-qualification.log`.
+The isolated incremental candidate is a different executable and does not
+qualify this tuple. This boot qualification grants no public live capability.
+The existing pause-only grant was separately requalified against the new
+native binding in `phase-20/pause-candidate-requalification.xml`; capture,
+restore, fork and incremental remain unqualified in production.
 
-Retained candidate evidence:
+Earlier kernel/configuration provenance remains in
 `.tmp/plan/evidence/phase-17/overlay-pause-binding-proof.log` and
 `.tmp/plan/evidence/phase-17/overlay-pause-binding-tuple.json`.
-The tuple records native build identity
-`v2:path:clean:2606116528aaddbb5e87aeb045abed80456a822c:content=21a00aec6ce92e89eb74366fb510bfc306b045056c1e62f22646458136668927:inputs=44e9e307075b795ae0423c46318fa9ec2985c79325d457d3cef64eef9a32a357`.
 Main independently extracted the exact tested kernel's embedded IKCONFIG and
 verified byte equality with the supplied resolved `.config`, binding the
 configuration to the executable rather than trusting its pathname. The

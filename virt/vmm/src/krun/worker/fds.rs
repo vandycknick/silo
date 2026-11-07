@@ -21,7 +21,8 @@
 //! | 30 | console input: connected stream socket (standalone only)     |
 //! | 31 | console output: connected stream socket (standalone only)    |
 //! | 32 | lifecycle: connected stream socket (normal worker only)      |
-//! | 33+| restore lowers: per read-only VMDK lower, its descriptor then its extents |
+//! | 33 | complete RAM map, read-only regular file                   |
+//! | 34+| restore lowers: per read-only VMDK lower, its descriptor then its extents |
 //!
 //! The optional mux hole stays closed; no other descriptor may be open. A
 //! normal launch is a restore launch exactly when the state roles are open;
@@ -43,12 +44,12 @@ pub(crate) const MUX_FD: RawFd = 7;
 pub(crate) const STORAGE_LEASE_FD: RawFd = 8;
 pub(crate) const FIRST_RAW_FD: RawFd = 9;
 const MAX_RAW_HANDLES: usize = 16;
-pub(crate) const RESTORE_STATE_FDS: [RawFd; 4] = [25, 26, 27, 28];
+pub(crate) const RESTORE_STATE_FDS: [RawFd; 5] = [25, 26, 27, 28, 33];
 pub(crate) const STANDALONE_ENDPOINT_FDS: [RawFd; 3] = [29, 30, 31];
 /// The normal worker's monitor lifecycle endpoint.
 pub(crate) const LIFECYCLE_FD: RawFd = 32;
 /// First restore lower role; the table is contiguous and holeless.
-pub(crate) const FIRST_LOWER_FD: RawFd = 33;
+pub(crate) const FIRST_LOWER_FD: RawFd = 34;
 /// Every lower contributes its descriptor; extents share one bound.
 pub(crate) const MAX_LOWER_FDS: usize =
     MAX_RAW_HANDLES + vm_spec::restore::MAX_RESTORE_LOWER_EXTENTS;
@@ -66,6 +67,7 @@ pub(crate) struct RestoreStateFiles {
     pub(crate) layout: std::fs::File,
     pub(crate) execution: std::fs::File,
     pub(crate) devices: std::fs::File,
+    pub(crate) ram_map: std::fs::File,
 }
 
 pub(crate) struct Bootstrap {
@@ -215,7 +217,7 @@ impl Bootstrap {
         storage_lease: RawFd,
         raw_handles: &[RawFd],
         lifecycle: Option<RawFd>,
-        state: Option<[RawFd; 4]>,
+        state: Option<[RawFd; 5]>,
         standalone: Option<[RawFd; 3]>,
         lowers: &[RawFd],
     ) -> io::Result<Self> {
@@ -252,6 +254,9 @@ impl Bootstrap {
                     },
                     Role::State {
                         maximum: 32 * 1024 * 1024,
+                    },
+                    Role::State {
+                        maximum: vm_spec::capture::MAX_RAM_MAP_BYTES as u64,
                     },
                 ])
             }))
@@ -374,11 +379,14 @@ impl Bootstrap {
                     .map(|&raw| OwnedFd::from_raw_fd(raw))
                     .collect(),
                 lifecycle: lifecycle.map(|raw| OwnedFd::from_raw_fd(raw)),
-                state_files: state.map(|[ram, layout, execution, devices]| RestoreStateFiles {
-                    ram: std::fs::File::from_raw_fd(ram),
-                    layout: std::fs::File::from_raw_fd(layout),
-                    execution: std::fs::File::from_raw_fd(execution),
-                    devices: std::fs::File::from_raw_fd(devices),
+                state_files: state.map(|[ram, layout, execution, devices, ram_map]| {
+                    RestoreStateFiles {
+                        ram: std::fs::File::from_raw_fd(ram),
+                        layout: std::fs::File::from_raw_fd(layout),
+                        execution: std::fs::File::from_raw_fd(execution),
+                        devices: std::fs::File::from_raw_fd(devices),
+                        ram_map: std::fs::File::from_raw_fd(ram_map),
+                    }
                 }),
                 lowers: lowers
                     .iter()
@@ -696,7 +704,7 @@ mod tests {
             .open(root.join("lease"))
             .unwrap();
         let mut files = Vec::new();
-        for index in 0..4 {
+        for index in 0..5 {
             let path = root.join(index.to_string());
             std::fs::write(&path, [1_u8; 8]).unwrap();
             files.push(std::fs::File::open(path).unwrap());
@@ -727,7 +735,7 @@ mod tests {
             .write(true)
             .open(root.join("0"))
             .unwrap();
-        refuse([writable.as_raw_fd(), raw[1], raw[2], raw[3]], &[]);
+        refuse([writable.as_raw_fd(), raw[1], raw[2], raw[3], raw[4]], &[]);
         #[cfg(target_os = "linux")]
         {
             let path_only = nix::fcntl::open(
@@ -736,13 +744,13 @@ mod tests {
                 nix::sys::stat::Mode::empty(),
             )
             .unwrap();
-            refuse([path_only.as_raw_fd(), raw[1], raw[2], raw[3]], &[]);
+            refuse([path_only.as_raw_fd(), raw[1], raw[2], raw[3], raw[4]], &[]);
         }
         let alias = files[0].try_clone().unwrap();
-        refuse([raw[0], alias.as_raw_fd(), raw[2], raw[3]], &[]);
-        refuse([raw[0], raw[0], raw[2], raw[3]], &[]);
-        refuse([-1, raw[1], raw[2], raw[3]], &[]);
-        refuse([config.as_raw_fd(), raw[1], raw[2], raw[3]], &[]);
+        refuse([raw[0], alias.as_raw_fd(), raw[2], raw[3], raw[4]], &[]);
+        refuse([raw[0], raw[0], raw[2], raw[3], raw[4]], &[]);
+        refuse([-1, raw[1], raw[2], raw[3], raw[4]], &[]);
+        refuse([config.as_raw_fd(), raw[1], raw[2], raw[3], raw[4]], &[]);
         refuse(raw, &[alias.as_raw_fd()]);
         files[3]
             .set_len(0)
@@ -775,7 +783,7 @@ mod tests {
             .mode(0o600)
             .open(root.join("lease"))
             .unwrap();
-        let files: [std::fs::File; 4] = std::array::from_fn(|index| {
+        let files: [std::fs::File; 5] = std::array::from_fn(|index| {
             let path = root.join(index.to_string());
             std::fs::write(&path, [1_u8; 8]).unwrap();
             let file = std::fs::File::open(path).unwrap();
@@ -808,6 +816,7 @@ mod tests {
             state.layout.as_fd(),
             state.execution.as_fd(),
             state.devices.as_fd(),
+            state.ram_map.as_fd(),
         ] {
             assert!(
                 FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD).unwrap())

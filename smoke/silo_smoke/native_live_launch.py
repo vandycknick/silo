@@ -64,7 +64,8 @@ def main() -> None:
     if args.restore:
         roles.update({25: args.ram_image_fd, 26: args.ram_layout_fd,
                       27: os.open(args.restore / "execution.state", os.O_RDONLY | os.O_CLOEXEC),
-                      28: os.open(args.restore / "devices.state", os.O_RDONLY | os.O_CLOEXEC)})
+                      28: os.open(args.restore / "devices.state", os.O_RDONLY | os.O_CLOEXEC),
+                      33: os.open(args.restore / "memory.map.json", os.O_RDONLY | os.O_CLOEXEC)})
     # Move above the entire fixed table before dup2; inherited source numbers can
     # otherwise collide with a destination and silently exchange resource roles.
     temporary = {destination: fcntl.fcntl(source, fcntl.F_DUPFD_CLOEXEC, 64)

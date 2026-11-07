@@ -135,6 +135,8 @@ pub fn request_to_wire(
             .collect::<Result<_, _>>()?,
         max_children: value.max_children.get(),
         resume_policy: crate::capture::resume_policy_to_wire(value.resume_policy),
+        policy: crate::capture::policy_to_wire(value.policy),
+        dirty_crossover_percent: u32::from(value.dirty_crossover_percent),
         resources: Some(crate::stopped::restore_resources_to_wire(value.resources)),
     };
     request_from_wire(request.clone())?;
@@ -173,11 +175,18 @@ pub fn request_from_wire(
         children,
         max_children,
         resume_policy: crate::capture::resume_policy_from_wire(value.resume_policy)?,
+        policy: crate::capture::policy_from_wire(value.policy)?,
+        dirty_crossover_percent: crate::capture::crossover_from_wire(
+            value.dirty_crossover_percent,
+        )?,
         resources: crate::stopped::restore_resources_from_wire(Some(required(
             value.resources,
             "fork.resources",
         )?))?,
     };
+    options
+        .validate()
+        .map_err(|_| invalid("fork.options", "invalid live fork options"))?;
     Ok((machine, options))
 }
 
@@ -588,6 +597,8 @@ mod tests {
     fn options() -> LiveForkOptions {
         LiveForkOptions {
             operation_id: OPERATION.parse().unwrap(),
+            policy: vm_spec::lifecycle::CapturePolicy::Full,
+            dirty_crossover_percent: 60,
             children: vec![
                 LiveForkChild {
                     name: "child-a".into(),

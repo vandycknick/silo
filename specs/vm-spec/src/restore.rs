@@ -28,10 +28,17 @@ pub enum RestoreObjectRole {
     Layout,
     Execution,
     Devices,
+    RamMap,
 }
 
 impl RestoreObjectRole {
-    pub const ALL: [Self; 4] = [Self::Ram, Self::Layout, Self::Execution, Self::Devices];
+    pub const ALL: [Self; 5] = [
+        Self::Ram,
+        Self::Layout,
+        Self::Execution,
+        Self::Devices,
+        Self::RamMap,
+    ];
 
     pub const fn capture_role(self) -> CaptureRole {
         match self {
@@ -39,6 +46,7 @@ impl RestoreObjectRole {
             Self::Layout => CaptureRole::Layout,
             Self::Execution => CaptureRole::Execution,
             Self::Devices => CaptureRole::Devices,
+            Self::RamMap => CaptureRole::RamMap,
         }
     }
 
@@ -48,6 +56,7 @@ impl RestoreObjectRole {
             Self::Layout => 64 << 10,
             Self::Execution => 16 << 20,
             Self::Devices => 32 << 20,
+            Self::RamMap => crate::capture::MAX_RAM_MAP_BYTES as u64,
         }
     }
 }
@@ -94,8 +103,8 @@ pub struct RestoreRequest {
     pub start_paused: bool,
     pub configuration: CaptureConfiguration,
     pub evidence: CaptureEvidence,
-    /// Exactly RAM, layout, execution, devices, in that order.
-    pub objects: [RestoreObject; 4],
+    /// Exactly RAM, layout, execution, devices, complete RAM map, in that order.
+    pub objects: [RestoreObject; 5],
     pub lowers: Vec<RestoreLower>,
     pub network: Option<RestoreNetwork>,
     /// Destination public SSH CA. Absent only during pre-allocation inspection.
@@ -431,13 +440,138 @@ pub struct RestoreInspectionReport {
     pub devices: Vec<RestoreAdmittedDevice>,
 }
 
+/// Bounded exact execution portability refusal, never RAM or secret contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestorePortabilityRefusal {
+    pub pin: String,
+    pub expected: String,
+    pub actual: String,
+    pub stage: String,
+}
+
+impl RestorePortabilityRefusal {
+    pub fn new(
+        pin: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        fn bounded(mut value: String) -> String {
+            if value.len() > 4096 {
+                let digest = Sha256Digest::of_bytes(value.as_bytes());
+                let mut end = 3968;
+                while !value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                value.truncate(end);
+                value.push_str(&format!(" [complete:{digest}]"));
+            }
+            value
+        }
+        Self {
+            pin: pin.into(),
+            expected: bounded(expected.into()),
+            actual: bounded(actual.into()),
+            stage: "restore-preflight".into(),
+        }
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.stage != "restore-preflight"
+            || self.pin.is_empty()
+            || self.pin.len() > 128
+            || self.expected.is_empty()
+            || self.expected.len() > 16384
+            || self.actual.is_empty()
+            || self.actual.len() > 16384
+            || [&self.pin, &self.expected, &self.actual]
+                .iter()
+                .any(|value| value.contains('\0'))
+        {
+            return Err("invalid bounded restore portability refusal".into());
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Display for RestorePortabilityRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} expected {}, destination {}; no execution child started",
+            self.stage, self.pin, self.expected, self.actual
+        )
+    }
+}
+impl std::error::Error for RestorePortabilityRefusal {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreInspectionFailure {
+    pub version: u32,
+    pub refusal: RestorePortabilityRefusal,
+}
+impl RestoreInspectionFailure {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != RESTORE_INSPECTION_VERSION {
+            return Err("unsupported inspection failure version".into());
+        }
+        self.refusal.validate()
+    }
+}
+
 impl RestoreInspectionReport {
+    pub fn portability_refusal(
+        &self,
+        request: &RestoreInspectionRequest,
+    ) -> Option<RestorePortabilityRefusal> {
+        let memory = request.restore.evidence.memory.as_ref()?;
+        let mismatch = |pin: &str, expected: String, actual: String| {
+            (expected != actual).then(|| RestorePortabilityRefusal::new(pin, expected, actual))
+        };
+        mismatch(
+            "native-producer",
+            memory.binding.native_producer.clone(),
+            self.native_producer.clone(),
+        )
+        .or_else(|| {
+            mismatch(
+                "silo-producer",
+                memory.binding.silo_producer.to_string(),
+                self.silo_producer.to_string(),
+            )
+        })
+        .or_else(|| {
+            mismatch(
+                "topology.cpu-count",
+                request.restore.configuration.cpus.to_string(),
+                self.cpu_count.to_string(),
+            )
+        })
+        .or_else(|| {
+            mismatch(
+                "ram-layout",
+                request.restore.configuration.ram_bytes().to_string(),
+                self.ram_bytes.to_string(),
+            )
+        })
+        .or_else(|| {
+            (self.lane == crate::live::LiveLane::NotApplicable).then(|| {
+                RestorePortabilityRefusal::new(
+                    "hypervisor",
+                    "captured execution lane",
+                    "unavailable",
+                )
+            })
+        })
+    }
     pub fn validate_against(
         &self,
         request_bytes: &[u8],
         request: &RestoreInspectionRequest,
     ) -> Result<(), String> {
         request.validate()?;
+        if let Some(refusal) = self.portability_refusal(request) {
+            return Err(refusal.to_string());
+        }
         let memory = request
             .restore
             .evidence
@@ -486,5 +620,39 @@ impl RestoreInspectionReport {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::capture::Sha256Digest;
+    use crate::restore::{
+        RestoreInspectionFailure, RestorePortabilityRefusal, RESTORE_INSPECTION_VERSION,
+    };
+
+    #[test]
+    fn portability_refusals_keep_exact_pin_and_bounded_complete_identity() {
+        let producer = "captured-build-".repeat(5000);
+        let digest = Sha256Digest::of_bytes(producer.as_bytes());
+        let refusal =
+            RestorePortabilityRefusal::new("native-producer", producer, "destination-build");
+        refusal.validate().unwrap();
+        assert!(refusal.expected.contains(&digest.to_string()));
+        assert!(refusal.expected.len() <= 4096);
+        assert!(refusal.to_string().contains("no execution child started"));
+        let failure = RestoreInspectionFailure {
+            version: RESTORE_INSPECTION_VERSION,
+            refusal,
+        };
+        let bytes = serde_json::to_vec(&failure).unwrap();
+        let decoded: RestoreInspectionFailure = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, failure);
+        let mut invalid = failure.clone();
+        invalid.refusal.stage = "activation".into();
+        assert!(invalid.validate().is_err());
+        let mut invalid = failure;
+        invalid.refusal.actual.clear();
+        assert!(invalid.validate().is_err());
     }
 }

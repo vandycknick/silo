@@ -2,11 +2,12 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use libkrun::control::{ControlFailure, ControlState, OperationId, PauseOwner, PauseToken};
 use libkrun::live::{
-    BaselineImage, CaptureId, CaptureStatus, CaptureTicket, CompletedCapture,
+    BaselineImage, CaptureId, CaptureStatus, CaptureTicket, CompletedCapture, DirtyEffect,
     ExecutionCaptureReceipt, ExecutionOutputs, GenerationKind, GenerationObservation,
     GenerationTicket, LiveError, MemoryCaptureRequest, MemoryOutputs, RamImageAuthentication,
     StateBinding, StoppedOwner, TrackingMode,
@@ -33,6 +34,14 @@ pub(crate) struct KrunNative {
     blocks: HashMap<String, (BlockBacking, bool)>,
     /// Launch raw disk handles and the launch storage lease.
     protected: Vec<OutputIdentity>,
+    baseline: Mutex<Option<NativeBaseline>>,
+    accepting: Mutex<Option<(Uuid, Digest32, Digest32)>>,
+}
+
+struct NativeBaseline {
+    token: Option<libkrun::live::BaselineToken>,
+    stream: Digest32,
+    layout: Digest32,
 }
 
 impl KrunNative {
@@ -70,7 +79,28 @@ impl KrunNative {
             control,
             blocks,
             protected,
+            baseline: Mutex::new(None),
+            accepting: Mutex::new(None),
         }
+    }
+
+    /// Verified restore authority only; the native child token already predates
+    /// state installation writes. Looking it up later never resets its union.
+    pub(crate) fn inherit_baseline(mut self, stream: Digest32, layout: Digest32) -> Self {
+        self.baseline = Mutex::new(Some(NativeBaseline {
+            token: None,
+            stream,
+            layout,
+        }));
+        self
+    }
+
+    fn baseline_stream(&self) -> Option<vm_spec::capture::Sha256Digest> {
+        self.baseline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|baseline| vm_spec::capture::Sha256Digest::from_bytes(baseline.stream.0))
     }
 }
 
@@ -105,6 +135,7 @@ impl NativeLifecycle for KrunNative {
         owner: NativePauseOwner,
         operation: NativeOperation,
         profile_operation: NativeOperation,
+        recovery_operation: NativeOperation,
         clock_profile: Option<ObservedClockProfile>,
         deadline: Instant,
     ) -> Result<PauseToken, NativeFailure> {
@@ -124,9 +155,21 @@ impl NativeLifecycle for KrunNative {
             NativePauseOwner::User => PauseOwner::User,
             NativePauseOwner::Capture => PauseOwner::Capture,
         };
-        self.control
+        match self
+            .control
             .pause(owner, OperationId(operation.get()), deadline)
-            .map_err(control_failure)
+        {
+            Ok(token) => Ok(token),
+            Err(failure) if recoverable_memory_cut(&failure) => self
+                .control
+                .recover_memory_cut(
+                    OperationId(operation.get()),
+                    OperationId(recovery_operation.get()),
+                    deadline,
+                )
+                .map_err(live_failure),
+            Err(failure) => Err(control_failure(failure)),
+        }
     }
 
     fn cancel_pause(
@@ -369,23 +412,49 @@ impl NativeLifecycle for KrunNative {
         capture: &CaptureTicket,
         ram: File,
         layout: File,
+        preparation: &crate::virt::lifecycle::CapturePreparation,
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<MemoryCapture, NativeFailure> {
+        let mut baseline = self
+            .baseline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(baseline) = baseline.as_mut() {
+            if baseline.token.is_none() {
+                baseline.token = self.control.baseline(deadline).map_err(live_failure)?;
+            }
+        }
+        let layout_digest = self.ram_layout_digest(deadline)?;
+        let token = baseline
+            .as_ref()
+            .filter(|baseline| {
+                preparation.baseline == Some(baseline.stream) && baseline.layout == layout_digest
+            })
+            .and_then(|baseline| baseline.token.clone());
+        let stream = baseline
+            .as_ref()
+            .map(|baseline| vm_spec::capture::Sha256Digest::from_bytes(baseline.stream.0));
         let completed = self
             .control
             .capture_memory(
                 capture,
                 MemoryCaptureRequest {
-                    baseline: None,
-                    full_at_dirty_percent: 0,
+                    baseline: token,
+                    full_at_dirty_percent: if preparation.policy
+                        == vm_spec::lifecycle::CapturePolicy::Full
+                    {
+                        0
+                    } else {
+                        preparation.dirty_crossover_percent
+                    },
                 },
                 MemoryOutputs { ram, layout },
                 OperationId(operation.get()),
                 deadline,
             )
             .map_err(live_failure)?;
-        memory_capture(&completed)
+        memory_capture(&completed, stream)
     }
 
     fn capture_status(
@@ -410,12 +479,33 @@ impl NativeLifecycle for KrunNative {
             CaptureStatus::MemoryPending(ticket) => NativeCaptureStatus::MemoryPending(ticket),
             CaptureStatus::CandidateComplete(completed) => NativeCaptureStatus::CandidateComplete {
                 ticket: completed.ticket.clone(),
-                memory: memory_capture(&completed)?,
+                memory: memory_capture(&completed, self.baseline_stream())?,
             },
-            CaptureStatus::Accepted { ticket, baseline } => NativeCaptureStatus::Accepted {
-                ticket,
-                memory_generation: baseline.memory_generation(),
-            },
+            CaptureStatus::Accepted { ticket, baseline } => {
+                let mut accepting = self
+                    .accepting
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if accepting
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| *pending == capture)
+                {
+                    if let Some((_, stream, layout)) = accepting.take() {
+                        *self
+                            .baseline
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = Some(NativeBaseline {
+                            token: Some(baseline.clone()),
+                            stream,
+                            layout,
+                        });
+                    }
+                }
+                NativeCaptureStatus::Accepted {
+                    ticket,
+                    memory_generation: baseline.memory_generation(),
+                }
+            }
             CaptureStatus::Abandoned(ticket) => NativeCaptureStatus::Abandoned(ticket),
             CaptureStatus::Failed {
                 ticket,
@@ -444,22 +534,46 @@ impl NativeLifecycle for KrunNative {
         operation: NativeOperation,
         deadline: Instant,
     ) -> Result<u64, NativeFailure> {
-        let baseline = self
-            .control
-            .accept_baseline(
-                capture,
-                BaselineImage {
-                    ram,
-                    layout,
-                    authentication: RamImageAuthentication {
-                        state: state_binding(binding),
-                        stream: stream.0,
-                    },
+        *self
+            .accepting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some((binding.capture, stream, binding.ram_layout));
+        let result = self.control.accept_baseline(
+            capture,
+            BaselineImage {
+                ram,
+                layout,
+                authentication: RamImageAuthentication {
+                    state: state_binding(binding),
+                    stream: stream.0,
                 },
-                OperationId(operation.get()),
-                deadline,
-            )
-            .map_err(live_failure)?;
+            },
+            OperationId(operation.get()),
+            deadline,
+        );
+        let baseline = match result {
+            Ok(baseline) => baseline,
+            Err(error) => match self
+                .control
+                .capture_status(CaptureId::new(*binding.capture.as_bytes()), deadline)
+            {
+                Ok(CaptureStatus::Accepted { baseline, .. }) => baseline,
+                _ => return Err(live_failure(error)),
+            },
+        };
+        *self
+            .baseline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(NativeBaseline {
+            token: Some(baseline.clone()),
+            stream,
+            layout: binding.ram_layout,
+        });
+        self.accepting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         Ok(baseline.memory_generation())
     }
 
@@ -650,13 +764,43 @@ fn execution_capture(
     })
 }
 
-fn memory_capture(completed: &CompletedCapture) -> Result<MemoryCapture, NativeFailure> {
-    if completed.ram.mode() != libkrun::live::RamCaptureMode::Full {
+fn memory_capture(
+    completed: &CompletedCapture,
+    baseline: Option<vm_spec::capture::Sha256Digest>,
+) -> Result<MemoryCapture, NativeFailure> {
+    use vm_spec::capture::{CaptureFullReason, CaptureMemoryStats, STREAM_CHUNK_BYTES};
+    use vm_spec::lifecycle::CapturePolicy;
+    let mode = match completed.ram.mode() {
+        libkrun::live::RamCaptureMode::Full => CapturePolicy::Full,
+        libkrun::live::RamCaptureMode::Incremental => CapturePolicy::Incremental,
+    };
+    let full_reason = completed.full_reason.map(|reason| match reason {
+        libkrun::live::FullCaptureReason::Requested => CaptureFullReason::Requested,
+        libkrun::live::FullCaptureReason::NoBaseline => CaptureFullReason::NoBaseline,
+        libkrun::live::FullCaptureReason::BaselineToken => CaptureFullReason::BaselineToken,
+        libkrun::live::FullCaptureReason::CoverageLost => CaptureFullReason::CoverageLost,
+        libkrun::live::FullCaptureReason::DirtyCrossover => CaptureFullReason::DirtyCrossover,
+    });
+    let chunks = completed.ram.packed_len().div_ceil(STREAM_CHUNK_BYTES) as usize;
+    if completed.ram.packed_len() == 0
+        || completed.ram.packed_len() > vm_spec::capture::MAX_CAPTURE_RAM_BYTES
+    {
         return Err(NativeFailure::with_detail(
             NativeFailureKind::Unexpected,
-            "native RAM candidate is not a full capture",
+            "native RAM length is outside its bound",
         ));
     }
+    let mut dirty_chunks = vec![0u8; chunks.div_ceil(8)];
+    for index in completed.ram.affected_chunks() {
+        if index >= chunks {
+            return Err(NativeFailure::with_detail(
+                NativeFailureKind::Unexpected,
+                "native affected chunk is outside RAM",
+            ));
+        }
+        dirty_chunks[index / 8] |= 1 << (index % 8);
+    }
+    let stats = completed.ram.stats();
     let [ram, layout] = completed
         .ram
         .output_identities()
@@ -671,6 +815,28 @@ fn memory_capture(completed: &CompletedCapture) -> Result<MemoryCapture, NativeF
         layout,
         memory_generation: completed.memory_generation,
         writers_closed: completed.ram.writers_closed(),
+        mode,
+        baseline: if mode == CapturePolicy::Incremental {
+            baseline
+        } else {
+            None
+        },
+        full_reason,
+        dirty_chunks,
+        stats: CaptureMemoryStats {
+            logical_bytes: stats.logical_bytes,
+            live_bytes_read: stats.live_bytes_read,
+            baseline_bytes_read: stats.baseline_bytes_read,
+            baseline_bytes_written: stats.baseline_bytes_written,
+            overlay_bytes_written: stats.overlay_bytes_written,
+            full_bytes_written: stats.full_bytes_written,
+            layout_bytes_written: stats.layout_bytes_written,
+            baseline_hole_bytes: stats.baseline_hole_bytes,
+            zero_bytes_omitted: stats.zero_bytes_omitted,
+            explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
+            extent_queries: stats.extent_queries,
+            ..CaptureMemoryStats::default()
+        },
     })
 }
 
@@ -706,6 +872,16 @@ fn generation_failure(name: &str) -> GenerationFailureKind {
         "Poisoned" => GenerationFailureKind::Poisoned,
         _ => GenerationFailureKind::Unrecognized,
     }
+}
+
+/// Recovery reconciles a retained cut, not a second pause attempt. Native
+/// authenticates the failed operation and keeps coverage invalid until FULL
+/// acceptance; pre-effect refusals and unrelated failures keep their policy.
+fn recoverable_memory_cut(failure: &ControlFailure) -> bool {
+    matches!(
+        failure,
+        ControlFailure::DirtyMemory(error) if error.effect != DirtyEffect::PreEffectRefusal
+    )
 }
 
 pub(crate) fn control_failure(failure: ControlFailure) -> NativeFailure {
@@ -763,8 +939,48 @@ fn capture_profile(
 
 #[cfg(test)]
 mod tests {
-    use crate::krun::worker::native::{generation_failure, provider_device};
+    use crate::krun::worker::native::{
+        generation_failure, provider_device, recoverable_memory_cut,
+    };
     use crate::virt::lifecycle::{GenerationFailureKind, ProviderDevice, VirtioKind};
+
+    #[test]
+    fn memory_cut_recovery_selects_only_typed_uncertain_dirty_failures() {
+        use libkrun::control::ControlFailure;
+        use libkrun::live::{DirtyEffect, DirtyFailure, DirtyLocation, DirtyOperation};
+
+        for effect in [
+            DirtyEffect::PreEffectRefusal,
+            DirtyEffect::CoverageLost,
+            DirtyEffect::ProtectionUnknown,
+        ] {
+            let failure = ControlFailure::DirtyMemory(DirtyFailure {
+                operation: DirtyOperation::Collect,
+                location: DirtyLocation::Slot(0),
+                native_code: 5,
+                effect,
+            });
+            assert_eq!(
+                recoverable_memory_cut(&failure),
+                effect != DirtyEffect::PreEffectRefusal
+            );
+        }
+        for failure in [
+            ControlFailure::Deadline,
+            ControlFailure::CallerTimeout,
+            ControlFailure::OwnerUnavailable,
+            ControlFailure::WakeUnknown("DirtyMemory CoverageLost".into()),
+            ControlFailure::Busy,
+            ControlFailure::InvalidToken,
+            ControlFailure::InvalidOperation,
+            ControlFailure::Exhausted,
+            ControlFailure::Unsupported("DirtyMemory CoverageLost".into()),
+            ControlFailure::Participant("DirtyMemory CoverageLost".into()),
+            ControlFailure::FailedFenced,
+        ] {
+            assert!(!recoverable_memory_cut(&failure), "{failure:?}");
+        }
+    }
 
     #[test]
     fn native_device_descriptions_classify_or_fail_closed() {

@@ -31,6 +31,12 @@ pub enum LibVmError {
     },
     #[error("live fork {operation_id} was not found")]
     LiveForkNotFound { operation_id: String },
+    #[error("checkpoint {checkpoint} refused at {}: pin {} expected {}, destination {}; no execution child was started", .refusal.stage, .refusal.pin, .refusal.expected, .refusal.actual)]
+    CheckpointPortability {
+        checkpoint: String,
+        /// Keep this uncommon diagnostic from enlarging every result and async state.
+        refusal: Box<vm_spec::restore::RestorePortabilityRefusal>,
+    },
 
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
@@ -350,6 +356,7 @@ impl LibVmError {
             Self::LiveProtocol { .. } => "LiveProtocol",
             Self::LiveObservation { .. } => "LiveObservation",
             Self::LiveCapture { .. } => "LiveCapture",
+            Self::CheckpointPortability { .. } => "CheckpointPortability",
             Self::LiveFork { .. } => "LiveFork",
             Self::LiveForkNotFound { .. } => "LiveForkNotFound",
             Self::Storage(_) => "Storage",

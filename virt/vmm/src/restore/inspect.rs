@@ -1,9 +1,9 @@
 //! `silo-vmm inspect-restore`: descriptor-only native compatibility admission
 //! before the manager allocates any child resource. stdin carries exactly one
-//! newline-terminated `RestoreInspectionRequest`; the four state objects are
-//! inherited at their request numbers. stdout carries exactly one report line;
-//! any refusal exits nonzero with a bounded diagnostic and empty stdout. No
-//! child VM is created: native may probe an empty host-profile VM only.
+//! newline-terminated `RestoreInspectionRequest`; the five state objects are
+//! inherited at their request numbers. stdout carries exactly one report line
+//! or a typed bounded portability refusal on nonzero exit. No child VM is
+//! created: native may probe an empty host-profile VM only.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -32,7 +32,26 @@ pub(crate) fn dispatch() -> Option<eyre::Result<()>> {
             .lock()
             .take(MAX_RESTORE_INSPECTION_BYTES as u64 + 2)
             .read_to_end(&mut encoded)?;
-        let report = inspect(&encoded)?;
+        let report = match inspect(&encoded) {
+            Ok(report) => report,
+            Err(error) => {
+                let refusal = error.chain().find_map(|cause| {
+                    cause.downcast_ref::<vm_spec::restore::RestorePortabilityRefusal>().cloned()
+                        .or_else(|| cause.downcast_ref::<std::io::Error>().and_then(|error|
+                            error.get_ref().and_then(|inner| inner.downcast_ref::<vm_spec::restore::RestorePortabilityRefusal>()).cloned()))
+                });
+                if let Some(refusal) = refusal {
+                    let failure = vm_spec::restore::RestoreInspectionFailure {
+                        version: RESTORE_INSPECTION_VERSION,
+                        refusal,
+                    };
+                    let mut line = serde_json::to_vec(&failure)?;
+                    line.push(b'\n');
+                    std::io::stdout().lock().write_all(&line)?;
+                }
+                return Err(error);
+            }
+        };
         let mut line = serde_json::to_vec(&report)?;
         line.push(b'\n');
         let mut stdout = std::io::stdout().lock();
@@ -75,9 +94,10 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
         crate::startup::set_cloexec(object.fd, true)?;
         files.push(file);
     }
-    let [_, layout, execution, devices] = files.as_slice() else {
-        return Err(eyre::eyre!("inspection requires exactly four objects"));
+    let [_, layout, execution, devices, ram_map] = files.as_slice() else {
+        return Err(eyre::eyre!("inspection requires exactly five objects"));
     };
+    crate::restore::inputs::verified_ram_map(restore, ram_map)?;
     let shape = crate::krun::restore::inspect(
         restore,
         request.network,
@@ -108,6 +128,9 @@ pub(crate) fn inspect(encoded: &[u8]) -> eyre::Result<RestoreInspectionReport> {
         ram_bytes: restore.configuration.ram_bytes(),
         devices: crate::krun::restore::admitted_devices(&shape),
     };
+    if let Some(refusal) = report.portability_refusal(&request) {
+        return Err(eyre::Report::new(refusal));
+    }
     // Self-check with the shared rules: never emit a report Main would refuse.
     report
         .validate_against(record, &request)

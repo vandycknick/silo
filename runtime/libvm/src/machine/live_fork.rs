@@ -25,11 +25,20 @@ pub struct LiveForkOptions {
     pub children: Vec<LiveForkChild>,
     pub max_children: NonZeroU32,
     pub resume_policy: CaptureResumePolicy,
+    pub policy: vm_spec::lifecycle::CapturePolicy,
+    pub dirty_crossover_percent: u8,
     pub resources: RestoreResourcePolicy,
 }
 
 impl LiveForkOptions {
     pub fn validate(&self) -> Result<(), LibVmError> {
+        crate::LiveSnapshotOptions {
+            name: None,
+            resume_policy: self.resume_policy,
+            policy: self.policy,
+            dirty_crossover_percent: self.dirty_crossover_percent,
+        }
+        .validate()?;
         let refused = |message: &str| LibVmError::LiveFork {
             operation_id: self.operation_id.to_string(),
             message: message.into(),
@@ -244,6 +253,9 @@ impl Machine {
             });
         }
         options.validate()?;
+        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
+            crate::require_live_operation(observation, vm_spec::live::LiveOperation::Incremental)?;
+        }
         if let Some(existing) = self
             .runtime()
             .native_store()?
@@ -325,6 +337,9 @@ async fn create_fork(
             .await?;
         crate::machine::live_operations::require_same_observation(&observation, &fresh)?;
         crate::require_live_operation(&fresh, vm_spec::live::LiveOperation::Fork)?;
+        if options.policy == vm_spec::lifecycle::CapturePolicy::Incremental {
+            crate::require_live_operation(&fresh, vm_spec::live::LiveOperation::Incremental)?;
+        }
         crate::machine::live_capture::admission(&fresh, options.resume_policy)?;
         let storage = runtime.machine_storage_record(machine).await?;
         if !config.spec.mounts.is_empty() || !storage.external_requirements.is_empty() {
@@ -381,6 +396,8 @@ async fn create_fork(
             crate::LiveSnapshotOptions {
                 name: None,
                 resume_policy: options.resume_policy,
+                policy: options.policy,
+                dirty_crossover_percent: options.dirty_crossover_percent,
             },
         )
         .await

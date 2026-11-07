@@ -437,6 +437,99 @@ failed samples stay in the retained workspace. Per-file residency inventories
 are kept in each sample record.
 A median over its target fails the gate and blocks admission.
 
+### Incremental capture and named disk recovery (Phase 20)
+
+These are maintained **functional** gates, not performance qualification. Use
+the same clean, exact-input KVM x86_64 runtime and VM-generation-aware workload
+kernel required by the restore gates. Production capture, restore, fork and
+incremental capability tables remain unchanged. Build a separate private
+candidate, outside both the repository and production runtime, with matching
+Cargo ancestor depth, build environment and profile:
+
+```sh
+PYTHONPATH=smoke uv run --project smoke python -m silo_smoke.capture_candidate \
+  --destination /absolute/private/phase20-candidate \
+  --runtime /absolute/production/staged-runtime --restore --incremental --profile release
+export SILO_SMOKE_BIN_DIR=/absolute/private/phase20-candidate/bin
+export SILO_SMOKE_RUNTIME_DIR=/absolute/private/phase20-candidate/runtime
+uv run --project smoke pytest smoke/tests/test_incremental.py -m slow --keep
+uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow --keep
+uv run --project smoke pytest smoke/tests/test_restore.py -m slow \
+  -k 'corrupt_real_closure or real_native_incompatibility' --keep
+```
+
+The builder refuses missing/dirty native provenance, mismatched build identity,
+IRQ diagnostic candidates and a production lane that is not still unqualified.
+`--incremental` requires `--restore`; `--fork` may additionally admit the local
+fork functional gates in the same isolated compilation. The resulting CLI,
+monitor and helper examples must be used together. No runtime flag grants
+production capability support.
+
+For Linux release stages, match `xtask/src/release.rs`'s system compiler/linker
+environment, including `CARGO_TARGET_DIR`, target linker and target Rust flags.
+`--profile debug` is appropriate only for a debug production stage. A mismatch
+is an evidence failure, not a reason to weaken the builder's identity check.
+
+Prerequisites are `/dev/kvm`, a static C toolchain (`CC`, default `cc`), `debugfs`,
+`sqlite3`, the restore fixture kernel/agent/initramfs and loopback TLS support.
+The host-writer gate additionally requires the workload kernel's
+`CONFIG_PAGE_REPORTING=y` and `CONFIG_VIRTIO_BALLOON=y`, a negotiated reporting
+queue and the matching `native-live-api inspect-devices` example. No missing
+driver, absent reports or unsupported lane is converted into a passing test.
+Artifact gates also use the existing pinned controlled Distribution binary
+(downloaded through its fixture when not already cached) and offline registry
+GC. The child-only syscall gates require Linux x86_64 ptrace of owned descendants;
+they never attach to an unrelated process. Every command is bounded, and failed
+workspaces retain their evidence.
+
+`test_incremental.py` pins guest tmpfs pages and independently reads their exact
+GPAs from sealed RAM after CPU stores, real O_DIRECT block-read DMA, repeated
+same-page writes and explicit nonzero-to-zero replacement. It checks canonical
+complete maps, full-file SHA evidence, catalog dependencies, bitmap/control
+record bounds, the lowered crossover, explicit full selection and worker-local
+baseline invalidation. Its first restored-child recapture must reuse the
+inherited map/token while retaining restore-time dirties. A real RAM-fsync
+pre-seal cancellation must preserve the abandoned dirty union. The separate
+coverage-loss case first observes an actual successful KVM_GET_DIRTY_LOG return
+(and its returned bitmap), substitutes only `-EIO`, then requires actual-state
+recovery, a full `coverage-lost` capture and renewed incremental reuse. This is
+an explicitly recorded syscall fault, never injected success or synthetic RAM.
+
+The host-writer case requires an observed `/dev/hvc0` serial token, byte-exact
+bidirectional vsock transport and actual balloon free-page-report completions.
+It decodes the bounded saved device queues, reads their real used indices and
+entries from sealed RAM and requires the reporting ring's chunks in the dirty
+bitmap. An explicit full capture at the same borrowed pause must have identical
+complete RAM bytes, identity and layout before the source can resume.
+
+The incremental artifact case reuses the source-free live-checkpoint pipeline:
+two incremental generations after full capture, both parent records/aliases
+removed and locally collected, complete standalone OCI closure, real registry
+GC, pull into a fresh home and first-child incremental recapture. The original
+source OCI publication is unavailable during offline restore. The incompatible
+CPU artifact still imports, then names the exact `cpu.cpuid` compatibility pin
+at `restore-preflight` before allocation. Only the separately invoked
+`silo recover-disks IMAGE --name CHILD` creates new stopped private disks with
+`stopOutcome: unknown`; an explicit subsequent start proves a different boot ID,
+the captured disk marker and absence of a RAM-only marker. Registry bytes are
+already collected, source home quarantined and source OCI unavailable.
+
+The existing real-closure corruption and exact-native-refusal matrices also run
+against genuinely incremental-derived snapshots. They cover byte corruption of
+RAM, root, layout, execution/device state, boot assets, map/root pages and
+provenance, plus exact CPU, XSAVE, native-producer, host-build, unscaled TSC-rate
+and captured MSR-model-value refusals before allocation. An empty actual MSR
+inventory refuses fixture preparation instead of inventing a register. These
+checksum-corruption cases do not claim to replace bounded
+malformed-schema/ABI/GPA decoder tests. KVM arm64/GIC and HVF/macOS/timebase
+lanes remain outside this KVM x86_64 fixture, not inferred qualified.
+
+Native `liveBytesRead`, baseline copying, full/overlay writes,
+`identityBytesHashed` and mandatory `wholeFileBytesHashed` are distinct evidence.
+The independent smoke oracle deliberately reads immutable output for
+authentication; it does not count that as a live RAM scan. No unchanged timing
+target is relaxed or qualified by these functional cases.
+
 ### Raw/qcow2 import, cloud disks, boot pinning and conversion (Phase 17)
 
 `tests/test_cloud_disk.py` uses only the staged CLI and the staged monitor.

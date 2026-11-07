@@ -287,6 +287,47 @@ impl w::runtime_service_server::RuntimeService for Service {
         Ok(Response::new(result))
     }
 
+    async fn recover_checkpoint_disks(
+        &self,
+        r: Request<w::RecoverCheckpointDisksRequest>,
+    ) -> Result<Response<w::MachineSnapshot>, Status> {
+        let value = r.get_ref().clone();
+        let reference = silo_vm_control::stopped::reference_from_wire(
+            crate::daemon::control::required(value.snapshot)?,
+        )
+        .map_err(conversion)?;
+        let options = libvm::RecoverDisksOptions {
+            name: silo_vm_control::stopped::name(value.name).map_err(conversion)?,
+            external_resources: silo_vm_control::stopped::policy_from_wire(
+                crate::daemon::control::required(value.external_resources)?,
+            )
+            .map_err(conversion)?,
+        };
+        libvm::preflight_recover_checkpoint_disks(
+            &self.config,
+            &reference,
+            &options.external_resources,
+        )
+        .await
+        .map_err(native)?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let machine = state
+                    .runtime()
+                    .await?
+                    .recover_checkpoint_disks(reference, options)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::snapshots::snapshot_to_wire(
+                    &machine.inspect().await.map_err(native)?,
+                )
+                .map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(result))
+    }
+
     async fn inspect_storage_snapshot(
         &self,
         r: Request<w::StorageSnapshotRef>,

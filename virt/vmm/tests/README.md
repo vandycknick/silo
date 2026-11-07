@@ -78,7 +78,8 @@ unit-test harness. The worker is that same executable spawned with argv[0]
 | 25..28 | restore-only RAM, layout, execution and devices objects |
 | 29..31 | forbidden in normal workers (standalone-native endpoints only) |
 | 32 | monitor lifecycle stream, required in every normal worker |
-| 33+ | restore-only VMDK descriptors and inherited extents, at most 16 + 1536 |
+| 33 | restore-only complete canonical RAM map |
+| 34+ | restore-only VMDK descriptors and inherited extents, at most 16 + 1536 |
 
 The tests cover:
 
@@ -143,15 +144,18 @@ reported as a typed verification I/O error.
 
 The resource increment is explicit: a 1 MiB remaining-role SHA buffer and one
 1 MiB requested RAM-thread stack. The existing 8 MiB RAM buffer still computes
-whole-file SHA and canonical stream identity together. libvm admits the
-additional 2 MiB in `reservation_memory_bytes`, separately from its existing
-16 MiB general capture overhead and from persistent state/staging charges.
-The thread's fixed-size closure, result, cancellation and standard-library
-bookkeeping are input-independent metadata covered by that existing general
-overhead, not an unaccounted per-file allocation. Monitor and manager
-authentication are sequential, so their extra-lane charges are a maximum,
-not a sum. There is one fixed-size RAM result, no second role inventory, and
-at most two authentication file descriptors. That descriptor peak is below
+the exact whole-file SHA over every byte. Full capture hashes every identity
+chunk; incremental capture reuses the authenticated map for unaffected chunks
+and hashes complete affected chunks (including explicit zeros and a short tail).
+The complete `memory.map.json` (named wire role `ram-map`) uses ADR 0014's
+existing canonical stream schema, is outside the 1 MiB control records,
+and is charged within the 64 MiB staged
+metadata allowance. At 1 TiB each decoded map has 131072 entries; retained and
+candidate maps have bounded operation/run lifetimes, not a TTL. Result release
+does not release the source's accepted baseline or its map. Restores inherit
+their verified map and child-local native token without scanning live child RAM
+or clearing restore-time dirties. At most two authentication file descriptors
+are open at once. That descriptor peak is below
 the four native output descriptors already admitted during capture preparation;
 held staging directories and the launch lease are unchanged.
 

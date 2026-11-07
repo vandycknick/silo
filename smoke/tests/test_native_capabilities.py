@@ -54,11 +54,9 @@ def test_native_capabilities_machine_less_binding_and_no_mutable_grants(config: 
         if operation == "pause":
             expected = ({"status": "supported"} if report["lane"] == "kvm-x86_64" else
                         {"status": "unsupported", "reason": {"code": "lane-not-qualified", "subject": None}})
-        elif operation in ("capture", "restore", "fork"):
+        else:
             code = "lane-not-qualified" if capability["native"] else "build-excluded"
             expected = {"status": "unsupported", "reason": {"code": code, "subject": None}}
-        else:
-            expected = {"status": "unsupported", "reason": {"code": "not-delivered", "subject": None}}
         assert capability["availability"] == expected
     identity = native_source_identity(report)
     assert identity.kind == "path"

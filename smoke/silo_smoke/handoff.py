@@ -112,13 +112,14 @@ def handoff(source: Runtime, destination: Runtime, *args: str, expect: int | Non
     return source.silo.run("handoff", *args, *destination.destination_flags(), expect=expect, timeout=timeout, label="handoff-" + args[0])
 
 
-def plan(source: Runtime, destination: Runtime, name: str, mode: str, operation: str, *flags: str, running: bool = False) -> dict[str, Any]:
+def plan(source: Runtime, destination: Runtime, name: str, mode: str, operation: str, *flags: str, running: bool = False,
+         batch: NoEffects | None = None) -> dict[str, Any]:
     """Preflight is an observation: it never reserves, stops or writes on either runtime.
 
     A running source's own guest legitimately writes its files, so then only the
     destination is held to byte-for-byte no-effect evidence."""
     runtimes = (destination,) if running else (source, destination)
-    result = without_effects(runtimes, "plan", lambda: handoff(source, destination, "plan", name, "--mode", mode, "--operation", operation, *flags, timeout=300))
+    result = without_effects(runtimes, "plan", lambda: handoff(source, destination, "plan", name, "--mode", mode, "--operation", operation, *flags, timeout=300), batch=batch)
     value = _report(result)
     assert _DIGEST.fullmatch(value["digest"]), value["digest"]
     assert UUID(value["operation"]) == UUID(operation)
@@ -138,16 +139,16 @@ def transfer(source: Runtime, destination: Runtime, name: str, mode: str, operat
     return report
 
 
-def status(source: Runtime, destination: Runtime, operation: str) -> dict[str, Any]:
+def status(source: Runtime, destination: Runtime, operation: str, *, batch: NoEffects | None = None) -> dict[str, Any]:
     """Read-only two-sided observation; it never chooses an outcome."""
-    value = _report(without_effects((source, destination), "status", lambda: handoff(source, destination, "status", operation)))
+    value = _report(without_effects((source, destination), "status", lambda: handoff(source, destination, "status", operation), batch=batch))
     assert UUID(value["operation"]) == UUID(operation)
     return value
 
 
-def stale(source: Runtime, destination: Runtime, label: str, *args: str) -> dict[str, Any] | None:
+def stale(source: Runtime, destination: Runtime, label: str, *args: str, batch: NoEffects | None = None) -> dict[str, Any] | None:
     """Replay an old request: refusal or a historical answer, never a durable change."""
-    result = without_effects((source, destination), label, lambda: handoff(source, destination, *args, expect=None))
+    result = without_effects((source, destination), label, lambda: handoff(source, destination, *args, expect=None), batch=batch)
     return _report(result) if result.returncode == 0 else None
 
 
@@ -347,24 +348,45 @@ def _state(runtimes: tuple[Runtime, ...]) -> list:
     return [(stopped.catalog(runtime.silo), _files(runtime.ws.silo_home)) for runtime in runtimes]
 
 
-def without_effects(runtimes: tuple[Runtime, ...], label: str, action: Callable[[], Result]) -> Result:
-    """Run one CLI action and require unchanged logical catalogs and private Home files on every runtime."""
-    before = _state(runtimes)
-    result = action()
-    after = _state(runtimes)
-    changes = {}
-    for runtime, (old_catalog, old_files), (new_catalog, new_files) in zip(runtimes, before, after):
-        for scope, old, new in (("catalog", old_catalog, new_catalog), ("files", old_files, new_files)):
-            delta = {key: {"before": old.get(key), "after": new.get(key)} for key in sorted(old.keys() | new.keys()) if old.get(key) != new.get(key)}
-            if delta:
-                changes[f"{runtime.label}:{scope}"] = delta
-    runtimes[0].ws.record("handoff-no-effects", json.dumps({"label": label, "args": result.args[1:], "exit": result.returncode, "changes": changes}, sort_keys=True, default=str) + "\n")
-    assert not changes, (label, changes)
-    return result
+class NoEffects:
+    """A no-writer interval of serial read-only/rejected requests on stopped VMs.
+
+    Construct after all setup/writes and discard before any boot, transfer,
+    recovery, abort or daemon restart. Only read-only assertions and evidence
+    logs (outside the Home) may intervene. Each request still independently
+    inventories both catalogs and every previously checked private-file fact;
+    its verified after-state supplies the next request's before-state.
+    """
+
+    def __init__(self, runtimes: tuple[Runtime, ...]) -> None:
+        self.runtimes = runtimes
+        self.before = _state(runtimes)
+
+    def run(self, label: str, action: Callable[[], Result]) -> Result:
+        result = action()
+        after = _state(self.runtimes)
+        changes = {}
+        for runtime, (old_catalog, old_files), (new_catalog, new_files) in zip(self.runtimes, self.before, after):
+            for scope, old, new in (("catalog", old_catalog, new_catalog), ("files", old_files, new_files)):
+                delta = {key: {"before": old.get(key), "after": new.get(key)} for key in sorted(old.keys() | new.keys()) if old.get(key) != new.get(key)}
+                if delta:
+                    changes[f"{runtime.label}:{scope}"] = delta
+        self.runtimes[0].ws.record("handoff-no-effects", json.dumps({"label": label, "args": result.args[1:], "exit": result.returncode, "changes": changes}, sort_keys=True, default=str) + "\n")
+        assert not changes, (label, changes)
+        self.before = after
+        return result
 
 
-def refuse(source: Runtime, destination: Runtime, label: str, *args: str) -> Result:
-    result = without_effects((source, destination), label, lambda: handoff(source, destination, *args, expect=None))
+def without_effects(runtimes: tuple[Runtime, ...], label: str, action: Callable[[], Result], *, batch: NoEffects | None = None) -> Result:
+    """Require unchanged logical catalogs and private Home files after one CLI action."""
+    if batch is None:
+        batch = NoEffects(runtimes)
+    assert batch.runtimes == runtimes, "a no-effects batch is bound to its ordered runtime pair"
+    return batch.run(label, action)
+
+
+def refuse(source: Runtime, destination: Runtime, label: str, *args: str, batch: NoEffects | None = None) -> Result:
+    result = without_effects((source, destination), label, lambda: handoff(source, destination, *args, expect=None), batch=batch)
     assert result.returncode != 0, (label, result.stdout)
     return result
 

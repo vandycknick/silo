@@ -202,6 +202,10 @@ Aliases share one `image:` namespace with snapshots. A snapshot source preserves
 its complete captured configuration; only `--name` applies. Stopped checkpoints
 restore stopped; live execution checkpoints require compatible live-restore
 admission rather than falling back to a cold boot.
+For explicit storage-only recovery of a live checkpoint, use
+`silo recover-disks image:<CHECKPOINT> --name <CHILD>`. This creates a stopped
+machine with private disks and the captured boot assets, not resumed execution.
+Its stop outcome is unknown; an explicit `silo start <CHILD>` cold-boots it.
 
 Transfer a complete managed image through an OCI VM artifact:
 

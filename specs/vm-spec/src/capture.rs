@@ -1,4 +1,4 @@
-//! ADR 0021 full-capture contract shared by libvm (planner, verifier and
+//! ADR 0021 capture contract shared by libvm (planner, verifier and
 //! publisher) and the monitor (sole writer of staging and evidence).
 //!
 //! ```text
@@ -37,6 +37,10 @@ pub const CAPTURE_EXECUTION_FILE: &str = "execution.state";
 pub const CAPTURE_DEVICES_FILE: &str = "devices.state";
 pub const CAPTURE_RAM_FILE: &str = "memory.ram";
 pub const CAPTURE_LAYOUT_FILE: &str = "memory-layout.json";
+pub const CAPTURE_RAM_MAP_FILE: &str = "memory.map.json";
+/// Complete canonical map bound, separate from the 1 MiB control records.
+pub const MAX_RAM_MAP_BYTES: usize =
+    (MAX_CAPTURE_RAM_BYTES / STREAM_CHUNK_BYTES) as usize * 74 + 256;
 pub const CAPTURE_EVIDENCE_FILE: &str = "vm.capture.json";
 pub const CAPTURE_SOURCE_FILE: &str = "vm.capture-source.json";
 /// The only temporary names a reader may find next to the records. A
@@ -230,6 +234,136 @@ impl StreamIdentity {
     }
 }
 
+/// ADR 0014 complete canonical stream map. `None` denotes an entire zero chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamMap {
+    length: u64,
+    chunks: Vec<Option<Sha256Digest>>,
+}
+
+impl StreamMap {
+    pub fn new(length: u64, chunks: Vec<Option<Sha256Digest>>) -> Result<Self, String> {
+        if length > MAX_STREAM_BYTES || chunks.len() as u64 != length.div_ceil(STREAM_CHUNK_BYTES) {
+            return Err(invalid("stream map length or chunk count is invalid"));
+        }
+        Ok(Self { length, chunks })
+    }
+
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+    pub fn chunks(&self) -> &[Option<Sha256Digest>] {
+        &self.chunks
+    }
+    pub fn into_chunks(self) -> Vec<Option<Sha256Digest>> {
+        self.chunks
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > (MAX_STREAM_BYTES / STREAM_CHUNK_BYTES) as usize * 74 + 256 {
+            return Err(invalid("stream map exceeds its encoded bound"));
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Record {
+            schema: u64,
+            kind: String,
+            length: u64,
+            chunk_size: u64,
+            #[serde(deserialize_with = "decode_map_chunks")]
+            chunks: Vec<Option<Sha256Digest>>,
+        }
+        struct ObjectRecord;
+        impl<'de> serde::de::Visitor<'de> for ObjectRecord {
+            type Value = Record;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a stream map object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Record, A::Error> {
+                Record::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+        let mut decoder = serde_json::Deserializer::from_slice(bytes);
+        let record = decoder
+            .deserialize_map(ObjectRecord)
+            .map_err(|error| error.to_string())?;
+        decoder.end().map_err(|error| error.to_string())?;
+        if record.schema != 1 || record.kind != "stream" || record.chunk_size != STREAM_CHUNK_BYTES
+        {
+            return Err(invalid("unsupported stream map schema, kind or chunk size"));
+        }
+        Self::new(record.length, record.chunks)
+    }
+
+    pub fn write_canonical(&self, mut output: impl std::io::Write) -> std::io::Result<()> {
+        output.write_all(b"{\"chunkSize\":8388608,\"chunks\":[")?;
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            if index != 0 {
+                output.write_all(b",")?;
+            }
+            match chunk {
+                None => output.write_all(b"\"zero\"")?,
+                Some(digest) => write!(output, "\"{digest}\"")?,
+            }
+        }
+        write!(
+            output,
+            "],\"kind\":\"stream\",\"length\":{},\"schema\":1}}",
+            self.length
+        )
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        self.write_canonical(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(bytes)
+    }
+
+    pub fn id(&self) -> Sha256Digest {
+        let mut identity = StreamIdentity::new();
+        let mut remaining = self.length;
+        for digest in &self.chunks {
+            // Constructor enforces the exact count and final range.
+            let _ = identity.push_digest(remaining.min(STREAM_CHUNK_BYTES), *digest);
+            remaining = remaining.saturating_sub(STREAM_CHUNK_BYTES);
+        }
+        identity.finish()
+    }
+}
+
+fn decode_map_chunks<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<Option<Sha256Digest>>, D::Error> {
+    struct Chunks;
+    impl<'de> serde::de::Visitor<'de> for Chunks {
+        type Value = Vec<Option<Sha256Digest>>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded array of zero or lowercase SHA-256 entries")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut chunks = Vec::new();
+            while let Some(entry) = sequence.next_element::<String>()? {
+                if chunks.len() as u64 == MAX_STREAM_BYTES / STREAM_CHUNK_BYTES {
+                    return Err(serde::de::Error::custom("too many stream chunks"));
+                }
+                chunks.push(if entry == "zero" {
+                    None
+                } else {
+                    Some(entry.parse().map_err(serde::de::Error::custom)?)
+                });
+            }
+            Ok(chunks)
+        }
+    }
+    decoder.deserialize_seq(Chunks)
+}
+
 /// Name of one writable disk capture: `disks/<name>.raw`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -275,14 +409,15 @@ impl From<CaptureDiskName> for String {
     }
 }
 
-/// One staged payload. Serialized as its fixed path relative to the capture
-/// directory, so a role can never name an arbitrary file.
+/// One named staged payload. Native payloads use their fixed relative paths;
+/// `ram-map` selects the fixed `memory.map.json` sidecar, never an arbitrary path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CaptureRole {
     Execution,
     Devices,
     Ram,
     Layout,
+    RamMap,
     Disk(CaptureDiskName),
 }
 
@@ -293,6 +428,7 @@ impl CaptureRole {
             Self::Devices => CAPTURE_DEVICES_FILE.into(),
             Self::Ram => CAPTURE_RAM_FILE.into(),
             Self::Layout => CAPTURE_LAYOUT_FILE.into(),
+            Self::RamMap => CAPTURE_RAM_MAP_FILE.into(),
             Self::Disk(name) => format!("{CAPTURE_DISKS_DIRECTORY}/{}", name.file_name()),
         }
     }
@@ -307,6 +443,7 @@ impl FromStr for CaptureRole {
             CAPTURE_DEVICES_FILE => Self::Devices,
             CAPTURE_RAM_FILE => Self::Ram,
             CAPTURE_LAYOUT_FILE => Self::Layout,
+            "ram-map" => Self::RamMap,
             other => {
                 let name = other
                     .strip_prefix(CAPTURE_DISKS_DIRECTORY)
@@ -321,7 +458,10 @@ impl FromStr for CaptureRole {
 
 impl Serialize for CaptureRole {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.relative_path())
+        match self {
+            Self::RamMap => serializer.serialize_str("ram-map"),
+            _ => serializer.serialize_str(&self.relative_path()),
+        }
     }
 }
 
@@ -567,6 +707,7 @@ pub struct CapturePlan {
     pub configuration: CaptureConfiguration,
     pub configuration_digest: Sha256Digest,
     pub policy: CapturePolicy,
+    pub dirty_crossover_percent: u8,
     pub resume_policy: CaptureResumePolicy,
     pub pause: CapturePauseAuthority,
     pub ram_bytes: u64,
@@ -579,6 +720,9 @@ impl CapturePlan {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != CAPTURE_RECORD_VERSION {
             return Err(invalid("unsupported capture plan version"));
+        }
+        if !(1..=60).contains(&self.dirty_crossover_percent) {
+            return Err(invalid("dirty crossover percent must be 1..=60"));
         }
         self.configuration.validate()?;
         if self.configuration.digest()? != self.configuration_digest {
@@ -708,13 +852,14 @@ impl CapturePlan {
     }
 
     /// The exact closed payload inventory of a coherent capture, in canonical
-    /// order: execution, devices, RAM, layout, then disks in attachment order.
+    /// order: execution, devices, RAM, layout, complete RAM map, then disks.
     pub fn roles(&self) -> Vec<CaptureRole> {
         let mut roles = vec![
             CaptureRole::Execution,
             CaptureRole::Devices,
             CaptureRole::Ram,
             CaptureRole::Layout,
+            CaptureRole::RamMap,
         ];
         roles.extend(
             self.disks
@@ -741,6 +886,35 @@ pub struct CaptureStateBinding {
     pub capture: LiveId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureFullReason {
+    Requested,
+    NoBaseline,
+    BaselineToken,
+    CoverageLost,
+    DirtyCrossover,
+}
+
+/// Native materialization and identity authentication costs, counted separately.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureMemoryStats {
+    pub logical_bytes: u64,
+    pub live_bytes_read: u64,
+    pub baseline_bytes_read: u64,
+    pub baseline_bytes_written: u64,
+    pub overlay_bytes_written: u64,
+    pub full_bytes_written: u64,
+    pub layout_bytes_written: u64,
+    pub baseline_hole_bytes: u64,
+    pub zero_bytes_omitted: u64,
+    pub explicit_zero_bytes_written: u64,
+    pub extent_queries: u64,
+    pub identity_bytes_hashed: u64,
+    pub whole_file_bytes_hashed: u64,
+}
+
 /// RAM layout and geometry of `memory.ram`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -751,6 +925,113 @@ pub struct CaptureMemoryEvidence {
     /// ADR 0014 canonical stream identity of `memory.ram`.
     pub ram_stream: Sha256Digest,
     pub binding: CaptureStateBinding,
+    pub mode: CapturePolicy,
+    #[serde(deserialize_with = "required")]
+    pub baseline: Option<Sha256Digest>,
+    #[serde(deserialize_with = "required")]
+    pub full_reason: Option<CaptureFullReason>,
+    /// One bit per 8 MiB chunk, least-significant bit first, zero tail padding.
+    pub dirty_chunks: Vec<u8>,
+    pub stats: CaptureMemoryStats,
+}
+
+impl CaptureMemoryEvidence {
+    pub fn validate_capture(&self) -> Result<(), String> {
+        if !self.page_granule.is_power_of_two()
+            || self.page_granule < 4096
+            || self.regions == 0
+            || !self
+                .packed_length
+                .is_multiple_of(u64::from(self.page_granule))
+            || u64::from(self.regions) > self.packed_length / u64::from(self.page_granule)
+            || self.binding.native_producer.is_empty()
+            || self.binding.native_producer.contains('\0')
+            || self.binding.native_producer.len() > MAX_NATIVE_PRODUCER_BYTES
+            || [
+                self.binding.silo_producer,
+                self.binding.profile,
+                self.binding.topology,
+                self.binding.ram_layout,
+            ]
+            .iter()
+            .any(|digest| digest.as_bytes().iter().all(|byte| *byte == 0))
+        {
+            return Err(invalid(
+                "RAM geometry or native producer binding is invalid",
+            ));
+        }
+        validate_dirty_chunks(self.packed_length, &self.dirty_chunks)?;
+        match self.mode {
+            CapturePolicy::Full if self.baseline.is_some() || self.full_reason.is_none() => {
+                return Err(invalid(
+                    "full RAM capture requires a reason and no reused baseline",
+                ));
+            }
+            CapturePolicy::Incremental if self.baseline.is_none() || self.full_reason.is_some() => {
+                return Err(invalid(
+                    "incremental RAM capture requires its exact baseline",
+                ));
+            }
+            _ => {}
+        }
+        if self.mode == CapturePolicy::Full {
+            let count = self.packed_length.div_ceil(STREAM_CHUNK_BYTES) as usize;
+            if (0..count).any(|index| self.dirty_chunks[index / 8] & (1 << (index % 8)) == 0) {
+                return Err(invalid("full RAM capture must affect every chunk"));
+            }
+        }
+        let count = self.packed_length.div_ceil(STREAM_CHUNK_BYTES) as usize;
+        let identity_bytes: u64 = (0..count)
+            .filter(|index| self.dirty_chunks[index / 8] & (1 << (index % 8)) != 0)
+            .map(|index| {
+                (self.packed_length - index as u64 * STREAM_CHUNK_BYTES).min(STREAM_CHUNK_BYTES)
+            })
+            .sum();
+        if self.stats.logical_bytes != self.packed_length
+            || self.stats.whole_file_bytes_hashed != self.packed_length
+            || self.stats.identity_bytes_hashed != identity_bytes
+            || self.stats.live_bytes_read > self.packed_length
+            || self.stats.baseline_bytes_read > self.packed_length
+            || self.stats.baseline_bytes_written > self.packed_length
+            || self.stats.overlay_bytes_written > self.packed_length
+            || self.stats.full_bytes_written > self.packed_length
+            || self.stats.layout_bytes_written > 64 * 1024
+        {
+            return Err(invalid(
+                "RAM authentication statistics differ from the complete stream",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate exact dense coverage, including unused bits at the admitted 1 TiB bound.
+pub fn validate_dirty_chunks(length: u64, bitmap: &[u8]) -> Result<(), String> {
+    if length == 0 || length > MAX_CAPTURE_RAM_BYTES {
+        return Err(invalid("RAM coverage length is outside its bound"));
+    }
+    let chunks = length.div_ceil(STREAM_CHUNK_BYTES) as usize;
+    if bitmap.len() != chunks.div_ceil(8)
+        || (!chunks.is_multiple_of(8)
+            && bitmap.last().is_some_and(|last| *last >> (chunks % 8) != 0))
+    {
+        return Err(invalid("RAM chunk bitmap length or padding is invalid"));
+    }
+    Ok(())
+}
+
+pub fn full_dirty_chunks(length: u64) -> Result<Vec<u8>, String> {
+    if length == 0 || length > MAX_CAPTURE_RAM_BYTES {
+        return Err(invalid("RAM coverage length is outside its bound"));
+    }
+    let count = length.div_ceil(STREAM_CHUNK_BYTES) as usize;
+    let mut bitmap = vec![u8::MAX; count.div_ceil(8)];
+    if !count.is_multiple_of(8) {
+        if let Some(last) = bitmap.last_mut() {
+            *last = ((1u16 << (count % 8)) - 1) as u8;
+        }
+    }
+    Ok(bitmap)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -908,14 +1189,19 @@ impl CaptureEvidence {
                 {
                     return Err(invalid("capture binding does not match its cut"));
                 }
-                if !memory.page_granule.is_power_of_two()
-                    || memory.page_granule < 4096
-                    || memory.regions == 0
-                    || memory.packed_length == 0
-                    || memory.packed_length > MAX_CAPTURE_RAM_BYTES
-                    || memory.packed_length % u64::from(memory.page_granule) != 0
-                {
-                    return Err(invalid("capture RAM geometry is invalid"));
+                memory.validate_capture()?;
+                for role in [
+                    CaptureRole::Execution,
+                    CaptureRole::Devices,
+                    CaptureRole::Ram,
+                    CaptureRole::Layout,
+                    CaptureRole::RamMap,
+                ] {
+                    if !self.inventory.iter().any(|entry| entry.role == role) {
+                        return Err(invalid(
+                            "coherent capture lacks a required complete output role",
+                        ));
+                    }
                 }
                 let mut state_bytes = 0u64;
                 for (index, entry) in self.inventory.iter().enumerate() {
@@ -925,11 +1211,18 @@ impl CaptureEvidence {
                     {
                         return Err(invalid("capture inventory repeats a role"));
                     }
+                    if entry.role == CaptureRole::RamMap && entry.length > MAX_RAM_MAP_BYTES as u64
+                    {
+                        return Err(invalid("complete RAM map exceeds its metadata bound"));
+                    }
                     match &entry.role {
                         CaptureRole::Ram if entry.length != memory.packed_length => {
                             return Err(invalid("RAM length differs from its layout"));
                         }
-                        CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout => {
+                        CaptureRole::Execution
+                        | CaptureRole::Devices
+                        | CaptureRole::Layout
+                        | CaptureRole::RamMap => {
                             if entry.length == 0 {
                                 return Err(invalid("captured state files are nonempty"));
                             }
@@ -967,6 +1260,23 @@ impl CaptureEvidence {
         }
         if self.capture_outcome == CaptureRecordOutcome::Failed {
             return Ok(());
+        }
+        if self.memory.as_ref().is_some_and(|memory| {
+            plan.policy == CapturePolicy::Full
+                && (memory.mode != CapturePolicy::Full
+                    || memory.full_reason != Some(CaptureFullReason::Requested))
+        }) {
+            return Err(invalid(
+                "explicit full capture did not return the requested full mode",
+            ));
+        }
+        if self.memory.as_ref().is_some_and(|memory| {
+            plan.policy == CapturePolicy::Incremental
+                && memory.full_reason == Some(CaptureFullReason::Requested)
+        }) {
+            return Err(invalid(
+                "incremental request returned an explicit-full reason",
+            ));
         }
         let expected_disposition = match &plan.pause {
             CapturePauseAuthority::Acquire => CapturePauseDisposition::Acquired,
@@ -1302,6 +1612,7 @@ mod tests {
             ram_bytes: configuration.ram_bytes(),
             configuration,
             policy: CapturePolicy::Full,
+            dirty_crossover_percent: 60,
             resume_policy: CaptureResumePolicy::ResumeIfAcquired,
             pause: CapturePauseAuthority::Acquire,
             disks: vec![
@@ -1370,6 +1681,16 @@ mod tests {
                     source_run: run(),
                     pause_generation: NonZeroU64::new(3).unwrap(),
                     capture: capture(),
+                },
+                mode: CapturePolicy::Full,
+                baseline: None,
+                full_reason: Some(CaptureFullReason::Requested),
+                dirty_chunks: crate::capture::full_dirty_chunks(1 << 30).unwrap(),
+                stats: CaptureMemoryStats {
+                    logical_bytes: 1 << 30,
+                    whole_file_bytes_hashed: 1 << 30,
+                    identity_bytes_hashed: 1 << 30,
+                    ..Default::default()
                 },
             }),
             inventory: plan
@@ -1780,14 +2101,14 @@ mod tests {
             lowers: vec![RestoreLower {
                 block_id: BlockId::new("silo-root-lower").unwrap(),
                 descriptor: RestoreDescriptor {
-                    fd: 7,
+                    fd: 8,
                     file_device: 1,
                     file_inode: 7,
                     length: 512,
                 },
                 extents: vec![RestoreExtent {
                     path: "/pool/lower".into(),
-                    fd: 8,
+                    fd: 9,
                     file_device: 1,
                     file_inode: 8,
                     length: 1 << 30,
@@ -1907,5 +2228,90 @@ mod tests {
         };
         assert!(failed.is_terminal());
         assert!(!CaptureContinuation::Pending.is_terminal());
+    }
+
+    #[test]
+    fn complete_maps_share_identity_and_reject_malformed_encodings() {
+        let digest = Sha256Digest::of_bytes(b"short final chunk");
+        let map = StreamMap::new(STREAM_CHUNK_BYTES + 17, vec![None, Some(digest)]).unwrap();
+        let mut identity = StreamIdentity::new();
+        identity.push_digest(STREAM_CHUNK_BYTES, None).unwrap();
+        identity.push_digest(17, Some(digest)).unwrap();
+        assert_eq!(map.id(), identity.finish());
+        let encoded = map.canonical_bytes().unwrap();
+        assert_eq!(StreamMap::decode(&encoded).unwrap(), map);
+        assert!(StreamMap::new(STREAM_CHUNK_BYTES + 1, vec![None]).is_err());
+        for malformed in [
+            br#"{"chunkSize":8388608,"chunks":[],"kind":"stream","length":1,"schema":1}"#.as_slice(),
+            br#"{"chunkSize":8388608,"chunks":["zero"],"kind":"stream","length":1,"schema":1,"schema":1}"#,
+            br#"{"chunkSize":4096,"chunks":["zero"],"kind":"stream","length":1,"schema":1}"#,
+            br#"{"chunkSize":8388608,"chunks":[null],"kind":"stream","length":1,"schema":1}"#,
+        ] { assert!(StreamMap::decode(malformed).is_err()); }
+        assert_eq!(CaptureRole::RamMap.relative_path(), "memory.map.json");
+        assert_eq!(
+            "ram-map".parse::<CaptureRole>().unwrap(),
+            CaptureRole::RamMap
+        );
+        assert_eq!(
+            serde_json::to_string(&CaptureRole::RamMap).unwrap(),
+            "\"ram-map\""
+        );
+        assert!("memory.map.json".parse::<CaptureRole>().is_err());
+    }
+
+    #[test]
+    fn ram_metadata_at_one_tib_is_bounded_outside_control_records() {
+        let count = (MAX_CAPTURE_RAM_BYTES / STREAM_CHUNK_BYTES) as usize;
+        let bitmap = full_dirty_chunks(MAX_CAPTURE_RAM_BYTES).unwrap();
+        assert_eq!(bitmap.len(), 16384);
+        validate_dirty_chunks(MAX_CAPTURE_RAM_BYTES, &bitmap).unwrap();
+        assert!(validate_dirty_chunks(MAX_CAPTURE_RAM_BYTES, &bitmap[..bitmap.len() - 1]).is_err());
+        assert!(validate_dirty_chunks(1, &[2]).is_err());
+        assert!(full_dirty_chunks(0).is_err());
+        assert!(full_dirty_chunks(MAX_CAPTURE_RAM_BYTES + 1).is_err());
+        let map = StreamMap::new(
+            MAX_CAPTURE_RAM_BYTES,
+            vec![Some(Sha256Digest::of_bytes(b"chunk")); count],
+        )
+        .unwrap();
+        let encoded = map.canonical_bytes().unwrap();
+        assert!(encoded.len() > MAX_CAPTURE_RECORD_BYTES);
+        assert!(encoded.len() < MAX_RAM_MAP_BYTES);
+        assert!((MAX_RAM_MAP_BYTES as u64) < CAPTURE_STATE_RESERVE_BYTES);
+        assert_eq!(StreamMap::decode(&encoded).unwrap(), map);
+    }
+
+    #[test]
+    fn crossover_and_actual_mode_are_independent_validated_facts() {
+        let mut plan = plan();
+        for threshold in [0, 61, 255] {
+            plan.dirty_crossover_percent = threshold;
+            assert!(plan.validate().is_err());
+        }
+        for threshold in [1, 60] {
+            plan.dirty_crossover_percent = threshold;
+            plan.validate().unwrap();
+        }
+        let mut seal = evidence(&plan);
+        seal.memory.as_ref().unwrap().validate_capture().unwrap();
+        let mut memory = seal.memory.clone().unwrap();
+        memory.mode = CapturePolicy::Incremental;
+        memory.full_reason = None;
+        assert!(memory.validate_capture().is_err());
+        memory.baseline = Some(Sha256Digest::of_bytes(b"exact predecessor stream"));
+        memory.validate_capture().unwrap();
+        seal.memory = Some(memory.clone());
+        assert!(seal
+            .validate_against_plan(&plan, &seal.request_digest)
+            .is_err());
+        plan.policy = CapturePolicy::Incremental;
+        seal.request_digest = Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap());
+        seal.validate_against_plan(&plan, &seal.request_digest)
+            .unwrap();
+        memory.stats.identity_bytes_hashed -= 1;
+        assert!(memory.validate_capture().is_err());
+        memory.stats.identity_bytes_hashed += 1;
+        memory.page_granule = 0;
+        assert!(memory.validate_capture().is_err());
     }
 }

@@ -425,6 +425,9 @@ pub struct CapturePreparation {
     pub pause: CapturePauseSource,
     pub resume_policy: CaptureResumePolicy,
     pub binding: CaptureDigests,
+    pub policy: vm_spec::lifecycle::CapturePolicy,
+    pub dirty_crossover_percent: u8,
+    pub baseline: Option<Digest32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -931,13 +934,19 @@ pub enum CommandOutcome {
         execution: OutputReceipt,
         devices: OutputReceipt,
     },
-    /// Full RAM candidate; native closed both writers when `writers_closed`.
+    /// Complete RAM candidate; native closed both writers when `writers_closed`.
     MemoryCaptured {
         binding: Box<CaptureStateBinding>,
         ram: OutputReceipt,
         layout: OutputReceipt,
         memory_generation: u64,
         writers_closed: bool,
+        mode: vm_spec::lifecycle::CapturePolicy,
+        baseline: Option<vm_spec::capture::Sha256Digest>,
+        full_reason: Option<vm_spec::capture::CaptureFullReason>,
+        dirty_chunks: Vec<u8>,
+        /// Keep capture-only counters out of every retained command's inline size.
+        stats: Box<vm_spec::capture::CaptureMemoryStats>,
     },
     CaptureAccepted {
         memory_generation: u64,
@@ -1487,6 +1496,9 @@ impl LifecycleRequest {
             return invalid(InvalidRequest::ActivationRequestIdentity);
         }
         if let LifecycleCommand::PrepareCapture { preparation, .. } = &self.command {
+            if !(1..=60).contains(&preparation.dirty_crossover_percent) {
+                return invalid(InvalidRequest::CapturePolicy);
+            }
             if let CapturePauseSource::Borrow { operation, .. } = preparation.pause {
                 if operation.is_nil() {
                     return invalid(InvalidRequest::NilIdentity);
@@ -1774,6 +1786,9 @@ mod tests {
                 profile: Digest32([2; 32]),
                 topology: Digest32([3; 32]),
             },
+            policy: vm_spec::lifecycle::CapturePolicy::Full,
+            dirty_crossover_percent: 60,
+            baseline: None,
         }
     }
 
