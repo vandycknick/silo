@@ -168,6 +168,23 @@ fn rootfs_from_wire(v: w::Rootfs) -> Result<libvm::MachineRootfs, ConversionErro
     out.image_id = v.image_id;
     Ok(out)
 }
+fn storage_stop_outcome_to_wire(v: libvm::StorageStopOutcome) -> w::StorageStopOutcome {
+    match v {
+        libvm::StorageStopOutcome::Clean => w::StorageStopOutcome::Clean,
+        libvm::StorageStopOutcome::Forced => w::StorageStopOutcome::Forced,
+        libvm::StorageStopOutcome::Unknown => w::StorageStopOutcome::Unknown,
+    }
+}
+fn storage_stop_outcome_from_wire(v: i32) -> Result<libvm::StorageStopOutcome, ConversionError> {
+    match w::StorageStopOutcome::try_from(v) {
+        Ok(w::StorageStopOutcome::Clean) => Ok(libvm::StorageStopOutcome::Clean),
+        Ok(w::StorageStopOutcome::Forced) => Ok(libvm::StorageStopOutcome::Forced),
+        Ok(w::StorageStopOutcome::Unknown) => Ok(libvm::StorageStopOutcome::Unknown),
+        Ok(w::StorageStopOutcome::Unspecified) | Err(_) => {
+            Err(invalid("machine.storage_stop_outcome", "invalid enum"))
+        }
+    }
+}
 pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, ConversionError> {
     if v.live.is_some() && v.prospective_live.is_some() {
         return Err(invalid(
@@ -247,6 +264,9 @@ pub fn snapshot_to_wire(v: &libvm::MachineData) -> Result<w::MachineSnapshot, Co
             v.boot_profile.as_ref(),
             v.boot_replacement.as_ref(),
         )?,
+        storage_stop_outcome: v
+            .storage_stop_outcome
+            .map(|outcome| storage_stop_outcome_to_wire(outcome) as i32),
     })
 }
 pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, ConversionError> {
@@ -349,6 +369,10 @@ pub fn snapshot_from_wire(v: w::MachineSnapshot) -> Result<libvm::MachineData, C
         .map(crate::capture::machine_capture_from_wire)
         .collect::<Result<_, _>>()?;
     (out.boot_profile, out.boot_replacement) = crate::boot::machine_boot_from_wire(v.boot)?;
+    out.storage_stop_outcome = v
+        .storage_stop_outcome
+        .map(storage_stop_outcome_from_wire)
+        .transpose()?;
     if let Some(live) = &out.live {
         if !crate::live::same_machine_identity(&live.machine_id, &out.id)
             || Some(live.run_id.as_str())

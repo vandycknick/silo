@@ -191,6 +191,22 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = message.clone();
             tonic::Code::InvalidArgument
         }
+        E::ArtifactInvalid { .. } | E::ArtifactWire(_) => {
+            d.kind = 1;
+            d.safe_message = "artifact integrity or semantic validation failed".into();
+            tonic::Code::InvalidArgument
+        }
+        E::ArtifactTrustMismatch { .. } => {
+            d.kind = 6;
+            d.safe_message = "resolved artifact index differs from the approved digest".into();
+            tonic::Code::PermissionDenied
+        }
+        E::ArtifactSignatureProviderUnavailable
+        | E::CheckpointPublicationNotAcknowledged { .. } => {
+            d.kind = 4;
+            d.safe_message = v.to_string();
+            tonic::Code::FailedPrecondition
+        }
         E::BackendAdmissionRejected {
             source_family,
             root_profile,

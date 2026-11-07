@@ -251,6 +251,36 @@ impl AppApi {
         }
     }
 
+    pub(crate) async fn inspect_artifact(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::ArtifactInspection> {
+        match self {
+            Self::Local(service) => service.inspect_artifact(reference).await,
+            Self::Daemon(service) => service.inspect_artifact(reference).await,
+        }
+    }
+
+    pub(crate) async fn acquire_artifact(
+        &mut self,
+        request: libvm::ArtifactAcquireRequest,
+    ) -> eyre::Result<libvm::ArtifactAcquireReport> {
+        match self {
+            Self::Local(service) => service.acquire_artifact(request).await,
+            Self::Daemon(service) => service.acquire_artifact(request).await,
+        }
+    }
+
+    pub(crate) async fn publish_artifact(
+        &mut self,
+        request: libvm::ArtifactPublishRequest,
+    ) -> eyre::Result<libvm::ArtifactPublishReport> {
+        match self {
+            Self::Local(service) => service.publish_artifact(request).await,
+            Self::Daemon(service) => service.publish_artifact(request).await,
+        }
+    }
+
     pub(crate) async fn import_image(
         &mut self,
         request: libvm::DiskImportRequest,

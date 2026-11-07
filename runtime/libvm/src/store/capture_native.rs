@@ -10,7 +10,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 
 use uuid::Uuid;
-use vm_spec::capture::{CapturePlan, CaptureStateBinding};
+use vm_spec::capture::{CaptureConfiguration, CaptureStateBinding};
 
 use crate::store::capture::Layout;
 use crate::store::models::snapshot::invalid;
@@ -21,11 +21,13 @@ pub(crate) const MAX_DEVICE_BYTES: u64 = 32 << 20;
 const MAX_ATTACHMENTS: usize = 256;
 const MAX_DEVICE_PAYLOAD: usize = 262_144;
 
+/// Correlates both native envelopes with the captured configuration only.
+/// Local capture, portable import and restore share this; none needs a plan.
 pub(crate) fn verify_headers(
     execution: &File,
     devices: &File,
     binding: &CaptureStateBinding,
-    plan: &CapturePlan,
+    configuration: &CaptureConfiguration,
     layout: &Layout,
 ) -> Result<(), LibVmError> {
     let mut execution = HeaderReader::new(execution, MAX_EXECUTION_BYTES)?;
@@ -45,7 +47,7 @@ pub(crate) fn verify_headers(
     }
     execution.binding(binding)?;
     let cpus = execution.count(255, 9)?;
-    if cpus != usize::from(plan.configuration.cpus) || cpus == 0 {
+    if cpus != usize::from(configuration.cpus) || cpus == 0 {
         return Err(invalid(
             "native CPU topology differs from capture configuration",
         ));
@@ -116,8 +118,8 @@ pub(crate) fn verify_headers(
         .iter()
         .filter(|(kind, _, _, _)| *kind == 2)
         .count();
-    if block_count != plan.configuration.attachments.len()
-        || plan.configuration.attachments.iter().any(|expected| {
+    if block_count != configuration.attachments.len()
+        || configuration.attachments.iter().any(|expected| {
             !attachments
                 .iter()
                 .any(|(kind, id, _, _)| *kind == 2 && id == expected.block_id.as_str())

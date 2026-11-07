@@ -13,6 +13,19 @@ pub enum OciError {
     Changeset(#[from] crate::changeset::ChangesetError),
     #[error(transparent)]
     Namespace(#[from] crate::changeset::namespace::NamespaceError),
+    #[error(transparent)]
+    VmArtifact(#[from] crate::vm_artifact::Error),
+    #[error("OCI reference {reference:?} is not a Silo VM artifact")]
+    NotVmArtifact { reference: String },
+    #[error("Silo VM artifact {reference:?} requires explicit acquisition approving index {index_digest}")]
+    VmArtifactRequiresAcquisition {
+        reference: String,
+        index_digest: String,
+    },
+    #[error(
+        "registry {reference:?} does not preserve the required OCI VM artifact graph: {message}"
+    )]
+    ArtifactRegistryIncompatible { reference: String, message: String },
     #[error("invalid staging operation ID {value:?}: expected a canonical lowercase UUID")]
     InvalidOperationId { value: String },
 

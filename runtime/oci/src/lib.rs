@@ -1,3 +1,4 @@
+pub mod artifact_registry;
 pub mod changeset;
 mod digest;
 mod error;
@@ -8,6 +9,7 @@ mod policy;
 mod progress;
 mod registry;
 mod store;
+pub mod vm_artifact;
 
 pub use crate::error::{OciError, OciResult};
 pub use crate::platform::Platform;

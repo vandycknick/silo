@@ -20,12 +20,12 @@ pub(crate) const CONVERSION_ABI: &str = "flat-ext4-v2:normalized-phase2:minimum-
 
 pub(crate) fn image_error(reference: &str, source: OciError) -> LibVmError {
     match source {
-        OciError::InvalidReference { .. } | OciError::RegistryPolicyDenied { .. } => {
-            LibVmError::ImageReferenceRejected {
-                reference: reference.into(),
-                message: source.to_string(),
-            }
-        }
+        OciError::InvalidReference { .. }
+        | OciError::RegistryPolicyDenied { .. }
+        | OciError::VmArtifactRequiresAcquisition { .. } => LibVmError::ImageReferenceRejected {
+            reference: reference.into(),
+            message: source.to_string(),
+        },
         source => LibVmError::Image {
             reference: reference.into(),
             source,
@@ -270,6 +270,15 @@ pub(crate) async fn acquire_rootfs<S: ImageStore + ?Sized>(
             reference: resolved.selected_reference.clone(),
         });
     };
+    let source_blobs = image
+        .layer_digests()
+        .map(str::parse)
+        .collect::<Result<Vec<crate::ObjectDigest>, _>>()
+        .map_err(|error| LibVmError::StateDecode {
+            field: "image.source-blob",
+            message: error.to_string(),
+        })?;
+    store.pin_source_blobs(operation_id, &source_blobs).await?;
     let options = MaterializeOptions::new(resolved.platform.clone());
     let staging_operation = ::oci::StagingOperation::try_from(operation_id.to_string())
         .map_err(|error| image_error(&resolved.requested_reference, error))?;

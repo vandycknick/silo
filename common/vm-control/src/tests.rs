@@ -653,6 +653,41 @@ fn snapshot_requires_explicit_run_prospective_or_unavailable_evidence() {
 }
 
 #[test]
+fn snapshot_carries_storage_stop_outcome_and_refuses_unknown_values() {
+    let mut data = snapshot();
+    let wire = snapshot_to_wire(&data).unwrap();
+    assert_eq!(wire.storage_stop_outcome, None);
+    assert_eq!(snapshot_from_wire(wire).unwrap().storage_stop_outcome, None);
+    for (outcome, expected) in [
+        (
+            libvm::StorageStopOutcome::Clean,
+            w::StorageStopOutcome::Clean,
+        ),
+        (
+            libvm::StorageStopOutcome::Forced,
+            w::StorageStopOutcome::Forced,
+        ),
+        (
+            libvm::StorageStopOutcome::Unknown,
+            w::StorageStopOutcome::Unknown,
+        ),
+    ] {
+        data.storage_stop_outcome = Some(outcome);
+        let wire = snapshot_to_wire(&data).unwrap();
+        assert_eq!(wire.storage_stop_outcome, Some(expected as i32));
+        assert_eq!(
+            snapshot_from_wire(wire).unwrap().storage_stop_outcome,
+            Some(outcome)
+        );
+    }
+    let mut wire = snapshot_to_wire(&data).unwrap();
+    for invalid in [w::StorageStopOutcome::Unspecified as i32, 4, -1] {
+        wire.storage_stop_outcome = Some(invalid);
+        assert!(snapshot_from_wire(wire.clone()).is_err(), "{invalid}");
+    }
+}
+
+#[test]
 fn snapshot_matches_compact_durable_machine_id_to_canonical_live_uuid() {
     use vm_spec::live::*;
     let mut data = snapshot();

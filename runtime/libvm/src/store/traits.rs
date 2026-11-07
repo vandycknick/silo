@@ -160,6 +160,12 @@ pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
         &self,
         operation_id: uuid::Uuid,
     ) -> Result<crate::storage::locks::StorageLock, LibVmError>;
+    /// Pins expected compressed inputs before the cache lookup or download.
+    async fn pin_source_blobs(
+        &self,
+        operation_id: uuid::Uuid,
+        digests: &[crate::storage::identity::ObjectDigest],
+    ) -> Result<(), LibVmError>;
     /// Upserts OCI manifest metadata, its mutable reference, layers, and rootfs artifact.
     async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
 

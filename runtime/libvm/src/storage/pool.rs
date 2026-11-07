@@ -38,6 +38,12 @@ pub struct OperationPaths {
     _lease: StorageLock,
 }
 
+impl OperationPaths {
+    pub(crate) fn lease_identity(&self) -> Result<(u64, u64), StorageError> {
+        Ok(self._lease.file_identity()?)
+    }
+}
+
 pub struct StoragePool {
     root: OwnedDirectory,
     objects: OwnedDirectory,
@@ -803,7 +809,7 @@ impl StoragePool {
         Ok(roots)
     }
 
-    fn stage(&self) -> Result<(Staging<'_>, File), StorageError> {
+    pub(crate) fn stage(&self) -> Result<(Staging<'_>, File), StorageError> {
         // These locks protect only unpublished disposable directories, not a
         // semantic closure. Canonical operation leases require catalog roots.
         let name = format!("stage-{}", Uuid::new_v4());
@@ -832,11 +838,17 @@ impl StoragePool {
     }
 }
 
-struct Staging<'a> {
+pub(crate) struct Staging<'a> {
     parent: &'a OwnedDirectory,
     directory: OwnedDirectory,
     name: String,
     _lease: StorageLock,
+}
+
+impl Staging<'_> {
+    pub(crate) fn path(&self) -> PathBuf {
+        self.directory.path().join("content")
+    }
 }
 
 impl Drop for Staging<'_> {

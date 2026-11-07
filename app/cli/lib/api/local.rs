@@ -659,6 +659,45 @@ impl LocalVmService {
         Ok(machine.inspect().await?)
     }
 
+    pub(crate) async fn inspect_artifact(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::ArtifactInspection> {
+        silo_vm_control::artifacts::validate_reference(reference)?;
+        Ok(self
+            .runtime()
+            .await?
+            .images()
+            .inspect_artifact(reference)
+            .await?)
+    }
+
+    pub(crate) async fn acquire_artifact(
+        &mut self,
+        request: libvm::ArtifactAcquireRequest,
+    ) -> eyre::Result<libvm::ArtifactAcquireReport> {
+        silo_vm_control::artifacts::acquire_to_wire(&request)?;
+        Ok(self
+            .runtime()
+            .await?
+            .images()
+            .acquire_artifact(request)
+            .await?)
+    }
+
+    pub(crate) async fn publish_artifact(
+        &mut self,
+        request: libvm::ArtifactPublishRequest,
+    ) -> eyre::Result<libvm::ArtifactPublishReport> {
+        silo_vm_control::artifacts::publish_to_wire(&request)?;
+        Ok(self
+            .runtime()
+            .await?
+            .images()
+            .publish_artifact(request)
+            .await?)
+    }
+
     pub(crate) async fn import_image(
         &mut self,
         request: libvm::DiskImportRequest,

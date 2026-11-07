@@ -47,7 +47,6 @@ pub(crate) struct ManagedImageStore {
 /// Dropping a caller future cannot close the original operation OFD in that worker.
 pub(crate) struct ManagedImageConsumer {
     pub info: ManagedImageRoot,
-    #[cfg(test)]
     pub operation_id: Uuid,
     _lease: StorageLock,
     closure: AuthenticatedClosure,
@@ -55,6 +54,12 @@ pub(crate) struct ManagedImageConsumer {
 }
 
 impl ManagedImageConsumer {
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+    pub(crate) fn duplicate_lease(&self) -> Result<StorageLock, LibVmError> {
+        Ok(self._lease.duplicate()?)
+    }
     pub(crate) fn open_stream(&self, pool: &StoragePool) -> Result<File, LibVmError> {
         let stream = &self.info.record.root.stream;
         let held = self
@@ -461,6 +466,13 @@ impl ManagedImageStore {
                     let mut tx = collection.store.pool.begin_with("BEGIN IMMEDIATE").await?;
                     recheck_image(&mut tx, &reference, &observed, &bytes, &streams, &objects)
                         .await?;
+                    let acquisition = crate::store::artifact_store::acquisition_objects(
+                        &mut tx,
+                        "image",
+                        &observed.id.to_string(),
+                    )
+                    .await?;
+                    objects.extend(acquisition);
                     let lease = pool.lease(operation_id)?;
                     Store::insert_stopped_operation(
                         &mut tx,
@@ -474,11 +486,15 @@ impl ManagedImageStore {
                     tx.commit().await?;
                     lease
                 };
+                collection
+                    .store
+                    .materialize_stream(operation_id, &observed.record.root.stream)
+                    .await?;
                 #[cfg(test)]
                 if let Some(hook) = &collection.store.layer_hook {
                     hook.hit(crate::store::layer_store::tests::WorkerPoint::AfterObject)?;
                 }
-                let mut retained_objects = objects.clone();
+                let mut retained_objects = observed.record.content_dependencies()?.1;
                 retained_objects.remove(&observed.record_digest);
                 retained_objects.remove(&observed.record.root.stream.map);
                 for page in &observed.record.root.stream.map_pages {
@@ -504,7 +520,6 @@ impl ManagedImageStore {
                 }
                 Ok(ManagedImageConsumer {
                     info: observed,
-                    #[cfg(test)]
                     operation_id,
                     _lease: lease,
                     closure,
@@ -914,6 +929,7 @@ async fn fetch_image(
     let (streams, mut objects) = record.content_dependencies()?;
     objects.insert(digest);
     exact_dependencies(connection, id, &streams, &objects).await?;
+    crate::store::artifact_store::acquisition_objects(connection, "image", &id.to_string()).await?;
     let retained: i64 = row.try_get("retained")?;
     let mut observation = ImageObservation {
         root: ManagedImageRoot {
@@ -953,7 +969,9 @@ async fn fetch_image(
     // Empty keys sort before the exclusive keyset cursors.
     let empty_key: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM image_alias WHERE image_id=?1 AND name='' UNION ALL SELECT 1 FROM image_provenance WHERE image_id=?1 AND digest='' UNION ALL SELECT 1 FROM raw_conversion_result WHERE image_id=?1 AND key_digest='')")
         .bind(id.to_string()).fetch_one(&mut *connection).await?;
-    if empty_key || !matches!(retained, 0 | 1) || (retained == 0 && !has_alias) {
+    let operation_owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='image' AND managed_id=?1)").bind(id.to_string()).fetch_one(&mut *connection).await?;
+    if empty_key || !matches!(retained, 0 | 1) || (retained == 0 && !has_alias && !operation_owned)
+    {
         return Err(invalid(
             "image has malformed metadata or an invalid public retention root",
         ));
@@ -1185,7 +1203,7 @@ pub(crate) async fn remove_unrooted_image(
     connection: &mut sqlx::SqliteConnection,
     id: &str,
 ) -> Result<(), LibVmError> {
-    sqlx::query("DELETE FROM storage_image WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE image_id=?1)")
+    sqlx::query("DELETE FROM storage_image WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE image_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='image' AND managed_id=?1)")
         .bind(id).execute(connection).await?;
     Ok(())
 }
@@ -1264,7 +1282,7 @@ impl crate::store::ReadOnlyStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
@@ -1282,7 +1300,7 @@ mod tests {
     use crate::store::snapshot_store::{publish_map, SnapshotRef, SnapshotStore};
     use crate::store::Store;
 
-    async fn fixture() -> (
+    pub(crate) async fn fixture() -> (
         tempfile::TempDir,
         ManagedImageStore,
         ImageRecord,

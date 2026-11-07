@@ -211,6 +211,7 @@ struct StoppedCommitCandidate {
     candidate_machine_id: Option<MachineId>,
     candidate_snapshot_id: Option<crate::storage::identity::SnapshotId>,
     candidate_image_id: Option<crate::storage::identity::ImageId>,
+    candidate_index_digest: Option<crate::storage::identity::ObjectDigest>,
     directory: Option<CandidateDirectory>,
 }
 
@@ -237,6 +238,11 @@ fn commit_candidate(json: &str) -> Result<StoppedCommitCandidate, LibVmError> {
                 ));
             }
         }
+    }
+    if candidate.candidate_index_digest.is_some() && candidate.candidate_machine_id.is_some() {
+        return Err(invalid(
+            "artifact acquisition index cannot authorize a machine directory",
+        ));
     }
     match (
         &candidate.candidate_machine_id,
@@ -724,6 +730,23 @@ impl Store {
         .await
     }
 
+    pub(crate) async fn preserve_imported_operation(
+        &self,
+        id: Uuid,
+        target: crate::image::import_types::ManagedSourceId,
+        index: crate::storage::identity::ObjectDigest,
+    ) -> Result<(), LibVmError> {
+        let json = match target {
+            crate::image::import_types::ManagedSourceId::Image(id) => {
+                serde_json::json!({"candidateImageId":id,"candidateIndexDigest":index})
+            }
+            crate::image::import_types::ManagedSourceId::Snapshot(id) => {
+                serde_json::json!({"candidateSnapshotId":id,"candidateIndexDigest":index})
+            }
+        };
+        self.preserve_stopped_candidate(id, &json.to_string()).await
+    }
+
     /// Existing machine update authority is never destination-directory cleanup
     /// authority. Retain the precise target for uncertain atomic storage saves.
     pub(crate) async fn preserve_boot_update_operation(
@@ -861,7 +884,7 @@ impl Store {
         let image = candidate.candidate_image_id.is_some();
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
-        let result = sqlx::query("UPDATE storage_operation SET state='committing',record_json=jsonb(?2) WHERE operation_id=?1 AND ((?3 AND kind='snapshot') OR (?4 AND kind IN ('import','convert')) OR (NOT ?3 AND NOT ?4 AND kind IN ('fork','import'))) AND state='staging'")
+        let result = sqlx::query("UPDATE storage_operation SET state='committing',record_json=jsonb(?2) WHERE operation_id=?1 AND ((?3 AND kind IN ('snapshot','import')) OR (?4 AND kind IN ('import','convert')) OR (NOT ?3 AND NOT ?4 AND kind IN ('fork','import'))) AND state='staging'")
             .bind(id.to_string()).bind(json).bind(snapshot).bind(image).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(invalid("stopped operation is not staging"));
@@ -1740,7 +1763,11 @@ impl Store {
                     {
                         let candidate =
                             commit_candidate(&row.try_get::<String, _>("record_json")?)?;
-                        if candidate.candidate_snapshot_id.is_some() != (kind == "snapshot") {
+                        if candidate.candidate_snapshot_id.is_some()
+                            && !matches!(kind.as_str(), "snapshot" | "import")
+                            || kind == "snapshot" && candidate.candidate_snapshot_id.is_none()
+                            || candidate.candidate_index_digest.is_some() && kind != "import"
+                        {
                             return Err(invalid(
                                 "operation kind contradicts its snapshot candidate",
                             ));

@@ -1,6 +1,7 @@
+pub(crate) mod artifact_store;
 pub(crate) mod cache_paths;
 pub(crate) mod capture;
-mod capture_native;
+pub(crate) mod capture_native;
 mod catalog_guard;
 mod config_store;
 pub(crate) mod fork;
@@ -20,6 +21,7 @@ mod row;
 pub(crate) mod snapshot_store;
 #[path = "store.rs"]
 mod storage;
+pub(crate) mod stream_representation;
 mod traits;
 
 pub(crate) use cache_paths::ensure_cache_paths_unreferenced;

@@ -30,6 +30,23 @@ impl ImageStore for Store {
         })
         .await?
     }
+    async fn pin_source_blobs(
+        &self,
+        operation_id: uuid::Uuid,
+        digests: &[crate::storage::identity::ObjectDigest],
+    ) -> Result<(), LibVmError> {
+        let store = self.clone();
+        let digests = digests.to_vec();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(store.pin_cache_inputs(
+                operation_id,
+                crate::store::stream_representation::CacheKind::SourceBlob,
+                &digests,
+            ))
+        })
+        .await?
+    }
     async fn retain_storage_stream(
         &self,
         stream_id: &crate::storage::identity::StreamId,
@@ -266,6 +283,7 @@ impl ImageStore for Store {
     }
 
     async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError> {
+        self.retire_layer_cache().await?;
         self.recover_layer_objects().await?;
         self.prune_image_cache(true).await.map(|(pruned, _)| pruned)
     }
@@ -378,23 +396,35 @@ impl Store {
             artifacts_removed: 0,
             bytes_removed: 0,
         };
+        crate::store::stream_representation::check_catalog(self).await?;
+        if prune_unreferenced {
+            report.bytes_removed = report
+                .bytes_removed
+                .saturating_add(self.evict_flat_materializations().await?);
+        }
+        report.bytes_removed = report.bytes_removed.saturating_add(
+            self.prune_transport_caches(&pool, prune_unreferenced)
+                .await?,
+        );
         let mut scan = pool.scan_streams()?;
         let mut pending_cursor = String::new();
         loop {
             self.check_operation_recovery(&pool).await?;
             crate::store::snapshot_store::check_snapshot_catalog(self).await?;
             crate::store::managed_image_store::check_image_catalog(self).await?;
+            crate::store::stream_representation::check_catalog(self).await?;
+            crate::store::cache_paths::check_machine_dependencies(self).await?;
             let discovered = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
             let scan_finished = discovered.is_empty();
             let _roots = pool.lock_roots()?;
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            let machine_streams =
-                crate::store::cache_paths::retained_machine_streams(&mut tx).await?;
             for (id, length) in discovered {
-                if machine_streams.contains(&id) {
+                if crate::store::cache_paths::machine_retains_stream(&mut tx, id).await?
+                    || crate::store::stream_representation::stream_reachable(&mut tx, id).await?
+                {
                     continue;
                 }
-                sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) SELECT ?1,?2 WHERE NOT EXISTS(SELECT 1 FROM image_rootfs_artifact WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency WHERE stream_id=?1) AND NOT EXISTS(SELECT 1 FROM layer_result WHERE pack_stream=?1) ON CONFLICT(stream_id) DO NOTHING")
+                sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) VALUES(?1,?2) ON CONFLICT(stream_id) DO NOTHING")
                     .bind(id.to_string()).bind(i64_from_u64(length)?).execute(&mut *tx).await?;
             }
             let artifacts = sqlx::query("SELECT image_id,rootfs_path,size_bytes,stream_id FROM image_rootfs_artifact a WHERE ?1 AND NOT EXISTS(SELECT 1 FROM image_ref r WHERE r.manifest_digest=a.manifest_digest) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream p WHERE p.stream_id=a.stream_id) LIMIT 256")
@@ -439,7 +469,9 @@ impl Store {
                 let id = stream
                     .parse::<crate::storage::identity::StreamId>()
                     .map_err(|error| storage_error(error.into()))?;
-                if machine_streams.contains(&id) {
+                if crate::store::cache_paths::machine_retains_stream(&mut tx, id).await?
+                    || crate::store::stream_representation::stream_reachable(&mut tx, id).await?
+                {
                     continue;
                 }
                 let path = pool.stream_path(&id);
@@ -481,6 +513,10 @@ impl Store {
                 if pool.remove_stream(&id)? {
                     report.bytes_removed = report.bytes_removed.saturating_add(size);
                 }
+                sqlx::query("DELETE FROM storage_stream WHERE stream_id=?1")
+                    .bind(&stream)
+                    .execute(&mut *tx)
+                    .await?;
                 sqlx::query("DELETE FROM image_stream_gc WHERE stream_id=?1")
                     .bind(stream)
                     .execute(&mut *tx)

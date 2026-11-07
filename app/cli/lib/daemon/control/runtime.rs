@@ -60,6 +60,77 @@ impl w::runtime_service_server::RuntimeService for Service {
     type ImportImageStream = Stream<w::ManagedImageEvent>;
     type ConvertImageStream = Stream<w::ManagedImageEvent>;
 
+    async fn inspect_artifact(
+        &self,
+        r: Request<w::InspectArtifactRequest>,
+    ) -> Result<Response<w::ArtifactInspection>, Status> {
+        let reference = r.into_inner().reference;
+        silo_vm_control::artifacts::validate_reference(&reference).map_err(conversion)?;
+        let report = self
+            .runtime()
+            .await?
+            .images()
+            .inspect_artifact(&reference)
+            .await
+            .map_err(native)?;
+        Ok(Response::new(
+            silo_vm_control::artifacts::inspection_to_wire(&report).map_err(conversion)?,
+        ))
+    }
+
+    async fn acquire_artifact(
+        &self,
+        r: Request<w::AcquireArtifactRequest>,
+    ) -> Result<Response<w::ArtifactAcquireReport>, Status> {
+        let request = silo_vm_control::artifacts::acquire_from_wire(r.get_ref().clone())
+            .map_err(conversion)?;
+        let permit = self.admit(&r, true).await?;
+        let state = self.clone();
+        // The task retains the mutation permit and operation even if the RPC disappears.
+        let result = tokio::spawn(async move {
+            let _permit = permit;
+            let report = state
+                .runtime()
+                .await?
+                .images()
+                .acquire_artifact(request)
+                .await
+                .map_err(native)?;
+            silo_vm_control::artifacts::acquired_to_wire(&report).map_err(conversion)
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!("artifact acquisition task failed: {error}"))
+        })??;
+        Ok(Response::new(result))
+    }
+
+    async fn publish_artifact(
+        &self,
+        r: Request<w::PublishArtifactRequest>,
+    ) -> Result<Response<w::ArtifactPublishReport>, Status> {
+        let request = silo_vm_control::artifacts::publish_from_wire(r.get_ref().clone())
+            .map_err(conversion)?;
+        let permit = self.admit(&r, true).await?;
+        let state = self.clone();
+        let result = tokio::spawn(async move {
+            let _permit = permit;
+            let report = state
+                .runtime()
+                .await?
+                .images()
+                .publish_artifact(request)
+                .await
+                .map_err(native)?;
+            silo_vm_control::artifacts::published_to_wire(&report).map_err(conversion)
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!("artifact publication task failed: {error}"))
+        })??;
+        Ok(Response::new(result))
+    }
+
     async fn import_image(
         &self,
         r: Request<w::DiskImportRequest>,

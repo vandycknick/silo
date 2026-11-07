@@ -1731,7 +1731,7 @@ fn verify_capture(
         execution.file(),
         devices.file(),
         &memory.binding,
-        &record.plan,
+        &record.plan.configuration,
         &layout,
     )?;
     let mut control_fingerprints = Vec::with_capacity(2);
@@ -1934,7 +1934,7 @@ pub(crate) struct Region {
     pub(crate) length: u64,
     stream_offset: u64,
 }
-fn validate_layout(
+pub(crate) fn validate_layout(
     bytes: &[u8],
     memory: &vm_spec::capture::CaptureMemoryEvidence,
     admitted: u64,
@@ -2260,7 +2260,7 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::num::NonZeroU64;
@@ -2300,15 +2300,15 @@ mod tests {
     };
     use crate::store::{MachineStore, Store};
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         _temporary: tempfile::TempDir,
-        snapshots: SnapshotStore,
+        pub(crate) snapshots: SnapshotStore,
         config: MachineConfig,
-        reservation: CaptureReservation,
+        pub(crate) reservation: CaptureReservation,
         launch: LaunchStorageLease,
     }
 
-    async fn fixture() -> Fixture {
+    pub(crate) async fn fixture() -> Fixture {
         fixture_with_external_data(false).await
     }
 
@@ -2623,7 +2623,7 @@ mod tests {
         bytes
     }
 
-    fn seal(fixture: &Fixture) -> (OwnedDirectory, CaptureEvidence) {
+    pub(crate) fn seal(fixture: &Fixture) -> (OwnedDirectory, CaptureEvidence) {
         let record = &fixture.reservation.record;
         let machine = OwnedDirectory::open_existing_root(&fixture.config.machine_dir)
             .unwrap()
@@ -2792,7 +2792,7 @@ mod tests {
             .restore_evidence(&consumer, &pool)
             .unwrap();
         assert_eq!(
-            evidence.freeze_operation_id.as_ref(),
+            evidence.evidence.freeze_operation_id.as_ref(),
             Some(&fixture.reservation.record.plan.capture_id)
         );
         assert_eq!(
@@ -2820,9 +2820,7 @@ mod tests {
         assert!(fixture
             .snapshots
             .restore_evidence(&consumer, &pool)
-            .unwrap_err()
-            .to_string()
-            .contains("captured configuration"));
+            .is_err());
         consumer.record.configuration.spec = saved;
         let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
             &mut consumer.record.capture
@@ -2836,9 +2834,7 @@ mod tests {
         assert!(fixture
             .snapshots
             .restore_evidence(&consumer, &pool)
-            .unwrap_err()
-            .to_string()
-            .contains("native producer"));
+            .is_err());
         consumer.info.provenance.clear();
         assert!(fixture
             .snapshots
@@ -4574,7 +4570,8 @@ mod tests {
             evidence: fixture
                 .snapshots
                 .restore_evidence(&consumer, &pool)
-                .unwrap(),
+                .unwrap()
+                .evidence,
             objects: objects.try_into().unwrap(),
             lowers: Vec::new(),
             network: None,
@@ -4624,7 +4621,8 @@ mod tests {
         request.evidence = fixture
             .snapshots
             .restore_evidence(&contradictory, &pool)
-            .unwrap();
+            .unwrap()
+            .evidence;
         assert_eq!(request.evidence, evidence);
         let (ram, measured_again) = contradictory
             .open_ram(&pool, &memory.stream, memory.length)

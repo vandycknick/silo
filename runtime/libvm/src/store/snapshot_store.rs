@@ -162,6 +162,7 @@ pub(crate) struct SnapshotConsumer {
     pub record: SnapshotRecord,
     pub operation_id: Uuid,
     closure: Option<AuthenticatedClosure>,
+    imported: Vec<crate::store::artifact_store::ImportedCaptureRef>,
     pub lease: StorageLock,
     // A consumer outlives its collection handle and retains the same writable
     // catalog capability through actual blocking reads/copy/publication.
@@ -186,6 +187,11 @@ pub(crate) struct AuthenticatedObject {
 }
 
 impl SnapshotConsumer {
+    pub(crate) fn imported_provenance(
+        &self,
+    ) -> &[crate::store::artifact_store::ImportedCaptureRef] {
+        &self.imported
+    }
     /// The held authenticated stream itself, rechecked against its hashed state.
     pub(crate) fn authenticated_stream(
         &self,
@@ -641,7 +647,7 @@ impl SnapshotStore {
             let pool = StoragePool::open(&store.images_dir)?;
             let id = Uuid::new_v4();
             let result: Result<SnapshotConsumer, LibVmError> = (|| {
-                let (info, lease) = runtime.block_on(async {
+                let (info, lease, imported) = runtime.block_on(async {
                     let _roots = pool.lock_roots()?;
                     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
                     recheck_catalog(&mut tx, &reference, &observed, &bytes, &streams, &objects)
@@ -655,6 +661,26 @@ impl SnapshotStore {
                             .iter()
                             .map(|provenance| provenance.evidence_digest),
                     );
+                    let imported = crate::store::artifact_store::imported_capture_refs(
+                        &mut tx,
+                        &observed.id.to_string(),
+                    )
+                    .await?;
+                    for capture in &imported {
+                        pinned_objects.extend([
+                            capture.provenance_digest,
+                            capture.evidence_digest,
+                            capture.receipt_digest,
+                        ]);
+                    }
+                    pinned_objects.extend(
+                        crate::store::artifact_store::acquisition_objects(
+                            &mut tx,
+                            "snapshot",
+                            &observed.id.to_string(),
+                        )
+                        .await?,
+                    );
                     let lease = pool.lease(id)?;
                     Store::insert_stopped_operation(
                         &mut tx,
@@ -666,16 +692,23 @@ impl SnapshotStore {
                     )
                     .await?;
                     tx.commit().await?;
-                    Ok::<_, LibVmError>((info, lease))
+                    Ok::<_, LibVmError>((info, lease, imported))
                 })?;
+                for content in record.streams() {
+                    runtime.block_on(store.materialize_stream(id, content))?;
+                }
                 let (_, closure) = verify_closure(&pool, &record, Some(info.record_digest), true)?;
                 for provenance in &info.provenance {
                     pool.verify_object(&provenance.evidence_digest)?;
                 }
+                crate::store::restore::authenticate_imported_captures(
+                    &pool, &record, info.id, &imported,
+                )?;
                 Ok(SnapshotConsumer {
                     info,
                     record,
                     operation_id: id,
+                    imported,
                     closure: Some(closure),
                     lease,
                     _store: store.clone(),
@@ -782,7 +815,7 @@ pub(crate) async fn fetch_catalog(
             "image requires image creation, not snapshot restore",
         ));
     }
-    let row = sqlx::query("SELECT id,record_digest,record_bytes,retained,created_at,EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) AS capture_owned FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
+    let row = sqlx::query("SELECT id,record_digest,record_bytes,retained,created_at,(EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) OR EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=storage_snapshot.id)) AS capture_owned FROM storage_snapshot WHERE id=?1 OR id=(SELECT snapshot_id FROM image_alias WHERE name=?2)")
         .bind(id).bind(alias).fetch_optional(&mut *connection).await?
         .ok_or_else(|| invalid(format!("snapshot {reference} does not exist")))?;
     let id: String = row.try_get("id")?;
@@ -800,6 +833,7 @@ pub(crate) async fn fetch_catalog(
     let objects = sqlx::query_scalar("SELECT object_digest FROM snapshot_object_dependency WHERE snapshot_id=?1 ORDER BY object_digest")
         .bind(&id).fetch_all(&mut *connection).await?;
     let provenance = provenance_facts(connection, &id).await?;
+    crate::store::artifact_store::acquisition_objects(connection, "snapshot", &id).await?;
     Ok(CatalogSnapshotFacts {
         id,
         digest: row.try_get("record_digest")?,
@@ -874,7 +908,7 @@ async fn catalog_info(
     id: SnapshotId,
     digest: ObjectDigest,
 ) -> Result<SnapshotInfo, LibVmError> {
-    let row = sqlx::query("SELECT retained,created_at,json_extract(CAST(record_bytes AS TEXT),'$.captureKind') AS capture_kind,EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) AS capture_owned FROM storage_snapshot WHERE id=?1")
+    let row = sqlx::query("SELECT retained,created_at,json_extract(CAST(record_bytes AS TEXT),'$.captureKind') AS capture_kind,(EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=storage_snapshot.id) OR EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=storage_snapshot.id)) AS capture_owned FROM storage_snapshot WHERE id=?1")
         .bind(id.to_string())
         .fetch_one(&mut *connection)
         .await?;
@@ -1046,13 +1080,22 @@ pub(crate) async fn check_snapshot_catalog(store: &Store) -> Result<(), LibVmErr
         let mut observed = Vec::with_capacity(ids.len());
         for id in ids {
             cursor = id.clone();
-            observed.push(
-                fetch_catalog(&mut tx, &SnapshotRef::Id(id.parse().map_err(invalid)?)).await?,
-            );
+            let facts =
+                fetch_catalog(&mut tx, &SnapshotRef::Id(id.parse().map_err(invalid)?)).await?;
+            let imported =
+                crate::store::artifact_store::imported_capture_refs(&mut tx, &id).await?;
+            observed.push((facts, imported));
         }
         tx.commit().await?;
-        for facts in observed {
-            authenticate_catalog(facts)?;
+        for (facts, imported) in observed {
+            let (record, info) = authenticate_catalog(facts)?;
+            if !imported.is_empty() {
+                let pool = StoragePool::open_existing(&store.images_dir)?
+                    .ok_or_else(|| invalid("imported checkpoint pool is missing"))?;
+                crate::store::restore::authenticate_imported_captures(
+                    &pool, &record, info.id, &imported,
+                )?;
+            }
         }
     }
     Ok(())
@@ -1062,7 +1105,7 @@ pub(crate) async fn remove_unrooted(
     connection: &mut sqlx::SqliteConnection,
     id: &str,
 ) -> Result<(), LibVmError> {
-    sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1)")
+    sqlx::query("DELETE FROM storage_snapshot WHERE id=?1 AND retained=0 AND NOT EXISTS(SELECT 1 FROM image_alias WHERE snapshot_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation WHERE kind='capture' AND json_extract(record_json,'$.candidate')=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_managed WHERE managed_kind='snapshot' AND managed_id=?1)")
         .bind(id).execute(connection).await?;
     Ok(())
 }
@@ -1102,7 +1145,9 @@ pub(crate) async fn require_operation_closure(
 
 pub(crate) type ClosureFingerprints = Vec<(std::path::PathBuf, SourceFingerprint)>;
 
-pub(crate) fn recheck_closure(fingerprints: &ClosureFingerprints) -> Result<(), LibVmError> {
+pub(crate) fn recheck_closure(
+    fingerprints: &[(std::path::PathBuf, SourceFingerprint)],
+) -> Result<(), LibVmError> {
     for (path, before) in fingerprints {
         if SourceFingerprint::new(&std::fs::symlink_metadata(path)?) != *before {
             return Err(invalid(
@@ -1354,7 +1399,7 @@ pub(crate) async fn publish_map(
     })
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::paths::LocalPaths;
     use crate::storage::identity::ObjectDigest;
     use crate::storage::pool::StoragePool;
@@ -1367,7 +1412,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::Arc;
 
-    async fn fixture(
+    pub(crate) async fn fixture(
         kind: &str,
     ) -> (
         tempfile::TempDir,

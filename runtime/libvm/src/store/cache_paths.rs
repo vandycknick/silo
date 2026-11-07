@@ -46,29 +46,86 @@ pub(crate) fn storage_pool_dependencies(
     Ok((streams, objects))
 }
 
-pub(crate) async fn retained_machine_objects(
+pub(crate) async fn machine_retains_object(
     connection: &mut sqlx::SqliteConnection,
-) -> Result<std::collections::BTreeSet<crate::storage::identity::ObjectDigest>, LibVmError> {
-    let records = sqlx::query_scalar::<_,String>("SELECT CASE WHEN json_valid(record_json,8) THEN json(record_json) ELSE '{}' END FROM machine_storage").fetch_all(connection).await?;
-    let mut objects = std::collections::BTreeSet::new();
-    for json in records {
-        objects.extend(storage_pool_dependencies(&crate::MachineStorageRecord::decode(&json)?)?.1);
-    }
-    Ok(objects)
+    object: crate::storage::identity::ObjectDigest,
+) -> Result<bool, LibVmError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM machine_object_dependency WHERE object_digest=?1)",
+    )
+    .bind(object.to_string())
+    .fetch_one(connection)
+    .await?)
 }
 
-pub(crate) async fn retained_machine_streams(
+pub(crate) async fn machine_retains_stream(
     connection: &mut sqlx::SqliteConnection,
-) -> Result<std::collections::HashSet<crate::storage::identity::StreamId>, LibVmError> {
-    let records = sqlx::query_scalar::<_, String>(
-        "SELECT CASE WHEN json_valid(record_json, 8) THEN json(record_json) ELSE '{}' END FROM machine_storage",
-    ).fetch_all(connection).await?;
-    let mut streams = std::collections::HashSet::new();
-    for json in records {
-        let record = crate::MachineStorageRecord::decode(&json)?;
-        streams.extend(storage_pool_dependencies(&record)?.0);
+    stream: crate::storage::identity::StreamId,
+) -> Result<bool, LibVmError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM machine_stream_dependency WHERE stream_id=?1)",
+    )
+    .bind(stream.to_string())
+    .fetch_one(connection)
+    .await?)
+}
+
+/// Derive typed edges one bounded record at a time, outside root coordination.
+/// A writer swaps record and indexed generation in one transaction. The read
+/// transaction compares a coherent generation, rejecting missing AND extra edges.
+pub(crate) async fn check_machine_dependencies(
+    store: &crate::store::Store,
+) -> Result<(), LibVmError> {
+    use sqlx::Row;
+    let mut cursor = String::new();
+    loop {
+        let mut tx = store.pool.begin().await?;
+        let row=sqlx::query("SELECT machine_id,CASE WHEN json_valid(record_json,8) AND length(json(record_json))<=?2 THEN json(record_json) END AS bytes FROM machine_storage WHERE machine_id>?1 ORDER BY machine_id LIMIT 1")
+            .bind(&cursor).bind(crate::storage::limits::Resource::MetadataPageBytes.maximum() as i64).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            break;
+        };
+        cursor = row.try_get("machine_id")?;
+        let bytes = row.try_get::<Option<String>, _>("bytes")?.ok_or_else(|| {
+            crate::store::models::snapshot::invalid("invalid or oversized machine storage catalog")
+        })?;
+        let record = crate::MachineStorageRecord::decode(&bytes)?;
+        let (streams, objects) = storage_pool_dependencies(&record)?;
+        let generation = i64::try_from(record.storage_generation)
+            .map_err(crate::store::models::snapshot::invalid)?;
+        let actual_streams = sqlx::query_as::<_, (i64, String)>(
+            "SELECT generation,stream_id FROM machine_stream_dependency WHERE machine_id=?1",
+        )
+        .bind(&cursor)
+        .fetch_all(&mut *tx)
+        .await?;
+        let actual_objects = sqlx::query_as::<_, (i64, String)>(
+            "SELECT generation,object_digest FROM machine_object_dependency WHERE machine_id=?1",
+        )
+        .bind(&cursor)
+        .fetch_all(&mut *tx)
+        .await?;
+        if actual_streams.iter().any(|(g, _)| *g != generation)
+            || actual_objects.iter().any(|(g, _)| *g != generation)
+            || streams
+                != actual_streams
+                    .into_iter()
+                    .map(|(_, v)| v.parse().map_err(crate::store::models::snapshot::invalid))
+                    .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+            || objects
+                != actual_objects
+                    .into_iter()
+                    .map(|(_, v)| v.parse().map_err(crate::store::models::snapshot::invalid))
+                    .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+        {
+            return Err(crate::store::models::snapshot::invalid(
+                "machine dependency index contradicts its semantic generation",
+            ));
+        }
+        tx.commit().await?;
     }
-    Ok(streams)
+    Ok(())
 }
 /// Call inside the same write transaction that removes catalog roots, after
 /// acquiring roots coordination. Provenance strings are not dependencies.

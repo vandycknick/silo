@@ -59,6 +59,9 @@ service RuntimeService {
  rpc RemoveImageAlias(Name) returns (google.protobuf.Empty);
  rpc ImportImage(DiskImportRequest) returns (stream ManagedImageEvent);
  rpc ConvertImage(ConvertImageRequest) returns (stream ManagedImageEvent);
+ rpc InspectArtifact(InspectArtifactRequest) returns (ArtifactInspection);
+ rpc AcquireArtifact(AcquireArtifactRequest) returns (ArtifactAcquireReport);
+ rpc PublishArtifact(PublishArtifactRequest) returns (ArtifactPublishReport);
  rpc ResolveManagedDigest(ManagedDigest) returns (ManagedSourceId);
  rpc InspectManagedImage(ManagedSourceRef) returns (ManagedSourceInfo);
  rpc ListManagedImages(google.protobuf.Empty) returns (ManagedSourceList);
@@ -68,6 +71,51 @@ service RuntimeService {
  // never resolved through a source machine, which may since have been removed.
  rpc GetFork(ForkOperationRef) returns (LiveForkResult);
  rpc CancelFork(ForkOperationRef) returns (LiveForkResult);
+}
+message InspectArtifactRequest { string reference = 1; }
+message AcquireArtifactRequest {
+ string reference = 1;
+ oneof trust {
+  string approved_digest = 2;
+  google.protobuf.Empty require_signature = 3;
+ }
+ optional string alias = 4;
+}
+enum ArtifactEncoding { ARTIFACT_ENCODING_UNSPECIFIED = 0; ARTIFACT_ENCODING_ZSTD = 1; ARTIFACT_ENCODING_RAW = 2; }
+message PublishArtifactRequest {
+ ManagedSourceRef source = 1;
+ string destination = 2;
+ ArtifactEncoding encoding = 3;
+ optional string checkpoint_acknowledgement = 4;
+}
+enum ArtifactPurpose { ARTIFACT_PURPOSE_UNSPECIFIED = 0; ARTIFACT_PURPOSE_IMAGE = 1; ARTIFACT_PURPOSE_CHECKPOINT = 2; }
+enum ArtifactCaptureKind { ARTIFACT_CAPTURE_KIND_UNSPECIFIED = 0; ARTIFACT_CAPTURE_KIND_STOPPED_STORAGE = 1; ARTIFACT_CAPTURE_KIND_LIVE_EXECUTION = 2; }
+enum ArtifactPublisher { ARTIFACT_PUBLISHER_UNSPECIFIED = 0; ARTIFACT_PUBLISHER_UNAUTHENTICATED = 1; }
+enum ArtifactRootFamily { ARTIFACT_ROOT_FAMILY_UNSPECIFIED = 0; ARTIFACT_ROOT_FAMILY_OPAQUE_RAW = 1; ARTIFACT_ROOT_FAMILY_LINUX_OVERLAY = 2; }
+message ArtifactInspection {
+ string repository = 1;
+ string index_digest = 2;
+ ArtifactPurpose purpose = 3;
+ optional ArtifactCaptureKind capture_kind = 4;
+ ArtifactRootFamily root_family = 5;
+ GuestArchitecture guest_architecture = 6;
+ bool live_restore = 7;
+ ManagedSourceId content = 8;
+ BackendRequirement backend = 9;
+}
+message ArtifactAcquireReport {
+ ManagedSourceInfo source = 1;
+ string repository = 2;
+ string index_digest = 3;
+ ArtifactPublisher publisher = 4;
+}
+message ArtifactPublishReport {
+ string repository = 1;
+ string index_digest = 2;
+ optional string tag = 3;
+ ManagedSourceId source = 4;
+ ArtifactPurpose purpose = 5;
+ optional ArtifactCaptureKind capture_kind = 6;
 }
 message Name { string name = 1; }
 message MachineRef { oneof reference { string id = 1; string name = 2; string id_prefix = 3; } }
@@ -196,7 +244,9 @@ enum ProvisionStepStatus { PROVISION_STEP_STATUS_UNSPECIFIED = 0; PROVISION_STEP
 enum ProvisionFailurePolicy { PROVISION_FAILURE_POLICY_UNSPECIFIED = 0; PROVISION_FAILURE_POLICY_BEST_EFFORT = 1; PROVISION_FAILURE_POLICY_FAIL_BOOT = 2; }
 message ProvisionStepReport { string id = 1; ProvisionStepStatus status = 2; ProvisionFailurePolicy failure_policy = 3; bool changed = 4; optional string backend = 5; google.protobuf.Duration duration = 6; optional string message = 7; optional string error_chain = 8; }
 message ProvisionReport { ProvisionStatus status = 1; google.protobuf.Timestamp started_at = 2; google.protobuf.Timestamp finished_at = 3; google.protobuf.Duration duration = 4; repeated ProvisionStepReport steps = 5; optional string message = 6; }
-message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; LiveMachineReport live = 29; LiveHostReport prospective_live = 30; optional LiveEvidenceState live_evidence = 31; MachineLifecycle lifecycle = 32; repeated MachineCapture captures = 33; MachineBoot boot = 34; }
+// Observed terminal storage result; absent when storage metadata is unavailable.
+enum StorageStopOutcome { STORAGE_STOP_OUTCOME_UNSPECIFIED = 0; STORAGE_STOP_OUTCOME_CLEAN = 1; STORAGE_STOP_OUTCOME_FORCED = 2; STORAGE_STOP_OUTCOME_UNKNOWN = 3; }
+message MachineSnapshot { string id = 1; string name = 2; VmSpec spec = 3; Retention retention = 4; ProcessConfig process = 5; optional string template_name = 6; Agent agent_mode = 7; bytes machine_dir = 8; google.protobuf.Timestamp created_at = 9; google.protobuf.Timestamp modified_at = 10; string image_ref = 11; Rootfs rootfs = 12; optional uint64 root_disk_size = 13; map<string,string> labels = 14; map<string,string> metadata = 15; ResolvedNetwork network = 16; MachineTailscale tailscale = 17; GuestConfig guest = 18; MachineStatus status = 19; Observation observation = 20; repeated MachineIssue issues = 21; optional string run_id = 22; BootReport boot_report = 23; ProvisionReport provision_report = 24; google.protobuf.Timestamp started_at = 25; optional string last_error = 26; google.protobuf.Timestamp updated_at = 27; NetworkObservation network_observation = 28; LiveMachineReport live = 29; LiveHostReport prospective_live = 30; optional LiveEvidenceState live_evidence = 31; MachineLifecycle lifecycle = 32; repeated MachineCapture captures = 33; MachineBoot boot = 34; optional StorageStopOutcome storage_stop_outcome = 35; }
 message MachineInventoryEntry { string id = 1; string name = 2; MachineSnapshot data = 3; repeated MachineIssue issues = 4; }
 message MachineStart { string run_id = 1; MachineSnapshot data = 2; }
 enum ReadinessOutcome { READINESS_OUTCOME_UNSPECIFIED = 0; READINESS_OUTCOME_READY = 1; READINESS_OUTCOME_TERMINAL = 2; READINESS_OUTCOME_TIMED_OUT = 3; }

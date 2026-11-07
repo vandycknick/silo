@@ -9,6 +9,14 @@ macro_rules! identity {
     ($name:ident) => {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name([u8; 32]);
+        impl $name {
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+            pub const fn from_sha256(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+        }
         impl FromStr for $name {
             type Err = ChangesetError;
             fn from_str(value: &str) -> ChangesetResult<Self> {

@@ -55,6 +55,27 @@ def ensure_ca(cache_dir: Path) -> tuple[Path, Path]:
     return cert, key
 
 
+def issue_leaf_certificate(cache_dir: Path, directory: Path) -> tuple[Path, Path]:
+    """Issue a loopback server certificate signed by the shared suite CA.
+
+    Returns `(certificate, key)` inside the caller-owned `directory`, so every
+    smoke workspace trusting the suite CA through `SSL_CERT_FILE` trusts it.
+    """
+    ca_path, ca_key = ensure_ca(cache_dir)
+    leaf = directory / "leaf.pem"
+    key = directory / "leaf.key"
+    csr = directory / "leaf.csr"
+    extensions = directory / "leaf.ext"
+    _openssl("ecparam", "-genkey", "-name", "prime256v1", "-out", str(key))
+    key.chmod(0o600)
+    _openssl("req", "-new", "-key", str(key), "-subj", "/CN=localhost", "-out", str(csr))
+    extensions.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n")
+    with _ca_lock(cache_dir):
+        _openssl("x509", "-req", "-in", str(csr), "-CA", str(ca_path), "-CAkey", str(ca_key),
+                 "-CAcreateserial", "-days", "3650", "-extfile", str(extensions), "-out", str(leaf))
+    return leaf, key
+
+
 @dataclass(frozen=True)
 class _Publication:
     name: str
@@ -64,7 +85,7 @@ class _Publication:
 
 class LoopbackRegistry:
     def __init__(self, cache_dir: Path) -> None:
-        self.ca_path, ca_key = ensure_ca(cache_dir)
+        self.ca_path, _ = ensure_ca(cache_dir)
         self.host = "127.0.0.1"
         self.requests = 0
         self._publications: list[_Publication] = []
@@ -72,19 +93,9 @@ class LoopbackRegistry:
         self._thread: threading.Thread | None = None
         self._stopped = False
         self._leaf_dir = Path(tempfile.mkdtemp(prefix="silo-smoke-registry-"))
-        leaf = self._leaf_dir / "leaf.pem"
-        key = self._leaf_dir / "leaf.key"
-        csr = self._leaf_dir / "leaf.csr"
-        extensions = self._leaf_dir / "leaf.ext"
         self._server: http.server.ThreadingHTTPServer | None = None
         try:
-            _openssl("ecparam", "-genkey", "-name", "prime256v1", "-out", str(key))
-            key.chmod(0o600)
-            _openssl("req", "-new", "-key", str(key), "-subj", "/CN=localhost", "-out", str(csr))
-            extensions.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n")
-            with _ca_lock(cache_dir):
-                _openssl("x509", "-req", "-in", str(csr), "-CA", str(self.ca_path), "-CAkey", str(ca_key),
-                         "-CAcreateserial", "-days", "3650", "-extfile", str(extensions), "-out", str(leaf))
+            leaf, key = issue_leaf_certificate(cache_dir, self._leaf_dir)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(leaf, key)

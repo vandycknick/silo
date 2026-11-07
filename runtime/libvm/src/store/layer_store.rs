@@ -31,6 +31,59 @@ pub struct RetainedLayer {
     pub pack_length: u64,
     pub index_root: ContentDigest,
 }
+
+/// Payload references remain usable only while this closure owner is alive.
+pub struct HeldLayer {
+    layer: LayerChangeset,
+    _owner: LayerReadOwner,
+}
+pub struct HeldNamespace {
+    namespace: oci::changeset::namespace::ValidatedNamespace,
+    _owner: LayerReadOwner,
+}
+struct LayerReadOwner {
+    _lease: crate::storage::locks::StorageLock,
+    _store: Store,
+}
+impl std::ops::Deref for HeldLayer {
+    type Target = LayerChangeset;
+    fn deref(&self) -> &Self::Target {
+        &self.layer
+    }
+}
+impl std::ops::Deref for HeldNamespace {
+    type Target = oci::changeset::namespace::ValidatedNamespace;
+    fn deref(&self) -> &Self::Target {
+        &self.namespace
+    }
+}
+impl std::fmt::Debug for HeldLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.layer, f)
+    }
+}
+impl std::fmt::Debug for HeldNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.namespace, f)
+    }
+}
+impl PartialEq for HeldLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.layer == other.layer
+    }
+}
+impl Eq for HeldLayer {}
+impl PartialEq<LayerChangeset> for HeldLayer {
+    fn eq(&self, other: &LayerChangeset) -> bool {
+        &self.layer == other
+    }
+}
+impl PartialEq for HeldNamespace {
+    fn eq(&self, other: &Self) -> bool {
+        self.namespace == other.namespace
+    }
+}
+impl Eq for HeldNamespace {}
 fn semantic(error: impl std::fmt::Display) -> LibVmError {
     LibVmError::StateDecode {
         field: "layer artifact",
@@ -316,6 +369,61 @@ impl LayerStore {
         &self,
         id: LayerResultId,
         limits: &ChangesetLimits,
+    ) -> Result<HeldLayer, LibVmError> {
+        let store = self.clone();
+        let limits = *limits;
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let owner = runtime.block_on(store.begin_layer_consumer(&[id]))?;
+            let layer = runtime.block_on(store.load_pinned(id, &limits, true))?;
+            Ok(HeldLayer {
+                layer,
+                _owner: owner,
+            })
+        })
+        .await?
+    }
+
+    async fn begin_layer_consumer(
+        &self,
+        results: &[LayerResultId],
+    ) -> Result<LayerReadOwner, LibVmError> {
+        let pool = StoragePool::open_existing(&self.store.images_dir)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "retained layer pool is absent",
+            )
+        })?;
+        let operation = uuid::Uuid::new_v4();
+        let _roots = pool.lock_roots_shared()?;
+        let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let lease = pool.lease(operation)?;
+        Store::insert_stopped_operation(&mut tx, operation, "import", &lease, &[], &[]).await?;
+        for result in results {
+            let stream: String =
+                sqlx::query_scalar("SELECT pack_stream FROM layer_result WHERE id=?1")
+                    .bind(result.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) VALUES(?1,?2)")
+                .bind(operation.to_string()).bind(result.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) VALUES(?1,?2)")
+                .bind(operation.to_string()).bind(stream).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM layer_object_dependency WHERE result_id=?2")
+                .bind(operation.to_string()).bind(result.to_string()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(LayerReadOwner {
+            _lease: lease,
+            _store: self.store.clone(),
+        })
+    }
+
+    async fn load_pinned(
+        &self,
+        id: LayerResultId,
+        limits: &ChangesetLimits,
+        authenticate_payload: bool,
     ) -> Result<LayerChangeset, LibVmError> {
         limits.validate()?;
         let row=sqlx::query("SELECT r.recipe_id,r.pack_stream,r.pack_length,r.index_root,r.record_digest,r.record_bytes,p.diff_id,p.record_digest AS recipe_digest,p.record_bytes AS recipe_bytes FROM layer_result r JOIN layer_recipe p ON p.id=r.recipe_id WHERE r.id=?1")
@@ -374,8 +482,12 @@ impl LayerStore {
                     "retained layer pool is absent",
                 )
             })?;
-            let map = pool.verify_stream(&pack_stream)?;
-            if map.length() != pack_length {
+            let length = if authenticate_payload {
+                pool.verify_stream(&pack_stream)?.length()
+            } else {
+                pool.lower_occurrence(&pack_stream)?.length()
+            };
+            if length != pack_length {
                 return Err(semantic("pack length contradiction"));
             }
             let mut observed = BTreeSet::new();
@@ -425,7 +537,7 @@ impl LayerStore {
         &self,
         results: &[LayerResultId],
         limits: &ChangesetLimits,
-    ) -> Result<oci::changeset::namespace::ValidatedNamespace, LibVmError> {
+    ) -> Result<HeldNamespace, LibVmError> {
         limits.validate()?;
         if results.len() as u64 > limits.max_layers {
             return Err(oci::changeset::ChangesetError::Limit {
@@ -435,18 +547,27 @@ impl LayerStore {
             }
             .into());
         }
-        let mut layers = Vec::new();
-        for id in results {
-            layers.push(self.load(*id, limits).await?);
-        }
+        let store = self.clone();
+        let results = results.to_vec();
         let limits = *limits;
-        let context = self.store.layer_worker_context();
+        let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
+            let owner = runtime.block_on(store.begin_layer_consumer(&results))?;
+            let mut layers = Vec::with_capacity(results.len());
+            for id in results {
+                layers.push(runtime.block_on(store.load_pinned(id, &limits, true))?);
+            }
+            let context = store.store.layer_worker_context();
             #[cfg(test)]
             context.hit(WorkerPoint::Compose)?;
             let _context = context;
-            oci::changeset::namespace::compose(&layers.iter().collect::<Vec<_>>(), &limits)
-                .map_err(LibVmError::Namespace)
+            let namespace =
+                oci::changeset::namespace::compose(&layers.iter().collect::<Vec<_>>(), &limits)
+                    .map_err(LibVmError::Namespace)?;
+            Ok(HeldNamespace {
+                namespace,
+                _owner: owner,
+            })
         })
         .await?
     }
@@ -578,45 +699,145 @@ fn prepare(
     })
 }
 impl Store {
+    pub(crate) async fn check_layer_catalog(&self) -> Result<(), LibVmError> {
+        let mut cursor = String::new();
+        loop {
+            let ids = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM layer_result WHERE id>?1 ORDER BY id LIMIT 256",
+            )
+            .bind(&cursor)
+            .fetch_all(&self.pool)
+            .await?;
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids {
+                cursor.clone_from(&id);
+                LayerStore {
+                    store: self.clone(),
+                }
+                .load_pinned(id.parse()?, &ChangesetLimits::default(), false)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) async fn retire_layer_cache(&self) -> Result<(), LibVmError> {
+        let store = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || runtime.block_on(async {
+            let pool=StoragePool::open(&store.images_dir)?;
+            store.retire_abandoned_storage_operations(&pool).await?;
+            store.check_layer_catalog().await?;
+            let mut cursor=String::new();
+            loop {
+                let ids=sqlx::query_scalar::<_,String>("SELECT owner_digest FROM layer_occurrence_set WHERE owner_digest>?1 ORDER BY owner_digest LIMIT 256")
+                    .bind(&cursor).fetch_all(&store.pool).await?;
+                if ids.is_empty(){break;}
+                let _roots=pool.lock_roots()?;
+                let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                for owner in ids {
+                    cursor.clone_from(&owner);
+                    sqlx::query("DELETE FROM layer_occurrence_set WHERE owner_digest=?1 AND NOT EXISTS(SELECT 1 FROM image_manifest m JOIN image_ref r ON r.manifest_digest=m.digest WHERE m.digest=?1 OR m.config_digest=?1) AND NOT EXISTS(SELECT 1 FROM storage_image WHERE record_digest=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_object WHERE object_digest=?1)")
+                        .bind(owner).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+            }
+            crate::store::cache_paths::check_machine_dependencies(&store).await?;
+            let mut cursor=String::new();
+            loop {
+                let ids=sqlx::query_scalar::<_,String>("SELECT id FROM layer_result WHERE id>?1 ORDER BY id LIMIT 256")
+                    .bind(&cursor).fetch_all(&store.pool).await?;
+                if ids.is_empty(){break;}
+                let _roots=pool.lock_roots()?;
+                let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                for id in ids {
+                    cursor.clone_from(&id);
+                    let stream: Option<String>=sqlx::query_scalar("SELECT pack_stream FROM layer_result WHERE id=?1").bind(&id).fetch_optional(&mut *tx).await?;
+                    if let Some(stream)=stream {
+                        if crate::store::cache_paths::machine_retains_stream(&mut tx,stream.parse::<StreamId>().map_err(semantic)?).await? {continue;}
+                    }
+                    sqlx::query("DELETE FROM layer_result WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM layer_occurrence WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_layer WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=layer_result.pack_stream)")
+                        .bind(&id).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+            }
+            loop {
+                let _roots=pool.lock_roots()?;
+                let removed=sqlx::query("DELETE FROM layer_recipe WHERE id IN (SELECT p.id FROM layer_recipe p WHERE NOT EXISTS(SELECT 1 FROM layer_result r WHERE r.recipe_id=p.id) ORDER BY p.id LIMIT 256)").execute(&store.pool).await?.rows_affected();
+                if removed<256 {break;}
+            }
+            Ok::<_,LibVmError>(())
+        })).await?
+    }
     pub(crate) async fn recover_layer_objects(&self) -> Result<(), LibVmError> {
         let store = self.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            let _context=store.layer_worker_context();
+            let _context = store.layer_worker_context();
             // Store owns the explicit catalog capability even if its SQL pool
             // is explicitly closed while this detached worker is still running.
             // Writable recovery initializes empty coordination directories for
             // catalog/immutable-pool snapshots that deliberately omit them.
             // Read-side load/find_recipe retain their noncreating opener.
-            let pool=StoragePool::open(&store.images_dir)?;
+            let pool = StoragePool::open(&store.images_dir)?;
             runtime.block_on(store.retire_abandoned_storage_operations(&pool))?;
-            let mut scan=pool.scan_objects()?;
+            runtime.block_on(crate::store::artifact_store::retire_unrooted_managed(
+                &store, &pool,
+            ))?;
+            let mut scan = pool.scan_objects()?;
             loop {
-                let batch=scan.by_ref().take(256).collect::<Result<Vec<_>,_>>()?;
-                if batch.is_empty() {break;}
+                let batch = scan.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
+                if batch.is_empty() {
+                    break;
+                }
                 runtime.block_on(store.check_operation_recovery(&pool))?;
+                runtime.block_on(store.check_layer_catalog())?;
                 runtime.block_on(crate::store::snapshot_store::check_snapshot_catalog(&store))?;
-                runtime.block_on(crate::store::managed_image_store::check_image_catalog(&store))?;
-                let _roots=pool.lock_roots()?;
+                runtime.block_on(crate::store::managed_image_store::check_image_catalog(
+                    &store,
+                ))?;
+                runtime.block_on(crate::store::stream_representation::check_catalog(&store))?;
+                runtime.block_on(crate::store::stream_representation::retire_unrooted(
+                    &store, &pool,
+                ))?;
+                runtime.block_on(crate::store::cache_paths::check_machine_dependencies(
+                    &store,
+                ))?;
+                let _roots = pool.lock_roots()?;
                 runtime.block_on(async {
-                    let mut tx=store.pool.begin_with("BEGIN IMMEDIATE").await?;
-                    let machine_objects=crate::store::cache_paths::retained_machine_objects(&mut tx).await?;
-                    let mut orphaned=Vec::new();
+                    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                    let mut orphaned = Vec::new();
                     for digest in batch {
-                        let retained:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM image_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_capture_provenance WHERE evidence_digest=?1)").bind(digest.to_string()).fetch_one(&mut *tx).await?;
-                        if !retained && !machine_objects.contains(&digest) {orphaned.push(digest);}
+                        let retained =
+                            crate::store::stream_representation::object_reachable(&mut tx, digest)
+                                .await?;
+                        if !retained {
+                            orphaned.push(digest);
+                        }
                     }
-                    let candidates=orphaned.iter().map(|digest|pool.object_path(digest)).collect::<Vec<_>>();
-                    crate::store::ensure_cache_paths_unreferenced(&mut tx,&candidates,&store.home).await?;
+                    let candidates = orphaned
+                        .iter()
+                        .map(|digest| pool.object_path(digest))
+                        .collect::<Vec<_>>();
+                    crate::store::ensure_cache_paths_unreferenced(
+                        &mut tx,
+                        &candidates,
+                        &store.home,
+                    )
+                    .await?;
                     #[cfg(test)]
                     _context.hit(WorkerPoint::RecoveryDelete)?;
-                    for digest in orphaned {pool.remove_object(&digest)?;}
+                    for digest in orphaned {
+                        pool.remove_object(&digest)?;
+                    }
                     tx.commit().await?;
-                    Ok::<_,LibVmError>(())
+                    Ok::<_, LibVmError>(())
                 })?;
             }
-            Ok::<_,LibVmError>(())
-        }).await?
+            Ok::<_, LibVmError>(())
+        })
+        .await?
     }
 }
 
@@ -1007,20 +1228,29 @@ pub(crate) mod tests {
             .execute(&store.store.pool)
             .await
             .unwrap();
+        // Occurrence metadata is subordinate cache state, not an immortal root.
+        // The actual namespace reader owns all three ordered inputs.
+        let namespace = store
+            .compose(&[a.id, b.id, a.id], &ChangesetLimits::default())
+            .await
+            .unwrap();
         let report = store.store.prune_images().await.unwrap();
         assert_eq!(report.bytes_removed, 0);
         store.load(a.id, &ChangesetLimits::default()).await.unwrap();
-        // An unreferenced flat artifact can share a retained layer stream. Its
-        // catalog row is prunable, but neither GC gate may unlink the pack.
+        // A flat artifact may share a live namespace's layer stream.
+        // Neither GC gate may unlink that pack while the consumer owns it.
         sqlx::query("INSERT INTO image_manifest(digest,media_type,image_id,platform_os,platform_architecture,config_digest,layer_count,total_size_bytes,created_at) VALUES('fixture-manifest','fixture','fixture-image','linux','amd64','fixture-config',0,4096,0)").execute(&store.store.pool).await.unwrap();
         let pool = StoragePool::open(&store.store.images_dir).unwrap();
         sqlx::query("INSERT INTO image_rootfs_artifact(image_id,manifest_digest,config_digest,platform_os,platform_architecture,filesystem,rootfs_path,size_bytes,created_at,stream_id,conversion_abi) VALUES('fixture-image','fixture-manifest','fixture-config','linux','amd64','ext4',?1,?2,0,?3,?4)")
             .bind(pool.stream_path(&a.pack_stream).to_str().unwrap()).bind(a.pack_length as i64).bind(a.pack_stream.to_string()).bind(crate::image::oci::CONVERSION_ABI).execute(&store.store.pool).await.unwrap();
         let report = store.store.prune_images().await.unwrap();
-        assert_eq!(report.artifacts_removed, 1);
         assert_eq!(report.bytes_removed, 0);
         assert!(pool.stream_path(&a.pack_stream).exists());
         store.load(a.id, &ChangesetLimits::default()).await.unwrap();
+        drop(namespace);
+        store.store.prune_images().await.unwrap();
+        assert_eq!(count(&store, "layer_result").await, 0);
+        assert!(!pool.stream_path(&a.pack_stream).exists());
     }
     #[tokio::test]
     async fn source_free_consumer_authenticates_every_closure_member() {

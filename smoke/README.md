@@ -23,6 +23,64 @@ make smoke SMOKE_ARGS="--backend vz"   # macOS only
 make smoke SMOKE_ARGS="-k tty_resize --keep"
 ```
 
+### Controlled Distribution registry
+
+`test_distribution_registry.py` runs CNCF Distribution 3.1.2 as a real local
+TLS server, with anonymous access and deletion enabled. It verifies exact-byte
+OCI VM artifact graphs, shared blobs, tag replacement, upload continuation
+across restart, missing-dependency refusal and offline garbage collection.
+The initial Linux run passed all 23 registry tests, including the existing
+loopback-registry test. This is registry compatibility evidence, not yet an
+end-to-end Silo artifact round trip or GHCR qualification. GHCR is deferred.
+
+The harness downloads the official Linux amd64 or arm64 archive and verifies
+both archive and extracted executable against pinned SHA-256 values in
+`silo_smoke/distribution_registry.py`. No Docker daemon is needed. For offline
+execution, seed the exact release archive under
+`<SILO_SMOKE_CACHE>/distribution-registry/3.1.2/<arch>/`.
+There is no macOS release asset or substitute server fallback.
+
+```sh
+uv run --project smoke pytest smoke/tests/test_distribution_registry.py smoke/tests/test_registry.py
+```
+
+The registry uses the suite's private CA. Offline GC requires the server to
+be stopped; it restarts on the same address. Failed runs retain identity,
+configuration and server/GC logs. A registry fixture never modifies the
+user's Docker configuration or hosted registry credentials.
+
+`test_artifact_stopped.py` drives the staged CLI in local and private-daemon
+mode against this registry. It covers raw and converted images plus stopped
+checkpoints, raw/zstd identity, trust refusal without catalog effects, source
+OCI deletion, offline registry GC, decoded-flat eviction, chunk-only
+reconstruction and real guest boot with retained boot assets. Its interrupted
+pull case removes a real registry chunk, corrupts one completed local cache
+entry, then proves the retry refetches only invalid/missing bytes.
+The Linux stopped-artifact gate passed all seven cases, including both local
+and daemon routes (`artifact-stopped-corrected.xml`, 338.87 s). This establishes
+the controlled Distribution lane only; GHCR remains deferred.
+
+```sh
+cargo build --locked -p libvm --example storage_acceptance
+uv run --project smoke pytest smoke/tests/test_artifact_stopped.py
+```
+
+`test_artifact_live.py` is a functional slow selection, not a performance
+qualification. Use the exact-input isolated capture/restore candidate's
+`SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR`; production admission must
+remain unchanged. It publishes a real matched-cut checkpoint, pulls into a
+fresh home, removes source/registry dependencies, and exercises exact restore
+or incompatible-producer refusal. The destination has its own private runtime.
+The Linux candidate gate passed all three cases
+(`artifact-live-exact-binding.xml`, 159.89 s). Restored machines preserve
+the complete captured boot binding and independently verified boot bytes,
+not a hardcoded ABI version.
+
+```sh
+uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow
+```
+
+
 ### Guest lifecycle controller (Phase 12)
 
 Main builds the explicit host-only smoke executable separately, then stages
