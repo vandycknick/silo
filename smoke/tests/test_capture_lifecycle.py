@@ -562,10 +562,12 @@ def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
         run.coherent(seal)
         before = capture.inventory(run.directory)
         assert "vm.capture-source.json" not in before
+        # The ordinary OCI source is layered; its upper keeps the tree below /upper.
         source_disk = stopped.writable_paths(silo, NAME)["root"]
+        assert stopped.record(silo, NAME)["root"]["kind"] == "linux-overlay"
 
         def disk_counter() -> bytes:
-            result = subprocess.run(["debugfs", "-R", "cat /capture-counter", str(source_disk)],
+            result = subprocess.run(["debugfs", "-R", "cat /upper/capture-counter", str(source_disk)],
                                     check=True, capture_output=True, timeout=30)
             silo.ws.record("capture-fenced-counter-reader", result.stderr.decode(errors="replace"))
             assert len(result.stdout) == run.counter.page_size

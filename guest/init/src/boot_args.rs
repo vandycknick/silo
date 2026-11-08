@@ -13,8 +13,8 @@ use rootfs_spec::kernel_cmdline::{params, Reserved};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootMarker {
-    /// `silo.rootfs=linux-flat-overlay-v1`, a consistency guard only.
-    FlatOverlay,
+    /// `silo.rootfs=linux-erofs-overlay-v1`, a consistency guard only.
+    ErofsOverlay,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -44,10 +44,10 @@ pub fn parse(cmdline: &[u8]) -> Result<BootArgs<'_>, &'static str> {
                 return Err("duplicate init= argument");
             }
         } else if param.is(b"silo.rootfs") {
-            if value != b"linux-flat-overlay-v1" {
+            if value != b"linux-erofs-overlay-v1" {
                 return Err("unknown silo.rootfs= root marker");
             }
-            if args.marker.replace(RootMarker::FlatOverlay).is_some() {
+            if args.marker.replace(RootMarker::ErofsOverlay).is_some() {
                 return Err("duplicate silo.rootfs= argument");
             }
         }
@@ -63,10 +63,10 @@ mod tests {
     fn plain_and_overlay_command_lines_parse_exactly() {
         assert_eq!(parse(b"console=hvc0 loglevel=4\n"), Ok(BootArgs::default()));
         assert_eq!(
-            parse(b"loglevel=6 silo.rootfs=linux-flat-overlay-v1 init=/sbin/candidate-init\n"),
+            parse(b"loglevel=6 silo.rootfs=linux-erofs-overlay-v1 init=/sbin/candidate-init\n"),
             Ok(BootArgs {
                 init: Some(b"/sbin/candidate-init".as_slice()),
-                marker: Some(RootMarker::FlatOverlay),
+                marker: Some(RootMarker::ErofsOverlay),
             })
         );
         // Similar names and quoted text are unrelated keys, as in the kernel.
@@ -79,10 +79,10 @@ mod tests {
     #[test]
     fn quoted_spellings_are_read_as_the_kernel_reads_them() {
         assert_eq!(
-            parse(b"\"silo.rootfs=linux-flat-overlay-v1\" init=\"/sbin/my init\"\n"),
+            parse(b"\"silo.rootfs=linux-erofs-overlay-v1\" init=\"/sbin/my init\"\n"),
             Ok(BootArgs {
                 init: Some(b"/sbin/my init".as_slice()),
-                marker: Some(RootMarker::FlatOverlay),
+                marker: Some(RootMarker::ErofsOverlay),
             })
         );
         assert!(parse(b"init=/a \"init=/b\"").is_err());
@@ -98,7 +98,7 @@ mod tests {
             b"rdinit=\"/agent/silo-agent\"",
             b"console=hvc0\x0brdinit=/agent/silo-agent",
             b"x\xa0rdinit=/agent/silo-agent",
-            b"silo.rootfs=linux-flat-overlay-v1 init=/sbin/init rdinit=/agent/silo-agent",
+            b"silo.rootfs=linux-erofs-overlay-v1 init=/sbin/init rdinit=/agent/silo-agent",
         ] {
             assert_eq!(
                 parse(cmdline),
@@ -115,7 +115,7 @@ mod tests {
             b"console=hvc0 root=PARTUUID=01234567-89ab-cdef-0123-456789abcdef",
             b"rootfstype=ext4",
             b"rootflags=ro",
-            b"silo.rootfs=linux-flat-overlay-v1 root=/dev/vdb",
+            b"silo.rootfs=linux-erofs-overlay-v1 root=/dev/vdb",
             b"root=",
             b"\"root=/dev/vda\"",
             b"rootflags=\"ro\"",
@@ -133,7 +133,8 @@ mod tests {
         for cmdline in [
             b"init=/a init=/b".as_slice(),
             b"init=/a init=/a",
-            b"silo.rootfs=linux-flat-overlay-v1 silo.rootfs=linux-flat-overlay-v1",
+            b"silo.rootfs=linux-erofs-overlay-v1 silo.rootfs=linux-erofs-overlay-v1",
+            b"silo.rootfs=linux-flat-overlay-v1",
             b"silo.rootfs=opaque-raw-v1",
             b"silo.rootfs=",
         ] {

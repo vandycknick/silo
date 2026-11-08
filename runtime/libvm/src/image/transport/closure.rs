@@ -74,6 +74,8 @@ pub(crate) enum ObjectRole {
     Devices,
     /// Opaque boot bytes: always reconstructed through a chunk stream.
     Streamed,
+    /// EROFS metadata keeps whole-byte object identity even when chunked.
+    Fsmeta,
 }
 
 impl ObjectRole {
@@ -82,7 +84,7 @@ impl ObjectRole {
             Self::Record { .. } => Some(PayloadMediaType::Record),
             Self::Execution => Some(PayloadMediaType::Execution),
             Self::Devices => Some(PayloadMediaType::DeviceState),
-            Self::Streamed => None,
+            Self::Streamed | Self::Fsmeta => None,
         }
     }
 
@@ -91,7 +93,8 @@ impl ObjectRole {
             Self::Record { maximum } => maximum,
             Self::Execution => crate::store::capture_native::MAX_EXECUTION_BYTES,
             Self::Devices => crate::store::capture_native::MAX_DEVICE_BYTES,
-            Self::Streamed => Resource::ArtifactStreamBytes.maximum(),
+            Self::Streamed => wire::MAX_STREAM_BYTES,
+            Self::Fsmeta => Resource::FsmetaBytes.maximum(),
         }
     }
 }
@@ -211,9 +214,57 @@ impl Semantic {
     /// Ordered semantic streams with repeats; geometry stays in the record.
     pub(crate) fn streams(&self) -> Vec<&SnapshotStream> {
         match &self.record {
-            SemanticRecord::Image(record) => vec![&record.root.stream],
+            SemanticRecord::Image(record) => {
+                let mut streams = vec![&record.root.stream];
+                if let SnapshotRootProfile::LinuxOverlay { lower, .. } = &record.root.profile {
+                    streams.extend(lower.layers.iter().map(|layer| &layer.pack));
+                }
+                streams
+            }
             SemanticRecord::Snapshot(record) => record.streams().collect(),
         }
+    }
+
+    pub(crate) fn composition(
+        &self,
+    ) -> Option<&crate::store::models::snapshot::SnapshotComposition> {
+        match &self.root().profile {
+            SnapshotRootProfile::LinuxOverlay { lower, .. } => Some(lower),
+            SnapshotRootProfile::OpaqueRaw => None,
+        }
+    }
+
+    /// Validate every retained edge and actual EROFS/body mapping before any
+    /// graph is published or accepted. No encoder or source registry is used.
+    pub(crate) fn authenticate_lower(
+        &self,
+        read_object: impl FnMut(&ObjectDigest, u64) -> Result<Vec<u8>, LibVmError>,
+        open_object: impl FnMut(&ObjectDigest) -> Result<std::fs::File, LibVmError>,
+        mut open_stream: impl FnMut(&SnapshotStream) -> Result<std::fs::File, LibVmError>,
+    ) -> Result<(), LibVmError> {
+        let SnapshotRootProfile::LinuxOverlay {
+            lower,
+            lower_geometry,
+            lower_filesystem_uuid,
+            upper_uuid,
+            ..
+        } = &self.root().profile
+        else {
+            return Ok(());
+        };
+        let upper = open_stream(&self.root().stream)?;
+        crate::machine::root_storage::validate_upper_file(
+            &upper,
+            *upper_uuid,
+            self.root().geometry.length,
+        )?;
+        let authenticated = lower.authenticate(read_object)?;
+        authenticated.check_root_claims(lower_geometry, *lower_filesystem_uuid)?;
+        crate::machine::root_storage::check_lower_platform(
+            &authenticated.recipe.platform,
+            self.boot(),
+        )?;
+        authenticate_composition_bytes(lower, &authenticated, open_object, open_stream)
     }
 
     fn binding(&self) -> Result<(&BootBinding, GuestArchitecture, &str), LibVmError> {
@@ -258,7 +309,7 @@ impl Semantic {
             SnapshotRootProfile::LinuxOverlay { .. } => (
                 wire::RootFamily::LinuxOverlay,
                 wire::BackendRequirement::KrunOverlay,
-                wire::StorageProfile::LinuxOverlayV1,
+                wire::StorageProfile::LinuxErofsOverlayV1,
             ),
         };
         let (purpose, capture_kind, execution_requirements) = match &self.record {
@@ -344,6 +395,20 @@ impl Semantic {
                 add_role(&mut roles, *page, metadata)?;
             }
         }
+        if let Some(lower) = self.composition() {
+            for digest in [lower.record, lower.recipe] {
+                add_role(&mut roles, digest, metadata)?;
+            }
+            add_role(&mut roles, lower.fsmeta, ObjectRole::Fsmeta)?;
+            for layer in &lower.layers {
+                for digest in [layer.recipe, layer.result, layer.index_root] {
+                    add_role(&mut roles, digest, metadata)?;
+                }
+                for page in &layer.index_pages {
+                    add_role(&mut roles, *page, metadata)?;
+                }
+            }
+        }
         let (binding, _, _) = self.binding()?;
         let BootBinding::Pinned {
             kernel,
@@ -407,6 +472,45 @@ impl Semantic {
     }
 }
 
+/// Authenticate held whole-byte fsmeta and occurrence-preserving pack files,
+/// including the logical concatenation identity, without materializing it.
+pub(crate) fn authenticate_composition_bytes(
+    lower: &crate::store::models::snapshot::SnapshotComposition,
+    authenticated: &crate::store::models::snapshot::AuthenticatedComposition,
+    mut open_object: impl FnMut(&ObjectDigest) -> Result<std::fs::File, LibVmError>,
+    mut open_stream: impl FnMut(&SnapshotStream) -> Result<std::fs::File, LibVmError>,
+) -> Result<(), LibVmError> {
+    let fsmeta = open_object(&lower.fsmeta)?;
+    let mut packs = BTreeMap::new();
+    for layer in &lower.layers {
+        if let std::collections::btree_map::Entry::Vacant(entry) = packs.entry(layer.pack.stream) {
+            entry.insert(open_stream(&layer.pack)?);
+        }
+    }
+    let layers = authenticated
+        .layers
+        .iter()
+        .zip(&lower.layers)
+        .map(|(layer, occurrence)| {
+            let pack = packs
+                .get(&occurrence.pack.stream)
+                .ok_or_else(|| failure("authenticated pack occurrence lost its held file"))?;
+            Ok(oci::erofs::Layer {
+                result: &layer.result,
+                changeset: &layer.changeset,
+                pack,
+            })
+        })
+        .collect::<Result<Vec<_>, LibVmError>>()?;
+    crate::storage::composition::load_exact(
+        &authenticated.recipe,
+        &layers,
+        &authenticated.result,
+        &fsmeta,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use oci::vm_artifact::wire::{self, ContentKind, RecordRef};
@@ -425,6 +529,24 @@ mod tests {
         )
         .unwrap()
         .id()
+    }
+
+    #[test]
+    fn fsmeta_is_a_streamed_object_with_its_own_four_gibibyte_bound() {
+        assert_eq!(ObjectRole::Fsmeta.media(), None);
+        assert_eq!(ObjectRole::Fsmeta.maximum(), 4 * 1024 * 1024 * 1024);
+        assert_ne!(ObjectRole::Fsmeta, ObjectRole::Streamed);
+        let mut roles = std::collections::BTreeMap::new();
+        let digest = ObjectDigest::of_bytes(b"fsmeta");
+        crate::image::transport::closure::add_role(&mut roles, digest, ObjectRole::Fsmeta).unwrap();
+        assert!(crate::image::transport::closure::add_role(
+            &mut roles,
+            digest,
+            ObjectRole::Record {
+                maximum: 4 * 1024 * 1024
+            },
+        )
+        .is_err());
     }
 
     #[test]

@@ -89,6 +89,8 @@ impl Iterator for StreamScan<'_> {
     }
 }
 
+/// Metadata-only discovery of immutable objects, including fsmeta lower
+/// backings. Recovery enumeration must not open them before FD admission.
 pub struct ObjectScan<'a> {
     directory: &'a OwnedDirectory,
     entries: nix::dir::OwningIter,
@@ -109,7 +111,7 @@ impl Iterator for ObjectScan<'_> {
                 Ok(name) => name,
                 Err(_) => continue,
             };
-            match existing(self.directory, name) {
+            match immutable_length(self.directory, name) {
                 Ok(Some(_)) => return Some(Ok(ObjectDigest::from_sha256(bytes))),
                 Ok(None) => continue,
                 Err(error) => return Some(Err(error)),
@@ -410,7 +412,30 @@ impl StoragePool {
             ))
         })?;
         Ok(crate::storage::vmdk::LowerOccurrence::resolved(
-            *id, path, length,
+            crate::storage::vmdk::LowerBacking::Stream(*id),
+            path,
+            length,
+        ))
+    }
+
+    /// Resolve an immutable byte-object lower occurrence (fsmeta) without
+    /// opening it; the same pinned-directory/NOFOLLOW rules as streams apply.
+    pub fn lower_object_occurrence(
+        &self,
+        digest: &ObjectDigest,
+    ) -> Result<crate::storage::vmdk::LowerOccurrence, StorageError> {
+        let name = digest.hex();
+        let path = self.objects.path().join(&name);
+        let length = immutable_length(&self.objects, &name)?.ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing object {}", path.display()),
+            ))
+        })?;
+        Ok(crate::storage::vmdk::LowerOccurrence::resolved(
+            crate::storage::vmdk::LowerBacking::Object(*digest),
+            path,
+            length,
         ))
     }
 
@@ -837,6 +862,55 @@ impl StoragePool {
             },
             roots,
         ))
+    }
+
+    /// Produce a byte object directly into owned pool staging, then hash and
+    /// publish that exact file; large objects (fsmeta) are never copied. The
+    /// producer must leave the complete object in `file`. Staging is removed
+    /// on any failure. Keep the guard through the catalog retention commit.
+    pub(crate) fn publish_produced_object_for_catalog<T, E: From<StorageError>>(
+        &self,
+        produce: impl FnOnce(&mut File) -> Result<T, E>,
+    ) -> Result<(PublishedObject, StorageLock, T), E> {
+        let (staging, mut file) = self.stage()?;
+        let output = produce(&mut file)?;
+        let published = (|| {
+            file.sync_all()?;
+            file.seek(SeekFrom::Start(0))?;
+            let before = SourceFingerprint::new(&file.metadata()?);
+            let (digest, length) = copy_object(&mut file, &mut std::io::sink())?;
+            if before != SourceFingerprint::new(&file.metadata()?) {
+                return Err(StorageError::SourceChanged(staging.directory.path().into()));
+            }
+            seal(&file)?;
+            let name = digest.hex();
+            let _publication = locks::blocking(
+                &self.publication,
+                &format!("object-{name}.lock"),
+                FlockArg::LockExclusive,
+            )?;
+            let verified = if let Some(mut existing) = existing(&self.objects, &name)? {
+                let before = SourceFingerprint::new(&existing.metadata()?);
+                if copy_object(&mut existing, &mut std::io::sink())? != (digest, length)
+                    || before != SourceFingerprint::new(&existing.metadata()?)
+                {
+                    return Err(StorageError::ContentMismatch(self.object_path(&digest)));
+                }
+                Some(before)
+            } else {
+                None
+            };
+            let roots = self.finish_publication(&self.objects, &staging, &name, verified)?;
+            Ok((
+                PublishedObject {
+                    digest,
+                    length,
+                    path: self.object_path(&digest),
+                },
+                roots,
+            ))
+        })()?;
+        Ok((published.0, published.1, output))
     }
 
     fn finish_publication(

@@ -607,9 +607,49 @@ func applyCommand(args []string) (result error) {
 	return os.WriteFile(filepath.Join(*out, "differences.md"), []byte(reportMarkdown(report)), 0600)
 }
 
+// collectCommand observes an independently unpacked tree without extracting,
+// repairing, normalizing, or suppressing metadata.
+func collectCommand(args []string) error {
+	flags := flag.NewFlagSet("collect", flag.ContinueOnError)
+	root := flags.String("root", "", "independently unpacked filesystem root")
+	out := flags.String("out", "", "filesystem observation JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *root == "" || *out == "" {
+		return fmt.Errorf("collect requires --root and --out")
+	}
+	absolute, err := filepath.Abs(*root)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("collection root is not a directory")
+	}
+	rows, problems := collect(absolute)
+	report := struct {
+		Schema      int            `json:"schema"`
+		Collector   string         `json:"collector"`
+		Environment map[string]any `json:"environment"`
+		Rows        []Row          `json:"rows"`
+		Problems    []string       `json:"problems"`
+	}{1, "silo-independent-filesystem-observer-v1", environment(absolute), rows, problems}
+	if err := writeJSON(*out, report); err != nil {
+		return err
+	}
+	if len(problems) != 0 {
+		return fmt.Errorf("filesystem observation is incomplete: %d problems", len(problems))
+	}
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: extractor apply|acquire|socket|metadata [options]")
+		fmt.Fprintln(os.Stderr, "usage: extractor apply|acquire|socket|metadata|collect [options]")
 		os.Exit(2)
 	}
 	if info, ok := debug.ReadBuildInfo(); !ok {
@@ -637,6 +677,8 @@ func main() {
 		err = socketCommand(os.Args[2:])
 	case "metadata":
 		err = metadataCommand(os.Args[2:])
+	case "collect":
+		err = collectCommand(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}

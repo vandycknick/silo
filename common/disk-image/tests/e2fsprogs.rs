@@ -174,7 +174,7 @@ fn e2fsprogs_validates_pure_rust_offline_grow() {
         .expect("dumpe2fs reports block count")
         .trim();
     assert_eq!(block_count, "262144");
-    let mut reader = Reader::new(&image).expect("open grown image");
+    let reader = Reader::new(&image).expect("open grown image");
     assert_eq!(
         reader.read_file("/etc/big-file", 0, None).unwrap().len(),
         2 * 1024 * 1024
@@ -360,7 +360,7 @@ fn initialized_group_records_unused_inode_table_tail() {
     let formatter = Formatter::new(&image, 4096, 256 * 1024).unwrap();
     formatter.close().unwrap();
 
-    let mut reader = Reader::new(&image).unwrap();
+    let reader = Reader::new(&image).unwrap();
     let sb = reader.superblock().clone();
     let gd0 = reader.get_group_descriptor(0).unwrap();
 
@@ -1190,5 +1190,329 @@ fn assert_debugfs_metadata(stat: &str, kind: &str, mode: u16, uid: u64, gid: u64
             "0x80000000:1d6f3455",
             "{field}: {stat}"
         );
+    }
+}
+
+/// Run an e2fsprogs repair/optimize pass: 0 (clean) or 1 (changed) succeed.
+fn run_repair(program: &str, args: &[&str]) {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program}: {err}"));
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{program} {} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+const FRAG_BLOCKS: usize = 4096;
+const SMALL_ENTRIES: usize = 3000;
+const DEEP_ENTRIES: usize = 12_000;
+
+fn deep_name(index: usize) -> String {
+    format!("{}-{index:05}", "n".repeat(190))
+}
+
+fn frag_expected() -> Vec<u8> {
+    let mut bytes = vec![0u8; FRAG_BLOCKS * 4096];
+    for (block, chunk) in bytes.chunks_mut(4096).enumerate() {
+        if block % 2 == 0 {
+            chunk.fill((block % 251) as u8 + 1);
+        }
+    }
+    bytes
+}
+
+/// A `silo-upper-ext4-v1` image mutated by libext2fs rather than the Rust
+/// formatter: indexed one- and two-level htree directories, a depth-2
+/// fragmented extent tree, unwritten allocation beyond EOF, external xattrs,
+/// a hardlink group and Linux special-file encodings. e2fsck must call it
+/// clean before the reader sees it.
+fn libext2fs_mutated_upper(dir: &Path) -> PathBuf {
+    use disk_image::ext4::upper::format_upper;
+    use rootfs_spec::upper_geometry::UpperCapacity;
+
+    let image = dir.join("mutated-upper.raw");
+    format_upper(&image, UpperCapacity::new(512 << 20).unwrap()).unwrap();
+    let frag = dir.join("frag.bin");
+    let mut source = frag_expected();
+    for (block, chunk) in source.chunks_mut(4096).enumerate() {
+        chunk.fill((block % 251) as u8 + 1);
+    }
+    std::fs::write(&frag, source).unwrap();
+    let small = dir.join("small.txt");
+    std::fs::write(&small, b"abc").unwrap();
+    let xattr = dir.join("xattr.bin");
+    std::fs::write(&xattr, vec![0x5au8; 3000]).unwrap();
+
+    let mut commands = String::from("cd /upper\nmkdir small\ncd small\n");
+    for index in 1..=SMALL_ENTRIES {
+        commands.push_str(&format!("mknod entry-{index:05} p\n"));
+    }
+    commands.push_str("cd /upper\nmkdir deep\ncd deep\n");
+    for index in 1..=DEEP_ENTRIES {
+        commands.push_str(&format!("mknod {} p\n", deep_name(index)));
+    }
+    commands.push_str("cd /upper\n");
+    commands.push_str(&format!("write {} frag\n", frag.display()));
+    for block in (1..FRAG_BLOCKS).step_by(2) {
+        commands.push_str(&format!("punch frag {block} {block}\n"));
+    }
+    commands.push_str(&format!(
+        "write {} pre\nfallocate pre 4 15\n",
+        small.display()
+    ));
+    commands.push_str(&format!("write {} attrs\n", small.display()));
+    commands.push_str(&format!("ea_set -f {} attrs user.big\n", xattr.display()));
+    commands.push_str("ea_set attrs trusted.overlay.origin abc\n");
+    commands.push_str(&format!(
+        "write {} orig\nln orig alias\nsif orig links_count 2\n",
+        small.display()
+    ));
+    // debugfs mknod limits both numbers to 16 bits. Create a new-encoding
+    // device first, then set its disk word to Linux's full 12:20-bit boundary.
+    commands.push_str("mknod null c 1 3\nmknod wide c 4095 65535\n");
+    commands.push_str("sif wide block[1] 0xffffffff\nmknod whiteout c 0 0\n");
+    commands.push_str("mknod disk b 8 1\nmknod pipe p\nsymlink fast frag\n");
+    commands.push_str(&format!("symlink slow {}\n", "x".repeat(100)));
+    let script = dir.join("mutate.debugfs");
+    std::fs::write(&script, commands).unwrap();
+    let path = image.to_str().unwrap();
+    run("debugfs", &["-w", "-f", script.to_str().unwrap(), path]);
+    run_repair("e2fsck", &["-fyD", path]);
+    run("e2fsck", &["-fn", path]);
+    image
+}
+
+#[test]
+fn reader_inspects_libext2fs_mutated_upper_exactly() {
+    use disk_image::ext4::constants::inode_flags;
+    use disk_image::ext4::reader::InodeKind;
+    use disk_image::ext4::types::ExtentHeader;
+    use disk_image::ext4::{DeviceId, FileRange};
+    use std::io::Read;
+
+    let dir = outside_workspace_tempdir();
+    let image = libext2fs_mutated_upper(dir.path());
+    let wide_stat = run(
+        "debugfs",
+        &["-R", "stat /upper/wide", image.to_str().unwrap()],
+    );
+    assert_eq!(
+        debugfs_stat_word(&wide_stat, "Device major/minor number:"),
+        "4095:1048575",
+        "{wide_stat}"
+    );
+    let reader = Reader::new(&image).unwrap();
+    let summary = reader.audit().unwrap();
+    assert_eq!(
+        summary.special_files,
+        (SMALL_ENTRIES + DEEP_ENTRIES + 5) as u64
+    );
+
+    let upper = reader.stat_no_follow("/upper").unwrap().0;
+    for (name, expected) in [
+        (
+            "small",
+            (1..=SMALL_ENTRIES)
+                .map(|i| format!("entry-{i:05}"))
+                .collect::<Vec<_>>(),
+        ),
+        ("deep", (1..=DEEP_ENTRIES).map(deep_name).collect()),
+    ] {
+        let number = reader.lookup(upper, name.as_bytes()).unwrap().unwrap();
+        let raw = reader.get_inode(number).unwrap();
+        assert_ne!(
+            raw.flags & inode_flags::HASHED_INDEX,
+            0,
+            "{name} must be indexed"
+        );
+        let names: Vec<_> = reader
+            .read_dir(number)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| String::from_utf8(entry.name).unwrap())
+            .collect();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(names, expected, "{name}");
+    }
+    // The two-level index is what the deep fixture exists for.
+    let indirect = run(
+        "debugfs",
+        &["-R", "htree /upper/deep", image.to_str().unwrap()],
+    );
+    assert!(indirect.contains("Indirect levels: 1"), "{indirect}");
+
+    let (frag, raw) = reader.stat_no_follow("/upper/frag").unwrap();
+    assert!(ExtentHeader::read_from(&raw.block).depth >= 2);
+    let body = reader.file_body(frag).unwrap();
+    assert_eq!(body.size(), (FRAG_BLOCKS * 4096) as u64);
+    let ranges: Vec<_> = body.stored_ranges().collect();
+    assert_eq!(ranges.len(), FRAG_BLOCKS / 2);
+    assert_eq!(
+        ranges[1],
+        FileRange {
+            offset: 2 * 4096,
+            length: 4096
+        }
+    );
+    let expected = frag_expected();
+    assert_eq!(reader.read_file("/upper/frag", 0, None).unwrap(), expected);
+    let dumped = dir.path().join("frag.dump");
+    run(
+        "debugfs",
+        &[
+            "-R",
+            &format!("dump /upper/frag {}", dumped.display()),
+            image.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(std::fs::read(&dumped).unwrap(), expected);
+    let mut stream = Vec::new();
+    reader.body_stream(&body).read_to_end(&mut stream).unwrap();
+    let stored: Vec<u8> = expected
+        .chunks(4096)
+        .step_by(2)
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(stream, stored);
+
+    let pre = reader.stat_no_follow("/upper/pre").unwrap().0;
+    let body = reader.file_body(pre).unwrap();
+    assert_eq!(
+        body.stored_ranges().collect::<Vec<_>>(),
+        [FileRange {
+            offset: 0,
+            length: 3
+        }]
+    );
+    assert_eq!(reader.read_file("/upper/pre", 0, None).unwrap(), b"abc");
+
+    let attrs = reader.xattrs("/upper/attrs").unwrap();
+    assert_eq!(attrs.get(b"user.big".as_slice()), Some(&vec![0x5au8; 3000]));
+    assert_eq!(
+        attrs.get(b"trusted.overlay.origin".as_slice()),
+        Some(&b"abc".to_vec())
+    );
+    assert_ne!(
+        reader
+            .stat_no_follow("/upper/attrs")
+            .unwrap()
+            .1
+            .xattr_block_lo,
+        0
+    );
+
+    let (orig, _) = reader.stat_no_follow("/upper/orig").unwrap();
+    assert_eq!(reader.stat_no_follow("/upper/alias").unwrap().0, orig);
+    assert_eq!(reader.metadata(orig).unwrap().links, 2);
+    for (name, kind) in [
+        (
+            "null",
+            InodeKind::CharacterDevice(DeviceId::new(1, 3).unwrap()),
+        ),
+        (
+            "wide",
+            InodeKind::CharacterDevice(DeviceId::new(4095, 1_048_575).unwrap()),
+        ),
+        (
+            "whiteout",
+            InodeKind::CharacterDevice(DeviceId::new(0, 0).unwrap()),
+        ),
+        ("disk", InodeKind::BlockDevice(DeviceId::new(8, 1).unwrap())),
+        ("pipe", InodeKind::Fifo),
+    ] {
+        let number = reader.lookup(upper, name.as_bytes()).unwrap().unwrap();
+        assert_eq!(reader.metadata(number).unwrap().kind, kind, "{name}");
+    }
+    assert_eq!(reader.read_link("/upper/fast").unwrap(), b"frag");
+    assert_eq!(
+        reader.read_link("/upper/slow").unwrap(),
+        "x".repeat(100).as_bytes()
+    );
+}
+
+#[test]
+fn reader_refuses_dirty_libext2fs_journal_without_replaying_it() {
+    use disk_image::ext4::error::{ReadError, RecoveryReason};
+
+    let dir = outside_workspace_tempdir();
+    let image = dir.path().join("dirty-upper.raw");
+    disk_image::ext4::upper::format_upper(
+        &image,
+        rootfs_spec::upper_geometry::UpperCapacity::new(64 << 20).unwrap(),
+    )
+    .unwrap();
+    let block = dir.path().join("block.bin");
+    std::fs::write(&block, vec![0xa5u8; 4096]).unwrap();
+    let script = dir.path().join("journal.debugfs");
+    std::fs::write(&script, format!("jo\njw -b 300 {}\njc\n", block.display())).unwrap();
+    let path = image.to_str().unwrap();
+    run("debugfs", &["-w", "-f", script.to_str().unwrap(), path]);
+    let before = std::fs::read(&image).unwrap();
+    assert!(matches!(
+        Reader::new(&image),
+        Err(ReadError::RequiresRecovery(
+            RecoveryReason::JournalNeedsRecovery
+        ))
+    ));
+    // The superblock stays readable for exact-copy callers, and nothing is replayed.
+    disk_image::ext4::read_superblock(&std::fs::File::open(&image).unwrap()).unwrap();
+    assert_eq!(std::fs::read(&image).unwrap(), before);
+
+    run("debugfs", &["-w", "-R", "feature -needs_recovery", path]);
+    assert!(matches!(
+        Reader::new(&image),
+        Err(ReadError::RequiresRecovery(RecoveryReason::JournalNotEmpty))
+    ));
+}
+
+#[test]
+fn reader_refuses_unsupported_mke2fs_formats() {
+    use disk_image::ext4::error::{ReadError, Unsupported};
+
+    let dir = outside_workspace_tempdir();
+    for (name, features, expected) in [
+        (
+            "csum.img",
+            "metadata_csum,64bit,^orphan_file",
+            (0u32, 0x80u32, 0x400u32),
+        ),
+        (
+            "inline.img",
+            "inline_data,^metadata_csum,^64bit,^orphan_file",
+            (0, 0x8000, 0),
+        ),
+    ] {
+        let image = dir.path().join(name);
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let path = image.to_str().unwrap();
+        run(
+            "mke2fs",
+            &["-q", "-F", "-t", "ext4", "-b", "4096", "-O", features, path],
+        );
+        match Reader::new(&image) {
+            Err(ReadError::Unsupported(Unsupported::Features {
+                compat,
+                incompat,
+                ro_compat,
+            })) => {
+                assert_eq!(compat & expected.0, expected.0, "{name}");
+                assert_eq!(incompat & expected.1, expected.1, "{name}");
+                assert_eq!(ro_compat & expected.2, expected.2, "{name}");
+            }
+            Err(other) => panic!("{name}: expected unsupported features, got {other:?}"),
+            Ok(_) => panic!("{name}: unsupported format was accepted"),
+        }
     }
 }

@@ -98,7 +98,7 @@ wire_enum!(Purpose { Image => "image", Checkpoint => "checkpoint" });
 wire_enum!(CaptureKind { StoppedStorage => "stopped-storage", LiveExecution => "live-execution" });
 wire_enum!(RootFamily { OpaqueRaw => "opaque-raw", LinuxOverlay => "linux-overlay" });
 wire_enum!(BackendRequirement { RawBlock => "raw-block", KrunOverlay => "krun-overlay" });
-wire_enum!(StorageProfile { OpaqueRawV1 => "opaque-raw-v1", LinuxOverlayV1 => "linux-overlay-v1" });
+wire_enum!(StorageProfile { OpaqueRawV1 => "opaque-raw-v1", LinuxErofsOverlayV1 => "linux-erofs-overlay-v1" });
 wire_enum!(GuestOs { Linux => "linux" });
 wire_enum!(Architecture { Amd64 => "amd64", Arm64 => "arm64" });
 
@@ -211,7 +211,7 @@ impl VmArtifactConfigV1 {
             | (
                 RootFamily::LinuxOverlay,
                 BackendRequirement::KrunOverlay,
-                StorageProfile::LinuxOverlayV1,
+                StorageProfile::LinuxErofsOverlayV1,
             ) => {}
             _ => return Err(invalid("inconsistent root/backend/storage profile")),
         }
@@ -233,7 +233,18 @@ impl VmArtifactConfigV1 {
     }
 }
 pub fn decode_vm_config(bytes: &[u8]) -> Result<VmArtifactConfigV1> {
-    let config: VmArtifactConfigV1 = decode_record(bytes)?;
+    let value: Value = decode_record(bytes)?;
+    if let Some(profile) = value
+        .pointer("/minimumCapabilities/storageProfile")
+        .and_then(Value::as_str)
+    {
+        if !matches!(profile, "opaque-raw-v1" | "linux-erofs-overlay-v1") {
+            return Err(crate::vm_artifact::Error::IncompatibleStorageProfile {
+                profile: profile.to_owned(),
+            });
+        }
+    }
+    let config: VmArtifactConfigV1 = serde_json::from_value(value)?;
     config.validate()?;
     Ok(config)
 }
@@ -714,6 +725,27 @@ mod tests {
             "guestPlatform":{"os":"linux","architecture":"arm64"},
             "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"linux-direct-v1","liveRestore":false},
             "executionRequirements":null,"streams":reference,"objects":reference,"captureProvenance":null})
+    }
+
+    #[test]
+    fn erofs_profile_is_explicit_and_retired_profiles_have_typed_refusals() {
+        let mut value = config_value();
+        value["rootFamily"] = json!("linux-overlay");
+        value["backendRequirement"] = json!("krun-overlay");
+        value["minimumCapabilities"]["storageProfile"] = json!("linux-erofs-overlay-v1");
+        assert!(wire::decode_vm_config(&wire::canonical_bytes(&value).unwrap()).is_ok());
+        for profile in [
+            "linux-overlay-v1",
+            "linux-flat-overlay-v1",
+            "future-overlay-v9",
+        ] {
+            value["minimumCapabilities"]["storageProfile"] = json!(profile);
+            assert!(matches!(
+                wire::decode_vm_config(&wire::canonical_bytes(&value).unwrap()),
+                Err(crate::vm_artifact::Error::IncompatibleStorageProfile { profile: refused })
+                    if refused == profile
+            ));
+        }
     }
     #[test]
     fn config_golden_and_required_nullable_closed_fields() {

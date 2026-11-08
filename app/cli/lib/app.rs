@@ -311,42 +311,6 @@ mod tests {
     }
 
     #[test]
-    fn stopped_help_distinguishes_retention_from_alias_removal_and_exact_bytes() {
-        let mut command = Cli::command();
-        let snapshot = command.find_subcommand_mut("snapshot").unwrap();
-        let help = snapshot.render_long_help().to_string();
-        assert!(help.contains("credentials"));
-        assert!(help.contains("dirty journals"));
-        assert!(help.contains("opaque raw"));
-        let remove = snapshot
-            .find_subcommand_mut("remove")
-            .unwrap()
-            .render_long_help()
-            .to_string();
-        assert!(remove.contains("Release explicit snapshot retention"));
-        assert!(remove.contains("Aliases"));
-        let image_remove = command
-            .find_subcommand_mut("image")
-            .unwrap()
-            .find_subcommand_mut("remove")
-            .unwrap()
-            .render_long_help()
-            .to_string();
-        assert!(image_remove.contains("only an image: alias"));
-        assert!(image_remove.contains("never release"));
-        for name in ["fork", "restore"] {
-            let help = command
-                .find_subcommand_mut(name)
-                .unwrap()
-                .render_long_help()
-                .to_string();
-            assert!(help.contains("catalog-owned secret-scope recovery"));
-            assert!(help.contains("with_secret_store"));
-            assert!(help.contains("secret-provider path remains supported"));
-        }
-    }
-
-    #[test]
     fn restore_activation_hook_cli_uses_the_strict_bounded_shared_type() {
         let valid =
             r#"{"argv":["/bin/false"],"environment":[],"workingDirectory":"/","timeoutMs":30000}"#;

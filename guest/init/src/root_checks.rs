@@ -1,4 +1,4 @@
-//! Pure checks over measured devices and ext4 primary superblocks.
+//! Pure checks over measured devices and fixed EROFS/ext4 root geometry.
 use rootfs_spec::upper_geometry::{self as profile, UpperCapacity, UpperGeometry};
 use rootfs_spec::{DeviceExpectation, DeviceNumber};
 
@@ -97,10 +97,9 @@ fn u32_at(bytes: &[u8; 1024], offset: usize) -> u32 {
     ])
 }
 
-pub fn check_superblock(
+pub fn check_upper_superblock(
     bytes: &[u8; 1024],
     expected: &DeviceExpectation,
-    upper: bool,
 ) -> Result<u64, &'static str> {
     if u16_at(bytes, 0x38) != 0xef53 {
         return Err("overlay: ext4 magic mismatch");
@@ -132,36 +131,172 @@ pub fn check_superblock(
     if u16_at(bytes, 0x3a) & 2 != 0 {
         return Err("overlay: ext4 error state");
     }
-    if upper {
-        if compat != profile::FEATURE_COMPAT
-            || ro != profile::FEATURE_RO_COMPAT
-            || u32_at(bytes, 0x20) != profile::BLOCKS_PER_GROUP
-            || u32_at(bytes, 0x24) != profile::BLOCKS_PER_GROUP
-            || u32_at(bytes, 0x28) != profile::INODES_PER_GROUP
-            || u32::from(u16_at(bytes, 0x58)) != profile::INODE_SIZE
-            || u32_at(bytes, 0xe0) != 8
-            || u32_at(bytes, 0xe4) != 0
-            || bytes[0x174] != profile::LOG_GROUPS_PER_FLEX
-            || bytes[0xfc] != profile::HASH_VERSION
-            || u32_at(bytes, 0x160) & 3 != profile::HASH_FLAGS
-            || u16_at(bytes, 0x15c) != 32
-            || u16_at(bytes, 0x15e) != 32
-            || bytes[0xec..0xfc] != expected.filesystem_uuid.bytes()
-        {
-            return Err("overlay: upper ext4 profile mismatch");
-        }
-        let groups = blocks.div_ceil(u64::from(profile::BLOCKS_PER_GROUP));
-        let descriptors = groups.div_ceil(u64::from(profile::DESCRIPTORS_PER_BLOCK));
-        if descriptors > u64::from(profile::MAX_DESCRIPTOR_BLOCKS)
-            || u64::from(u16_at(bytes, 0xce))
-                != u64::from(profile::MAX_DESCRIPTOR_BLOCKS) - descriptors
-        {
-            return Err("overlay: upper resize reservation mismatch");
-        }
-    } else if incompat & 4 != 0 || u16_at(bytes, 0x3a) & 1 == 0 || u32_at(bytes, 0xe8) != 0 {
-        return Err("overlay: lower requires journal recovery");
+    if compat != profile::FEATURE_COMPAT
+        || ro != profile::FEATURE_RO_COMPAT
+        || u32_at(bytes, 0x20) != profile::BLOCKS_PER_GROUP
+        || u32_at(bytes, 0x24) != profile::BLOCKS_PER_GROUP
+        || u32_at(bytes, 0x28) != profile::INODES_PER_GROUP
+        || u32::from(u16_at(bytes, 0x58)) != profile::INODE_SIZE
+        || u32_at(bytes, 0xe0) != 8
+        || u32_at(bytes, 0xe4) != 0
+        || bytes[0x174] != profile::LOG_GROUPS_PER_FLEX
+        || bytes[0xfc] != profile::HASH_VERSION
+        || u32_at(bytes, 0x160) & 3 != profile::HASH_FLAGS
+        || u16_at(bytes, 0x15c) != 32
+        || u16_at(bytes, 0x15e) != 32
+        || bytes[0xec..0xfc] != expected.filesystem_uuid.bytes()
+    {
+        return Err("overlay: upper ext4 profile mismatch");
+    }
+    let groups = blocks.div_ceil(u64::from(profile::BLOCKS_PER_GROUP));
+    let descriptors = groups.div_ceil(u64::from(profile::DESCRIPTORS_PER_BLOCK));
+    if descriptors > u64::from(profile::MAX_DESCRIPTOR_BLOCKS)
+        || u64::from(u16_at(bytes, 0xce)) != u64::from(profile::MAX_DESCRIPTOR_BLOCKS) - descriptors
+    {
+        return Err("overlay: upper resize reservation mismatch");
     }
     Ok(span)
+}
+
+/// Fixed `silo-erofs-v1` superblock, without following any untrusted address.
+/// Pack slots are checked separately and incrementally before the first mount.
+pub struct ErofsGeometry {
+    pub fsmeta_bytes: u64,
+    pub metadata_offset: u64,
+    pub devices: u16,
+}
+
+fn erofs_crc(block: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for (index, byte) in block[1024..].iter().enumerate() {
+        // The checksum field itself is zeroed for the CRC32C calculation.
+        crc ^= if (4..8).contains(&index) {
+            0
+        } else {
+            u32::from(*byte)
+        };
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f6_3b78 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    crc
+}
+
+pub fn check_erofs_superblock(
+    block: &[u8],
+    expected: &DeviceExpectation,
+) -> Result<ErofsGeometry, &'static str> {
+    if block.len() != 4096 {
+        return Err("overlay: truncated EROFS primary block");
+    }
+    let sb: &[u8; 1024] = block[1024..2048]
+        .try_into()
+        .map_err(|_| "overlay: truncated EROFS superblock")?;
+    if u32_at(sb, 0) != 0xe0f5_e1e2 {
+        return Err("overlay: EROFS magic mismatch");
+    }
+    if sb[48..64] != expected.filesystem_uuid.bytes() {
+        return Err("overlay: EROFS UUID mismatch");
+    }
+    if erofs_crc(block) != u32_at(sb, 4) {
+        return Err("overlay: EROFS superblock checksum mismatch");
+    }
+    if u32_at(sb, 8) != 3
+        || sb[12] != 12
+        || sb[13] != 0
+        || u16_at(sb, 14) != 0
+        || u32_at(sb, 80) != 12
+        || u32_at(sb, 44) != 0
+        || block[..1024].iter().any(|byte| *byte != 0)
+        || sb[24..36].iter().any(|byte| *byte != 0)
+        || sb[64..80].iter().any(|byte| *byte != 0)
+        || sb[84..86].iter().any(|byte| *byte != 0)
+        || block[1114..].iter().any(|byte| *byte != 0)
+    {
+        return Err("overlay: unsupported EROFS profile");
+    }
+    let inodes = u64::from(u32_at(sb, 16)) | (u64::from(u32_at(sb, 20)) << 32);
+    let fsmeta_bytes = u64::from(u32_at(sb, 36)) * 4096;
+    let metadata_offset = u64::from(u32_at(sb, 40)) * 4096;
+    let devices = u16_at(sb, 86);
+    let table_end = 4096 + u64::from(devices) * 128;
+    if inodes == 0
+        || inodes > 4_000_000
+        || devices > 1024
+        || u16_at(sb, 88) != if devices == 0 { 0 } else { 32 }
+        || metadata_offset != table_end.div_ceil(4096) * 4096
+        || fsmeta_bytes <= metadata_offset
+        || fsmeta_bytes > 1 << 32
+        || fsmeta_bytes > expected.length_bytes
+        || fsmeta_bytes
+            .checked_sub(metadata_offset)
+            .is_none_or(|available| inodes > available / 64)
+        || expected.length_bytes > 1 << 40
+        || expected.logical_sector_size != 512
+        || !expected.length_bytes.is_multiple_of(4096)
+        || !expected.read_only
+        || expected.serial != rootfs_spec::RootSerial::Lower
+    {
+        return Err("overlay: invalid EROFS geometry");
+    }
+    Ok(ErofsGeometry {
+        fsmeta_bytes,
+        metadata_offset,
+        devices,
+    })
+}
+
+/// A bounded streaming check of the flattened EROFS device table. Occurrences,
+/// including empty and repeated packs, must be contiguous after fsmeta.
+pub struct ErofsDevices {
+    next_offset: u64,
+    remaining: u16,
+    length_bytes: u64,
+}
+
+impl ErofsDevices {
+    pub fn new(geometry: &ErofsGeometry, length_bytes: u64) -> Self {
+        Self {
+            next_offset: geometry.fsmeta_bytes,
+            remaining: geometry.devices,
+            length_bytes,
+        }
+    }
+
+    pub fn observe(&mut self, slot: &[u8]) -> Result<(), &'static str> {
+        if self.remaining == 0 || slot.len() != 128 {
+            return Err("overlay: invalid EROFS device slot count or size");
+        }
+        if slot[..64]
+            .iter()
+            .any(|byte| !matches!(*byte, b'0'..=b'9' | b'a'..=b'f'))
+            || slot[72..].iter().any(|byte| *byte != 0)
+        {
+            return Err("overlay: invalid EROFS device slot profile");
+        }
+        let blocks = u32::from_le_bytes([slot[64], slot[65], slot[66], slot[67]]);
+        let address = u32::from_le_bytes([slot[68], slot[69], slot[70], slot[71]]);
+        if u64::from(address) * 4096 != self.next_offset {
+            return Err("overlay: EROFS device mapping is not contiguous");
+        }
+        let end = self
+            .next_offset
+            .checked_add(u64::from(blocks) * 4096)
+            .ok_or("overlay: EROFS device mapping overflow")?;
+        if end > self.length_bytes {
+            return Err("overlay: EROFS device mapping exceeds lower");
+        }
+        self.next_offset = end;
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<(), &'static str> {
+        if self.remaining != 0 || self.next_offset != self.length_bytes {
+            return Err("overlay: EROFS device mapping does not cover lower");
+        }
+        Ok(())
+    }
 }
 
 pub fn check_achieved_span(backing: u64, observed: u64) -> Result<u64, &'static str> {
@@ -370,7 +505,8 @@ pub fn check_journal_inode(inode: &[u8; 256], span: u64) -> Result<u32, &'static
 #[cfg(test)]
 mod tests {
     use crate::root_checks::{
-        check_achieved_span, check_device, check_superblock, decimal, serial_matches, DeviceFacts,
+        check_achieved_span, check_device, check_upper_superblock, decimal, serial_matches,
+        DeviceFacts,
     };
     use rootfs_spec::{DeviceExpectation, DeviceNumber, FilesystemUuid, RootSerial};
 
@@ -409,6 +545,206 @@ mod tests {
         bytes[0xec..0xfc].fill(1);
         bytes
     }
+
+    fn lower_expectation() -> DeviceExpectation {
+        DeviceExpectation {
+            serial: RootSerial::Lower,
+            read_only: true,
+            length_bytes: 16384,
+            ..expectation()
+        }
+    }
+
+    fn seal_erofs(block: &mut [u8; 4096]) {
+        let crc = crate::root_checks::erofs_crc(block);
+        block[1028..1032].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn erofs_block() -> [u8; 4096] {
+        let mut block = [0; 4096];
+        let sb = &mut block[1024..];
+        sb[0..4].copy_from_slice(&0xe0f5_e1e2u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&3u32.to_le_bytes());
+        sb[12] = 12;
+        sb[16..24].copy_from_slice(&1u64.to_le_bytes());
+        sb[36..40].copy_from_slice(&3u32.to_le_bytes());
+        sb[40..44].copy_from_slice(&2u32.to_le_bytes());
+        sb[48..64].fill(1);
+        sb[80..84].copy_from_slice(&12u32.to_le_bytes());
+        sb[86..88].copy_from_slice(&1u16.to_le_bytes());
+        sb[88..90].copy_from_slice(&32u16.to_le_bytes());
+        seal_erofs(&mut block);
+        block
+    }
+
+    fn erofs_slot(blocks: u32, address: u32) -> [u8; 128] {
+        let mut slot = [0; 128];
+        slot[..64].fill(b'a');
+        slot[64..68].copy_from_slice(&blocks.to_le_bytes());
+        slot[68..72].copy_from_slice(&address.to_le_bytes());
+        slot
+    }
+
+    #[test]
+    fn erofs_fixed_superblock_and_each_truncation_are_bounded() {
+        use crate::root_checks::{check_erofs_superblock, ErofsDevices};
+        let block = erofs_block();
+        let expected = lower_expectation();
+        let geometry = check_erofs_superblock(&block, &expected).unwrap();
+        assert_eq!(
+            (
+                geometry.fsmeta_bytes,
+                geometry.metadata_offset,
+                geometry.devices
+            ),
+            (12288, 8192, 1)
+        );
+        let mut devices = ErofsDevices::new(&geometry, expected.length_bytes);
+        devices.observe(&erofs_slot(1, 3)).unwrap();
+        devices.finish().unwrap();
+        for length in 0..4096 {
+            assert!(
+                check_erofs_superblock(&block[..length], &expected).is_err(),
+                "{length}"
+            );
+        }
+        let mut too_long = alloc::vec::Vec::from(block);
+        too_long.push(0);
+        assert!(check_erofs_superblock(&too_long, &expected).is_err());
+        let mut wrong_uuid = expected;
+        wrong_uuid.filesystem_uuid = FilesystemUuid::new([2; 16]).unwrap();
+        assert!(check_erofs_superblock(&block, &wrong_uuid).is_err());
+        let mut corrupted = block;
+        corrupted[1040] ^= 1;
+        assert!(check_erofs_superblock(&corrupted, &expected).is_err());
+        let mut writable = expected;
+        writable.read_only = false;
+        assert!(check_erofs_superblock(&block, &writable).is_err());
+    }
+
+    #[test]
+    fn erofs_noncanonical_fields_reject_even_with_valid_checksum() {
+        use crate::root_checks::check_erofs_superblock;
+        let expected = lower_expectation();
+        for offset in [
+            0, 1024, 1032, 1036, 1037, 1038, 1048, 1059, 1064, 1068, 1088, 1104, 1108, 1112, 1114,
+            1151, 1152, 4095,
+        ] {
+            let mut block = erofs_block();
+            block[offset] ^= 1;
+            seal_erofs(&mut block);
+            assert!(
+                check_erofs_superblock(&block, &expected).is_err(),
+                "{offset}"
+            );
+        }
+        for count in [0u64, 4_000_001, u64::MAX] {
+            let mut block = erofs_block();
+            block[1040..1048].copy_from_slice(&count.to_le_bytes());
+            seal_erofs(&mut block);
+            assert!(check_erofs_superblock(&block, &expected).is_err());
+        }
+        for blocks in [0u32, 1, 2, 5, u32::MAX] {
+            let mut block = erofs_block();
+            block[1060..1064].copy_from_slice(&blocks.to_le_bytes());
+            seal_erofs(&mut block);
+            assert!(
+                check_erofs_superblock(&block, &expected).is_err(),
+                "{blocks}"
+            );
+        }
+        let mut excessive_devices = erofs_block();
+        excessive_devices[1110..1112].copy_from_slice(&1025u16.to_le_bytes());
+        seal_erofs(&mut excessive_devices);
+        assert!(check_erofs_superblock(&excessive_devices, &expected).is_err());
+    }
+
+    #[test]
+    fn erofs_device_ranges_are_exact_bounded_and_occurrence_preserving() {
+        use crate::root_checks::{check_erofs_superblock, ErofsDevices, ErofsGeometry};
+        let expected = lower_expectation();
+        let geometry = check_erofs_superblock(&erofs_block(), &expected).unwrap();
+        for length in 0..128 {
+            let mut devices = ErofsDevices::new(&geometry, expected.length_bytes);
+            assert!(devices.observe(&erofs_slot(1, 3)[..length]).is_err());
+        }
+        for slot in [
+            erofs_slot(1, 2),
+            erofs_slot(1, 4),
+            erofs_slot(2, 3),
+            erofs_slot(u32::MAX, 3),
+            erofs_slot(1, u32::MAX),
+        ] {
+            let mut devices = ErofsDevices::new(&geometry, expected.length_bytes);
+            assert!(devices.observe(&slot).is_err());
+        }
+        for offset in [0, 63, 72, 127] {
+            let mut slot = erofs_slot(1, 3);
+            slot[offset] = b'X';
+            let mut devices = ErofsDevices::new(&geometry, expected.length_bytes);
+            assert!(devices.observe(&slot).is_err());
+        }
+        assert!(ErofsDevices::new(&geometry, expected.length_bytes)
+            .finish()
+            .is_err());
+        let mut short = ErofsDevices::new(&geometry, expected.length_bytes);
+        short.observe(&erofs_slot(0, 3)).unwrap();
+        assert!(short.finish().is_err());
+        let mut extra = ErofsDevices::new(&geometry, expected.length_bytes);
+        extra.observe(&erofs_slot(1, 3)).unwrap();
+        assert!(extra.observe(&erofs_slot(0, 4)).is_err());
+        let repeated = ErofsGeometry {
+            devices: 3,
+            ..geometry
+        };
+        let mut devices = ErofsDevices::new(&repeated, 20480);
+        // Same tag repeated, including an empty occurrence, is not deduplicated.
+        devices.observe(&erofs_slot(1, 3)).unwrap();
+        devices.observe(&erofs_slot(0, 4)).unwrap();
+        devices.observe(&erofs_slot(1, 4)).unwrap();
+        devices.finish().unwrap();
+        let empty = ErofsGeometry {
+            devices: 0,
+            ..repeated
+        };
+        ErofsDevices::new(&empty, empty.fsmeta_bytes)
+            .finish()
+            .unwrap();
+    }
+
+    #[test]
+    fn erofs_empty_composition_and_format_resource_limits() {
+        use crate::root_checks::{check_erofs_superblock, ErofsDevices};
+        let mut block = erofs_block();
+        block[1060..1064].copy_from_slice(&2u32.to_le_bytes());
+        block[1064..1068].copy_from_slice(&1u32.to_le_bytes());
+        block[1110..1114].fill(0);
+        seal_erofs(&mut block);
+        let mut expected = lower_expectation();
+        expected.length_bytes = 8192;
+        let geometry = check_erofs_superblock(&block, &expected).unwrap();
+        ErofsDevices::new(&geometry, expected.length_bytes)
+            .finish()
+            .unwrap();
+        // A metadata-only lower cannot hide extra unaddressed bytes.
+        assert!(ErofsDevices::new(&geometry, expected.length_bytes + 4096)
+            .finish()
+            .is_err());
+        // The claimed inode count must fit even the minimum extended inode width.
+        block[1040..1048].copy_from_slice(&65u64.to_le_bytes());
+        seal_erofs(&mut block);
+        assert!(check_erofs_superblock(&block, &expected).is_err());
+        block[1040..1048].copy_from_slice(&1u64.to_le_bytes());
+        block[1060..1064].copy_from_slice(&1_048_576u32.to_le_bytes());
+        seal_erofs(&mut block);
+        expected.length_bytes = 1 << 32;
+        let geometry = check_erofs_superblock(&block, &expected).unwrap();
+        assert_eq!(geometry.fsmeta_bytes, 1 << 32);
+        block[1060..1064].copy_from_slice(&1_048_577u32.to_le_bytes());
+        seal_erofs(&mut block);
+        expected.length_bytes += 4096;
+        assert!(check_erofs_superblock(&block, &expected).is_err());
+    }
     #[test]
     fn exact_serial_never_trims_or_matches_prefix() {
         assert!(serial_matches(b"silo-root-upper\n", b"silo-root-upper"));
@@ -435,6 +771,13 @@ mod tests {
             }
             assert!(discovery.finish().is_ok());
         }
+        assert!(SerialDiscovery::default().finish().is_err());
+        let mut only_upper = SerialDiscovery::default();
+        only_upper.observe(b"silo-root-upper\n").unwrap();
+        assert!(only_upper.finish().is_err());
+        let mut duplicate_upper = SerialDiscovery::default();
+        duplicate_upper.observe(b"silo-root-upper").unwrap();
+        assert!(duplicate_upper.observe(b"silo-root-upper\n").is_err());
         let mut discovery = SerialDiscovery::default();
         assert!(discovery.observe(b"silo-root-lower").unwrap().is_some());
         assert!(discovery.observe(b"silo-root-lower").is_err());
@@ -479,6 +822,18 @@ mod tests {
             read_only: true,
         };
         assert!(check_device(&expected, facts).is_ok());
+        for length_bytes in [0, facts.length_bytes - 512, facts.length_bytes + 512] {
+            assert_eq!(
+                check_device(
+                    &expected,
+                    DeviceFacts {
+                        length_bytes,
+                        ..facts
+                    }
+                ),
+                Err("overlay: device length mismatch")
+            );
+        }
         assert_eq!(
             check_device(
                 &expected,
@@ -537,14 +892,14 @@ mod tests {
     #[test]
     fn upper_recovery_allowed_but_wrong_uuid_and_features_reject() {
         let mut bytes = superblock();
-        assert!(check_superblock(&bytes, &expectation(), true).is_ok());
+        assert!(check_upper_superblock(&bytes, &expectation()).is_ok());
         put(&mut bytes, 0x60, 0x246);
-        assert!(check_superblock(&bytes, &expectation(), true).is_ok());
+        assert!(check_upper_superblock(&bytes, &expectation()).is_ok());
         bytes[0x68] = 2;
-        assert!(check_superblock(&bytes, &expectation(), true).is_err());
+        assert!(check_upper_superblock(&bytes, &expectation()).is_err());
         bytes[0x68] = 1;
         put(&mut bytes, 0x60, 0x252);
-        assert!(check_superblock(&bytes, &expectation(), true).is_err());
+        assert!(check_upper_superblock(&bytes, &expectation()).is_err());
     }
     #[test]
     fn swapped_files_under_correct_role_serials_fail_uuid_validation() {
@@ -552,22 +907,21 @@ mod tests {
         lower_expected.serial = RootSerial::Lower;
         lower_expected.filesystem_uuid = FilesystemUuid::new([2; 16]).unwrap();
         lower_expected.read_only = true;
-        let upper_bytes = superblock();
-        assert!(check_superblock(&upper_bytes, &lower_expected, false).is_err());
-        let mut lower_bytes = superblock();
-        lower_bytes[0x68..0x78].fill(2);
-        assert!(check_superblock(&lower_bytes, &expectation(), true).is_err());
+        let mut upper_bytes = [0; 4096];
+        upper_bytes[1024..2048].copy_from_slice(&superblock());
+        assert!(crate::root_checks::check_erofs_superblock(&upper_bytes, &lower_expected).is_err());
+        let lower_bytes = erofs_block();
+        assert!(check_upper_superblock(
+            lower_bytes[1024..2048].try_into().unwrap(),
+            &expectation()
+        )
+        .is_err());
     }
     #[test]
-    fn dirty_lower_and_overlong_filesystem_reject() {
+    fn overlong_upper_filesystem_rejects() {
         let mut bytes = superblock();
-        bytes[0x3a] = 1;
-        assert!(check_superblock(&bytes, &expectation(), false).is_ok());
-        put(&mut bytes, 0x60, 0x246);
-        assert!(check_superblock(&bytes, &expectation(), false).is_err());
-        put(&mut bytes, 0x60, 0x242);
         put(&mut bytes, 4, 32768);
-        assert!(check_superblock(&bytes, &expectation(), true).is_err());
+        assert!(check_upper_superblock(&bytes, &expectation()).is_err());
     }
     #[test]
     fn short_tail_is_explicit_and_undergrowth_rejected() {

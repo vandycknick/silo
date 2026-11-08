@@ -785,12 +785,11 @@ fn current_typed_disks_survive_management_wire_without_inference() {
 }
 
 #[test]
-fn current_create_selectors_are_explicit_and_closed_on_wire() {
+fn create_tmpfs_wire_policy_requires_nonzero_explicit_capacity() {
     let input = w::NormalizedMachineCreate {
         process: Some(w::ProcessConfig::default()),
         retention: values::retention_to_wire(libvm::MachineRetention::Persistent),
         agent: Some(values::agent_to_wire(&libvm::MachineAgent::Default).unwrap()),
-        root_profile: Some(w::RootProfile::LinuxFlatOverlayV1 as i32),
         temporary_directory: Some(w::TemporaryDirectoryPolicy {
             backing: Some(w::temporary_directory_policy::Backing::TmpfsCapacityBytes(
                 64 << 20,
@@ -798,21 +797,6 @@ fn current_create_selectors_are_explicit_and_closed_on_wire() {
         }),
         ..Default::default()
     };
-    let native = updates::create_from_wire(input.clone()).unwrap();
-    assert_eq!(native.root_profile, libvm::RootProfile::LinuxFlatOverlayV1);
-    assert_eq!(
-        native.temporary_directory,
-        libvm::TemporaryDirectoryPolicy::Tmpfs {
-            capacity_bytes: 64 << 20
-        }
-    );
-    assert_eq!(updates::create_to_wire(&native).unwrap(), input);
-    let mut missing_profile = input.clone();
-    missing_profile.root_profile = None;
-    assert!(updates::create_from_wire(missing_profile).is_err());
-    let mut unknown_profile = input.clone();
-    unknown_profile.root_profile = Some(999);
-    assert!(updates::create_from_wire(unknown_profile).is_err());
     let mut missing_policy = input.clone();
     missing_policy.temporary_directory = None;
     assert!(updates::create_from_wire(missing_policy).is_err());

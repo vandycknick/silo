@@ -80,10 +80,12 @@ def _run_controller(silo: Silo, executable: Path, fixture: Path, directory: Path
 def private_root(silo: Silo, image: str, prefix: str) -> tuple[dict, Path]:
     """Create a stopped machine and return a private copy of its populated root.
 
-    The catalog's stopped root is never booted or mutated; only private bytes are.
+    The fixture boots a whole-disk ext4 bootstrap, so the root is explicitly
+    converted to the opaque raw family. The catalog's stopped root is never
+    booted or mutated; only private bytes are.
     """
     name = "guest-freezer-" + uuid4().hex[:8]
-    silo.create(name, image, "--cpus", "2", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
+    silo.create(name, silo.raw_image(image), "--cpus", "2", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
     configuration = stopped.configuration(silo, name)
     disk = dict(configuration["spec"]["storage"]["disks"][0])
     source = Path(disk["path"])

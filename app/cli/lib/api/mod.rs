@@ -66,6 +66,17 @@ impl AppApi {
         }
     }
 
+    pub(crate) async fn export_raw_disk(
+        &mut self,
+        reference: &str,
+        options: libvm::RawDiskExportOptions,
+    ) -> eyre::Result<libvm::RawDiskExport> {
+        match self {
+            Self::Local(service) => service.export_raw_disk(reference, options).await,
+            Self::Daemon(service) => service.export_raw_disk(reference, options).await,
+        }
+    }
+
     pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
         match self {
             Self::Local(service) => service.pause_machine(reference).await,

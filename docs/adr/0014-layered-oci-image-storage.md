@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Updated: 2026-11-01
+Updated: 2026-11-07
 
 ## Status
 
@@ -20,6 +20,15 @@ state conversion. The initial schema and all callers are replaced directly;
 incompatible state is refused with a reinstall/wipe diagnostic, never deleted
 automatically. This supersedes the former existing-machine preservation and
 additive-migration requirements throughout the implementation plan.
+
+Phase 22 cuts current OCI creation over to `linux-erofs-overlay-v1` on
+libkrun and removes the development flat profile and root-profile selector.
+Exact Linux x86_64 production-root tuples passed boot and lifecycle qualification
+on stable 7.2.2 and longterm 6.18.48, including kernel-mutated flatten export and
+raw re-import. Public live lanes remain unqualified; performance qualification
+is deferred to the mandatory Phase 24 sweep. The independent published-builder
+oracle exception is recorded under [Filesystem and Linux gates](#filesystem-and-linux-gates);
+it does not waive runtime, cross-host or performance gates.
 
 The 2026-09-26 revision follows the change that made libkrun the default
 backend on Linux and macOS. It confines layered OCI roots to libkrun, limits
@@ -276,14 +285,13 @@ names an image or snapshot record by its typed ID; the two record kinds are
 stored separately and one typed ID cannot denote both. V1 has no separate
 `snapshot:` source kind.
 
-OCI container images create `linux-erofs-overlay-v1` roots after that profile
-passes admission, and only on a libkrun runtime. Until admission, an OCI
-reference on libkrun creates a whole-disk opaque raw root through the explicit
-conversion below, recorded with manifest provenance; such machines keep that
-family after admission. The development stage may use `linux-flat-overlay-v1`
-internally; it is never a published or transferable profile. Artifact presence
-does not choose a root mode. Imported disks create opaque raw roots, even when
-their contents happen to be ext4.
+OCI container images create `linux-erofs-overlay-v1` roots by default, and
+only on a libkrun runtime. There is no `--root-profile` selector or template
+`root_profile` field. The development `linux-flat-overlay-v1` profile has been
+removed without migration or compatibility shims; obsolete profiles receive
+typed rejection. Artifact presence does not choose a root mode. Imported disks
+create opaque raw roots, even when their contents happen to be ext4. A VZ
+runtime requires explicit OCI-to-raw conversion, not an automatic fallback.
 
 Every opaque disk is stored as `raw-private-v1`. There is no storage selector
 flag: the encoding is fixed, and a fork inherits its source's family. A qcow2
@@ -321,8 +329,8 @@ naming the persisted root family, its requirement and the effective backend.
 
 ### Explicit OCI-to-raw conversion
 
-The OCI-to-ext4 flattener that creates today's `rootfs.img` is retained as an
-explicit conversion, not as a creation path. Given a resolved OCI container
+The OCI-to-ext4 flattener is retained as an explicit conversion, not as an
+implicit creation path. Given a resolved OCI container
 image, it writes the merged namespace into a fresh ext4 filesystem through
 `disk-image`, publishes the result as an immutable opaque raw image with a
 whole-disk `LinuxDirect` boot profile and records the source manifest digest as
@@ -333,10 +341,10 @@ The flattener is not deterministic and its output is transfer-only. So that
 repeated conversion does not accumulate images, the database records each
 result under the conversion key `(source manifest digest, platform, flattener
 ABI)`; a second conversion with the same key reuses the retained image, and the
-key is dropped when that image is garbage collected. Until the changeset
-composer of stage 4 exists, the conversion uses the existing `tar`-based layer
-applier in `oci`. Stage 4 rebases the conversion on the composer and retires
-the old applier, so one namespace semantics remains.
+key is dropped when that image is garbage collected. Conversion now consumes
+the same authenticated changesets, exact EROFS composition and held payload
+packs as layered creation. The old tar applier and flat OCI cache are retired;
+one namespace semantics remains.
 
 The Silo daemon (`silo daemon run`) uses this conversion for its system
 appliance on a VZ backend, because the appliance image is an OCI reference. On
@@ -380,7 +388,7 @@ silo create ghcr.io/acme/dev-checkpoint@sha256:HEX --name cloud-dev
 silo create --platform linux/amd64 ubuntu:24.04 --name amd-dev
 
 # VZ runtime: an OCI reference is rejected; convert first, then create.
-silo image convert ubuntu:24.04 --to raw --name ubuntu-raw
+silo image convert ubuntu:24.04 --disk-format raw --name ubuntu-raw
 silo create image:ubuntu-raw --name vz-dev
 ```
 
@@ -471,10 +479,10 @@ flowchart TB
 
 The VMDK is a launch-only mapping of exact local extents, not a retained disk
 image or a remote block service. Guest init performs overlay assembly; the host
-does not mount the root. The development flat-lower profile substitutes an ext4
-lower for EROFS without changing that two-device assembly. Raw storage alone
-does not imply a boot method; firmware and macOS auxiliary state remain separate
-private platform files as specified below.
+does not mount the root. The development ext4 lower has been retired; current
+layered roots always use EROFS. Raw storage alone does not imply a boot method;
+firmware and macOS auxiliary state remain separate private platform files as
+specified below.
 
 ### Illustrative typed API
 
@@ -585,7 +593,7 @@ are closed, versioned variants, not arbitrary strings interpreted by `silo-vmm`:
 ```text
 MachineRoot
   LinuxOverlay                      requires krun-overlay
-    lower: ErofsComposition | FlatExt4 (development stage only)
+    lower: ErofsComposition
     upper: private ext4 path, UUID, capacity, ext4 profile
     overlay profile
   OpaqueRaw                         requires raw-block
@@ -1441,36 +1449,32 @@ pointing somewhere inside a layer file is insufficient: a chunk must name the
 expected body data, not an unrelated inode or payload. All index pages, device
 slots and composition extents must agree before publication or receipt succeeds.
 
-### Development-stage flat lower
+### Retired development-stage flat lower
 
-`linux-flat-overlay-v1` uses one exact ext4 base and the same private upper. It
-exists so that the two-device guest assembly, VMDK descriptor generation, block
-serials, upper formatting, effective-profile checks, fork, resize and orderly
-shutdown can be built and tested on libkrun, on both host platforms, before the
-EROFS encoder lands. Its base is the ext4 image the retained flattener already
-produces, attached as one backing file through a generated VMDK descriptor
-(one or more `FLAT` records under the same 2 GiB record limit as the EROFS
-lower) and mounted `ro,noload` by the guest, so the descriptor, split and
-serial paths are exercised two stages before they carry EROFS. Stage 2
-qualification includes a base larger than 2 GiB so that record splitting is
-tested before any pack exists.
+The development `linux-flat-overlay-v1` profile used one exact ext4 base and
+the same private upper to exercise two-device guest assembly, VMDK descriptor
+generation, block serials, upper formatting, effective-profile checks, fork,
+resize and orderly shutdown before the EROFS encoder landed. Its one backing
+file used generated `FLAT` records under the same 2 GiB record limit as the
+EROFS lower and was mounted `ro,noload` by the guest. Stage 2 qualification
+included a base larger than 2 GiB to test splitting before packs existed.
 
-The profile is not published, transferred, snapshotted or made a default. A
-machine created with it is a development artifact and is removed, not migrated,
-when `linux-erofs-overlay-v1` is admitted. This keeps the flat lower from
-becoming a second long-lived lower format.
+During that development phase opaque raw was the default and flat overlay was
+an explicit creation selection. Phase 22 removes that profile and its selector,
+not migrates them. Old flat roots and bootstrap/profile variants are rejected;
+there is no second long-lived lower format or compatibility reader.
 
-During this development phase opaque raw remains the default, using `root.raw`;
-flat overlay is an explicit creation selection. The current disk contract is
-VM spec `0.2.0` only. Every attachment carries a mandatory semantic role
-(`root`, `root-lower`, `root-upper`, `data`), explicit `raw` or `vmdk` format,
-positive exact virtual `length`, 512-byte `logicalSectorSize`, validated
-`blockId`, access mode and path. Old versions and missing disk fields reject;
-there is no ordered-disk reader, extension sniffing or format fallback.
+### Current attachment contract
+
+The disk contract is VM spec `0.2.0` only. Every attachment carries a mandatory
+semantic role (`root`, `root-lower`, `root-upper`, `data`), explicit `raw` or
+`vmdk` format, positive exact virtual `length`, 512-byte `logicalSectorSize`,
+validated `blockId`, access mode and path. Old versions and missing disk fields
+reject; there is no ordered-disk reader, extension sniffing or format fallback.
 `DiskRole` and `DiskGeometry` are defined once in `vm-spec`, also used directly
 by the durable semantic storage model. External-resource discovery filters
-the `data` role rather than skipping the first attachment. A persisted flat
-lower names its immutable StreamId, geometry and filesystem UUID, not a
+the `data` role rather than skipping the first attachment. A persisted layered
+lower names its exact composition identity, geometry and EROFS UUID, not a
 descriptor pathname or a source tag to resolve again at start.
 
 
@@ -1675,7 +1679,7 @@ handoff input. Both sides read the joined command line with Linux `next_arg`
 tokenization and `isspace` (including VT and byte 0xA0), so double-quoted
 spellings such as `"rdinit=/x"` or `rdinit="/x"` are recognized exactly as the
 kernel recognizes them; NUL bytes are refused. The overlay kernel command line
-additionally requires the explicit `silo.rootfs=linux-flat-overlay-v1` marker
+additionally requires the explicit `silo.rootfs=linux-erofs-overlay-v1` marker
 as a consistency guard,
 and a raw root forbids it. Init enforces uid/gid 0, mode 0600 on
 bootstrap/observation and mode 0700 on maintenance parents.
@@ -1707,10 +1711,11 @@ effective launch attachment, `logicalSectorSize` 512, `readOnly`), `selector`
 (`{"kind":"whole-disk"}`, `{"kind":"gpt-partition","guid":…}` with a nonzero
 canonical lowercase GUID in RFC 4122 byte order, or
 `{"kind":"mbr-partition","number":1..4}`) and `filesystem` `ext4`. A
-`linux-flat-overlay-v1` root records exactly two
-serial/length/sector/access/ext4-UUID expectations, fixed upper/overlay profiles,
-the qualified rendering ABI and an explicit disk-backed or sized-tmpfs temporary
-directory policy. Archive ownership is uid/gid 0 and mode 0600. Duplicate,
+`linux-erofs-overlay-v1` root records exactly two serial/length/sector/access
+expectations, an EROFS lower UUID and an ext4 upper UUID, fixed upper/overlay
+profiles, the qualified rendering ABI and an explicit disk-backed or sized-tmpfs
+temporary directory policy. The old flat profile is not accepted. Archive
+ownership is uid/gid 0 and mode 0600. Duplicate,
 unknown and missing members, members of the other root kind, other schema
 versions, malformed or overflowing integers/UUIDs, nil GUIDs, invalid slots or
 geometry, bytes over 64 KiB and trailing content reject. There is no schema-1
@@ -1863,13 +1868,24 @@ sent to the ext4 formatter merely because it is a VM root.
 
 ### Export and flattening
 
-`storage export --disk-format=raw` produces one exact virtual disk stream from an
-opaque disk, including partition tables and unused data. The flag is
-`--disk-format` because `--format` is the CLI's established output-format option.
-Companion metadata records geometry, boot/platform requirements and, as an
-optional convenience, the whole-file SHA-256 of the exported stream. Exporting a
-macOS disk alone is permitted as a disk export but is not labelled a complete VM
-export.
+`silo storage export VM DEST --disk-format raw [--flatten-filesystem] [--format json]`
+exports only an already-stopped machine's root. It never stops the source
+implicitly, and attached data disks and shares are not exported. Current export
+requires Linux direct boot; EFI and macOS roots receive typed unsupported
+rejection. This is narrower than the full opaque-root storage model.
+
+For opaque roots it copies exact virtual disk bytes, including partition tables,
+unused/deleted data and dirty journals, without filesystem interpretation.
+`--disk-format` is mandatory because `--format` selects CLI report presentation,
+not disk encoding. There is no implicit sanitization.
+
+The existing destination parent must be outside the runtime state root. Neither
+`DEST` nor `DEST.json` may exist, including dangling symlinks; publication never
+overwrites either. The JSON sidecar records `geometry`, `boot`, export `kind`,
+`path` and `metadataPath`. The two path fields are raw Unix pathname byte arrays,
+not strings, preserving non-UTF-8 paths. `--format json` prints the same report.
+The export kind distinguishes `opaque-exact` from `flattened-filesystem`; the
+latter records the fresh filesystem UUID.
 
 For a Linux overlay root, `storage export --disk-format=raw` requires explicit
 `--flatten-filesystem` and a stopped upper whose on-disk filesystem state needs
@@ -1880,16 +1896,18 @@ and shut it down cleanly before exporting it. Silo does not replay JBD2 on the
 host, boot a helper VM, or repair the source implicitly. Exact dirty checkpoints
 remain supported.
 
-libvm reconstructs the lower namespace from retained indexes and packs, then
-reads the upper with `disk-image`. The flattener implements only the admitted
+libvm authenticates the exact retained fsmeta/pack graph and reconstructs the
+lower namespace from retained indexes and packs, then strictly audits and reads
+the upper with `disk-image`. The flattener implements only the admitted
 overlay profile: visible upper entries, whiteouts and opaque markers, plus
 `work/index` and `trusted.overlay.origin` associations validated against the
 exact lower. An indexed copied-up inode supplies every surviving lower alias,
 including names absent from `upper/`; deleted aliases stay deleted. Output
 preserves visible hardlink groups and excludes OverlayFS control metadata.
 Unknown or inconsistent index state fails rather than producing an approximate
-tree. Host reading of kernel-mutated ext4 layouts and this index reconstruction
-must pass the flattening gate before the operation is exposed.
+tree. Unsupported ext4 layouts and corrupt state are rejected, never silently
+repaired. Host reading of kernel-mutated ext4 layouts and this index
+reconstruction remain subject to the runtime flattening gate.
 
 The output is a fresh ext4 filesystem with a new image identity, not an exact
 snapshot of upper bytes or OverlayFS inode numbers. It remains a direct-kernel
@@ -2815,6 +2833,25 @@ mocked mount or VMM behavior does not qualify a profile.
   each composed namespace is compared with a container runtime's extraction of
   the same image, including entries placed through symlink parents. Layered
   OCI does not become the default while a corpus image differs.
+  The owner explicitly approved privileged **umoci v0.6.0** as the independent
+  published-builder positive-control oracle in place of containerd v2.4.2
+  `archive.Apply`. The original containerd differential reports remain unchanged,
+  including root-metadata differences, and the original absolute-path Nix
+  specimen remains a negative control. The additional provenance-reviewed
+  Nix-built Cardano tracer supplies the Nix positive. The retained
+  `.tmp/plan/evidence/phase-22/umoci-corpus-comparisons.json` records Docker
+  5,793, Buildah 15,584, Bazel 1,745, apko 1,375, Kaniko 502 and Nix tracer
+  10,905 rows: **35,904 rows, zero differences and zero observer problems**.
+  Only descriptor mediaTypes in the Kaniko/Nix OCI envelopes were adapted for
+  umoci; config/layer bytes, digests, order and repetition were unchanged.
+  A separate actual readonly EROFS traversal on longterm 6.18.48 matched all
+  35,904 rows with no excluded fields or observer problems:
+  `.tmp/plan/evidence/phase-22/erofs-corpus-20261108T000726/summary.json`.
+  Exact logical fsmeta/pack placement, device read-only state, source-byte
+  preservation and complete namespace comparisons are retained there.
+  These are functional results, not performance or cross-host qualification.
+  The [conformance guide](../../runtime/oci/testdata/changesets/README.md#observed-admission-and-phase-22-default-gates)
+  records the pinned tools, observers and remaining gates.
 - Descriptor digest and full-stream `diff_id` corruption fail independently.
   Tar end markers cannot bypass hashing of trailing decoded bytes.
 - Double builds, Linux/macOS and x86_64/arm64 host lanes targeting the same guest,
@@ -2826,8 +2863,9 @@ mocked mount or VMM behavior does not qualify a profile.
   for all six builders is not proof that all six archives are admitted or that
   their namespaces match. Root/default-directory differences are not normalized
   away. The [conformance guide](../../runtime/oci/testdata/changesets/README.md)
-  defines separate synthetic, producer-original and published-corpus lanes;
-  its partial evidence does not waive the later default-admission gate.
+  defines separate synthetic, producer-original and published-corpus lanes.
+  The approved oracle exception above does not turn the original differential
+  results into passes or waive any other default-admission gate.
 - Composition corruption tests include undeclared devices, overflow, out-of-range
   addresses and references into another payload or metadata region.
 - VMDK descriptor tests cover empty files, repeated objects, 2 GiB splits, extent
@@ -2907,8 +2945,12 @@ mocked mount or VMM behavior does not qualify a profile.
 - Registry tests use actual admitted registries, including nested index retention,
   custom media types, shared blobs, tag replacement, graph limits and GC after
   source tags are deleted. Publication never relies on JSON-only dependency edges.
-- Portable snapshots boot after source OCI blobs and source local caches are
-  unavailable and old encoders are disabled, using retained exact artifacts.
+- Portable layered snapshots retain the exact composition recipe/result,
+  fsmeta, ordered layer recipe/result/index closure and payload-pack streams,
+  including repeated occurrences, alongside the private upper and boot closure.
+  They boot after source OCI blobs and source local caches are unavailable and
+  old encoders are disabled, using retained exact artifacts. OCI regeneration
+  is a digest-gated acquisition fallback only, never the portability boundary.
 - A published raw-disk artifact (Linux and macOS) round-trips through push and
   pull to the identical virtual stream on a different host.
 - Remote preparation with only OCI access reproduces pack/index/fsmeta digests;

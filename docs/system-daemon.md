@@ -192,6 +192,14 @@ VMs the daemon creates carry the `io.silo.system.role=system` and
 `io.silo.system.installation` labels so they can be tracked. Ordinary `silo`
 commands (`stop`, `rm`, `set`, ...) work on them like on any other VM.
 
+On startup retries and daemon adoption, host-side data-disk validation reads only
+the backing-file size and primary ext4 superblock identity/geometry. The appliance
+may already have the data filesystem mounted, so its namespace is not safe for a
+host reader. Guest activation validates the mounted UUID, layout marker and engine
+directories before Docker starts. Fresh-image and offline upgrade validation still
+use the strict ext4 namespace reader, which refuses filesystems requiring recovery.
+The host never replays the data filesystem's journal.
+
 Global `networking.drivers.netd` settings apply only to direct CLI/libvm operations,
 not the system appliance. Its networking uses the runtime defaults plus the
 explicit system publication setting.

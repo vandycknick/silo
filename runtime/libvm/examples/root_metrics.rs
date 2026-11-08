@@ -1,5 +1,5 @@
 //! Read root capacity through the normal public libvm monitor relay.
-use libvm::{MachineRef, MachineTemporaryDirectoryKind, Runtime};
+use libvm::{MachineRef, MachineRootStorageKind, MachineTemporaryDirectoryKind, Runtime};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,6 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         MachineTemporaryDirectoryKind::Tmpfs => "tmpfs",
         MachineTemporaryDirectoryKind::Other => "other",
     };
+    let root_kind = match root.kind {
+        MachineRootStorageKind::LinuxErofsOverlayV1 => "linux-erofs-overlay-v1",
+    };
     let json = serde_json::json!({
         "machineId": metrics.machine_id,
         "agentInstanceId": observation.agent_instance_id,
@@ -44,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "receivedAtUnixMillis": received_at,
         "staleAtUnixMillis": stale_at,
         "rootStorage": {
-            "kind": "linux-flat-overlay-v1",
+            "kind": root_kind,
             "upperProfile": root.upper_profile,
             "upperUuid": root.upper_uuid,
             "upperBackingBytes": root.upper_backing_bytes,

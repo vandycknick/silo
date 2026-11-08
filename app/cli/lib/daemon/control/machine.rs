@@ -20,6 +20,28 @@ impl w::machine_service_server::MachineService for Service {
     type ListMachinesStream = Stream<w::MachineInventoryEntry>;
     type CreateMachineStream = Stream<w::CreateMachineEvent>;
     type ReadLogsStream = Stream<w::LogChunk>;
+    async fn export_raw_disk(
+        &self,
+        r: Request<w::ExportRawDiskRequest>,
+    ) -> Result<Response<w::RawDiskExport>, Status> {
+        let (reference, options) =
+            silo_vm_control::stopped::raw_export_request_from_wire(r.get_ref().clone())
+                .map_err(conversion)?;
+        let state = self.clone();
+        let result = self
+            .mutate(&r, true, async move {
+                let report = state
+                    .machine(&reference)
+                    .await?
+                    .export_raw_disk(options)
+                    .await
+                    .map_err(native)?;
+                silo_vm_control::stopped::raw_export_to_wire(&report).map_err(conversion)
+            })
+            .await?;
+        Ok(Response::new(result))
+    }
+
     async fn pause_machine(
         &self,
         r: Request<w::LiveMachineRequest>,

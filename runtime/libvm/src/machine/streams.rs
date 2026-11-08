@@ -557,7 +557,7 @@ pub struct MachineFilesystemMetrics {
 /// Managed root identity; opaque raw roots retain ordinary filesystem metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineRootStorageKind {
-    LinuxFlatOverlayV1,
+    LinuxErofsOverlayV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1857,7 +1857,7 @@ impl TryFrom<v1::RootStorageMetrics> for MachineRootStorageMetrics {
     fn try_from(value: v1::RootStorageMetrics) -> Result<Self, Self::Error> {
         protocol::validate_root_storage_metrics(&value)?;
         Ok(Self {
-            kind: MachineRootStorageKind::LinuxFlatOverlayV1,
+            kind: MachineRootStorageKind::LinuxErofsOverlayV1,
             upper_profile: required(value.upper_profile, "metrics.root_storage.upper_profile")?,
             upper_uuid: required(value.upper_uuid, "metrics.root_storage.upper_uuid")?,
             upper_backing_bytes: required(
@@ -2715,7 +2715,7 @@ mod tests {
     }
     fn root_metrics() -> v1::RootStorageMetrics {
         v1::RootStorageMetrics {
-            kind: Some(v1::RootStorageKind::LinuxFlatOverlayV1 as i32),
+            kind: Some(v1::RootStorageKind::LinuxErofsOverlayV1 as i32),
             upper_profile: Some("silo-upper-ext4-v1".into()),
             upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
             upper_backing_bytes: Some(134_221_824),

@@ -255,6 +255,39 @@ pub(crate) fn verify_imported_artifact(
             },
         );
     }
+    semantic.authenticate_lower(
+        |digest, maximum| {
+            let held = objects
+                .get(digest)
+                .ok_or_else(|| invalid("composition", format!("missing object {digest}")))?;
+            if held.size > maximum {
+                return Err(invalid(
+                    "composition",
+                    format!("{digest} exceeds its record bound"),
+                ));
+            }
+            let mut bytes =
+                vec![0; usize::try_from(held.size).map_err(|error| invalid("composition", error))?];
+            held.file.read_exact_at(&mut bytes, 0)?;
+            Ok(bytes)
+        },
+        |digest| {
+            objects
+                .get(digest)
+                .ok_or_else(|| invalid("composition", format!("missing object {digest}")))?
+                .file
+                .try_clone()
+                .map_err(Into::into)
+        },
+        |stream| {
+            streams
+                .get(&stream.stream)
+                .ok_or_else(|| invalid("composition", format!("missing pack {}", stream.stream)))?
+                .file
+                .try_clone()
+                .map_err(Into::into)
+        },
+    )?;
 
     let content = match semantic.record {
         SemanticRecord::Image(record) => {
@@ -418,7 +451,10 @@ pub(crate) fn closure_plan(
         } = row
         {
             let digest = object(*digest);
-            if roles.get(&digest) != Some(&ObjectRole::Streamed) {
+            if !matches!(
+                roles.get(&digest),
+                Some(ObjectRole::Streamed | ObjectRole::Fsmeta)
+            ) {
                 return Err(invalid(
                     "object table",
                     format!("{digest} is not an opaque streamed role"),

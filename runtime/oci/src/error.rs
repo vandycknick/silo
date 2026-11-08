@@ -133,6 +133,12 @@ pub enum OciError {
         source: disk_image::ext4::FormatError,
     },
 
+    #[error("held ext4 upper read failed")]
+    UpperRead {
+        #[source]
+        source: disk_image::ext4::ReadError,
+    },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -189,6 +195,10 @@ impl OciError {
 
     pub(crate) fn flat_ext4(source: disk_image::ext4::FormatError) -> Self {
         Self::FlatExt4 { source }
+    }
+
+    pub(crate) fn upper_read(source: disk_image::ext4::ReadError) -> Self {
+        Self::UpperRead { source }
     }
 }
 

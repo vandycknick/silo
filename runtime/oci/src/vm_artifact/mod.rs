@@ -9,6 +9,8 @@ pub mod wire;
 pub enum Error {
     #[error("invalid VM artifact: {0}")]
     Invalid(String),
+    #[error("incompatible VM artifact storage profile {profile}; exact artifacts require an admitted current root profile")]
+    IncompatibleStorageProfile { profile: String },
     #[error("VM artifact JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("VM artifact I/O: {0}")]

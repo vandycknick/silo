@@ -158,7 +158,13 @@ impl<'a> Plan<'a> {
                     body.length
                 }
                 NamespaceKind::Directory => directory_size(plan.directory(id)?)?,
-                NamespaceKind::Symlink { target } => target.len() as u64,
+                NamespaceKind::Symlink { target } => {
+                    // Linux page_get_link reserves the final byte for NUL.
+                    if target.len() >= BLOCK_SIZE as usize {
+                        return Err(invalid("symlink target exceeds the 4095-byte kernel limit"));
+                    }
+                    target.len() as u64
+                }
                 _ => 0,
             };
             let end = align(

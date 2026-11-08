@@ -118,9 +118,9 @@ pub use crate::machine::{
     MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineTailscale,
     MachineTemporaryDirectoryKind, MachineTemporaryDirectoryMetrics, MachineUpdate,
     MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions,
-    Memory, NetworkPolicyUpdate, ProcessConfig, RootProfile, SshExitStatus, SshShellAttachment,
-    SshShellControl, SshShellOptions, SshShellOptionsBuilder, SshShellSignal, StdinMode,
-    DEFAULT_MACHINE_WAIT_TIMEOUT,
+    Memory, NetworkPolicyUpdate, ProcessConfig, RawDiskExport, RawDiskExportKind,
+    RawDiskExportOptions, SshExitStatus, SshShellAttachment, SshShellControl, SshShellOptions,
+    SshShellOptionsBuilder, SshShellSignal, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,

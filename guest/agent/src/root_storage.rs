@@ -9,6 +9,7 @@ use eyre::Context;
 use nix::fcntl::{openat, OFlag};
 use nix::mount::{mount, umount, MsFlags};
 use nix::sys::stat::{major, minor, Mode};
+use nix::sys::statfs::{fstatfs, FsType, EXT4_SUPER_MAGIC};
 use nix::sys::statvfs::{fstatvfs, FsFlags};
 use nix::unistd::syncfs;
 use rootfs_spec::{Observation, LOWER_MOUNT, MAX_JSON_BYTES, OBSERVATION_PATH, UPPER_MOUNT};
@@ -40,9 +41,19 @@ pub(crate) fn retained_root() -> eyre::Result<Option<Observation>> {
     if !root_is_overlay(&fs::read_to_string("/proc/self/mountinfo")?)? {
         eyre::bail!("retained overlay observation does not describe current root");
     }
-    for (path, expected) in [
-        (LOWER_MOUNT, observation.lower_device),
-        (UPPER_MOUNT, observation.upper_device),
+    for (path, expected, filesystem, read_only) in [
+        (
+            LOWER_MOUNT,
+            observation.lower_device,
+            FsType(0xe0f5_e1e2),
+            true,
+        ),
+        (
+            UPPER_MOUNT,
+            observation.upper_device,
+            EXT4_SUPER_MAGIC,
+            false,
+        ),
     ] {
         let mounted = OpenOptions::new()
             .read(true)
@@ -52,6 +63,11 @@ pub(crate) fn retained_root() -> eyre::Result<Option<Observation>> {
         if major(device) != u64::from(expected.major) || minor(device) != u64::from(expected.minor)
         {
             eyre::bail!("retained root device disagrees with maintenance mount {path}");
+        }
+        if fstatfs(&mounted)?.filesystem_type() != filesystem
+            || fstatvfs(&mounted)?.flags().contains(FsFlags::ST_RDONLY) != read_only
+        {
+            eyre::bail!("retained root filesystem/access disagrees with maintenance mount {path}");
         }
     }
     Ok(Some(observation))
@@ -416,7 +432,24 @@ impl StorageShutdown {
                 {
                     eyre::bail!("whole-attachment filesystem overlaps its partition layout");
                 }
-                if fstype != "ext4" && !(fstype == "vfat" && partition_numbers.contains(number)) {
+                let immutable_erofs = self.overlay
+                    && fstype == "erofs"
+                    && target == LOWER_MOUNT
+                    && flags.split(',').filter(|flag| *flag == "ro").count() == 1
+                    && !flags.split(',').any(|flag| flag == "rw")
+                    && filesystem.split_whitespace().nth(2).is_some_and(|options| {
+                        options.split(',').filter(|option| *option == "ro").count() == 1
+                            && !options.split(',').any(|option| option == "rw")
+                    })
+                    && devices.iter().any(|device| {
+                        device.number == number
+                            && device.serial == rootfs_spec::RootSerial::Lower.as_str()
+                            && device.read_only
+                    });
+                if fstype != "ext4"
+                    && !immutable_erofs
+                    && !(fstype == "vfat" && partition_numbers.contains(number))
+                {
                     eyre::bail!("unqualified block filesystem {fstype} {number}");
                 }
                 if !retained
@@ -1042,6 +1075,70 @@ mod tests {
             partitions: Vec::new(),
         }];
         (storage, manifest, blocks, mounts)
+    }
+
+    #[test]
+    fn erofs_shutdown_coverage_requires_exact_immutable_lower_and_retained_cursor() {
+        use crate::root_storage::{DiscoveredBlock, StorageShutdown};
+        let manifest = protocol::shutdown::manifest_from_json(br#"{"kind":"complete","attachments":[{"kind":"block","blockId":"silo-root-lower","role":"root-lower","format":"vmdk","geometry":{"length":16384,"logicalSectorSize":512},"readOnly":true,"exclusiveWriter":false},{"kind":"block","blockId":"silo-root-upper","role":"root-upper","format":"raw","geometry":{"length":67108864,"logicalSectorSize":512},"readOnly":false,"exclusiveWriter":true}]}"#).unwrap();
+        let storage = StorageShutdown {
+            mounts: Vec::new(),
+            overlay: true,
+        };
+        let mut devices = vec![
+            DiscoveredBlock {
+                serial: "silo-root-lower".into(),
+                number: "254:0".into(),
+                length: 16384,
+                sector_size: 512,
+                read_only: true,
+                path: "/dev/vda".into(),
+                partitions: Vec::new(),
+            },
+            DiscoveredBlock {
+                serial: "silo-root-upper".into(),
+                number: "254:1".into(),
+                length: 67108864,
+                sector_size: 512,
+                read_only: false,
+                path: "/dev/vdb".into(),
+                partitions: Vec::new(),
+            },
+        ];
+        let mounts = "40 1 254:0 / /run/silo/rootfs/lower ro - erofs /dev/vda ro\n\
+                      41 1 254:1 / /run/silo/rootfs/upperfs rw - ext4 /dev/vdb rw\n\
+                      42 1 0:42 / / rw - overlay overlay rw\n";
+        let retained = vec![(40, "254:0".into()), (41, "254:1".into())];
+        storage
+            .coverage_with_retained(&manifest, &devices, mounts, &retained)
+            .unwrap();
+        for invalid in [
+            mounts.replace("lower ro", "lower rw"),
+            mounts.replace("/dev/vda ro", "/dev/vda rw"),
+            mounts.replace("/dev/vda ro", "/dev/vda ro,rw"),
+            mounts.replace("lower ro", "lower ro,ro"),
+            mounts.replace("/run/silo/rootfs/lower", "/other"),
+            mounts.replace(" - erofs ", " - xfs "),
+            mounts.replace("40 1 254:0", "40 1 254:1"),
+        ] {
+            assert!(storage
+                .coverage_with_retained(&manifest, &devices, &invalid, &retained)
+                .is_err());
+        }
+        assert!(storage
+            .coverage_with_retained(&manifest, &devices, mounts, &retained[1..])
+            .is_err());
+        let raw = StorageShutdown {
+            mounts: Vec::new(),
+            overlay: false,
+        };
+        assert!(raw
+            .coverage_with_retained(&manifest, &devices, mounts, &retained)
+            .is_err());
+        devices[0].read_only = false;
+        assert!(storage
+            .coverage_with_retained(&manifest, &devices, mounts, &retained)
+            .is_err());
     }
 
     #[test]

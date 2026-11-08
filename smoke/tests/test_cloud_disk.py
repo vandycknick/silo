@@ -47,7 +47,7 @@ def cloud_roots(config: SmokeConfig, registry: LoopbackRegistry, tmp_path_factor
         for identity in ("root", "clone"):
             reference = registry.publish(images.build(cloud_disk.root_image_spec(identity), base), f"phase17-{identity}")
             name = f"phase17-prepare-{identity}"
-            silo.create(name, reference, "--disk-size", "512mib", "--network", "none")
+            silo.create(name, silo.raw_image(reference), "--disk-size", "512mib", "--network", "none")
             record = stopped.record(silo, name)
             assert record["root"]["kind"] == "opaque-raw" and record["root"]["layout"] == {"kind": "whole-disk"}, record["root"]
             output = cloud_disk.sparse_clone(cloud_disk.root_disk(silo, name), directory / f"{identity}.ext4")
@@ -612,7 +612,7 @@ def test_explicit_conversion_is_cached_preserves_defaults_and_boots(silo: Silo, 
     for name in ("kernel-default", "initramfs", "agent"):
         shutil.copyfile(assets / name, saved / name)
     packaged = cloud_disk.packaged_binding(assets)
-    converted = json.loads(silo.run("image", "convert", reference, "--name", "conv-a", timeout=600).stdout)
+    converted = json.loads(silo.run("image", "convert", reference, "--disk-format", "raw", "--name", "conv-a", timeout=600).stdout)
     record = converted["record"]
     assert record["root"]["layout"] == {"kind": "whole-disk"} and record["root"]["profile"] == {"kind": "opaque-raw"}
     assert record["boot"]["rootSelector"] == {"kind": "whole-disk"} and record["boot"]["rootFilesystem"] == "ext4"
@@ -622,11 +622,11 @@ def test_explicit_conversion_is_cached_preserves_defaults_and_boots(silo: Silo, 
                                         "sourceManifest": oci.manifest_digest, "sourceConfig": oci.config_digest, "disk": None}]
     assert converted["retained"] is True and converted["aliases"] == ["conv-a"]
 
-    repeated = json.loads(silo.run("image", "convert", reference, timeout=600).stdout)
+    repeated = json.loads(silo.run("image", "convert", reference, "--disk-format", "raw", timeout=600).stdout)
     assert repeated["id"] == converted["id"] and repeated["record"] == record
     # A packaged upgrade never re-keys or re-pins a cached conversion.
     cloud_disk.valid_replacement_assets(assets, saved)
-    aliased = json.loads(silo.run("image", "convert", reference, "--name", "conv-b", timeout=600).stdout)
+    aliased = json.loads(silo.run("image", "convert", reference, "--disk-format", "raw", "--name", "conv-b", timeout=600).stdout)
     assert aliased["id"] == converted["id"] and aliased["record"]["boot"]["binding"] == packaged
     assert set(aliased["aliases"]) == {"conv-a", "conv-b"}
     catalog = stopped.catalog(silo)
@@ -642,21 +642,22 @@ def test_explicit_conversion_is_cached_preserves_defaults_and_boots(silo: Silo, 
 
 
 @pytest.mark.macos_only
-def test_vz_refuses_oci_and_overlay_roots_and_boots_converted_raw(silo: Silo, basic_image: str) -> None:
+def test_vz_refuses_oci_and_layered_roots_and_boots_converted_raw(silo: Silo, basic_image: str) -> None:
     """pending-lane:macos until exercised on VZ; never substituted by a Linux run."""
     if silo.ws.config.backend != "vz":
         pytest.skip("requires --backend vz")
     initialize(silo)
+    # Ordinary OCI creation is layered; VZ refuses it and names explicit raw conversion.
     refused = cloud_disk.refuse_before_publication(silo, "create", basic_image, "--name", "vz-oci", "--network", "none")
     assert "boot admission rejected" in refused.stderr and "Conversion" in refused.stderr, refused.stderr
-    cloud_disk.refuse_before_publication(silo, "create", basic_image, "--name", "vz-overlay", "--network", "none", "--root-profile", overlay.PROFILE)
     krun = silo.ws.env(SILO_VIRT_BACKEND="krun")
-    silo.run("create", basic_image, "--name", "krun-overlay", "--network", "none", "--root-profile", overlay.PROFILE, env=krun)
-    silo.ws.register_machine("krun-overlay")
-    before = stopped.record(silo, "krun-overlay")
-    assert silo.run("start", "krun-overlay", expect=None).returncode != 0
-    assert stopped.record(silo, "krun-overlay") == before and silo.info("krun-overlay")["state"] == "stopped"
-    silo.run("image", "convert", basic_image, "--name", "vz-raw", timeout=600)
+    silo.run("create", basic_image, "--name", "krun-layered", "--network", "none", env=krun)
+    silo.ws.register_machine("krun-layered")
+    before = stopped.record(silo, "krun-layered")
+    assert before["root"]["kind"] == "linux-overlay", before["root"]
+    assert silo.run("start", "krun-layered", expect=None).returncode != 0
+    assert stopped.record(silo, "krun-layered") == before and silo.info("krun-layered")["state"] == "stopped"
+    silo.run("image", "convert", basic_image, "--disk-format", "raw", "--name", "vz-raw", timeout=600)
     create_vm(silo, "vz-raw-vm", "image:vz-raw")
     cloud_disk.boot(silo, "vz-raw-vm")
     silo.exec("vz-raw-vm", "test", "-f", "/etc/proof", user="root")

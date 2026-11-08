@@ -502,8 +502,7 @@ pub(crate) fn validate_captured_boot_lane(
     lane: CaptureLane,
 ) -> Result<(), LibVmError> {
     use crate::store::models::storage::{
-        BackendRequirement, MachineRoot, OverlayLower, RawLayout, RootSelector, StorageProfile,
-        Translation,
+        BackendRequirement, MachineRoot, RawLayout, RootSelector, StorageProfile, Translation,
     };
 
     storage.validate()?;
@@ -571,10 +570,7 @@ pub(crate) fn validate_captured_boot_lane(
             BackendRequirement::RawBlock,
         ) => lane == CaptureLane::Stopped,
         (
-            MachineRoot::LinuxOverlay {
-                lower: OverlayLower::FlatExt4 { .. },
-                ..
-            },
+            MachineRoot::LinuxOverlay { .. },
             RootSelector::ManagedOverlay,
             StorageProfile::LinuxOverlayV1,
             BackendRequirement::KrunOverlay,
@@ -621,7 +617,7 @@ fn qualify_captured_assets(
     };
     if *root_selector == crate::RootSelector::ManagedOverlay {
         return Ok(CapturedBootAssets::Overlay(
-            crate::boot_qualification::admit_flat_overlay_assets(
+            crate::boot_qualification::admit_erofs_overlay_assets(
                 kernel.into_asset(),
                 initramfs,
                 *kernel_architecture,
@@ -1148,6 +1144,92 @@ pub(crate) async fn capture_boot(
         context.backend,
         context.native_executable,
     )?;
+    Ok(boot)
+}
+
+/// Record exact boot bytes for a host-only raw export. This is identity
+/// authentication, not permission to launch the source or the exported disk.
+/// In particular it neither consults the overlay qualification table nor
+/// changes platform, translation, or a source's already pinned selection.
+pub(crate) async fn capture_export_boot(
+    storage: &MachineStorageRecord,
+    spec: &vm_spec::VmSpec,
+    agent: &MachineAgent,
+    context: CapturedBootContext<'_>,
+) -> Result<BootProfile, LibVmError> {
+    let mut boot = storage.boot.clone();
+    boot.validate()?;
+    let BootProfile::LinuxDirect {
+        binding,
+        kernel_architecture,
+        ..
+    } = &mut boot
+    else {
+        return Err(LibVmError::RawExportUnsupported {
+            reason: "raw export requires Linux direct boot, never EFI".into(),
+        });
+    };
+    if let BootBinding::Pinned {
+        kernel,
+        base_initramfs,
+        agent: pinned_agent,
+        ..
+    } = &*binding
+    {
+        if pinned_agent.is_some() != agent.enabled() {
+            return Err(invalid_capture(
+                "pinned boot agent and configured agent mode disagree",
+            ));
+        }
+        let objects = [
+            binding.digest()?,
+            *kernel,
+            *base_initramfs,
+            pinned_agent.unwrap_or(*kernel),
+        ];
+        let count = if pinned_agent.is_some() { 4 } else { 3 };
+        // Pin before opening, then perform whole-object authentication outside
+        // root coordination. The caller retains the operation lease throughout.
+        {
+            let _roots = context.pool.lock_roots_shared()?;
+            context
+                .store
+                .pin_published_storage_dependencies(context.operation_id, &[], &objects[..count])
+                .await?;
+        }
+        for object in &objects[..count] {
+            resolve_boot_object(context.pool, object)?;
+        }
+        return Ok(boot);
+    }
+    let configured = spec.boot.as_ref().and_then(|boot| boot.kernel.as_ref());
+    let assets = resolve_boot_assets(
+        BootAssetOverrides {
+            kernel: configured.and_then(|kernel| kernel.path.as_deref()),
+            initramfs: configured.and_then(|kernel| kernel.initramfs.as_deref()),
+        },
+        context.default_kernel,
+        context.default_initramfs,
+    )?;
+    // Hold every selected input before ingesting any of them. No composite,
+    // kernel execution, capability query or source-file write is involved.
+    let kernel = qualify_capture_source(&assets.kernel)?;
+    let initramfs = qualify_capture_source(&assets.initramfs)?;
+    let agent = resolve_agent(agent, context.default_agent)?
+        .as_deref()
+        .map(qualify_capture_source)
+        .transpose()?;
+    *binding = BootBinding::Pinned {
+        kernel: ingest_selected_object(kernel, &context).await?,
+        base_initramfs: ingest_selected_object(initramfs, &context).await?,
+        agent: match agent {
+            Some(agent) => Some(ingest_selected_object(agent, &context).await?),
+            None => None,
+        },
+        architecture: *kernel_architecture,
+        abi: DIRECT_BOOT_ABI.to_owned(),
+    };
+    publish_binding(binding, &context).await?;
     Ok(boot)
 }
 

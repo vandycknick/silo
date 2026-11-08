@@ -150,6 +150,22 @@ impl ObjectDigest {
     }
 }
 
+impl LowerResultId {
+    /// A lower result is exactly the canonical composition-result identity;
+    /// no second hash or domain is layered over it.
+    pub fn from_composition(id: oci::composition::CompositionResultId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    /// The OCI wire type has no raw-bytes constructor; its canonical spelling
+    /// is identical, so this parse cannot fail for a valid identity.
+    pub fn composition(
+        &self,
+    ) -> Result<oci::composition::CompositionResultId, oci::changeset::ChangesetError> {
+        self.to_string().parse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::storage::identity::{ImageId, LowerResultId, ObjectDigest, SnapshotId, StreamId};
@@ -185,6 +201,12 @@ mod tests {
         assert_eq!(valid.parse::<ImageId>().unwrap().to_string(), valid);
         assert_eq!(valid.parse::<SnapshotId>().unwrap().to_string(), valid);
         assert_eq!(valid.parse::<LowerResultId>().unwrap().to_string(), valid);
+        let lower: LowerResultId = valid.parse().unwrap();
+        assert_eq!(
+            LowerResultId::from_composition(lower.composition().unwrap()),
+            lower
+        );
+        assert_eq!(lower.composition().unwrap().to_string(), valid);
         assert_eq!(
             ObjectDigest::of_bytes(b"abc").to_string(),
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

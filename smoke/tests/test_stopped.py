@@ -15,7 +15,7 @@ from uuid import UUID
 import pytest
 
 from silo_smoke import image_cache, images, overlay, procs, shutdown, stopped
-from silo_smoke.cli import TIMINGS_PROPERTY, Silo, release, timed
+from silo_smoke.cli import ROOT_PROFILES, TIMINGS_PROPERTY, RootProfile, Silo, release, timed
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -48,8 +48,8 @@ def stopped_image(registry: LoopbackRegistry, overlay_image_bytes: images.OciIma
     return registry.publish(overlay_image_bytes, "stopped")
 
 
-def create(silo: Silo, image: str, name: str, profile: str, *flags: str) -> None:
-    silo.create(name, image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock", *(["--root-profile", overlay.PROFILE] if profile == "flat" else []), *flags)
+def create(silo: Silo, image: str, name: str, profile: RootProfile, *flags: str) -> None:
+    silo.create(name, silo.root_image(image, profile), "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock", *flags)
     stopped.mount_evidence(silo, os.environ.get("SILO_SMOKE_STOPPED_FS"))
 
 
@@ -96,9 +96,14 @@ fi
     assert machine_identity == ("" if identity is None else identity)
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+def lower_backings(silo: Silo, name: str) -> dict[Path, str]:
+    """Every distinct immutable composition backing (fsmeta and packs) of the lower."""
+    return overlay.lower_digests(overlay.machine_dir(silo, name) / "lower.vmdk")
+
+
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("dirty", [False, True], ids=["clean", "dirty-replay"])
-def test_stopped_two_child_fork_independent_replay(stopped_silo: Silo, stopped_image: str, profile: str, dirty: bool) -> None:
+def test_stopped_two_child_fork_independent_replay(stopped_silo: Silo, stopped_image: str, profile: RootProfile, dirty: bool) -> None:
     silo = stopped_silo
     source, first, second = "fork-source", "fork-first", "fork-second"
     create(silo, stopped_image, source, profile)
@@ -110,8 +115,7 @@ ln /stopped-hard-a /stopped-hard-b
 printf 'stopped-guest-identity\\n' >/etc/machine-id
 sync
 """, "stopped-source", overlay.PROBE, user="root")
-    lower = overlay.records(overlay.machine_dir(silo, source) / "lower.vmdk")[0].path if profile == "flat" else None
-    lower_before = overlay.digest(lower) if lower is not None else None
+    lower_before = lower_backings(silo, source) if profile == "layered" else None
     if dirty:
         bound, lease = shutdown.holder(silo, source)
         processes = {entry["role"]: shutdown.Process(entry["pid"]) for entry in bound["holders"]}
@@ -169,26 +173,28 @@ sync
     assert len({original_run, run_a, run_b}) == 3
     # Identity only: fresh independent catalog reads, compared canonically.
     assert len({UUID(procs.machine_id(silo.ws, name)) for name in (source, first, second)}) == 3
-    if lower is not None:
-        assert overlay.digest(lower) == lower_before
-        assert stopped.record(silo, first)["root"]["lower"] == stopped.record(silo, source)["root"]["lower"]
+    if lower_before is not None:
+        assert lower_backings(silo, source) == lower_before
+        for child in (first, second):
+            assert lower_backings(silo, child) == lower_before
+            assert stopped.record(silo, child)["root"]["lower"] == stopped.record(silo, source)["root"]["lower"]
     boot(silo, source)
     assert_guest_copy(silo, source, absent=("/first-only", "/second-only"))
     stopped.stop(silo, source)
 
 
-def test_stopped_flat_snapshot_and_explicit_live_refuse_before_effects(stopped_silo: Silo, stopped_image: str) -> None:
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+def test_stopped_explicit_live_and_execution_refuse_before_effects(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
-    create(silo, stopped_image, "refuse-flat", "flat")
-    stopped.refuse_without_effects(silo, "snapshot", "create", "refuse-flat", "--name", "never-published")
-    for args in [("fork", "refuse-flat", "--live", "--name", "never-live-child"), ("snapshot", "create", "refuse-flat", "--live"), ("restore", str(silo.ws.root / "absent-execution-artifact"), "--execution", "--name", "never-execution-child")]:
+    create(silo, stopped_image, "refuse-source", profile)
+    for args in [("fork", "refuse-source", "--live", "--name", "never-live-child"), ("snapshot", "create", "refuse-source", "--live"), ("restore", str(silo.ws.root / "absent-execution-artifact"), "--execution", "--name", "never-execution-child")]:
         stopped.refuse_without_effects(silo, *args)
-    assert [item["name"] for item in silo.ls()] == ["refuse-flat"]
+    assert [item["name"] for item in silo.ls()] == ["refuse-source"]
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.slow
-def test_stopped_orphan_worker_fences_fork_and_snapshot(stopped_silo: Silo, stopped_image: str, profile: str) -> None:
+def test_stopped_orphan_worker_fences_fork_and_snapshot(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
     create(silo, stopped_image, "orphan-source", profile)
     with shutdown.subreaper():
@@ -247,8 +253,9 @@ def test_stopped_host_ext4_fork_requires_actual_mount(stopped_silo: Silo, stoppe
     stopped.independent(before, child)
 
 
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("custom_boot", [False, True], ids=["runtime-boot", "source-private-boot"])
-def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo, stopped_image: str, custom_boot: bool) -> None:
+def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo, stopped_image: str, profile: RootProfile, custom_boot: bool) -> None:
     silo = stopped_silo
     private_runtime = silo.ws.root / "private-runtime"
     with timed(silo.ws, "overlay.copy_runtime"):
@@ -256,7 +263,7 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     silo.ws.config = replace(silo.ws.config, runtime_dir=private_runtime)
     userdata = silo.ws.root / "userdata"
     userdata.write_text("#!/bin/sh\nprintf 'captured-host\\n' >/etc/hostname\n")
-    create(silo, stopped_image, "snapshot-source", "raw", "--kernel-arg", "silo.capture_config=exact", "--userdata", str(userdata), "--label", "owner=stopped-gate")
+    create(silo, stopped_image, "snapshot-source", profile, "--kernel-arg", "silo.capture_config=exact", "--userdata", str(userdata), "--label", "owner=stopped-gate")
     expected_boot = stopped.install_managed_fixture(silo, "snapshot-source", custom_boot=custom_boot)
     if not custom_boot:
         expected_boot = {role: overlay.digest(private_runtime / "assets" / component) for role, component in {"kernel": "kernel-default", "baseInitramfs": "initramfs", "agent": "agent"}.items()}
@@ -270,7 +277,8 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     stopped.stop(silo, "snapshot-source", require_clean=False)
     source = stopped.backing(silo, "snapshot-source", "before-snapshot")
     source_binding = stopped.record(silo, "snapshot-source")["boot"]["binding"]
-    assert set(source) == {"root", "data:1"}
+    data_key = f"data:{2 if profile == 'layered' else 1}"
+    assert set(source) == {"root", data_key}
     captured = json.loads(silo.run("snapshot", "create", "snapshot-source", "--name", "stopped-checkpoint", timeout=240).stdout)
     assert captured["retained"] is True and "stopped-checkpoint" in captured["aliases"]
     captured_rows = procs.query(silo.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{captured['id']}'")
@@ -279,6 +287,19 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     assert captured_record["captureKind"] == "stopped-storage"
     assert captured_record["stopOutcome"] == shutdown.outcome(silo, "snapshot-source")
     assert captured_record["purpose"] == "checkpoint"
+    source_root = stopped.record(silo, "snapshot-source")["root"]
+    snapshot_root = captured_record["root"]["profile"]
+    if profile == "layered":
+        # The portable snapshot names the complete composition graph, never a
+        # materialized lower stream, and the exact lower the source booted.
+        assert source_root["kind"] == "linux-overlay" and snapshot_root["kind"] == "linux-overlay", (source_root, snapshot_root)
+        assert snapshot_root["lower"]["result"] == source_root["lower"]["record"]
+        assert snapshot_root["lowerGeometry"] == source_root["lower"]["geometry"]
+        assert snapshot_root["lowerFilesystemUuid"] == source_root["lower"]["filesystemUuid"]
+        assert snapshot_root["upperUuid"] == source_root["upperUuid"]
+        assert "stream" not in snapshot_root["lower"] and snapshot_root["lower"]["layers"]
+    else:
+        assert source_root["kind"] == "opaque-raw" and snapshot_root == {"kind": "opaque-raw"}, (source_root, snapshot_root)
     immutable = "image:" + captured["id"]
     inspected = json.loads(silo.run("snapshot", "inspect", immutable).stdout)
     assert inspected == captured
@@ -299,7 +320,8 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
     silo.rm("snapshot-source")
     assert not source_dir.exists()
     # Remove unrelated OCI retention and collect before restoring the sibling.
-    # The artifact and committed child must keep precisely their own closure.
+    # The artifact and committed child must keep precisely their own closure;
+    # a layered restore must not need the OCI source or its acquisition cache.
     shutdown.storage_tool(silo, "remove-image", stopped_image)
     shutdown.storage_tool(silo, "prune")
     for component in ("kernel-default", "initramfs", "agent"):
@@ -308,6 +330,8 @@ def test_stopped_snapshot_full_config_managed_data_exact_boot(stopped_silo: Silo
         target.write_bytes(b"not-the-captured-boot-bytes\n")
         target.chmod(0o755 if component == "agent" else 0o644)
     stopped.restore(silo, immutable, "snapshot-second")
+    if profile == "layered":
+        assert stopped.record(silo, "snapshot-second")["root"]["lower"] == stopped.record(silo, "snapshot-first")["root"]["lower"]
     b = stopped.backing(silo, "snapshot-second", "second-restored-after-source-deletion")
     stopped.same_content(a, b)
     stopped.independent(a, b)
@@ -330,7 +354,7 @@ cat /proc/cmdline
         assert "silo.capture_config=exact" in cmdline
         # The real worker must own the destination Data inode, never a path
         # retained from the deleted source's VmSpec.
-        disk = stopped.writable_paths(silo, child)["data:1"]
+        disk = stopped.writable_paths(silo, child)[data_key]
         shutdown.handles(silo, overlay.worker_pid(silo, child), [disk])
         silo.exec(child, "sh", "-eu", "-c", 'device=""; for p in /sys/block/*; do if test "$(cat "$p/serial" 2>/dev/null)" = silo-data-0; then device=/dev/${p##*/}; fi; done; test -n "$device"; test "$(dd if="$device" bs=1 count=20 2>/dev/null)" = raw-data-before-stop; printf child-data | dd of="$device" bs=512 count=1 conv=sync,notrunc; sync', user="root")
         stopped.stop(silo, child, require_clean=False)
@@ -342,9 +366,10 @@ cat /proc/cmdline
 
 
 @pytest.mark.slow
-def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stopped_silo: Silo, stopped_image: str) -> None:
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
-    create(silo, stopped_image, "retention-source", "raw")
+    create(silo, stopped_image, "retention-source", profile)
     stopped.install_managed_fixture(silo, "retention-source", custom_boot=False)
     baseline = stopped.backing(silo, "retention-source", "retention-before")
     info = json.loads(silo.run("snapshot", "create", "retention-source", "--name", "retention-race", timeout=240).stdout)
@@ -376,7 +401,7 @@ def test_stopped_restore_retains_closure_during_concurrent_snapshot_removal(stop
     stopped.same_content(baseline, stopped.backing(silo, "retention-child", "retention-after-publication"))
     shutdown.storage_tool(silo, "prune")
     boot(silo, "retention-child")
-    disk = stopped.writable_paths(silo, "retention-child")["data:1"]
+    disk = stopped.writable_paths(silo, "retention-child")[f"data:{2 if profile == 'layered' else 1}"]
     shutdown.handles(silo, overlay.worker_pid(silo, "retention-child"), [disk])
     stopped.stop(silo, "retention-child", require_clean=False)
 
@@ -433,8 +458,8 @@ def test_stopped_fork_cancelled_waiter_keeps_actual_worker_locks(stopped_silo: S
         os.close(input_fd)
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
-def test_stopped_fork_snapshot_running_generation_refuses_without_implicit_stop(stopped_silo: Silo, stopped_image: str, profile: str) -> None:
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+def test_stopped_fork_snapshot_running_generation_refuses_without_implicit_stop(stopped_silo: Silo, stopped_image: str, profile: RootProfile) -> None:
     silo = stopped_silo
     create(silo, stopped_image, "running-source", profile)
     with shutdown.subreaper():
@@ -461,7 +486,7 @@ def test_stopped_fork_snapshot_running_generation_refuses_without_implicit_stop(
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize(("boundary", "injected_errno"), [
     ("source-sync", errno.EIO),
     ("destination-copy", errno.EIO),
@@ -470,7 +495,7 @@ def test_stopped_fork_snapshot_running_generation_refuses_without_implicit_stop(
     ("publication-rename", errno.EACCES),
     ("destination-directory-sync", errno.EIO),
 ])
-def test_stopped_fork_real_syscall_failure_never_publishes_partial_child(stopped_silo: Silo, stopped_image: str, profile: str, boundary: str, injected_errno: int) -> None:
+def test_stopped_fork_real_syscall_failure_never_publishes_partial_child(stopped_silo: Silo, stopped_image: str, profile: RootProfile, boundary: str, injected_errno: int) -> None:
     silo = stopped_silo
     create(silo, stopped_image, "failure-source", profile)
     baseline = stopped.backing(silo, "failure-source", "failure-before")
@@ -502,10 +527,17 @@ def test_stopped_prepared_image_catalog_has_no_extra_retention_roots(stopped_sil
     assert not (home / "images/locks").exists()
     assert not (home / "images/tmp").exists()
     assert procs.query(home / "state.db", "SELECT requested_reference FROM image_ref") == [(stopped_image,)]
-    for table in ("machine_config", "storage_operation", "storage_snapshot", "storage_operation_stream", "storage_operation_object", "storage_operation_layer"):
+    for table in ("machine_config", "storage_operation", "storage_snapshot", "storage_image", "storage_operation_stream", "storage_operation_object", "storage_operation_layer", "storage_operation_lower", "machine_lower_dependency"):
         assert procs.query(home / "state.db", f"SELECT COUNT(*) FROM {table}") == [("0",)], table
-    paths = procs.query(home / "state.db", "SELECT rootfs_path FROM image_rootfs_artifact")
-    assert len(paths) == 1
-    root = Path(paths[0][0])
-    assert root.is_relative_to(home / "images/streams/sha256") and root.is_file()
+    # The prepared OCI selection retains exactly one layered composition:
+    # its fsmeta object and every ordered layer pack stream are seeded bytes.
+    lowers = procs.query(home / "state.db", "SELECT lower_id FROM image_composition_artifact")
+    assert len(lowers) == 1
+    fsmeta = procs.query(home / "state.db", f"SELECT fsmeta_digest FROM composition_result WHERE id='{lowers[0][0]}'")
+    assert len(fsmeta) == 1
+    assert (home / "images/objects/sha256" / fsmeta[0][0].removeprefix("sha256:")).is_file()
+    packs = procs.query(home / "state.db", f"SELECT l.pack_stream FROM composition_layer c JOIN layer_result l ON l.id=c.layer_result_id WHERE c.result_id='{lowers[0][0]}' ORDER BY c.position")
+    assert packs
+    for (stream,) in packs:
+        assert (home / "images/streams/sha256" / stream.removeprefix("sha256:")).is_file(), stream
     assert stopped_silo.ls() == []

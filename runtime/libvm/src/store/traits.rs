@@ -166,15 +166,9 @@ pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
         operation_id: uuid::Uuid,
         digests: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError>;
-    /// Upserts OCI manifest metadata, its mutable reference, layers, and rootfs artifact.
+    /// Upserts OCI manifest metadata, its mutable reference, layers, and the
+    /// selection's immutable retained composition artifact.
     async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
-
-    /// Retains a verified stream while an operation holds its filesystem lease.
-    async fn retain_storage_stream(
-        &self,
-        stream_id: &crate::storage::identity::StreamId,
-        operation_id: uuid::Uuid,
-    ) -> Result<(), LibVmError>;
 
     async fn cached_oci_image(
         &self,

@@ -1,6 +1,6 @@
-//! Portable capture provenance: exact transported seal bytes plus the
-//! attachment binding a local plan would otherwise supply. Verification here
-//! proves the record-to-inventory relationships of one checkpoint. It never
+//! Portable capture provenance: exact transported seal and historical plan.
+//! Verification proves the record-to-inventory and immutable-input
+//! relationships of one checkpoint. It never
 //! proves that a trusted monitor performed the cut, and it never creates local
 //! capture, launch, pause or reservation authority.
 use std::collections::BTreeMap;
@@ -9,7 +9,8 @@ use std::fs::File;
 use oci::vm_artifact::wire::{canonical_bytes, decode_record, strict_value, RecordRef};
 use serde::{Deserialize, Serialize};
 use vm_spec::capture::{
-    CaptureConfiguration, CaptureEvidence, CaptureInventoryEntry, CaptureRole, Sha256Digest,
+    CaptureConfiguration, CaptureEvidence, CaptureInventoryEntry, CapturePlan, CaptureRole,
+    Sha256Digest,
 };
 use vm_spec::DiskFormat;
 
@@ -42,6 +43,7 @@ pub(crate) struct PortableCaptureProvenanceV1 {
     pub(crate) snapshot: SnapshotId,
     pub(crate) evidence: RecordRef,
     pub(crate) disks: Vec<PortableCaptureDisk>,
+    pub(crate) plan: CapturePlan,
 }
 
 /// One sealed writable attachment. The role is an opaque identifier from the
@@ -160,6 +162,7 @@ pub(crate) fn build_local(
     record: &SnapshotRecord,
     snapshot: SnapshotId,
     evidence_bytes: &[u8],
+    plan: &CapturePlan,
 ) -> Result<(PortableBinding, Vec<u8>), LibVmError> {
     let evidence = decode_portable_evidence(evidence_bytes)?;
     let configuration =
@@ -179,6 +182,7 @@ pub(crate) fn build_local(
         kind: "portable-capture-provenance".into(),
         snapshot,
         evidence: RecordRef::of_bytes(evidence_bytes),
+        plan: plan.clone(),
         disks: disks
             .iter()
             .zip(&sealed)
@@ -218,6 +222,36 @@ pub(crate) fn verify_portable_binding(
         .ok_or_else(|| failure("coherent seal lacks RAM evidence"))?;
     let configuration =
         CaptureConfiguration::from_spec(&record.configuration.spec).map_err(failure)?;
+    wrapper.plan.validate().map_err(failure)?;
+    let plan_bytes = wrapper.plan.canonical_bytes().map_err(failure)?;
+    evidence
+        .validate_against_plan(&wrapper.plan, &Sha256Digest::of_bytes(&plan_bytes))
+        .map_err(failure)?;
+    if wrapper.plan.configuration != configuration {
+        return Err(failure(
+            "retained capture plan differs from checkpoint configuration",
+        ));
+    }
+    for input in &wrapper.plan.read_only_inputs {
+        let identity = match (&record.root.profile, input.attachment_index) {
+            (SnapshotRootProfile::LinuxOverlay { lower, .. }, 0) => lower.result.to_string(),
+            _ => record
+                .disks
+                .iter()
+                .find(|disk| disk.order == input.attachment_index && !disk.writable)
+                .ok_or_else(|| {
+                    failure("capture read-only input has no immutable checkpoint binding")
+                })?
+                .content
+                .stream
+                .to_string(),
+        };
+        if input.identity != identity {
+            return Err(failure(
+                "captured immutable input differs from the checkpoint graph",
+            ));
+        }
+    }
     let digest = configuration.digest().map_err(failure)?;
     if evidence.configuration_digest != digest || memory.binding.topology != digest {
         return Err(failure(
@@ -438,6 +472,7 @@ mod tests {
         record: SnapshotRecord,
         id: SnapshotId,
         evidence: Vec<u8>,
+        plan: vm_spec::capture::CapturePlan,
     }
 
     async fn published() -> Published {
@@ -463,6 +498,7 @@ mod tests {
             .unwrap();
         Published {
             record: consumer.record.clone(),
+            plan: fixture.reservation.record.plan.clone(),
             _fixture: fixture,
             pool,
             id: info.id,
@@ -483,16 +519,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_seal_rebinds_to_a_closed_portable_wrapper_without_its_plan() {
+    async fn local_seal_rebinds_to_a_closed_portable_wrapper_with_its_exact_plan() {
         let published = published().await;
-        let (binding, wrapper) =
-            build_local(&published.record, published.id, &published.evidence).unwrap();
+        let (binding, wrapper) = build_local(
+            &published.record,
+            published.id,
+            &published.evidence,
+            &published.plan,
+        )
+        .unwrap();
         assert_eq!(
             binding.wrapper_digest,
             crate::storage::identity::ObjectDigest::of_bytes(&wrapper)
         );
         let decoded = PortableCaptureProvenanceV1::decode(&wrapper).unwrap();
         assert_eq!(decoded.snapshot, published.id);
+        assert_eq!(decoded.plan, published.plan);
+        assert_eq!(
+            Sha256Digest::of_bytes(&decoded.plan.canonical_bytes().unwrap()),
+            binding.evidence.request_digest,
+        );
         assert_eq!(decoded.disks.len(), binding.disks.len());
         assert!(!decoded.disks.is_empty());
         assert_eq!(
@@ -523,7 +569,7 @@ mod tests {
         let published = published().await;
         let record = &published.record;
         let id = published.id;
-        let (_, wrapper) = build_local(record, id, &published.evidence).unwrap();
+        let (_, wrapper) = build_local(record, id, &published.evidence, &published.plan).unwrap();
         let other = SnapshotId::from_sha256([7; 32]);
         let cases: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
             (
@@ -556,6 +602,27 @@ mod tests {
                 reencode(&published.evidence, |evidence| {
                     evidence.completed_at_unix_ms += 1
                 }),
+            ),
+            (
+                "different historical plan",
+                rewrap(&wrapper, |wrapper| {
+                    wrapper.plan.dirty_crossover_percent += 1
+                }),
+                published.evidence.clone(),
+            ),
+            (
+                "foreign immutable input",
+                rewrap(&wrapper, |wrapper| {
+                    wrapper
+                        .plan
+                        .read_only_inputs
+                        .push(vm_spec::capture::CaptureReadOnlyInput {
+                            attachment_index: 0,
+                            block_id: wrapper.plan.configuration.attachments[0].block_id.clone(),
+                            identity: format!("sha256:{}", "ab".repeat(32)),
+                        });
+                }),
+                published.evidence.clone(),
             ),
         ];
         for (case, wrapper, evidence) in cases {
@@ -602,7 +669,10 @@ mod tests {
             ),
         ];
         for (case, evidence) in evidence_cases {
-            assert!(build_local(record, id, &evidence).is_err(), "{case}");
+            assert!(
+                build_local(record, id, &evidence, &published.plan).is_err(),
+                "{case}"
+            );
         }
         // The local decoder admits additive fields; a portable seal does not,
         // and its bytes are never stripped into a different blob.
@@ -610,20 +680,21 @@ mod tests {
         value["futureField"] = serde_json::json!(true);
         let extended = serde_json::to_vec(&value).unwrap();
         assert!(CaptureEvidence::decode(&extended).is_ok());
-        assert!(build_local(record, id, &extended).is_err());
+        assert!(build_local(record, id, &extended, &published.plan).is_err());
         // A stopped snapshot has no portable capture.
         let mut stopped = record.clone();
         stopped.capture = SnapshotCaptureKind::StoppedStorage {
             stop_outcome: crate::store::models::storage::StorageStopOutcome::Unknown,
         };
-        assert!(build_local(&stopped, id, &published.evidence).is_err());
+        assert!(build_local(&stopped, id, &published.evidence, &published.plan).is_err());
     }
 
     #[tokio::test]
     async fn byte_measurements_bind_disks_ram_layout_and_native_headers() {
         let published = published().await;
         let record = &published.record;
-        let (binding, _) = build_local(record, published.id, &published.evidence).unwrap();
+        let (binding, _) =
+            build_local(record, published.id, &published.evidence, &published.plan).unwrap();
         let SnapshotCaptureKind::LiveExecution { execution } = &record.capture else {
             panic!("live checkpoint expected");
         };

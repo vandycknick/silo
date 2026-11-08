@@ -45,7 +45,7 @@ def replacement(silo: Silo, reference: str) -> None:
         assert overlay.digest(successor / files[kind].relative_to(private)) == overlay.digest(files[kind])
     environment = silo.ws.env(SILO_RUNTIME_DIR=str(private))
     name = 'overlay-stage-replacement'
-    silo.run('create', reference, '--name', name, '--root-profile', overlay.PROFILE, '--disk-size', '128mib', '--network', 'none', '--vsock', env=environment)
+    silo.run('create', reference, '--name', name, '--disk-size', '128mib', '--network', 'none', '--vsock', env=environment)
     silo.ws.register_machine(name)
     directory = overlay.machine_dir(silo, name)
     assert not (directory / 'kernel-qualified').exists(), 'fresh create must not have published a launch kernel'
@@ -104,7 +104,7 @@ def replacement(silo: Silo, reference: str) -> None:
     before = {'runId': procs.run_id(silo.ws, name), 'monitorPid': procs.vmm_pid(silo.ws, name)}
     refusal = silo.run('start', name, env=environment, expect=None)
     assert refusal.returncode != 0
-    assert 'unqualified linux-flat-overlay-v1 boot tuple' in refusal.stderr and 'native sha256:' + fixture['binarySha256'] in refusal.stderr
+    assert 'unqualified ' + overlay.PROFILE + ' boot tuple' in refusal.stderr and 'native sha256:' + fixture['binarySha256'] in refusal.stderr
     assert silo.info(name)['state'] == 'stopped'
     assert before == {'runId': procs.run_id(silo.ws, name), 'monitorPid': procs.vmm_pid(silo.ws, name)}, 'unknown replacement bytes must not allocate a new run'
     silo.ws.record('overlay-stage-fresh-refusal', json.dumps(before) + '\n' + refusal.stderr)

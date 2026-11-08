@@ -140,11 +140,26 @@ impl SystemRuntime {
         )
         .with_name("docker");
         forward.validate()?;
-        let machine = self
-            .runtime
-            .machine()
+        let builder = match config.backend {
+            crate::daemon::system_config::SystemBackend::Krun => {
+                self.runtime.machine().resolved_image(image)
+            }
+            crate::daemon::system_config::SystemBackend::Vz => {
+                let converted = self
+                    .runtime
+                    .images()
+                    .convert(&image, libvm::RawConversionOptions { alias: None })
+                    .await
+                    .context("convert appliance OCI root for VZ raw storage")?;
+                self.runtime
+                    .machine()
+                    .image_source(libvm::ImageSource::Managed(libvm::ManagedSourceRef::Image(
+                        converted.id,
+                    )))
+            }
+        };
+        let machine = builder
             .name(name)
-            .resolved_image(image)
             .label(MANAGED_ROLE_LABEL, MANAGED_ROLE)
             .label(INSTALLATION_LABEL, installation_id.to_string())
             .retention(MachineRetention::Persistent)

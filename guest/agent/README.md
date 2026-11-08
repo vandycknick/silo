@@ -142,13 +142,16 @@ through queued data's actual kernel writes, not just through enqueueing.
 
 ### Managed overlay root and mount ordering
 
-The opt-in `linux-flat-overlay-v1` root is assembled and grown by trusted init,
-before the agent starts. The agent reads the bounded shared-codec observation at
+The `linux-erofs-overlay-v1` root is assembled and grown by trusted init,
+before the agent starts. Its immutable lower is EROFS and its private writable
+upper is ext4. Init authenticates the lower serial, read-only access, exact
+length, sector size, EROFS UUID, CRC32C, fixed superblock and contiguous mapped
+pack geometry before mounting it read-only. The agent reads the bounded shared-codec observation at
 `/run/silo/rootfs/observation.json` through root-only, no-follow directories and
 checks the retained lower/upper mount devices. A missing or malformed observation
 on an overlay root fails boot. The agent never sends a resize ioctl to overlay
 `/`; ordinary raw ext4 and btrfs root resizing remains separate.
-Init requires the explicit `silo.rootfs=linux-flat-overlay-v1` boot contract and
+Init requires the explicit `silo.rootfs=linux-erofs-overlay-v1` boot contract and
 never falls back to raw boot or a rescue shell after managed assembly failure.
 The root-owned maintenance mounts `/run/silo/rootfs/lower` and
 `/run/silo/rootfs/upperfs`, plus their observation, survive a checked `/run`
@@ -157,6 +160,17 @@ persistence profiles, filesystem span, unusable tail and temporary-directory
 policy, not a shutdown certificate. `/tmp` remains merged-disk backed by
 default; an explicitly sized tmpfs is mounted before handoff and is
 nonpersistent and memory-charged.
+
+The independent `specs/rootfs-spec/fixtures/overlay.json` bootstrap and
+`observation.json` retained record encode `lower.filesystem` as `erofs` and
+`upper.filesystem` as `ext4`; the device expectation type is unchanged.
+Negative UUID and tail fixtures retain that same current profile so they fail
+for their intended identity/accounting violation. Codec regressions separately
+refuse retired `linux-flat-overlay-v1` kind/marker bytes, swapped filesystem
+roles, malformed or truncated inputs and non-block-aligned lowers. The init
+unit regressions construct fixed-format superblocks and device slots, covering
+checksums, unsupported features, nil/out-of-range geometry, missing/repeated
+occurrences, truncated records and wrong UUIDs without mounting a host filesystem.
 
 All requested mounts are required early boot state, including when optional
 provisioning is disabled. The complete plan is normalized and validated before

@@ -3,6 +3,7 @@ pub(crate) mod cache_paths;
 pub(crate) mod capture;
 pub(crate) mod capture_native;
 mod catalog_guard;
+pub(crate) mod composition_store;
 mod config_store;
 pub(crate) mod fork;
 pub(crate) mod handoff_payload_store;
@@ -22,7 +23,7 @@ pub(crate) mod restore;
 mod row;
 pub(crate) mod snapshot_store;
 #[path = "store.rs"]
-mod storage;
+pub(crate) mod storage;
 pub(crate) mod stream_representation;
 mod traits;
 

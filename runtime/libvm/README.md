@@ -76,9 +76,10 @@ execution, independently of guest-agent injection.
 The frozen effective backend governs both admission and the monitor request.
 Direct OCI creation on VZ refuses before materialization and names explicit
 OCI-to-raw conversion; VZ also refuses managed overlay roots. Stopped snapshots
-and forks admit raw whole-disk and GPT/MBR partition roots on the Linux krun
-lane (same architecture, no translation); live capture keeps its narrower
-whole-disk/flat-overlay root set. Neither lane is broadened by boot admission.
+and forks admit raw whole-disk and GPT/MBR partition roots and retained layered
+roots, subject to their boot/backend admission. Live capture keeps its narrower
+whole-disk/layered-overlay root set. Neither lane is qualified merely by boot
+admission; public live lanes remain unqualified.
 
 Managed aliases resolve to typed immutable targets. Image roots are copied from
 their authenticated stream capability. A snapshot source uses full snapshot
@@ -374,15 +375,21 @@ recovery authority, not partial public images or aliases.
 
 ## Stopped Snapshot Retention And Identity
 
-Stopped-storage snapshots are immutable opaque-raw checkpoints, not execution
-checkpoints. Their current schema-1 record includes complete configured semantics,
-ordered included disk streams and maps, exact pinned next-boot assets, external
-resource requirements, and the actual `clean`, `forced`, or `unknown` stop outcome.
-Capture preserves guest bytes, including credentials, filesystem identities,
-journals and deleted-data remnants; it does not sanitize or repair them. Host
-machine identity, source paths, display names and timestamps are not identity
-inputs. Development flat-overlay roots are eligible for local stopped fork only,
-not snapshot publication.
+Stopped-storage snapshots are immutable opaque-raw or layered-root checkpoints,
+not execution checkpoints. Their current schema-1 record includes complete
+configured semantics, ordered included disk streams and maps, exact pinned
+next-boot assets, external resource requirements, and the actual `clean`,
+`forced`, or `unknown` stop outcome. Capture preserves guest bytes, including
+credentials, filesystem identities, journals and deleted-data remnants; it does
+not sanitize or repair them. Host machine identity, source paths, display names
+and timestamps are not identity inputs.
+
+A layered snapshot retains the exact composition recipe/result and fsmeta,
+every occurrence of the layer recipe/result/index closure and payload-pack
+stream, plus the upper. Layer order and repetition are identity-bearing; no
+single materialized flat lower substitutes for this graph. Exact retained
+artifacts are the portability boundary. Original OCI regeneration is only a
+digest-gated fallback, never a requirement to restore a portable snapshot.
 
 The snapshot ID is SHA-256 of `silo:snapshot:v1\n` followed by the RFC 8785
 canonical record. The serialized byte-object digest is separate. Canonical
@@ -514,14 +521,19 @@ unsafe or replaced operation lease inodes block destructive recovery. A free
 lease alone never retires a launch: exact-generation holder terminality and
 lifecycle/storage-outcome reconciliation are required first.
 
-### Opt-in development flat overlay
+### Layered EROFS OCI roots
 
-`MachineBuilder::root_profile(RootProfile::LinuxFlatOverlayV1)` explicitly selects
-an immutable OCI-derived ext4 lower and a freshly formatted private `upper.raw`.
-`RootProfile::OpaqueRaw` remains the default. `root_disk_size(bytes)` selects upper
-backing capacity for overlay roots, defaulting to 4 GiB; the admitted envelope is
-64 MiB through 1 TiB, aligned to 4096 bytes. Backing length, achieved ext4 span,
-unusable short-group tail, filesystem overhead and usable bytes are distinct.
+OCI creation on libkrun defaults to `linux-erofs-overlay-v1`: immutable per-layer
+payload packs and merged EROFS fsmeta, plus a freshly formatted private
+`upper.raw`. There is no `MachineBuilder::root_profile`, CLI `--root-profile`
+selector or template `root_profile` field. The old development flat profile is
+removed; obsolete profiles receive typed rejection, not a compatibility shim or
+raw fallback. VZ requires explicit `silo image convert REF --disk-format raw`.
+
+`root_disk_size(bytes)` selects upper backing capacity, defaulting to 4 GiB;
+the admitted envelope is 64 MiB through 1 TiB, aligned to 4096 bytes. Backing
+length, achieved ext4 span, unusable short-group tail, filesystem overhead and
+usable bytes are distinct.
 
 Every upper has a new UUID. Creation holds the materialization lease until the
 machine and lower retention root commit together. Pruning image references does
@@ -530,11 +542,11 @@ again. It regenerates a bounded read-only `lower.vmdk` for the current home,
 preflights descriptor/record/FD bounds before authenticating lower bytes, and
 retains closure ownership through startup or completed failure cleanup. The
 running machine's semantic root remains the durable retention root. Worker-FD
-lease transfer and certified storage shutdown belong to the later lifecycle gate.
+lease transfer and certified storage shutdown remain separate lifecycle gates.
 
-Only the exact qualified kernel/init/native-monitor/profile/architecture/krun
-tuple is admitted. VZ, mock, non-Linux descriptor execution and unqualified
-artifacts fail before materialization or launch effects. Admission retains opened
+Only an exactly admitted kernel/init/native-monitor/profile/architecture/krun
+tuple may launch. VZ, mock and unqualified artifacts fail before materialization
+or launch effects. Admission retains opened
 boot artifacts. Launch copies and hashes the kernel and base initramfs from those
 same descriptors, never reopening the original paths. On Linux it rechecks and
 executes the retained native ELF through `/proc/self/fd/N`, keeping the descriptor
@@ -574,12 +586,39 @@ boundary for its machine directory. This favors retained unreferenced bytes over
 a catalog root pointing at a deleted file; no uncertain publication is silently
 treated as a confirmed rollback.
 
+### Stopped raw export
+
+`Machine::export_raw_disk(RawDiskExportOptions)` is the API behind
+`silo storage export VM DEST --disk-format raw [--flatten-filesystem] [--format json]`.
+It requires an already-stopped source with Linux direct boot, exports only its
+root, and never implicitly stops, repairs or snapshots the machine. EFI/macOS
+roots receive typed unsupported rejection. Attached data disks and shares are
+not included.
+
+Opaque roots are copied byte-exactly, including dirty journals, unused bytes and
+deleted-data remnants. Layered roots require explicit `flatten_filesystem` and
+a strictly audited, supported, clean on-disk ext4 upper. A recorded clean stop
+cannot bypass that check. Recovery-required state returns
+`RawExportRecoveryRequired`; unsupported/corrupt layout or OverlayFS index state
+is rejected rather than approximated. No host journal replay occurs.
+Flattening authenticates the retained lower, preserves the visible namespace
+and surviving hardlink groups, removes OverlayFS controls and writes a fresh
+whole-disk ext4 filesystem with a new UUID/identity, not an exact checkpoint.
+
+The existing destination parent must be outside the runtime state root.
+Neither destination nor its `.json` sidecar is overwritten. `RawDiskExport`
+records geometry, boot requirements and `opaque-exact` or `flattened-filesystem`
+kind, with the latter's new filesystem UUID. Both the sidecar and CLI JSON report
+serialize `path` and `metadataPath` as raw Unix pathname byte arrays. No
+sanitization, EFI synthesis or cloud-provider bootloader is supplied.
+
 ### Stopped forks and checkpoints
 
 `Machine::fork_stopped(ForkOptions)` creates a new **stopped** machine from an
-opaque raw root or an admitted development flat-overlay root.
+opaque raw root or an admitted `linux-erofs-overlay-v1` root.
 `Machine::snapshot_stopped(SnapshotOptions)` captures an immutable opaque-raw
-checkpoint. `Runtime::restore_snapshot(SnapshotRef, RestoreOptions)` dispatches
+or exact layered-root checkpoint.
+`Runtime::restore_snapshot(SnapshotRef, RestoreOptions)` dispatches
 by the checkpoint's capture kind: stopped storage produces a new **stopped**
 machine, while a live checkpoint continues execution through paused construction
 and fenced activation. Neither path stops a source, replays a journal, repairs
@@ -723,8 +762,8 @@ Raw roots and writable Data disks become isolated private copies. A streaming
 copy from an authenticated closure or cut reuses that source map instead of
 recomputing it, but still scans the completed output and compares its complete
 map and length, rechecks source stability and syncs before publication; stopped
-machine disks, which carry no map authority, are scanned while copying. Flat-overlay
-lowers remain read-only VMDK devices with an explicitly retained descriptor/extent
+machine disks, which carry no map authority, are scanned while copying. Layered
+EROFS lowers remain read-only VMDK devices with an explicitly retained fsmeta/pack
 closure; the generated descriptor is moved into the child without changing its
 inode. Source device IDs, order, format, access and geometry are preserved.
 The pinned kernel, base initramfs and agent remain retained; a destination
@@ -789,10 +828,15 @@ or failed-start cleanup, the manager reacquires the mutation lock and
 reauthenticates the published run; a concurrent stop or replacement run cannot be
 overwritten by a late startup result.
 
-Production restore qualification remains lane-gated until the combined Phase 16
-milestone. Stopped snapshots still reject development flat-overlay publication;
-live capture/restore preserves its admitted read-only VMDK representation.
-Existing state still requires an explicit user wipe.
+Production restore remains lane-gated; public live lanes are unqualified.
+Stopped layered snapshots preserve the exact fsmeta/pack graph, while live
+capture/restore preserves its admitted read-only VMDK representation. Existing
+state still requires an explicit user wipe. Phase 22's independent umoci
+namespace observations matched actual readonly EROFS traversals for all six
+published positives. Exact stable 7.2.2 and longterm 6.18.48 tuples passed
+production boot/lifecycle and guest-mutated flatten export followed by raw boot.
+Stopped portable artifacts and ownership return cycles passed independently.
+Performance remains deferred to the mandatory Phase 24 sweep.
 
 
 The initial stream hash of a private root describes its creation bytes only.
@@ -903,18 +947,13 @@ actual host reservations and start-time limit adjustment are separate concerns.
 
 ## Lossless OCI Layer Artifacts
 
-The Phase2 ingest/compose implementation also supplies every fresh OCI-to-flat
-conversion, for both the default opaque-raw profile and the opt-in flat overlay.
-Acquired blobs pass the same bounded normalized ingestion and ordered namespace
-composition before the final tree is encoded; there is no legacy tar application
-fallback. This does not select a layered guest root, claim an EROFS encoder, or
-qualify a new kernel/init/backend tuple.
-
-Fresh flattening keeps one parsed layer at a time, applies the existing namespace
-kernel incrementally, and retains only live body references and their private
-packs. Zero-copy pack adoption transfers cleanup to the enclosing operation lease
-before releasing each child lease. Reclamation waits for the last hardlink name,
-and wholly unreferenced packs are removed before filesystem encoding.
+Fresh OCI ingestion and explicit OCI-to-raw conversion use the same bounded,
+normalized changesets and ordered namespace composition. Layered creation
+retains the exact payload packs, indexes, composition recipe/result and fsmeta;
+there is no legacy tar applier, default full-ext4 renderer or flat OCI cache.
+Explicit conversion authenticates that same retained graph and renders only its
+merged namespace into a new opaque ext4 image. Conversion is not an implicit
+fallback for a rejected root/backend profile.
 
 Flat encoding preserves raw pathname, symlink and xattr bytes, shared-inode
 hardlinks, source ownership/mode/mtime, directory/root metadata and admitted
@@ -928,8 +967,8 @@ accounts for unique live inode data, directory names, xattrs and the formatter's
 inode/extent/GDT/bitmap/journal overhead; a real dense image may therefore produce
 a lower larger than 2 GiB. Logical sparse-file length alone does not enlarge the
 artifact. The complete image remains bounded to 1 TiB. The current conversion
-identity is `flat-ext4-v2:normalized-phase2:minimum-size=536870912`, so an earlier
-lossy development artifact is never reused under this conversion. There is no
+identity is `flat-ext4-v3:erofs-composition:minimum-size=536870912`, so an earlier
+development artifact is never reused under this conversion. There is no
 old-state migration, cache repair, compatibility reader or automatic wipe.
 
 `oci::changeset::ingest_layer` returns an owned `StagedChangeset` only after

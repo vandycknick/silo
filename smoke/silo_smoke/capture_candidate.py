@@ -155,11 +155,15 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
     if admitted is None:
         raise ValueError("missing existing compiled overlay boot tuple")
     native = re.findall(r"native_sha256:\s*\[.*?\]", admitted.group(), re.DOTALL)
-    if len(native) != 1:
-        raise ValueError("expected one admitted native monitor digest")
+    if not native or any(
+        "".join(re.findall(r"0x([0-9a-fA-F]{2})", value)).lower() != production_hash
+        for value in native
+    ):
+        raise ValueError("existing boot tuples must bind the staged production monitor")
     replacement = "native_sha256: [" + ", ".join("0x" + monitor_hash[index:index + 2]
                                                    for index in range(0, 64, 2)) + "]"
-    proof["mutations"].append(replace_once(boot, native[0], replacement))
+    rebound = re.sub(r"native_sha256:\s*\[.*?\]", replacement, admitted.group(), flags=re.DOTALL)
+    proof["mutations"].append(replace_once(boot, admitted.group(), rebound))
     compile_candidate("candidate-consumers-build", ["-p", "cli", "--bin", "silo",
                                                      "-p", "libvm", "--examples"])
     if restore:

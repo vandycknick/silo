@@ -46,9 +46,9 @@ pub enum StorageError {
     NotRegular(std::path::PathBuf),
     #[error("source changed while being retained: {0}")]
     SourceChanged(std::path::PathBuf),
-    #[error("lower stream {stream} has length {actual}, expected retained length {expected}")]
+    #[error("lower {backing} has length {actual}, expected retained length {expected}")]
     LowerLength {
-        stream: identity::StreamId,
+        backing: crate::storage::vmdk::LowerBacking,
         expected: u64,
         actual: u64,
     },

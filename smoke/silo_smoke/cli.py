@@ -10,7 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, IO
+from typing import TYPE_CHECKING, Any, IO, Literal
 
 from .errors import SmokeAssertion
 
@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 TIMING_EVIDENCE = "timing"
 # Per-test JUnit property; session preparations append `-prepare-<catalog>`.
 TIMINGS_PROPERTY = "silo-smoke-timings"
+# Lifecycle matrices: an explicitly converted opaque raw disk, or the ordinary
+# OCI default (layered `linux-erofs-overlay-v1` root on libkrun).
+RootProfile = Literal["raw", "layered"]
+ROOT_PROFILES: tuple[RootProfile, ...] = ("raw", "layered")
 
 
 def record_timing(ws: Workspace, operation: str, started: float, outcome: str) -> None:
@@ -171,6 +175,20 @@ class Silo:
         self.run("create", image, "--name", name, *flags)
         self.ws.register_machine(name)
         return self.info(name)
+
+    def raw_image(self, reference: str) -> str:
+        """Explicitly convert an OCI reference into the opaque raw disk family.
+
+        New OCI machines default to the layered EROFS root; tests that need
+        opaque whole-disk bytes request them through the real conversion CLI.
+        Returns the immutable managed `image:sha256:HEX` spelling.
+        """
+        converted = json.loads(self.run("image", "convert", reference, "--disk-format", "raw", timeout=600, label="image-convert-raw").stdout)
+        return "image:" + str(converted["id"])
+
+    def root_image(self, reference: str, profile: RootProfile) -> str:
+        """The create source for one lifecycle matrix root profile."""
+        return self.raw_image(reference) if profile == "raw" else reference
 
     def start(self, name: str) -> None:
         self.run("start", name)

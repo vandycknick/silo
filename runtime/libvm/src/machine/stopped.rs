@@ -1,7 +1,7 @@
 //! Exact stopped-storage operations. The blocking owner outlives its requester.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use crate::storage::locks::StorageLock;
 use crate::storage::pool::StoragePool;
 use crate::store::models::snapshot::{
     SnapshotCaptureKind, SnapshotDisk, SnapshotKind, SnapshotPurpose, SnapshotRecord, SnapshotRoot,
-    SnapshotStream,
+    SnapshotRootProfile, SnapshotStream,
 };
 use crate::store::models::{MachineConfig, MachineId};
 use crate::store::snapshot_store::publish_map;
@@ -234,7 +234,7 @@ pub async fn preflight_stopped(
         let (machine, state) = observer.lookup(reference).await?;
         let storage = observer.machine_storage(machine.id).await?;
         validate_managed_attachments(&machine.spec, &storage)?;
-        validate_capture_shape(&storage, snapshot, StoppedAdmission::Ordinary)?;
+        validate_capture_shape(&storage, StoppedAdmission::Ordinary)?;
         check_policy(&external_requirements(&machine.spec, &storage)?, policy)?;
         if let Some(pid) = state.vmm_pid {
             if let Some(identity) = crate::supervisor::process::ProcessIdentity::for_pid(pid)? {
@@ -420,11 +420,14 @@ pub(crate) struct StoppedStorageGuard {
 
 /// Whose stopped boundary is being admitted. Ordinary copies require plain
 /// ownership; a handoff cut requires exactly its own durable reservation,
-/// which the ownership ledger wrote under this same lifecycle lock.
+/// which the ownership ledger wrote under this same lifecycle lock. A raw
+/// export is an ordinary-ownership, host-only read: it never launches or
+/// captures, so it skips only captured lane and boot qualification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StoppedAdmission {
     Ordinary,
     Handoff(crate::handoff::types::OperationId),
+    RawExport,
 }
 
 /// An exact private inode held under the source machine's storage fences.
@@ -483,14 +486,13 @@ impl PrivateSource {
 pub(crate) async fn admit_stopped(
     runtime: &Runtime,
     id: MachineId,
-    snapshot: bool,
     policy: &ExternalResourcePolicy,
     admission: StoppedAdmission,
 ) -> Result<StoppedStorageGuard, LibVmError> {
     let (lifecycle, config) = runtime.lock_machine_config(id).await?;
     runtime.validate_machine_data_dir(&config)?;
     let initial_storage = runtime.machine_storage_record(id).await?;
-    validate_capture_shape(&initial_storage, snapshot, admission)?;
+    validate_capture_shape(&initial_storage, admission)?;
     validate_managed_attachments(&config.spec, &initial_storage)?;
     check_policy(
         &external_requirements(&config.spec, &initial_storage)?,
@@ -499,17 +501,19 @@ pub(crate) async fn admit_stopped(
     runtime
         .preflight_stopped_generation_locked(&config, &initial_storage)
         .await?;
-    runtime.preflight_captured_lane(&initial_storage, CaptureLane::Stopped)?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let store = runtime.native_store()?;
-    let context = runtime.captured_boot_context(&pool, &store, Uuid::nil());
-    preflight_captured_boot(
-        &initial_storage,
-        &config.spec,
-        &config.guest.agent,
-        &context,
-        CaptureLane::Stopped,
-    )?;
+    if admission != StoppedAdmission::RawExport {
+        runtime.preflight_captured_lane(&initial_storage, CaptureLane::Stopped)?;
+        let context = runtime.captured_boot_context(&pool, &store, Uuid::nil());
+        preflight_captured_boot(
+            &initial_storage,
+            &config.spec,
+            &config.guest.agent,
+            &context,
+            CaptureLane::Stopped,
+        )?;
+    }
     let mut ids = initial_storage
         .disks
         .iter()
@@ -552,13 +556,20 @@ pub(crate) async fn admit_stopped(
     }
     let mut storage = runtime.machine_storage_record(id).await?;
     storage.disks.sort_by_key(|disk| disk.order);
-    validate_capture_shape(&storage, snapshot, admission)?;
+    validate_capture_shape(&storage, admission)?;
     let directory = OwnedDirectory::open_existing_root(&config.machine_dir)?
         .ok_or_else(|| invalid("source machine directory is missing"))?;
     let mut files = Vec::with_capacity(storage.disks.len() + 1);
     let (path, length) = root_private(&storage);
     let root_source = open_private(&directory, path, length)?;
-    validate_upper_metadata(&storage, &root_source.file)?;
+    validate_upper_metadata(&storage, &root_source.file).map_err(|error| match admission {
+        // An export reads the upper as data: an incompatible layout is an
+        // unsupported export, never a storage-record defect to repair.
+        StoppedAdmission::RawExport => LibVmError::RawExportUnsupported {
+            reason: error.to_string(),
+        },
+        StoppedAdmission::Ordinary | StoppedAdmission::Handoff(_) => error,
+    })?;
     files.push(root_source);
     for disk in &storage.disks {
         if let DiskStorage::ManagedWritable { path, geometry } = &disk.storage {
@@ -584,14 +595,16 @@ pub(crate) async fn admit_stopped(
     })
 }
 
+/// Opaque raw and layered overlay roots are both admitted for exact stopped
+/// copies, snapshots and exports. Captures additionally require a Linux
+/// direct boot; an export reports its own typed boot refusal.
 pub(crate) fn validate_capture_shape(
     storage: &MachineStorageRecord,
-    snapshot: bool,
     admission: StoppedAdmission,
 ) -> Result<(), LibVmError> {
     storage.validate()?;
     let admitted = match admission {
-        StoppedAdmission::Ordinary => storage.ownership.is_owned(),
+        StoppedAdmission::Ordinary | StoppedAdmission::RawExport => storage.ownership.is_owned(),
         StoppedAdmission::Handoff(operation) => {
             storage.ownership == crate::MachineOwnership::Reserved { operation }
         }
@@ -601,18 +614,9 @@ pub(crate) fn validate_capture_shape(
             "storage has an unresolved offline operation or ownership fence",
         ));
     }
-    match &storage.root {
-        MachineRoot::OpaqueRaw { .. } => {}
-        MachineRoot::LinuxOverlay {
-            lower: crate::OverlayLower::FlatExt4 { .. },
-            ..
-        } if !snapshot => {}
-        MachineRoot::LinuxOverlay { .. } if snapshot => {
-            return Err(LibVmError::FlatOverlayPublicationUnsupported)
-        }
-        _ => return Err(invalid("root family is not admitted for stopped copying")),
-    }
-    if !matches!(storage.boot, BootProfile::LinuxDirect { .. }) {
+    if admission != StoppedAdmission::RawExport
+        && !matches!(storage.boot, BootProfile::LinuxDirect { .. })
+    {
         return Err(invalid(
             "stopped capture requires an admitted Linux direct boot profile",
         ));
@@ -658,34 +662,7 @@ fn validate_upper_metadata(storage: &MachineStorageRecord, file: &File) -> Resul
     else {
         return Ok(());
     };
-    let mut bytes = [0u8; 1024];
-    file.read_exact_at(&mut bytes, 1024)?;
-    let word = |offset: usize| {
-        u32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ])
-    };
-    let profile = rootfs_spec::upper_geometry::FEATURE_INCOMPAT;
-    if bytes[56..58] != [0x53, 0xef]
-        || &bytes[104..120] != upper_uuid.as_bytes()
-        || word(24) != 2
-        || word(96) & !4 != profile
-        || word(92) & !rootfs_spec::upper_geometry::FEATURE_COMPAT != 0
-        || word(100) & !rootfs_spec::upper_geometry::FEATURE_RO_COMPAT != 0
-        || word(4) as u64 * 4096 > *capacity
-        || word(4) == 0
-        || word(336) != 0
-    {
-        return Err(invalid(
-            "stopped upper metadata does not match its admitted profile and UUID",
-        ));
-    }
-    // EXT4_FEATURE_INCOMPAT_RECOVER is deliberately permitted. Never replay,
-    // repair or clear the dirty journal while admitting an exact capture.
-    Ok(())
+    crate::machine::root_storage::validate_upper_file(file, *upper_uuid, *capacity)
 }
 
 pub(crate) fn root_private(storage: &MachineStorageRecord) -> (&crate::PrivatePath, u64) {
@@ -919,18 +896,18 @@ async fn fork_owned(
     let mut source = admit_stopped(
         &runtime,
         id,
-        false,
         &options.external_resources,
         StoppedAdmission::Ordinary,
     )
     .await?;
     let store = runtime.native_store()?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
-    let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage)?;
-    let streams = streams.into_iter().collect::<Vec<_>>();
-    let objects = objects.into_iter().collect::<Vec<_>>();
+    let closure = stopped_closure(&store, &source.storage).await?;
     let (operation_id, lease) = store
-        .begin_stopped_operation("fork", &streams, &objects)
+        .begin_stopped_operation("fork", &closure.streams, &closure.objects)
+        .await?;
+    store
+        .pin_operation_lowers(operation_id, &closure.lowers)
         .await?;
     let mut staging = OperationStaging::new(&pool, operation_id, &lease)?;
     for file in &source.files {
@@ -984,18 +961,18 @@ async fn snapshot_owned(
     let mut source = admit_stopped(
         &runtime,
         id,
-        true,
         &options.external_resources,
         StoppedAdmission::Ordinary,
     )
     .await?;
     let store = runtime.native_store()?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
-    let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&source.storage)?;
-    let streams = streams.into_iter().collect::<Vec<_>>();
-    let objects = objects.into_iter().collect::<Vec<_>>();
+    let closure = stopped_closure(&store, &source.storage).await?;
     let (operation_id, lease) = store
-        .begin_stopped_operation("snapshot", &streams, &objects)
+        .begin_stopped_operation("snapshot", &closure.streams, &closure.objects)
+        .await?;
+    store
+        .pin_operation_lowers(operation_id, &closure.lowers)
         .await?;
     let mut staging = OperationStaging::new(&pool, operation_id, &lease)?;
     for file in &source.files {
@@ -1024,11 +1001,45 @@ async fn snapshot_owned(
     let root_content = writable
         .next()
         .ok_or_else(|| invalid("capture has no private root"))?;
-    let MachineRoot::OpaqueRaw {
-        geometry, layout, ..
-    } = &source.storage.root
-    else {
-        return Err(LibVmError::FlatOverlayPublicationUnsupported);
+    let (profile, geometry, layout) = match (&source.storage.root, closure.graph) {
+        (
+            MachineRoot::OpaqueRaw {
+                geometry, layout, ..
+            },
+            None,
+        ) => (SnapshotRootProfile::OpaqueRaw, *geometry, layout.clone()),
+        (
+            MachineRoot::LinuxOverlay {
+                lower,
+                upper_uuid,
+                capacity,
+                ext4_profile,
+                overlay_profile,
+                temporary_directory,
+                ..
+            },
+            Some(graph),
+        ) => (
+            SnapshotRootProfile::LinuxOverlay {
+                lower: Box::new(graph),
+                lower_geometry: lower.geometry(),
+                lower_filesystem_uuid: lower.filesystem_uuid(),
+                upper_uuid: *upper_uuid,
+                ext4_profile: *ext4_profile,
+                overlay_profile: *overlay_profile,
+                temporary_directory: *temporary_directory,
+            },
+            vm_spec::DiskGeometry {
+                length: *capacity,
+                logical_sector_size: 512,
+            },
+            crate::RawLayout::WholeDisk,
+        ),
+        _ => {
+            return Err(invalid(
+                "stopped root contradicts its retained lower closure",
+            ))
+        }
     };
     let mut disks = Vec::with_capacity(source.storage.disks.len());
     for disk in &source.storage.disks {
@@ -1062,10 +1073,10 @@ async fn snapshot_owned(
         },
         purpose: SnapshotPurpose::Checkpoint,
         root: SnapshotRoot {
-            profile: crate::store::models::snapshot::SnapshotRootProfile::OpaqueRaw,
+            profile,
             stream: root_content,
-            geometry: *geometry,
-            layout: layout.clone(),
+            geometry,
+            layout,
         },
         disks,
         platform_files: Vec::new(),
@@ -1081,6 +1092,57 @@ async fn snapshot_owned(
     store.finish_stopped_operation(operation_id).await?;
     drop(lease);
     Ok(info)
+}
+
+/// Pool closure a stopped operation pins before reading any source byte: the
+/// machine's own edges plus, for a layered root, the retained composition and
+/// every object/stream of its exact graph (published snapshots require each
+/// one operation-pinned).
+struct StoppedClosure {
+    streams: Vec<crate::storage::identity::StreamId>,
+    objects: Vec<crate::storage::identity::ObjectDigest>,
+    lowers: Vec<crate::storage::identity::LowerResultId>,
+    graph: Option<crate::store::models::snapshot::SnapshotComposition>,
+}
+
+async fn stopped_closure(
+    store: &Store,
+    storage: &MachineStorageRecord,
+) -> Result<StoppedClosure, LibVmError> {
+    let crate::store::cache_paths::PoolDependencies {
+        mut streams,
+        mut objects,
+        lowers,
+    } = crate::store::cache_paths::storage_pool_dependencies(storage)?;
+    let graph = match &storage.root {
+        MachineRoot::OpaqueRaw { .. } => None,
+        MachineRoot::LinuxOverlay { lower, .. } => {
+            let layers = crate::store::layer_store::LayerStore::from_store(store.clone());
+            let retained = layers.retained_composition(lower.record()).await?;
+            retained.check_lower(lower)?;
+            crate::machine::root_storage::check_lower_platform(
+                &retained.recipe.platform,
+                &storage.boot,
+            )?;
+            let graph = layers.snapshot_composition(lower.record()).await?;
+            if graph.result != lower.record() || graph.record != retained.record_digest {
+                return Err(invalid("lower graph differs from its retained composition"));
+            }
+            for layer in &graph.layers {
+                streams.insert(layer.pack.stream);
+                objects.insert(layer.pack.map);
+                objects.extend(layer.pack.map_pages.iter().copied());
+            }
+            objects.extend(graph.objects());
+            Some(graph)
+        }
+    };
+    Ok(StoppedClosure {
+        streams: streams.into_iter().collect(),
+        objects: objects.into_iter().collect(),
+        lowers: lowers.into_iter().collect(),
+        graph,
+    })
 }
 
 async fn publish_private_stream(
@@ -1121,17 +1183,17 @@ fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord
             ),
         });
     }
+    let StoppedRoot {
+        root,
+        profile,
+        backend,
+    } = stopped_root(record)?;
     let mut storage = MachineStorageRecord {
         schema: 1,
-        root: MachineRoot::OpaqueRaw {
-            path: crate::PrivatePath::new("root.raw")?,
-            geometry: record.root.geometry,
-            layout: record.root.layout.clone(),
-            initial_content: Some(record.root.stream.stream),
-        },
+        root,
         boot: record.boot.clone(),
-        profile: crate::StorageProfile::OpaqueRawV1,
-        backend: crate::BackendRequirement::RawBlock,
+        profile,
+        backend,
         disks: record
             .disks
             .iter()
@@ -1164,7 +1226,7 @@ fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord
         snapshot: None,
     };
     reset_child_storage(&mut storage);
-    validate_capture_shape(&storage, true, StoppedAdmission::Ordinary)?;
+    validate_capture_shape(&storage, StoppedAdmission::Ordinary)?;
     if !matches!(
         storage.boot,
         BootProfile::LinuxDirect {
@@ -1177,6 +1239,55 @@ fn storage_from_snapshot(record: &SnapshotRecord) -> Result<MachineStorageRecord
         ));
     }
     Ok(storage)
+}
+
+struct StoppedRoot {
+    root: MachineRoot,
+    profile: crate::StorageProfile,
+    backend: crate::BackendRequirement,
+}
+
+/// The child root of a stopped snapshot. A layered lower keeps the exact
+/// composition identity of its graph; geometry/UUID remain derived claims
+/// that the record validation already checked against the graph.
+fn stopped_root(record: &SnapshotRecord) -> Result<StoppedRoot, LibVmError> {
+    Ok(match &record.root.profile {
+        SnapshotRootProfile::OpaqueRaw => StoppedRoot {
+            root: MachineRoot::OpaqueRaw {
+                path: crate::PrivatePath::new("root.raw")?,
+                geometry: record.root.geometry,
+                layout: record.root.layout.clone(),
+                initial_content: Some(record.root.stream.stream),
+            },
+            profile: crate::StorageProfile::OpaqueRawV1,
+            backend: crate::BackendRequirement::RawBlock,
+        },
+        SnapshotRootProfile::LinuxOverlay {
+            lower,
+            lower_geometry,
+            lower_filesystem_uuid,
+            upper_uuid,
+            ext4_profile,
+            overlay_profile,
+            temporary_directory,
+        } => StoppedRoot {
+            root: MachineRoot::LinuxOverlay {
+                lower: crate::OverlayLower::ErofsComposition {
+                    record: lower.result,
+                    geometry: *lower_geometry,
+                    filesystem_uuid: *lower_filesystem_uuid,
+                },
+                upper: crate::PrivatePath::new("upper.raw")?,
+                upper_uuid: *upper_uuid,
+                capacity: record.root.geometry.length,
+                ext4_profile: *ext4_profile,
+                overlay_profile: *overlay_profile,
+                temporary_directory: *temporary_directory,
+            },
+            profile: crate::StorageProfile::LinuxOverlayV1,
+            backend: crate::BackendRequirement::KrunOverlay,
+        },
+    })
 }
 
 async fn restore_owned(
@@ -1231,6 +1342,20 @@ async fn restore_owned(
     }
     let pool = StoragePool::open(runtime.local_images_dir())?;
     let mut staging = OperationStaging::new(&pool, consumer.operation_id, &consumer.lease)?;
+    // A retained layered lower is re-registered from the authenticated,
+    // exact-loaded checkpoint graph and pinned under the consumer before the
+    // child (whose root names it) can be published.
+    if let Some(lower) = consumer.record.lower() {
+        let layers = crate::store::layer_store::LayerStore::from_store(store.clone());
+        let id = layers
+            .publish_snapshot_composition(consumer.operation_id, lower)
+            .await?;
+        let retained = layers.retained_composition(id).await?;
+        crate::machine::root_storage::check_lower_platform(
+            &retained.recipe.platform,
+            &consumer.record.boot,
+        )?;
+    }
     tracing::debug!(snapshot = %consumer.info.id, operation = %consumer.operation_id, "restoring stopped snapshot");
     let mut storage = preview_storage;
     let mut configuration = consumer.record.configuration.clone();

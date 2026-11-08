@@ -21,9 +21,14 @@ CACHE_NAME = "image-catalog"
 POOL_DIRECTORIES = ("objects", "streams", "source-blobs", "transport")
 # db_config is deliberately absent: each seeded Home must initialize its own
 # persistent runtime identity on first open, never copy the preparer's.
+# An OCI selection is retained as its layered composition graph: rows root
+# every pack stream, fsmeta, record and index object, and embed no paths.
 CATALOG_TABLES = {
     "_sqlx_migrations", "image_manifest", "image_ref", "image_config",
-    "image_layer", "image_manifest_layer", "image_rootfs_artifact",
+    "image_layer", "image_manifest_layer", "image_composition_artifact",
+    "composition_recipe", "composition_result", "composition_layer",
+    "layer_recipe", "layer_result", "layer_object_dependency",
+    "layer_occurrence_set", "layer_occurrence",
 }
 
 
@@ -62,8 +67,8 @@ def _catalog(home: Path) -> set[tuple[str, str, str]]:
     try:
         with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
             return set(connection.execute(
-                "SELECT r.requested_reference, r.manifest_digest, a.stream_id "
-                "FROM image_ref r JOIN image_rootfs_artifact a ON a.manifest_digest = r.manifest_digest"
+                "SELECT r.requested_reference, r.manifest_digest, a.lower_id "
+                "FROM image_ref r JOIN image_composition_artifact a ON a.manifest_digest = r.manifest_digest"
             ))
     except sqlite3.DatabaseError:
         # A cache from an incompatible schema is not reusable after a hard break.
@@ -80,7 +85,7 @@ def _copy_pool(source: Path, destination: Path) -> None:
         subprocess.run([*command, str(path), str(destination / name)], check=True, capture_output=True, text=True, timeout=300)
 
 
-def _snapshot(source: Path, destination: Path, final_home: Path) -> None:
+def _snapshot(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     database = destination / "state.db"
     with closing(sqlite3.connect((source / "state.db").as_uri() + "?mode=ro", uri=True)) as original:
@@ -92,11 +97,6 @@ def _snapshot(source: Path, destination: Path, final_home: Path) -> None:
             for table in tables:
                 if table not in CATALOG_TABLES and not table.startswith("sqlite_"):
                     copy.execute('DELETE FROM "' + table.replace('"', '""') + '"')
-            for image_id, stream_id in copy.execute("SELECT image_id, stream_id FROM image_rootfs_artifact").fetchall():
-                algorithm, separator, digest = stream_id.partition(":")
-                if algorithm != "sha256" or separator != ":" or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-                    raise ValueError(f"Invalid cached stream identity: {stream_id!r}")
-                copy.execute("UPDATE image_rootfs_artifact SET rootfs_path = ? WHERE image_id = ?", (str(final_home / "images/streams/sha256" / digest), image_id))
             copy.commit()
             copy.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             copy.execute("PRAGMA journal_mode = DELETE")
@@ -115,7 +115,7 @@ def seed(cache_dir: Path, silo_home: Path) -> set[str]:
         if (silo_home / "state.db").exists():
             raise ValueError("Image cache seeding requires an unopened fresh Silo Home")
         _copy_pool(cached / "images", silo_home / "images")
-        _snapshot(cached, silo_home, silo_home)
+        _snapshot(cached, silo_home)
         return {reference for reference, _, _ in entries}
 
 
@@ -131,7 +131,7 @@ def persist(cache_dir: Path, silo_home: Path) -> bool:
         cached.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             with _pool_lock(silo_home):
-                _snapshot(silo_home, staging, cached)
+                _snapshot(silo_home, staging)
                 _copy_pool(silo_home / "images", staging / "images")
             if cached.exists():
                 cached.rename(retired)

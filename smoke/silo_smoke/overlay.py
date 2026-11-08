@@ -1,4 +1,4 @@
-"""Phase 4 native helpers. Every VM goes through staged Silo or its real monitor.
+"""Managed EROFS root helpers. Every VM uses staged Silo or its real monitor.
 
 The linear oracle consumes whole occurrences, and intentionally knows nothing
 about the descriptor's splitting arithmetic. The second oracle independently
@@ -32,9 +32,10 @@ from .workspace import Workspace
 
 SPLIT = 2 * 1024**3
 PROBE = "/usr/local/bin/overlay-probe"
-PROFILE = "linux-flat-overlay-v1"
+PROFILE = "linux-erofs-overlay-v1"
 APPROVED_NATIVE_REVISION = "58253c00580bda34f5ea9fc4e0fccaf1e09a83d4"
 OVERLAYFS_SUPER_MAGIC = 0x794C7630
+EROFS_SUPER_MAGIC = 0xE0F5E1E2
 TMPFS_MAGIC = 0x01021994
 
 
@@ -210,6 +211,26 @@ def records(descriptor: Path) -> list[Record]:
     return result
 
 
+def lower_occurrences(descriptor: Path) -> list[Path]:
+    """Recover whole backing occurrences, independently of 2GiB splitting."""
+    result: list[Path] = []
+    covered = 0
+    for record in records(descriptor):
+        if record.offset == 0:
+            if result:
+                assert covered == result[-1].stat().st_size
+            result.append(record.path)
+            covered = 0
+        assert result and record.path == result[-1] and record.offset * 512 == covered
+        covered += record.sectors * 512
+    assert covered == result[-1].stat().st_size
+    return result
+
+
+def lower_digests(descriptor: Path) -> dict[Path, str]:
+    return {path: digest(path) for path in dict.fromkeys(lower_occurrences(descriptor))}
+
+
 def linear_read(occurrences: list[Path], offset: int, length: int) -> bytes:
     result = bytearray()
     for path in occurrences:
@@ -344,6 +365,23 @@ df -Pk / /tmp /run/silo/rootfs/upperfs
 df -Pi /run/silo/rootfs/upperfs
 """, user="root")
     assert root_metrics["upperBackingBytes"] == value["root"]["upper"]["lengthBytes"]
+    assert value["root"]["kind"] == PROFILE
+    assert value["root"]["lower"]["filesystem"] == "erofs"
+    assert value["root"]["upper"]["filesystem"] == "ext4"
+    assert filesystem_magic(silo, name, "/run/silo/rootfs/lower") == EROFS_SUPER_MAGIC
+    descriptor = machine_dir(silo, name) / "lower.vmdk"
+    occurrences = lower_occurrences(descriptor)
+    fsmeta = erofs(occurrences[0])
+    assert value["root"]["lower"]["filesystemUuid"] == str(UUID(hex=fsmeta["uuid"]))
+    assert fsmeta["filesystem_bytes"] == occurrences[0].stat().st_size
+    assert fsmeta["devices"] >= len(occurrences) - 1
+    assert sum(path.stat().st_size for path in occurrences) == value["root"]["lower"]["lengthBytes"]
+    rows = procs.query(silo.ws.state_db(), "SELECT json(record_json) FROM machine_storage WHERE machine_id='" + procs.machine_id(silo.ws, name) + "'")
+    assert len(rows) == 1
+    retained = json.loads(rows[0][0])["root"]["lower"]
+    assert retained["kind"] == "erofs-composition" and retained["record"].startswith("sha256:")
+    assert retained["filesystemUuid"] == value["root"]["lower"]["filesystemUuid"]
+    assert retained["geometry"]["length"] == value["root"]["lower"]["lengthBytes"]
     assert root_metrics["sharedLowerLogicalBytes"] == value["root"]["lower"]["lengthBytes"]
     temporary = root_metrics["temporaryDirectory"]
     if value["root"]["temporaryDirectory"]["kind"] == "tmpfs":
@@ -403,7 +441,7 @@ def readonly_handle_evidence(ws: Workspace, pid: int, descriptor: Path, upper_fi
 
 
 def create(silo: Silo, name: str, reference: str, *flags: str, capacity: str = "256mib") -> None:
-    silo.create(name, reference, "--root-profile", PROFILE, "--disk-size", capacity, "--network", "none", "--vsock", *flags)
+    silo.create(name, reference, "--disk-size", capacity, "--network", "none", "--vsock", *flags)
     silo.start(name)
     silo.wait_ready(name)
 
@@ -415,6 +453,15 @@ def ext4(path: Path) -> dict:
     assert len(sb) == 1024 and sb[56:58] == b"\x53\xef"
     blocks = struct.unpack_from("<I", sb, 4)[0]
     return {"uuid": sb[104:120].hex(), "filesystem_bytes": blocks * 4096, "incompat": struct.unpack_from("<I", sb, 96)[0], "compat": struct.unpack_from("<I", sb, 92)[0], "ro_compat": struct.unpack_from("<I", sb, 100)[0], "reserved_gdt": struct.unpack_from("<H", sb, 206)[0]}
+
+
+def erofs(path: Path) -> dict:
+    with path.open("rb") as stream:
+        stream.seek(1024)
+        sb = stream.read(128)
+    assert len(sb) == 128 and struct.unpack_from("<I", sb)[0] == EROFS_SUPER_MAGIC
+    assert sb[12] == 12, "expected fixed 4096-byte EROFS blocks"
+    return {"uuid": sb[48:64].hex(), "filesystem_bytes": struct.unpack_from("<I", sb, 36)[0] * 4096, "devices": struct.unpack_from("<H", sb, 86)[0]}
 
 
 def shutdown_watch(silo: Silo, name: str) -> dict:

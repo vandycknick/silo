@@ -196,7 +196,7 @@ func TestNativeControlLifecycle(t *testing.T) {
 	if image == nil {
 		t.Fatal("missing immutable image")
 	}
-	created, err := client.Machines.CreateMachine(ctx, &w.CreateMachineRequest{Configuration: &w.NormalizedMachineCreate{Name: proto.String("control-smoke"), Cpus: proto.Uint32(2), MemoryBytes: proto.Uint64(512 << 20), Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{WorkingDirectory: "/"}, Labels: map[string]string{"smoke": "control"}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}, RootProfile: w.RootProfile_ROOT_PROFILE_OPAQUE_RAW.Enum(), TemporaryDirectory: &w.TemporaryDirectoryPolicy{Backing: &w.TemporaryDirectoryPolicy_DiskBacked{DiskBacked: &emptypb.Empty{}}}}, Source: &w.CreateMachineRequest_Oci{Oci: image.Identity}})
+	created, err := client.Machines.CreateMachine(ctx, &w.CreateMachineRequest{Configuration: &w.NormalizedMachineCreate{Name: proto.String("control-smoke"), Cpus: proto.Uint32(2), MemoryBytes: proto.Uint64(512 << 20), Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{WorkingDirectory: "/"}, Labels: map[string]string{"smoke": "control"}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}, TemporaryDirectory: &w.TemporaryDirectoryPolicy{Backing: &w.TemporaryDirectoryPolicy_DiskBacked{DiskBacked: &emptypb.Empty{}}}}, Source: &w.CreateMachineRequest_Oci{Oci: image.Identity}})
 	if err != nil {
 		t.Fatal(err)
 	}

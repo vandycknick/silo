@@ -251,7 +251,7 @@ message FilesystemMetrics {
 
 enum RootStorageKind {
   ROOT_STORAGE_KIND_UNSPECIFIED = 0;
-  ROOT_STORAGE_KIND_LINUX_FLAT_OVERLAY_V1 = 1;
+  ROOT_STORAGE_KIND_LINUX_EROFS_OVERLAY_V1 = 1;
 }
 
 enum TemporaryDirectoryKind {

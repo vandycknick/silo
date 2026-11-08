@@ -19,7 +19,7 @@ The formatter now emits classic Linux-growable ext4 metadata: `sparse_super` plu
 |                         |                                                                                                                                |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | **Formatter**           | Create ext4 images from scratch: superblock, group descriptors, inode table, bitmaps, extent trees, and online-resize metadata |
-| **Reader**              | Open existing ext4 images: path resolution, symlink following, file reading                                                    |
+| **Reader**              | Validated, read-only inspection of admitted images, including guest-kernel-mutated uppers: htree directories, deep extent trees, external xattrs, positioned body reads |
 | **Offline Grower**      | Grow clean, unmounted Silo ext4 images without host e2fsprogs                                                                  |
 | **Journal**             | Internal JBD2 journal for kernel crash recovery                                                                                |
 | **Extended Attributes** | Deterministic inline/block placement, raw Linux names/values, explicit POSIX ACL ABI-to-disk conversion                       |
@@ -113,14 +113,55 @@ replacing any inode or creating parents, never truncates it.
 ```rust
 use disk_image::ext4::Reader;
 
-let mut reader = Reader::new(std::path::Path::new("rootfs.ext4"))?;
+// `Reader::from_file` holds an already-open descriptor instead.
+let reader = Reader::new(std::path::Path::new("rootfs.ext4"))?;
 
 // Check existence, list directories, read files.
 assert!(reader.exists("/etc/hostname"));
 let entries = reader.list_dir("/etc")?;
 let data = reader.read_file("/etc/hostname", 0, None)?;
 assert_eq!(&data, b"silo\n");
+
+// Whole-namespace cross-check before trusting a kernel-mutated image.
+reader.audit()?;
 ```
+
+The reader implements exactly the features of the formatter and the fixed
+`silo-upper-ext4-v1` profile (`has_journal`, `ext_attr`, `resize_inode`,
+`dir_index`; `filetype`, `extents`, `flex_bg`; `sparse_super`, `large_file`,
+`huge_file`, `gdt_csum`, `dir_nlink`, `extra_isize`) with 4096-byte blocks and
+256-byte inodes. Everything it returns is exact or one of three typed errors:
+
+- `ReadError::RequiresRecovery`: `needs_recovery`, a journal with unreplayed
+  transactions or an abort errno, a nonempty orphan list, or superblock state
+  that is not clean. The journal is never replayed and the image never written;
+  `read_superblock` still exposes superblock facts for exact-copy callers.
+- `ReadError::Unsupported`: any other feature (`inline_data`, `ea_inode`,
+  `64bit`, `metadata_csum`, encryption, casefolding, ...), unknown inode
+  encoding flags, block-mapped (non-extent) inodes with content, EA-inode or
+  `system.data` xattrs, SipHash directories, and the resource bounds
+  (1 TiB files, 4,194,304 extents per inode, 4,000,000 entries per directory).
+- `ReadError::Corrupt`: geometry, group-descriptor checksums and ranges,
+  allocation bitmaps, extent tree depth/order/key/range/cycle checks, exact
+  `i_blocks` accounting, directory record tiling, `.`/`..`, names and types,
+  htree structure and hash placement, xattr layout, symlink lengths and
+  device encodings.
+
+Construction validates the superblock, clean state, every group descriptor
+and the journal superblock; inodes and directories are validated when read.
+`Reader::audit` additionally walks the whole namespace and proves exact hard
+link counts, single-named directories with correct `..`, matching entry types,
+directory link counts (or `dir_nlink`'s 1) and that every allocated inode is
+reachable. All reads are positioned and take `&self`.
+
+Inode-level APIs serve namespace consumers such as the overlay flattener:
+`read_dir`/`lookup` (sorted entries without `.`/`..`), `metadata` (kind,
+device numbers, permissions, ids, nanosecond times, attribute flags),
+`inode_xattrs`, `symlink_target` and `file_body`. A `FileBody` exposes ordered,
+coalesced `stored_ranges` (holes and unwritten extents excluded, allocation
+beyond `i_size` clipped); `read_at` performs positioned logical reads and
+`body_stream` yields exactly the stored bytes, so a body can feed
+`FileData::Sparse` without a staging copy.
 
 ### Probe an image format
 
@@ -290,7 +331,7 @@ This table follows the feature list documented in [`ext4(5)`](https://www.man7.o
 - Offline resize supports the Silo formatter profile only and refuses images that require journal recovery.
 - Host-side JBD2 replay is intentionally not implemented; Linux performs recovery before the guest online-resize fallback.
 - `sparse_super2` is intentionally disabled; use classic `sparse_super` plus `resize_inode` for Linux online resize.
-- The formatter writes a focused subset of ext4 metadata. Features outside the table's enabled set should be treated as unsupported even if the reader can tolerate some of their on-disk structures.
+- The formatter writes a focused subset of ext4 metadata. The reader refuses every feature outside the listed reader profile with `ReadError::Unsupported` rather than approximating it.
 
 ## Testing
 
@@ -310,6 +351,15 @@ cargo test -p disk-image
 The e2fsprogs integration tests compile and run only on Linux. They call the
 host `tune2fs`, `e2fsck`, `resize2fs`, and `debugfs` binaries, and they create
 temporary images under the system temp directory outside the workspace.
+
+Directory-hash unit vectors come from e2fsprogs 1.47.4
+[`ext2fs_dirhash`](https://github.com/tytso/e2fsprogs/blob/v1.47.4/lib/ext2fs/dirhash.c),
+queried with exact byte buffers and lengths, without lossy UTF-8 conversion.
+They cover signed/unsigned bytes, seeds, empty names, 16/32-byte chunk
+boundaries, and 255-byte names. The mutated-upper fixture retains the full
+Linux 12:20-bit device boundary: since `debugfs mknod` limits each number to
+16 bits, it creates the inode first and sets the encoded word with
+`set_inode_field` before the independent `e2fsck` clean check.
 
 ```sh
 cargo test -p disk-image --test e2fsprogs -- --nocapture

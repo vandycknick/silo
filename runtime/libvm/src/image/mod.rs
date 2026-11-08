@@ -158,10 +158,11 @@ pub struct ImageResolveOptions {
     pub platform: Option<crate::LinuxPlatform>,
 }
 
-/// Whether the resolved immutable image already has a complete local rootfs.
+/// Whether the resolved immutable image already has a retained local
+/// layered composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageCacheState {
-    /// The selected manifest has a complete rootfs in the local cache.
+    /// The selected manifest has a retained composition in the local cache.
     Complete,
     /// The selected manifest must be materialized before it can be used.
     Missing,
@@ -272,7 +273,7 @@ pub struct ImageLayerDetail {
 pub struct ImagePruneReport {
     /// Number of image references removed.
     pub references_removed: u64,
-    /// Number of materialized rootfs artifact records removed.
+    /// Number of retained image composition records removed.
     pub artifacts_removed: u64,
     /// Number of bytes removed from disk when known.
     pub bytes_removed: u64,
@@ -432,18 +433,27 @@ impl Images {
     }
 }
 
+/// The root an image source contributes to a new machine.
+pub(crate) enum MaterializedRoot {
+    /// Whole authenticated raw disk bytes, copied into the machine.
+    Raw {
+        stream: crate::storage::identity::StreamId,
+        size_bytes: u64,
+        authenticated: crate::storage::stream::AuthenticatedStream,
+    },
+    /// An OCI selection's leased exact layered composition; never copied.
+    Layered(Box<crate::store::composition_store::HeldComposition>),
+}
+
 pub(crate) struct MaterializedImage {
-    pub(crate) rootfs_path: PathBuf,
-    pub(crate) stream: Option<crate::storage::identity::StreamId>,
+    pub(crate) root: MaterializedRoot,
     pub(crate) requested_reference: String,
     pub(crate) selected_reference: Option<String>,
     pub(crate) source_kind: ImageSourceKind,
     pub(crate) image_id: Option<String>,
     pub(crate) manifest_digest: Option<String>,
     pub(crate) config_digest: Option<String>,
-    pub(crate) size_bytes: u64,
     pub(crate) platform: Platform,
     pub(crate) managed: Option<crate::store::managed_image_store::ManagedImageConsumer>,
-    pub(crate) authenticated: Option<crate::storage::stream::AuthenticatedStream>,
     pub(crate) _lease: Option<crate::storage::locks::StorageLock>,
 }

@@ -97,7 +97,7 @@ def overlay_image_bytes(config: SmokeConfig, overlay_probe: Path) -> images.OciI
 
 @contextmanager
 def _prepared_image_catalogs(config: SmokeConfig, registry: LoopbackRegistry, request: pytest.FixtureRequest, record_testsuite_property: Callable[[str, object], None], references: dict[str, str]) -> Iterator[dict[str, Path]]:
-    """Prepare one image-only catalog per reference, each from its own never-booted machine and Home."""
+    """Prepare image-only catalogs via explicit conversion, without boot admission."""
     preparations: list[tuple[str, Workspace]] = []
     caches: dict[str, Path] = {}
     prepared = False
@@ -106,7 +106,7 @@ def _prepared_image_catalogs(config: SmokeConfig, registry: LoopbackRegistry, re
             preparation = Workspace(config, registry.ca_path)
             preparations.append((name, preparation))
             with timed(preparation, "image_cache.prepare"):
-                Silo(preparation).create("prepare-" + name, reference, "--disk-size", "512mib", "--network", "none")
+                Silo(preparation).raw_image(reference)
                 cache = preparation.root / "prepared-images"
                 assert image_cache.persist(cache, preparation.silo_home)
             caches[name] = cache

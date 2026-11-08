@@ -54,6 +54,15 @@ privileged container with private cgroup and tmpfs mounts, and requires a Docker
 host that supports running systemd with cgroup v2. It does not start the host's
 Silo daemon or replace its system image.
 
+For a daemon smoke gate of current appliance changes, build the current image
+first and publish it to an OCI registry the private smoke workspace can reach.
+Set `SILO_SMOKE_SYSTEM_IMAGE` to that image's immutable registry digest when running
+`make smoke SMOKE_ARGS="tests/test_daemon_system.py::test_graceful_restart_adopts_running_appliance"`.
+The `build` target only loads Docker's local image store; Silo does not resolve
+that store, so a local tag alone is not sufficient. A cached published `dev` image
+may predate current activation resources, including the bounded systemd-manager
+wait, and does not qualify the current appliance source.
+
 ## Activation request
 
 The controller invokes `silo-system-activate activate` as root and sends exactly

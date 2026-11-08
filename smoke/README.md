@@ -23,6 +23,15 @@ make smoke SMOKE_ARGS="--backend vz"   # macOS only
 make smoke SMOKE_ARGS="-k tty_resize --keep"
 ```
 
+Phase 22 makes `linux-erofs-overlay-v1` the libkrun OCI default and removes the
+flat profile and root-profile selector. Exact Linux x86_64 stable 7.2.2 and
+longterm 6.18.48 production-root tuples passed boot/lifecycle and kernel-mutated
+flatten export followed by raw boot. Independent umoci extraction used the prior
+raw reference environment; a separate readonly EROFS traversal matched every
+published-corpus row without exclusions. Performance must be remeasured in the
+mandatory Phase 24 sweep; public live lanes remain unqualified. See the
+[changeset conformance evidence](../runtime/oci/testdata/changesets/README.md#observed-admission-and-phase-22-default-gates).
+
 ### Controlled EROFS encoder qualification
 
 Build `cargo build --locked -p libvm --example erofs_qualification` and the
@@ -116,7 +125,7 @@ uv run --project smoke pytest smoke/tests/test_artifact_live.py -m slow
 `test_handoff.py` drives two real daemons with independent Homes, runtime IDs,
 config directories and run roots. It covers raw relocation and growth, a
 deliberately stopped running-source fork, stale-plan refusal without catalog
-mutation, destination crash/recovery, and repeated flat-overlay return cycles.
+mutation, destination crash/recovery, and repeated layered-overlay return cycles.
 Read-only catalog queries, private-file hashes and guest markers verify the
 result independently of the coordinator's reports. The old owner must refuse
 start, and terminal recovery must work after payload cleanup.
@@ -214,7 +223,7 @@ and `runtime` directories, then run:
 uv run --project smoke pytest smoke/tests/test_capture.py smoke/tests/test_capture_multidisk.py smoke/tests/test_capture_lifecycle.py -m slow --keep
 ```
 
-The root-family gates exercise raw and flat-overlay matched disk/RAM cuts,
+The root-family gates exercise raw and EROFS-overlay matched disk/RAM cuts,
 source continuation, acquired and borrowed pause authority, sealed-file
 immutability, independent retained RAM, and retention through source/alias
 removal, home relocation and GC. Unsupported readonly virtiofs must be refused
@@ -246,7 +255,7 @@ dispatch and no cold-boot recovery fallback:
 uv run --project smoke pytest smoke/tests/test_restore.py -m slow -k 'not pending_hardware_irq' --keep
 ```
 
-The raw and flat-overlay cases cover acquired and borrowed freeze authority,
+The raw and EROFS-overlay cases cover acquired and borrowed freeze authority,
 fresh machine/run/generation identity and reseeding, unchanged boot ID, sibling
 disk isolation, exact captured kernel/initramfs/agent objects, source removal,
 home relocation, GC, recapture and generation-lease release after owned processes
@@ -439,7 +448,7 @@ SILO_SMOKE_BUDGET_DIR=/home/$USER/sm/phase16-ext4 TMPDIR=/home/$USER/sm \
 
 The exact fixture, cache method and boundaries are in
 `silo_smoke/fork_budget.py`: `restore-execution` image, 2 vCPUs, 4096 MiB RAM,
-`--network private`, flat-overlay with a 2 GiB upper holding exactly 1 GiB of
+`--network private`, EROFS overlay with a 2 GiB upper holding exactly 1 GiB of
 guest-written `/dev/urandom` bytes (logical, allocated and nonzero upper bytes
 are recorded separately). Each test runs five cold samples, one discarded
 warm-up and five warm samples sequentially and reports median, minimum and
@@ -448,6 +457,9 @@ input file before dispatch, with mincore(2) residency before and after; there
 is no global `drop_caches` and no sudo. Pages a live process still maps (the
 running source) remain resident and the sample is labelled `partial-cold`.
 Fresh capture RAM written inside the timed fork is part of the measurement.
+Historical flat-overlay measurements do not qualify this EROFS fixture. The
+mandatory Phase 24 sweep must retain new measurements; no current performance
+success is inferred from the earlier runs.
 
 Gated values: fork4 is CLI dispatch to the last durable child `running` stamp
 (API entry, seal to Running and caller end-to-end are separate fields); capture
@@ -966,12 +978,13 @@ Here `<cache>` is the resolved smoke cache directory. Changing that directory
 or replacing its CA requires trusting the new certificate. The registry's leaf
 certificate is issued per session with localhost/127.0.0.1 subject alternatives.
 
-## Flat-overlay and VMDK qualification
+## EROFS-overlay and VMDK qualification
 
 `tests/test_overlay.py` drives the normal staged CLI/libvm/monitor/worker path.
-Opaque raw remains the default. Managed overlay needs an immutable admitted
-kernel/base-initramfs/resolved-config/profile/architecture/attachment tuple;
-schema support and kernel track names do not grant admission.
+OCI creation now defaults to EROFS overlay on libkrun, with no profile selector.
+Managed overlay still needs an immutable admitted kernel/base-initramfs/
+resolved-config/profile/architecture/attachment tuple; schema support and kernel
+track names do not grant admission.
 
 Prepare the two pure host consumers and stage production binaries after all
 changes have landed:
@@ -1007,9 +1020,10 @@ export SILO_SMOKE_KERNEL_CONFIG="$KERNEL_BUILD/.config"
 make smoke SMOKE_ARGS="-k overlay_candidate_qualification --keep"
 ```
 
-This uses a normal opaque create for its disposable flattener-produced lower,
-the real `format_upper` implementation for its upper, and the shipped monitor
-in foreground mode, which starts its real krun worker. It does not call libkrun
+This uses the `overlay_candidate_lower` libvm example to acquire an authenticated
+EROFS composition with exact fsmeta and ordered pack occurrences, the real
+`format_upper` implementation for its upper, and the shipped monitor in
+foreground mode, which starts its real krun worker. It does not call libkrun
 directly and does not insert a database/home/environment qualification grant.
 Kernel, base initramfs, composite and monitor/worker are private snapshots;
 evidence hashes the exact bytes consumed, so restaging cannot silently change
@@ -1405,7 +1419,7 @@ An old helper must refuse a new-format Home, not bypass schema admission.
 
 `test_shutdown_cli_clean_independent_facts` keeps two real guest writers
 active at stop and checks persisted acknowledged content after restart.
-The outcome matrix covers healthy managed flat-overlay, forced termination,
+The outcome matrix covers healthy managed EROFS overlay, forced termination,
 actual worker SIGKILL, an actual guest kernel panic (retained serial evidence),
 image-owned PID1, unmounted externally writable Data and writable host shares.
 Unsupported shapes remain supported VM launches but cannot certify clean.
@@ -1565,13 +1579,15 @@ silo image remove image:CHECKPOINT       # alias only
 silo snapshot remove image:sha256:HEX    # explicit retention only
 ```
 
-Fork is stopped-only for admitted opaque raw and development flat overlay;
-snapshot/restore artifacts are opaque raw only. Flat publication preparation is
-rejected before effects, not flattened into an artifact. `--live` on fork or
-snapshot creation and `--execution` on restore are separate, still-refused
-execution operations, not implicit stop/cold-boot fallbacks. An exact checkpoint
-preserves configured secrets, guest credentials, dirty journals and deleted-data
-remnants. It is neither sanitization nor application-consistency certification.
+Ordinary fork and snapshot capture require a stopped source and admit opaque raw
+and EROFS-overlay roots subject to their boot/backend admission. Layered
+snapshot/restore artifacts retain the exact fsmeta, ordered pack and metadata
+graph, not a flattened lower or a requirement to regenerate from OCI. Obsolete
+flat profiles are rejected before effects. Live execution operations remain
+separate and publicly unqualified, not implicit stop/cold-boot fallbacks. An
+exact checkpoint preserves configured secrets, guest credentials, dirty journals
+and deleted-data remnants. It is neither sanitization nor application-consistency
+certification.
 External disks/shares require explicit `--external-requirements` at snapshot
 capture; snapshot records never store destination host mappings. Fork/restore
 may instead supply complete `--map-disk ORDER=PATH` / `--map-share TAG=PATH`

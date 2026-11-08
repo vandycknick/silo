@@ -57,6 +57,32 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
         ..Default::default()
     };
     let code = match v {
+        E::IncompatibleRootProfile { profile } => {
+            d.kind = 4;
+            d.code = 16;
+            d.reference = Some(profile.clone());
+            d.safe_message = v.to_string();
+            tonic::Code::FailedPrecondition
+        }
+        E::CompositionAcquisitionRequired { lower, missing } => {
+            d.kind = 2;
+            d.code = 17;
+            d.reference = Some(lower.to_string());
+            d.safe_message = missing.clone();
+            tonic::Code::FailedPrecondition
+        }
+        E::RawExportRecoveryRequired { reason } => {
+            d.kind = 4;
+            d.code = 18;
+            d.safe_message = reason.clone();
+            tonic::Code::FailedPrecondition
+        }
+        E::RawExportUnsupported { reason } => {
+            d.kind = 4;
+            d.code = 19;
+            d.safe_message = reason.clone();
+            tonic::Code::FailedPrecondition
+        }
         E::CheckpointPortability {
             checkpoint,
             refusal,
@@ -402,6 +428,7 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         || (d.code != 10 && d.root_selection.is_some())
         || (d.code != 13 && d.disk_import.is_some())
         || (d.code != 14 && d.boot_bundle_abi.is_some())
+        || (d.code != 15 && d.checkpoint_portability.is_some())
     {
         return Err(invalid(
             "error.detail",
@@ -417,6 +444,41 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         }
     };
     Ok(match d.code {
+        16 => {
+            category(tonic::Code::FailedPrecondition, 4, "error.root_profile")?;
+            E::IncompatibleRootProfile {
+                profile: required(d.reference, "error.reference")?,
+            }
+        }
+        17 => {
+            category(tonic::Code::FailedPrecondition, 2, "error.composition")?;
+            E::CompositionAcquisitionRequired {
+                lower: required(d.reference, "error.reference")?
+                    .parse()
+                    .map_err(|_| invalid("error.reference", "invalid lower result identity"))?,
+                missing: d.safe_message,
+            }
+        }
+        18 => {
+            category(
+                tonic::Code::FailedPrecondition,
+                4,
+                "error.raw_export_recovery",
+            )?;
+            E::RawExportRecoveryRequired {
+                reason: d.safe_message,
+            }
+        }
+        19 => {
+            category(
+                tonic::Code::FailedPrecondition,
+                4,
+                "error.raw_export_unsupported",
+            )?;
+            E::RawExportUnsupported {
+                reason: d.safe_message,
+            }
+        }
         9 => {
             category(
                 tonic::Code::FailedPrecondition,

@@ -16,8 +16,8 @@ pub(crate) mod storage;
 
 pub(crate) use db_config::DbConfig;
 pub(crate) use image::{
-    CacheCleanupDeferral, CacheRecoveryReport, ImageConfigRecord, ImageLayerRecord,
-    ImageManifestLayerRecord, ImageManifestRecord, ImageRefRecord, ImageRootfsArtifactRecord,
+    CacheCleanupDeferral, CacheRecoveryReport, ImageCompositionArtifactRecord, ImageConfigRecord,
+    ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord, ImageRefRecord,
     MachineRootfsRecord, OciImageRecord,
 };
 pub(crate) use machine::{MachineConfig, MachineRuntimeState, MachineState};

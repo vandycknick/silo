@@ -5,6 +5,111 @@ use libvm::{
 };
 use silod_spec::daemon::v1 as w;
 
+fn export_path(path: &std::path::Path, field: &'static str) -> Result<(), ConversionError> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(invalid(field, "must name an absolute output file"));
+    }
+    Ok(())
+}
+
+pub fn raw_export_request_to_wire(
+    machine: &libvm::MachineRef,
+    options: &libvm::RawDiskExportOptions,
+) -> Result<w::ExportRawDiskRequest, ConversionError> {
+    export_path(&options.destination, "export.destination")?;
+    let value = w::ExportRawDiskRequest {
+        machine: Some(crate::lifecycle::reference_to_wire(machine)?),
+        destination: path_to_wire(&options.destination),
+        format: w::DiskFormat::Raw as i32,
+        flatten_filesystem: options.flatten_filesystem,
+    };
+    Ok(value)
+}
+
+pub fn raw_export_request_from_wire(
+    value: w::ExportRawDiskRequest,
+) -> Result<(libvm::MachineRef, libvm::RawDiskExportOptions), ConversionError> {
+    if value.format != w::DiskFormat::Raw as i32 {
+        return Err(invalid("export.format", "raw format must be explicit"));
+    }
+    let destination = path_from_wire(value.destination)?;
+    export_path(&destination, "export.destination")?;
+    Ok((
+        crate::lifecycle::reference_from_wire(required(value.machine, "export.machine")?)?,
+        libvm::RawDiskExportOptions {
+            destination,
+            flatten_filesystem: value.flatten_filesystem,
+        },
+    ))
+}
+
+pub fn raw_export_to_wire(
+    value: &libvm::RawDiskExport,
+) -> Result<w::RawDiskExport, ConversionError> {
+    use w::raw_disk_export::Kind;
+    value
+        .geometry
+        .validate()
+        .map_err(|_| invalid("export.geometry", "invalid geometry"))?;
+    Ok(w::RawDiskExport {
+        path: path_to_wire(&value.path),
+        metadata_path: path_to_wire(&value.metadata_path),
+        geometry: Some(w::DiskGeometry {
+            length: value.geometry.length,
+            logical_sector_size: value.geometry.logical_sector_size,
+        }),
+        boot: Some(crate::boot::boot_profile_to_wire(&value.boot)?),
+        kind: Some(match &value.kind {
+            libvm::RawDiskExportKind::OpaqueExact => Kind::OpaqueExact(()),
+            libvm::RawDiskExportKind::FlattenedFilesystem { filesystem_uuid } => {
+                Kind::FlattenedFilesystemUuid(filesystem_uuid.to_string())
+            }
+        }),
+    })
+}
+
+pub fn raw_export_from_wire(
+    value: w::RawDiskExport,
+) -> Result<libvm::RawDiskExport, ConversionError> {
+    use w::raw_disk_export::Kind;
+    let geometry = required(value.geometry, "export.geometry")?;
+    let geometry = vm_spec::DiskGeometry {
+        length: geometry.length,
+        logical_sector_size: geometry.logical_sector_size,
+    };
+    geometry
+        .validate()
+        .map_err(|_| invalid("export.geometry", "invalid geometry"))?;
+    let kind = match required(value.kind, "export.kind")? {
+        Kind::OpaqueExact(()) => libvm::RawDiskExportKind::OpaqueExact,
+        Kind::FlattenedFilesystemUuid(value) => {
+            let filesystem_uuid = uuid::Uuid::parse_str(&value)
+                .map_err(|_| invalid("export.filesystem_uuid", "invalid UUID"))?;
+            if filesystem_uuid.is_nil() {
+                return Err(invalid("export.filesystem_uuid", "nil UUID"));
+            }
+            libvm::RawDiskExportKind::FlattenedFilesystem { filesystem_uuid }
+        }
+    };
+    let path = path_from_wire(value.path)?;
+    let metadata_path = path_from_wire(value.metadata_path)?;
+    export_path(&path, "export.path")?;
+    export_path(&metadata_path, "export.metadata_path")?;
+    if path == metadata_path {
+        return Err(invalid(
+            "export.metadata_path",
+            "must differ from the disk path",
+        ));
+    }
+    Ok(libvm::RawDiskExport {
+        path,
+        metadata_path,
+        geometry,
+        boot: crate::boot::boot_profile_from_wire(required(value.boot, "export.boot")?)?,
+        kind,
+    })
+}
+
 pub fn name(value: Option<String>) -> Result<Option<String>, ConversionError> {
     if let Some(value) = &value {
         libvm::validate_new_machine_name(value)

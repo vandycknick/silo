@@ -152,7 +152,7 @@ Workload artifact metadata additionally carries a `rootRuntime` object:
   "managedOverlay": {
     "eligible": true,
     "minimumKernelVersion": "6.6",
-    "rootProfile": "linux-flat-overlay-v1",
+    "rootProfile": "linux-erofs-overlay-v1",
     "upperProfile": "silo-upper-ext4-v1",
     "overlayProfile": "silo-overlay-v1",
     "renderingAbi": "linux-overlayfs-mountinfo-v1",
@@ -165,8 +165,8 @@ Workload artifact metadata additionally carries a `rootRuntime` object:
 `eligible` is only the numeric Linux >=6.6 prerequisite for workload kernels,
 never a claim that a boot or conformance gate passed. `longterm5` is always
 opaque-raw-only, and `rprobe` is not a workload root candidate. Resolved config
-validation pins built-in ext4, ACL/security support, OverlayFS and its module
-defaults. The overlay contract itself does not add EROFS or partition support.
+validation pins built-in EROFS and ext4, ACL/security support, OverlayFS and its
+module defaults. Exact runtime evidence remains required.
 
 ### Workload Partition and Rosetta Configuration (Qualification Pending)
 
@@ -223,7 +223,7 @@ boot, and guest gates remain the evidence that a kernel actually boots.
 ### Exact-byte Overlay Admission
 
 
-Production flat-overlay admission is owned by libvm's focused
+Production EROFS-overlay admission is owned by libvm's focused
 `boot_qualification` module, not package metadata or runtime discovery. Its
 immutable reviewed tuples bind exact kernel, reusable base-initramfs and native
 monitor/worker executable bytes, the actual resolved Kconfig digest, kernel
@@ -285,59 +285,47 @@ its codec. Xtask separately tests/lints init's pure library with `--lib
 --no-default-features`, never its no_std/no_main binary harness. The static
 guest init build remains `no_std`.
 
-The flat profile is opt-in and development-only. Opaque raw remains the default.
-Flat roots are not published, transferred or snapshotted; they are removed,
-not migrated, when the final EROFS profile replaces them.
+Layered OCI roots are the libkrun default. Raw disks remain explicit inputs or
+conversion/export products. The development flat lower and root-profile selector
+are removed; incompatible state requires an explicit wipe, not a migration.
 
-### Observed Linux KVM Candidate
+### Observed Linux KVM Tuples
 
-Main observed the controlled real monitor/worker candidate pass on Linux
-x86_64 KVM. The immutable boot-admission entry records exactly:
+The reviewed production boot-admission table binds these exact bytes:
 
 | Identity | Value |
 | --- | --- |
-| Kernel | Linux `7.2.2`, SHA256 `4c54fc038844b04d712bd4cdb8a9d6a945a5f3d7a8bb1db5a5d50d5271d5dddc` |
-| Reusable base initramfs | SHA256 `793730230b7fba3551a1f3b426e11cb343a916090380da87f35f06735dbf28ed` |
-| Actual monitor and worker executable | SHA256 `b44276251676c0b1b1076b096cc67b88a10e8455064a283fe7e4ab9fc1930bbb` |
-| Actual resolved Kconfig | SHA256 `7249a93adabeb4348fc902df83ed252be4c71762ac131cf003070431afdf68a9` |
+| Stable kernel | Linux `7.2.2`, SHA256 `2ce7271136af454c427880212f085271fc2fdea13efb599ba82ff6ebe4d62dc7` |
+| Stable resolved Kconfig | SHA256 `b82647103b73ac2f7fafc3b1bdd6ad927ba2f1c68e5b5f11a3e3da4bfdf533f4` |
+| Longterm kernel | Linux `6.18.48`, SHA256 `69095b40e489efd67b60ae3aae3098454f39515727b180ce65eb9a3ed0ace6ba` |
+| Longterm resolved Kconfig | SHA256 `2184ecc3adae8b99fb194b6fc8c4f0d1d3b40e5429a300edccbb54d0270b678e` |
+| Reusable base initramfs | SHA256 `fa47abf63ab4946efaaacb4e0326ea3d1d953795444ba9073dfa23407ce57e3c` |
+| Actual monitor and worker executable | SHA256 `0816521bbaf2349c4adb51e5ac1e725af433c1482469a5895ebbfbc9d3a44b02` |
 | Native source revision | `8babb9fd9b4a0413ea79ce160e5cc5fab5dea384` |
 | Guest / host lane | `amd64` / Linux `x86_64`, KVM |
-| Profiles | `linux-flat-overlay-v1`, `silo-upper-ext4-v1`, `silo-overlay-v1` |
+| Profiles | `linux-erofs-overlay-v1`, `silo-upper-ext4-v1`, `silo-overlay-v1` |
 | Rendering / attachment | `linux-overlayfs-mountinfo-v1` / `krun-virtio-blk-v1` |
 
-Phase 20 refreshed this tuple after incremental capture and guarded uncertain
-dirty-harvest recovery. The exact optimized production monitor passed
-`test_overlay_candidate_qualification`, recorded in
-`.tmp/plan/evidence/phase-20/exact-final-production-overlay-boot-qualification.log`.
-The isolated incremental candidate is a different executable and does not
-qualify this tuple. This boot qualification grants no public live capability.
-The existing pause-only grant was separately requalified against the new
-native binding in `phase-20/pause-candidate-requalification.xml`; capture,
-restore, fork and incremental remain unqualified in production.
+Phase 22 retained candidate observations in
+`.tmp/plan/evidence/phase-22/qualified-boot-candidate.json` and
+`qualified-longterm-boot-candidate.json`. Each observed the actual worker,
+readonly EROFS lower, writable ext4 upper and successful effective-option
+verification before workload handoff. The per-launch composite initramfs is
+not the reusable base identity.
 
-Earlier kernel/configuration provenance remains in
-`.tmp/plan/evidence/phase-17/overlay-pause-binding-proof.log` and
-`.tmp/plan/evidence/phase-17/overlay-pause-binding-tuple.json`.
-Main independently extracted the exact tested kernel's embedded IKCONFIG and
-verified byte equality with the supplied resolved `.config`, binding the
-configuration to the executable rather than trusting its pathname. The
-per-launch composite initramfs is not the reusable base identity.
+Normal production CLI/monitor/worker gates subsequently exercised both tracks,
+including large mappings, serial/access fault refusals, upper growth, ENOSPC,
+restart, native DISCARD/WRITE_ZEROES, and kernel-mutated flatten export followed
+by raw boot and independent namespace comparison. The complete longterm overlay
+and flatten matrix passed 99 cases (`longterm-all-overlay-and-flatten.log`);
+stable production and corrected fixture observations are retained alongside it.
+The separate two-track encoder matrix passed all ten cases, including 1024
+occurrences and a sparse mapping beyond 2 GiB (`stable-native-prerequisite-gates.log`).
 
-The observed guest validated exact lower/upper serials, a 512 MiB read-only
-lower and 256 MiB writable upper, retained the maintenance mounts and reached
-the workload only after init accepted the effective profile. Mountinfo showed
-explicit `uuid=null,xino=on`; current module parameters were `index=Y`,
-`metacopy=N`, `nfs_export=N`, `redirect_always_follow=N`, `redirect_dir=N`.
-The lower mount was `ro,norecovery`, and the retained observation reported
-256 MiB upper filesystem span with zero excluded tail.
-
-This is controlled-candidate boot evidence only. Main must restage and confirm
-the native executable digest remains unchanged before the normal production
-matrix. Full production-path overlay acceptance, >2 GiB mapping, serial and
-effective-option fault probes, upper lifecycle/growth/capacity/ENOSPC and native
-DISCARD/WRITE_ZEROES gates remain required; this entry does not mark them passed.
-Other native binaries, kernels, base initramfs bytes and host lanes are not
-admitted by this candidate.
+These boot and storage results grant no public live capability. Capture,
+restore, fork and incremental remain unqualified pending the mandatory
+performance sweep. Other native binaries, kernel/initramfs bytes and host lanes
+are not admitted by these tuples.
 
 
 

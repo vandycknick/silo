@@ -44,7 +44,7 @@ def cpio(entries: list[tuple[str, bytes, int]]) -> bytes:
 
 
 class Candidate:
-    def __init__(self, silo: Silo, reference: str, *, fault: str = "none", historical: bool = False, data: Path | None = None, range_request: str | None = None) -> None:
+    def __init__(self, silo: Silo, reference: str | None = None, *, fault: str = "none", historical: bool = False, data: Path | None = None, range_request: str | None = None) -> None:
         self.silo = silo
         self.root = silo.ws.root / ("candidate-" + str(uuid4())[:8])
         self.root.mkdir(mode=0o700)
@@ -84,22 +84,30 @@ class Candidate:
             stage = json.loads((silo.ws.config.runtime_dir / "runtime-manifest.json").read_text())
             assert stage["managedOverlayCandidate"]["nativeExecutableDigest"] == "sha256:" + overlay.digest(self.monitor)
         silo.ws.record("overlay-candidate-native-capabilities", json.dumps(native_capabilities, sort_keys=True) + "\n")
-        # Opaque create remains admitted before the candidate tuple is qualified.
-        name = "candidate-source-" + str(uuid4())[:8]
-        silo.create(name, reference, "--network", "none")
-        lower = overlay.machine_dir(silo, name) / "root.raw"
-        self.occurrences = [lower]
+        self.mapping_only = historical
+        produced = None
+        if not historical:
+            assert reference is not None, "root qualification requires an OCI reference"
+            producer = silo.ws.config.bin_dir / "examples/overlay_candidate_lower"
+            if not producer.is_file():
+                producer = REPO / "target/debug/examples/overlay_candidate_lower"
+            assert producer.is_file(), "Main must build cargo build -p libvm --example overlay_candidate_lower"
+            result = subprocess.run([str(producer), reference, str(self.root / "composition")], env=silo.ws.env(), check=True, capture_output=True, text=True, timeout=300)
+            silo.ws.record("overlay-candidate-composition", result.stdout + result.stderr)
+            produced = json.loads(result.stdout)
+            source_descriptor = Path(produced["descriptor"])
+            self.occurrences = overlay.lower_occurrences(source_descriptor)
+        else:
+            assert reference is None, "byte-mapping qualification has no filesystem source"
+            self.occurrences = []
         self.mapping_probes: list[tuple[int, int]] = []
         if historical:
             import random
             a = self.root / "a.bin"
-            subprocess.run(["cp", "--reflink=auto", "--sparse=always", str(lower), str(a)], check=True, timeout=120)
-            span = overlay.ext4(a)["filesystem_bytes"]
-            assert span < 4 * 1024**3 and a.stat().st_size <= 4_831_838_208
-            with a.open("r+b") as stream:
+            with a.open("w+b") as stream:
                 stream.truncate(4_831_838_208)
                 rng = random.Random(14)
-                for offset in [4 * 1024**3, 4_831_838_208 - 4096]:
+                for offset in [0, overlay.SPLIT - 4096, overlay.SPLIT, overlay.SPLIT + 4096, 2 * overlay.SPLIT - 4096, 2 * overlay.SPLIT, 4_831_838_208 - 4096]:
                     stream.seek(offset)
                     stream.write(rng.randbytes(4096))
             empty = self.root / "empty.bin"
@@ -107,11 +115,11 @@ class Candidate:
             b = self.root / "b.bin"
             b.write_bytes(random.Random(14).randbytes(1024**2))
             self.occurrences = [a, empty, b, b]
-            lower = a
         self.logical_lower_bytes = sum(path.stat().st_size for path in self.occurrences)
         if historical:
             self.mapping_probes = sorted(set(overlay.probes(self.logical_lower_bytes) + [(4_831_838_208 - 2048, 4096), (4_831_838_208, 4096), (4_831_838_208 + 1024**2 - 2048, 4096)]))
             assert len(self.mapping_probes) <= 64
+        lower = self.occurrences[0]
         self.lower = lower
         self.occurrence_digests = {path: overlay.digest(path) for path in dict.fromkeys(self.occurrences)}
         self.lower_digest = self.occurrence_digests[lower]
@@ -157,22 +165,45 @@ class Candidate:
             assert "symlink" in result.stdout.lower()
         descriptor = self.root / "lower.vmdk"
         self.descriptor = descriptor
-        # The historical fixture is deliberately controlled, not a claim that
-        # libvm's current one-stream semantic lower supports repeated objects.
-        extents = [overlay.Record(lower.stat().st_size // 512, lower, 0)]
+        # Arbitrary-byte mapping uses a standalone init and mounts no root.
+        extents = overlay.records(source_descriptor) if produced is not None else []
         if historical:
             extents = [overlay.Record(4_194_304, lower, 0), overlay.Record(4_194_304, lower, 4_194_304), overlay.Record(1_048_576, lower, 8_388_608), overlay.Record(2048, b, 0), overlay.Record(2048, b, 0)]
-        descriptor.write_text('# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType="twoGbMaxExtentFlat"\n\n' + "".join(f'RW {record.sectors} FLAT "{record.path}" {record.offset}\n' for record in extents))
         bootstrap = json.loads((REPO / "specs/rootfs-spec/fixtures/overlay.json").read_text())
         root = bootstrap["root"]
         root["lower"]["lengthBytes"] = self.logical_lower_bytes
-        root["lower"]["filesystemUuid"] = str(UUID(hex=overlay.ext4(lower)["uuid"]))
+        if produced is not None:
+            assert produced["candidateOnly"] is True
+            assert produced["logicalLowerBytes"] == self.logical_lower_bytes
+            root["lower"]["filesystemUuid"] = produced["filesystemUuid"]
+            assert root["lower"]["filesystemUuid"] == str(UUID(hex=overlay.erofs(lower)["uuid"]))
+        if fault in {"lower-magic", "lower-device-range"}:
+            assert produced is not None
+            damaged = self.root / "damaged-fsmeta.erofs"
+            shutil.copyfile(lower, damaged)
+            with damaged.open("r+b") as stream:
+                if fault == "lower-magic":
+                    stream.seek(1024)
+                    stream.write(b"\0\0\0\0")
+                else:
+                    assert overlay.erofs(lower)["devices"] > 0
+                    stream.seek(4096 + 68)
+                    stream.write((self.logical_lower_bytes // 4096 + 1).to_bytes(4, "little"))
+            extents = [overlay.Record(record.sectors, damaged if record.path == lower else record.path, record.offset) for record in extents]
+            self.occurrences = [damaged if path == lower else path for path in self.occurrences]
+            lower = damaged
+            self.lower = lower
+            self.occurrence_digests = {path: overlay.digest(path) for path in dict.fromkeys(self.occurrences)}
+            self.lower_digest = self.occurrence_digests[lower]
+        if fault == "lower-uuid":
+            root["lower"]["filesystemUuid"] = str(uuid4())
         root["upper"]["lengthBytes"] = formatted["backing_bytes"]
         root["upper"]["filesystemUuid"] = formatted["uuid"]
         if fault == "uuid":
             root["upper"]["filesystemUuid"] = str(uuid4())
         if fault == "length":
             root["lower"]["lengthBytes"] += 512
+        descriptor.write_text('# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType="twoGbMaxExtentFlat"\n\n' + "".join(f'RW {record.sectors} FLAT "{record.path}" {record.offset}\n' for record in extents))
         self.bootstrap = bootstrap
         assets = silo.ws.config.runtime_dir / "assets"
         base = assets / "initramfs"
@@ -203,24 +234,34 @@ class Candidate:
         raw += cpio(entries)
         composite.write_bytes(raw)
         disks = [
-            {"path": str(descriptor), "role": "root-lower", "format": "vmdk", "geometry": {"length": lower.stat().st_size, "logicalSectorSize": 512}, "blockId": "silo-root-lower", "readOnly": True},
+            {"path": str(descriptor), "role": "root-lower", "format": "vmdk", "geometry": {"length": self.logical_lower_bytes, "logicalSectorSize": 512}, "blockId": "silo-root-lower", "readOnly": True},
             {"path": str(upper), "role": "root-upper", "format": "raw", "geometry": {"length": formatted["backing_bytes"], "logicalSectorSize": 512}, "blockId": "silo-root-upper", "readOnly": False},
         ]
         if fault == "duplicate":
             # Unique host/native key. The isolated native response mutation maps
             # ONLY this extra real block device's GET_ID to silo-root-lower.
-            disks.append({"path": str(lower), "role": "data", "format": "raw", "geometry": disks[0]["geometry"], "blockId": "silo-data-0", "readOnly": True})
+            duplicate = self.root / "duplicate-lower.raw"
+            with duplicate.open("xb") as output:
+                for occurrence in self.occurrences:
+                    with occurrence.open("rb") as source:
+                        shutil.copyfileobj(source, output)
+            assert duplicate.stat().st_size == self.logical_lower_bytes
+            disks.append({"path": str(duplicate), "role": "data", "format": "raw", "geometry": {"length": self.logical_lower_bytes, "logicalSectorSize": 512}, "blockId": "silo-data-0", "readOnly": True})
         if data is not None:
             assert fault == "range-observer" and range_request is not None
             assert data.stat().st_size == 4 * 1024**2
             disks.append({"path": str(data), "role": "data", "format": "raw", "geometry": {"length": data.stat().st_size, "logicalSectorSize": 512}, "blockId": "silo-data-0", "readOnly": False})
-        self.spec = {"specVersion": "0.2.0", "boot": {"kernel": {"path": str(kernel_snapshot), "initramfs": str(composite), "cmdline": ["loglevel=6", "silo.rootfs=linux-flat-overlay-v1", "init=/sbin/candidate-init"]}}, "hardware": {"cpus": 1, "memory": 512, "rosetta": False, "nestedVirtualization": False}, "storage": {"disks": disks}}
-        self.spec["storage"]["disks"][0]["geometry"]["length"] = self.logical_lower_bytes
+        self.spec = {"specVersion": "0.2.0", "boot": {"kernel": {"path": str(kernel_snapshot), "initramfs": str(composite), "cmdline": ["loglevel=6", "silo.rootfs=" + overlay.PROFILE, "init=/sbin/candidate-init"]}}, "hardware": {"cpus": 1, "memory": 512, "rosetta": False, "nestedVirtualization": False}, "storage": {"disks": disks}}
         if self.mapping_probes:
             self.spec["boot"]["kernel"]["cmdline"].append("silo.smoke_probes=" + ",".join(f"{offset}:{length}" for offset, length in self.mapping_probes))
         if range_request is not None:
             assert fault == "range-observer" and data is not None
             self.spec["boot"]["kernel"]["cmdline"].append("silo.smoke_range=" + range_request)
+        if historical:
+            mapping_init = self.root / "mapping-init"
+            subprocess.run([os.environ.get("CC", "cc"), "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(mapping_init), str(REPO / "smoke/fixtures/vmdk_mapping.c")], check=True, capture_output=True, timeout=90)
+            composite.write_bytes(cpio([("init", mapping_init.read_bytes(), 0o100755)]))
+            self.spec["boot"]["kernel"]["cmdline"] = ["loglevel=6", "rdinit=/init", "silo.smoke_probes=" + ",".join(f"{offset}:{length}" for offset, length in self.mapping_probes)]
         self.config = self.root / "spec.json"
         self.config.write_text(json.dumps(self.spec))
         self.identities = {"kernelSha256": overlay.digest(kernel_snapshot), "initramfsSha256": hashlib.sha256(base_bytes).hexdigest(), "compositeInitramfsSha256": overlay.digest(composite), "monitorWorkerSha256": overlay.digest(self.monitor), "hostSystem": platform.system(), "hostArchitecture": platform.machine(), "hostKernelRelease": platform.release(), "hostLane": "linux-kvm" if platform.system() == "Linux" else "macos-hvf", "rootProfile": overlay.PROFILE, "upperProfile": "silo-upper-ext4-v1", "renderingAbi": "linux-overlayfs-mountinfo-v1", "attachmentFamily": "krun-virtio-blk-v1", "candidateOnly": True}
@@ -228,6 +269,14 @@ class Candidate:
         self.identities["actualNativeCapabilities"] = native_capabilities
         self.identities["logicalLowerBytes"] = self.logical_lower_bytes
         self.identities["lowerOccurrences"] = [{"path": str(path), "lengthBytes": path.stat().st_size, "sha256": self.occurrence_digests[path]} for path in self.occurrences]
+        if produced is not None:
+            self.identities["compositionResult"] = produced["compositionResult"]
+            self.identities["fsmetaObject"] = produced["fsmetaObject"]
+        if historical:
+            self.identities["rootProfile"] = "none"
+            self.identities["experiment"] = "arbitrary-byte-vmdk-mapping"
+            self.identities["initramfsSha256"] = overlay.digest(composite)
+            self.identities["compositeInitramfsSha256"] = overlay.digest(composite)
         config_input = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
         if config_input:
             config_snapshot = self.root / "resolved.config"
@@ -272,6 +321,12 @@ class Candidate:
         deadline = time.monotonic() + 90
         while True:
             text = bounded_log(self.serial) if self.serial.exists() else ""
+            if self.mapping_only:
+                assert not rejected
+                assert "SILO_VMDK_MAPPING_FAIL" not in text, text
+                if "SILO_VMDK_MAPPING_PASS" in text:
+                    self.observe_worker()
+                    return text
             if rejected:
                 assert "SILO_OVERLAY_WORKLOAD_REACHED" not in text
                 assert "starting rescue shell" not in text
@@ -281,6 +336,8 @@ class Candidate:
             elif "SILO_OVERLAY_WORKLOAD_REACHED" in text:
                 assert "SILO_OVERLAY_CANDIDATE_BEGIN" in text
                 assert '"effectiveOverlayProfile":"silo-overlay-v1"' in text.replace(" ", "")
+                assert '"kind":"' + overlay.PROFILE + '"' in text.replace(" ", "")
+                assert '"filesystem":"erofs"' in text.replace(" ", "")
                 self.observe_worker()
                 return text
             if self.process is None or self.process.poll() is not None:

@@ -55,7 +55,8 @@ pub(crate) fn writable_files(
 
 /// The observation projection of a current record. A record reserved for
 /// `reserved` is projected as owned, so capture can compare it to the plan.
-pub(crate) fn observation_body(
+pub(crate) async fn observation_body(
+    runtime: &Runtime,
     runtime_id: RuntimeId,
     config: &MachineConfig,
     storage: &MachineStorageRecord,
@@ -79,7 +80,7 @@ pub(crate) fn observation_body(
     storage.stop_outcome = crate::StorageStopOutcome::Unknown;
     storage.ownership.ensure_owned(config.id)?;
     crate::machine::stopped::validate_managed_attachments(&config.spec, &storage)?;
-    crate::machine::stopped::validate_capture_shape(&storage, false, StoppedAdmission::Ordinary)?;
+    crate::machine::stopped::validate_capture_shape(&storage, StoppedAdmission::Ordinary)?;
     if !matches!(
         &storage.boot,
         crate::BootProfile::LinuxDirect {
@@ -93,8 +94,39 @@ pub(crate) fn observation_body(
     }
     let external_requirements =
         crate::machine::stopped::external_requirements(&config.spec, &storage)?;
-    let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(&storage)?;
+    let crate::store::cache_paths::PoolDependencies {
+        mut streams,
+        mut objects,
+        ..
+    } = crate::store::cache_paths::storage_pool_dependencies(&storage)?;
+    let composition = match &storage.root {
+        crate::MachineRoot::LinuxOverlay {
+            lower: crate::OverlayLower::ErofsComposition { record, .. },
+            ..
+        } => Some(
+            crate::store::layer_store::LayerStore::open(runtime.local_home())
+                .await?
+                .snapshot_composition(*record)
+                .await?,
+        ),
+        crate::MachineRoot::OpaqueRaw { .. } => None,
+    };
+    if let Some(lower) = &composition {
+        objects.extend(lower.objects());
+        for layer in &lower.layers {
+            objects.insert(layer.pack.map);
+            objects.extend(layer.pack.map_pages.iter().copied());
+            streams.insert(layer.pack.stream);
+        }
+    }
     let mut immutable = ImmutableClosure {
+        oci_source: if composition.is_some() {
+            crate::image::oci::machine_composition_source(&runtime.native_store()?, config.id)
+                .await?
+        } else {
+            None
+        },
+        composition,
         objects: Vec::with_capacity(objects.len()),
         streams: Vec::with_capacity(streams.len()),
     };
@@ -166,14 +198,18 @@ pub(crate) async fn observe(
     let (_lifecycle, config) = runtime.lock_machine_config(config.id).await?;
     let storage = runtime.machine_storage_record(config.id).await?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
-    SourceObservation::new(observation_body(
-        store.runtime_id().await?,
-        &config,
-        &storage,
-        &pool,
-        None,
-        source_execution(runtime, &config, &storage).await?,
-    )?)
+    SourceObservation::new(
+        observation_body(
+            runtime,
+            store.runtime_id().await?,
+            &config,
+            &storage,
+            &pool,
+            None,
+            source_execution(runtime, &config, &storage).await?,
+        )
+        .await?,
+    )
 }
 
 fn require_source(record: &HandoffRecord) -> Result<(), LibVmError> {
@@ -227,13 +263,16 @@ pub(crate) async fn begin(
         let storage = runtime.machine_storage_record(config.id).await?;
         let pool = StoragePool::open(runtime.local_images_dir())?;
         if observation_body(
+            runtime,
             store.runtime_id().await?,
             &config,
             &storage,
             &pool,
             None,
             source_execution(runtime, &config, &storage).await?,
-        )? != plan.body().observation
+        )
+        .await?
+            != plan.body().observation
         {
             return Err(HandoffError::AdmissionStale.into());
         }
@@ -260,6 +299,11 @@ pub(crate) async fn begin(
         store
             .pin_handoff_dependencies(intent.operation, &streams, &objects)
             .await?;
+        if let Some(lower) = &closure.composition {
+            store
+                .pin_operation_lowers(intent.operation.as_uuid(), &[lower.result])
+                .await?;
+        }
     }
     for entry in &closure.objects {
         let file = pool.verify_object(&entry.digest)?;
@@ -312,6 +356,7 @@ pub(crate) async fn capture(
         let storage = runtime.machine_storage_record(id).await?;
         let pool = StoragePool::open(runtime.local_images_dir())?;
         let current = observation_body(
+            runtime,
             intent.source_runtime,
             &config,
             &storage,
@@ -323,7 +368,8 @@ pub(crate) async fn capture(
             } else {
                 source_execution(runtime, &config, &storage).await?
             },
-        )?;
+        )
+        .await?;
         if current != plan.body().observation {
             return Err(HandoffError::AdmissionStale.into());
         }
@@ -348,20 +394,22 @@ pub(crate) async fn capture(
     let guard = crate::machine::stopped::admit_stopped(
         runtime,
         id,
-        false,
         &ExternalResourcePolicy::RequireMappings,
         StoppedAdmission::Handoff(operation),
     )
     .await?;
     let pool = StoragePool::open(runtime.local_images_dir())?;
     if observation_body(
+        runtime,
         intent.source_runtime,
         &guard.config,
         &guard.storage,
         &pool,
         Some(operation),
         plan.body().observation.execution.clone(),
-    )? != plan.body().observation
+    )
+    .await?
+        != plan.body().observation
     {
         return Err(HandoffError::AdmissionStale.into());
     }

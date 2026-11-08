@@ -44,7 +44,7 @@ func TestActualManagementAdapters(t *testing.T) {
 		t.Fatal("image terminal identity incomplete")
 	}
 	name := "adapter-dev"
-	d, e := n.Control.Create(ctx, &w.NormalizedMachineCreate{Name: &name, Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}, RootProfile: w.RootProfile_ROOT_PROFILE_OPAQUE_RAW.Enum(), TemporaryDirectory: &w.TemporaryDirectoryPolicy{Backing: &w.TemporaryDirectoryPolicy_DiskBacked{DiskBacked: &emptypb.Empty{}}}}, image.Identity)
+	d, e := n.Control.Create(ctx, &w.NormalizedMachineCreate{Name: &name, Retention: w.Retention_RETENTION_PERSISTENT, Process: &w.ProcessConfig{}, Network: &w.ResolvedNetwork{Attachment: &w.ResolvedNetwork_None{None: &emptypb.Empty{}}}, Agent: &w.Agent{Mode: &w.Agent_DefaultAgent{DefaultAgent: &emptypb.Empty{}}}, TemporaryDirectory: &w.TemporaryDirectoryPolicy{Backing: &w.TemporaryDirectoryPolicy_DiskBacked{DiskBacked: &emptypb.Empty{}}}}, image.Identity)
 	if e != nil {
 		t.Fatal(e)
 	}

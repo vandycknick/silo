@@ -73,7 +73,6 @@ pub struct NormalizedMachineCreate {
     pub cpus: Option<u8>,
     pub memory_bytes: Option<u64>,
     pub root_disk_size_bytes: Option<u64>,
-    pub root_profile: libvm::RootProfile,
     pub temporary_directory: libvm::TemporaryDirectoryPolicy,
     pub userdata: Option<String>,
     pub network: Option<ResolvedNetwork>,
@@ -100,7 +99,6 @@ impl NormalizedMachineCreate {
             .nested_virtualization(self.nested_virtualization)
             .rosetta(self.rosetta)
             .platform(self.platform)
-            .root_profile(self.root_profile)
             .temporary_directory(self.temporary_directory)
             .disks(self.disks)
             .mounts(self.mounts)

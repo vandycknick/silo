@@ -33,7 +33,7 @@ from urllib.request import urlopen
 import pytest
 
 from silo_smoke import capture, incremental, overlay, procs, restore, shutdown, stopped
-from silo_smoke.cli import TIMINGS_PROPERTY, Result, Silo, release
+from silo_smoke.cli import ROOT_PROFILES, TIMINGS_PROPERTY, Result, RootProfile, Silo, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.distribution_registry import (
     OCI_EMPTY, OCI_INDEX, OCI_MANIFEST, DistributionClient, DistributionRegistry, digest_of, install_distribution,
@@ -172,6 +172,7 @@ class PublishedGraph:
     streams: frozenset[str]
     direct: dict[str, str]
     chunk_media: frozenset[str]
+    objects: frozenset[str]
 
 
 def published_graph(client: DistributionClient, reference: str) -> PublishedGraph:
@@ -257,7 +258,9 @@ def published_graph(client: DistributionClient, reference: str) -> PublishedGrap
                     assert entry["kind"] == "zero", entry
         assert decoded == binding["length"], "transfer pages do not cover the whole stream"
     direct: dict[str, str] = {}
+    objects: set[str] = set()
     for binding in pages(record(config["objects"]), "object-table"):
+        objects.add(binding["object"])
         if binding["kind"] == "direct":
             assert binding["payload"]["digest"] == binding["object"]
             assert binding["payload"]["size"] == binding["size"]
@@ -274,7 +277,8 @@ def published_graph(client: DistributionClient, reference: str) -> PublishedGrap
     # tables, not merely listed in a manifest.
     assert set(layers) == referenced, sorted(set(layers) ^ referenced)
     return PublishedGraph(index.digest, frozenset(digests), layers, config, record_bytes, evidence,
-                          config["captureProvenance"]["digest"], frozenset(streams), direct, frozenset(chunk_media))
+                          config["captureProvenance"]["digest"], frozenset(streams), direct, frozenset(chunk_media),
+                          frozenset(objects))
 
 
 def source_closure(silo: Silo, saved: restore.Checkpoint) -> tuple[bytes, bytes, dict]:
@@ -286,15 +290,30 @@ def source_closure(silo: Silo, saved: restore.Checkpoint) -> tuple[bytes, bytes,
 
 
 def verify_graph(graph: PublishedGraph, saved: restore.Checkpoint, record_bytes: bytes, evidence: bytes,
-                 record: dict, *, profile: str, encoding: str, state_digests: dict[str, str]) -> None:
+                 record: dict, *, profile: RootProfile, encoding: str, state_digests: dict[str, str]) -> None:
     config = graph.config
     assert (config["schema"], config["kind"], config["encoding"]) == (1, "vm-artifact", "silo-chunks-v1")
     assert config["purpose"] == "checkpoint" and config["captureKind"] == "live-execution"
     assert config["content"]["kind"] == "snapshot" and config["content"]["id"] == saved.snapshot
     family, backend, storage = (("opaque-raw", "raw-block", "opaque-raw-v1") if profile == "raw"
-                                else ("linux-overlay", "krun-overlay", "linux-overlay-v1"))
+                                else ("linux-overlay", "krun-overlay", "linux-erofs-overlay-v1"))
     assert (config["rootFamily"], config["backendRequirement"]) == (family, backend)
     assert config["minimumCapabilities"]["storageProfile"] == storage
+    assert record["root"]["stream"]["stream"] in graph.streams
+    root_profile = record["root"]["profile"]
+    if profile == "layered":
+        # The complete composition graph travels: canonical records, fsmeta
+        # under its object identity, every layer's records/index and pack.
+        assert root_profile["kind"] == "linux-overlay", root_profile
+        lower = root_profile["lower"]
+        assert lower["layers"], lower
+        members = {lower["record"], lower["recipe"], lower["fsmeta"]}
+        for layer in lower["layers"]:
+            members |= {layer["recipe"], layer["result"], layer["indexRoot"], *layer["indexPages"]}
+            assert layer["pack"]["stream"] in graph.streams, layer["pack"]
+        assert members <= graph.objects, sorted(members - graph.objects)
+    else:
+        assert root_profile == {"kind": "opaque-raw"}, root_profile
     assert config["minimumCapabilities"]["liveRestore"] is True
     assert config["guestPlatform"] == {"os": "linux", "architecture": guest_architecture()}
     execution = record["execution"]
@@ -429,11 +448,11 @@ def allocation_state(silo: Silo) -> dict:
 
 
 @pytest.mark.parametrize(("profile", "encoding", "policy"), [
-    ("raw", "zstd", "full"), ("flat", "raw", "full"), ("raw", "zstd", "incremental"),
-], ids=["raw-root-zstd-chunks", "flat-root-raw-chunks", "incremental-standalone"])
+    ("raw", "zstd", "full"), ("layered", "raw", "full"), ("raw", "zstd", "incremental"),
+], ids=["raw-root-zstd-chunks", "layered-root-raw-chunks", "incremental-standalone"])
 def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
     silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,  # noqa: F811
-    registry: LoopbackRegistry, profile: str, encoding: str, policy: str,
+    registry: LoopbackRegistry, profile: RootProfile, encoding: str, policy: str,
     artifact_processes: list[shutdown.Process],
 ) -> None:
     expected_boot = {role: overlay.digest(silo.ws.config.runtime_dir / "assets" / filename)
@@ -613,16 +632,19 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
     }, sort_keys=True) + "\n")
 
 
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_incompatible_imported_execution_refuses_before_child_allocation(
     silo: Silo, destination: Silo, distribution: DistributionRegistry, restore_image: str,  # noqa: F811
-    registry: LoopbackRegistry, artifact_processes: list[shutdown.Process],
+    registry: LoopbackRegistry, artifact_processes: list[shutdown.Process], profile: RootProfile,
 ) -> None:
     """Exact Phase 20 portability refusal, then separately named cold recovery.
 
     The CPUID mutation keeps every header and binding valid, so publication,
     graph verification and import succeed. Only execution admission refuses.
+    Cold recovery of a layered root uses only the imported composition graph;
+    the source OCI and producer home are unavailable.
     """
-    restore.create_source(silo, restore_image, name=SOURCE)
+    restore.create_source(silo, restore_image, name=SOURCE, profile=profile)
     own(silo, SOURCE, artifact_processes)
     mark(silo, SOURCE, "recoverable-disk-cut")
     silo.exec(SOURCE, "sh", "-eu", "-c", "printf live-only >/dev/shm/recovery-live-only", user="root")
@@ -673,8 +695,14 @@ def test_incompatible_imported_execution_refuses_before_child_allocation(
     # operation, never a fallback inside the failed restore request.
     imported_record = rows(destination, f"SELECT hex(record_bytes) FROM storage_snapshot WHERE id='{forged}'")
     assert json.loads(bytes.fromhex(imported_record[0][0]))["captureKind"] == "live-execution"
-    immutable_paths = [pool_path(destination, "streams", stream) for stream in graph.streams]
-    immutable_paths += [pool_path(destination, "objects", digest) for digest in graph.direct]
+    # Imports retain chunked streams; whole stream files are materialized on demand.
+    # Observe every persisted immutable member, including transport and chunk bytes.
+    immutable_paths = sorted(
+        path
+        for kind in ("streams", "objects", "transport", "source-blobs")
+        for path in (destination.ws.silo_home / "images" / kind / "sha256").iterdir()
+        if path.is_file()
+    )
     immutable = {path: stopped.read_bytes(path) for path in immutable_paths}
     silo.rm(SOURCE)
     silo.run("image", "remove", "image:artifact-checkpoint")
@@ -697,6 +725,7 @@ def test_incompatible_imported_execution_refuses_before_child_allocation(
         assert info["name"] == recovered and info["id"] != saved.source_info["id"]
         assert info["state"] == "stopped" and info["run_id"] is None and info["ready"] is False
         storage = stopped.record(destination, recovered)
+        assert storage["root"]["kind"] == ("opaque-raw" if profile == "raw" else "linux-overlay"), storage["root"]
         assert storage["snapshot"] == forged and storage["stopOutcome"] == "unknown"
         assert storage["boot"] == json.loads(bytes.fromhex(imported_record[0][0]))["boot"]
         assert count(destination, "SELECT count(*) FROM restore_memory_reservation") == 0

@@ -253,7 +253,7 @@ fn root_storage_from_observation(
         .checked_sub(capacity.usable)
         .ok_or_else(|| "managed upper usable bytes exceed its filesystem span".to_string())?;
     let metrics = RootStorageMetrics {
-        kind: Some(RootStorageKind::LinuxFlatOverlayV1 as i32),
+        kind: Some(RootStorageKind::LinuxErofsOverlayV1 as i32),
         upper_profile: Some(observation.root.upper_profile.as_str().to_string()),
         upper_uuid: Some(observation.root.upper.filesystem_uuid.to_string()),
         upper_backing_bytes: Some(observation.root.upper.length_bytes),
@@ -601,6 +601,10 @@ mod tests {
         let temporary = temporary_directory_metrics(TemporaryDirectoryKind::Upper, capacity);
         let report =
             root_storage_from_observation(&observation, capacity, 8192, 0, 0, temporary).unwrap();
+        assert_eq!(
+            report.kind,
+            Some(protocol::v1::RootStorageKind::LinuxErofsOverlayV1 as i32)
+        );
         assert_eq!(report.upper_backing_bytes, Some(67_112_960));
         assert_eq!(report.upper_filesystem_bytes, Some(67_108_864));
         assert_eq!(report.unusable_tail_bytes, Some(4096));

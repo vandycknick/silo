@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from silo_smoke import capture, capture_multidisk as multidisk, images, overlay, pause, procs, shutdown, stopped
-from silo_smoke.cli import Silo
+from silo_smoke import capture, capture_multidisk as multidisk, images, pause, procs, shutdown, stopped
+from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
@@ -29,11 +29,10 @@ def multidisk_image(config: SmokeConfig, registry: LoopbackRegistry,
     return registry.publish(images.build(spec, images.fetch_alpine(config.cache_dir)), "capture-multidisk")
 
 
-def create(silo: Silo, image: str, profile: str) -> tuple[str, list[str]]:
+def create(silo: Silo, image: str, profile: RootProfile) -> tuple[str, list[str]]:
     name = "capture-multidisk"
-    silo.create(name, image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib",
-                "--vsock", "--network", "none",
-                *(["--root-profile", overlay.PROFILE] if profile == "flat" else []))
+    silo.create(name, silo.root_image(image, profile), "--cpus", "1", "--memory", "512mib",
+                "--disk-size", "512mib", "--vsock", "--network", "none")
     roles = multidisk.install_disks(silo, name)
     stopped.mount_evidence(silo, os.environ.get("SILO_SMOKE_CAPTURE_FS"))
     return name, roles
@@ -75,9 +74,9 @@ def finish(silo: Silo, name: str, trace: multidisk.Trace) -> None:
             process.close()
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_capture_multidisk_dirty_matched_cut_and_independent_sealed_bytes(
-    silo: Silo, multidisk_image: str, profile: str,
+    silo: Silo, multidisk_image: str, profile: RootProfile,
 ) -> None:
     name, roles = create(silo, multidisk_image, profile)
     source_paths = stopped.writable_paths(silo, name)
@@ -140,10 +139,10 @@ sync
             workload.close()
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("policy", ["resume", "preserve", "borrow"])
 def test_capture_multidisk_included_copy_enospc_never_publishes_partial_checkpoint(
-    silo: Silo, multidisk_image: str, profile: str, policy: str,
+    silo: Silo, multidisk_image: str, profile: RootProfile, policy: str,
 ) -> None:
     name, roles = create(silo, multidisk_image, profile)
     target = stopped.writable_paths(silo, name)["root"]

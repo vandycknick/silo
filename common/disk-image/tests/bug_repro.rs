@@ -42,7 +42,7 @@ fn bug1_remove_original_preserves_hardlink() {
     fmt.remove("/original").unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // /alias should still exist and be readable.
     assert!(
@@ -106,7 +106,7 @@ fn bug1b_last_hardlink_reclaims_inode() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     assert!(!reader.exists("/original"));
     assert!(!reader.exists("/alias"));
@@ -204,7 +204,7 @@ fn bug1c_large_file_hardlink_reclaim() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Inode should be fully reclaimed.
     // lost+found=11, bigfile=12, dummy=13
@@ -351,7 +351,7 @@ fn bug4_mkdir_p_through_symlink() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // /sym should still be a symlink, not a directory.
     let (_, sym_inode) = reader.stat_no_follow("/sym").unwrap();

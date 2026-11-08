@@ -92,12 +92,6 @@ mock! {
         async fn pin_source_blobs(&self, operation_id: uuid::Uuid, digests: &[crate::storage::identity::ObjectDigest]) -> Result<(),LibVmError>;
         async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
 
-        async fn retain_storage_stream(
-            &self,
-            stream_id: &crate::storage::identity::StreamId,
-            operation_id: uuid::Uuid,
-        ) -> Result<(), LibVmError>;
-
         async fn cached_oci_image(
             &self,
             reference: &str,

@@ -694,7 +694,36 @@ impl Store {
             crate::storage::identity::StreamId,
             crate::storage::stream::AuthenticatedStream,
         > = std::collections::BTreeMap::new();
+        let mut launch_lower = None;
         for input in &record.plan.read_only_inputs {
+            let attachment = record
+                .plan
+                .configuration
+                .attachments
+                .get(input.attachment_index as usize)
+                .ok_or_else(|| invalid("local cut read-only attachment index is missing"))?;
+            if attachment.role == vm_spec::DiskRole::RootLower {
+                // The layered lower is bound by its composition identity; its
+                // occurrences are leased and authenticated by verify_local_lower.
+                let crate::MachineRoot::LinuxOverlay { lower, .. } = &record.storage.root else {
+                    return Err(invalid("local cut lower input has no layered root"));
+                };
+                if launch_lower.is_some() || input.identity != lower.record().to_string() {
+                    return Err(invalid(
+                        "local cut lower input differs from its retained root identity",
+                    ));
+                }
+                let pinned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_lower WHERE operation_id=?1 AND lower_id=?2)").bind(operation.to_string()).bind(lower.record().to_string()).fetch_one(&self.pool).await?;
+                if !pinned {
+                    return Err(invalid("local cut lower lost its dependency root"));
+                }
+                launch_lower = Some(
+                    crate::store::layer_store::LayerStore::from_store(self.clone())
+                        .launch_lower(lower)
+                        .await?,
+                );
+                continue;
+            }
             let stream: crate::storage::identity::StreamId = input.identity.parse().map_err(
                 |error: crate::storage::identity::IdentityError| invalid(error.to_string()),
             )?;
@@ -704,14 +733,7 @@ impl Store {
                     "local cut read-only input lost its dependency root",
                 ));
             }
-            let length = record
-                .plan
-                .configuration
-                .attachments
-                .get(input.attachment_index as usize)
-                .ok_or_else(|| invalid("local cut read-only attachment index is missing"))?
-                .geometry
-                .length;
+            let length = attachment.geometry.length;
             match pool_streams.entry(stream) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(crate::machine::stopped::open_immutable_stream(
@@ -732,7 +754,7 @@ impl Store {
             &pool,
             &record.storage,
             &record.configuration,
-            &pool_streams,
+            launch_lower.as_ref(),
         )?;
         Ok(VerifiedRestoreCut {
             record,

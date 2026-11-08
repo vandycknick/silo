@@ -202,10 +202,10 @@ mod tests {
         assert_params(b"rdinit", &[param(b"rdinit", None)]);
         assert_params(b"rdinit=", &[param(b"rdinit", Some(b""))]);
         assert_params(
-            b" \"init=/sbin/my init\" silo.rootfs=\"linux-flat-overlay-v1\"",
+            b" \"init=/sbin/my init\" silo.rootfs=\"linux-erofs-overlay-v1\"",
             &[
                 param(b"init", Some(b"/sbin/my init")),
-                param(b"silo.rootfs", Some(b"linux-flat-overlay-v1")),
+                param(b"silo.rootfs", Some(b"linux-erofs-overlay-v1")),
             ],
         );
         assert_params(b"", &[]);

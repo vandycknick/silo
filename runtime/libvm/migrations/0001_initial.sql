@@ -243,20 +243,18 @@ CREATE TABLE image_manifest_layer (
     CHECK (position >= 0)
 );
 
-CREATE TABLE image_rootfs_artifact (
+-- An OCI selection retains its layered composition; never a whole-lower copy.
+CREATE TABLE image_composition_artifact (
     image_id                TEXT PRIMARY KEY,
     manifest_digest         TEXT NOT NULL REFERENCES image_manifest(digest) ON DELETE RESTRICT,
     config_digest           TEXT NOT NULL,
     platform_os             TEXT NOT NULL,
     platform_architecture   TEXT NOT NULL,
     platform_variant        TEXT,
-    filesystem              TEXT NOT NULL,
-    rootfs_path             TEXT NOT NULL,
-    size_bytes              INTEGER NOT NULL,
+    lower_id                TEXT NOT NULL REFERENCES composition_result(id) ON DELETE RESTRICT,
+    lower_length            INTEGER NOT NULL CHECK (lower_length > 0),
     created_at              INTEGER NOT NULL,
-    last_used_at            INTEGER,
-    stream_id               TEXT NOT NULL,
-    conversion_abi          TEXT NOT NULL
+    last_used_at            INTEGER
 );
 
 CREATE TABLE machine_rootfs (
@@ -276,8 +274,10 @@ ON image_ref(manifest_digest);
 CREATE INDEX image_manifest_layer_layer_diff_id_idx
 ON image_manifest_layer(layer_diff_id);
 
-CREATE INDEX image_rootfs_artifact_manifest_digest_idx
-ON image_rootfs_artifact(manifest_digest);
+CREATE INDEX image_composition_artifact_manifest_digest_idx
+ON image_composition_artifact(manifest_digest);
+CREATE INDEX image_composition_artifact_lower_idx
+ON image_composition_artifact(lower_id);
 
 CREATE INDEX machine_rootfs_manifest_digest_idx
 ON machine_rootfs(manifest_digest);
@@ -306,10 +306,15 @@ BEGIN
     SELECT RAISE(ABORT, 'image_layer.created_at is immutable');
 END;
 
-CREATE TRIGGER image_rootfs_artifact_created_at_immutable
-BEFORE UPDATE OF created_at ON image_rootfs_artifact
+CREATE TRIGGER image_composition_artifact_created_at_immutable
+BEFORE UPDATE OF created_at ON image_composition_artifact
 BEGIN
-    SELECT RAISE(ABORT, 'image_rootfs_artifact.created_at is immutable');
+    SELECT RAISE(ABORT, 'image_composition_artifact.created_at is immutable');
+END;
+CREATE TRIGGER image_composition_artifact_lower_immutable
+BEFORE UPDATE OF lower_id, lower_length ON image_composition_artifact
+BEGIN
+    SELECT RAISE(ABORT, 'image_composition_artifact lower is immutable');
 END;
 
 CREATE TRIGGER machine_rootfs_created_at_immutable
@@ -336,12 +341,21 @@ CREATE TABLE machine_object_dependency (
     PRIMARY KEY(machine_id,object_digest)
 );
 CREATE INDEX machine_object_reverse ON machine_object_dependency(object_digest,machine_id);
+-- Machines root their layered lower by identity; the composition row roots
+-- its layer results, fsmeta and canonical record objects.
+CREATE TABLE machine_lower_dependency (
+    machine_id TEXT NOT NULL REFERENCES machine_storage(machine_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL CHECK(generation>=0),
+    lower_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE RESTRICT,
+    PRIMARY KEY(machine_id,lower_id)
+);
+CREATE INDEX machine_lower_reverse ON machine_lower_dependency(lower_id,machine_id);
 
 
 CREATE TABLE storage_operation (
     operation_id TEXT PRIMARY KEY NOT NULL,
     schema INTEGER NOT NULL CHECK (schema = 1),
-    kind TEXT NOT NULL CHECK (kind IN ('import', 'convert', 'snapshot', 'capture', 'fork', 'live-fork', 'relocate', 'update-boot-assets', 'launch')),
+    kind TEXT NOT NULL CHECK (kind IN ('import', 'convert', 'snapshot', 'capture', 'fork', 'live-fork', 'relocate', 'update-boot-assets', 'raw-export', 'launch')),
     state TEXT NOT NULL CHECK (state IN ('prepared', 'staging', 'committing', 'cleaning', 'committed', 'aborted')),
     machine_id TEXT,
     run_id TEXT,
@@ -529,6 +543,7 @@ CREATE TABLE layer_result (
     recipe_id TEXT NOT NULL UNIQUE REFERENCES layer_recipe(id) ON DELETE RESTRICT,
     pack_stream TEXT NOT NULL,
     pack_length INTEGER NOT NULL CHECK (pack_length >= 0),
+    pack_map TEXT NOT NULL,
     index_root TEXT NOT NULL,
     record_digest TEXT NOT NULL,
     record_bytes BLOB NOT NULL
@@ -566,6 +581,45 @@ CREATE TRIGGER layer_occurrence_set_immutable BEFORE UPDATE ON layer_occurrence_
 BEGIN SELECT RAISE(ABORT, 'layer occurrence set is immutable'); END;
 CREATE TRIGGER layer_occurrence_immutable BEFORE UPDATE ON layer_occurrence
 BEGIN SELECT RAISE(ABORT, 'layer occurrence is immutable'); END;
+
+CREATE TABLE composition_recipe (
+    id TEXT PRIMARY KEY NOT NULL,
+    record_digest TEXT NOT NULL,
+    record_bytes BLOB NOT NULL
+);
+CREATE TABLE composition_result (
+    id TEXT PRIMARY KEY NOT NULL,
+    recipe_id TEXT NOT NULL UNIQUE REFERENCES composition_recipe(id) ON DELETE RESTRICT,
+    fsmeta_digest TEXT NOT NULL,
+    fsmeta_length INTEGER NOT NULL CHECK (fsmeta_length > 0),
+    lower_stream TEXT NOT NULL,
+    lower_length INTEGER NOT NULL CHECK (lower_length > 0),
+    record_digest TEXT NOT NULL,
+    record_bytes BLOB NOT NULL
+);
+CREATE INDEX composition_result_fsmeta_idx ON composition_result(fsmeta_digest);
+CREATE INDEX composition_result_record_idx ON composition_result(record_digest);
+CREATE INDEX composition_recipe_record_idx ON composition_recipe(record_digest);
+-- Exact ordered occurrences, including repetitions of one layer result.
+CREATE TABLE composition_layer (
+    result_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0 AND position < 1024),
+    layer_result_id TEXT NOT NULL REFERENCES layer_result(id) ON DELETE RESTRICT,
+    PRIMARY KEY (result_id, position)
+);
+CREATE INDEX composition_layer_reverse_idx ON composition_layer(layer_result_id, result_id);
+CREATE TABLE storage_operation_lower (
+    operation_id TEXT NOT NULL REFERENCES storage_operation(operation_id) ON DELETE CASCADE,
+    lower_id TEXT NOT NULL REFERENCES composition_result(id) ON DELETE RESTRICT,
+    PRIMARY KEY (operation_id, lower_id)
+);
+CREATE INDEX storage_operation_lower_reverse_idx ON storage_operation_lower(lower_id, operation_id);
+CREATE TRIGGER composition_recipe_immutable BEFORE UPDATE ON composition_recipe
+BEGIN SELECT RAISE(ABORT, 'composition recipe is immutable'); END;
+CREATE TRIGGER composition_result_immutable BEFORE UPDATE ON composition_result
+BEGIN SELECT RAISE(ABORT, 'composition result is immutable'); END;
+CREATE TRIGGER composition_layer_immutable BEFORE UPDATE ON composition_layer
+BEGIN SELECT RAISE(ABORT, 'composition occurrence is immutable'); END;
 
 -- Immutable storage and execution artifacts. Names are image: aliases;
 -- explicit retention is independent of every alias.
@@ -657,7 +711,8 @@ CREATE TABLE snapshot_capture_provenance (
     capture_id TEXT PRIMARY KEY NOT NULL,
     snapshot_id TEXT NOT NULL REFERENCES storage_snapshot(id) ON DELETE CASCADE,
     evidence_digest TEXT NOT NULL,
-    evidence_bytes BLOB NOT NULL
+    evidence_bytes BLOB NOT NULL,
+    plan_bytes BLOB NOT NULL
 );
 CREATE INDEX snapshot_capture_provenance_reverse_idx ON snapshot_capture_provenance(evidence_digest, snapshot_id);
 CREATE TRIGGER snapshot_capture_provenance_immutable BEFORE UPDATE ON snapshot_capture_provenance

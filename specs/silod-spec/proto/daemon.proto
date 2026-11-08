@@ -37,6 +37,8 @@ service MachineService {
  rpc SnapshotStopped(CreateStorageSnapshotRequest) returns (StorageSnapshotInfo);
  // Explicit stopped boot-bundle replacement; the root and its platform never change.
  rpc UpdateBootAssets(UpdateBootAssetsRequest) returns (MachineSnapshot);
+ // Root disk only; never stops, repairs, flattens, or overwrites implicitly.
+ rpc ExportRawDisk(ExportRawDiskRequest) returns (RawDiskExport);
 }
 service NetworkService {
  rpc ListNetworkDefinitions(google.protobuf.Empty) returns (stream NetworkDefinition);
@@ -292,6 +294,17 @@ message Mount { bytes source = 1; string tag = 2; bool read_only = 3; }
 enum DiskRole { DISK_ROLE_UNSPECIFIED = 0; DISK_ROLE_ROOT = 1; DISK_ROLE_ROOT_LOWER = 2; DISK_ROLE_ROOT_UPPER = 3; DISK_ROLE_DATA = 4; }
 enum DiskFormat { DISK_FORMAT_UNSPECIFIED = 0; DISK_FORMAT_RAW = 1; DISK_FORMAT_VMDK = 2; }
 message DiskGeometry { uint64 length = 1; uint32 logical_sector_size = 2; }
+message ExportRawDiskRequest { MachineRef machine = 1; bytes destination = 2; DiskFormat format = 3; bool flatten_filesystem = 4; }
+message RawDiskExport {
+ bytes path = 1;
+ bytes metadata_path = 2;
+ DiskGeometry geometry = 3;
+ LinuxDirectBoot boot = 4;
+ oneof kind {
+  google.protobuf.Empty opaque_exact = 5;
+  string flattened_filesystem_uuid = 6;
+ }
+}
 message Disk { bytes path = 1; optional bool read_only = 2; optional DiskRole role = 3; optional DiskFormat format = 4; DiskGeometry geometry = 5; optional string block_id = 6; }
 message Address { oneof address { string tcp = 1; bytes unix = 2; } }
 message Endpoint { oneof endpoint { Address host = 1; Address guest = 2; uint32 vsock = 3; } }
@@ -314,9 +327,8 @@ message NetworkDefinition { string name = 1; NetworkTopology topology = 2; Netwo
 message OptionalNetworkDefinition { NetworkDefinition definition = 1; }
 message CreateNetworkDefinitionRequest { NetworkDefinition definition = 1; }
 message SetMachineNetworkRequest { MachineRef machine = 1; ResolvedNetwork network = 2; }
-enum RootProfile { ROOT_PROFILE_UNSPECIFIED = 0; ROOT_PROFILE_OPAQUE_RAW = 1; ROOT_PROFILE_LINUX_FLAT_OVERLAY_V1 = 2; }
 message TemporaryDirectoryPolicy { oneof backing { google.protobuf.Empty disk_backed = 1; uint64 tmpfs_capacity_bytes = 2; } }
-message NormalizedMachineCreate { optional string name = 1; optional string template_name = 2; map<string,string> labels = 3; ProcessConfig process = 4; Retention retention = 5; optional bytes kernel = 6; optional bytes initramfs = 7; repeated string kernel_args = 8; bool nested_virtualization = 9; optional bool rosetta = 10; repeated bytes disks = 11; repeated Mount mounts = 12; repeated Forward forwards = 13; optional bool vsock = 14; optional uint32 cpus = 15; optional uint64 memory_bytes = 16; optional uint64 root_disk_size_bytes = 17; optional string userdata = 18; ResolvedNetwork network = 19; Agent agent = 20; User provision_user = 21; optional RootProfile root_profile = 22; TemporaryDirectoryPolicy temporary_directory = 23; LinuxPlatform platform = 24; }
+message NormalizedMachineCreate { optional string name = 1; optional string template_name = 2; map<string,string> labels = 3; ProcessConfig process = 4; Retention retention = 5; optional bytes kernel = 6; optional bytes initramfs = 7; repeated string kernel_args = 8; bool nested_virtualization = 9; optional bool rosetta = 10; repeated bytes disks = 11; repeated Mount mounts = 12; repeated Forward forwards = 13; optional bool vsock = 14; optional uint32 cpus = 15; optional uint64 memory_bytes = 16; optional uint64 root_disk_size_bytes = 17; optional string userdata = 18; ResolvedNetwork network = 19; Agent agent = 20; User provision_user = 21; reserved 22; reserved "root_profile"; TemporaryDirectoryPolicy temporary_directory = 23; LinuxPlatform platform = 24; }
 enum PullPolicy { PULL_POLICY_UNSPECIFIED = 0; PULL_POLICY_IF_MISSING = 1; PULL_POLICY_ALWAYS = 2; PULL_POLICY_NEVER = 3; }
 enum CacheState { CACHE_STATE_UNSPECIFIED = 0; CACHE_STATE_COMPLETE = 1; CACHE_STATE_MISSING = 2; }
 message OciIdentity { string requested_reference = 1; string selected_reference = 2; string platform = 3; string manifest_digest = 4; string config_digest = 5; PullPolicy pull_policy = 6; }
@@ -433,7 +445,7 @@ enum PolicySecretsState { POLICY_SECRETS_STATE_UNSPECIFIED = 0; POLICY_SECRETS_S
 message SecretDiagnostic { string slot = 1; optional string key = 2; string code = 3; }
 message PolicySecretsResult { PolicySecretsState state = 1; repeated SecretDiagnostic diagnostics = 2; repeated SecretRequirement requirements = 3; repeated SecretSlot slots = 4; }
 enum ErrorKind { ERROR_KIND_UNSPECIFIED = 0; ERROR_KIND_INVALID = 1; ERROR_KIND_MISSING = 2; ERROR_KIND_DUPLICATE = 3; ERROR_KIND_CONFLICT = 4; ERROR_KIND_LIMIT = 5; ERROR_KIND_DENIED = 6; ERROR_KIND_UNAVAILABLE = 7; ERROR_KIND_INTERNAL = 8; }
-enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; ERROR_CODE_LIVE_OPERATION_UNSUPPORTED = 8; ERROR_CODE_BACKEND_ADMISSION_REJECTED = 9; ERROR_CODE_ROOT_SELECTION_FAILED = 10; ERROR_CODE_TRANSLATION_UNAVAILABLE = 11; ERROR_CODE_BOOT_ASSETS_ACQUISITION_REQUIRED = 12; ERROR_CODE_DISK_IMPORT_REJECTED = 13; ERROR_CODE_BOOT_BUNDLE_ABI_UNSUPPORTED = 14; ERROR_CODE_CHECKPOINT_PORTABILITY = 15; }
+enum ErrorCode { ERROR_CODE_UNSPECIFIED = 0; ERROR_CODE_ALREADY_RUNNING = 1; ERROR_CODE_NOT_RUNNING = 2; ERROR_CODE_STALE_GENERATION = 3; ERROR_CODE_MONITOR_CONNECTION = 4; ERROR_CODE_ENTRYPOINT_LAUNCH_FAILED = 5; ERROR_CODE_COMMAND_NOT_FOUND = 6; ERROR_CODE_NATIVE = 7; ERROR_CODE_LIVE_OPERATION_UNSUPPORTED = 8; ERROR_CODE_BACKEND_ADMISSION_REJECTED = 9; ERROR_CODE_ROOT_SELECTION_FAILED = 10; ERROR_CODE_TRANSLATION_UNAVAILABLE = 11; ERROR_CODE_BOOT_ASSETS_ACQUISITION_REQUIRED = 12; ERROR_CODE_DISK_IMPORT_REJECTED = 13; ERROR_CODE_BOOT_BUNDLE_ABI_UNSUPPORTED = 14; ERROR_CODE_CHECKPOINT_PORTABILITY = 15; ERROR_CODE_INCOMPATIBLE_ROOT_PROFILE = 16; ERROR_CODE_COMPOSITION_ACQUISITION_REQUIRED = 17; ERROR_CODE_RAW_EXPORT_RECOVERY_REQUIRED = 18; ERROR_CODE_RAW_EXPORT_UNSUPPORTED = 19; }
 message ErrorDetail { ErrorKind kind = 1; ErrorCode code = 2; string safe_message = 3; optional string reference = 4; optional string expected_run = 5; optional string current_run = 6; optional string program = 7; optional string native_variant = 8; optional LaunchFailureReason launch_failure_reason = 9; LiveOperationUnsupported live_unsupported = 10; BackendAdmissionRejected backend_admission = 11; RootSelectionFailed root_selection = 12; DiskImportRejected disk_import = 13; BootBundleAbiUnsupported boot_bundle_abi = 14; RestorePortabilityRefusal checkpoint_portability = 15; }
 // A custom base initramfs whose bootstrap ABI is not the locally known packaged one.
 message BootBundleAbiUnsupported { string expected = 1; string actual = 2; }

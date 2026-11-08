@@ -93,6 +93,23 @@ path bytes. Hardlink groups use the smallest raw member path per `(dev,ino)`
 class, including hardlinked symlinks and FIFOs, never a host inode number.
 Root metadata, nanoseconds and implicit directories are retained, not erased.
 
+The separate `collect` command is a read-only metadata observer of a filesystem
+already unpacked by an independent tool:
+
+```sh
+target/changeset-tools/extractor collect \
+  --root /absolute/independent-bundle/rootfs --out /outside/rootfs/observation.json
+```
+
+It does not call `archive.Apply`, extract layers, repair state or normalize
+metadata. Choose `--out` outside the observed tree. The command writes the JSON
+and reports any collection problems as failure after retaining it. Root metadata,
+raw names, ownership, modes, nanoseconds, xattrs, hardlink classes and content
+hashes use the same collector described above. The Phase 22 observer was built
+with Go **1.26.8**, `CGO_ENABLED=0`, and the same pinned containerd v2.4.2 module
+graph. Those linked dependencies do not make containerd the applier in this lane;
+umoci independently unpacks the tree before `collect` observes it.
+
 ```sh
 make qualify-changesets CHANGESET_ARGS='--user-namespace --out target/changeset-qualification/synthetic'
 ```
@@ -209,27 +226,61 @@ rejection report remains historical evidence, not the current admission verdict.
 
 Original Nix layer 0 starts with `/nix/` and `/nix/store/`, which remain rejected.
 The independently pinned additional Nix-built Cardano tracer specimen was
-actually admitted by the supervisor, but its report retains five differences:
-root mode/mtime and `nix/store` mtime. Its metadata/source provenance and measured
-result are recorded in `.tmp/plan/research/phase-02-c4-candidates/README.md`.
-It does not silently replace the original default inventory or rejection.
+actually admitted by the supervisor, but its original containerd report retains
+five differences: root mode/mtime and `nix/store` mtime. Its metadata/source
+provenance and measured result are recorded in
+`.tmp/plan/research/phase-02-c4-candidates/README.md`. That report remains intact,
+as does the original absolute-path Nix rejection; neither is relabelled a pass.
 
 The exact pinned [containerd default applier](https://github.com/containerd/containerd/blob/v2.4.2/pkg/archive/tar.go#L264-L277)
 unconditionally ignores an entry resolving to the extraction root. Thus changing
 an extractor option or rewriting its final listing cannot honestly establish
-root-metadata equality. A future separate probe could measure a real
-snapshotter-backed mounted root, rather than a fresh private extraction
-directory; that is a different reference surface and is **not** assumed to
-produce canonical mtimes or erase the discrepancy. If that faithful measurement
-still differs, an explicit owner-approved qualification-policy decision is
-required. No default-qualification exemption is implemented here.
+root-metadata equality. A snapshotter-backed mounted root would be a different
+reference surface, not permission to rewrite the original report.
 
-**Phase 22 must not make layered OCI the default while any default-corpus result
-differs.** Successful report generation, ordinary tests, admitted non-root
-entries, and classification as a policy difference do not satisfy that gate.
-Candidate investigations must remain separate and retain the rejected original
-evidence; accepting an alternative pin requires measured raw-layer admission and
-reviewed actual builder provenance.
+The owner explicitly approved a different independent published-builder
+positive-control gate: **privileged umoci v0.6.0 unpack**, rather than the pinned
+containerd v2.4.2 `archive.Apply` application. The exact umoci binary SHA-256 is
+`b51c267ec394499e42c6fde47f240b7b7dba57ea49df0b5acd304378b82a3b71`.
+The additional, provenance-reviewed Nix-built Cardano tracer is the Nix positive;
+the original `/nix/` archive remains a required negative, not a silently
+rewritten input. This is an explicit owner exception to the former
+containerd-only positive gate, not a waiver of differences in that evidence.
+
+The actual independent results are retained in
+`.tmp/plan/evidence/phase-22/umoci-corpus-comparisons.json`:
+
+| Published builder/specimen | Silo rows | umoci rows | Differences | Observer problems |
+|---|---:|---:|---:|---:|
+| Docker | 5,793 | 5,793 | 0 | 0 |
+| Buildah | 15,584 | 15,584 | 0 | 0 |
+| Bazel | 1,745 | 1,745 | 0 | 0 |
+| apko | 1,375 | 1,375 | 0 | 0 |
+| Kaniko | 502 | 502 | 0 | 0 |
+| Nix Cardano tracer | 10,905 | 10,905 | 0 | 0 |
+| **Total** | **35,904** | **35,904** | **0** | **0** |
+
+No metadata normalization or root-row deletion was used. Kaniko and Nix needed
+only descriptor mediaTypes adapted into OCI envelopes for umoci; config and
+layer bytes, digests, layer order and repeated occurrences remained unchanged.
+The original descriptors, adapted envelopes, observations and comparisons remain
+separate evidence. The existing Go helper's `collect --root --out` command only
+observed the unpacked roots; it did not supply the reference extraction.
+
+The reference extraction used Linux **7.2.2** and the prior raw runtime.
+A separate fresh-state helper on **6.18.48** then mounted the actual composed
+EROFS bytes through readonly virtio block attachments and matched all **35,904**
+rows with no differences, observer problems, or excluded fields. Each logical
+lower preserved the generated VMDK's exact fsmeta/pack placement; kernel device
+read-only state, capacity, complete content hash and source immutability were
+checked independently. Evidence:
+`.tmp/plan/evidence/phase-22/erofs-corpus-20261108T000726/summary.json`.
+
+Separately, exact Linux x86_64 stable **7.2.2** and longterm **6.18.48** production
+tuples passed boot/lifecycle and kernel-mutated flatten export followed by raw
+boot. Cross-host format/runtime qualification is not inferred from these gates.
+Performance qualification remains deferred to the mandatory Phase 24 sweep;
+public live lanes remain unqualified.
 
 The final Linux synthetic comparison exercised 64 cases: 25 policy differences,
 25 semantic differences, seven extraction rejections and seven environment
@@ -376,6 +427,14 @@ authorize guessing producer intent from incidental headers or decoding every
 SCHILY percent sequence. Each independently archived name is qualified separately,
 so an early ambiguous name cannot hide the other cases behind one rejection.
 
+The shared libvm composition fixture selects the admitted original
+`metadata-producers/gnu-tar-file-04.tar` and
+`generated/metadata-raw-schily-names/layer-0.tar` in `A, B, A` occurrence order.
+Both carry nonempty metadata-bearing regular files, and their distinct pack
+bytes preserve the two-retained-packs coverage in OCI acquisition and conversion
+tests. GNU `file-00`, `file-01` and `file-02` remain unmodified ambiguous-SCHILY
+rejection specimens, not positive layers or identity-mismatch substitutes.
+
 The final qualification command retains three distinct comparisons in its JSON:
 `producerToSilo`, `producerToContainerd`, and ordinary Silo-to-containerd
 `differences`, together with `producerOriginal`, typed `siloRejectionKind` and the
@@ -476,8 +535,10 @@ generation, build, test, formatter or extraction was executed by the slice coder
 ## Phase 21 canonical EROFS compositions
 
 `oci::composition` is a production, path-independent recipe/result boundary.
-It does not select the runtime lower default or retire the flat renderer.
-Recipes bind ordered `LayerResultId`/index-root pairs, a Linux OCI platform,
+Phase 21 introduced that boundary without selecting the runtime default;
+Phase 22 now uses it for default `linux-erofs-overlay-v1` OCI roots on libkrun
+and retires the development flat lower. Recipes bind ordered
+`LayerResultId`/index-root pairs, a Linux OCI platform,
 `silo-namespace-v1`, `silo-erofs-v1`, and `silo-overlay-v1`. Architecture and
 optional variant are nonempty lowercase OCI tokens of at most 64 bytes.
 Recipe and result IDs use separate `silo:composition-recipe:v1\n` and
@@ -525,6 +586,13 @@ against the caller's independently computed ID. It does not invoke the writer.
 `composition::regenerate_exact` writes only to a caller-owned staging file and
 refuses any fsmeta digest/UUID/length, pack range, recipe, total-length, or final
 lower-ID mismatch. A mismatch never authorizes replacing the retained result.
+
+Portable layered snapshots retain the exact fsmeta and complete composition/
+layer recipe/result/index/pack graph, preserving layer order and repetition.
+Retained exact artifacts are authoritative; `regenerate_exact` is a digest-gated
+OCI acquisition fallback only. Portable restore must not require original OCI
+blobs or a historical encoder to remain available. Obsolete flat profiles are
+rejected without a shim.
 
 `erofs::encode`/`erofs::validate` accept the validated namespace, occurrence-
 ordered borrowed layers, and the recipe ID's canonical ASCII spelling. Their

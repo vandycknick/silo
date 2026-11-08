@@ -81,9 +81,9 @@ fn run_init(failure: &mut Failure) -> Result<(), &'static str> {
     }
     let bootstrap = crate::bootstrap::load()?;
     match bootstrap.root {
-        rootfs_spec::Root::FlatOverlay(root) => {
+        rootfs_spec::Root::ErofsOverlay(root) => {
             *failure = Failure::FailClosed("overlay");
-            if args.marker != Some(::init::boot_args::RootMarker::FlatOverlay) {
+            if args.marker != Some(::init::boot_args::RootMarker::ErofsOverlay) {
                 return Err("overlay: missing managed kernel marker");
             }
             crate::overlay::assemble(root)?;

@@ -589,23 +589,33 @@ impl SnapshotStore {
             .await?;
         }
         if let Some((evidence_digest, evidence)) = capture {
-            let existing = sqlx::query("SELECT snapshot_id,evidence_digest,evidence_bytes FROM snapshot_capture_provenance WHERE capture_id=?1")
-                .bind(operation_id.to_string()).fetch_optional(&mut *tx).await?;
+            let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
+                .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
+            let mut capture = crate::store::capture::decode_record(&json)?;
+            let plan_bytes = capture.plan.canonical_bytes().map_err(invalid)?;
+            authenticate_capture_plan(&plan_bytes, &evidence, operation_id)?;
+            let existing = sqlx::query("SELECT snapshot_id,evidence_digest,CASE WHEN typeof(evidence_bytes)='blob' AND length(evidence_bytes)<=?2 THEN evidence_bytes END AS evidence_bytes,CASE WHEN typeof(plan_bytes)='blob' AND length(plan_bytes)<=?2 THEN plan_bytes END AS plan_bytes FROM snapshot_capture_provenance WHERE capture_id=?1")
+                .bind(operation_id.to_string()).bind(vm_spec::capture::MAX_CAPTURE_RECORD_BYTES as i64)
+                .fetch_optional(&mut *tx).await?;
             if let Some(existing) = existing {
                 if existing.try_get::<String, _>("snapshot_id")? != id.to_string()
                     || existing.try_get::<String, _>("evidence_digest")?
                         != evidence_digest.to_string()
-                    || existing.try_get::<Vec<u8>, _>("evidence_bytes")? != evidence
+                    || existing
+                        .try_get::<Option<Vec<u8>>, _>("evidence_bytes")?
+                        .as_deref()
+                        != Some(evidence.as_slice())
+                    || existing
+                        .try_get::<Option<Vec<u8>>, _>("plan_bytes")?
+                        .as_deref()
+                        != Some(plan_bytes.as_slice())
                 {
                     return Err(invalid("immutable capture provenance contradiction"));
                 }
             } else {
-                sqlx::query("INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes) VALUES(?1,?2,?3,?4)")
-                    .bind(operation_id.to_string()).bind(id.to_string()).bind(evidence_digest.to_string()).bind(evidence).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) VALUES(?1,?2,?3,?4,?5)")
+                    .bind(operation_id.to_string()).bind(id.to_string()).bind(evidence_digest.to_string()).bind(evidence).bind(&plan_bytes).execute(&mut *tx).await?;
             }
-            let json: String = sqlx::query_scalar("SELECT json(record_json) FROM storage_operation WHERE operation_id=?1 AND kind='capture'")
-                .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
-            let mut capture = crate::store::capture::decode_record(&json)?;
             if capture.candidate != Some(id) {
                 return Err(invalid("capture candidate changed before commit"));
             }
@@ -819,6 +829,14 @@ fn reference_parts(reference: &SnapshotRef) -> Result<(Option<String>, Option<&s
         }
     }
 }
+
+struct CaptureProvenanceFact {
+    capture: String,
+    digest: String,
+    evidence: Vec<u8>,
+    plan: Vec<u8>,
+}
+
 /// Plain immutable catalog facts. Fetching performs no JSON decoding,
 /// canonicalization, or content hashing while the read transaction is open.
 pub(crate) struct CatalogSnapshotFacts {
@@ -830,7 +848,7 @@ pub(crate) struct CatalogSnapshotFacts {
     aliases: Vec<String>,
     streams: Vec<String>,
     objects: Vec<String>,
-    provenance: Vec<(String, String, Vec<u8>)>,
+    provenance: Vec<CaptureProvenanceFact>,
     capture_owned: bool,
 }
 
@@ -986,41 +1004,102 @@ async fn catalog_info(
 async fn provenance_facts(
     connection: &mut sqlx::SqliteConnection,
     id: &str,
-) -> Result<Vec<(String, String, Vec<u8>)>, LibVmError> {
-    let rows = sqlx::query("SELECT capture_id,evidence_digest,evidence_bytes FROM snapshot_capture_provenance WHERE snapshot_id=?1 ORDER BY capture_id")
-        .bind(id).fetch_all(connection).await?;
+) -> Result<Vec<CaptureProvenanceFact>, LibVmError> {
+    let rows = sqlx::query("SELECT capture_id,evidence_digest,CASE WHEN typeof(evidence_bytes)='blob' AND length(evidence_bytes)<=?2 THEN evidence_bytes END AS evidence_bytes,CASE WHEN typeof(plan_bytes)='blob' AND length(plan_bytes)<=?2 THEN plan_bytes END AS plan_bytes FROM snapshot_capture_provenance WHERE snapshot_id=?1 ORDER BY capture_id")
+        .bind(id).bind(vm_spec::capture::MAX_CAPTURE_RECORD_BYTES as i64)
+        .fetch_all(connection).await?;
     rows.into_iter()
         .map(|row| {
-            Ok((
-                row.try_get("capture_id")?,
-                row.try_get("evidence_digest")?,
-                row.try_get("evidence_bytes")?,
-            ))
+            Ok(CaptureProvenanceFact {
+                capture: row.try_get("capture_id")?,
+                digest: row.try_get("evidence_digest")?,
+                evidence: row
+                    .try_get::<Option<Vec<u8>>, _>("evidence_bytes")?
+                    .ok_or_else(|| {
+                        invalid("capture evidence exceeds its bound or has invalid type")
+                    })?,
+                plan: row
+                    .try_get::<Option<Vec<u8>>, _>("plan_bytes")?
+                    .ok_or_else(|| invalid("capture plan exceeds its bound or has invalid type"))?,
+            })
         })
         .collect()
 }
 
+/// Historical capture intent, retained with the evidence rather than a live
+/// operation. This must never be used as a lease, pause or restore capability.
+pub(crate) async fn capture_plan(
+    store: &Store,
+    snapshot: SnapshotId,
+    capture: Uuid,
+) -> Result<vm_spec::capture::CapturePlan, LibVmError> {
+    let row = sqlx::query("SELECT evidence_digest,CASE WHEN typeof(evidence_bytes)='blob' AND length(evidence_bytes)<=?3 THEN evidence_bytes END AS evidence_bytes,CASE WHEN typeof(plan_bytes)='blob' AND length(plan_bytes)<=?3 THEN plan_bytes END AS plan_bytes FROM snapshot_capture_provenance WHERE snapshot_id=?1 AND capture_id=?2")
+        .bind(snapshot.to_string()).bind(capture.to_string())
+        .bind(vm_spec::capture::MAX_CAPTURE_RECORD_BYTES as i64)
+        .fetch_optional(&store.pool).await?
+        .ok_or_else(|| invalid("snapshot capture lacks its retained exact plan"))?;
+    let evidence = row
+        .try_get::<Option<Vec<u8>>, _>("evidence_bytes")?
+        .ok_or_else(|| invalid("capture evidence exceeds its bound or has invalid type"))?;
+    if ObjectDigest::of_bytes(&evidence).to_string()
+        != row.try_get::<String, _>("evidence_digest")?
+    {
+        return Err(invalid("snapshot capture evidence digest contradiction"));
+    }
+    let plan = row
+        .try_get::<Option<Vec<u8>>, _>("plan_bytes")?
+        .ok_or_else(|| invalid("capture plan exceeds its bound or has invalid type"))?;
+    authenticate_capture_plan(&plan, &evidence, capture)
+}
+
+fn authenticate_capture_plan(
+    plan_bytes: &[u8],
+    evidence_bytes: &[u8],
+    capture: Uuid,
+) -> Result<vm_spec::capture::CapturePlan, LibVmError> {
+    let plan = vm_spec::capture::CapturePlan::decode(plan_bytes).map_err(invalid)?;
+    let evidence = vm_spec::capture::CaptureEvidence::decode(evidence_bytes).map_err(invalid)?;
+    if plan.capture_id.to_string() != capture.to_string() || !evidence.is_sealed() {
+        return Err(invalid(
+            "retained capture plan or seal identity contradiction",
+        ));
+    }
+    evidence
+        .validate_against_plan(&plan, &vm_spec::capture::Sha256Digest::of_bytes(plan_bytes))
+        .map_err(invalid)?;
+    Ok(plan)
+}
+
 fn authenticate_provenance(
-    facts: Vec<(String, String, Vec<u8>)>,
+    facts: Vec<CaptureProvenanceFact>,
 ) -> Result<Vec<SnapshotCaptureProvenance>, LibVmError> {
     facts
         .into_iter()
-        .map(|(capture, digest, bytes)| {
-            let evidence = vm_spec::capture::CaptureEvidence::decode(&bytes).map_err(invalid)?;
-            let digest: ObjectDigest = digest.parse().map_err(invalid)?;
-            if !evidence.is_sealed()
-                || evidence.capture_id.to_string() != capture
-                || ObjectDigest::of_bytes(&bytes) != digest
-            {
-                return Err(invalid("capture provenance identity contradiction"));
-            }
-            Ok(SnapshotCaptureProvenance {
-                capture_id: capture.parse().map_err(invalid)?,
-                machine_id: evidence.machine_id.to_string().parse().map_err(invalid)?,
-                run_id: evidence.run_id.to_string().parse().map_err(invalid)?,
-                evidence_digest: digest,
-            })
-        })
+        .map(
+            |CaptureProvenanceFact {
+                 capture,
+                 digest,
+                 evidence: bytes,
+                 plan,
+             }| {
+                let evidence =
+                    vm_spec::capture::CaptureEvidence::decode(&bytes).map_err(invalid)?;
+                authenticate_capture_plan(&plan, &bytes, capture.parse().map_err(invalid)?)?;
+                let digest: ObjectDigest = digest.parse().map_err(invalid)?;
+                if !evidence.is_sealed()
+                    || evidence.capture_id.to_string() != capture
+                    || ObjectDigest::of_bytes(&bytes) != digest
+                {
+                    return Err(invalid("capture provenance identity contradiction"));
+                }
+                Ok(SnapshotCaptureProvenance {
+                    capture_id: capture.parse().map_err(invalid)?,
+                    machine_id: evidence.machine_id.to_string().parse().map_err(invalid)?,
+                    run_id: evidence.run_id.to_string().parse().map_err(invalid)?,
+                    evidence_digest: digest,
+                })
+            },
+        )
         .collect()
 }
 
@@ -1442,6 +1521,7 @@ pub(crate) async fn publish_map(
 }
 #[cfg(test)]
 pub(crate) mod tests {
+
     use crate::paths::LocalPaths;
     use crate::storage::identity::ObjectDigest;
     use crate::storage::pool::StoragePool;
@@ -1453,6 +1533,60 @@ pub(crate) mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn retained_capture_plan_is_exact_and_rejects_a_different_request() {
+        let fixture = crate::store::capture::tests::fixture().await;
+        let (directory, _) = crate::store::capture::tests::seal(&fixture);
+        let capture = fixture.reservation.record.capture_id;
+        let info = fixture
+            .snapshots
+            .publish_capture(
+                capture,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .unwrap();
+        let plan =
+            crate::store::snapshot_store::capture_plan(&fixture.snapshots.store, info.id, capture)
+                .await
+                .unwrap();
+        assert_eq!(plan, fixture.reservation.record.plan);
+        let mut foreign = plan;
+        foreign.dirty_crossover_percent += 1;
+        let mut tx = fixture
+            .snapshots
+            .store
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        let row: (String, Vec<u8>) = sqlx::query_as(
+            "SELECT evidence_digest,evidence_bytes FROM snapshot_capture_provenance WHERE capture_id=?1",
+        ).bind(capture.to_string()).fetch_one(&mut *tx).await.unwrap();
+        sqlx::query("DELETE FROM snapshot_capture_provenance WHERE capture_id=?1")
+            .bind(capture.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) VALUES(?1,?2,?3,?4,?5)")
+            .bind(capture.to_string()).bind(info.id.to_string()).bind(row.0).bind(row.1)
+            .bind(foreign.canonical_bytes().unwrap()).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(crate::store::snapshot_store::capture_plan(
+            &fixture.snapshots.store,
+            info.id,
+            capture,
+        )
+        .await
+        .is_err());
+        assert!(fixture
+            .snapshots
+            .inspect(&SnapshotRef::Id(info.id))
+            .await
+            .is_err());
+    }
 
     pub(crate) async fn fixture(
         kind: &str,

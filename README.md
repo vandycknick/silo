@@ -39,26 +39,36 @@ state from earlier installations. There is no upgrade migration, legacy cache
 import, or compatibility reader. Silo refuses incompatible state with a
 reinstall/reset diagnostic; it does not automatically delete it.
 
-Fresh machines default to private `root.raw` disks. The image cache uses immutable
-content-addressed streams and a SQLite catalog, not mutable JSON metadata.
-The development-only `linux-flat-overlay-v1` profile is explicitly opt-in:
+OCI creation on libkrun now defaults to `linux-erofs-overlay-v1`: shared,
+immutable per-layer payload packs and merged EROFS metadata (`fsmeta`), with a
+fresh private ext4 upper per machine. The image cache uses content-addressed
+streams and a SQLite catalog, not mutable JSON metadata. There is no
+`--root-profile` selector or template `root_profile` field. The development flat
+profile has been removed, not migrated; obsolete profiles are rejected.
 
 ```sh
-silo create ubuntu:24.04 --name overlay-dev \
-  --root-profile linux-flat-overlay-v1 --disk-size 4gib
-silo run ubuntu:24.04 --root-profile linux-flat-overlay-v1 -- uname -a
+silo create ubuntu:24.04 --name overlay-dev --disk-size 4gib
+silo run ubuntu:24.04 -- uname -a
 ```
 
-It retains one shared read-only ext4 lower and creates a fresh private ext4 upper.
 `--disk-size` selects exact upper backing capacity (64 MiB through 1 TiB,
 4096-byte aligned), not usable payload bytes. Filesystem metadata and an explicitly
 reported unusable short-group tail reduce usable capacity. A small growth can
 increase backing length without adding usable space. Resize requires a stopped
 machine; the next boot replays and grows the upper in the guest.
-The profile requires an exactly qualified kernel/init tuple on libkrun and is
-never silently substituted for raw. Stopped snapshots and VM artifacts preserve
-the profile and exact boot closure. Live execution checkpoints remain separately gated.
-The profile will be removed rather than migrated when EROFS replaces it.
+The profile requires an exactly admitted kernel/init tuple on libkrun and is
+never silently substituted for raw. VZ rejects direct OCI and layered sources;
+use explicit `silo image convert REF --disk-format raw` and then create from the
+returned managed raw image. Imported disks remain opaque raw roots.
+Stopped snapshots and VM artifacts retain the exact fsmeta/pack graph, including
+layer order and repetition, plus the upper and boot closure. Exact OCI
+regeneration is only a digest-gated fallback, not a portability requirement.
+
+The published-builder namespace gate matched all 35,904 independent umoci rows
+through actual readonly EROFS mounts. Exact Linux x86_64 stable 7.2.2 and
+longterm 6.18.48 production-root tuples passed boot, lifecycle and flatten gates.
+The mandatory Phase 24 performance sweep remains outstanding; public live
+execution lanes remain unqualified.
 
 `/tmp` remains persistent and disk-backed by default. With the overlay profile,
 `--tmpfs-size 64mib` explicitly selects a memory-charged, nonpersistent `/tmp`;
@@ -70,12 +80,39 @@ again. Templates support the same choices:
 ```yaml
 version: "1"
 image: ubuntu:24.04
-root_profile: linux-flat-overlay-v1
 disk_size: 4gib
 tmpfs_size: 64mib
 ```
 
 See [ADR 0014](docs/adr/0014-layered-oci-image-storage.md) for the storage model.
+
+### Export a stopped root disk
+
+```sh
+# Opaque raw root: preserve exact virtual disk bytes.
+silo storage export raw-dev /outside/silo-home/root.raw --disk-format raw
+# Layered root: explicitly produce a new whole-disk ext4 filesystem.
+silo storage export overlay-dev /outside/silo-home/flattened.raw \
+  --disk-format raw --flatten-filesystem --format json
+```
+
+The machine must already be stopped; export never stops or repairs it. Only the
+root is exported, not attached data disks or shares. The destination parent must
+exist outside Silo's state root, and neither `DEST` nor `DEST.json` may exist.
+The disk and its JSON sidecar are published without overwriting either.
+`--format json` prints the same report, including geometry, boot requirements and
+export kind. Its `path` and `metadataPath` are arrays of raw Unix pathname bytes,
+not JSON strings, so non-UTF-8 paths remain lossless.
+
+Opaque export preserves deleted-data remnants and dirty journals exactly.
+Layered flattening instead requires strictly supported, clean on-disk ext4 and
+OverlayFS index state, irrespective of the recorded stop outcome. Dirty uppers
+return a typed recovery-required error; unsupported or inconsistent state is
+rejected, not approximated. No host journal replay or implicit recovery occurs.
+Flattening preserves the visible namespace and hardlinks, removes OverlayFS
+controls and creates a new filesystem UUID/identity. It is not sanitization or
+an exact checkpoint. Export currently requires Linux direct boot; EFI and macOS
+roots are rejected. No EFI layout or provider bootloader is synthesized.
 
 ## Stopped handoff
 
@@ -190,7 +227,7 @@ raw image (required before an OCI root can run on VZ):
 
 ```bash
 silo image import ./cloud.qcow2 --platform linux/amd64 --root auto --boot linux-direct --name cloud
-silo image convert ubuntu:24.04 --platform linux/arm64 --name ubuntu-raw
+silo image convert ubuntu:24.04 --disk-format raw --platform linux/arm64 --name ubuntu-raw
 silo create image:cloud --name web
 silo image inspect image:cloud
 silo image list

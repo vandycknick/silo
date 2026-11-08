@@ -61,21 +61,20 @@ pub(crate) struct ImageManifestLayerRecord {
     pub position: i64,
 }
 
+/// An OCI selection's retained layered lower. The lower length is a derived
+/// catalog claim checked against the exact retained composition result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImageRootfsArtifactRecord {
+pub(crate) struct ImageCompositionArtifactRecord {
     pub image_id: String,
     pub manifest_digest: String,
     pub config_digest: String,
     pub platform_os: String,
     pub platform_architecture: String,
     pub platform_variant: Option<String>,
-    pub filesystem: String,
-    pub rootfs_path: PathBuf,
-    pub size_bytes: u64,
+    pub lower: crate::storage::identity::LowerResultId,
+    pub lower_length: u64,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
-    pub stream_id: crate::storage::identity::StreamId,
-    pub conversion_abi: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +98,7 @@ pub(crate) struct OciImageRecord {
     pub config: ImageConfigRecord,
     pub layers: Vec<ImageLayerRecord>,
     pub manifest_layers: Vec<ImageManifestLayerRecord>,
-    pub artifact: ImageRootfsArtifactRecord,
+    pub artifact: ImageCompositionArtifactRecord,
 }
 
 /// Only outcomes whose bytes and durable deletion jobs remain safely retained
@@ -136,10 +135,11 @@ impl ImageRecord {
     pub fn validate(&self) -> Result<(), crate::LibVmError> {
         use crate::store::models::snapshot::{invalid, validate_geometry, SnapshotRootProfile};
         use crate::store::models::storage::{validate_root_selection, BootBinding, BootProfile};
-        if self.schema != 1 || self.root.profile != SnapshotRootProfile::OpaqueRaw {
-            return Err(invalid("image requires current schema and opaque raw root"));
+        if self.schema != 1 {
+            return Err(invalid("image requires current schema"));
         }
         validate_geometry(&self.root.stream, &self.root.geometry)?;
+        self.root.validate_lower()?;
         let expected_pages = self
             .root
             .stream
@@ -163,7 +163,18 @@ impl ImageRecord {
         if abi != crate::runtime::boot_assets::DIRECT_BOOT_ABI {
             return Err(invalid("unsupported image direct boot ABI"));
         }
-        validate_root_selection(&self.root.layout, root_selector)?;
+        match &self.root.profile {
+            SnapshotRootProfile::OpaqueRaw => {
+                validate_root_selection(&self.root.layout, root_selector)?
+            }
+            SnapshotRootProfile::LinuxOverlay { .. } => {
+                if root_selector != &crate::RootSelector::ManagedOverlay {
+                    return Err(invalid(
+                        "layered image requires managed-overlay root selection",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -188,7 +199,15 @@ impl ImageRecord {
             .check(bytes.len() as u64)
             .map_err(crate::storage::StorageError::from)?;
         let value = crate::store::models::snapshot::decode_identity_value(bytes)?;
-        let record: Self = serde_json::from_value(value.clone()).map_err(invalid)?;
+        let record: Self = match serde_json::from_value(value.clone()) {
+            Ok(record) => record,
+            Err(error) => {
+                if let Some(root) = value.get("root") {
+                    crate::store::models::snapshot::refuse_retired_snapshot_root(root)?;
+                }
+                return Err(invalid(error));
+            }
+        };
         if serde_json::to_value(&record).map_err(invalid)? != value {
             return Err(invalid("image is not the closed current schema"));
         }
@@ -217,8 +236,19 @@ impl ImageRecord {
         crate::LibVmError,
     > {
         use crate::store::models::storage::BootBinding;
+        let mut streams = std::collections::BTreeSet::from([self.root.stream.stream]);
         let mut objects = std::collections::BTreeSet::from([self.root.stream.map]);
         objects.extend(self.root.stream.map_pages.iter().copied());
+        if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay { lower, .. } =
+            &self.root.profile
+        {
+            objects.extend(lower.objects());
+            for layer in &lower.layers {
+                streams.insert(layer.pack.stream);
+                objects.insert(layer.pack.map);
+                objects.extend(layer.pack.map_pages.iter().copied());
+            }
+        }
         let binding = self.boot_binding()?;
         let BootBinding::Pinned {
             kernel,
@@ -233,10 +263,7 @@ impl ImageRecord {
         };
         objects.extend([binding.digest()?, *kernel, *base_initramfs]);
         objects.extend(agent.iter().copied());
-        Ok((
-            std::collections::BTreeSet::from([self.root.stream.stream]),
-            objects,
-        ))
+        Ok((streams, objects))
     }
 }
 
@@ -401,5 +428,60 @@ mod tests {
         assert_eq!(BootBinding::decode(&bytes).unwrap(), *binding);
         assert_eq!(binding.digest().unwrap(), ObjectDigest::of_bytes(&bytes));
         assert!(BootBinding::RuntimeSelected.canonical_bytes().is_err());
+    }
+
+    #[test]
+    fn layered_image_binds_complete_lower_closure_and_refuses_wrong_root_claims() {
+        use crate::store::models::snapshot::SnapshotRootProfile;
+        let lower = crate::store::models::snapshot::tests::composition();
+        let mut record = image();
+        record.root.profile = SnapshotRootProfile::LinuxOverlay {
+            lower: Box::new(lower.clone()),
+            lower_geometry: vm_spec::DiskGeometry {
+                length: 4096
+                    + lower
+                        .layers
+                        .iter()
+                        .map(|layer| layer.pack.length)
+                        .sum::<u64>(),
+                logical_sector_size: 512,
+            },
+            lower_filesystem_uuid: uuid::Uuid::from_bytes([1; 16]),
+            upper_uuid: uuid::Uuid::from_bytes([2; 16]),
+            ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
+            overlay_profile: crate::OverlayProfile::SiloOverlayV1,
+            temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
+        };
+        assert!(
+            record.validate().is_err(),
+            "raw root selector cannot describe layered storage"
+        );
+        if let BootProfile::LinuxDirect { root_selector, .. } = &mut record.boot {
+            *root_selector = RootSelector::ManagedOverlay;
+        }
+        record.validate().unwrap();
+        let (streams, objects) = record.content_dependencies().unwrap();
+        for layer in &lower.layers {
+            assert!(streams.contains(&layer.pack.stream));
+            assert!(objects.contains(&layer.pack.map));
+            assert!(layer
+                .pack
+                .map_pages
+                .iter()
+                .all(|page| objects.contains(page)));
+        }
+        assert!(lower.objects().all(|object| objects.contains(&object)));
+        let mut malformed = record.clone();
+        malformed.root.layout = RawLayout::Partitioned {
+            table: PartitionTable::Gpt,
+        };
+        assert!(malformed.validate().is_err());
+        if let SnapshotRootProfile::LinuxOverlay { lower_geometry, .. } = &mut record.root.profile {
+            lower_geometry.length = 4096;
+        }
+        assert!(
+            record.validate().is_err(),
+            "geometry must include fsmeta and every pack occurrence"
+        );
     }
 }

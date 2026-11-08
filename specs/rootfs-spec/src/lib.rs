@@ -57,7 +57,7 @@ pub struct Bootstrap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Root {
     Raw(RawRoot),
-    FlatOverlay(OverlayRoot),
+    ErofsOverlay(OverlayRoot),
 }
 
 /// Why init prepares the Rosetta capability. Both enabled modes fail boot when
@@ -324,7 +324,7 @@ impl Bootstrap {
     pub fn validate(&self) -> Result<(), Error> {
         match &self.root {
             Root::Raw(root) => root.validate(),
-            Root::FlatOverlay(root) => root.validate(),
+            Root::ErofsOverlay(root) => root.validate(),
         }
     }
 }
@@ -359,7 +359,9 @@ impl OverlayRoot {
         for device in [&self.lower, &self.upper] {
             validate_attachment(device.length_bytes, device.logical_sector_size)?;
         }
-        if self.lower.serial != RootSerial::Lower
+        if self.lower.length_bytes < 8192
+            || !self.lower.length_bytes.is_multiple_of(4096)
+            || self.lower.serial != RootSerial::Lower
             || self.upper.serial != RootSerial::Upper
             || !self.lower.read_only
             || self.upper.read_only
@@ -525,7 +527,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn parse_device(parser: &mut Parser<'_>) -> Result<DeviceExpectation, Error> {
+fn parse_device(parser: &mut Parser<'_>, filesystem: &str) -> Result<DeviceExpectation, Error> {
     let (mut serial, mut length, mut sector, mut read_only, mut uuid) =
         (None, None, None, None, None);
     let seen = parser.object(
@@ -549,7 +551,7 @@ fn parse_device(parser: &mut Parser<'_>) -> Result<DeviceExpectation, Error> {
                 1 => length = Some(p.uint()?),
                 2 => sector = Some(p.u32()?),
                 3 => read_only = Some(p.boolean()?),
-                4 => p.literal("ext4")?,
+                4 => p.literal(filesystem)?,
                 5 => uuid = Some(FilesystemUuid::parse(p.string()?)?),
                 _ => return Err(Error::UnknownField),
             }
@@ -663,8 +665,8 @@ fn parse_root(parser: &mut Parser<'_>) -> Result<Root, Error> {
             match field {
                 0 => kind = Some(p.string()?),
                 1 => p.literal("virtio-block-serial")?,
-                2 => lower = Some(parse_device(p)?),
-                3 => upper = Some(parse_device(p)?),
+                2 => lower = Some(parse_device(p, "erofs")?),
+                3 => upper = Some(parse_device(p, "ext4")?),
                 4 => p.literal("silo-upper-ext4-v1")?,
                 5 => p.literal("silo-overlay-v1")?,
                 6 => temporary = Some(parse_temporary(p)?),
@@ -694,7 +696,7 @@ fn parse_root(parser: &mut Parser<'_>) -> Result<Root, Error> {
             root.validate()?;
             Ok(Root::Raw(root))
         }
-        ("linux-flat-overlay-v1", OVERLAY_FIELDS) => {
+        ("linux-erofs-overlay-v1", OVERLAY_FIELDS) => {
             let root = OverlayRoot {
                 lower: required(lower)?,
                 upper: required(upper)?,
@@ -704,7 +706,7 @@ fn parse_root(parser: &mut Parser<'_>) -> Result<Root, Error> {
                 temporary_directory: required(temporary)?,
             };
             root.validate()?;
-            Ok(Root::FlatOverlay(root))
+            Ok(Root::ErofsOverlay(root))
         }
         _ => Err(Error::InvalidValue),
     }
@@ -787,7 +789,7 @@ pub fn decode_observation(input: &[u8]) -> Result<Observation, Error> {
                 }
                 1 => {
                     root = Some(match parse_root(p)? {
-                        Root::FlatOverlay(root) => root,
+                        Root::ErofsOverlay(root) => root,
                         Root::Raw(_) => return Err(Error::InvalidValue),
                     })
                 }
@@ -843,7 +845,7 @@ impl<'a> Writer<'a> {
     fn uuid(&mut self, value: &impl fmt::Display) -> Result<(), Error> {
         write!(self, "{value}").map_err(|_| Error::BufferTooSmall)
     }
-    fn device(&mut self, value: &DeviceExpectation) -> Result<(), Error> {
+    fn device(&mut self, value: &DeviceExpectation, filesystem: &str) -> Result<(), Error> {
         self.text("{\"serial\":\"")?;
         self.text(value.serial.as_str())?;
         self.text("\",\"lengthBytes\":")?;
@@ -852,14 +854,16 @@ impl<'a> Writer<'a> {
         self.uint(u64::from(value.logical_sector_size))?;
         self.text(",\"readOnly\":")?;
         self.text(if value.read_only { "true" } else { "false" })?;
-        self.text(",\"filesystem\":\"ext4\",\"filesystemUuid\":\"")?;
+        self.text(",\"filesystem\":\"")?;
+        self.text(filesystem)?;
+        self.text("\",\"filesystemUuid\":\"")?;
         self.uuid(&value.filesystem_uuid)?;
         self.text("\"}")
     }
     fn root(&mut self, root: &Root) -> Result<(), Error> {
         match root {
             Root::Raw(root) => self.raw_root(root),
-            Root::FlatOverlay(root) => self.overlay_root(root),
+            Root::ErofsOverlay(root) => self.overlay_root(root),
         }
     }
     fn raw_root(&mut self, root: &RawRoot) -> Result<(), Error> {
@@ -895,11 +899,11 @@ impl<'a> Writer<'a> {
     }
     fn overlay_root(&mut self, root: &OverlayRoot) -> Result<(), Error> {
         self.text(
-            "{\"kind\":\"linux-flat-overlay-v1\",\"discovery\":\"virtio-block-serial\",\"lower\":",
+            "{\"kind\":\"linux-erofs-overlay-v1\",\"discovery\":\"virtio-block-serial\",\"lower\":",
         )?;
-        self.device(&root.lower)?;
+        self.device(&root.lower, "erofs")?;
         self.text(",\"upper\":")?;
-        self.device(&root.upper)?;
+        self.device(&root.upper, "ext4")?;
         self.text(",\"upperProfile\":\"silo-upper-ext4-v1\",\"overlayProfile\":\"silo-overlay-v1\",\"renderingAbi\":\"linux-overlayfs-mountinfo-v1\",\"temporaryDirectory\":")?;
         match root.temporary_directory {
             TemporaryDirectory::DiskBacked => self.text("{\"kind\":\"disk-backed\"}")?,
@@ -1041,7 +1045,7 @@ mod tests {
         );
         let overlay = decode_bootstrap(OVERLAY).unwrap();
         assert_eq!(overlay.rosetta, RosettaMode::Disabled);
-        assert!(matches!(overlay.root, Root::FlatOverlay(_)));
+        assert!(matches!(overlay.root, Root::ErofsOverlay(_)));
     }
 
     #[test]
@@ -1256,6 +1260,57 @@ mod tests {
     }
 
     #[test]
+    fn erofs_root_kind_and_role_specific_filesystems_are_closed() {
+        for (before, after) in [
+            ("linux-erofs-overlay-v1", "linux-flat-overlay-v1"),
+            ("linux-erofs-overlay-v1", "linux-erofs-overlay-v2"),
+            ("\"filesystem\":\"erofs\"", "\"filesystem\":\"ext4\""),
+            ("\"filesystem\":\"erofs\"", "\"filesystem\":\"auto\""),
+            ("\"filesystem\":\"ext4\"", "\"filesystem\":\"erofs\""),
+            ("\"lengthBytes\":268435456", "\"lengthBytes\":512"),
+            ("\"lengthBytes\":268435456", "\"lengthBytes\":4096"),
+            ("\"lengthBytes\":268435456", "\"lengthBytes\":8704"),
+            ("\"readOnly\":true", "\"readOnly\":false"),
+            (
+                "\"serial\":\"silo-root-lower\"",
+                "\"serial\":\"silo-root-upper\"",
+            ),
+        ] {
+            for input in [OVERLAY, OBSERVATION] {
+                let mutated = replace_once(input, before, after);
+                if input == OVERLAY {
+                    assert_eq!(
+                        decode_bootstrap(&mutated),
+                        Err(Error::InvalidValue),
+                        "{after}"
+                    );
+                } else {
+                    assert_eq!(
+                        decode_observation(&mutated),
+                        Err(Error::InvalidValue),
+                        "{after}"
+                    );
+                }
+            }
+        }
+        let value = decode_bootstrap(OVERLAY).unwrap();
+        let mut output = [0; 4096];
+        let length = encode_bootstrap(&value, &mut output).unwrap();
+        let text = core::str::from_utf8(&output[..length]).unwrap();
+        assert!(text.contains("\"kind\":\"linux-erofs-overlay-v1\""));
+        assert_eq!(text.matches("\"filesystem\":\"erofs\"").count(), 1);
+        assert_eq!(text.matches("\"filesystem\":\"ext4\"").count(), 1);
+        // Device object order is unconstrained: filesystem is checked by role,
+        // not by whether its serial has already been parsed.
+        let reordered = replace_once(
+            OVERLAY,
+            "\"serial\":\"silo-root-lower\",\"lengthBytes\":268435456",
+            "\"lengthBytes\":268435456,\"serial\":\"silo-root-lower\"",
+        );
+        assert_eq!(decode_bootstrap(&reordered).unwrap(), value);
+    }
+
+    #[test]
     fn typed_raw_values_validate_geometry_and_newtype_bounds() {
         assert!(MbrPartitionNumber::new(0).is_err());
         assert!(MbrPartitionNumber::new(5).is_err());
@@ -1334,7 +1389,7 @@ mod tests {
 
     #[test]
     fn typed_values_cannot_bypass_geometry_roles_or_accounting() {
-        let Root::FlatOverlay(mut root) = decode_bootstrap(OVERLAY).unwrap().root else {
+        let Root::ErofsOverlay(mut root) = decode_bootstrap(OVERLAY).unwrap().root else {
             panic!("overlay fixture");
         };
         root.lower.read_only = false;
@@ -1519,7 +1574,7 @@ mod tests {
     #[test]
     fn both_encoders_respect_exact_fit_and_output_sentinels_in_every_branch() {
         let mut tmpfs = decode_bootstrap(OVERLAY).unwrap();
-        let Root::FlatOverlay(root) = &mut tmpfs.root else {
+        let Root::ErofsOverlay(root) = &mut tmpfs.root else {
             panic!("overlay");
         };
         root.temporary_directory = TemporaryDirectory::Tmpfs {

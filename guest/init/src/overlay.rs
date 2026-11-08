@@ -26,6 +26,31 @@ fn superblock(fd: &Fd) -> Result<[u8; 1024], &'static str> {
     Ok(bytes)
 }
 
+fn lower_geometry(fd: &Fd, expected: &DeviceExpectation) -> Result<u64, &'static str> {
+    let mut block = [0; 4096];
+    pread_all(fd, 0, &mut block)?;
+    let geometry = root_checks::check_erofs_superblock(&block, expected)?;
+    let mut devices = root_checks::ErofsDevices::new(&geometry, expected.length_bytes);
+    let mut offset = 4096;
+    for _ in 0..geometry.devices {
+        let mut slot = [0; 128];
+        pread_all(fd, offset, &mut slot)?;
+        devices.observe(&slot)?;
+        offset += 128;
+    }
+    devices.finish()?;
+    // The canonical device table is followed only by block-alignment padding.
+    while offset < geometry.metadata_offset {
+        let length = (geometry.metadata_offset - offset).min(4096) as usize;
+        pread_all(fd, offset, &mut block[..length])?;
+        if block[..length].iter().any(|byte| *byte != 0) {
+            return Err("overlay: nonzero EROFS device table padding");
+        }
+        offset += length as u64;
+    }
+    Ok(expected.length_bytes)
+}
+
 fn walk_journal(
     fd: &Fd,
     node: &[u8],
@@ -98,11 +123,14 @@ fn measure(name: &[u8], expected: &DeviceExpectation, upper: bool) -> Result<Dev
         facts,
     } = block::measure(&sysfs, name, &queue, upper)?;
     root_checks::check_device(expected, facts)?;
-    let sb = superblock(&fd)?;
-    let span = root_checks::check_superblock(&sb, expected, upper)?;
-    if upper {
+    let span = if upper {
+        let sb = superblock(&fd)?;
+        let span = root_checks::check_upper_superblock(&sb, expected)?;
         check_journal(&fd, &sb, expected, span)?;
-    }
+        span
+    } else {
+        lower_geometry(&fd, expected)?
+    };
     Ok(Device {
         fd,
         path: device_path,
@@ -195,15 +223,8 @@ pub(crate) fn assemble(root: OverlayRoot) -> Result<(), &'static str> {
     directory(ROOT, 0o700)?;
     directory(LOWER, 0o700)?;
     directory(UPPER, 0o700)?;
-    if applets::system::mount_one(
-        &lower.path,
-        LOWER,
-        Some(b"ext4"),
-        libc::MS_RDONLY,
-        Some(b"noload"),
-    ) != 0
-    {
-        return Err("overlay: lower ro,noload mount failed");
+    if applets::system::mount_one(&lower.path, LOWER, Some(b"erofs"), libc::MS_RDONLY, None) != 0 {
+        return Err("overlay: lower read-only EROFS mount failed");
     }
     if applets::system::mount_one(&upper.path, UPPER, Some(b"ext4"), 0, None) != 0 {
         return Err("overlay: upper replay mount failed");
@@ -212,7 +233,7 @@ pub(crate) fn assemble(root: OverlayRoot) -> Result<(), &'static str> {
     if unsafe { libc::syncfs(upper_mount.0) } != 0 {
         return Err("overlay: upper replay sync failed");
     }
-    upper.span = root_checks::check_superblock(&superblock(&upper.fd)?, &root.upper, true)?;
+    upper.span = root_checks::check_upper_superblock(&superblock(&upper.fd)?, &root.upper)?;
     let predicted = rootfs_spec::upper_geometry::UpperGeometry::for_capacity(
         rootfs_spec::upper_geometry::UpperCapacity::new(root.upper.length_bytes)
             .map_err(|_| "overlay: invalid growth capacity")?,
@@ -229,7 +250,7 @@ pub(crate) fn assemble(root: OverlayRoot) -> Result<(), &'static str> {
         if unsafe { libc::syncfs(upper_mount.0) } != 0 {
             return Err("overlay: upper resize sync failed");
         }
-        upper.span = root_checks::check_superblock(&superblock(&upper.fd)?, &root.upper, true)?;
+        upper.span = root_checks::check_upper_superblock(&superblock(&upper.fd)?, &root.upper)?;
     }
     let tail = root_checks::check_achieved_span(root.upper.length_bytes, upper.span)?;
     check_journal(&upper.fd, &superblock(&upper.fd)?, &root.upper, upper.span)?;
@@ -240,17 +261,15 @@ pub(crate) fn assemble(root: OverlayRoot) -> Result<(), &'static str> {
         return Err("overlay: merged mount failed");
     }
     let mountinfo = read_file(b"/proc/self/mountinfo", MAX_MOUNTINFO)?;
-    overlay_verify::verify_ext4_mount(
+    overlay_verify::verify_erofs_mount(
         &mountinfo,
         LOWER,
         (lower.facts.number.major, lower.facts.number.minor),
-        true,
     )?;
     overlay_verify::verify_ext4_mount(
         &mountinfo,
         UPPER,
         (upper.facts.number.major, upper.facts.number.minor),
-        false,
     )?;
     overlay_verify::verify(
         root.rendering_abi.as_str(),

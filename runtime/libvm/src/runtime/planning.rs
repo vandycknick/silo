@@ -5,10 +5,7 @@ use oci::{MaterializeOptions, OciMaterializer};
 
 use crate::image::{
     local_disk::OpenDiskSource,
-    oci::{
-        cached_resolved_oci_image, image_error, resolve_oci_image_from_registry,
-        verify_cached_image,
-    },
+    oci::{cached_resolved_oci_image, image_error, resolve_oci_image_from_registry},
     ImagePullPolicy, ResolvedOciImage,
 };
 use crate::runtime::RuntimeConfig;
@@ -146,20 +143,16 @@ impl ReadOnlyRuntime {
             .candidates(reference)
             .map_err(|error| image_error(reference, error))?
         {
-            if let Some(mut image) = store
+            // Read-only planning trusts the catalog row naming a retained
+            // composition; acquisition authenticates every byte before use.
+            if let Some(image) = store
                 .cached_oci_image(&candidate.to_string(), platform)
                 .await?
             {
-                let images = self.home.join("images");
-                return tokio::task::spawn_blocking(move || {
-                    verify_cached_image(&mut image, &images)?;
-                    Ok(Some(cached_resolved_oci_image(
-                        &image,
-                        candidate.to_string(),
-                    )))
-                })
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                return Ok(Some(cached_resolved_oci_image(
+                    &image,
+                    candidate.to_string(),
+                )));
             }
         }
         Ok(None)
@@ -416,7 +409,6 @@ mod tests {
         .unwrap();
         crate::runtime::core::tests::write_cached_oci_rootfs(
             &runtime,
-            &paths,
             &reference,
             &digest,
             &format!("sha256:{}", "b".repeat(64)),

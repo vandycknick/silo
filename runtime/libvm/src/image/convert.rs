@@ -7,13 +7,15 @@
 //!            │                      ─► original ImageId and pinned bundle
 //!            │                      (missing/corrupt content refuses; it is
 //!            │                       never replaced by a fresh flattening)
-//!            └─ no mapping ───────► existing OCI rootfs cache / flattener
-//!                                   ─► stream map ─► packaged pinned bundle
+//!            └─ no mapping ───────► layered acquisition (exact composition)
+//!                                   ─► namespace ext4 flattener (held packs)
+//!                                   ─► stream + map ─► packaged pinned bundle
 //!                                   ─► image + alias + mapping in one commit
 //! ```
 //!
 //! Nothing here runs implicitly at machine creation or start. A backend that
-//! cannot boot an OCI source names this operation as the remedy instead.
+//! cannot boot an OCI source names this operation as the remedy instead. The
+//! flattened bytes exist only as the converted raw image; no flat OCI cache.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +24,10 @@ use crate::image::import_types::{
     BootAssetSelection, ImageContainerKind, ImageProvenance, ManagedImageInfo, ManagedSourceInfo,
     ManagedSourceRef, RawConversionKey, RawConversionOptions,
 };
-use crate::image::oci::{acquire_rootfs, image_error, CONVERSION_ABI};
-use crate::image::{ImageProgressSender, Images, OciImageConfigMetadata, ResolvedOciImage};
+use crate::image::oci::{acquire_composition, image_error};
+use crate::image::{
+    ImageProgress, ImageProgressSender, Images, OciImageConfigMetadata, ResolvedOciImage,
+};
 use crate::machine::stopped::OperationStaging;
 use crate::runtime::boot_assets::{direct_boot_profile, pin_image_boot, CapturedBootContext};
 use crate::storage::identity::ObjectDigest;
@@ -34,6 +38,13 @@ use crate::store::models::snapshot::{SnapshotRoot, SnapshotRootProfile};
 use crate::store::models::storage::{GuestArchitecture, LinuxPlatform, RawLayout, RootSelector};
 use crate::store::{ImageStore, Store};
 use crate::{LibVmError, ProcessConfig};
+
+/// Floor of a converted root; the flattener grows it to fit the namespace.
+const MINIMUM_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The one conversion flattener ABI and part of the raw-conversion key, so a
+/// changed renderer or floor never aliases an earlier conversion.
+pub(crate) const FLATTENER_ABI: &str = "flat-ext4-v3:erofs-composition:minimum-size=536870912";
 
 impl Images {
     /// Explicitly converts an already selected OCI identity into a reusable,
@@ -172,23 +183,60 @@ async fn convert_owned(
     let operation_id = uuid::Uuid::new_v4();
     let lease = context.store.begin_storage_operation(operation_id).await?;
     let staging = OperationStaging::new(&pool, operation_id, &lease)?;
-    let rootfs = acquire_rootfs(
-        &*context.store,
-        &context.images_dir,
+    let acquired = acquire_composition(
+        &context.store,
         &context.producer,
         context.progress.as_ref(),
         resolved,
-        operation_id,
     )
     .await?;
-    let stream =
-        crate::store::snapshot_store::publish_map(&pool, &context.store, operation_id, &rootfs.map)
-            .await?;
-    if stream.stream != rootfs.record.artifact.stream_id
-        || stream.length != rootfs.record.artifact.size_bytes
-    {
+    if let Some(progress) = &context.progress {
+        progress.send(ImageProgress::MaterializingRootfs);
+    }
+    let output = staging.directory()?.path().join("root.raw");
+    let held = acquired.held;
+    let (pool, published, roots) = tokio::task::spawn_blocking(move || {
+        let layers = held.layers();
+        let retained = held.retained();
+        oci::overlay_flatten::flatten_lower(
+            oci::overlay_flatten::FlattenLower {
+                recipe: &retained.recipe,
+                result: &retained.result,
+                layers: &layers,
+                fsmeta: held.fsmeta(),
+            },
+            &output,
+            MINIMUM_SIZE_BYTES,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .map_err(flatten_error)?;
+        let file = std::fs::File::open(&output)?;
+        file.sync_all()?;
+        let length = file.metadata()?.len();
+        let (published, roots) = pool.publish_stream_file_for_catalog(file, length)?;
+        drop(layers);
+        Ok::<_, LibVmError>((pool, published, roots))
+    })
+    .await??;
+    if let Some(progress) = &context.progress {
+        progress.send(ImageProgress::PublishingRootfs);
+    }
+    context
+        .store
+        .pin_published_storage_dependencies(operation_id, &[published.id], &[])
+        .await?;
+    // The publication roots guard covers the stream until its retention.
+    drop(roots);
+    let stream = crate::store::snapshot_store::publish_map(
+        &pool,
+        &context.store,
+        operation_id,
+        &published.map,
+    )
+    .await?;
+    if stream.stream != published.id || stream.length != published.length {
         return Err(invalid(
-            "converted stream map contradicts the flattened rootfs",
+            "converted stream map contradicts the flattened root",
         ));
     }
     let boot = pin_image_boot(
@@ -236,6 +284,15 @@ fn invalid(message: impl Into<String>) -> LibVmError {
     }
 }
 
+fn flatten_error(error: oci::overlay_flatten::FlattenError) -> LibVmError {
+    match error {
+        oci::overlay_flatten::FlattenError::Io(error) => error.into(),
+        other => invalid(format!(
+            "retained composition could not be flattened: {other}"
+        )),
+    }
+}
+
 /// OCI spells architectures with GOARCH names; nothing else is admitted.
 fn linux_platform(platform: &::oci::Platform) -> Result<LinuxPlatform, LibVmError> {
     if platform.os != "linux" {
@@ -270,7 +327,7 @@ fn conversion_key(
     Ok(RawConversionKey {
         source_manifest: oci_digest(&resolved.manifest_digest, "manifest")?,
         platform,
-        flattener_abi: CONVERSION_ABI.to_owned(),
+        flattener_abi: FLATTENER_ABI.to_owned(),
     })
 }
 
@@ -427,7 +484,7 @@ mod tests {
         assert_ne!(arm, arm_v8, "a present variant cannot alias its absence");
 
         let exact = conversion_key(&base, linux_platform(&base.platform).unwrap()).unwrap();
-        assert_eq!(exact.flattener_abi, crate::image::oci::CONVERSION_ABI);
+        assert_eq!(exact.flattener_abi, crate::image::convert::FLATTENER_ABI);
         let mut other_abi = exact.clone();
         other_abi.flattener_abi.push_str(":next");
         assert_ne!(exact.digest().unwrap(), other_abi.digest().unwrap());
@@ -575,13 +632,11 @@ mod tests {
         use crate::store::models::storage::{
             BootBinding, BootProfile, RawLayout, RootFilesystem, RootSelector,
         };
-        use crate::store::{ImageStore, Store};
+        use crate::store::Store;
 
         const REFERENCE: &str = "example.test/app:1";
-        const MANIFEST: &str =
-            "sha256:5555555555555555555555555555555555555555555555555555555555555555";
-        const CONFIG: &str =
-            "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+        const MANIFEST: &str = crate::image::oci::tests::MANIFEST;
+        const CONFIG: &str = crate::image::oci::tests::CONFIG;
 
         struct Fixture {
             _temp: TempDir,
@@ -592,18 +647,16 @@ mod tests {
             initramfs: PathBuf,
             agent: PathBuf,
             resolved: crate::ResolvedOciImage,
-            stream: crate::storage::identity::StreamId,
-            rootfs_length: u64,
+            lower: crate::store::composition_store::RetainedComposition,
         }
 
         impl Fixture {
-            /// A complete OCI rootfs cache row over real pool bytes, so the
-            /// conversion path runs end to end without any registry traffic.
+            /// A pulled layered image over real corpus layers, so conversion
+            /// runs end to end without any registry traffic.
             async fn new() -> Self {
                 let temp = TempDir::new().unwrap();
                 let paths = crate::paths::LocalPaths::new(temp.path());
                 let store = Store::new(&paths).await.unwrap();
-                let pool = StoragePool::open(paths.images_dir()).unwrap();
                 let private = temp.path().join("packaged");
                 std::fs::create_dir(&private).unwrap();
                 let kernel = private.join("kernel");
@@ -615,37 +668,28 @@ mod tests {
                 for path in [&kernel, &initramfs, &agent] {
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
                 }
-                let rootfs = temp.path().join("flattened.raw");
-                let mut bytes = vec![0_u8; 8192];
-                bytes[1024..1032].copy_from_slice(b"ext4ish!");
-                bytes[8000] = 0x7f;
-                std::fs::write(&rootfs, &bytes).unwrap();
-                let published = pool.publish_stream(&rootfs).unwrap();
-                let metadata = oci::RootfsMetadata {
-                    requested_reference: REFERENCE.into(),
-                    selected_reference: format!("example.test/app@{MANIFEST}"),
-                    manifest_digest: MANIFEST.into(),
-                    config_digest: CONFIG.into(),
-                    config: OciImageConfigMetadata {
-                        entrypoint: Some(vec!["/bin/app".into()]),
-                        cmd: Some(vec!["--serve".into()]),
-                        env: Some(vec!["PATH=/usr/bin".into(), "MODE=prod".into()]),
-                        working_dir: Some("/srv".into()),
-                        user: Some("app".into()),
-                        ..OciImageConfigMetadata::default()
-                    },
-                    layers: vec![oci::RootfsLayerMetadata {
-                        blob_digest: format!("sha256:{}", "7".repeat(64)),
-                        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
-                        size_bytes: 10,
-                        diff_id: format!("sha256:{}", "8".repeat(64)),
-                    }],
-                    platform: oci::Platform::host().unwrap(),
-                    created_at_unix: 1,
+                let mut metadata = crate::image::oci::tests::metadata(REFERENCE, MANIFEST);
+                metadata.config = OciImageConfigMetadata {
+                    entrypoint: Some(vec!["/bin/app".into()]),
+                    cmd: Some(vec!["--serve".into()]),
+                    env: Some(vec!["PATH=/usr/bin".into(), "MODE=prod".into()]),
+                    working_dir: Some("/srv".into()),
+                    user: Some("app".into()),
+                    ..OciImageConfigMetadata::default()
                 };
-                let record =
-                    crate::image::oci::oci_image_record(&published, &metadata, REFERENCE).unwrap();
-                store.save_oci_image(&record).await.unwrap();
+                metadata.platform = oci::Platform::host().unwrap();
+                let (record, acquired) =
+                    crate::image::oci::tests::cache_image(&store, &metadata).await;
+                let lower = acquired.held.retained().clone();
+                drop(acquired);
+                // The fixture's own acquisition operation is closed; retire it
+                // so tests observe only operations conversion registers.
+                store
+                    .retire_abandoned_storage_operations(
+                        &StoragePool::open(paths.images_dir()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
                 let resolved =
                     crate::image::oci::cached_resolved_oci_image(&record, REFERENCE.into());
                 let producer =
@@ -660,8 +704,7 @@ mod tests {
                     initramfs,
                     agent,
                     resolved,
-                    stream: published.id,
-                    rootfs_length: published.length,
+                    lower,
                 }
             }
 
@@ -736,12 +779,8 @@ mod tests {
             let root = &info.record.root;
             assert_eq!(root.profile, SnapshotRootProfile::OpaqueRaw);
             assert_eq!(root.layout, RawLayout::WholeDisk);
-            assert_eq!(
-                root.stream.stream, fixture.stream,
-                "the flattened stream is reused"
-            );
-            assert_eq!(root.stream.length, fixture.rootfs_length);
-            assert_eq!(root.geometry.length, fixture.rootfs_length);
+            assert_eq!(root.stream.length, root.geometry.length);
+            assert!(root.geometry.length >= crate::image::convert::MINIMUM_SIZE_BYTES);
             assert_eq!(root.geometry.logical_sector_size, 512);
             let BootProfile::LinuxDirect {
                 binding,
@@ -786,12 +825,33 @@ mod tests {
             );
             assert_eq!(fixture.mapped_image().await, info.id.to_string());
             assert_eq!(fixture.count("storage_image").await, 1);
-            // The pool stream itself is immutable: conversion never rewrote it.
+            // A fresh ext4 stream, never the layered lower or a cache entry:
+            // the selection's retained composition is untouched.
             let pool = StoragePool::open(fixture.paths.images_dir()).unwrap();
             assert_eq!(
-                pool.verify_stream(&fixture.stream).unwrap().id(),
-                fixture.stream
+                pool.verify_stream(&root.stream.stream).unwrap().id(),
+                root.stream.stream
             );
+            let mut magic = [0_u8; 2];
+            std::os::unix::fs::FileExt::read_exact_at(
+                &std::fs::File::open(pool.stream_path(&root.stream.stream)).unwrap(),
+                &mut magic,
+                1024 + 0x38,
+            )
+            .unwrap();
+            assert_eq!(u16::from_le_bytes(magic), 0xef53);
+            assert_ne!(
+                root.stream.stream.as_bytes(),
+                fixture.lower.result.lower_stream.as_bytes()
+            );
+            let held = crate::store::layer_store::LayerStore::from_store(fixture.store.clone())
+                .hold_composition(fixture.lower.id)
+                .await
+                .unwrap();
+            assert_eq!(held.retained(), &fixture.lower);
+            // Streams are exactly the two layer packs and the converted root:
+            // conversion leaves no second flattened copy behind.
+            assert_eq!(pool.scan_streams().unwrap().count(), 3);
         }
 
         #[tokio::test]
