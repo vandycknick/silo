@@ -124,6 +124,8 @@ pub(crate) struct ImmutableStream {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ImmutableClosure {
+    pub(crate) composition: Option<crate::store::models::snapshot::SnapshotComposition>,
+    pub(crate) oci_source: Option<crate::image::oci::OciCompositionSource>,
     pub(crate) objects: Vec<ImmutableObject>,
     pub(crate) streams: Vec<ImmutableStream>,
 }
@@ -248,6 +250,132 @@ impl ObservationBody {
         {
             return Err(invalid("immutable closure is not canonical"));
         }
+        match (&self.storage.root, &self.immutable.composition) {
+            (
+                crate::MachineRoot::LinuxOverlay {
+                    lower: crate::OverlayLower::ErofsComposition { record, .. },
+                    ..
+                },
+                Some(composition),
+            ) if *record == composition.result => {}
+            (crate::MachineRoot::OpaqueRaw { .. }, None) => {}
+            _ => {
+                return Err(invalid(
+                    "immutable composition contradicts the machine root",
+                ))
+            }
+        }
+        if self.immutable.oci_source.is_some() && self.immutable.composition.is_none() {
+            return Err(invalid(
+                "OCI reconstruction provenance requires a composition",
+            ));
+        }
+        let crate::store::cache_paths::PoolDependencies {
+            streams: mut expected_streams,
+            objects: mut expected_objects,
+            ..
+        } = crate::store::cache_paths::storage_pool_dependencies(&self.storage)?;
+        if let Some(lower) = &self.immutable.composition {
+            lower.validate_shape()?;
+            expected_objects.extend(lower.objects());
+            for layer in &lower.layers {
+                expected_objects.insert(layer.pack.map);
+                expected_objects.extend(layer.pack.map_pages.iter().copied());
+                expected_streams.insert(layer.pack.stream);
+                let expected_pages = layer
+                    .pack
+                    .length
+                    .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
+                    .div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
+                if layer.pack.map_pages.len() as u64 != expected_pages {
+                    return Err(invalid(
+                        "immutable pack map coverage contradicts its length",
+                    ));
+                }
+                if self
+                    .immutable
+                    .streams
+                    .iter()
+                    .find(|entry| entry.stream == layer.pack.stream)
+                    .is_none_or(|entry| entry.length != layer.pack.length)
+                {
+                    return Err(invalid("immutable pack length contradicts the composition"));
+                }
+            }
+        }
+        if self
+            .immutable
+            .objects
+            .iter()
+            .map(|entry| entry.digest)
+            .ne(expected_objects.iter().copied())
+            || self
+                .immutable
+                .streams
+                .iter()
+                .map(|entry| entry.stream)
+                .ne(expected_streams.iter().copied())
+        {
+            return Err(invalid(
+                "immutable closure differs from the root and boot graph",
+            ));
+        }
+        let BootProfile::LinuxDirect {
+            binding:
+                crate::BootBinding::Pinned {
+                    kernel,
+                    base_initramfs,
+                    agent,
+                    ..
+                },
+            ..
+        } = &self.storage.boot
+        else {
+            return Err(invalid(
+                "handoff requires a pinned Linux direct boot closure",
+            ));
+        };
+        let mut bulk_objects = std::collections::BTreeSet::from([*kernel, *base_initramfs]);
+        bulk_objects.extend(agent.iter().copied());
+        for object in &self.immutable.objects {
+            let bound = if self
+                .immutable
+                .composition
+                .as_ref()
+                .is_some_and(|lower| lower.fsmeta == object.digest)
+            {
+                bulk_objects.insert(object.digest);
+                crate::storage::limits::Resource::FsmetaBytes
+            } else if bulk_objects.contains(&object.digest) {
+                crate::storage::limits::Resource::VirtualDiskBytes
+            } else {
+                crate::storage::limits::Resource::MetadataPageBytes
+            };
+            bound
+                .check(object.length)
+                .map_err(crate::storage::StorageError::from)?;
+        }
+        for stream in &self.immutable.streams {
+            crate::storage::limits::Resource::VirtualDiskBytes
+                .check(stream.length)
+                .map_err(crate::storage::StorageError::from)?;
+        }
+        crate::storage::limits::Resource::ArtifactStreamBytes
+            .sum(
+                self.immutable
+                    .streams
+                    .iter()
+                    .map(|entry| entry.length)
+                    .chain(self.writable.iter().map(|entry| entry.length))
+                    .chain(
+                        self.immutable
+                            .objects
+                            .iter()
+                            .filter(|entry| bulk_objects.contains(&entry.digest))
+                            .map(|entry| entry.length),
+                    ),
+            )
+            .map_err(crate::storage::StorageError::from)?;
         Ok(())
     }
 }

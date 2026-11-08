@@ -22,7 +22,7 @@ import pytest
 
 from silo_smoke import capture, fork, pause, procs, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
-from silo_smoke.cli import Silo, TIMINGS_PROPERTY, release
+from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo, TIMINGS_PROPERTY, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.restore import restore_image  # noqa: F401, pytest fixture
@@ -60,12 +60,10 @@ def require_fork(info: dict) -> None:
         "select the explicit isolated capture_candidate --restore --fork build", live["fork"])
 
 
-def create(silo: Silo, image: str, *flags: str, name: str = SOURCE, memory: str = "512mib",
-           profile: str = "raw", network: str = "none") -> None:
-    assert profile in {"raw", "flat"}
-    silo.create(name, image, "--cpus", "2", "--memory", memory, "--disk-size", "512mib",
-                "--vsock", "--network", network,
-                *(["--root-profile", "linux-flat-overlay-v1"] if profile == "flat" else []), *flags)
+def create(silo: Silo, image: str, *flags: str, profile: RootProfile, name: str = SOURCE,
+           memory: str = "512mib", network: str = "none") -> None:
+    silo.create(name, silo.root_image(image, profile), "--cpus", "2", "--memory", memory,
+                "--disk-size", "512mib", "--vsock", "--network", network, *flags)
 
 
 def witness_source(silo: Silo, name: str = SOURCE) -> Prepared:
@@ -86,7 +84,7 @@ def witness_source(silo: Silo, name: str = SOURCE) -> Prepared:
     return Prepared(info, initial, boot_id, pause.generation(silo, name), blob)
 
 
-def prepare(silo: Silo, image: str, *flags: str, memory: str = "512mib", profile: str = "raw",
+def prepare(silo: Silo, image: str, *flags: str, profile: RootProfile, memory: str = "512mib",
             network: str = "none") -> Prepared:
     create(silo, image, *flags, memory=memory, profile=profile, network=network)
     silo.start(SOURCE)
@@ -128,7 +126,7 @@ def private_inodes(silo: Silo, names: list[str], cut: Path) -> None:
     assert len(identities) == count, "writable source/sibling/cut inode alias"
 
 
-def continued(silo: Silo, call: fork.Call, prepared: Prepared, *, profile: str
+def continued(silo: Silo, call: fork.Call, prepared: Prepared, *, profile: RootProfile
               ) -> tuple[restore.Checkpoint, restore.Cut]:
     saved = fork.cut(silo, call, prepared.info, prepared.boot_id, prepared.generation)
     return saved, restore.matched_cut(silo, saved, prepared.initial, profile=profile)
@@ -168,9 +166,9 @@ def source_running(silo: Silo, prepared: Prepared) -> None:
 
 # -- acceptance -------------------------------------------------------------------
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
-    silo: Silo, restore_image: str, profile: str,  # noqa: F811
+    silo: Silo, restore_image: str, profile: RootProfile,  # noqa: F811
 ) -> None:
     prepared = prepare(silo, restore_image, "--forward", FORWARD, profile=profile, network="private")
     source_identity = lifecycle.guest_identity(silo, SOURCE)
@@ -270,7 +268,7 @@ def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
 def test_fork_child_failure_after_seal_names_that_child_and_keeps_siblings(
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
-    prepared = prepare(silo, restore_image)
+    prepared = prepare(silo, restore_image, profile="layered")
     failing = 2
     call = fork.run(silo, SOURCE, NAMES, hooks={failing: FAILING_HOOK}, expect=1)
     result = call.result
@@ -283,7 +281,7 @@ def test_fork_child_failure_after_seal_names_that_child_and_keeps_siblings(
     fork.journal_matches(silo, result)
     running = [index for index in range(len(NAMES)) if index != failing]
     fork.ordered_events(call, fork.events(silo, call.operation), running=running)
-    saved, cut = continued(silo, call, prepared, profile="raw")
+    saved, cut = continued(silo, call, prepared, profile="layered")
     survivors = running_children(silo, result, saved, prepared, cut)
     assert survivors == [NAMES[index] for index in running]
     live = [SOURCE, *survivors]
@@ -317,7 +315,7 @@ def failed_child(silo: Silo, child: dict) -> dict | None:
 def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
-    prepared = prepare(silo, restore_image)
+    prepared = prepare(silo, restore_image, profile="layered")
     report, operations = [], []
     for count in (1, 2, 4):
         names = [f"share-{count}-{index}" for index in range(count)]
@@ -352,10 +350,10 @@ def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
 def test_fork_children_outlive_source_deletion_and_gc_then_recapture(
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
-    prepared = prepare(silo, restore_image)
+    prepared = prepare(silo, restore_image, profile="layered")
     names = NAMES[:2]
     call = fork.run(silo, SOURCE, names, expect=0)
-    saved, cut = continued(silo, call, prepared, profile="raw")
+    saved, cut = continued(silo, call, prepared, profile="layered")
     assert running_children(silo, call.result, saved, prepared, cut) == names
     ram = saved.staging / "memory.ram"
     identity = (ram.stat().st_dev, ram.stat().st_ino)
@@ -373,7 +371,7 @@ def test_fork_children_outlive_source_deletion_and_gc_then_recapture(
     assert fork.observe(silo, call.operation)["stage"] == "finished"
     next_identity = restore.witness(silo, names[0], "arm")
     recaptured = restore.checkpoint(silo, names[0], alias="fork-recaptured")
-    next_cut = restore.matched_cut(silo, recaptured, next_identity, profile="raw")
+    next_cut = restore.matched_cut(silo, recaptured, next_identity, profile="layered")
     silo.run("resume", names[0])
     restore.restore_child(silo, recaptured, "fork-recaptured-child")
     restore.resumed(silo, "fork-recaptured-child", next_identity, next_cut)
@@ -473,7 +471,7 @@ def test_fork_refuses_count_memory_and_descriptor_budgets_before_freeze(
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
     ram = 1024 * MIB
-    prepared = prepare(silo, restore_image, memory="1gib")
+    prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
     # Count: 17 children exceed the default maximum of 16 without an explicit flag.
     refused_before_freeze(silo, prepared, [f"count-{index}" for index in range(17)])
     # Memory: the whole batch at 100% private allowance is twice MemAvailable.
@@ -508,14 +506,14 @@ def test_fork_whole_batch_refusal_counts_another_homes_admitted_batch_then_pre_s
     silo: Silo, other_silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
     ram = 1024 * MIB
-    prepared = prepare(silo, restore_image, memory="1gib")
+    prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
     available = mem_available()
     other_count = children_for(ram, int(0.6 * available))
     count = children_for(ram, int(0.6 * available))
     alone = batch_bytes(ram, count)
     assert alone < available and alone + batch_bytes(ram, other_count) > available
     other_names = [f"b{index}" for index in range(other_count)]
-    create(other_silo, restore_image, memory="1gib")
+    create(other_silo, restore_image, profile="layered", memory="1gib")
     traced = fork.TracedSource(other_silo, SOURCE, other_names, "capture-execution-sync",
                                "--max-children", str(other_count), "--private-write-percent", "100")
     try:
@@ -571,7 +569,7 @@ def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
     names = NAMES[:2]
-    create(silo, restore_image)
+    create(silo, restore_image, profile="layered")
     traced = fork.TracedSource(silo, SOURCE, names, "capture-source-sync")
     try:
         prepared = witness_source(silo)
@@ -590,7 +588,7 @@ def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest
         running = []
         if "running" in fork.outcomes(result):
             saved, cut = continued(silo, fork.Call(traced.operation, [], code, "", "", result, 0, 0),
-                                   prepared, profile="raw")
+                                   prepared, profile="layered")
             running = running_children(silo, result, saved, prepared, cut)
         for child in result["children"]:
             if child["outcome"]["kind"] == "cancelled":
@@ -615,7 +613,7 @@ def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
     names = NAMES[:2]
-    create(silo, restore_image)
+    create(silo, restore_image, profile="layered")
     traced = fork.TracedSource(silo, SOURCE, names, "capture-execution-sync")
     try:
         prepared = witness_source(silo)
@@ -649,7 +647,7 @@ def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
 def test_fork_manager_killed_during_child_construction_recovers_without_orphans(
     silo: Silo, restore_image: str,  # noqa: F811
 ) -> None:
-    prepared = prepare(silo, restore_image)
+    prepared = prepare(silo, restore_image, profile="layered")
     process, args, operation, dispatched = fork.spawn(silo, SOURCE, NAMES)
     try:
         def constructing() -> bool:
@@ -668,7 +666,7 @@ def test_fork_manager_killed_during_child_construction_recovers_without_orphans(
     assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
     assert set(fork.outcomes(result)) <= {"running", "abandoned", "failed"}, result
     saved, cut = continued(silo, fork.Call(operation, args, call.returncode, "", "", result,
-                                           call.dispatched_ns, call.exited_ns), prepared, profile="raw")
+                                           call.dispatched_ns, call.exited_ns), prepared, profile="layered")
     running = running_children(silo, result, saved, prepared, cut)
     for child in result["children"]:
         if child["outcome"]["kind"] == "running":

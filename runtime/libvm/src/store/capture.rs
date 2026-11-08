@@ -33,9 +33,7 @@ use crate::store::snapshot_store::{
     CaptureSpaceCharge, CaptureState, SnapshotInfo, SnapshotRef, SnapshotStore,
 };
 use crate::store::{MachineStore, Store};
-use crate::{
-    BootBinding, BootProfile, DiskStorage, LibVmError, MachineRoot, OverlayLower, RawLayout,
-};
+use crate::{BootBinding, BootProfile, DiskStorage, LibVmError, MachineRoot, RawLayout};
 
 impl SnapshotStore {
     /// Plans, pins and reserves the complete peak before the monitor may freeze.
@@ -186,11 +184,10 @@ impl SnapshotStore {
                 .check(attachment.geometry.length)
                 .map_err(StorageError::from)?;
             if attachment.read_only {
-                let stream = read_only_identity(&storage, index as u32, attachment.role)?;
                 read_only_inputs.push(CaptureReadOnlyInput {
                     attachment_index: index as u32,
                     block_id: attachment.block_id.clone(),
-                    identity: stream.to_string(),
+                    identity: read_only_identity(&storage, index as u32, attachment.role)?,
                 });
             } else {
                 let source = if attachment.role == vm_spec::DiskRole::Data
@@ -414,6 +411,7 @@ impl SnapshotStore {
         sqlx::query("INSERT INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(record.capture_id.to_string()).bind(launch.operation_id.to_string()).execute(&mut *tx).await?;
         tx.commit().await?;
         drop(_roots);
         self.store.reserve_capture_inventory(&record).await?;
@@ -860,7 +858,21 @@ impl SnapshotStore {
             .await?;
         drop(roots);
         let mut immutable = BTreeMap::new();
+        let mut lower_graph = None;
         for input in &record.plan.read_only_inputs {
+            let attachment = record
+                .plan
+                .configuration
+                .attachments
+                .get(input.attachment_index as usize)
+                .ok_or_else(|| invalid("read-only input attachment is absent"))?;
+            if attachment.role == vm_spec::DiskRole::RootLower {
+                lower_graph = Some(
+                    self.capture_lower_graph(capture, &record, input, attachment, &boot)
+                        .await?,
+                );
+                continue;
+            }
             let stream = input.identity.parse().map_err(invalid)?;
             let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE operation_id=?1 AND stream_id=?2)")
                 .bind(capture.to_string()).bind(input.identity.clone()).fetch_one(&self.store.pool).await?;
@@ -870,12 +882,6 @@ impl SnapshotStore {
                 ));
             }
             let map = pool.verify_stream(&stream)?;
-            let attachment = record
-                .plan
-                .configuration
-                .attachments
-                .get(input.attachment_index as usize)
-                .ok_or_else(|| invalid("read-only input attachment is absent"))?;
             if map.length() != attachment.geometry.length {
                 return Err(invalid("read-only input geometry changed"));
             }
@@ -904,12 +910,7 @@ impl SnapshotStore {
                 geometry, layout, ..
             } => (SnapshotRootProfile::OpaqueRaw, layout.clone(), *geometry),
             MachineRoot::LinuxOverlay {
-                lower:
-                    OverlayLower::FlatExt4 {
-                        geometry,
-                        filesystem_uuid,
-                        ..
-                    },
+                lower: root_lower,
                 upper_uuid,
                 ext4_profile,
                 overlay_profile,
@@ -917,14 +918,14 @@ impl SnapshotStore {
                 capacity,
                 ..
             } => {
-                let lower = immutable
-                    .remove(&0)
+                let lower = lower_graph
+                    .take()
                     .ok_or_else(|| invalid("overlay lower input is missing"))?;
                 (
                     SnapshotRootProfile::LinuxOverlay {
-                        lower,
-                        lower_geometry: *geometry,
-                        lower_filesystem_uuid: *filesystem_uuid,
+                        lower: Box::new(lower),
+                        lower_geometry: root_lower.geometry(),
+                        lower_filesystem_uuid: root_lower.filesystem_uuid(),
                         upper_uuid: *upper_uuid,
                         ext4_profile: *ext4_profile,
                         overlay_profile: *overlay_profile,
@@ -937,7 +938,6 @@ impl SnapshotStore {
                     },
                 )
             }
-            _ => return Err(invalid("capture root lacks an admitted immutable closure")),
         };
         let mut disks = Vec::new();
         for (order, attachment) in record
@@ -982,7 +982,7 @@ impl SnapshotStore {
         if memory.stream.as_bytes() != memory_evidence.ram_stream.as_bytes() {
             return Err(invalid("capture RAM canonical identity mismatch"));
         }
-        if !streams.is_empty() || !immutable.is_empty() {
+        if !streams.is_empty() || !immutable.is_empty() || lower_graph.is_some() {
             return Err(invalid("capture has unconsumed stream roles"));
         }
         let take = |role: CaptureRole| {
@@ -1044,6 +1044,64 @@ impl SnapshotStore {
         self.store.complete_capture_peak(capture).await?;
         drop(lease);
         Ok(result)
+    }
+}
+
+impl SnapshotStore {
+    /// The exact retained graph of a capture's layered lower. The capture
+    /// inherited the launch's lower pin; the graph's objects and pack streams
+    /// (already rooted by that composition) are pinned to the capture so its
+    /// publication closure is complete. No pack byte is read.
+    async fn capture_lower_graph(
+        &self,
+        capture: Uuid,
+        record: &CaptureRecord,
+        input: &CaptureReadOnlyInput,
+        attachment: &vm_spec::capture::CaptureAttachment,
+        boot: &BootProfile,
+    ) -> Result<crate::store::models::snapshot::SnapshotComposition, LibVmError> {
+        let MachineRoot::LinuxOverlay {
+            lower: root_lower, ..
+        } = &record.storage.root
+        else {
+            return Err(invalid("captured lower input has no layered root"));
+        };
+        let lower: crate::storage::identity::LowerResultId =
+            input.identity.parse().map_err(invalid)?;
+        if input.attachment_index != 0
+            || lower != root_lower.record()
+            || attachment.geometry.length != root_lower.geometry().length
+        {
+            return Err(invalid(
+                "captured lower input differs from its retained root identity",
+            ));
+        }
+        let pinned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_lower WHERE operation_id=?1 AND lower_id=?2)")
+            .bind(capture.to_string()).bind(lower.to_string()).fetch_one(&self.store.pool).await?;
+        if !pinned {
+            return Err(invalid("captured lower was not pinned before access"));
+        }
+        let layers = crate::store::layer_store::LayerStore::from_store((*self.store).clone());
+        let retained = layers.retained_composition(lower).await?;
+        retained.check_lower(root_lower)?;
+        crate::machine::root_storage::check_lower_platform(&retained.recipe.platform, boot)?;
+        let graph = layers.snapshot_composition(lower).await?;
+        if graph.result != lower || graph.record != retained.record_digest {
+            return Err(invalid(
+                "captured lower graph differs from its retained result",
+            ));
+        }
+        let mut streams = Vec::with_capacity(graph.layers.len());
+        let mut objects = graph.objects().collect::<Vec<_>>();
+        for layer in &graph.layers {
+            streams.push(layer.pack.stream);
+            objects.push(layer.pack.map);
+            objects.extend(layer.pack.map_pages.iter().copied());
+        }
+        self.store
+            .pin_published_storage_dependencies(capture, &streams, &objects)
+            .await?;
+        Ok(graph)
     }
 }
 
@@ -1255,26 +1313,25 @@ fn writable_path(
     }
 }
 
+/// The canonical identity a capture plan binds for one read-only attachment:
+/// the retained composition `LowerResultId` of a layered lower, or the
+/// managed stream of a read-only Data disk.
 fn read_only_identity(
     storage: &crate::MachineStorageRecord,
     order: u32,
     role: vm_spec::DiskRole,
-) -> Result<crate::storage::identity::StreamId, LibVmError> {
+) -> Result<String, LibVmError> {
     match (&storage.root, role) {
-        (
-            MachineRoot::LinuxOverlay {
-                lower: OverlayLower::FlatExt4 { stream, .. },
-                ..
-            },
-            vm_spec::DiskRole::RootLower,
-        ) if order == 0 => Ok(*stream),
+        (MachineRoot::LinuxOverlay { lower, .. }, vm_spec::DiskRole::RootLower) if order == 0 => {
+            Ok(lower.record().to_string())
+        }
         (_, vm_spec::DiskRole::Data) => storage
             .disks
             .iter()
             .find_map(|disk| {
                 if disk.order == order {
                     match &disk.storage {
-                        DiskStorage::ManagedReadOnly { stream, .. } => Some(*stream),
+                        DiskStorage::ManagedReadOnly { stream, .. } => Some(stream.to_string()),
                         _ => None,
                     }
                 } else {
@@ -2148,6 +2205,7 @@ impl SnapshotStore {
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
+                    sqlx::query("INSERT OR IGNORE INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(operation.to_string()).bind(capture.to_string()).execute(&mut *tx).await?;
                     tx.commit().await?;
                     // Only the disks' held inodes and maps outlive verification;
                     // state-role descriptors close here exactly as before.
@@ -2994,10 +3052,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(consumer.record.boot, fixture.launch.storage_record().boot);
-        let (_, boot_objects) = crate::store::cache_paths::storage_pool_dependencies(
+        let boot_objects = crate::store::cache_paths::storage_pool_dependencies(
             &fixture.reservation.record.storage,
         )
-        .unwrap();
+        .unwrap()
+        .objects;
         assert!(!boot_objects.is_empty());
         let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
             &consumer.record.capture
@@ -4853,11 +4912,12 @@ pub(crate) mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes) VALUES(?1,?2,?3,?4)")
+        sqlx::query("INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) VALUES(?1,?2,?3,?4,?5)")
             .bind(fixture.reservation.record.capture_id.to_string())
             .bind(info.id.to_string())
             .bind(object.digest.to_string())
             .bind(&bytes)
+            .bind(fixture.reservation.record.plan.canonical_bytes().unwrap())
             .execute(&mut *tx)
             .await
             .unwrap();

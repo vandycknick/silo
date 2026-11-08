@@ -117,8 +117,9 @@ def test_daemon_managed_disk_create_update_remove(
 ) -> None:
     daemon.start()
     daemon.wait_core("ready")
+    # The copied file must be an opaque whole-disk root, so convert explicitly.
     source = silo.create(
-        "disk-a", basic_image, "--cpus", "1", "--memory", "512mb",
+        "disk-a", silo.raw_image(basic_image), "--cpus", "1", "--memory", "512mb",
         "--network", "none",
     )
     assert source["state"] == "stopped"

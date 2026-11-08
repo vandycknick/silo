@@ -19,12 +19,12 @@ use vm_spec::{Boot, Hardware, Kernel, VmSpec};
 
 use crate::image::{
     oci::{
-        cached_resolved_oci_image, image_error, materialized_image,
-        resolve_oci_image_from_registry, verify_cached_image,
+        acquire_composition, cached_resolved_oci_image, image_error, materialized_image,
+        resolve_oci_image_from_registry,
     },
     ImageDetail, ImageHandle, ImageProgress, ImageProgressSender, ImagePruneReport,
     ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images, MaterializedImage,
-    ResolvedOciImage,
+    MaterializedRoot, ResolvedOciImage,
 };
 use crate::machine::{
     EgressCredentials, Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind,
@@ -613,7 +613,7 @@ impl Runtime {
         )
     }
 
-    pub(crate) fn qualify_flat_overlay(
+    pub(crate) fn qualify_erofs_overlay(
         &self,
         kernel: Option<&Path>,
         initramfs: Option<&Path>,
@@ -632,7 +632,7 @@ impl Runtime {
                 })
             }
         };
-        crate::boot_qualification::admit_flat_overlay(
+        crate::boot_qualification::admit_erofs_overlay(
             &assets.kernel,
             &assets.initramfs,
             architecture,
@@ -832,18 +832,19 @@ impl Runtime {
         };
         let stream = &consumer.info.record.root.stream;
         Ok(MaterializedImage {
-            rootfs_path: pool.stream_path(&stream.stream),
-            stream: Some(stream.stream),
+            root: MaterializedRoot::Raw {
+                stream: stream.stream,
+                size_bytes: stream.length,
+                authenticated,
+            },
             requested_reference,
             selected_reference: Some(source.to_string()),
             source_kind,
             image_id: Some(consumer.info.id.to_string()),
             manifest_digest: None,
             config_digest: None,
-            size_bytes: stream.length,
             platform,
             managed: Some(consumer),
-            authenticated: Some(authenticated),
             _lease: None,
         })
     }
@@ -908,28 +909,20 @@ impl Runtime {
     ) -> Result<MaterializedImage, LibVmError> {
         let runtime = self.clone();
         let resolved = resolved.clone();
-        // Cancellation of the caller must not retire the operation while its
-        // filesystem workers still authenticate or publish the flattened root.
+        // Cancellation of the caller must not abandon acquisition while its
+        // workers still authenticate or publish the retained composition.
         tokio::spawn(async move {
             let producer = runtime
                 .image_store()
                 .map_err(|error| image_error(&resolved.requested_reference, error))?;
-            let operation_id = uuid::Uuid::new_v4();
-            let lease = runtime.store.begin_storage_operation(operation_id).await?;
-            let rootfs = crate::image::oci::acquire_rootfs(
-                &*runtime.store,
-                runtime.local_images_dir(),
+            let acquired = acquire_composition(
+                &runtime.native_store()?,
                 &producer,
                 runtime.image_progress.as_ref(),
                 &resolved,
-                operation_id,
             )
             .await?;
-            Ok(materialized_image(
-                rootfs.record,
-                &resolved.requested_reference,
-                lease,
-            ))
+            Ok(materialized_image(acquired, &resolved.requested_reference))
         })
         .await?
     }
@@ -944,18 +937,12 @@ impl Runtime {
             .candidates(reference)
             .map_err(|error| image_error(reference, error))?
         {
-            if let Some(mut image) = self
+            if let Some(image) = self
                 .store
                 .cached_oci_image(&candidate.to_string(), platform)
                 .await?
             {
-                let images = self.local_images_dir().to_path_buf();
-                return tokio::task::spawn_blocking(move || {
-                    verify_cached_image(&mut image, &images)?;
-                    Ok(Some(image))
-                })
-                .await
-                .map_err(|error| io::Error::other(error.to_string()))?;
+                return Ok(Some(image));
             }
         }
         Ok(None)
@@ -1508,11 +1495,7 @@ impl Runtime {
         }
         validate_launch_storage(&storage)?;
         crate::machine::root_storage::validate_spec(&storage, &config.spec)?;
-        crate::store::operation_store::preflight_launch_storage(
-            &storage,
-            &config.spec,
-            self.local_images_dir(),
-        )?;
+        crate::store::operation_store::preflight_launch_storage(&storage, &config.spec)?;
         Ok(storage)
     }
 
@@ -1638,13 +1621,15 @@ impl Runtime {
                     });
             }
             let (kernel, initramfs) = boot_asset_overrides_from_spec(&config.spec);
-            Ok(Some(self.qualify_flat_overlay(kernel, initramfs)?))
+            Ok(Some(self.qualify_erofs_overlay(kernel, initramfs)?))
         } else {
             Ok(None)
         }
     }
 
-    pub(crate) fn prepare_machine_root(
+    /// The layered lower is leased (layers, packs and fsmeta) before any VMDK
+    /// preflight and the lease is held by the prepared root through launch.
+    pub(crate) async fn prepare_machine_root(
         &self,
         config: &MachineConfig,
         storage: &crate::MachineStorageRecord,
@@ -1659,10 +1644,19 @@ impl Runtime {
                 .filter(|disk| disk.role == vm_spec::DiskRole::Data)
                 .count() as u64
         });
+        let lower = match &storage.root {
+            crate::MachineRoot::LinuxOverlay { lower, .. } if qualification.is_some() => Some(
+                crate::store::layer_store::LayerStore::from_store(self.native_store()?)
+                    .launch_lower(lower)
+                    .await?,
+            ),
+            _ => None,
+        };
         crate::machine::root_storage::prepare(
             storage,
             &config.machine_dir,
             self.local_images_dir(),
+            lower,
             data_disks,
             qualification,
             effective.rosetta,
@@ -2628,10 +2622,7 @@ fn validate_launch_storage(storage: &crate::MachineStorageRecord) -> Result<(), 
             storage.backend
         ),
         (
-            MachineRoot::LinuxOverlay {
-                lower: crate::OverlayLower::FlatExt4 { .. },
-                ..
-            },
+            MachineRoot::LinuxOverlay { .. },
             BootProfile::LinuxDirect {
                 root_selector: RootSelector::ManagedOverlay,
                 ..
@@ -2977,7 +2968,7 @@ pub(crate) mod tests {
                 .contains("run_id")
         );
     }
-    use crate::image::oci::oci_image_record;
+    use crate::image::MaterializedRoot;
     use crate::lock_manager::LockId;
     use crate::paths::LocalPaths;
     use crate::runtime::core::{
@@ -2994,10 +2985,10 @@ pub(crate) mod tests {
     use crate::OciImageConfigMetadata;
     use crate::Platform;
     use crate::{
-        GuestPublish, ImageCacheState, ImageProgress, ImageProgressSender, ImagePullOptions,
-        ImagePullPolicy, ImageResolveOptions, ImageSource, LibVmError, MachineExitOutcome,
-        MachineKillOptions, MachineRef, MachineRetention, MachineRunId, MachineStatus,
-        MachineUpdate, Memory, PublishBind, RuntimeNetworkingConfig,
+        GuestPublish, ImageCacheState, ImagePullOptions, ImagePullPolicy, ImageResolveOptions,
+        ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef,
+        MachineRetention, MachineRunId, MachineStatus, MachineUpdate, Memory, PublishBind,
+        RuntimeNetworkingConfig,
     };
     use oci::RootfsMetadata;
     use silo_policy::NetworkPolicy;
@@ -3113,6 +3104,8 @@ pub(crate) mod tests {
                         &oci::Platform::host().unwrap(),
                     )
                     .unwrap(),
+                    rosetta: rootfs_spec::RosettaMode::Required,
+                    _lower: None,
                 },
             )
             .expect_err("reject ineligible durable contract");
@@ -3121,37 +3114,25 @@ pub(crate) mod tests {
         assert!(!runtime.machine_paths(config.id).vm_spec_path().exists());
     }
 
+    /// Cache a real retained composition of the corpus layers under an OCI
+    /// reference; the image catalog row alone roots it once the hold ends.
     pub(crate) async fn write_cached_oci_rootfs(
         runtime: &Runtime,
-        paths: &LocalPaths,
         requested_reference: &str,
         manifest_digest: &str,
         config_digest: &str,
     ) -> RootfsMetadata {
-        let source = paths.home().join("cache-fixture.raw");
-        std::fs::write(&source, [0x5a_u8; 512]).unwrap();
-        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
-        let published = pool.publish_stream(&source).unwrap();
-        std::fs::remove_file(source).unwrap();
-        let repository = requested_reference.split('@').next().unwrap();
-        let repository = repository
-            .rsplit_once(':')
-            .map_or(repository, |(repository, _)| repository);
-        let metadata = RootfsMetadata {
-            requested_reference: requested_reference.into(),
-            selected_reference: format!("{repository}@{manifest_digest}"),
-            manifest_digest: manifest_digest.into(),
-            config_digest: config_digest.into(),
-            config: OciImageConfigMetadata {
-                cmd: Some(vec!["serve".into()]),
-                ..OciImageConfigMetadata::default()
-            },
-            layers: Vec::new(),
-            platform: Platform::host().unwrap(),
-            created_at_unix: 7,
+        let mut metadata = crate::image::oci::tests::metadata(requested_reference, manifest_digest);
+        metadata.config_digest = config_digest.into();
+        metadata.config = OciImageConfigMetadata {
+            cmd: Some(vec!["serve".into()]),
+            ..OciImageConfigMetadata::default()
         };
-        let record = oci_image_record(&published, &metadata, requested_reference).unwrap();
-        runtime.store.save_oci_image(&record).await.unwrap();
+        metadata.platform = Platform::host().unwrap();
+        let (_record, acquired) =
+            crate::image::oci::tests::cache_image(&runtime.native_store().unwrap(), &metadata)
+                .await;
+        drop(acquired);
         metadata
     }
 
@@ -3324,7 +3305,6 @@ pub(crate) mod tests {
         let reference = "example.invalid/demo:latest";
         write_cached_oci_rootfs(
             &runtime,
-            &paths,
             reference,
             &format!("sha256:{}", "a".repeat(64)),
             &format!("sha256:{}", "b".repeat(64)),
@@ -3336,13 +3316,16 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
-        let stream = record.artifact.stream_id;
+        let lower = record.artifact.lower;
         runtime.store.native_store().unwrap().close().await;
         drop(runtime);
         std::fs::rename(&original, &relocated).unwrap();
         let paths = LocalPaths::new(relocated);
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
+            .unwrap();
+        let pool = crate::storage::pool::StoragePool::open_existing(paths.images_dir())
+            .unwrap()
             .unwrap();
         for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
             let resolved = runtime
@@ -3353,113 +3336,14 @@ pub(crate) mod tests {
                 .materialize_resolved_oci_image(&resolved)
                 .await
                 .unwrap();
-            assert_eq!(image.stream, Some(stream));
-            assert_eq!(
-                image.rootfs_path,
-                paths.images_dir().join("streams/sha256").join(stream.hex())
-            );
-            assert!(!image.rootfs_path.starts_with(&original));
+            let MaterializedRoot::Layered(held) = &image.root else {
+                panic!("an OCI image materializes its retained composition");
+            };
+            assert_eq!(held.retained().id, lower);
+            let fsmeta = pool.object_path(&held.retained().fsmeta());
+            assert!(fsmeta.starts_with(paths.images_dir()));
+            assert!(!fsmeta.starts_with(&original));
         }
-    }
-
-    #[tokio::test]
-    async fn retained_stream_corruption_is_rejected_for_offline_pull_policies() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = LocalPaths::new(temp.path().join("silo"));
-        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
-            .await
-            .unwrap();
-        let reference = "example.invalid/demo:latest";
-        write_cached_oci_rootfs(
-            &runtime,
-            &paths,
-            reference,
-            &format!("sha256:{}", "a".repeat(64)),
-            &format!("sha256:{}", "b".repeat(64)),
-        )
-        .await;
-        let platform = Platform::host().unwrap();
-        let record = runtime
-            .store
-            .cached_oci_image(reference, &platform)
-            .await
-            .unwrap()
-            .unwrap();
-        std::fs::set_permissions(
-            &record.artifact.rootfs_path,
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        std::fs::write(&record.artifact.rootfs_path, b"corrupted").unwrap();
-        std::fs::set_permissions(
-            &record.artifact.rootfs_path,
-            std::fs::Permissions::from_mode(0o400),
-        )
-        .unwrap();
-        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
-            let error = runtime
-                .resolve_oci_image(reference.into(), policy, None)
-                .await
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                LibVmError::Storage(crate::storage::StorageError::ContentMismatch(_))
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn warm_cache_requires_readonly_single_link_owned_streams() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = LocalPaths::new(temp.path().join("home"));
-        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
-            .await
-            .unwrap();
-        let reference = "example.invalid/demo:latest";
-        write_cached_oci_rootfs(
-            &runtime,
-            &paths,
-            reference,
-            &format!("sha256:{}", "a".repeat(64)),
-            &format!("sha256:{}", "b".repeat(64)),
-        )
-        .await;
-        let record = runtime
-            .store
-            .cached_oci_image(reference, &Platform::host().unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        let path = &record.artifact.rootfs_path;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(
-            runtime
-                .resolve_oci_image(reference.into(), ImagePullPolicy::Never, None)
-                .await,
-            Err(LibVmError::Storage(
-                crate::storage::StorageError::InvalidPath(_)
-            ))
-        ));
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
-        let alias = paths.home().join("unexpected-hardlink");
-        std::fs::hard_link(path, &alias).unwrap();
-        assert!(matches!(
-            runtime
-                .resolve_oci_image(reference.into(), ImagePullPolicy::Never, None)
-                .await,
-            Err(LibVmError::Storage(
-                crate::storage::StorageError::InvalidPath(_)
-            ))
-        ));
-        std::fs::remove_file(alias).unwrap();
-        assert_eq!(
-            runtime
-                .resolve_oci_image(reference.into(), ImagePullPolicy::Never, None)
-                .await
-                .unwrap()
-                .cache_state,
-            ImageCacheState::Complete
-        );
     }
 
     #[test]
@@ -3497,7 +3381,7 @@ pub(crate) mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        let metadata = write_cached_oci_rootfs(&runtime, &paths, REFERENCE, MANIFEST, CONFIG).await;
+        let metadata = write_cached_oci_rootfs(&runtime, REFERENCE, MANIFEST, CONFIG).await;
         let before = runtime.images().list().await.unwrap();
 
         for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
@@ -3550,8 +3434,8 @@ pub(crate) mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        write_cached_oci_rootfs(&runtime, &paths, FIRST_REFERENCE, MANIFEST, CONFIG).await;
-        write_cached_oci_rootfs(&runtime, &paths, SECOND_REFERENCE, MANIFEST, CONFIG).await;
+        write_cached_oci_rootfs(&runtime, FIRST_REFERENCE, MANIFEST, CONFIG).await;
+        write_cached_oci_rootfs(&runtime, SECOND_REFERENCE, MANIFEST, CONFIG).await;
 
         let handle = runtime
             .images()
@@ -3593,15 +3477,25 @@ pub(crate) mod tests {
         let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
             .await
             .expect("open runtime");
-        let metadata = write_cached_oci_rootfs(&runtime, &paths, REFERENCE, MANIFEST, CONFIG).await;
-        let artifact_dir = runtime
+        let metadata = write_cached_oci_rootfs(&runtime, REFERENCE, MANIFEST, CONFIG).await;
+        let lower = runtime
             .store
             .cached_oci_image(REFERENCE, &Platform::host().unwrap())
             .await
             .unwrap()
             .unwrap()
             .artifact
-            .rootfs_path;
+            .lower;
+        let artifact_dir = crate::storage::pool::StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap()
+            .object_path(
+                &crate::store::layer_store::LayerStore::from_store(runtime.native_store().unwrap())
+                    .retained_composition(lower)
+                    .await
+                    .unwrap()
+                    .fsmeta(),
+            );
 
         runtime
             .images()
@@ -3656,7 +3550,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_image_builder_persists_the_selected_identity() {
+    async fn resolved_image_creation_refuses_unqualified_layered_boot_without_effects() {
         const REFERENCE: &str = "example.invalid/demo:mutable";
         const MANIFEST: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -3682,10 +3576,8 @@ pub(crate) mod tests {
             test_utils::direct_kernel::host_kernel("unit-test packaged boot asset"),
         )
         .unwrap();
-        let metadata = write_cached_oci_rootfs(&runtime, &paths, REFERENCE, MANIFEST, CONFIG).await;
-        let (progress, mut progress_events) = ImageProgressSender::default_channel();
-        let progress_runtime = runtime.clone().with_image_progress(progress);
-        let resolved = progress_runtime
+        let metadata = write_cached_oci_rootfs(&runtime, REFERENCE, MANIFEST, CONFIG).await;
+        let resolved = runtime
             .images()
             .resolve_with(
                 REFERENCE,
@@ -3696,56 +3588,30 @@ pub(crate) mod tests {
             )
             .await
             .expect("resolve cached image");
-        let selected_reference = resolved.selected_reference.clone();
-
-        let machine = progress_runtime
+        assert_eq!(resolved.selected_reference, metadata.selected_reference);
+        // The OCI source selects the layered root; no exact boot tuple is
+        // admitted, so creation is refused before acquisition or effects.
+        let error = runtime
             .machine()
             .name("resolved-image")
             .resolved_image(resolved)
             .create()
             .await
-            .expect("create machine from resolved image");
-        drop(progress_runtime);
-        let mut events = Vec::new();
-        while let Some(event) = progress_events.recv().await {
-            events.push(event);
-        }
-        assert_eq!(
-            events,
-            [
-                ImageProgress::CheckingCache {
-                    image_ref: REFERENCE.to_string(),
-                },
-                ImageProgress::CacheHit {
-                    image_ref: REFERENCE.to_string(),
-                },
-                ImageProgress::Complete,
-            ]
+            .expect_err("unqualified layered boot must not create");
+        assert!(
+            matches!(
+                error,
+                LibVmError::OverlayBootQualification(_)
+                    | LibVmError::OverlayBackendUnsupported { .. }
+                    | LibVmError::BackendAdmissionRejected { .. }
+            ),
+            "{error}"
         );
-        let rootfs = runtime
-            .store
-            .machine_rootfs(machine.machine_id())
+        assert!(runtime
+            .machine_config_by_name("resolved-image")
             .await
-            .expect("read rootfs pin")
-            .expect("machine rootfs pin");
-
-        assert_eq!(rootfs.requested_reference, REFERENCE);
-        assert_eq!(
-            rootfs.selected_reference.as_deref(),
-            Some(selected_reference.as_str())
-        );
-        assert_eq!(rootfs.manifest_digest.as_deref(), Some(MANIFEST));
-        assert_eq!(rootfs.config_digest.as_deref(), Some(CONFIG));
-        assert_eq!(
-            runtime
-                .images()
-                .get(REFERENCE)
-                .await
-                .expect("read persisted image")
-                .expect("persisted image")
-                .selected_reference,
-            metadata.selected_reference
-        );
+            .unwrap()
+            .is_none());
     }
 
     struct TestMachineCreate {
@@ -6520,7 +6386,6 @@ pub(crate) mod tests {
         let reference = "example.invalid/demo:latest";
         write_cached_oci_rootfs(
             &runtime,
-            &paths,
             reference,
             &format!("sha256:{}", "a".repeat(64)),
             &format!("sha256:{}", "b".repeat(64)),

@@ -691,6 +691,40 @@ pub(crate) struct DestinationState {
     pub(crate) inventory: Arc<Inventory>,
     pub(crate) prior: Option<Arc<PriorOwner>>,
     pub(crate) verified: HashSet<ObjectDigest>,
+    acquisition: Option<PendingCompositionAcquisition>,
+}
+
+/// Exact graph metadata is transferred first. Only after it is retained may a
+/// destination try its own admitted OCI encoder; unavailable sources or any
+/// mismatch immediately restore the ordinary exact-artifact transfer path.
+struct PendingCompositionAcquisition {
+    metadata: BTreeSet<ObjectDigest>,
+    fsmeta: ObjectDigest,
+}
+
+impl PendingCompositionAcquisition {
+    fn for_plan(plan: &ApprovedPlan) -> Option<Self> {
+        let closure = &plan.body().observation.immutable;
+        closure.oci_source.as_ref()?;
+        let lower = closure.composition.as_ref()?;
+        let mut metadata = BTreeSet::from([lower.record, lower.recipe]);
+        for layer in &lower.layers {
+            metadata.extend([layer.recipe, layer.result, layer.index_root, layer.pack.map]);
+            metadata.extend(layer.index_pages.iter().copied());
+            metadata.extend(layer.pack.map_pages.iter().copied());
+        }
+        Some(Self {
+            metadata,
+            fsmeta: lower.fsmeta,
+        })
+    }
+
+    fn defers(&self, descriptor: &PayloadDescriptor) -> bool {
+        match descriptor {
+            PayloadDescriptor::Object { digest, .. } => *digest == self.fsmeta,
+            PayloadDescriptor::StreamMap { .. } | PayloadDescriptor::Chunk { .. } => true,
+        }
+    }
 }
 
 /// One inventory entry's local state. A pool object verified outside root
@@ -735,6 +769,7 @@ impl DestinationState {
             inventory: Arc::new(Inventory::build(&plan, &files, &whole)?),
             prior: PriorOwner::load(runtime, &plan).await?.map(Arc::new),
             verified: HashSet::new(),
+            acquisition: PendingCompositionAcquisition::for_plan(&plan),
         })
     }
 
@@ -749,6 +784,71 @@ impl DestinationState {
         let (key, _) = inventory_key(&plan, &files, &self.inventory.whole)?;
         if key != self.inventory.key {
             self.inventory = Arc::new(Inventory::build(&plan, &files, &self.inventory.whole)?);
+        }
+        Ok(())
+    }
+
+    async fn acquire_composition(
+        &mut self,
+        runtime: &Runtime,
+        operation: OperationId,
+    ) -> Result<(), LibVmError> {
+        let Some(pending) = &self.acquisition else {
+            return Ok(());
+        };
+        let pool = StoragePool::open(runtime.local_images_dir())?;
+        if pending
+            .metadata
+            .iter()
+            .any(|digest| !pool.object_path(digest).is_file())
+        {
+            return Ok(());
+        }
+        let plan = crate::handoff::source::stored_plan(runtime, operation)?;
+        let closure = &plan.body().observation.immutable;
+        let (Some(expected), Some(source)) = (&closure.composition, &closure.oci_source) else {
+            return Err(invalid(
+                "OCI acquisition lost its approved composition provenance",
+            ));
+        };
+        self.acquisition = None;
+        let exact_present = pool.object_path(&expected.fsmeta).is_file()
+            && expected
+                .layers
+                .iter()
+                .all(|layer| pool.stream_path(&layer.pack.stream).is_file());
+        let acquired = if exact_present {
+            // Retained exact bytes are authoritative even when OCI sources
+            // and every historical encoder have disappeared.
+            crate::store::layer_store::LayerStore::open(runtime.local_home())
+                .await?
+                .publish_snapshot_composition(operation.as_uuid(), expected)
+                .await
+        } else {
+            crate::image::oci::prepare_exact_composition(
+                runtime,
+                operation.as_uuid(),
+                expected,
+                source,
+            )
+            .await
+        };
+        match acquired {
+            Ok(id) => {
+                if id != expected.result {
+                    return Err(invalid(
+                        "OCI preparation returned a different lower identity",
+                    ));
+                }
+                authenticate_lower(expected, &pool, &plan.body().observation.storage)?;
+                let whole =
+                    retain_whole(runtime, operation, whole_streams(runtime, &plan)?).await?;
+                let files = OperationFiles::existing(runtime.local_home(), operation)?;
+                self.inventory = Arc::new(Inventory::build(&plan, &files, &whole)?);
+            }
+            Err(error) => {
+                tracing::debug!(%operation, %error, "OCI lower preparation unavailable; requesting retained exact artifacts");
+            }
         }
         Ok(())
     }
@@ -829,6 +929,9 @@ impl DestinationState {
         if limit == 0 || limit > MAX_PAGE_ENTRIES {
             return Err(invalid("needs page limit is outside 1..=1024"));
         }
+        if cursor.is_none() {
+            self.acquire_composition(runtime, operation).await?;
+        }
         self.refresh(runtime, operation)?;
         let inventory = self.inventory.clone();
         let start = usize::try_from(cursor.map_or(0, |cursor| cursor.0))
@@ -843,6 +946,14 @@ impl DestinationState {
         while let Some(descriptor) = inventory.entries.get(index).copied() {
             if needs.len() + candidates.len() == limit as usize {
                 break;
+            }
+            if self
+                .acquisition
+                .as_ref()
+                .is_some_and(|pending| pending.defers(&descriptor))
+            {
+                index += 1;
+                continue;
             }
             match self.local(&pool, &files, &descriptor)? {
                 Local::Satisfied => {}
@@ -1298,6 +1409,13 @@ pub(crate) async fn prepare(
             .await?;
         drop(roots);
     }
+    if let Some(lower) = &body.observation.immutable.composition {
+        authenticate_lower(lower, &pool, &body.observation.storage)?;
+        crate::store::layer_store::LayerStore::open(runtime.local_home())
+            .await?
+            .publish_snapshot_composition(operation.as_uuid(), lower)
+            .await?;
+    }
     // Pin and qualify the approved boot tuple from this pool only.
     let prior = match runtime.machine_config(body.destination_machine).await? {
         Some(config) => Some(runtime.machine_storage_record(config.id).await?),
@@ -1340,6 +1458,7 @@ pub(crate) async fn prepare(
             return Err(error);
         }
     }
+    validate_prepared_upper(&storage, &directory)?;
     directory.sync()?;
     store.prepare_handoff_destination(binding).await
 }
@@ -1381,6 +1500,58 @@ fn prepare_demand(
         }
     }
     Ok(required)
+}
+
+fn authenticate_lower(
+    lower: &crate::store::models::snapshot::SnapshotComposition,
+    pool: &StoragePool,
+    storage: &MachineStorageRecord,
+) -> Result<(), LibVmError> {
+    let authenticated =
+        lower.authenticate(|digest, maximum| Ok(pool.read_object(digest, maximum)?))?;
+    let MachineRoot::LinuxOverlay {
+        lower:
+            crate::OverlayLower::ErofsComposition {
+                record,
+                geometry,
+                filesystem_uuid,
+            },
+        ..
+    } = &storage.root
+    else {
+        return Err(invalid("composition supplied for a non-overlay machine"));
+    };
+    if *record != lower.result {
+        return Err(invalid("composition identity contradicts machine storage"));
+    }
+    authenticated.check_root_claims(geometry, *filesystem_uuid)?;
+    crate::machine::root_storage::check_lower_platform(
+        &authenticated.recipe.platform,
+        &storage.boot,
+    )?;
+    crate::image::transport::closure::authenticate_composition_bytes(
+        lower,
+        &authenticated,
+        |digest| Ok(pool.open_object(digest)?),
+        |stream| Ok(pool.open_stream(&stream.stream)?),
+    )
+}
+
+fn validate_prepared_upper(
+    storage: &MachineStorageRecord,
+    directory: &OwnedDirectory,
+) -> Result<(), LibVmError> {
+    if let MachineRoot::LinuxOverlay {
+        upper,
+        upper_uuid,
+        capacity,
+        ..
+    } = &storage.root
+    {
+        let source = crate::machine::stopped::open_private(directory, upper, *capacity)?;
+        crate::machine::root_storage::validate_upper_file(&source.file, *upper_uuid, *capacity)?;
+    }
+    Ok(())
 }
 
 /// The selection that materializes exactly the approved tuple: the retained
@@ -1459,7 +1630,12 @@ pub(crate) async fn commit(
     for (_, path, length) in writable_files(&storage) {
         crate::machine::stopped::open_private(&directory, &path, length)?;
     }
+    validate_prepared_upper(&storage, &directory)?;
     readmit(runtime, &plan).await?;
+    if let Some(lower) = &plan.body().observation.immutable.composition {
+        let pool = StoragePool::open(runtime.local_images_dir())?;
+        authenticate_lower(lower, &pool, &storage)?;
+    }
     let (publication, lock, created_at) = match &prior {
         Some((config, previous)) => {
             CleanupAuthority::replaced(machine, &directory, previous, &storage)?.store(&files)?;

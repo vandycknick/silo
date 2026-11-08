@@ -168,39 +168,16 @@ fn validate_lease_metadata(
     Ok(())
 }
 
+/// Record-local launch admission. The layered lower's VMDK resource preflight
+/// needs its leased retained occurrences and runs in `root_storage::prepare`
+/// before any descriptor is encoded or backing opened.
 pub(crate) fn preflight_launch_storage(
     storage: &MachineStorageRecord,
     spec: &vm_spec::VmSpec,
-    images_dir: &std::path::Path,
 ) -> Result<(), LibVmError> {
     storage.validate()?;
     if let Some(disks) = &spec.storage {
         disks.validate().map_err(invalid)?;
-    }
-    if let crate::MachineRoot::LinuxOverlay {
-        lower: crate::OverlayLower::FlatExt4 {
-            stream, geometry, ..
-        },
-        ..
-    } = &storage.root
-    {
-        let occurrences = [crate::storage::vmdk::LowerOccurrence::resolved(
-            *stream,
-            images_dir.join("streams/sha256").join(stream.hex()),
-            geometry.length,
-        )];
-        let data_disks = spec
-            .storage
-            .as_ref()
-            .map(|storage| {
-                storage
-                    .disks
-                    .iter()
-                    .filter(|disk| disk.role == vm_spec::DiskRole::Data)
-                    .count()
-            })
-            .unwrap_or(0);
-        crate::storage::vmdk::FlatLowerPlan::new(&occurrences)?.preflight(data_disks as u64)?;
     }
     Ok(())
 }
@@ -645,7 +622,10 @@ impl Store {
         streams: &[StreamId],
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(Uuid, StorageLock), LibVmError> {
-        if !matches!(kind, "snapshot" | "fork" | "import" | "update-boot-assets") {
+        if !matches!(
+            kind,
+            "snapshot" | "fork" | "import" | "update-boot-assets" | "raw-export"
+        ) {
             return Err(invalid("unsupported stopped operation kind"));
         }
         let id = Uuid::new_v4();
@@ -666,7 +646,12 @@ impl Store {
         streams: &[StreamId],
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError> {
-        if id.is_nil() || !matches!(kind, "snapshot" | "fork" | "import" | "update-boot-assets") {
+        if id.is_nil()
+            || !matches!(
+                kind,
+                "snapshot" | "fork" | "import" | "update-boot-assets" | "raw-export"
+            )
+        {
             return Err(invalid("invalid stopped operation"));
         }
         let (device, inode) = lease.file_identity()?;
@@ -1014,7 +999,7 @@ impl Store {
     pub(crate) async fn finish_stopped_operation(&self, id: Uuid) -> Result<(), LibVmError> {
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
-        let result = sqlx::query("UPDATE storage_operation SET state='committed',record_json=jsonb('{}') WHERE operation_id=?1 AND kind IN ('snapshot','fork','import','update-boot-assets') AND state IN ('staging','committing','committed')")
+        let result = sqlx::query("UPDATE storage_operation SET state='committed',record_json=jsonb('{}') WHERE operation_id=?1 AND kind IN ('snapshot','fork','import','update-boot-assets','raw-export') AND state IN ('staging','committing','committed')")
             .bind(id.to_string()).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(invalid("stopped operation is not active"));
@@ -1049,7 +1034,7 @@ impl Store {
         objects: &[crate::storage::identity::ObjectDigest],
     ) -> Result<(), LibVmError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','capture','fork','import','relocate','update-boot-assets') AND state='staging')")
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND schema=1 AND kind IN ('convert','snapshot','capture','fork','import','relocate','update-boot-assets','raw-export') AND state='staging')")
             .bind(operation_id.to_string()).fetch_one(&mut *tx).await?;
         if !active {
             return Err(invalid(
@@ -1386,7 +1371,7 @@ impl Store {
     ) -> Result<LaunchStorageLease, LibVmError> {
         storage.validate_for_machine(machine_id.into())?;
         storage.ownership.ensure_owned(machine_id)?;
-        preflight_launch_storage(storage, spec, &self.images_dir)?;
+        preflight_launch_storage(storage, spec)?;
         let machine_directory = crate::paths::machine_data_dir_in(&self.home, machine_id);
         if !machine_directory.is_absolute() {
             return Err(invalid("machine directory is not absolute"));
@@ -1419,7 +1404,11 @@ impl Store {
         let json = encode(&record)?;
         let generation = i64::try_from(record.storage_generation)
             .map_err(|_| invalid("storage generation exceeds SQL range"))?;
-        let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(storage)?;
+        let crate::store::cache_paths::PoolDependencies {
+            streams,
+            objects,
+            lowers,
+        } = crate::store::cache_paths::storage_pool_dependencies(storage)?;
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
         let lease = pool.lease(record.operation_id)?;
@@ -1479,6 +1468,15 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        // The launch generation roots its layered lower (and through it every
+        // layer, pack stream and fsmeta object) until its retirement.
+        for lower in lowers {
+            sqlx::query("INSERT INTO storage_operation_lower(operation_id,lower_id) VALUES(?1,?2)")
+                .bind(record.operation_id.to_string())
+                .bind(lower.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
         if let Some(restore) = restore {
             restore.validate()?;
             let consumer: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind='import')")
@@ -1508,6 +1506,7 @@ impl Store {
                 ));
             }
             sqlx::query("INSERT OR IGNORE INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT OR IGNORE INTO storage_operation_cut(operation_id,cut_id) SELECT ?1,cut_id FROM storage_operation_cut WHERE operation_id=?2").bind(record.operation_id.to_string()).bind(restore.consumer_operation.to_string()).execute(&mut *tx).await?;
             if let crate::store::restore::RestoreIdentity::LocalCut { id } = &restore.checkpoint {
                 let child:Option<(String,i64,String,String)>=sqlx::query_as("SELECT c.operation_id,c.child_index,c.machine_id,c.run_id FROM live_fork_child c JOIN live_fork f ON f.operation_id=c.operation_id JOIN local_cut l ON l.operation_id=f.operation_id WHERE c.consumer_id=?1 AND c.launch_id IS NULL AND c.name_reserved=1 AND l.cut_id=?2 AND json_extract(f.result_json,'$.cancellationRequested')=0 AND f.admission_complete=1").bind(restore.consumer_operation.to_string()).bind(id.to_string()).fetch_optional(&mut *tx).await?;
@@ -1759,7 +1758,7 @@ impl Store {
                         }
                     }
                     "live-fork" | "convert" | "snapshot" | "fork" | "import" | "relocate"
-                    | "update-boot-assets"
+                    | "update-boot-assets" | "raw-export"
                         if matches!(state.as_str(), "staging" | "committed") =>
                     {
                         let json: String = row.try_get("record_json")?;

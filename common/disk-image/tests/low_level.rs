@@ -290,7 +290,7 @@ fn test_internal_journal_inode_and_superblock() {
         .close()
         .unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock().clone();
     let journal = reader.get_inode(8).unwrap();
     assert_eq!(journal.mode & file_mode::TYPE_MASK, file_mode::S_IFREG);
@@ -332,7 +332,7 @@ fn test_resize_inode_and_backup_sparse_super_layout() {
     let fmt = Formatter::new(tmp.path(), 4096, 512 * 1024 * 1024).unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock().clone();
     let block_size = 1024u64 * (1 << sb.log_block_size);
 
@@ -427,7 +427,7 @@ fn test_resize_inode_and_backup_sparse_super_layout() {
 
 #[test]
 fn test_group_descriptor_fields() {
-    let (mut reader, _tmp) = build_standard_fs();
+    let (reader, _tmp) = build_standard_fs();
     let sb = reader.superblock().clone();
     let gd = reader.get_group_descriptor(0).unwrap();
 
@@ -473,7 +473,7 @@ fn test_group_descriptor_fields() {
 
 #[test]
 fn test_inode_table_via_get_inode() {
-    let (mut reader, _tmp) = build_standard_fs();
+    let (reader, _tmp) = build_standard_fs();
 
     // -- Root inode (2) -------------------------------------------------------
     let root = reader.get_inode(ROOT_INODE).unwrap();
@@ -549,7 +549,7 @@ fn test_inode_table_via_get_inode() {
 
 #[test]
 fn test_block_and_inode_bitmaps() {
-    let (mut reader, tmp) = build_standard_fs();
+    let (reader, tmp) = build_standard_fs();
     let sb = reader.superblock().clone();
     let gd = reader.get_group_descriptor(0).unwrap();
     let block_size = 1024u64 * (1 << sb.log_block_size);
@@ -611,7 +611,7 @@ fn test_group_descriptor_counts_match_bitmaps() {
     let fmt = Formatter::new(tmp.path(), 4096, 512 * 1024 * 1024).unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock().clone();
     let block_size = 1024u64 * (1 << sb.log_block_size);
     let group_count = (sb.blocks_count_lo - 1) / sb.blocks_per_group + 1;
@@ -717,7 +717,7 @@ fn test_inode_dtime_after_removal() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let victim = reader.get_inode(victim_ino).unwrap();
 
     // After removal the formatter zeros the inode but sets dtime.
@@ -754,7 +754,7 @@ fn test_hardlink_links_count() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, inode) = reader.stat("/original").unwrap();
 
     // Original file + 2 hard links = 3.
@@ -786,7 +786,7 @@ fn test_removing_hardlink_does_not_decrement_parent_directory_link_count() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let root = reader.get_inode(ROOT_INODE).unwrap();
     assert_eq!(
         root.links_count, 3,
@@ -825,7 +825,7 @@ fn test_failed_hardlink_does_not_mutate_target_link_count() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, inode) = reader.stat("/target").unwrap();
     assert_eq!(
         inode.links_count, 1,
@@ -929,7 +929,7 @@ fn test_directory_entry_name_length_boundaries() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     assert!(reader.exists(&ascii_path));
     assert!(reader.exists(&utf8_path));
 }
@@ -987,7 +987,7 @@ fn test_xattr_name_length_boundaries() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     assert!(reader.stat("/max-xattr-name").unwrap().1.xattr_block_lo != 0);
 }
 
@@ -1038,7 +1038,7 @@ fn test_i_blocks_accounts_for_external_xattr_blocks() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, with_data) = reader.stat("/with-data").unwrap();
     assert_ne!(with_data.xattr_block_lo, 0);
     assert_ne!(with_data.flags & inode_flags::HUGE_FILE, 0);
@@ -1098,7 +1098,7 @@ fn test_hardlink_external_xattr_blocks_are_reclaimed() {
     .unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let deleted_inode = reader.get_inode(12).unwrap();
     assert_eq!(deleted_inode.links_count, 0);
     assert_ne!(deleted_inode.dtime, 0);
@@ -1176,7 +1176,7 @@ fn test_directory_links_count() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let (_, parent_inode) = reader.stat("/parent").unwrap();
 
     // A directory's links_count = 2 (. and ..) + number of child directories.

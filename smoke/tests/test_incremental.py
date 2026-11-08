@@ -71,7 +71,7 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     # changed independently read RAM bytes, not merely receipt counters.
     changed = incremental.pages_at_cut(silo, first, {**first_pages, "pages": first_pages["pages"][:2]})
     assert changed <= facts["affected"]
-    cut = restore.matched_cut(silo, first, execution, profile="raw")
+    cut = restore.matched_cut(silo, first, execution, profile="layered")
     silo.run("resume", SOURCE)
     restore.resumed(silo, SOURCE, execution, cut)
 
@@ -106,7 +106,7 @@ def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     assert changed <= child_facts["affected"]
     incremental.pages_at_cut(silo, recaptured, child_pages)
     capture.unchanged(silo, zero.staging, sealed)
-    restore.matched_cut(silo, recaptured, execution, profile="raw")
+    restore.matched_cut(silo, recaptured, execution, profile="layered")
 
 
 def test_observed_console_vsock_and_balloon_writes_match_frozen_full_ram(

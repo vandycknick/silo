@@ -101,6 +101,16 @@ impl LocalVmService {
         })
     }
 
+    pub(crate) async fn export_raw_disk(
+        &mut self,
+        reference: &str,
+        options: libvm::RawDiskExportOptions,
+    ) -> eyre::Result<libvm::RawDiskExport> {
+        let reference = MachineRef::parse(reference)?;
+        let machine = self.runtime().await?.get_machine(&reference).await?;
+        Ok(machine.export_raw_disk(options).await?)
+    }
+
     pub(crate) async fn pause_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
         let reference = MachineRef::parse(reference)?;
         if let Self::Uninitialized {
@@ -962,7 +972,6 @@ pub(crate) fn normalize_plan(
             .and_then(|resources| resources.cpus),
         memory_bytes,
         root_disk_size_bytes,
-        root_profile: plan.machine.root_profile.native(),
         temporary_directory: match crate::machine_defaults::disk_size_bytes(
             plan.machine.tmpfs_size.as_deref(),
         )? {
@@ -1154,7 +1163,6 @@ mod tests {
             machine: MachinePlan {
                 resources: None,
                 disk_size: None,
-                root_profile: Default::default(),
                 tmpfs_size: None,
                 userdata: None,
                 mounts: Vec::new(),

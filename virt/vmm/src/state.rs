@@ -2594,7 +2594,7 @@ mod tests {
             RootStorageKind, RootStorageMetrics, TemporaryDirectoryKind, TemporaryDirectoryMetrics,
         };
         RootStorageMetrics {
-            kind: Some(RootStorageKind::LinuxFlatOverlayV1 as i32),
+            kind: Some(RootStorageKind::LinuxErofsOverlayV1 as i32),
             upper_profile: Some("silo-upper-ext4-v1".into()),
             upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
             upper_backing_bytes: Some(67_112_960),

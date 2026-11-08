@@ -1041,9 +1041,10 @@ mod tests {
 
         assert_eq!(outcome, RootDiskResizeOutcome::GuestRequired);
         assert_eq!(fs::metadata(&path).expect("metadata").len(), new_size);
-        let reader = disk_image::ext4::Reader::new(&path).expect("open unchanged ext4 image");
-        assert_eq!(reader.superblock().blocks_count_lo as u64 * 4096, old_size);
-        assert_ne!(reader.superblock().feature_incompat & 0x4, 0);
+        let superblock =
+            disk_image::ext4::read_superblock(&fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(superblock.blocks_count_lo as u64 * 4096, old_size);
+        assert_ne!(superblock.feature_incompat & 0x4, 0);
     }
 
     #[test]
@@ -1085,17 +1086,14 @@ mod tests {
             .hash_reader(&mut fs::File::open(&replacement_path).unwrap().take(old_length))
             .unwrap();
         assert_eq!(old.id(), prefix.id());
+        let superblock =
+            disk_image::ext4::read_superblock(&fs::File::open(&replacement_path).unwrap()).unwrap();
+        assert_eq!(uuid::Uuid::from_bytes(superblock.uuid), formatted.uuid);
+        assert_ne!(superblock.feature_incompat & 4, 0);
         assert_eq!(
-            crate::machine::root_storage::filesystem_uuid(&replacement_path).unwrap(),
-            formatted.uuid
-        );
-        let reader = disk_image::ext4::Reader::new(&replacement_path).unwrap();
-        assert_ne!(reader.superblock().feature_incompat & 4, 0);
-        assert_eq!(
-            reader.superblock().blocks_count_lo as u64 * 4096,
+            superblock.blocks_count_lo as u64 * 4096,
             formatted.filesystem_bytes
         );
-        drop(reader);
         replacement.commit();
         assert!(!source.exists());
         assert!(replacement_path.exists());

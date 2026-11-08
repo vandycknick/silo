@@ -145,6 +145,229 @@ impl Participant {
     }
 }
 
+/// Install an authenticated layered root on a real stopped raw-machine catalog.
+/// This is storage-only setup, never an admitted boot tuple or a launched VM.
+async fn install_layered_root(
+    participant: &Participant,
+    machine: MachineId,
+) -> crate::store::models::snapshot::SnapshotComposition {
+    let store = participant.runtime.native_store().unwrap();
+    let (_images, _, image) =
+        crate::image::transport::tests::layered_image_in(std::sync::Arc::new(store.clone())).await;
+    let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
+        lower,
+        lower_geometry,
+        lower_filesystem_uuid,
+        upper_uuid,
+        ext4_profile,
+        overlay_profile,
+        temporary_directory,
+    } = image.root.profile
+    else {
+        panic!("layered fixture");
+    };
+    let mut config = participant
+        .runtime
+        .machine_config(machine)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut storage = participant.storage(machine).await;
+    let root = participant.root_file(machine).await;
+    let pool =
+        crate::storage::pool::StoragePool::open(participant.runtime.local_images_dir()).unwrap();
+    let mut source = pool.open_stream(&image.root.stream.stream).unwrap();
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&root)
+        .unwrap();
+    std::io::copy(&mut source, &mut destination).unwrap();
+    destination.sync_all().unwrap();
+    let upper_path = crate::machine::stopped::root_private(&storage).0.clone();
+    storage.root = crate::MachineRoot::LinuxOverlay {
+        lower: crate::OverlayLower::ErofsComposition {
+            record: lower.result,
+            geometry: lower_geometry,
+            filesystem_uuid: lower_filesystem_uuid,
+        },
+        upper: upper_path.clone(),
+        upper_uuid,
+        capacity: image.root.geometry.length,
+        ext4_profile,
+        overlay_profile,
+        temporary_directory,
+    };
+    storage.profile = crate::StorageProfile::LinuxOverlayV1;
+    storage.backend = crate::BackendRequirement::KrunOverlay;
+    storage.storage_generation += 1;
+    let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot else {
+        panic!("direct boot fixture");
+    };
+    *root_selector = crate::RootSelector::ManagedOverlay;
+    config.spec.storage.as_mut().unwrap().disks = vec![
+        crate::machine::root_storage::disk(
+            "lower.vmdk",
+            vm_spec::DiskRole::RootLower,
+            lower_geometry.length,
+            "silo-root-lower".into(),
+        )
+        .unwrap(),
+        crate::machine::root_storage::disk(
+            upper_path.as_path(),
+            vm_spec::DiskRole::RootUpper,
+            image.root.geometry.length,
+            "silo-root-upper".into(),
+        )
+        .unwrap(),
+    ];
+    config
+        .spec
+        .boot
+        .as_mut()
+        .unwrap()
+        .kernel
+        .as_mut()
+        .unwrap()
+        .cmdline
+        .push("silo.rootfs=linux-erofs-overlay-v1".into());
+    let mut transaction = store
+        .test_pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE machine_config SET config_json=jsonb(?1) WHERE id=?2")
+        .bind(serde_json::to_string(&config).unwrap())
+        .bind(machine.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    crate::store::Store::write_machine_storage(&mut transaction, machine, &storage)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    *lower
+}
+
+#[tokio::test]
+async fn layered_handoff_estimates_and_transfers_one_closed_graph_before_capture() {
+    let source = participant().await;
+    let destination = participant().await;
+    let machine = source.create_raw("layered-transfer").await;
+    let lower = install_layered_root(&source, machine).await;
+    let op = operation();
+    let observation = source
+        .service
+        .observe_source(&MachineRef::id(machine))
+        .await
+        .unwrap();
+    assert_eq!(
+        observation.body().immutable.composition.as_ref(),
+        Some(&lower)
+    );
+    assert_eq!(observation.body().immutable.streams.len(), 1);
+    let proposal = destination
+        .service
+        .preflight_destination(&observation, &request(op, HandoffMode::Relocate))
+        .await
+        .unwrap();
+    let expected: u64 = observation
+        .body()
+        .immutable
+        .objects
+        .iter()
+        .map(|object| object.length)
+        .chain(
+            observation
+                .body()
+                .immutable
+                .streams
+                .iter()
+                .map(|stream| stream.length),
+        )
+        .sum();
+    assert_eq!(proposal.estimate.immutable_bytes, expected);
+    let digest = proposal.plan.digest();
+    let plan = proposal.plan.approve(digest).unwrap();
+    source.service.begin_source(&plan).await.unwrap();
+    destination.service.receive(&plan).await.unwrap();
+    let mut moved = Moved::default();
+    fill(&source, &destination, op, &mut moved).await;
+    let pool =
+        crate::storage::pool::StoragePool::open(destination.runtime.local_images_dir()).unwrap();
+    let fsmeta = pool.verify_object(&lower.fsmeta).unwrap();
+    assert!(fsmeta.metadata().unwrap().len() > 0);
+    assert!(moved.objects > 0 && moved.chunks > 0);
+    assert!(destination
+        .runtime
+        .machine_config(machine)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        source.storage(machine).await.ownership,
+        MachineOwnership::Owned
+    ));
+    let receipt = destination
+        .service
+        .abort(&plan.intent().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(receipt.decision, HandoffDecision::Aborted);
+    source.service.resolve_source(&receipt).await.unwrap();
+    assert_eq!(
+        destination
+            .service
+            .abort(&plan.intent().unwrap())
+            .await
+            .unwrap(),
+        receipt
+    );
+}
+
+#[tokio::test]
+async fn unavailable_oci_source_falls_back_to_exact_layered_handoff_objects() {
+    let source = participant().await;
+    let destination = participant().await;
+    let machine = source.create_raw("layered-unavailable-source").await;
+    let lower = install_layered_root(&source, machine).await;
+    let manifest = crate::storage::identity::ObjectDigest::of_bytes(b"deleted OCI source manifest");
+    let store = source.runtime.native_store().unwrap();
+    sqlx::query("UPDATE machine_rootfs SET source_kind='oci',selected_reference=?1,manifest_digest=?2 WHERE machine_id=?3")
+        .bind(format!("localhost:1/deleted/source@{manifest}")).bind(manifest.to_string())
+        .bind(machine.to_string()).execute(store.test_pool()).await.unwrap();
+    let op = operation();
+    let plan = approve(
+        &source,
+        &destination,
+        machine,
+        &request(op, HandoffMode::Relocate),
+    )
+    .await;
+    assert!(plan.body().observation.immutable.oci_source.is_some());
+    source.service.begin_source(&plan).await.unwrap();
+    destination.service.receive(&plan).await.unwrap();
+    let mut moved = Moved::default();
+    fill(&source, &destination, op, &mut moved).await;
+    let pool =
+        crate::storage::pool::StoragePool::open(destination.runtime.local_images_dir()).unwrap();
+    assert!(pool.verify_object(&lower.fsmeta).is_ok());
+    assert!(moved.chunks > 0);
+    assert!(destination
+        .service
+        .list_needs(op, None, 256)
+        .await
+        .unwrap()
+        .needs
+        .is_empty());
+    let receipt = destination
+        .service
+        .abort(&plan.intent().unwrap())
+        .await
+        .unwrap();
+    source.service.resolve_source(&receipt).await.unwrap();
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Moved {
     objects: u64,

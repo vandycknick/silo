@@ -1,7 +1,7 @@
 use crate::context::Context;
 use clap::{Args, Subcommand};
 
-const EXACT_BYTES_WARNING: &str = "Copies exact storage bytes, including credentials, guest keys, dirty journals and deleted-data remnants. No sanitization, journal replay, implicit stop or implicit start is performed. External resources require explicit policy; snapshots support opaque raw roots only.";
+const EXACT_BYTES_WARNING: &str = "Copies exact storage bytes, including credentials, guest keys, dirty journals and deleted-data remnants. No sanitization, journal replay, implicit stop or implicit start is performed. External resources require explicit policy. Layered snapshots retain their authenticated immutable composition and exact writable upper.";
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum CapturePolicyArgument {
@@ -614,6 +614,9 @@ enum ImageCommand {
     Convert {
         #[arg(value_name = "OCI_REFERENCE")]
         reference: String,
+        /// Explicit output format; conversion creates a whole-disk ext4 raw image.
+        #[arg(long, value_enum, required = true)]
+        disk_format: crate::commands::storage::ExportFormat,
         /// Linux platform to select from an OCI index; host-native when absent.
         #[arg(long, value_name = "PLATFORM", value_parser = platform_arg)]
         platform: Option<libvm::LinuxPlatform>,
@@ -735,6 +738,7 @@ impl Image {
             }
             ImageCommand::Convert {
                 reference,
+                disk_format: crate::commands::storage::ExportFormat::Raw,
                 platform,
                 pull,
                 name,

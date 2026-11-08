@@ -4,7 +4,7 @@ import platform
 import stat
 from uuid import UUID
 
-from silo_smoke import overlay, shutdown
+from silo_smoke import overlay, shutdown, stopped
 from silo_smoke.cli import Silo
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.workspace import Workspace
@@ -22,11 +22,17 @@ def test_create_start_ready_stop_restart_rm(
     assert created["rootfs"]["source_kind"] == "oci"
     assert created["resources"] == {"cpus": 1, "memory_mib": 512}
     assert registry.requests > 0
+    # Ordinary OCI creation defaults to the layered EROFS root, never raw.
+    storage = stopped.record(silo, name)
+    assert storage["root"]["kind"] == "linux-overlay", storage["root"]
+    assert storage["root"]["lower"]["kind"] == "erofs-composition", storage["root"]
+    root = stopped.writable_paths(silo, name)["root"]
     silo.start(name)
     running = silo.wait_ready(name)
     assert running["state"] == "running"
     assert running["ready"] is True
     assert running["guest"]["boot"]["agent_is_pid1"] is True
+    assert overlay.filesystem_magic(silo, name, "/") == overlay.OVERLAYFS_SUPER_MAGIC
     run_id = running["run_id"]
     assert str(UUID(run_id)) == run_id
     known_host = workspace.known_host(created["id"])
@@ -43,7 +49,6 @@ def test_create_start_ready_stop_restart_rm(
         worker = shutdown.Process(identities["krun-worker"])
         processes = (monitor, worker)
         assert overlay.worker_pid_of_monitor(monitor.pid) == worker.pid
-        root = workspace.silo_home / "machines" / created["id"] / "root.raw"
         for process in processes:
             shutdown.handles(silo, process.pid, [root, lease])
     try:

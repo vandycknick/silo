@@ -588,7 +588,7 @@ fn candidate_boot_metadata(
     Ok(serde_json::json!({
         "qualification": "requires-exact-boot-evidence",
         "guestArchitecture": context.host.oci_architecture(),
-        "rootProfile": "linux-flat-overlay-v1",
+        "rootProfile": "linux-erofs-overlay-v1",
         "upperProfile": "silo-upper-ext4-v1",
         "overlayProfile": "silo-overlay-v1",
         "renderingAbi": "linux-overlayfs-mountinfo-v1",

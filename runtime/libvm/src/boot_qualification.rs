@@ -15,7 +15,7 @@ use vm_spec::live::LiveBackend;
 
 use crate::GuestArchitecture;
 
-const ROOT_PROFILE: &str = "linux-flat-overlay-v1";
+const ROOT_PROFILE: &str = "linux-erofs-overlay-v1";
 const ATTACHMENT_FAMILY: &str = "krun-virtio-blk-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,43 +41,77 @@ struct AdmittedBoot {
     evidence: &'static str,
 }
 
-// Only reviewed real monitor/worker observations admit exact tuples. This
-// candidate binds the corrected native image; it is not evidence that the
-// subsequent normal libvm integration/conformance matrix has passed.
-const ADMITTED_BOOTS: &[AdmittedBoot] = &[AdmittedBoot {
-    identity: BootIdentity {
-        kernel_sha256: [
-            0x4c, 0x54, 0xfc, 0x03, 0x88, 0x44, 0xb0, 0x4d, 0x71, 0x2b, 0xd4, 0xcd, 0xb8, 0xa9,
-            0xd6, 0xa9, 0x45, 0xa5, 0xf3, 0xd7, 0xa8, 0xbb, 0x1d, 0xb5, 0xa5, 0xd5, 0x0d, 0x52,
-            0x71, 0xd5, 0xdd, 0xdc,
+// Only reviewed real monitor/worker observations admit exact tuples.
+const ADMITTED_BOOTS: &[AdmittedBoot] = &[
+    AdmittedBoot {
+        identity: BootIdentity {
+            kernel_sha256: [
+                0x2c, 0xe7, 0x27, 0x11, 0x36, 0xaf, 0x45, 0x4c, 0x42, 0x78, 0x80, 0x21, 0x2f, 0x08,
+                0x52, 0x71, 0xfc, 0x2f, 0xde, 0xa1, 0x3e, 0xfb, 0x59, 0x9b, 0xa8, 0x2f, 0xf6, 0xeb,
+                0xe4, 0xd6, 0x2d, 0xc7,
+            ],
+            initramfs_sha256: [
+                0xfa, 0x47, 0xab, 0xf6, 0x3a, 0xb4, 0x94, 0x6e, 0xfa, 0xaa, 0xcb, 0x4e, 0x03, 0x26,
+                0xea, 0x3d, 0x1d, 0x95, 0x37, 0x95, 0x44, 0x4b, 0xa9, 0x07, 0x3d, 0xfa, 0x23, 0x40,
+                0x7c, 0xe5, 0x7e, 0x3c,
+            ],
+            native_sha256: [
+                0x08, 0x16, 0x52, 0x1b, 0xba, 0xf2, 0x34, 0x9c, 0x4a, 0xdb, 0x51, 0xe5, 0xac, 0x1e,
+                0x72, 0x5a, 0xf4, 0x33, 0xc1, 0x48, 0x24, 0x69, 0xa5, 0x89, 0x5e, 0xbb, 0xfb, 0xc9,
+                0xd3, 0xa4, 0x4b, 0x02,
+            ],
+            architecture: GuestArchitecture::Amd64,
+        },
+        resolved_config_sha256: [
+            0xb8, 0x26, 0x47, 0x10, 0x3b, 0x73, 0xac, 0x2f, 0x7f, 0xaf, 0xc3, 0xb1, 0xbd, 0xd6,
+            0xad, 0x92, 0x7b, 0xa2, 0xf1, 0xc6, 0x8e, 0x5b, 0x5f, 0x11, 0xa3, 0xe3, 0xda, 0x4b,
+            0xfd, 0xf5, 0x33, 0xf4,
         ],
-        initramfs_sha256: [
-            0x79, 0x37, 0x30, 0x23, 0x0b, 0x7f, 0xba, 0x35, 0x51, 0xa1, 0xf3, 0xb4, 0x26, 0xe1,
-            0x1c, 0xb3, 0x43, 0xa9, 0x16, 0x09, 0x03, 0x80, 0xda, 0x87, 0xf3, 0x5f, 0x06, 0x73,
-            0x5d, 0xbf, 0x28, 0xed,
-        ],
-        native_sha256: [
-            0xb4, 0x42, 0x76, 0x25, 0x16, 0x76, 0xc0, 0xb1, 0xb1, 0x07, 0x6b, 0x09, 0x6c, 0xc6,
-            0x7b, 0x88, 0xa1, 0x0e, 0x84, 0x55, 0x06, 0x4a, 0x28, 0x3f, 0xe7, 0xe4, 0xab, 0x9f,
-            0xc1, 0x93, 0x0b, 0xbb,
-        ],
-        architecture: GuestArchitecture::Amd64,
+        kernel_version: (7, 2, 2),
+        host_os: "linux",
+        host_arch: "x86_64",
+        root_profile: ROOT_PROFILE,
+        upper_profile: UpperProfile::SiloUpperExt4V1,
+        overlay_profile: OverlayProfile::SiloOverlayV1,
+        rendering_abi: OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
+        attachment_family: ATTACHMENT_FAMILY,
+        evidence: "phase-22/overlay-candidate-qualification-second: silo-smoke-ih7vf9oo",
     },
-    resolved_config_sha256: [
-        0x72, 0x49, 0xa9, 0x3a, 0xda, 0xbe, 0xb4, 0x34, 0x8f, 0xc9, 0x02, 0xdf, 0x83, 0xed, 0x25,
-        0x2b, 0xe4, 0xc7, 0x17, 0x62, 0xac, 0x13, 0x1c, 0xf0, 0x03, 0x07, 0x04, 0x31, 0xaf, 0xdf,
-        0x68, 0xa9,
-    ],
-    kernel_version: (7, 2, 2),
-    host_os: "linux",
-    host_arch: "x86_64",
-    root_profile: ROOT_PROFILE,
-    upper_profile: UpperProfile::SiloUpperExt4V1,
-    overlay_profile: OverlayProfile::SiloOverlayV1,
-    rendering_abi: OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
-    attachment_family: ATTACHMENT_FAMILY,
-    evidence: "resources/kernels/artifacts.md#observed-linux-kvm-candidate",
-}];
+    AdmittedBoot {
+        identity: BootIdentity {
+            kernel_sha256: [
+                0x69, 0x09, 0x5b, 0x40, 0xe4, 0x89, 0xef, 0xd6, 0x7b, 0x60, 0xae, 0x3a, 0xae, 0x30,
+                0x98, 0x45, 0x4f, 0x39, 0x51, 0x57, 0x27, 0xb1, 0x80, 0xce, 0x65, 0xeb, 0x9a, 0x3e,
+                0xd0, 0xac, 0xe6, 0xba,
+            ],
+            initramfs_sha256: [
+                0xfa, 0x47, 0xab, 0xf6, 0x3a, 0xb4, 0x94, 0x6e, 0xfa, 0xaa, 0xcb, 0x4e, 0x03, 0x26,
+                0xea, 0x3d, 0x1d, 0x95, 0x37, 0x95, 0x44, 0x4b, 0xa9, 0x07, 0x3d, 0xfa, 0x23, 0x40,
+                0x7c, 0xe5, 0x7e, 0x3c,
+            ],
+            native_sha256: [
+                0x08, 0x16, 0x52, 0x1b, 0xba, 0xf2, 0x34, 0x9c, 0x4a, 0xdb, 0x51, 0xe5, 0xac, 0x1e,
+                0x72, 0x5a, 0xf4, 0x33, 0xc1, 0x48, 0x24, 0x69, 0xa5, 0x89, 0x5e, 0xbb, 0xfb, 0xc9,
+                0xd3, 0xa4, 0x4b, 0x02,
+            ],
+            architecture: GuestArchitecture::Amd64,
+        },
+        resolved_config_sha256: [
+            0x21, 0x84, 0xec, 0xc3, 0xad, 0xae, 0x8b, 0x99, 0xfb, 0x19, 0x4b, 0x6f, 0xc8, 0xc4,
+            0xf0, 0xd1, 0xd3, 0xb4, 0x0e, 0x54, 0x29, 0xa3, 0x00, 0xed, 0xcc, 0xbb, 0x54, 0xd0,
+            0x27, 0x0b, 0x67, 0x8e,
+        ],
+        kernel_version: (6, 18, 48),
+        host_os: "linux",
+        host_arch: "x86_64",
+        root_profile: ROOT_PROFILE,
+        upper_profile: UpperProfile::SiloUpperExt4V1,
+        overlay_profile: OverlayProfile::SiloOverlayV1,
+        rendering_abi: OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
+        attachment_family: ATTACHMENT_FAMILY,
+        evidence: "phase-22/longterm-overlay-candidate-second: silo-smoke-xj57b84z",
+    },
+];
 
 /// Owns qualified sources through launch. Guest assets are staged through checked
 /// copies; Linux executes the retained native descriptor without reopening paths.
@@ -195,7 +229,7 @@ pub struct UnqualifiedOverlayBootIdentity {
 /// effects. The per-launch root/agent archive must be appended only afterwards.
 /// Config identity is bound by the reviewed tuple's exact kernel digest, not by
 /// a caller-supplied or mutable metadata claim.
-pub fn admit_flat_overlay(
+pub fn admit_erofs_overlay(
     kernel: &Path,
     initramfs: &Path,
     architecture: GuestArchitecture,
@@ -210,7 +244,7 @@ pub fn admit_flat_overlay(
             host_os: std::env::consts::OS,
         });
     }
-    admit_flat_overlay_assets(
+    admit_erofs_overlay_assets(
         QualifiedAsset::open(kernel)?,
         QualifiedAsset::open(initramfs)?,
         architecture,
@@ -220,7 +254,7 @@ pub fn admit_flat_overlay(
 }
 
 /// Qualify the already authenticated held guest assets, never their former paths.
-pub(crate) fn admit_flat_overlay_assets(
+pub(crate) fn admit_erofs_overlay_assets(
     kernel: QualifiedAsset,
     initramfs: QualifiedAsset,
     architecture: GuestArchitecture,
@@ -726,7 +760,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::boot_qualification::QualifiedOverlayBoot;
     use crate::boot_qualification::{
-        admit_flat_overlay, admitted_boot, native_kernel_image, AdmittedBoot, BootIdentity,
+        admit_erofs_overlay, admitted_boot, native_kernel_image, AdmittedBoot, BootIdentity,
         DirectKernelRejection, InspectedKernel, KernelHeader, OverlayBootQualificationError,
         QualifiedAsset,
     };
@@ -752,7 +786,7 @@ mod tests {
             kernel_version: (6, 6, 0),
             host_os: "linux",
             host_arch: "x86_64",
-            root_profile: "linux-flat-overlay-v1",
+            root_profile: "linux-erofs-overlay-v1",
             upper_profile: UpperProfile::SiloUpperExt4V1,
             overlay_profile: OverlayProfile::SiloOverlayV1,
             rendering_abi: OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
@@ -835,7 +869,7 @@ mod tests {
             crate::boot_qualification::hex_digest(QualifiedAsset::open(&kernel).unwrap().digest),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        let admission = admit_flat_overlay(
+        let admission = admit_erofs_overlay(
             &kernel,
             &initramfs,
             GuestArchitecture::Amd64,
@@ -847,7 +881,7 @@ mod tests {
             let OverlayBootQualificationError::Unqualified { identity } = &error else {
                 panic!("expected exact tuple rejection: {error}");
             };
-            assert_eq!(identity.profile, "linux-flat-overlay-v1");
+            assert_eq!(identity.profile, "linux-erofs-overlay-v1");
             assert_eq!(identity.architecture, GuestArchitecture::Amd64);
             assert_eq!(identity.native_sha256, identity.kernel_sha256);
             assert!(error.to_string().contains(&format!(
@@ -882,7 +916,7 @@ mod tests {
         let missing = std::path::Path::new("/nonexistent/overlay-qualification-asset");
         for backend in [LiveBackend::Mock, LiveBackend::Vz] {
             assert!(matches!(
-                admit_flat_overlay(missing, missing, GuestArchitecture::Amd64, backend, missing),
+                admit_erofs_overlay(missing, missing, GuestArchitecture::Amd64, backend, missing),
                 Err(OverlayBootQualificationError::UnsupportedBackend { .. })
             ));
         }

@@ -50,9 +50,10 @@ def budget_silo(config: SmokeConfig, registry: LoopbackRegistry,
 
 
 def budget_source(silo: Silo, image: str, name: str = SOURCE) -> dict:
-    """The exact cohort fixture: 4 GiB RAM, 2 GiB flat upper, witness running."""
+    """The exact cohort fixture: 4 GiB RAM, 2 GiB layered upper, witness running."""
     silo.create(name, image, "--cpus", "2", "--memory", fork_budget.RAM, "--disk-size", fork_budget.UPPER,
-                "--root-profile", overlay.PROFILE, "--vsock", "--network", "private")
+                "--vsock", "--network", "private")
+    assert stopped.record(silo, name)["root"]["kind"] == "linux-overlay", "budget fixture is the default layered root"
     silo.start(name)
     info = silo.wait_ready(name)
     restore.require_restore_candidate(info)

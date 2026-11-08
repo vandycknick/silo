@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from silo_smoke import capture, images, overlay, pause, procs, shutdown, stopped
-from silo_smoke.cli import Silo
+from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
@@ -32,13 +32,13 @@ def capture_image(config: SmokeConfig, registry: LoopbackRegistry,
     return registry.publish(images.build(spec, images.fetch_alpine(config.cache_dir)), "capture-counter")
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("policy", ["resume", "preserve", "borrow"])
 def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_image: str,
-                                                          profile: str, policy: str) -> None:
+                                                          profile: RootProfile, policy: str) -> None:
     name = "capture-source"
-    silo.create(name, capture_image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib",
-                "--vsock", "--network", "none", *(["--root-profile", overlay.PROFILE] if profile == "flat" else []))
+    silo.create(name, silo.root_image(capture_image, profile), "--cpus", "1", "--memory", "512mib",
+                "--disk-size", "512mib", "--vsock", "--network", "none")
     silo.start(name)
     running = silo.wait_ready(name)
     admitted = running["lifecycle"]["report"]["live"]["capture"]["availability"]
@@ -85,7 +85,7 @@ def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_i
         assert all(item.mode == 0o600 for item in before.values())
         disks = list((directory / "disks").glob("*.raw"))
         assert len(disks) == 1, "root-only fixture must seal exactly one writable disk"
-        capture.matched_cut(silo, directory, disks[0], counter, overlay=profile == "flat")
+        capture.matched_cut(silo, directory, disks[0], counter, profile=profile)
         current = silo.info(name)
         assert current["run_id"] == running["run_id"]
         if policy != "resume":

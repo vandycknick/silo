@@ -665,7 +665,7 @@ pub struct CaptureDiskPlan {
     pub copy: CaptureDiskCopy,
 }
 
-/// One read-only attachment (flat lower, read-only data), bound by libvm's
+/// One read-only attachment (composed lower, read-only data), bound by libvm's
 /// immutable content identity and never copied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

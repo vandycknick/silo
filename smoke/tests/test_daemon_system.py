@@ -37,7 +37,9 @@ def test_graceful_restart_adopts_running_appliance(daemon: Daemon, workspace: Wo
     )
     try:
         daemon.start(*args)
-        daemon.wait_system("ready", 150)
+        initial = daemon.wait_system("ready", 150)
+        # Current appliance resources wait for systemd, not merely agent readiness.
+        assert initial["system"]["restart_count"] == 0
         before = _identity(workspace)
         _, vmm, _, netd = before
         assert daemon.terminate() == 0

@@ -296,16 +296,38 @@ def _hex(digest: str) -> str:
     return digest.removeprefix("sha256:")
 
 
+def _lower_closure(runtime: Runtime, machine: str) -> tuple[list[str], list[str], list[str]]:
+    """A layered root's immutable composition graph: lower IDs, pack streams and objects."""
+    database = runtime.ws.state_db()
+    lowers = [row[0] for row in procs.query(database, f"SELECT lower_id FROM machine_lower_dependency WHERE machine_id='{machine}'")]
+    streams: list[str] = []
+    objects: list[str] = []
+    for lower in lowers:
+        rows = procs.query(database, f"SELECT r.record_digest,r.fsmeta_digest,p.record_digest FROM composition_result r JOIN composition_recipe p ON p.id=r.recipe_id WHERE r.id='{lower}'")
+        assert len(rows) == 1, (lower, rows)
+        objects.extend(rows[0])
+        packs = [row[0] for row in procs.query(database, f"SELECT l.pack_stream FROM composition_layer c JOIN layer_result l ON l.id=c.layer_result_id WHERE c.result_id='{lower}' ORDER BY c.position")]
+        assert packs, f"composition {lower} names no layer occurrence"
+        streams.extend(packs)
+        objects.extend(row[0] for row in procs.query(database, f"SELECT DISTINCT o.object_digest FROM composition_layer c JOIN layer_object_dependency o ON o.result_id=c.layer_result_id WHERE c.result_id='{lower}'"))
+    return lowers, streams, objects
+
+
 def assert_immutable_warm(source: Runtime, name: str, destination: Runtime) -> None:
-    """Prove the precondition for zero immutable payload: D already holds S's exact closure."""
+    """Prove the precondition for zero immutable payload: D already holds S's exact closure,
+    including every composition graph member of a layered root."""
     machine = procs.machine_id(source.ws, name)
     streams = [row[0] for row in procs.query(source.ws.state_db(), f"SELECT stream_id FROM machine_stream_dependency WHERE machine_id='{machine}'")]
     objects = [row[0] for row in procs.query(source.ws.state_db(), f"SELECT object_digest FROM machine_object_dependency WHERE machine_id='{machine}'")]
+    lowers, lower_streams, lower_objects = _lower_closure(source, machine)
+    streams = sorted({*streams, *lower_streams})
+    objects = sorted({*objects, *lower_objects})
+    missing_lowers = [lower for lower in lowers if procs.query(destination.ws.state_db(), f"SELECT id FROM composition_result WHERE id='{lower}'") != [(lower,)]]
     missing_streams = [stream for stream in streams if not (_pool(destination, "streams") / _hex(stream)).is_file()]
     missing_objects = [digest for digest in objects if not _verified_object(_pool(destination, "objects") / _hex(digest), _hex(digest), None)]
-    destination.ws.record("handoff-oracle", json.dumps({"warm": name, "streams": streams, "objects": objects, "missingStreams": missing_streams, "missingObjects": missing_objects}, sort_keys=True) + "\n")
+    destination.ws.record("handoff-oracle", json.dumps({"warm": name, "lowers": lowers, "streams": streams, "objects": objects, "missingLowers": missing_lowers, "missingStreams": missing_streams, "missingObjects": missing_objects}, sort_keys=True) + "\n")
     assert streams or objects, "source closure has no immutable dependency to prove reuse against"
-    assert not missing_streams and not missing_objects, (missing_streams, missing_objects)
+    assert not missing_lowers and not missing_streams and not missing_objects, (missing_lowers, missing_streams, missing_objects)
 
 
 def expected_mutable(source: Runtime, name: str, destination: Runtime) -> dict[str, int]:

@@ -62,6 +62,37 @@ impl DaemonVmService {
             .transpose()?)
     }
 
+    pub(crate) async fn export_raw_disk(
+        &self,
+        value: &str,
+        options: libvm::RawDiskExportOptions,
+    ) -> eyre::Result<libvm::RawDiskExport> {
+        let request = silo_vm_control::stopped::raw_export_request_to_wire(
+            &libvm::MachineRef::parse(value)?,
+            &options,
+        )?;
+        let result = silo_vm_control::stopped::raw_export_from_wire(
+            self.machines
+                .clone()
+                .export_raw_disk(request)
+                .await
+                .map_err(native_status)?
+                .into_inner(),
+        )?;
+        eyre::ensure!(
+            result.path == options.destination,
+            "daemon export destination mismatch"
+        );
+        eyre::ensure!(
+            !matches!(
+                result.kind,
+                libvm::RawDiskExportKind::FlattenedFilesystem { .. }
+            ) || options.flatten_filesystem,
+            "daemon flattened storage without explicit permission"
+        );
+        Ok(result)
+    }
+
     pub(crate) async fn pause_machine(&self, value: &str) -> eyre::Result<MachineData> {
         Ok(snapshots::snapshot_from_wire(
             self.machines

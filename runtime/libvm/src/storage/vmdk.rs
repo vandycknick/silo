@@ -8,7 +8,7 @@
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
-use crate::storage::identity::StreamId;
+use crate::storage::identity::{ObjectDigest, StreamId};
 use crate::storage::limits::{
     preflight_fd_budget, BoundViolation, FileDescriptorLimits, Resource, LOGICAL_SECTOR_SIZE,
 };
@@ -18,26 +18,43 @@ use crate::storage::StorageError;
 const FLAT_SECTORS: u64 = 2 * 1024 * 1024 * 1024 / LOGICAL_SECTOR_SIZE;
 const HEADER: &str = "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n";
 
-/// One retained whole-stream occurrence. Only the owned pool resolves these;
-/// repeats remain separate occurrences, not a set of attachment paths.
+/// The retained immutable identity backing one occurrence: the fsmeta byte
+/// object or a payload-pack stream. Neither is ever copied into a lower file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LowerBacking {
+    Object(ObjectDigest),
+    Stream(StreamId),
+}
+
+impl std::fmt::Display for LowerBacking {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Object(digest) => write!(formatter, "object {digest}"),
+            Self::Stream(id) => write!(formatter, "stream {id}"),
+        }
+    }
+}
+
+/// One retained whole-object or whole-stream occurrence. Only the owned pool
+/// resolves these; repeats remain separate occurrences, not a set of paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LowerOccurrence {
-    stream: StreamId,
+    backing: LowerBacking,
     path: PathBuf,
     length: u64,
 }
 
 impl LowerOccurrence {
-    pub(crate) fn resolved(stream: StreamId, path: PathBuf, length: u64) -> Self {
+    pub(crate) fn resolved(backing: LowerBacking, path: PathBuf, length: u64) -> Self {
         Self {
-            stream,
+            backing,
             path,
             length,
         }
     }
 
-    pub fn stream(&self) -> &StreamId {
-        &self.stream
+    pub fn backing(&self) -> LowerBacking {
+        self.backing
     }
 
     pub fn path(&self) -> &Path {
@@ -139,7 +156,7 @@ impl PreparedLowerPlan<'_> {
         self.plan.occurrences
     }
 
-    /// No path copies or per-record hashes. Empty streams have no backing open.
+    /// No path copies or per-record hashes. Empty backings have no open.
     pub fn unique_occurrences(&self) -> impl Iterator<Item = &LowerOccurrence> {
         self.plan
             .occurrences
@@ -148,39 +165,50 @@ impl PreparedLowerPlan<'_> {
             .filter_map(|(index, occurrence)| {
                 (occurrence.length != 0
                     && !self.plan.occurrences[..index].iter().any(|previous| {
-                        previous.length != 0 && previous.stream == occurrence.stream
+                        previous.length != 0 && previous.backing == occurrence.backing
                     }))
                 .then_some(occurrence)
             })
     }
 
-    /// Authenticate each unique immutable stream once, after resource admission.
-    /// The caller must retain its closure guard throughout this operation and
-    /// until worker startup/failure cleanup has completed.
+    /// Authenticate each unique immutable backing once, after resource
+    /// admission: streams through their map, objects by a held streaming
+    /// whole-byte SHA-256 (never a whole-object buffer). The caller retains
+    /// its closure guard through this operation and worker startup/cleanup.
     pub fn verify(&self, pool: &StoragePool) -> Result<(), StorageError> {
         for occurrence in self.occurrences() {
-            if pool.stream_path(&occurrence.stream) != occurrence.path {
+            let expected_path = match occurrence.backing {
+                LowerBacking::Stream(id) => pool.stream_path(&id),
+                LowerBacking::Object(digest) => pool.object_path(&digest),
+            };
+            if expected_path != occurrence.path {
                 return Err(StorageError::InvalidPath(format!(
                     "lower occurrence {} is outside the current pool",
-                    occurrence.stream
+                    occurrence.backing
                 )));
             }
-            let current = pool.lower_occurrence(&occurrence.stream)?;
+            let current = match occurrence.backing {
+                LowerBacking::Stream(id) => pool.lower_occurrence(&id)?,
+                LowerBacking::Object(digest) => pool.lower_object_occurrence(&digest)?,
+            };
             if current.length != occurrence.length {
                 return Err(StorageError::LowerLength {
-                    stream: occurrence.stream,
+                    backing: occurrence.backing,
                     expected: occurrence.length,
                     actual: current.length,
                 });
             }
         }
         for occurrence in self.unique_occurrences() {
-            let map = pool.verify_stream(&occurrence.stream)?;
-            if map.length() != occurrence.length {
+            let actual = match occurrence.backing {
+                LowerBacking::Stream(id) => pool.verify_stream(&id)?.length(),
+                LowerBacking::Object(digest) => pool.verify_object(&digest)?.metadata()?.len(),
+            };
+            if actual != occurrence.length {
                 return Err(StorageError::LowerLength {
-                    stream: occurrence.stream,
+                    backing: occurrence.backing,
                     expected: occurrence.length,
-                    actual: map.length(),
+                    actual,
                 });
             }
         }
@@ -294,15 +322,21 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
 
-    use crate::storage::identity::StreamId;
+    use crate::storage::identity::{ObjectDigest, StreamId};
     use crate::storage::limits::{
         BoundViolation, FileDescriptorBudgetError, FileDescriptorLimits, Resource,
     };
-    use crate::storage::vmdk::{FlatLowerPlan, LowerOccurrence, PreparedLowerPlan, HEADER};
+    use crate::storage::vmdk::{
+        FlatLowerPlan, LowerBacking, LowerOccurrence, PreparedLowerPlan, HEADER,
+    };
     use crate::storage::StorageError;
 
     fn occurrence(id: u8, path: impl Into<PathBuf>, length: u64) -> LowerOccurrence {
-        LowerOccurrence::resolved(StreamId::from_sha256([id; 32]), path.into(), length)
+        LowerOccurrence::resolved(
+            LowerBacking::Stream(StreamId::from_sha256([id; 32])),
+            path.into(),
+            length,
+        )
     }
 
     // Pure encoder tests do not mutate the process-wide limits. Actual admission
@@ -588,7 +622,7 @@ mod tests {
             .verify(&pool)
             .is_ok());
         let wrong_length = [LowerOccurrence::resolved(
-            published.id,
+            LowerBacking::Stream(published.id),
             published.path.clone(),
             1024,
         )];
@@ -600,7 +634,11 @@ mod tests {
                 ..
             })
         ));
-        let outside = [LowerOccurrence::resolved(published.id, source, 512)];
+        let outside = [LowerOccurrence::resolved(
+            LowerBacking::Stream(published.id),
+            source,
+            512,
+        )];
         assert!(matches!(
             admitted(FlatLowerPlan::new(&outside).unwrap()).verify(&pool),
             Err(StorageError::InvalidPath(_))
@@ -616,6 +654,71 @@ mod tests {
         std::fs::set_permissions(&published.path, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(matches!(
             admitted(FlatLowerPlan::new(&occurrences).unwrap()).verify(&pool),
+            Err(StorageError::ContentMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn vmdk_object_backing_is_streamed_whole_sha_verified_and_typed_distinct() {
+        use crate::storage::pool::StoragePool;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let pool = StoragePool::open(&directory.path().join("images")).unwrap();
+        let fsmeta = directory.path().join("fsmeta");
+        std::fs::write(&fsmeta, [3; 4096]).unwrap();
+        let (object, guard) = pool.publish_object_for_catalog(&fsmeta).unwrap();
+        drop(guard);
+        assert_eq!(object.digest, ObjectDigest::of_bytes(&[3; 4096]));
+        let pack = directory.path().join("pack");
+        std::fs::write(&pack, [5; 8192]).unwrap();
+        let stream = pool.publish_stream(&pack).unwrap();
+        let lower = [
+            pool.lower_object_occurrence(&object.digest).unwrap(),
+            pool.lower_occurrence(&stream.id).unwrap(),
+            pool.lower_occurrence(&stream.id).unwrap(),
+        ];
+        assert_eq!(lower[0].backing(), LowerBacking::Object(object.digest));
+        let plan = admitted(FlatLowerPlan::new(&lower).unwrap());
+        assert_eq!(plan.logical_length(), 4096 + 2 * 8192);
+        assert_eq!(plan.unique_occurrences().count(), 2);
+        plan.verify(&pool).unwrap();
+        // One digest spelled as an object and as a stream names two backings.
+        let aliased = [
+            LowerOccurrence::resolved(
+                LowerBacking::Object(ObjectDigest::from_sha256([9; 32])),
+                "/a".into(),
+                512,
+            ),
+            LowerOccurrence::resolved(
+                LowerBacking::Stream(StreamId::from_sha256([9; 32])),
+                "/a".into(),
+                512,
+            ),
+        ];
+        assert_eq!(
+            admitted(FlatLowerPlan::new(&aliased).unwrap())
+                .unique_occurrences()
+                .count(),
+            2
+        );
+        let wrong = [LowerOccurrence::resolved(
+            LowerBacking::Object(object.digest),
+            object.path.clone(),
+            8192,
+        )];
+        assert!(matches!(
+            admitted(FlatLowerPlan::new(&wrong).unwrap()).verify(&pool),
+            Err(StorageError::LowerLength {
+                backing: LowerBacking::Object(_),
+                expected: 8192,
+                actual: 4096,
+            })
+        ));
+        std::fs::set_permissions(&object.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&object.path, [4; 4096]).unwrap();
+        std::fs::set_permissions(&object.path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(
+            plan.verify(&pool),
             Err(StorageError::ContentMismatch(_))
         ));
     }

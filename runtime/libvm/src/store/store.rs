@@ -282,7 +282,7 @@ pub(crate) async fn validate_embedded_migration_history(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
@@ -364,6 +364,88 @@ mod tests {
         db.add_machine(config, &state)
             .await
             .expect("insert machine");
+    }
+
+    /// A real retained layered lower: one ingested layer composed with a
+    /// repeated occurrence for the host platform. The returned hold leases the
+    /// exact closure until a machine, image or operation roots it.
+    pub(crate) async fn retained_lower(
+        store: &Store,
+        scratch: &Path,
+        byte: u8,
+    ) -> crate::store::composition_store::HeldComposition {
+        let layers = crate::store::layer_store::LayerStore::from_store(store.clone());
+        let staged = crate::store::layer_store::tests::staged_byte(scratch, &layers, byte);
+        let layer = layers
+            .publish(staged, &oci::changeset::ChangesetLimits::default())
+            .await
+            .unwrap();
+        layers
+            .compose_retained(
+                oci::Platform::host().unwrap(),
+                &[layer.id, layer.id],
+                &oci::changeset::ChangesetLimits::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Turn a seeded raw machine into the exact layered root over `held`:
+    /// freshly formatted private upper, launch roots and the root marker.
+    pub(crate) fn layered_machine(
+        config: &mut MachineConfig,
+        storage: &mut crate::MachineStorageRecord,
+        held: &crate::store::composition_store::HeldComposition,
+    ) {
+        let capacity = 64 * 1024 * 1024;
+        let upper = disk_image::ext4::upper::format_upper(
+            &config.machine_dir.join("upper.raw"),
+            rootfs_spec::upper_geometry::UpperCapacity::new(capacity).unwrap(),
+        )
+        .unwrap();
+        let lower = held.retained().overlay_lower();
+        config.root_disk_size = Some(capacity);
+        config.spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                crate::machine::root_storage::disk(
+                    "lower.vmdk",
+                    vm_spec::DiskRole::RootLower,
+                    lower.geometry().length,
+                    "silo-root-lower".into(),
+                )
+                .unwrap(),
+                crate::machine::root_storage::disk(
+                    "upper.raw",
+                    vm_spec::DiskRole::RootUpper,
+                    capacity,
+                    "silo-root-upper".into(),
+                )
+                .unwrap(),
+            ],
+        });
+        config.spec.boot = Some(vm_spec::Boot {
+            kernel: Some(vm_spec::Kernel {
+                path: None,
+                initramfs: None,
+                cmdline: vec![crate::machine::root_storage::ROOT_MARKER.into()],
+            }),
+            userdata: None,
+        });
+        storage.root = crate::MachineRoot::LinuxOverlay {
+            lower,
+            upper: crate::PrivatePath::new("upper.raw").unwrap(),
+            upper_uuid: upper.uuid,
+            capacity,
+            ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
+            overlay_profile: crate::OverlayProfile::SiloOverlayV1,
+            temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
+        };
+        storage.profile = crate::StorageProfile::LinuxOverlayV1;
+        storage.backend = crate::BackendRequirement::KrunOverlay;
+        if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
+            *root_selector = crate::RootSelector::ManagedOverlay;
+        }
+        storage.validate().unwrap();
     }
 
     fn network_instance(id: &str, definition_name: Option<&str>) -> NetworkInstance {
@@ -2070,107 +2152,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vmdk_semantic_machine_roots_survive_prune_recovery_and_release_last_reference() {
+    async fn layered_machine_roots_retain_exact_composition_through_prune_and_release_last_reference(
+    ) {
         use crate::store::ImageStore;
         let (_temp, paths) = temp_paths();
         let db = Store::new(&paths).await.unwrap();
+        let held = retained_lower(&db, paths.home(), b'L').await;
+        let retained = held.retained().clone();
+        let graph = held.snapshot_composition().unwrap();
+        assert_eq!(graph.layers.len(), 2, "repeated occurrence order is exact");
         let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
-        let source = paths.home().join("source");
-        std::fs::write(&source, [0x42; 512]).unwrap();
-        let lower = pool.publish_stream(&source).unwrap();
+        let fsmeta = pool.object_path(&retained.fsmeta());
+        let pack = pool.stream_path(&graph.layers[0].pack.stream);
         let mut configs = Vec::new();
-        sqlx::query("INSERT INTO image_manifest(digest,media_type,image_id,platform_os,platform_architecture,config_digest,layer_count,total_size_bytes,created_at) VALUES('sha256:flat-manifest','application/vnd.oci.image.manifest.v1+json','sha256:flat-image','linux','amd64','sha256:flat-config',0,512,1)")
-            .execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO image_ref(requested_reference,selected_reference,manifest_digest,created_at,updated_at) VALUES('example.test/flat:latest','example.test/flat@sha256:flat-manifest','sha256:flat-manifest',1,1)")
-            .execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO image_rootfs_artifact(image_id,manifest_digest,config_digest,platform_os,platform_architecture,filesystem,rootfs_path,size_bytes,created_at,stream_id,conversion_abi) VALUES('sha256:flat-image','sha256:flat-manifest','sha256:flat-config','linux','amd64','ext4',?1,512,1,?2,?3)")
-            .bind(lower.path.to_str().unwrap()).bind(lower.id.to_string()).bind(crate::image::oci::CONVERSION_ABI)
-            .execute(&db.pool).await.unwrap();
-        let mut uuids = std::collections::HashSet::new();
-        let lower_uuid = uuid::Uuid::new_v4();
         for index in 0..2 {
             let id = MachineId::new();
             let mut config =
                 machine_from_path(id, format!("overlay-{index}"), paths.machine(id).dir());
             std::fs::create_dir_all(&config.machine_dir).unwrap();
-            let capacity = 64 * 1024 * 1024;
-            let upper = disk_image::ext4::upper::format_upper(
-                &config.machine_dir.join("upper.raw"),
-                rootfs_spec::upper_geometry::UpperCapacity::new(capacity).unwrap(),
-            )
-            .unwrap();
-            assert!(uuids.insert(upper.uuid));
-            config.root_disk_size = Some(capacity);
-            config.spec.storage = Some(vm_spec::Storage {
-                disks: vec![
-                    crate::machine::root_storage::disk(
-                        "lower.vmdk",
-                        vm_spec::DiskRole::RootLower,
-                        512,
-                        "silo-root-lower".into(),
-                    )
-                    .unwrap(),
-                    crate::machine::root_storage::disk(
-                        "upper.raw",
-                        vm_spec::DiskRole::RootUpper,
-                        capacity,
-                        "silo-root-upper".into(),
-                    )
-                    .unwrap(),
-                ],
-            });
             seed_machine(&db, &config).await;
             let mut storage = db.machine_storage(id).await.unwrap().unwrap();
-            storage.root = crate::MachineRoot::LinuxOverlay {
-                lower: crate::OverlayLower::FlatExt4 {
-                    stream: lower.id,
-                    geometry: vm_spec::DiskGeometry {
-                        length: 512,
-                        logical_sector_size: 512,
-                    },
-                    filesystem_uuid: lower_uuid,
-                },
-                upper: crate::PrivatePath::new("upper.raw").unwrap(),
-                upper_uuid: upper.uuid,
-                capacity,
-                ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
-                overlay_profile: crate::OverlayProfile::SiloOverlayV1,
-                temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
-            };
-            storage.profile = crate::StorageProfile::LinuxOverlayV1;
-            storage.backend = crate::BackendRequirement::KrunOverlay;
-            if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
-                *root_selector = crate::RootSelector::ManagedOverlay;
-            }
+            layered_machine(&mut config, &mut storage, &held);
             db.save_machine_config_with_storage(&config, &storage)
                 .await
                 .unwrap();
             configs.push(config);
         }
-        db.remove_image(
-            "example.test/flat:latest",
-            crate::ImageRemoveOptions::default(),
-        )
-        .await
-        .unwrap();
-        // No image alias, descriptor or operation lease retains this stream.
-        // Even an already queued collection must obey the semantic machine roots.
-        sqlx::query("INSERT INTO image_stream_gc(stream_id,size_bytes) VALUES(?1,512)")
-            .bind(lower.id.to_string())
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        // Only the machine rows root the lower once the acquisition lease ends.
+        drop(held);
+        let lowers = |db: &Store| {
+            let pool = db.pool.clone();
+            let id = retained.id.to_string();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM composition_result WHERE id=?1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
         db.prune_images().await.unwrap();
-        assert_eq!(std::fs::read(&lower.path).unwrap(), [0x42; 512]);
+        assert_eq!(lowers(&db).await, 1);
+        assert!(fsmeta.exists() && pack.exists());
         db.close().await;
         let db = Store::open(&paths.state_db_path()).await.unwrap();
-        assert!(lower.path.exists());
+        // The exact retained closure reloads without any OCI source.
+        let reloaded = crate::store::layer_store::LayerStore::from_store(db.clone())
+            .hold_composition(retained.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.retained(), &retained);
+        drop(reloaded);
         db.remove_machine(&configs[0]).await.unwrap();
         db.prune_images().await.unwrap();
-        assert!(lower.path.exists());
+        assert_eq!(lowers(&db).await, 1);
+        assert!(fsmeta.exists() && pack.exists());
         db.remove_machine(&configs[1]).await.unwrap();
         db.prune_images().await.unwrap();
-        assert!(!lower.path.exists());
+        assert_eq!(lowers(&db).await, 0);
+        assert!(!fsmeta.exists());
+        assert!(!pack.exists());
+    }
+
+    #[tokio::test]
+    async fn machine_lower_claims_must_equal_the_retained_composition() {
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let held = retained_lower(&db, paths.home(), b'M').await;
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "claims".into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        seed_machine(&db, &config).await;
+        let original = db.machine_storage(id).await.unwrap().unwrap();
+        let mut storage = original.clone();
+        layered_machine(&mut config, &mut storage, &held);
+        let crate::MachineRoot::LinuxOverlay { lower, .. } = &mut storage.root else {
+            unreachable!("layered fixture");
+        };
+        let crate::OverlayLower::ErofsComposition {
+            filesystem_uuid, ..
+        } = lower;
+        *filesystem_uuid = uuid::Uuid::new_v4();
+        // A derived UUID claim contradicting the authenticated result is
+        // refused in the same transaction; nothing of the claim persists.
+        assert!(db
+            .save_machine_config_with_storage(&config, &storage)
+            .await
+            .is_err());
+        assert_eq!(db.machine_storage(id).await.unwrap().unwrap(), original);
+        let mut absent = storage.clone();
+        let crate::MachineRoot::LinuxOverlay { lower, .. } = &mut absent.root else {
+            unreachable!("layered fixture");
+        };
+        *lower = held.retained().overlay_lower();
+        let crate::OverlayLower::ErofsComposition { record, .. } = lower;
+        *record = format!("sha256:{}", "07".repeat(32)).parse().unwrap();
+        // A lower without a retained composition is never rooted by claim.
+        assert!(db
+            .save_machine_config_with_storage(&config, &absent)
+            .await
+            .is_err());
+        assert_eq!(db.machine_storage(id).await.unwrap().unwrap(), original);
     }
 
     #[tokio::test]
@@ -2316,21 +2398,24 @@ mod tests {
         let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
         let source = paths.home().join("source");
         std::fs::write(&source, [3; 512]).unwrap();
-        let stream = pool.publish_stream(&source).unwrap();
         let operation = uuid::Uuid::new_v4();
         let lease = pool.lease(operation).unwrap();
-        assert!(db.prune_images().await.is_err());
-        assert!(stream.path.exists());
+        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
         assert!(db
-            .retain_storage_stream(&stream.id, operation)
+            .pin_published_storage_dependencies(operation, &[stream.id], &[])
             .await
             .is_err());
+        drop(roots);
+        assert!(db.prune_images().await.is_err());
+        assert!(stream.path.exists());
         drop(lease);
         let operation = uuid::Uuid::new_v4();
         let lease = db.begin_storage_operation(operation).await.unwrap();
-        db.retain_storage_stream(&stream.id, operation)
+        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        db.pin_published_storage_dependencies(operation, &[stream.id], &[])
             .await
             .unwrap();
+        drop(roots);
         drop(lease);
         let path = paths
             .images_dir()
@@ -2449,12 +2534,13 @@ mod tests {
         let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
         let source = paths.home().join("source");
         std::fs::write(&source, [4; 512]).unwrap();
-        let stream = pool.publish_stream(&source).unwrap();
         let operation = uuid::Uuid::new_v4();
         let lease = db.begin_storage_operation(operation).await.unwrap();
-        db.retain_storage_stream(&stream.id, operation)
+        let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+        db.pin_published_storage_dependencies(operation, &[stream.id], &[])
             .await
             .unwrap();
+        drop(roots);
         let path = paths
             .images_dir()
             .join("locks/leases")
@@ -2518,13 +2604,10 @@ mod tests {
             .unwrap();
         let operation = owner.operation_id();
         drop(owner);
-        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
-        let source = paths.home().join("concurrent-source");
-        std::fs::write(&source, [8; 512]).unwrap();
-        let stream = pool.publish_stream(&source).unwrap();
-        let stream_operation = uuid::Uuid::new_v4();
-        let _stream_lease = db.begin_storage_operation(stream_operation).await.unwrap();
-        for phase in ["register", "admit", "retain", "retire"] {
+        let digest = crate::storage::identity::ObjectDigest::of_bytes(&[8; 512]);
+        let cache_operation = uuid::Uuid::new_v4();
+        let _cache_lease = db.begin_storage_operation(cache_operation).await.unwrap();
+        for phase in ["register", "admit", "pin-cache", "retire"] {
             let images = paths.images_dir().to_path_buf();
             let (entered, ready) = tokio::sync::oneshot::channel();
             let (release, resume) = std::sync::mpsc::channel();
@@ -2542,7 +2625,6 @@ mod tests {
             let worker = db.clone();
             let storage = storage.clone();
             let spec = config.spec.clone();
-            let stream_id = stream.id;
             let task = tokio::spawn(async move {
                 match phase {
                     "register" => worker
@@ -2550,11 +2632,7 @@ mod tests {
                         .await
                         .map(drop),
                     "admit" => worker.mark_launch_storage_admitted(operation).await,
-                    "retain" => {
-                        worker
-                            .retain_storage_stream(&stream_id, stream_operation)
-                            .await
-                    }
+                    "pin-cache" => worker.pin_source_blobs(cache_operation, &[digest]).await,
                     "retire" => worker
                         .try_retire_launch_storage(
                             operation,

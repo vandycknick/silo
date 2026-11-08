@@ -88,6 +88,9 @@ pub enum PartitionTable {
     Gpt,
     Mbr,
 }
+/// The only admitted lower is a retained EROFS composition. `geometry` and
+/// `filesystem_uuid` are derived duplicate claims: publication and every
+/// launch check them against the authenticated composition result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -96,14 +99,63 @@ pub enum PartitionTable {
     deny_unknown_fields
 )]
 pub enum OverlayLower {
-    FlatExt4 {
-        stream: StreamId,
+    ErofsComposition {
+        record: LowerResultId,
         geometry: DiskGeometry,
         filesystem_uuid: uuid::Uuid,
     },
-    ErofsComposition {
-        record: LowerResultId,
-    },
+}
+
+impl OverlayLower {
+    pub fn record(&self) -> LowerResultId {
+        match self {
+            Self::ErofsComposition { record, .. } => *record,
+        }
+    }
+
+    pub fn geometry(&self) -> DiskGeometry {
+        match self {
+            Self::ErofsComposition { geometry, .. } => *geometry,
+        }
+    }
+
+    pub fn filesystem_uuid(&self) -> uuid::Uuid {
+        match self {
+            Self::ErofsComposition {
+                filesystem_uuid, ..
+            } => *filesystem_uuid,
+        }
+    }
+}
+
+/// Retired and unknown persisted root formats are refused by name, never
+/// reinterpreted. `root` is the persisted `MachineRoot` JSON value.
+pub(crate) fn refuse_retired_root(root: &serde_json::Value) -> Result<(), LibVmError> {
+    let kind = root.get("kind").and_then(serde_json::Value::as_str);
+    match kind {
+        Some("opaque-raw") => Ok(()),
+        Some("linux-overlay") => {
+            let lower = root
+                .get("lower")
+                .and_then(|lower| lower.get("kind"))
+                .and_then(serde_json::Value::as_str);
+            match lower {
+                Some("erofs-composition") => Ok(()),
+                Some(other) => Err(LibVmError::IncompatibleRootProfile {
+                    profile: format!("linux-overlay/{other}"),
+                }),
+                None => Err(LibVmError::IncompatibleRootProfile {
+                    profile: "linux-overlay/unspecified-lower".into(),
+                }),
+            }
+        }
+        Some(other) => Err(LibVmError::IncompatibleRootProfile {
+            profile: other.into(),
+        }),
+        None => Err(LibVmError::IncompatibleRootProfile {
+            profile: "unspecified".into(),
+        }),
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -572,11 +624,24 @@ impl MachineStorageRecord {
         crate::storage::limits::Resource::MetadataPageBytes
             .check(json.len() as u64)
             .map_err(crate::storage::StorageError::from)?;
-        let record: Self =
-            serde_json::from_str(json).map_err(|error| LibVmError::InvalidStorageRecord {
-                record: "machine-storage",
-                message: error.to_string(),
-            })?;
+        let record: Self = match serde_json::from_str(json) {
+            Ok(record) => record,
+            Err(error) => {
+                // Name retired/unknown root formats instead of reporting a
+                // generic schema failure; never reinterpret them.
+                if let Some(root) = serde_json::from_str::<serde_json::Value>(json)
+                    .ok()
+                    .as_ref()
+                    .and_then(|value| value.get("root"))
+                {
+                    refuse_retired_root(root)?;
+                }
+                return Err(LibVmError::InvalidStorageRecord {
+                    record: "machine-storage",
+                    message: error.to_string(),
+                });
+            }
+        };
         record.validate_persistent()?;
         Ok(record)
     }
@@ -717,18 +782,23 @@ fn validate_root(root: &MachineRoot) -> Result<(), LibVmError> {
             if upper_uuid.is_nil() {
                 return Err(invalid("upper filesystem UUID must not be nil"));
             }
-            if let OverlayLower::FlatExt4 {
+            let OverlayLower::ErofsComposition {
                 geometry,
                 filesystem_uuid,
                 ..
-            } = lower
+            } = lower;
+            validate_geometry(geometry)?;
+            // Fsmeta and every pack occurrence are 4 KiB aligned.
+            if !geometry
+                .length
+                .is_multiple_of(oci::changeset::limits::PACK_ALIGNMENT)
             {
-                validate_geometry(geometry)?;
-                if filesystem_uuid.is_nil() || filesystem_uuid == upper_uuid {
-                    return Err(invalid(
-                        "root filesystem UUIDs must be nonzero and distinct",
-                    ));
-                }
+                return Err(invalid("composition lower length is not block aligned"));
+            }
+            if filesystem_uuid.is_nil() || filesystem_uuid == upper_uuid {
+                return Err(invalid(
+                    "root filesystem UUIDs must be nonzero and distinct",
+                ));
             }
         }
     }
@@ -910,7 +980,6 @@ mod tests {
             record
         );
         for (field, invalid) in [
-            ("root", serde_json::json!({"kind":"legacy"})),
             ("boot", serde_json::json!({"kind":"bios"})),
             ("backend", serde_json::json!("other")),
             ("profile", serde_json::json!("other")),
@@ -923,6 +992,12 @@ mod tests {
                 Err(LibVmError::InvalidStorageRecord { .. })
             ));
         }
+        let mut changed = value.clone();
+        changed["root"] = serde_json::json!({"kind":"legacy"});
+        assert!(matches!(
+            MachineStorageRecord::decode(&changed.to_string()),
+            Err(LibVmError::IncompatibleRootProfile { profile }) if profile == "legacy"
+        ));
         let mut changed = value;
         changed["backend"] = serde_json::json!("krun-overlay");
         assert!(MachineStorageRecord::decode(&changed.to_string()).is_err());
@@ -1305,7 +1380,7 @@ mod tests {
         tmpfs["root"]["temporaryDirectory"] =
             serde_json::json!({"kind":"tmpfs","capacityBytes":4096});
         let parsed = rootfs_spec::decode_bootstrap(&serde_json::to_vec(&tmpfs).unwrap()).unwrap();
-        let rootfs_spec::Root::FlatOverlay(root) = parsed.root else {
+        let rootfs_spec::Root::ErofsOverlay(root) = parsed.root else {
             panic!("overlay");
         };
         assert_eq!(
@@ -1316,8 +1391,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn flat_lower_and_temporary_policy_are_required_semantic_fields() {
+    fn overlay_record(lower_length: u64) -> MachineStorageRecord {
         use crate::store::models::storage::{
             BackendRequirement, BootProfile, MachineRoot, OverlayLower, RootSelector,
             StorageProfile, TemporaryDirectoryPolicy,
@@ -1329,15 +1403,11 @@ mod tests {
         )
         .unwrap();
         pin(&mut record);
-        let stream = crate::storage::stream::StreamHasher::new()
-            .hash_reader(std::io::Cursor::new([0; 512]))
-            .unwrap()
-            .id();
         record.root = MachineRoot::LinuxOverlay {
-            lower: OverlayLower::FlatExt4 {
-                stream,
+            lower: OverlayLower::ErofsComposition {
+                record: format!("sha256:{}", "cd".repeat(32)).parse().unwrap(),
                 geometry: vm_spec::DiskGeometry {
-                    length: 512,
+                    length: lower_length,
                     logical_sector_size: 512,
                 },
                 filesystem_uuid: uuid::Uuid::new_v4(),
@@ -1354,14 +1424,23 @@ mod tests {
         if let BootProfile::LinuxDirect { root_selector, .. } = &mut record.boot {
             *root_selector = RootSelector::ManagedOverlay;
         }
+        record
+    }
+
+    #[test]
+    fn composition_lower_and_temporary_policy_are_required_semantic_fields() {
+        use crate::store::models::storage::TemporaryDirectoryPolicy;
+        let mut record = overlay_record(8192);
         record.validate().unwrap();
         let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["root"]["lower"]["kind"], "erofs-composition");
         assert_eq!(
             MachineStorageRecord::decode(&value.to_string()).unwrap(),
             record
         );
         for (parent, field) in [
             ("/root", "temporaryDirectory"),
+            ("/root/lower", "record"),
             ("/root/lower", "geometry"),
             ("/root/lower", "filesystemUuid"),
         ] {
@@ -1377,6 +1456,8 @@ mod tests {
                 "{field}"
             );
         }
+        // Composition lowers are 4 KiB aligned; a sector-only length is a lie.
+        assert!(overlay_record(512).validate().is_err());
         assert!(TemporaryDirectoryPolicy::Tmpfs { capacity_bytes: 1 }
             .validate()
             .is_err());
@@ -1398,6 +1479,41 @@ mod tests {
         );
         record.disks[0].order = 2;
         record.validate().unwrap();
+    }
+
+    #[test]
+    fn retired_flat_and_unknown_lowers_are_typed_compatibility_refusals() {
+        let value = serde_json::to_value(overlay_record(8192)).unwrap();
+        let stream = format!("sha256:{}", "ab".repeat(32));
+        for (lower, profile) in [
+            (
+                serde_json::json!({"kind":"flat-ext4","stream":stream,
+                    "geometry":{"length":8192,"logicalSectorSize":512},
+                    "filesystemUuid":uuid::Uuid::new_v4()}),
+                "linux-overlay/flat-ext4",
+            ),
+            (
+                serde_json::json!({"kind":"squashfs"}),
+                "linux-overlay/squashfs",
+            ),
+            (serde_json::json!({}), "linux-overlay/unspecified-lower"),
+        ] {
+            let mut changed = value.clone();
+            changed["root"]["lower"] = lower;
+            match MachineStorageRecord::decode(&changed.to_string()) {
+                Err(LibVmError::IncompatibleRootProfile { profile: actual }) => {
+                    assert_eq!(actual, profile)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A current-format but internally invalid lower stays a schema error.
+        let mut changed = value;
+        changed["root"]["lower"]["record"] = serde_json::json!("sha256:short");
+        assert!(matches!(
+            MachineStorageRecord::decode(&changed.to_string()),
+            Err(LibVmError::InvalidStorageRecord { .. })
+        ));
     }
 
     #[test]

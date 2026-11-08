@@ -182,10 +182,6 @@ pub fn create_to_wire(
         cpus: v.cpus.map(u32::from),
         memory_bytes: v.memory_bytes,
         root_disk_size_bytes: v.root_disk_size_bytes,
-        root_profile: Some(match v.root_profile {
-            libvm::RootProfile::OpaqueRaw => w::RootProfile::OpaqueRaw as i32,
-            libvm::RootProfile::LinuxFlatOverlayV1 => w::RootProfile::LinuxFlatOverlayV1 as i32,
-        }),
         temporary_directory: Some(temporary_directory_to_wire(v.temporary_directory)),
         userdata: v.userdata.clone(),
         network: v.network.as_ref().map(resolved_to_wire).transpose()?,
@@ -233,14 +229,6 @@ pub fn create_from_wire(
             .map(|v| memory_from_wire(v).map(|v| v.as_bytes()))
             .transpose()?,
         root_disk_size_bytes: v.root_disk_size_bytes,
-        root_profile: match w::RootProfile::try_from(required(
-            v.root_profile,
-            "create.root_profile",
-        )?) {
-            Ok(w::RootProfile::OpaqueRaw) => libvm::RootProfile::OpaqueRaw,
-            Ok(w::RootProfile::LinuxFlatOverlayV1) => libvm::RootProfile::LinuxFlatOverlayV1,
-            _ => return Err(invalid("create.root_profile", "unknown root profile")),
-        },
         temporary_directory: temporary_directory_from_wire(required(
             v.temporary_directory,
             "create.temporary_directory",

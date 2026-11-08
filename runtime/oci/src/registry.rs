@@ -46,6 +46,11 @@ impl ResolvedImage {
     pub fn layer_digests(&self) -> impl Iterator<Item = &str> {
         self.layers.iter().map(|layer| layer.digest.as_str())
     }
+
+    /// Verified descriptors of every ordered layer occurrence, repeats kept.
+    pub fn layer_metadata(&self) -> impl Iterator<Item = crate::RootfsLayerMetadata> + '_ {
+        self.layers.iter().map(crate::RootfsLayerMetadata::from)
+    }
 }
 
 #[derive(Debug, Clone)]

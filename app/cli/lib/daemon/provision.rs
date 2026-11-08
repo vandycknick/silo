@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::daemon::record::DaemonRecord;
 use crate::daemon::runtime::SystemRuntime;
-use crate::daemon::storage::{ensure_data_image, validate_data_image};
+use crate::daemon::storage::{ensure_data_image, validate_data_image_identity};
 use crate::daemon::system_config::{DesiredSystem, ResolvedSystemConfig};
 use silod_spec::paths::DaemonPaths;
 
@@ -73,17 +73,20 @@ pub(crate) fn prepare_installation(
         }
     };
 
-    let prepare_data = if installation.machine_id.is_some() {
-        validate_data_image
+    if installation.machine_id.is_some() {
+        validate_data_image_identity(
+            &paths.data_image(),
+            installation.data_size_bytes,
+            installation.data_uuid,
+        )?;
     } else {
-        ensure_data_image
-    };
-    prepare_data(
-        &paths.data_image(),
-        installation.data_size_bytes,
-        installation.installation_id,
-        installation.data_uuid,
-    )?;
+        ensure_data_image(
+            &paths.data_image(),
+            installation.data_size_bytes,
+            installation.installation_id,
+            installation.data_uuid,
+        )?;
+    }
 
     Ok(installation)
 }
@@ -386,6 +389,47 @@ mod tests {
             inode,
             std::fs::metadata(paths.data_image()).expect("disk").ino()
         );
+    }
+
+    #[test]
+    fn provisioned_installation_accepts_mounted_data_without_reading_its_namespace() {
+        use std::os::unix::fs::FileExt as _;
+
+        use disk_image::ext4::constants::{incompat, SUPERBLOCK_OFFSET};
+        use disk_image::ext4::types::SUPERBLOCK_SIZE;
+        use disk_image::ext4::{read_superblock, ReadError, Reader};
+
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, state) = fixture(temp.path());
+        state.save(&paths).expect("initial identity");
+        let mut state = prepare_installation(&paths, &state.config).expect("fresh storage");
+        state.machine_id = Some("running-vm".to_string());
+        state.save(&paths).expect("record VM before activation");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.data_image())
+            .expect("data image");
+        let mut superblock = read_superblock(&file).expect("superblock");
+        superblock.feature_incompat |= incompat::RECOVER;
+        let mut before = [0; SUPERBLOCK_SIZE];
+        superblock.write_to(&mut before);
+        file.write_all_at(&before, SUPERBLOCK_OFFSET)
+            .expect("mounted state");
+
+        for _ in 0..2 {
+            let resumed = prepare_installation(&paths, &state.config)
+                .expect("activation retry or daemon adoption must use only attachment identity");
+            assert_eq!(resumed, state);
+            assert!(matches!(
+                Reader::new(&paths.data_image()),
+                Err(ReadError::RequiresRecovery(_))
+            ));
+        }
+        let mut after = [0; SUPERBLOCK_SIZE];
+        file.read_exact_at(&mut after, SUPERBLOCK_OFFSET)
+            .expect("unchanged");
+        assert_eq!(after, before);
     }
 
     #[test]

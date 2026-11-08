@@ -16,10 +16,11 @@
 //!     Some(FileData::Dense(&mut "hello world".as_bytes())), None, None, None, None).unwrap();
 //! fmt.close().unwrap();
 //!
-//! // Read it back.
-//! let mut reader = disk_image::ext4::Reader::new(Path::new("rootfs.ext4")).unwrap();
+//! // Read it back. Opening refuses dirty, unsupported or corrupt filesystems.
+//! let reader = disk_image::ext4::Reader::new(Path::new("rootfs.ext4")).unwrap();
 //! let data = reader.read_file("/hello.txt", 0, None).unwrap();
 //! assert_eq!(&data, b"hello world");
+//! reader.audit().unwrap();
 //!
 //! // Grow a clean, unmounted image.
 //! let target = 512 * 1024 * 1024;
@@ -51,7 +52,7 @@ pub mod xattr;
 pub use error::{FormatError, FormatResult, ReadError, ReadResult, ResizeError, ResizeResult};
 pub use formatter::{FileTimestamps, FormatOptions, Formatter};
 pub use input::{DeviceId, FileData, FileRange, SparseData};
-pub use reader::Reader;
+pub use reader::{Reader, read_superblock};
 pub use resizer::{GrowOutcome, grow_image};
 pub use sizing::FormatSizing;
 

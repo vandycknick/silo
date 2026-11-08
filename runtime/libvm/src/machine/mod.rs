@@ -16,6 +16,7 @@ mod mounts;
 mod name_generator;
 mod node_status;
 mod process;
+mod raw_export;
 mod reference;
 pub(crate) mod restore;
 pub(crate) mod root_disk;
@@ -30,7 +31,7 @@ mod streams;
 mod update;
 mod vsock;
 
-pub use builder::{MachineBuilder, RootProfile};
+pub use builder::MachineBuilder;
 pub use forward::{
     MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
     MachineForwardStatus,
@@ -62,6 +63,7 @@ pub use node_status::{
     MachineNodeState, MachineNodeStatus,
 };
 pub use process::{MachineRetention, ProcessConfig};
+pub use raw_export::{RawDiskExport, RawDiskExportKind, RawDiskExportOptions};
 pub use reference::validate_new_machine_name;
 pub use reference::MachineRef;
 pub use session::host::AttachmentSignal;

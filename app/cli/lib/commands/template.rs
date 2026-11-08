@@ -227,7 +227,6 @@ fn create_template(store: &TemplateStore, command: CreateCmd) -> eyre::Result<()
         image: command.image,
         resources: None,
         disk_size: None,
-        root_profile: None,
         tmpfs_size: None,
         userdata: None,
         mounts: Vec::new(),

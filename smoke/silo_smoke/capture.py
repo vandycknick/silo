@@ -11,7 +11,7 @@ import struct
 import subprocess
 import time
 
-from .cli import Silo
+from .cli import RootProfile, Silo
 from .config import REPO
 from . import stopped
 
@@ -88,7 +88,7 @@ class Counter:
 
 
 def matched_cut(silo: Silo, directory: Path, disk: Path, counter: Counter,
-                *, overlay: bool) -> dict[str, int]:
+                *, profile: RootProfile) -> dict[str, int]:
     """Read sealed disk and exact RAM GPA without mounting or replaying a journal."""
     layout_path = directory / "memory-layout.json"
     assert layout_path.stat().st_size <= 4 * 1024 * 1024
@@ -110,7 +110,7 @@ def matched_cut(silo: Silo, directory: Path, disk: Path, counter: Counter,
     assert magic == 0x53494C4F43555431, "pinned witness address changed or RAM cut is corrupt"
     assert writing in (0, 1)
     assert pending in (committed, committed + 1)
-    path = "/upper/capture-counter" if overlay else "/capture-counter"
+    path = "/upper/capture-counter" if profile == "layered" else "/capture-counter"
     result = subprocess.run(["debugfs", "-R", f"cat {path}", str(disk)],
                             capture_output=True, check=True, timeout=30)
     silo.ws.record("capture-counter-disk-reader", result.stderr.decode(errors="replace"))
@@ -137,6 +137,10 @@ def unchanged(silo: Silo, directory: Path, before: dict[str, stopped.Bytes]) -> 
     assert set(before) <= set(after)
     assert set(after) - set(before) <= {"vm.capture-source.json"}
     for name, original in before.items():
-        assert after[name] == original, f"sealed capture file mutated: {name}"
+        observed = after[name]
+        # Read-only faults can allocate tmpfs holes without changing file bytes.
+        assert (observed.path, observed.device, observed.inode, observed.mode, observed.content()) == (
+            original.path, original.device, original.inode, original.mode, original.content()
+        ), f"sealed capture file mutated: {name}: {original!r} -> {observed!r}"
     silo.ws.record("capture-sealed-inventory", json.dumps({
         name: asdict(value) for name, value in after.items()}, sort_keys=True) + "\n")

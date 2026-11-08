@@ -25,7 +25,7 @@ import uuid
 import pytest
 
 from . import images, overlay, pause, procs, stopped
-from .cli import Result, Silo
+from .cli import Result, RootProfile, Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
 
@@ -56,12 +56,11 @@ def require_restore_candidate(info: dict) -> None:
             "select the explicit isolated capture+restore candidate", operation, live[operation])
 
 
-def create_source(silo: Silo, image: str, *flags: str, name: str = "restore-source",
-                  profile: str = "raw", network: str = "none", cpus: int = 2) -> dict:
-    assert profile in {"raw", "flat"} and cpus in (2, 4)
-    silo.create(name, image, "--cpus", str(cpus), "--memory", "512mib", "--disk-size", "512mib",
-                "--vsock", "--network", network,
-                *(["--root-profile", overlay.PROFILE] if profile == "flat" else []), *flags)
+def create_source(silo: Silo, image: str, *flags: str, profile: RootProfile, name: str = "restore-source",
+                  network: str = "none", cpus: int = 2) -> dict:
+    assert cpus in (2, 4)
+    silo.create(name, silo.root_image(image, profile), "--cpus", str(cpus), "--memory", "512mib",
+                "--disk-size", "512mib", "--vsock", "--network", network, *flags)
     silo.start(name)
     info = silo.wait_ready(name)
     require_restore_candidate(info)
@@ -217,7 +216,7 @@ def sealed_ram(saved: Checkpoint, address: int, length: int) -> tuple[bytes, int
     return raw, offset
 
 
-def matched_cut(silo: Silo, saved: Checkpoint, identity: dict, *, profile: str) -> Cut:
+def matched_cut(silo: Silo, saved: Checkpoint, identity: dict, *, profile: RootProfile) -> Cut:
     address = identity["guestPhysicalAddress"]
     raw, offset = sealed_ram(saved, address, STATE.size)
     state = STATE.unpack(raw)
@@ -229,7 +228,7 @@ def matched_cut(silo: Silo, saved: Checkpoint, identity: dict, *, profile: str) 
     assert state[13] > 0 and state[14] in (0, 1), "live register workload did not reach the cut"
     disks = list((saved.staging / "disks").glob("*.raw"))
     assert len(disks) == 1
-    path = "/upper/restore-execution.records" if profile == "flat" else "/restore-execution.records"
+    path = "/upper/restore-execution.records" if profile == "layered" else "/restore-execution.records"
     result = subprocess.run(["debugfs", "-R", f"cat {path}", str(disks[0])],
                             capture_output=True, check=True, timeout=30)
     silo.ws.record("restore-independent-disk-reader", result.stderr.decode(errors="replace"))
@@ -373,9 +372,9 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
     evidence_digest, path = object_bytes(silo, seal_bytes)
     created.append(path)
     provenance = procs.query(silo.ws.state_db(),
-        f"SELECT capture_id,evidence_digest,hex(evidence_bytes) FROM snapshot_capture_provenance WHERE snapshot_id='{saved.snapshot}'")
+        f"SELECT capture_id,evidence_digest,hex(evidence_bytes),hex(plan_bytes) FROM snapshot_capture_provenance WHERE snapshot_id='{saved.snapshot}'")
     assert len(provenance) == 1
-    capture_id, old_evidence_digest, old_evidence_hex = provenance[0]
+    capture_id, old_evidence_digest, old_evidence_hex, plan_hex = provenance[0]
     assert capture_id == saved.seal["captureId"]
     old_record_digest = procs.query(silo.ws.state_db(),
         f"SELECT record_digest FROM storage_snapshot WHERE id='{saved.snapshot}'")[0][0]
@@ -388,7 +387,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
         f"INSERT INTO snapshot_stream_dependency SELECT '{snapshot}',stream_id FROM snapshot_stream_dependency WHERE snapshot_id='{saved.snapshot}';",
         *[f"INSERT INTO snapshot_object_dependency VALUES('{snapshot}','{digest}');" for digest in sorted(objects)],
         f"DELETE FROM snapshot_capture_provenance WHERE capture_id='{capture_id}';",
-        f"INSERT INTO snapshot_capture_provenance VALUES('{capture_id}','{snapshot}','{evidence_digest}',X'{seal_bytes.hex()}');",
+        f"INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) VALUES('{capture_id}','{snapshot}','{evidence_digest}',X'{seal_bytes.hex()}',X'{plan_hex}');",
         "COMMIT;",
     ]
     installed = False
@@ -411,7 +410,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
             sql(silo, "\n".join([
                 "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;",
                 f"DELETE FROM storage_snapshot WHERE id='{snapshot}';",
-                f"INSERT INTO snapshot_capture_provenance VALUES('{capture_id}','{saved.snapshot}','{old_evidence_digest}',X'{old_evidence_hex}');",
+                f"INSERT INTO snapshot_capture_provenance(capture_id,snapshot_id,evidence_digest,evidence_bytes,plan_bytes) VALUES('{capture_id}','{saved.snapshot}','{old_evidence_digest}',X'{old_evidence_hex}',X'{plan_hex}');",
                 "COMMIT;",
             ]))
 

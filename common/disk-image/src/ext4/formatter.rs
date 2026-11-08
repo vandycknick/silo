@@ -673,7 +673,10 @@ impl Formatter {
         Self::construct(path, opts, None)
     }
 
-    pub(crate) fn new_upper(path: &Path, capacity: UpperCapacity) -> FormatResult<Self> {
+    /// A formatter with the fixed `silo-upper-ext4-v1` profile. Production
+    /// uppers use [`crate::ext4::upper::format_upper`]; this constructor lets
+    /// callers build populated profile images, finished with `close`.
+    pub fn new_upper(path: &Path, capacity: UpperCapacity) -> FormatResult<Self> {
         Self::construct(path, FormatOptions::new(capacity.bytes()), Some(capacity))
     }
 
@@ -2284,7 +2287,7 @@ mod tests {
 
         fmt.close().unwrap();
 
-        let mut reader = crate::ext4::Reader::new(&path).unwrap();
+        let reader = crate::ext4::Reader::new(&path).unwrap();
         let root_entries = reader.children_of(ROOT_INODE).unwrap();
         assert!(root_entries.iter().any(|(name, _)| name == b"."));
         assert!(root_entries.iter().any(|(name, _)| name == b".."));
@@ -2304,7 +2307,7 @@ mod tests {
         fmt.seek_to_block(root_directory_block).unwrap();
         fmt.close().unwrap();
 
-        let mut reader = crate::ext4::Reader::new(&path).unwrap();
+        let reader = crate::ext4::Reader::new(&path).unwrap();
         let sb = reader.superblock().clone();
         let block_size = 1024u64 * (1 << sb.log_block_size);
         let group_count = (sb.blocks_count_lo - 1) / sb.blocks_per_group + 1;
@@ -2723,7 +2726,7 @@ mod tests {
                 .unwrap();
         }
         formatter.close().unwrap();
-        let mut reader = Reader::new(&image).unwrap();
+        let reader = Reader::new(&image).unwrap();
         assert!(!reader.exists("/lost+found"));
         assert_eq!(reader.read_link(b"/link\xfb").unwrap(), b"dir \xff/f \xfe");
         assert_eq!(reader.read_file(b"/link\xfb", 0, None).unwrap(), b"payload");
@@ -2862,7 +2865,7 @@ mod tests {
             )
             .unwrap();
         formatter.close().unwrap();
-        let mut reader = Reader::new(&image).unwrap();
+        let reader = Reader::new(&image).unwrap();
         let inode = reader.stat("/sparse").unwrap().1;
         assert_eq!(inode.file_size(), length);
         assert_eq!(inode.blocks_lo, 3);
@@ -2995,7 +2998,7 @@ mod tests {
             )
             .unwrap();
         formatter.close().unwrap();
-        let mut reader = Reader::new(&image).unwrap();
+        let reader = Reader::new(&image).unwrap();
         for index in [0, 339, 340, 1360, 1999] {
             assert_eq!(
                 reader
@@ -3076,7 +3079,7 @@ mod tests {
             )
             .unwrap();
         formatter.close().unwrap();
-        let mut reader = Reader::new(&image).unwrap();
+        let reader = Reader::new(&image).unwrap();
         assert!(reader.superblock().blocks_count_lo as u64 * 4096 > 16u64 << 30);
         assert_eq!(reader.read_file("/tail", 0, None).unwrap(), b"tail");
         let mut file = File::open(image).unwrap();

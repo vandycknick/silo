@@ -53,8 +53,8 @@ def test_overlay_production_persistence_index_metadata_whiteouts(silo: Silo, ove
     first_run = procs.run_id(silo.ws, name)
     first_monitor = procs.vmm_pid(silo.ws, name)
     descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
-    lower = overlay.records(descriptor)[0].path
-    before = overlay.digest(lower)
+    before = overlay.lower_digests(descriptor)
+    assert not (overlay.machine_dir(silo, name) / "root.raw").exists(), "ordinary OCI must not materialize an opaque lower"
     assert overlay.filesystem_magic(silo, name, "/") == overlay.OVERLAYFS_SUPER_MAGIC
     overlay.probe(silo, name, "lower-ro")
     overlay.probe(silo, name, "metadata")
@@ -82,7 +82,7 @@ printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
     assert devices[0] == tmp_device[0].strip()
     overlay.orderly_guest_shutdown(silo, name)
     assert silo.info(name)["state"] == "stopped"
-    assert overlay.digest(lower) == before
+    assert overlay.lower_digests(descriptor) == before
     stopped = overlay.ext4(overlay.upper(silo, name))
     assert stopped["incompat"] & 4 == 0, "orderly shutdown left RECOVER set"
     silo.start(name)
@@ -108,7 +108,7 @@ printf '%s\\n' SILO_OVERLAY_PERSIST_BOUNDARY
     assert readback_parts[1] == "committed\n"
     assert readback_parts[2] == "committed\n"
     assert overlay.observation(silo, name)["root"]["upper"]["filesystemUuid"] == observed.observation["root"]["upper"]["filesystemUuid"]
-    assert overlay.digest(lower) == before
+    assert overlay.lower_digests(descriptor) == before
 
 
 def test_overlay_sized_tmpfs_and_policy_removal(silo: Silo, overlay_image: str) -> None:
@@ -157,21 +157,28 @@ def test_vmdk_production_split_mapping_independent_oracles(silo: Silo, overlay_l
     overlay.create(silo, name, overlay_large_image)
     descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
     records = overlay.records(descriptor)
-    lower = records[0].path
-    assert lower.stat().st_size > overlay.SPLIT
-    assert len(records) >= 2 and records[1].offset == overlay.SPLIT // 512
+    occurrences = overlay.lower_occurrences(descriptor)
+    assert len(occurrences) >= 2, "production lower must include fsmeta and payload packs"
+    assert overlay.erofs(occurrences[0])["filesystem_bytes"] == occurrences[0].stat().st_size
+    assert any(path.stat().st_size > overlay.SPLIT for path in occurrences[1:])
+    assert any(record.offset == overlay.SPLIT // 512 for record in records)
+    total = sum(path.stat().st_size for path in occurrences)
+    boundaries = []
+    at = 0
+    for record in records[:-1]:
+        at += record.sectors * 512
+        boundaries.append((at - 2048, 4096))
     wrong_mismatches = 0
     zero_controls = 0
-    for offset, length in overlay.probes(lower.stat().st_size):
-        expected = overlay.linear_read([lower], offset, length)
+    for offset, length in sorted(set(overlay.probes(total) + boundaries)):
+        expected = overlay.linear_read(occurrences, offset, length)
         assert overlay.record_read(records, offset, length) == expected
         actual = bytes.fromhex(overlay.probe(silo, name, "read", str(offset), str(length))["hex"])
         assert actual == expected, f"production lower mismatch at {offset}+{length}"
         wrong = overlay.record_read(records, offset, length, wrong_bytes=True)
-        if offset + length <= overlay.SPLIT:
-            assert wrong == expected
+        if wrong == expected:
             zero_controls += 1
-        elif wrong != expected:
+        else:
             wrong_mismatches += 1
     assert zero_controls and wrong_mismatches, "byte-offset negative control did not detect mapping defect"
     silo.ws.record("vmdk-negative-control", f"mutation=reader-offsets-as-bytes mismatches={wrong_mismatches} zero-offset-controls={zero_controls}\n")
@@ -186,7 +193,7 @@ def test_vmdk_home_spaces_and_relocation(silo: Silo, workspace: Workspace, overl
     workspace.silo_home = spaced
     overlay.create(silo, "overlay-moved", overlay_image)
     original_descriptor = overlay.machine_dir(silo, "overlay-moved") / "lower.vmdk"
-    lower_digest = overlay.digest(overlay.records(original_descriptor)[0].path)
+    lower_digest = overlay.lower_digests(original_descriptor)
     silo.stop("overlay-moved")
     moved = workspace.root / "relocated state with spaces"
     spaced.rename(moved)
@@ -196,7 +203,7 @@ def test_vmdk_home_spaces_and_relocation(silo: Silo, workspace: Workspace, overl
     descriptor = overlay.machine_dir(silo, "overlay-moved") / "lower.vmdk"
     assert str(spaced) not in descriptor.read_text()
     assert str(moved) in descriptor.read_text()
-    assert overlay.digest(overlay.records(descriptor)[0].path) == lower_digest
+    assert list(overlay.lower_digests(descriptor).values()) == list(lower_digest.values())
     overlay.probe(silo, "overlay-moved", "lower-ro")
 
 
@@ -204,8 +211,8 @@ def test_vmdk_home_spaces_and_relocation(silo: Silo, workspace: Workspace, overl
 def test_overlay_guest_enospc(silo: Silo, overlay_image: str, kind: str) -> None:
     name = "overlay-enospc"
     overlay.create(silo, name, overlay_image, capacity="64mib")
-    lower = overlay.records(overlay.machine_dir(silo, name) / "lower.vmdk")[0].path
-    before = overlay.digest(lower)
+    descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
+    before = overlay.lower_digests(descriptor)
     host_before = shutil.disk_usage(silo.ws.silo_home).free
     assert host_before > 512 * 1024**2, "guest ENOSPC gate requires ample host space"
     result = overlay.probe(silo, name, "fill", kind, timeout=120)
@@ -224,7 +231,7 @@ def test_overlay_guest_enospc(silo: Silo, overlay_image: str, kind: str) -> None
     overlay.evidence(silo, name)
     host_after = shutil.disk_usage(silo.ws.silo_home).free
     assert host_after > 256 * 1024**2
-    assert overlay.digest(lower) == before
+    assert overlay.lower_digests(descriptor) == before
     if kind != "copyup":
         silo.exec(name, "rm", "-rf", "/fill", user="root")
         silo.exec(name, overlay.PROBE, "syncfs", user="root")
@@ -262,8 +269,8 @@ def test_overlay_replacement_growth_and_short_tails(silo: Silo, overlay_image: s
     overlay.create(silo, name, overlay_image, capacity="64mib")
     silo.exec(name, overlay.PROBE, "durable", "/committed", user="root")
     before = overlay.observation(silo, name)
-    lower = overlay.records(overlay.machine_dir(silo, name) / "lower.vmdk")[0].path
-    lower_digest = overlay.digest(lower)
+    descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
+    lower_digest = overlay.lower_digests(descriptor)
     if dirty:
         writer = silo.popen("exec", name, "--user", "root", "--", overlay.PROBE, "write-loop", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
@@ -371,7 +378,7 @@ def test_overlay_replacement_growth_and_short_tails(silo: Silo, overlay_image: s
     inspected = subprocess.run(["e2fsck", "-fn", str(replacement)], capture_output=True, text=True, timeout=240)
     silo.ws.record("overlay-second-recovered-e2fsck", inspected.stdout + inspected.stderr)
     assert inspected.returncode == 0
-    assert overlay.digest(lower) == lower_digest
+    assert overlay.lower_digests(descriptor) == lower_digest
 
 
 @pytest.mark.slow
@@ -398,21 +405,21 @@ def test_overlay_directory_scale_dir_nlink_htree(silo: Silo, overlay_image: str)
 def test_overlay_reserved_oci_encodings_reject_before_machine_publication(silo: Silo, config: SmokeConfig, registry: LoopbackRegistry, overlay_probe: Path, overlay_image_bytes: images.OciImage, reserved: str) -> None:
     from uuid import UUID
     admitted = registry.publish(overlay_image_bytes, "overlay-reserved-positive-control")
-    silo.create("reserved-control", admitted, "--root-profile", overlay.PROFILE, "--disk-size", "64mib", "--network", "none")
+    silo.create("reserved-control", admitted, "--disk-size", "64mib", "--network", "none")
     before = {UUID(machine["id"]) for machine in silo.ls()}
     image = overlay.image(config, overlay_probe, reserved=reserved)
     reference = registry.publish(image, "overlay-forbidden-" + reserved.replace(".", "-"))
-    result = silo.run("create", reference, "--name", "forbidden-overlay", "--root-profile", overlay.PROFILE, expect=None)
+    result = silo.run("create", reference, "--name", "forbidden-overlay", expect=None)
     assert result.returncode != 0
     assert {UUID(machine["id"]) for machine in silo.ls()} == before, "rejected metadata published a machine"
-    artifacts = procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM image_rootfs_artifact WHERE manifest_digest='" + image.manifest_digest + "'")
+    artifacts = procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM image_composition_artifact WHERE manifest_digest='" + image.manifest_digest + "'")
     assert artifacts == [("0",)], "rejected metadata published a failed rootfs artifact"
     silo.ws.record("overlay-reserved-refusal", json.dumps({"mutation": reserved, "manifestDigest": image.manifest_digest, "positiveControlMachineIds": sorted(str(value) for value in before), "publishedRejectedRootfsArtifacts": 0}) + "\n" + result.stdout + result.stderr)
 
 
-def test_overlay_raw_default_regression(silo: Silo, basic_image: str) -> None:
+def test_overlay_explicit_raw_conversion_persistence(silo: Silo, basic_image: str) -> None:
     name = "overlay-raw-regression"
-    silo.create(name, basic_image, "--network", "none", "--vsock")
+    silo.create(name, silo.raw_image(basic_image), "--network", "none", "--vsock")
     assert (overlay.machine_dir(silo, name) / "root.raw").is_file()
     silo.start(name)
     silo.wait_ready(name)
@@ -486,16 +493,17 @@ def test_overlay_candidate_qualification(silo: Silo, overlay_image: str) -> None
         candidate.close()
 
 
-@pytest.mark.parametrize("fault", ["uuid", "length", "magic", "journal-inode", "upper-symlink", "missing-bootstrap", "malformed-bootstrap"])
+@pytest.mark.parametrize("fault", ["uuid", "lower-uuid", "length", "magic", "lower-magic", "lower-device-range", "journal-inode", "upper-symlink", "missing-bootstrap", "malformed-bootstrap"])
 def test_overlay_candidate_guest_rejection(silo: Silo, overlay_image: str, fault: str) -> None:
     from silo_smoke.overlay_candidate import Candidate
     candidate = Candidate(silo, overlay_image, fault=fault)
-    upper_before = overlay.digest(candidate.upper) if fault == "journal-inode" else None
+    unchanged_upper = fault in {"journal-inode", "lower-uuid", "lower-magic", "lower-device-range", "length"}
+    upper_before = overlay.digest(candidate.upper) if unchanged_upper else None
     try:
         candidate.start()
         candidate.wait(rejected=True)
-        if fault == "journal-inode":
-            assert overlay.digest(candidate.upper) == upper_before, "invalid active journal must fail before replay/write"
+        if unchanged_upper:
+            assert overlay.digest(candidate.upper) == upper_before, "invalid lower/journal must fail before upper replay/write"
     finally:
         candidate.close()
 
@@ -505,8 +513,8 @@ def test_overlay_candidate_guest_rejection(silo: Silo, overlay_image: str, fault
 def test_overlay_actual_host_enospc_isolated_upper(silo: Silo, overlay_image: str) -> None:
     name = "overlay-host-enospc"
     overlay.create(silo, name, overlay_image, capacity="256mib")
-    lower = overlay.records(overlay.machine_dir(silo, name) / "lower.vmdk")[0].path
-    lower_before = overlay.digest(lower)
+    descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
+    lower_before = overlay.lower_digests(descriptor)
     silo.stop(name)
     request = silo.ws.evidence / "host-enospc-request.json"
     request.write_text(json.dumps({"silo": str(silo.ws.config.silo), "name": name, "machine_id": silo.machine_id(name), "upper": str(overlay.upper(silo, name)), "scratch": str(silo.ws.root / "bounded-upper"), "evidence": str(silo.ws.evidence), "exit_path": str(silo.ws.silo_home / "logs/machines" / silo.machine_id(name) / "vm.exit.json"), "outer_uid": str(os.getuid()), "outer_user_namespace": os.readlink("/proc/self/ns/user"), "log_directories": [str(silo.ws.silo_home / "logs/machines" / silo.machine_id(name))]}))
@@ -515,7 +523,7 @@ def test_overlay_actual_host_enospc_isolated_upper(silo: Silo, overlay_image: st
     result = subprocess.run(["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private", sys.executable, "-m", "silo_smoke.overlay_host_enospc", str(request)], env=environment, capture_output=True, text=True, timeout=240)
     silo.ws.record("overlay-host-namespace", result.stdout + result.stderr)
     assert result.returncode == 0, result.stderr
-    assert overlay.digest(lower) == lower_before
+    assert overlay.lower_digests(descriptor) == lower_before
     assert json.loads((silo.ws.evidence / "actual-host-enospc.json").read_text())["errno"] == 28
 
 
@@ -721,7 +729,7 @@ def test_overlay_nested_mount_source_rejected_before_workload(silo: Silo, worksp
         (parent / "child").symlink_to(child, target_is_directory=True)
     name = "overlay-bad-nested"
     workspace.register_machine(name)
-    result = silo.run("run", overlay_image, "--name", name, "--root-profile", overlay.PROFILE, "--network", "none", "--mount", f"{child}:/parent/child", "--mount", f"{parent}:/parent", "--", "/bin/sh", "-c", "echo SILO_USER_MOUNT_WORKLOAD_REACHED; echo reached >/parent/workload-sentinel", expect=None, timeout=90)
+    result = silo.run("run", overlay_image, "--name", name, "--network", "none", "--mount", f"{child}:/parent/child", "--mount", f"{parent}:/parent", "--", "/bin/sh", "-c", "echo SILO_USER_MOUNT_WORKLOAD_REACHED; echo reached >/parent/workload-sentinel", expect=None, timeout=90)
     assert result.returncode != 0
     serial = workspace.silo_home / "logs/machines" / silo.machine_id(name) / "serial.log"
     text = serial.read_text(errors="replace")
@@ -772,7 +780,7 @@ def test_vmdk_native_attachment_reserve_edge(silo: Silo, workspace: Workspace, o
         data.append(path)
         flags.extend(["--disk", str(path)])
     name = "vmdk-sixteen-attachments"
-    silo.create(name, overlay_image, "--root-profile", overlay.PROFILE, "--disk-size", "64mib", "--network", "none", "--vsock", *flags)
+    silo.create(name, overlay_image, "--disk-size", "64mib", "--network", "none", "--vsock", *flags)
     started = overlay.limited_start(silo, name, 256, 512)
     assert started.returncode == 0, started.stderr
     silo.wait_ready(name)
@@ -799,8 +807,7 @@ def test_vmdk_native_attachment_reserve_edge(silo: Silo, workspace: Workspace, o
     assert next(line.split()[3:5] for line in limits.splitlines() if line.startswith("Max open files")) == ["512", "512"]
     workspace.record("vmdk-sixteen-attachment-proof", json.dumps({"workerPid": pid, "actualDevices": devices, "actualWritableDataHandles": sorted(str(path) for path in seen)}) + "\n" + limits)
     descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
-    lower = overlay.records(descriptor)[0].path
-    lower_before = overlay.digest(lower)
+    lower_before = overlay.lower_digests(descriptor)
     overlay.probe(silo, name, "lower-ro")
     data_devices = [devices[f"silo-data-{index}"][0] for index in range(len(data))]
     transport_output = silo.exec(name, "sh", "-eu", "-c", """
@@ -852,7 +859,7 @@ done
             assert path.stat().st_size == len(expected), "Data logical length changed"
             assert path.read_bytes() == expected, f"Data-{index} write/read range or untouched outside bytes changed"
             observed.append({"blockId": f"silo-data-{index}", "lengthBytes": path.stat().st_size, "sha256": overlay.digest(path)})
-        assert overlay.digest(lower) == lower_before, "Data I/O changed immutable lower"
+        assert overlay.lower_digests(descriptor) == lower_before, "Data I/O changed immutable lower"
         return observed
 
     silo.stop(name)
@@ -865,14 +872,14 @@ done
     assert reopened["completedDevices"] == len(data) and reopened["verifiedBytes"] == len(data) * 8 * 65536
     silo.stop(name)
     after_reopen = check_backings()
-    workspace.record("vmdk-concurrent-data-io", json.dumps({"guestWriteFlushRead": written, "guestColdReopenRead": reopened, "afterStop": after_write, "afterReopenStop": after_reopen, "lowerSha256": lower_before}) + "\n")
+    workspace.record("vmdk-concurrent-data-io", json.dumps({"guestWriteFlushRead": written, "guestColdReopenRead": reopened, "afterStop": after_write, "afterReopenStop": after_reopen, "lowerBackings": [{"path": str(path), "sha256": digest} for path, digest in lower_before.items()]}) + "\n")
 
 
 @pytest.mark.slow
 @pytest.mark.linux_only
-def test_vmdk_controlled_historical_occurrences_native_mapping(silo: Silo, overlay_large_image: str) -> None:
+def test_vmdk_controlled_historical_occurrences_native_mapping(silo: Silo) -> None:
     from silo_smoke.overlay_candidate import Candidate
-    candidate = Candidate(silo, overlay_large_image, historical=True)
+    candidate = Candidate(silo, historical=True)
     try:
         assert candidate.logical_lower_bytes == 4_833_935_360
         records = overlay.records(candidate.descriptor)
@@ -944,20 +951,23 @@ def test_overlay_qualified_stage_replacement_uses_retained_triplet(silo: Silo, o
 
 
 @pytest.mark.linux_only
-def test_overlay_native_symlink_4095_and_flat_4096_refusal(silo: Silo, config: SmokeConfig, registry: LoopbackRegistry, overlay_probe: Path) -> None:
+def test_overlay_native_symlink_4095_and_erofs_4096_refusal(silo: Silo, config: SmokeConfig, registry: LoopbackRegistry, overlay_probe: Path) -> None:
     from uuid import UUID
     valid = registry.publish(overlay.image(config, overlay_probe, symlink_target_length=4095), "overlay-symlink-4095")
     name = "overlay-symlink-4095"
     overlay.create(silo, name, valid, capacity="128mib")
+    assert overlay.filesystem_magic(silo, name, "/run/silo/rootfs/lower") == overlay.EROFS_SUPER_MAGIC
     target = silo.exec(name, "readlink", "-n", "/overlay-fixture/long-symlink", user="root").stdout
     assert target == "t" * 4095
     silo.stop(name)
     before = {UUID(machine["id"]) for machine in silo.ls()}
     invalid = registry.publish(overlay.image(config, overlay_probe, symlink_target_length=4096), "overlay-symlink-4096")
-    refused = silo.run("create", invalid, "--name", "overlay-symlink-4096", "--root-profile", overlay.PROFILE, expect=None)
-    assert refused.returncode != 0, "one-byte-overflow symlink must fail flat materialization"
-    assert {UUID(machine["id"]) for machine in silo.ls()} == before, "failed flat materialization published a machine"
-    silo.ws.record("overlay-symlink-boundary", json.dumps({"nativeReadlinkBytes": len(target), "refusedTargetBytes": 4096, "publishedMachineIds": sorted(str(value) for value in before)}) + "\n" + refused.stdout + refused.stderr)
+    refused = silo.run("create", invalid, "--name", "overlay-symlink-4096", expect=None)
+    # EROFS flat-plain links use page_get_link, which terminates at PAGE_SIZE-1.
+    # A normalized 4096-byte target must not become a silently truncated guest link.
+    assert refused.returncode != 0, "kernel-unrepresentable EROFS link was published"
+    assert {UUID(machine["id"]) for machine in silo.ls()} == before
+    silo.ws.record("overlay-symlink-boundary", json.dumps({"nativeReadlinkBytes": len(target), "refusedTargetBytes": 4096, "filesystem": "erofs", "publishedMachineIds": sorted(str(value) for value in before)}) + "\n" + refused.stdout + refused.stderr)
 
 
 @pytest.mark.linux_only

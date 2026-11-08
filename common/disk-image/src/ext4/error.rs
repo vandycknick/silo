@@ -1,24 +1,34 @@
 use std::path::PathBuf;
 
 /// Errors that can occur when reading an ext4 filesystem.
+///
+/// Callers distinguish three filesystem classes and never receive an
+/// approximate answer instead of one of them:
+///
+/// - [`ReadError::RequiresRecovery`]: on-disk state is not clean; only the
+///   kernel (journal replay, orphan cleanup) or fsck may make it readable.
+/// - [`ReadError::Unsupported`]: a valid ext4 encoding this reader does not
+///   implement, or a resource bound it refuses to exceed.
+/// - [`ReadError::Corrupt`]: an inconsistent or malformed structure.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
     #[error("file at path {0} not found")]
     NotFound(PathBuf),
-    #[error("could not read {2} bytes of superblock from {0} at offset {1}")]
-    CouldNotReadSuperBlock(PathBuf, u64, usize),
-    #[error("not a valid ext4 superblock")]
+    #[error("not an ext4 filesystem: missing superblock magic")]
     InvalidSuperBlock,
-    #[error("extents invalid or corrupted")]
-    InvalidExtents,
-    #[error("invalid extended attribute entry")]
-    InvalidXattrEntry,
-    #[error("could not read block {0}")]
-    CouldNotReadBlock(u32),
-    #[error("could not read inode {0}")]
-    CouldNotReadInode(u32),
-    #[error("could not read group descriptor {0}")]
-    CouldNotReadGroup(u32),
+    #[error("ext4 filesystem requires kernel recovery before host reading: {0}")]
+    RequiresRecovery(RecoveryReason),
+    #[error("unsupported ext4 layout: {0}")]
+    Unsupported(Unsupported),
+    #[error("corrupt ext4 filesystem: {0}")]
+    Corrupt(Corruption),
+    #[error("read of {length} bytes at offset {offset} exceeds inode {inode} size {size}")]
+    OutOfRange {
+        inode: u32,
+        offset: u64,
+        length: u64,
+        size: u64,
+    },
     #[error("no such file or directory: {0}")]
     PathNotFound(String),
     #[error("not a regular file: {0}")]
@@ -34,6 +44,125 @@ pub enum ReadError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
+
+impl ReadError {
+    pub(crate) fn corrupt(structure: Structure, inode: Option<u32>, reason: &'static str) -> Self {
+        Self::Corrupt(Corruption {
+            structure,
+            inode,
+            reason,
+        })
+    }
+}
+
+/// Fallible metadata allocation failure surfaces as host out-of-memory I/O,
+/// separately from format and corruption errors.
+impl From<std::collections::TryReserveError> for ReadError {
+    fn from(error: std::collections::TryReserveError) -> Self {
+        Self::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))
+    }
+}
+
+/// On-disk state that only kernel recovery or fsck can resolve. The host never
+/// replays the journal or repairs the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RecoveryReason {
+    #[error("the journal needs recovery (RECOVER is set)")]
+    JournalNeedsRecovery,
+    #[error("the journal superblock records unreplayed transactions")]
+    JournalNotEmpty,
+    #[error("the journal recorded an abort (errno {0})")]
+    JournalAborted(i32),
+    #[error("the orphan inode list is not empty (first orphan inode {0})")]
+    OrphanInodes(u32),
+    #[error("the filesystem is not marked cleanly unmounted (state {0:#06x})")]
+    NotCleanlyUnmounted(u16),
+    #[error("the filesystem recorded errors (state {0:#06x}); run fsck")]
+    RecordedErrors(u16),
+}
+
+/// Valid ext4 encodings outside the admitted reader profile, and resource
+/// bounds the reader refuses to exceed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Unsupported {
+    #[error(
+        "features compat {compat:#x}, incompat {incompat:#x}, ro_compat {ro_compat:#x} are not implemented"
+    )]
+    Features {
+        compat: u32,
+        incompat: u32,
+        ro_compat: u32,
+    },
+    #[error("required incompatible features {0:#x} are absent")]
+    MissingFeatures(u32),
+    #[error("superblock revision {0} (only dynamic revision 1)")]
+    Revision(u32),
+    #[error("creator OS {0} (only the Linux inode layout)")]
+    CreatorOs(u32),
+    #[error("log block size {0} (only 4096-byte blocks)")]
+    BlockSize(u32),
+    #[error("inode size {0} (only 256-byte inodes)")]
+    InodeSize(u16),
+    #[error("external or non-inode-8 journal")]
+    ExternalJournal,
+    #[error("inode {inode} uses inode flags {flags:#x}")]
+    InodeFlags { inode: u32, flags: u32 },
+    #[error("inode {inode} has extra inode size {extra_isize} (only 32)")]
+    InodeExtraSize { inode: u32, extra_isize: u16 },
+    #[error("inode {0} uses indirect block maps instead of extents")]
+    BlockMappedInode(u32),
+    #[error("inode {inode} size {size} exceeds the 1 TiB reader bound")]
+    FileTooLarge { inode: u32, size: u64 },
+    #[error("inode {inode} has more than {limit} extents")]
+    TooManyExtents { inode: u32, limit: usize },
+    #[error("directory inode {inode} has more than {limit} entries")]
+    DirectoryTooLarge { inode: u32, limit: usize },
+    #[error("directory inode {inode} uses hash version {version}")]
+    HashVersion { inode: u32, version: u8 },
+    #[error("indexed directory inode {0} but the superblock records no hash signedness")]
+    HashSignedness(u32),
+    #[error("inode {inode} uses xattr name index {index}")]
+    XattrNamespace { inode: u32, index: u8 },
+    #[error("inode {0} stores inline data (system.data)")]
+    InlineData(u32),
+    #[error("inode {0} stores an xattr value in an EA inode")]
+    XattrValueInode(u32),
+}
+
+/// The ext4 structure in which a [`Corruption`] was detected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Structure {
+    Superblock,
+    GroupDescriptor(u32),
+    Journal,
+    Inode,
+    ExtentTree,
+    Directory,
+    HashIndex,
+    Xattr,
+    Symlink,
+    Namespace,
+}
+
+/// A malformed or inconsistent on-disk structure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Corruption {
+    pub structure: Structure,
+    pub inode: Option<u32>,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for Corruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.structure)?;
+        if let Some(inode) = self.inode {
+            write!(f, " of inode {inode}")?;
+        }
+        write!(f, ": {}", self.reason)
+    }
+}
+
+impl std::error::Error for Corruption {}
 
 /// Errors that can occur when formatting an ext4 filesystem.
 #[derive(Debug, thiserror::Error)]

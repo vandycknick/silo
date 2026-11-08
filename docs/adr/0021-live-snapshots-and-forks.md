@@ -2,7 +2,7 @@
 
 Date: 2026-10-25
 
-Updated: 2026-11-01
+Updated: 2026-11-07
 
 ## Status
 
@@ -23,6 +23,21 @@ readers or compatibility bridges are provided. Initial schemas and callers
 cut over directly; incompatible state is refused with a reinstall/wipe
 diagnostic rather than automatically deleted. Current-format checkpoint
 validation, crash recovery and portability refusal remain mandatory.
+
+Phase 22 replaces the development flat lower with ADR 0014's default
+`linux-erofs-overlay-v1` OCI root on libkrun. Stopped layered snapshots retain
+the exact fsmeta and ordered, occurrence-preserving pack/metadata graph; OCI
+regeneration is only a digest-gated fallback, not a requirement for portable
+restore. There are no old-profile readers or root-profile selectors.
+
+The owner-approved privileged umoci v0.6.0 published-builder namespace gate
+also matched actual readonly EROFS traversals without excluded fields.
+Production-root boot/lifecycle and kernel-mutated flatten gates passed on
+Linux x86_64 with stable 7.2.2 and longterm 6.18.48. These results do not admit
+public live lanes; performance qualification remains deferred to the mandatory
+Phase 24 sweep. Original containerd differential evidence and the absolute-path
+Nix negative remain intact; see
+[ADR 0014's gate exception](0014-layered-oci-image-storage.md#filesystem-and-linux-gates).
 
 ## The Problem
 

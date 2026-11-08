@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use vm_spec::{DiskGeometry, DiskRole};
 
 use crate::machine::stopped::{ExternalResourceRequirement, SnapshotConfiguration};
-use crate::storage::identity::{ObjectDigest, SnapshotId, StreamId};
+use crate::storage::identity::{LowerResultId, ObjectDigest, SnapshotId, StreamId};
 use crate::storage::limits::{Resource, JSON_SAFE_INTEGER_MAX};
 use crate::store::models::storage::{
     BootBinding, BootFileRole, BootProfile, RawLayout, StorageStopOutcome,
@@ -76,6 +76,312 @@ pub struct SnapshotRoot {
     pub layout: RawLayout,
 }
 
+impl SnapshotRoot {
+    pub(crate) fn validate_lower(&self) -> Result<(), LibVmError> {
+        if let SnapshotRootProfile::LinuxOverlay {
+            lower,
+            lower_geometry,
+            lower_filesystem_uuid,
+            upper_uuid,
+            ..
+        } = &self.profile
+        {
+            if self.layout != RawLayout::WholeDisk {
+                return Err(invalid("overlay upper must use whole-disk layout"));
+            }
+            lower.validate_shape()?;
+            let packs = Resource::LogicalLowerBytes
+                .sum(lower.layers.iter().map(|layer| layer.pack.length))
+                .map_err(crate::storage::StorageError::from)?;
+            Resource::LogicalLowerBytes
+                .check(lower_geometry.length)
+                .map_err(crate::storage::StorageError::from)?;
+            let fsmeta = lower_geometry.length.saturating_sub(packs);
+            if lower_geometry.logical_sector_size != 512
+                || fsmeta == 0
+                || !lower_geometry
+                    .length
+                    .is_multiple_of(oci::changeset::limits::PACK_ALIGNMENT)
+            {
+                return Err(invalid(
+                    "overlay lower geometry contradicts its composition occurrences",
+                ));
+            }
+            Resource::FsmetaBytes
+                .check(fsmeta)
+                .map_err(crate::storage::StorageError::from)?;
+            if lower_filesystem_uuid.is_nil()
+                || upper_uuid.is_nil()
+                || lower_filesystem_uuid == upper_uuid
+            {
+                return Err(invalid(
+                    "overlay filesystem identities must be nonnil and distinct",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The complete layered lower graph, never one materialized lower stream.
+/// `record`/`recipe` are the canonical composition-result/recipe objects;
+/// layer order and repetition are the exact composition occurrences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotComposition {
+    pub result: LowerResultId,
+    pub record: ObjectDigest,
+    pub recipe: ObjectDigest,
+    pub fsmeta: ObjectDigest,
+    pub layers: Vec<SnapshotLayer>,
+}
+
+/// One occurrence: canonical layer recipe/result objects, the paged index
+/// closure (root plus the strictly increasing set of every page it names)
+/// and the payload pack stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotLayer {
+    pub recipe: ObjectDigest,
+    pub result: ObjectDigest,
+    pub index_root: ObjectDigest,
+    pub index_pages: Vec<ObjectDigest>,
+    pub pack: SnapshotStream,
+}
+
+/// Canonical records proved to describe exactly one closed composition graph.
+/// Fsmeta bytes and pack streams are authenticated by their held owners.
+#[derive(Debug)]
+pub struct AuthenticatedComposition {
+    pub recipe: oci::composition::CompositionRecipe,
+    pub result: oci::composition::CompositionResult,
+    pub layers: Vec<oci::composition::AuthenticatedLayer>,
+}
+
+const LAYER_RECORD_BYTES: u64 = 65536;
+
+impl SnapshotComposition {
+    /// Record-local shape: bounded occurrences and a canonical page set.
+    pub(crate) fn validate_shape(&self) -> Result<(), LibVmError> {
+        Resource::LayerOccurrences
+            .check(self.layers.len() as u64)
+            .map_err(crate::storage::StorageError::from)?;
+        for layer in &self.layers {
+            let expected_pages = layer
+                .pack
+                .length
+                .div_ceil(crate::storage::limits::CHUNK_SIZE as u64)
+                .div_ceil(crate::storage::map::MAP_PAGE_ENTRIES as u64);
+            if layer.pack.map_pages.len() as u64 != expected_pages {
+                return Err(invalid("layer pack map page count contradicts its length"));
+            }
+            if layer.index_pages.windows(2).any(|pair| pair[0] >= pair[1])
+                || layer.index_pages.contains(&layer.index_root)
+            {
+                return Err(invalid(
+                    "layer index pages must be a strictly increasing set excluding the root",
+                ));
+            }
+            if !layer
+                .pack
+                .length
+                .is_multiple_of(oci::changeset::limits::PACK_ALIGNMENT)
+            {
+                return Err(invalid("layer pack length is not block aligned"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every immutable object of the graph, excluding pack stream maps.
+    pub(crate) fn objects(&self) -> impl Iterator<Item = ObjectDigest> + '_ {
+        [self.record, self.recipe, self.fsmeta]
+            .into_iter()
+            .chain(self.layers.iter().flat_map(|layer| {
+                [layer.recipe, layer.result, layer.index_root]
+                    .into_iter()
+                    .chain(layer.index_pages.iter().copied())
+            }))
+    }
+
+    /// Authenticate every cross-record identity through `read_object`
+    /// (digest, maximum bytes). The callback is never asked for fsmeta.
+    pub fn authenticate(
+        &self,
+        mut read_object: impl FnMut(&ObjectDigest, u64) -> Result<Vec<u8>, LibVmError>,
+    ) -> Result<AuthenticatedComposition, LibVmError> {
+        use oci::composition::{CompositionRecipe, CompositionResult, MAX_RECORD_BYTES};
+        self.validate_shape()?;
+        let mut read_exact = |digest: &ObjectDigest, maximum: u64| {
+            let bytes = read_object(digest, maximum)?;
+            if bytes.len() as u64 > maximum || ObjectDigest::of_bytes(&bytes) != *digest {
+                return Err(invalid("composition object bytes differ from their digest"));
+            }
+            Ok::<_, LibVmError>(bytes)
+        };
+        let recipe = CompositionRecipe::decode(&read_exact(&self.recipe, MAX_RECORD_BYTES as u64)?)
+            .map_err(invalid)?;
+        let result = CompositionResult::decode(&read_exact(&self.record, MAX_RECORD_BYTES as u64)?)
+            .map_err(invalid)?;
+        if LowerResultId::from_composition(result.id().map_err(invalid)?) != self.result {
+            return Err(invalid(
+                "composition record differs from its lower identity",
+            ));
+        }
+        result.validate_recipe(&recipe).map_err(invalid)?;
+        if content_object(result.fsmeta.digest)? != self.fsmeta
+            || recipe.layers.len() != self.layers.len()
+        {
+            return Err(invalid(
+                "composition fsmeta or occurrence count contradicts its records",
+            ));
+        }
+        let limits = oci::changeset::ChangesetLimits::default();
+        let mut layers: Vec<oci::composition::AuthenticatedLayer> =
+            Vec::with_capacity(self.layers.len());
+        for (index, ((layer, binding), range)) in self
+            .layers
+            .iter()
+            .zip(&recipe.layers)
+            .zip(&result.packs)
+            .enumerate()
+        {
+            if content_object(binding.index_root)? != layer.index_root {
+                return Err(invalid(
+                    "layer index root contradicts its composition recipe",
+                ));
+            }
+            // Repeated occurrences of one exact layer reuse its authentication.
+            let previous = self.layers[..index]
+                .iter()
+                .position(|other| other == layer)
+                .and_then(|position| layers.get(position));
+            let authenticated = match previous {
+                Some(previous) => oci::composition::AuthenticatedLayer {
+                    result: previous.result,
+                    changeset: previous.changeset.clone(),
+                },
+                None => {
+                    let diff_id =
+                        decode_layer_recipe(&read_exact(&layer.recipe, LAYER_RECORD_BYTES)?)?;
+                    let result_bytes = read_exact(&layer.result, LAYER_RECORD_BYTES)?;
+                    let root_bytes =
+                        read_exact(&layer.index_root, oci::changeset::limits::MAX_ROOT_BYTES)?;
+                    let mut observed = BTreeSet::new();
+                    let mut page_error = None;
+                    let authenticated = oci::composition::authenticate_layer(
+                        binding.result,
+                        &result_bytes,
+                        &root_bytes,
+                        |digest| {
+                            let page = content_object(digest).map_err(|error| {
+                                oci::changeset::ChangesetError::Invalid(error.to_string())
+                            })?;
+                            observed.insert(page);
+                            match read_exact(&page, limits.max_page_bytes) {
+                                Ok(bytes) => Ok(bytes),
+                                Err(error) => {
+                                    page_error = Some(error);
+                                    Err(oci::changeset::ChangesetError::Invalid(
+                                        "layer index page unavailable".into(),
+                                    ))
+                                }
+                            }
+                        },
+                        diff_id,
+                        &limits,
+                    );
+                    if let Some(error) = page_error {
+                        return Err(error);
+                    }
+                    let authenticated = authenticated.map_err(invalid)?;
+                    if observed.into_iter().collect::<Vec<_>>() != layer.index_pages {
+                        return Err(invalid("layer index page closure differs from its record"));
+                    }
+                    authenticated
+                }
+            };
+            if authenticated.result.pack_stream.as_bytes() != layer.pack.stream.as_bytes()
+                || authenticated.result.pack_length != layer.pack.length
+                || range.stream != authenticated.result.pack_stream
+                || range.length != layer.pack.length
+            {
+                return Err(invalid(
+                    "layer pack stream contradicts its result or composition range",
+                ));
+            }
+            layers.push(authenticated);
+        }
+        Ok(AuthenticatedComposition {
+            recipe,
+            result,
+            layers,
+        })
+    }
+}
+
+impl AuthenticatedComposition {
+    pub fn id(&self) -> Result<LowerResultId, LibVmError> {
+        Ok(LowerResultId::from_composition(
+            self.result.id().map_err(invalid)?,
+        ))
+    }
+
+    pub fn lower_geometry(&self) -> DiskGeometry {
+        DiskGeometry {
+            length: self.result.lower_length,
+            logical_sector_size: 512,
+        }
+    }
+
+    pub fn filesystem_uuid(&self) -> uuid::Uuid {
+        uuid::Uuid::from_bytes(self.result.fsmeta.uuid)
+    }
+
+    /// Derived root claims are admissible only when they equal the result.
+    pub fn check_root_claims(
+        &self,
+        lower_geometry: &DiskGeometry,
+        lower_filesystem_uuid: uuid::Uuid,
+    ) -> Result<(), LibVmError> {
+        if *lower_geometry != self.lower_geometry()
+            || lower_filesystem_uuid != self.filesystem_uuid()
+        {
+            return Err(invalid(
+                "root lower geometry or filesystem UUID differs from its composition",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn content_object(
+    digest: oci::changeset::ContentDigest,
+) -> Result<ObjectDigest, LibVmError> {
+    Ok(ObjectDigest::from_sha256(*digest.as_bytes()))
+}
+
+/// Authenticate a canonical layer recipe without trusting its parsed form.
+pub(crate) fn decode_layer_recipe(
+    bytes: &[u8],
+) -> Result<oci::changeset::ContentDigest, LibVmError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(invalid)?;
+    let diff_id: oci::changeset::ContentDigest = value
+        .get("diffId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("layer recipe has no diff ID"))?
+        .parse()
+        .map_err(invalid)?;
+    if (oci::changeset::LayerRecipe { diff_id })
+        .canonical_bytes()
+        .map_err(invalid)?
+        != bytes
+    {
+        return Err(invalid("layer recipe is not its canonical record"));
+    }
+    Ok(diff_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -86,7 +392,7 @@ pub struct SnapshotRoot {
 pub enum SnapshotRootProfile {
     OpaqueRaw,
     LinuxOverlay {
-        lower: SnapshotStream,
+        lower: Box<SnapshotComposition>,
         lower_geometry: DiskGeometry,
         lower_filesystem_uuid: uuid::Uuid,
         upper_uuid: uuid::Uuid,
@@ -94,6 +400,39 @@ pub enum SnapshotRootProfile {
         overlay_profile: crate::store::models::storage::OverlayProfile,
         temporary_directory: crate::store::models::storage::TemporaryDirectoryPolicy,
     },
+}
+
+/// Name retired or unknown snapshot root formats (including the flat-lower
+/// single `SnapshotStream`) instead of reporting a generic schema failure.
+/// `root` is the record's `root` JSON value.
+pub(crate) fn refuse_retired_snapshot_root(root: &Value) -> Result<(), LibVmError> {
+    let profile = root.get("profile");
+    let kind = profile
+        .and_then(|profile| profile.get("kind"))
+        .and_then(Value::as_str);
+    match kind {
+        Some("opaque-raw") => Ok(()),
+        Some("linux-overlay") => {
+            let lower = profile.and_then(|profile| profile.get("lower"));
+            if lower.is_some_and(|lower| lower.get("layers").is_some()) {
+                Ok(())
+            } else if lower.is_some_and(|lower| lower.get("stream").is_some()) {
+                Err(LibVmError::IncompatibleRootProfile {
+                    profile: "linux-overlay/flat-ext4".into(),
+                })
+            } else {
+                Err(LibVmError::IncompatibleRootProfile {
+                    profile: "linux-overlay/unspecified-lower".into(),
+                })
+            }
+        }
+        Some(other) => Err(LibVmError::IncompatibleRootProfile {
+            profile: other.into(),
+        }),
+        None => Err(LibVmError::IncompatibleRootProfile {
+            profile: "unspecified".into(),
+        }),
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -154,19 +493,7 @@ impl SnapshotRecord {
             )
             .map_err(crate::storage::StorageError::from)?;
         validate_geometry(&self.root.stream, &self.root.geometry)?;
-        if let SnapshotRootProfile::LinuxOverlay {
-            lower,
-            lower_geometry,
-            lower_filesystem_uuid,
-            upper_uuid,
-            ..
-        } = &self.root.profile
-        {
-            validate_geometry(lower, lower_geometry)?;
-            if lower_filesystem_uuid.is_nil() || upper_uuid.is_nil() {
-                return Err(invalid("overlay filesystem identities must be nonnil"));
-            }
-        }
+        self.root.validate_lower()?;
         let mut logical = 0u64;
         for stream in self.streams() {
             logical = logical
@@ -310,7 +637,15 @@ impl SnapshotRecord {
         let StrictValue(value) = StrictValue::deserialize(&mut decoder).map_err(invalid)?;
         decoder.end().map_err(invalid)?;
         validate_numbers(&value)?;
-        let record = Self::deserialize(&value).map_err(invalid)?;
+        let record = match Self::deserialize(&value) {
+            Ok(record) => record,
+            Err(error) => {
+                if let Some(root) = value.get("root") {
+                    refuse_retired_snapshot_root(root)?;
+                }
+                return Err(invalid(error));
+            }
+        };
         // Nested configuration types have defaults/flattening. A round-trip
         // equality check rejects ignored keys and omitted required current data.
         if serde_json::to_value(&record).map_err(invalid)? != value {
@@ -321,13 +656,21 @@ impl SnapshotRecord {
     }
 
     pub(crate) fn storage_streams(&self) -> impl Iterator<Item = &SnapshotStream> {
-        let lower = match &self.root.profile {
-            SnapshotRootProfile::LinuxOverlay { lower, .. } => Some(lower),
-            SnapshotRootProfile::OpaqueRaw => None,
+        let packs = match &self.root.profile {
+            SnapshotRootProfile::LinuxOverlay { lower, .. } => lower.layers.as_slice(),
+            SnapshotRootProfile::OpaqueRaw => &[],
         };
         std::iter::once(&self.root.stream)
-            .chain(lower)
+            .chain(packs.iter().map(|layer| &layer.pack))
             .chain(self.disks.iter().map(|disk| &disk.content))
+    }
+
+    /// The layered lower graph of an overlay root, if any.
+    pub fn lower(&self) -> Option<&SnapshotComposition> {
+        match &self.root.profile {
+            SnapshotRootProfile::LinuxOverlay { lower, .. } => Some(lower),
+            SnapshotRootProfile::OpaqueRaw => None,
+        }
     }
 
     pub fn streams(&self) -> impl Iterator<Item = &SnapshotStream> {
@@ -357,6 +700,9 @@ impl SnapshotRecord {
             streams.insert(stream.stream);
             objects.insert(stream.map);
             objects.extend(stream.map_pages.iter().copied());
+        }
+        if let Some(lower) = self.lower() {
+            objects.extend(lower.objects());
         }
         if let BootProfile::LinuxDirect {
             binding:
@@ -973,5 +1319,75 @@ pub(crate) mod tests {
             execution.memory.map_pages.push(digest);
         }
         assert!(record.validate().is_err());
+    }
+
+    /// Shape-valid layered lower graph (identities are not authenticated).
+    pub(crate) fn composition() -> crate::store::models::snapshot::SnapshotComposition {
+        use crate::store::models::snapshot::{SnapshotComposition, SnapshotLayer};
+        let digest = |byte: u8| ObjectDigest::from_sha256([byte; 32]);
+        SnapshotComposition {
+            result: format!("sha256:{}", "0c".repeat(32)).parse().unwrap(),
+            record: digest(1),
+            recipe: digest(2),
+            fsmeta: digest(3),
+            layers: vec![SnapshotLayer {
+                recipe: digest(4),
+                result: digest(5),
+                index_root: digest(6),
+                index_pages: vec![digest(7)],
+                pack: SnapshotStream {
+                    stream: StreamId::from_sha256([8; 32]),
+                    map: digest(9),
+                    map_pages: vec![digest(10)],
+                    length: 4096,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn layered_lower_shape_and_retired_flat_snapshot_roots_are_refused() {
+        let mut graph = composition();
+        graph.validate_shape().unwrap();
+        let duplicate = graph.layers[0].index_pages[0];
+        graph.layers[0].index_pages.push(duplicate);
+        assert!(graph.validate_shape().is_err(), "duplicate page");
+        let mut graph = composition();
+        graph.layers[0].index_pages = vec![graph.layers[0].index_root];
+        assert!(graph.validate_shape().is_err(), "root listed as a page");
+        let mut graph = composition();
+        graph.layers[0].pack.length = 512;
+        assert!(graph.validate_shape().is_err(), "unaligned pack");
+
+        let stream = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let raw = record(
+            stream,
+            ObjectDigest::of_bytes(b"map"),
+            ObjectDigest::of_bytes(b"kernel"),
+        );
+        let mut value = serde_json::to_value(&raw).unwrap();
+        value["root"]["profile"] = serde_json::json!({
+            "kind": "linux-overlay",
+            "lower": serde_json::to_value(&raw.root.stream).unwrap(),
+            "lowerGeometry": {"length": 512, "logicalSectorSize": 512},
+            "lowerFilesystemUuid": uuid::Uuid::new_v4(),
+            "upperUuid": uuid::Uuid::new_v4(),
+            "ext4Profile": "silo-upper-ext4-v1",
+            "overlayProfile": "silo-overlay-v1",
+            "temporaryDirectory": {"kind": "disk-backed"},
+        });
+        match SnapshotRecord::decode(&serde_json::to_vec(&value).unwrap()) {
+            Err(crate::LibVmError::IncompatibleRootProfile { profile }) => {
+                assert_eq!(profile, "linux-overlay/flat-ext4")
+            }
+            other => panic!("{other:?}"),
+        }
+        value["root"]["profile"] = serde_json::json!({"kind": "linux-flat-overlay"});
+        assert!(matches!(
+            SnapshotRecord::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(crate::LibVmError::IncompatibleRootProfile { .. })
+        ));
     }
 }

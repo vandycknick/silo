@@ -238,7 +238,7 @@ def install_managed_fixture(silo: Silo, name: str, *, custom_boot: bool) -> dict
         finally:
             os.close(data_fd)
         geometry = {"length": 8 * 1024**2, "logicalSectorSize": 512}
-        storage["disks"].append({"id": str(uuid4()), "role": "data", "order": 1, "storage": {"kind": "managed-writable", "path": "disks/data.raw", "geometry": geometry}})
+        storage["disks"].append({"id": str(uuid4()), "role": "data", "order": len(config["spec"]["storage"]["disks"]), "storage": {"kind": "managed-writable", "path": "disks/data.raw", "geometry": geometry}})
         config["spec"]["storage"]["disks"].append({"path": str(path), "role": "data", "format": "raw", "geometry": geometry, "blockId": "silo-data-0", "readOnly": False})
         config["process"] = {"entrypoint": None, "command": [], "environment": {"CAPTURE_EMPTY": "", "CAPTURE_UNICODE": "雪/é", "CAPTURE_SECRET_WARNING": "exact-not-sanitized"}, "workingDirectory": "/", "user": "root"}
         config["labels"] = {"capture": "nondefault", "é": "雪"}

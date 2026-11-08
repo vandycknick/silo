@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
@@ -6,9 +6,13 @@ use std::path::Path;
 use vm_spec::{BlockId, Disk, DiskFormat, DiskGeometry, DiskRole};
 
 use crate::storage::pool::StoragePool;
-use crate::{
-    LibVmError, MachineRoot, MachineStorageRecord, OverlayLower, TemporaryDirectoryPolicy,
-};
+use crate::store::composition_store::LaunchLower;
+use crate::{LibVmError, MachineRoot, MachineStorageRecord, TemporaryDirectoryPolicy};
+
+/// Value of the single builder-emitted `silo.rootfs=` kernel argument.
+pub(crate) const ROOT_MARKER_VALUE: &str = "linux-erofs-overlay-v1";
+/// The exact whole kernel argument selecting the layered overlay root.
+pub(crate) const ROOT_MARKER: &str = "silo.rootfs=linux-erofs-overlay-v1";
 
 pub(crate) struct PreparedRoot {
     pub(crate) disks: Vec<Disk>,
@@ -17,6 +21,9 @@ pub(crate) struct PreparedRoot {
     pub(crate) qualification: Option<crate::QualifiedOverlayBoot>,
     pub(crate) storage: MachineStorageRecord,
     pub(crate) rosetta: rootfs_spec::RosettaMode,
+    /// Lease over the layered lower's layers, packs and fsmeta, held until
+    /// the launched monitor has opened its verified backings.
+    pub(crate) _lower: Option<LaunchLower>,
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> LibVmError {
@@ -62,7 +69,7 @@ pub(crate) fn validate_spec(
     let overlay = matches!(&storage.root, MachineRoot::LinuxOverlay { .. });
     validate_root_arguments(args, overlay)?;
     let MachineRoot::LinuxOverlay {
-        lower: OverlayLower::FlatExt4 { geometry, .. },
+        lower,
         upper,
         capacity,
         ..
@@ -70,6 +77,7 @@ pub(crate) fn validate_spec(
     else {
         return Ok(());
     };
+    let geometry = lower.geometry();
     spec.validate()
         .map_err(|error| invalid(error.to_string()))?;
     let disks = spec
@@ -103,10 +111,7 @@ pub(crate) fn validate_spec(
         .ok_or_else(|| invalid("overlay requires qualified direct kernel boot"))?;
     // The token checks above already refused selectors and conflicting
     // markers; the builder-emitted marker must also be a whole argument.
-    if !args
-        .iter()
-        .any(|arg| arg.as_str() == "silo.rootfs=linux-flat-overlay-v1")
-    {
+    if !args.iter().any(|arg| arg.as_str() == ROOT_MARKER) {
         return Err(invalid(
             "overlay requires its exact root marker as a whole kernel argument",
         ));
@@ -145,7 +150,7 @@ pub(crate) fn validate_root_arguments(args: &[String], overlay: bool) -> Result<
             continue;
         };
         if param.is(b"silo.rootfs") {
-            if !overlay || value != b"linux-flat-overlay-v1" {
+            if !overlay || value != ROOT_MARKER_VALUE.as_bytes() {
                 return Err(invalid(
                     "root profile marker conflicts with the persisted root",
                 ));
@@ -169,23 +174,63 @@ pub(crate) fn allows_rootfs_resize(storage: &MachineStorageRecord) -> bool {
     )
 }
 
-pub(crate) fn filesystem_uuid(path: &Path) -> Result<uuid::Uuid, LibVmError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
-        .open(path)?;
-    let mut superblock = [0u8; 120];
-    file.read_exact_at(&mut superblock, 1024)?;
-    if superblock[56..58] != [0x53, 0xef] {
-        return Err(invalid("flat lower is not ext4"));
+/// A layered lower is admissible only for the userspace its boot profile
+/// names: the composition recipe platform is the image's exact OCI platform.
+pub(crate) fn check_lower_platform(
+    recipe: &oci::Platform,
+    boot: &crate::BootProfile,
+) -> Result<(), LibVmError> {
+    let crate::BootProfile::LinuxDirect {
+        userspace_platform, ..
+    } = boot
+    else {
+        return Err(invalid(
+            "layered lower requires a Linux direct boot profile",
+        ));
+    };
+    if crate::LinuxPlatform::from_oci(recipe)? != *userspace_platform {
+        return Err(invalid(
+            "layered lower recipe platform differs from the boot userspace platform",
+        ));
     }
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&superblock[104..120]);
-    let uuid = uuid::Uuid::from_bytes(bytes);
-    if uuid.is_nil() {
-        return Err(invalid("flat lower has zero filesystem UUID"));
+    Ok(())
+}
+
+/// Geometry, UUID and profile admission of a private upper. The dirty
+/// journal (`EXT4_FEATURE_INCOMPAT_RECOVER`) is deliberately permitted: exact
+/// captures and forks never replay, repair or clear it. Consumers requiring a
+/// clean filesystem (flattening export) must check that separately.
+pub(crate) fn validate_upper_file(
+    file: &File,
+    upper_uuid: uuid::Uuid,
+    capacity: u64,
+) -> Result<(), LibVmError> {
+    let mut bytes = [0u8; 1024];
+    file.read_exact_at(&mut bytes, 1024)?;
+    let word = |offset: usize| {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    let profile = rootfs_spec::upper_geometry::FEATURE_INCOMPAT;
+    if bytes[56..58] != [0x53, 0xef]
+        || &bytes[104..120] != upper_uuid.as_bytes()
+        || word(24) != 2
+        || word(96) & !4 != profile
+        || word(92) & !rootfs_spec::upper_geometry::FEATURE_COMPAT != 0
+        || word(100) & !rootfs_spec::upper_geometry::FEATURE_RO_COMPAT != 0
+        || u64::from(word(4)) * 4096 > capacity
+        || word(4) == 0
+        || word(336) != 0
+    {
+        return Err(invalid(
+            "upper metadata does not match its admitted profile and UUID",
+        ));
     }
-    Ok(uuid)
+    Ok(())
 }
 
 pub(crate) fn validate_private(path: &Path, length: u64) -> Result<(), LibVmError> {
@@ -208,6 +253,7 @@ pub(crate) fn prepare(
     storage: &MachineStorageRecord,
     machine_dir: &Path,
     images_dir: &Path,
+    lower: Option<LaunchLower>,
     data_disks: u64,
     qualification: Option<crate::QualifiedOverlayBoot>,
     rosetta: rootfs_spec::RosettaMode,
@@ -275,12 +321,7 @@ pub(crate) fn prepare(
             )
         }
         MachineRoot::LinuxOverlay {
-            lower:
-                OverlayLower::FlatExt4 {
-                    stream,
-                    geometry,
-                    filesystem_uuid: lower_uuid,
-                },
+            lower: persisted,
             upper,
             upper_uuid,
             capacity,
@@ -289,24 +330,26 @@ pub(crate) fn prepare(
         } => {
             let qualification = qualification
                 .as_ref()
-                .ok_or_else(|| invalid("flat overlay boot was not qualified"))?;
+                .ok_or_else(|| invalid("layered overlay boot was not qualified"))?;
+            let launch = lower
+                .as_ref()
+                .ok_or_else(|| invalid("overlay launch has no leased retained composition"))?;
+            // Geometry and UUID are derived claims of the authenticated result.
+            launch.retained.check_lower(persisted)?;
+            check_lower_platform(&launch.retained.recipe.platform, &storage.boot)?;
+            let geometry = persisted.geometry();
+            let lower_uuid = persisted.filesystem_uuid();
             let pool = StoragePool::open_existing(images_dir)?
                 .ok_or_else(|| invalid("immutable lower pool is missing"))?;
-            let occurrence = pool.lower_occurrence(stream)?;
-            if occurrence.length() != geometry.length {
+            let plan = crate::storage::vmdk::FlatLowerPlan::new(&launch.occurrences)?;
+            if plan.logical_length() != geometry.length {
                 return Err(invalid(
-                    "retained lower length differs from semantic geometry",
+                    "retained lower occurrences differ from semantic geometry",
                 ));
             }
-            let occurrences = [occurrence];
-            let plan = crate::storage::vmdk::FlatLowerPlan::new(&occurrences)?;
             let admitted = plan.preflight(data_disks)?;
+            // Streams by map, the fsmeta object by held whole-byte SHA-256.
             admitted.verify(&pool)?;
-            if filesystem_uuid(occurrences[0].path())? != *lower_uuid {
-                return Err(invalid(
-                    "retained lower filesystem UUID differs from semantic identity",
-                ));
-            }
             validate_private(&machine_dir.join(upper.as_path()), *capacity)?;
             descriptor = Some(admitted.descriptor()?);
             let temporary_directory = match temporary_directory {
@@ -333,7 +376,7 @@ pub(crate) fn prepare(
                     rootfs_spec::RootSerial::Lower,
                     geometry.length,
                     true,
-                    *lower_uuid,
+                    lower_uuid,
                 )?,
                 upper: expectation(
                     rootfs_spec::RootSerial::Upper,
@@ -361,10 +404,9 @@ pub(crate) fn prepare(
                         "silo-root-upper".into(),
                     )?,
                 ],
-                rootfs_spec::Root::FlatOverlay(root),
+                rootfs_spec::Root::ErofsOverlay(root),
             )
         }
-        _ => return Err(invalid("root family has not passed the launch gate")),
     };
     let mut bootstrap = vec![0; rootfs_spec::MAX_JSON_BYTES];
     let count =
@@ -378,6 +420,7 @@ pub(crate) fn prepare(
         qualification,
         storage: storage.clone(),
         rosetta,
+        _lower: lower,
     })
 }
 
@@ -448,15 +491,11 @@ mod tests {
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
-        let stream = crate::storage::stream::StreamHasher::new()
-            .hash_reader([0u8; 512].as_slice())
-            .unwrap()
-            .id();
         storage.root = MachineRoot::LinuxOverlay {
-            lower: OverlayLower::FlatExt4 {
-                stream,
+            lower: OverlayLower::ErofsComposition {
+                record: format!("sha256:{}", "ab".repeat(32)).parse().unwrap(),
                 geometry: vm_spec::DiskGeometry {
-                    length: 512,
+                    length: 4096,
                     logical_sector_size: 512,
                 },
                 filesystem_uuid: uuid::Uuid::new_v4(),
@@ -483,7 +522,7 @@ mod tests {
                 disk(
                     "lower.vmdk",
                     DiskRole::RootLower,
-                    512,
+                    4096,
                     "silo-root-lower".into(),
                 )
                 .unwrap(),
@@ -500,7 +539,7 @@ mod tests {
             kernel: Some(vm_spec::Kernel {
                 path: None,
                 initramfs: None,
-                cmdline: vec!["silo.rootfs=linux-flat-overlay-v1".into()],
+                cmdline: vec![crate::machine::root_storage::ROOT_MARKER.into()],
             }),
             userdata: None,
         });
@@ -522,7 +561,8 @@ mod tests {
             "rdinit=\"/agent/silo-agent\"",
             "silo.rootfs=other",
             "silo.rootfs=linux-flat-overlay-v1",
-            "\"silo.rootfs=linux-flat-overlay-v1\"",
+            "silo.rootfs=linux-erofs-overlay-v1",
+            "\"silo.rootfs=linux-erofs-overlay-v1\"",
         ] {
             let mut invalid = valid.clone();
             invalid
@@ -556,7 +596,7 @@ mod tests {
             .kernel
             .as_mut()
             .unwrap()
-            .cmdline = vec!["silo.rootfs=linux-flat-overlay-v1 quiet".into()];
+            .cmdline = vec!["silo.rootfs=linux-erofs-overlay-v1 quiet".into()];
         assert!(validate_spec(&storage, &embedded_marker).is_err());
         let mut imported = valid.clone();
         imported.storage.as_mut().unwrap().disks[0].path = "/external/arbitrary.vmdk".into();
@@ -566,6 +606,11 @@ mod tests {
             .geometry
             .length += 4096;
         assert!(validate_spec(&storage, &changed_upper).is_err());
+        let mut changed_lower = valid.clone();
+        changed_lower.storage.as_mut().unwrap().disks[0]
+            .geometry
+            .length += 4096;
+        assert!(validate_spec(&storage, &changed_lower).is_err());
     }
 
     #[test]
@@ -575,6 +620,7 @@ mod tests {
             &storage(),
             temp.path(),
             &temp.path().join("missing-pool"),
+            None,
             0,
             None,
             rootfs_spec::RosettaMode::Disabled,
@@ -587,6 +633,72 @@ mod tests {
             crate::LibVmError::InvalidStorageRecord { .. }
         ));
         assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn lower_recipe_platform_must_equal_boot_userspace_platform() {
+        let storage = storage();
+        crate::machine::root_storage::check_lower_platform(
+            &oci::Platform::host().unwrap(),
+            &storage.boot,
+        )
+        .unwrap();
+        let foreign = if oci::Platform::host().unwrap().architecture == "amd64" {
+            oci::Platform {
+                os: "linux".into(),
+                architecture: "arm64".into(),
+                variant: None,
+            }
+        } else {
+            oci::Platform::linux_amd64()
+        };
+        assert!(
+            crate::machine::root_storage::check_lower_platform(&foreign, &storage.boot).is_err()
+        );
+        let windows = oci::Platform {
+            os: "windows".into(),
+            ..oci::Platform::host().unwrap()
+        };
+        assert!(
+            crate::machine::root_storage::check_lower_platform(&windows, &storage.boot).is_err()
+        );
+    }
+
+    #[test]
+    fn upper_admission_checks_profile_uuid_and_capacity_but_never_journal_state() {
+        use std::os::unix::fs::FileExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("upper.raw");
+        let capacity = 64 * 1024 * 1024;
+        let formatted = disk_image::ext4::upper::format_upper(
+            &path,
+            rootfs_spec::upper_geometry::UpperCapacity::new(capacity).unwrap(),
+        )
+        .unwrap();
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let validate = |uuid, capacity| {
+            crate::machine::root_storage::validate_upper_file(&open(), uuid, capacity)
+        };
+        validate(formatted.uuid, capacity).unwrap();
+        assert!(validate(uuid::Uuid::new_v4(), capacity).is_err());
+        assert!(validate(formatted.uuid, 4096).is_err());
+        // A dirty journal (RECOVER) is an exact captured state, never repaired.
+        let file = open();
+        let mut incompat = [0u8; 4];
+        file.read_exact_at(&mut incompat, 1024 + 96).unwrap();
+        let dirty = u32::from_le_bytes(incompat) | 4;
+        file.write_all_at(&dirty.to_le_bytes(), 1024 + 96).unwrap();
+        validate(formatted.uuid, capacity).unwrap();
+        // An unknown incompatible feature is refused.
+        file.write_all_at(&(dirty | 0x8000_0000).to_le_bytes(), 1024 + 96)
+            .unwrap();
+        assert!(validate(formatted.uuid, capacity).is_err());
     }
 
     #[test]
@@ -603,6 +715,7 @@ mod tests {
             &storage,
             temp.path(),
             &temp.path().join("missing-pool"),
+            None,
             0,
             None,
             rootfs_spec::RosettaMode::Disabled,
@@ -645,6 +758,7 @@ mod tests {
             &storage,
             temp.path(),
             &temp.path().join("images"),
+            None,
             0,
             None,
             rootfs_spec::RosettaMode::Required,
@@ -786,5 +900,66 @@ mod tests {
             std::fs::read_to_string(new_home.join("machines/test/lower.vmdk")).unwrap(),
             second
         );
+    }
+
+    #[tokio::test]
+    async fn layered_launch_lower_holds_exact_occurrences_and_refuses_forged_claims_or_bytes() {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::LocalPaths::new(temp.path());
+        let store = crate::store::Store::new(&paths).await.unwrap();
+        let held = crate::store::storage::tests::retained_lower(&store, paths.home(), b'R').await;
+        let retained = held.retained().clone();
+        let lower = retained.overlay_lower();
+        let layers = crate::store::layer_store::LayerStore::from_store(store.clone());
+        let launch = layers.launch_lower(&lower).await.unwrap();
+        // fsmeta object first, then every pack occurrence; the repeated layer
+        // keeps its exact position and shares one retained backing.
+        assert_eq!(launch.occurrences.len(), 3);
+        assert_eq!(
+            launch.occurrences[0].backing(),
+            crate::storage::vmdk::LowerBacking::Object(retained.fsmeta())
+        );
+        assert_eq!(
+            launch.occurrences[1].backing(),
+            launch.occurrences[2].backing()
+        );
+        let pool = crate::storage::pool::StoragePool::open_existing(paths.images_dir())
+            .unwrap()
+            .unwrap();
+        let admitted = crate::storage::vmdk::FlatLowerPlan::new(&launch.occurrences)
+            .unwrap()
+            .preflight(0)
+            .unwrap();
+        assert_eq!(admitted.logical_length(), lower.geometry().length);
+        admitted.verify(&pool).unwrap();
+        // Derived claims contradicting the authenticated result never lease.
+        let crate::OverlayLower::ErofsComposition {
+            record, geometry, ..
+        } = lower.clone();
+        assert!(layers
+            .launch_lower(&crate::OverlayLower::ErofsComposition {
+                record,
+                geometry,
+                filesystem_uuid: uuid::Uuid::new_v4(),
+            })
+            .await
+            .is_err());
+        // A retained fsmeta byte change is refused by the held whole-object
+        // verification before any descriptor could be handed to a monitor.
+        let fsmeta = pool.object_path(&retained.fsmeta());
+        let mode = std::fs::metadata(&fsmeta).unwrap().permissions().mode();
+        std::fs::set_permissions(&fsmeta, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fsmeta)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, 0).unwrap();
+        file.write_all_at(&[byte[0] ^ 0xff], 0).unwrap();
+        drop(file);
+        std::fs::set_permissions(&fsmeta, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(admitted.verify(&pool).is_err());
     }
 }

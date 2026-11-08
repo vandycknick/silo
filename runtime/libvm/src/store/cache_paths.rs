@@ -4,32 +4,30 @@ use crate::store::models::MachineConfig;
 use crate::store::row::DbMachineConfig;
 use crate::LibVmError;
 
+/// Typed retained-storage edges of one machine. Its layered lower is rooted
+/// by identity; the composition row roots that lower's complete closure.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PoolDependencies {
+    pub(crate) streams: std::collections::BTreeSet<crate::storage::identity::StreamId>,
+    pub(crate) objects: std::collections::BTreeSet<crate::storage::identity::ObjectDigest>,
+    pub(crate) lowers: std::collections::BTreeSet<crate::storage::identity::LowerResultId>,
+}
+
 pub(crate) fn storage_pool_dependencies(
     storage: &crate::MachineStorageRecord,
-) -> Result<
-    (
-        std::collections::BTreeSet<crate::storage::identity::StreamId>,
-        std::collections::BTreeSet<crate::storage::identity::ObjectDigest>,
-    ),
-    LibVmError,
-> {
-    let mut streams = std::collections::BTreeSet::new();
-    let mut objects = std::collections::BTreeSet::new();
+) -> Result<PoolDependencies, LibVmError> {
+    let mut dependencies = PoolDependencies::default();
     // A prior-owner record is a replay/collision guard, not a bulk retention
     // request. Unresolved reservations/fences still retain the complete closure.
     if matches!(storage.ownership, crate::MachineOwnership::Relocated { .. }) {
-        return Ok((streams, objects));
+        return Ok(dependencies);
     }
-    if let crate::MachineRoot::LinuxOverlay {
-        lower: crate::OverlayLower::FlatExt4 { stream, .. },
-        ..
-    } = &storage.root
-    {
-        streams.insert(*stream);
+    if let crate::MachineRoot::LinuxOverlay { lower, .. } = &storage.root {
+        dependencies.lowers.insert(lower.record());
     }
     for disk in &storage.disks {
         if let crate::DiskStorage::ManagedReadOnly { stream, .. } = &disk.storage {
-            streams.insert(*stream);
+            dependencies.streams.insert(*stream);
         }
     }
     if let crate::BootProfile::LinuxDirect {
@@ -43,12 +41,12 @@ pub(crate) fn storage_pool_dependencies(
         ..
     } = &storage.boot
     {
-        objects.insert(*kernel);
-        objects.insert(*base_initramfs);
-        objects.extend(agent.iter().copied());
-        objects.insert(binding.digest()?);
+        dependencies.objects.insert(*kernel);
+        dependencies.objects.insert(*base_initramfs);
+        dependencies.objects.extend(agent.iter().copied());
+        dependencies.objects.insert(binding.digest()?);
     }
-    Ok((streams, objects))
+    Ok(dependencies)
 }
 
 pub(crate) async fn machine_retains_object(
@@ -96,7 +94,11 @@ pub(crate) async fn check_machine_dependencies(
             crate::store::models::snapshot::invalid("invalid or oversized machine storage catalog")
         })?;
         let record = crate::MachineStorageRecord::decode(&bytes)?;
-        let (streams, objects) = storage_pool_dependencies(&record)?;
+        let PoolDependencies {
+            streams,
+            objects,
+            lowers,
+        } = storage_pool_dependencies(&record)?;
         let generation = i64::try_from(record.storage_generation)
             .map_err(crate::store::models::snapshot::invalid)?;
         let actual_streams = sqlx::query_as::<_, (i64, String)>(
@@ -111,8 +113,15 @@ pub(crate) async fn check_machine_dependencies(
         .bind(&cursor)
         .fetch_all(&mut *tx)
         .await?;
+        let actual_lowers = sqlx::query_as::<_, (i64, String)>(
+            "SELECT generation,lower_id FROM machine_lower_dependency WHERE machine_id=?1",
+        )
+        .bind(&cursor)
+        .fetch_all(&mut *tx)
+        .await?;
         if actual_streams.iter().any(|(g, _)| *g != generation)
             || actual_objects.iter().any(|(g, _)| *g != generation)
+            || actual_lowers.iter().any(|(g, _)| *g != generation)
             || streams
                 != actual_streams
                     .into_iter()
@@ -120,6 +129,11 @@ pub(crate) async fn check_machine_dependencies(
                     .collect::<Result<std::collections::BTreeSet<_>, _>>()?
             || objects
                 != actual_objects
+                    .into_iter()
+                    .map(|(_, v)| v.parse().map_err(crate::store::models::snapshot::invalid))
+                    .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+            || lowers
+                != actual_lowers
                     .into_iter()
                     .map(|(_, v)| v.parse().map_err(crate::store::models::snapshot::invalid))
                     .collect::<Result<std::collections::BTreeSet<_>, _>>()?

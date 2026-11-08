@@ -2,7 +2,7 @@
 pub mod index;
 pub mod ingest;
 pub mod limits;
-mod metadata;
+pub(crate) mod metadata;
 pub mod model;
 pub mod namespace;
 mod pack;

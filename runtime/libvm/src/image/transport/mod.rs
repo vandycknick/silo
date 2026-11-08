@@ -15,6 +15,14 @@
 //! retried push reuses the retained representation registered by the first
 //! attempt, so it reproduces the exact graph bytes, and the registry skips
 //! blobs it already holds with matching digest and length.
+//!
+//! Layered roots retain canonical composition and per-occurrence layer records,
+//! index-page closure, whole-byte fsmeta, and pack streams alongside the private
+//! upper. Fsmeta is chunked only for transport: its permanent identity/backing is
+//! an object, never another concatenated-lower or whole-fsmeta stream. Both
+//! directions authenticate the complete retained EROFS graph without invoking a
+//! source registry or encoder; optional OCI reconstruction belongs to handoff
+//! preparation and must match these exact retained identities.
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -1009,6 +1017,493 @@ pub(crate) mod tests {
         records.push(transport.root);
         records.extend(transport.pages);
         finish(graph, config, streams, objects, records)
+    }
+
+    /// Build a real retained EROFS graph from the admitted pack/index corpus.
+    /// Repeating one layer deliberately retains two occurrence slots, not two
+    /// physical payload copies.
+    pub(crate) async fn layered_image() -> (
+        tempfile::TempDir,
+        Arc<Store>,
+        ManagedImageStore,
+        ImageId,
+        ImageRecord,
+    ) {
+        let (temp, store) = home().await;
+        let (images, id, record) = layered_image_in(store.clone()).await;
+        (temp, store, images, id, record)
+    }
+
+    pub(crate) async fn layered_image_in(
+        store: Arc<Store>,
+    ) -> (ManagedImageStore, ImageId, ImageRecord) {
+        use crate::store::models::snapshot::{
+            SnapshotComposition, SnapshotLayer, SnapshotRootProfile,
+        };
+        let pool = StoragePool::open(store.images_path()).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let paths = pool
+            .create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../oci/testdata/changesets/metadata-producers/silo-artifacts/case-0007/layer-0000",
+        );
+        let recipe_bytes = std::fs::read(fixture.join("recipe.json")).unwrap();
+        let recipe_value: serde_json::Value = serde_json::from_slice(&recipe_bytes).unwrap();
+        let diff_id: ContentDigest =
+            serde_json::from_value(recipe_value["diffId"].clone()).unwrap();
+        let index = std::fs::read(fixture.join("index.json")).unwrap();
+        let changeset = oci::changeset::decode_index(
+            &index,
+            |digest| {
+                Ok(std::fs::read(
+                    fixture.join(format!("{}.json", object(digest).hex())),
+                )?)
+            },
+            diff_id,
+            &oci::changeset::ChangesetLimits::default(),
+        )
+        .unwrap();
+        let (pack, roots) = pool
+            .publish_stream_for_catalog(&fixture.join("payload.pack"))
+            .unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[pack.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        let pack_map =
+            crate::store::snapshot_store::publish_map(&pool, &store, operation, &pack.map)
+                .await
+                .unwrap();
+        let layer_recipe = oci::changeset::LayerRecipe { diff_id };
+        let layer_result = oci::changeset::LayerResult {
+            recipe: layer_recipe.id().unwrap(),
+            pack_stream: identity(pack.id),
+            pack_length: pack.length,
+            index_root: ContentDigest::of_bytes(&index),
+        };
+        let index = oci::changeset::index::encode_index(
+            &changeset,
+            &oci::changeset::ChangesetLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(index.root.digest, layer_result.index_root);
+        let recipe_digest = publish_fixture_object(
+            &store,
+            &pool,
+            operation,
+            &layer_recipe.canonical_bytes().unwrap(),
+        )
+        .await;
+        let result_digest = publish_fixture_object(
+            &store,
+            &pool,
+            operation,
+            &layer_result.canonical_bytes().unwrap(),
+        )
+        .await;
+        let root_digest = publish_fixture_object(&store, &pool, operation, &index.root.bytes).await;
+        let mut index_pages = Vec::new();
+        for page in index.pages {
+            index_pages.push(publish_fixture_object(&store, &pool, operation, &page.bytes).await);
+        }
+        index_pages.sort();
+        let pack_file = pool.open_stream(&pack.id).unwrap();
+        let occurrence = oci::erofs::Layer {
+            result: &layer_result,
+            changeset: &changeset,
+            pack: &pack_file,
+        };
+        let occurrences = [occurrence, occurrence];
+        let recipe = oci::composition::CompositionRecipe::from_layers(
+            oci::Platform::linux_amd64(),
+            &occurrences,
+        )
+        .unwrap();
+        let fsmeta_path = paths.temporary.join("fsmeta");
+        let mut fsmeta = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&fsmeta_path)
+            .unwrap();
+        let composed =
+            crate::storage::composition::compose(&recipe, &occurrences, &mut fsmeta).unwrap();
+        let (published, roots) = pool
+            .publish_object_file_for_catalog(fsmeta, &paths.temporary)
+            .unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[published.digest])
+            .await
+            .unwrap();
+        drop(roots);
+        let graph = SnapshotComposition {
+            result: crate::storage::identity::LowerResultId::from_composition(
+                composed.result.id().unwrap(),
+            ),
+            record: publish_fixture_object(
+                &store,
+                &pool,
+                operation,
+                &composed.result.canonical_bytes().unwrap(),
+            )
+            .await,
+            recipe: publish_fixture_object(
+                &store,
+                &pool,
+                operation,
+                &recipe.canonical_bytes().unwrap(),
+            )
+            .await,
+            fsmeta: published.digest,
+            layers: vec![
+                SnapshotLayer {
+                    recipe: recipe_digest,
+                    result: result_digest,
+                    index_root: root_digest,
+                    index_pages,
+                    pack: pack_map,
+                };
+                2
+            ],
+        };
+        crate::store::layer_store::LayerStore::open(store.home_path())
+            .await
+            .unwrap()
+            .publish_snapshot_composition(operation, &graph)
+            .await
+            .unwrap();
+        let upper_path = paths.temporary.join("upper.raw");
+        let upper = disk_image::ext4::upper::format_upper(
+            &upper_path,
+            rootfs_spec::upper_geometry::UpperCapacity::new(64 << 20).unwrap(),
+        )
+        .unwrap();
+        let (upper_stream, roots) = pool.publish_stream_for_catalog(&upper_path).unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[upper_stream.id], &[])
+            .await
+            .unwrap();
+        drop(roots);
+        let upper_map =
+            crate::store::snapshot_store::publish_map(&pool, &store, operation, &upper_stream.map)
+                .await
+                .unwrap();
+        let kernel =
+            publish_fixture_object(&store, &pool, operation, b"layered fixture boot bytes").await;
+        let mut snapshot =
+            crate::store::models::snapshot::tests::record(upper_map.stream, upper_map.map, kernel);
+        snapshot.root.stream = upper_map;
+        snapshot.root.geometry.length = 64 << 20;
+        snapshot.root.profile = SnapshotRootProfile::LinuxOverlay {
+            lower: Box::new(graph),
+            lower_geometry: vm_spec::DiskGeometry {
+                length: composed.result.lower_length,
+                logical_sector_size: 512,
+            },
+            lower_filesystem_uuid: uuid::Uuid::from_bytes(composed.result.fsmeta.uuid),
+            upper_uuid: upper.uuid,
+            ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
+            overlay_profile: crate::OverlayProfile::SiloOverlayV1,
+            temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
+        };
+        let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut snapshot.boot else {
+            panic!("Linux direct fixture");
+        };
+        *root_selector = crate::RootSelector::ManagedOverlay;
+        let record = ImageRecord {
+            schema: 1,
+            kind: ImageRecordKind::Image,
+            root: snapshot.root,
+            boot: snapshot.boot,
+            process: crate::ProcessConfig::default(),
+        };
+        let images = ManagedImageStore::from_store(store.clone());
+        let info = images
+            .publish_owned(record.clone(), operation, lease, None, Vec::new(), None)
+            .await
+            .unwrap();
+        (images, info.id, record)
+    }
+
+    #[tokio::test]
+    async fn stopped_layered_snapshot_roundtrips_its_graph_and_private_upper() {
+        let (_home, source, _images, _, image) = layered_image().await;
+        let crate::BootProfile::LinuxDirect {
+            binding: crate::BootBinding::Pinned { kernel, .. },
+            ..
+        } = &image.boot
+        else {
+            panic!("pinned fixture");
+        };
+        let mut record = crate::store::models::snapshot::tests::record(
+            image.root.stream.stream,
+            image.root.stream.map,
+            *kernel,
+        );
+        record.root = image.root;
+        record.boot = image.boot;
+        let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
+            lower,
+            lower_geometry,
+            ..
+        } = &record.root.profile
+        else {
+            panic!("layered fixture");
+        };
+        record.configuration.spec.storage = Some(vm_spec::Storage {
+            disks: vec![
+                crate::machine::root_storage::disk(
+                    "captured-disk-0",
+                    vm_spec::DiskRole::RootLower,
+                    lower_geometry.length,
+                    "silo-root-lower".into(),
+                )
+                .unwrap(),
+                crate::machine::root_storage::disk(
+                    "captured-disk-1",
+                    vm_spec::DiskRole::RootUpper,
+                    record.root.geometry.length,
+                    "silo-root-upper".into(),
+                )
+                .unwrap(),
+            ],
+        });
+        let (streams, objects) = record.content_dependencies().unwrap();
+        let (operation, lease) = source
+            .begin_stopped_operation(
+                "snapshot",
+                &streams.into_iter().collect::<Vec<_>>(),
+                &objects.into_iter().collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        source
+            .pin_operation_lowers(operation, &[lower.result])
+            .await
+            .unwrap();
+        let pool = StoragePool::open(source.images_path()).unwrap();
+        let _paths = pool
+            .create_operation_with_lease(operation, lease.duplicate().unwrap())
+            .unwrap();
+        let snapshots = crate::store::snapshot_store::SnapshotStore::from_store(source.clone());
+        let info = snapshots.publish(&record, operation, None).await.unwrap();
+        let consumer = snapshots.consume(&SnapshotRef::Id(info.id)).await.unwrap();
+        let prepared = export(
+            source,
+            ExportSource::Snapshot(Box::new(consumer)),
+            ChunkEncoding::Zstd,
+        )
+        .await;
+        let transfer = transfer(&prepared.graph, &prepared.payloads());
+        let (_home, destination) = home().await;
+        let verified = verify(
+            &transfer,
+            stage(&destination, &transfer).await,
+            index_digest(&transfer),
+        )
+        .await
+        .unwrap();
+        let commit = commit_imported_artifact(verified, None).await.unwrap();
+        assert!(
+            matches!(&commit.info, crate::ManagedSourceInfo::Snapshot(imported) if imported.id == info.id)
+        );
+        let imported = crate::store::snapshot_store::SnapshotStore::from_store(destination.clone());
+        let consumer = imported.consume(&SnapshotRef::Id(info.id)).await.unwrap();
+        assert_eq!(consumer.record, record);
+        assert_eq!(consumer.record.streams().count(), 3);
+    }
+
+    async fn publish_fixture_object(
+        store: &Store,
+        pool: &StoragePool,
+        operation: uuid::Uuid,
+        bytes: &[u8],
+    ) -> ObjectDigest {
+        let input =
+            crate::store::snapshot_store::RecordInput::new(store.images_path(), operation, bytes)
+                .unwrap();
+        let (object, roots) = pool.publish_object_for_catalog(&input.path()).unwrap();
+        store
+            .pin_published_storage_dependencies(operation, &[], &[object.digest])
+            .await
+            .unwrap();
+        drop(roots);
+        object.digest
+    }
+
+    #[tokio::test]
+    async fn layered_exact_artifacts_roundtrip_without_producer_paths() {
+        let (producer, source, images, id, record) = layered_image().await;
+        let prepared = export(
+            source.clone(),
+            ExportSource::Image(Box::new(
+                images.consume(&ManagedSourceRef::Image(id)).await.unwrap(),
+            )),
+            ChunkEncoding::Raw,
+        )
+        .await;
+        let transfer = transfer(&prepared.graph, &prepared.payloads());
+        let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay { lower, .. } =
+            &record.root.profile
+        else {
+            panic!("layered fixture");
+        };
+        let graph = verified_graph(&transfer);
+        let fsmeta_stream = graph
+            .objects()
+            .iter()
+            .find_map(|object| match object {
+                ObjectBinding::Stream { object, stream, .. }
+                    if *object == content(lower.fsmeta) =>
+                {
+                    Some(crate::image::transport::closure::stream_id(*stream))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(lower.layers.len(), 2);
+        assert_eq!(lower.layers[0], lower.layers[1]);
+        let lower_stream = lower
+            .authenticate(|digest, maximum| {
+                Ok(StoragePool::open(source.images_path())?.read_object(digest, maximum)?)
+            })
+            .unwrap()
+            .result
+            .lower_stream;
+        drop(prepared);
+        drop(images);
+        drop(source);
+        producer.close().unwrap();
+        let (_home, destination) = home().await;
+        let verified = verify(
+            &transfer,
+            stage(&destination, &transfer).await,
+            index_digest(&transfer),
+        )
+        .await
+        .unwrap();
+        let committed = commit_imported_artifact(verified, None).await.unwrap();
+        assert!(
+            matches!(&committed.info, crate::ManagedSourceInfo::Image(imported) if imported.id == id)
+        );
+        let pool = StoragePool::open(destination.images_path()).unwrap();
+        assert!(pool.object_path(&lower.fsmeta).is_file());
+        assert!(!pool.stream_path(&fsmeta_stream).exists());
+        assert!(!pool
+            .stream_path(&crate::image::transport::closure::stream_id(lower_stream))
+            .exists());
+        let imported = ManagedImageStore::from_store(destination.clone());
+        let retained = imported
+            .consume(&ManagedSourceRef::Image(id))
+            .await
+            .unwrap();
+        assert_eq!(retained.info.record, record);
+        let republished = export(
+            destination,
+            ExportSource::Image(Box::new(retained)),
+            ChunkEncoding::Raw,
+        )
+        .await;
+        assert_eq!(republished.graph.index.bytes, transfer.index);
+    }
+
+    /// A fully valid OCI transport graph whose semantic record makes a
+    /// different claim about the same authenticated retained object graph.
+    fn forge_layered_claim(
+        graph: &EncodedVmGraph,
+        mutate: impl FnOnce(&mut ImageRecord),
+    ) -> EncodedVmGraph {
+        let mut config = decode_vm_config(&graph.config.bytes).unwrap();
+        let semantic = Semantic::decode(
+            config.content.kind,
+            record_bytes(graph, config.content.record.digest),
+        )
+        .unwrap();
+        let old = content(semantic.digest);
+        let SemanticRecord::Image(mut record) = semantic.record else {
+            panic!("image fixture");
+        };
+        mutate(&mut record);
+        let forged = Semantic::image(*record).unwrap();
+        config.content = forged.content_ref();
+        let (streams, mut replaced) = stream_rows(graph, config.streams.digest);
+        let (mut objects, object_tables) = object_rows(graph, config.objects.digest);
+        replaced.extend(object_tables);
+        replaced.push(old);
+        objects.retain(|row| row.object() != old);
+        let mut records = graph
+            .records
+            .iter()
+            .filter(|record| !replaced.contains(&record.reference.digest))
+            .cloned()
+            .collect::<Vec<_>>();
+        let record = RecordBlob::new(forged.bytes).unwrap();
+        objects.push(direct(&record));
+        records.push(record);
+        finish(graph, config, streams, objects, records)
+    }
+
+    #[tokio::test]
+    async fn closed_layered_graph_rejects_grafted_indexes_results_and_root_uuids() {
+        let (_home, source, images, id, _) = layered_image().await;
+        let prepared = export(
+            source,
+            ExportSource::Image(Box::new(
+                images.consume(&ManagedSourceRef::Image(id)).await.unwrap(),
+            )),
+            ChunkEncoding::Raw,
+        )
+        .await;
+        for case in 0..4 {
+            let forged = forge_layered_claim(&prepared.graph, |record| {
+                let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
+                    lower,
+                    lower_filesystem_uuid,
+                    upper_uuid,
+                    ..
+                } = &mut record.root.profile
+                else {
+                    panic!("layered fixture");
+                };
+                match case {
+                    0 => *lower_filesystem_uuid = uuid::Uuid::new_v4(),
+                    1 => *upper_uuid = uuid::Uuid::new_v4(),
+                    2 => lower.layers[0].index_root = lower.layers[0].recipe,
+                    3 => lower.layers[0].result = lower.layers[0].recipe,
+                    _ => unreachable!(),
+                }
+            });
+            let transfer = transfer(&forged, &prepared.payloads());
+            let (_home, destination) = home().await;
+            let staging = stage(&destination, &transfer).await;
+            assert!(
+                verify(&transfer, staging, index_digest(&transfer))
+                    .await
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                count(
+                    &database(&destination).await,
+                    "SELECT count(*) FROM storage_image"
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                count(
+                    &database(&destination).await,
+                    "SELECT count(*) FROM storage_snapshot"
+                )
+                .await,
+                0
+            );
+        }
     }
 
     const TAIL_BYTES: usize = 1 << 20;

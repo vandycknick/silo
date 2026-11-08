@@ -11,8 +11,8 @@ from uuid import UUID
 
 import pytest
 
-from silo_smoke import images, overlay, procs, shutdown
-from silo_smoke.cli import Silo
+from silo_smoke import images, overlay, procs, shutdown, stopped
+from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
@@ -42,14 +42,20 @@ def boot(silo: Silo, image: str, name: str, *flags: str) -> tuple[str, shutdown.
     return record["runId"], monitor, worker, lease
 
 
+def writable_root(silo: Silo, name: str) -> Path:
+    """The catalog-selected writable root: raw disk or layered upper."""
+    return stopped.writable_paths(silo, name)["root"]
+
+
 @pytest.mark.slow
-def test_shutdown_cli_clean_independent_facts(silo: Silo, basic_image: str) -> None:
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
+def test_shutdown_cli_clean_independent_facts(silo: Silo, basic_image: str, profile: RootProfile) -> None:
     """Concurrent-writer positive gate through CLI/libvm, never a guest shortcut."""
     name = "shutdown-clean"
     with shutdown.subreaper():
-        run, monitor, worker, lease = boot(silo, basic_image, name)
+        run, monitor, worker, lease = boot(silo, silo.root_image(basic_image, profile), name)
         with shutdown.owned_processes(monitor, worker):
-            root = overlay.machine_dir(silo, name) / "root.raw"
+            root = writable_root(silo, name)
             shutdown.handles(silo, monitor.pid, [root])
             shutdown.handles(silo, worker.pid, [root])
             silo.exec(name, "sh", "-c", "printf durable-before-stop >/shutdown-persist; sync", user="root")
@@ -82,14 +88,12 @@ def test_shutdown_cli_clean_independent_facts(silo: Silo, basic_image: str) -> N
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("mode", ["clean-overlay", "forced", "worker-crash", "guest-panic", "external-data", "writable-share", "image-pid1"])
+@pytest.mark.parametrize("mode", ["clean-layered", "forced", "worker-crash", "guest-panic", "external-data", "writable-share", "image-pid1"])
 def test_shutdown_real_outcome_and_unsupported_matrix(silo: Silo, basic_image: str, image_pid1: str, mode: str) -> None:
     name = "shutdown-" + mode
     flags = []
     external = silo.ws.root / "external-data.raw"
     share = silo.ws.root / "external-share"
-    if mode == "clean-overlay":
-        flags += ["--root-profile", overlay.PROFILE]
     if mode == "external-data":
         with external.open("wb") as stream:
             stream.truncate(8 * 1024**2)
@@ -167,8 +171,9 @@ def test_shutdown_real_outcome_and_unsupported_matrix(silo: Silo, basic_image: s
             worker.wait()
             monitor.wait()
             assert not shutdown.lease_busy(lease)
-            if mode == "clean-overlay":
+            if mode == "clean-layered":
                 shutdown.assert_clean(silo, name, terminal)
+                assert stopped.record(silo, name)["root"]["kind"] == "linux-overlay"
                 assert overlay.ext4(overlay.upper(silo, name))["incompat"] & 4 == 0
             else:
                 facts = terminal.get("storageShutdown")
@@ -201,14 +206,15 @@ def test_shutdown_real_outcome_and_unsupported_matrix(silo: Silo, basic_image: s
 def test_shutdown_actual_stopped_worker_pins_gc_and_reuse(silo: Silo, basic_image: str) -> None:
     name = "shutdown-orphan"
     with shutdown.subreaper():
-        run, monitor, worker, lease = boot(silo, basic_image, name, "--root-profile", overlay.PROFILE)
+        run, monitor, worker, lease = boot(silo, basic_image, name)
         with shutdown.owned_processes(monitor, worker):
             machine_id = silo.machine_id(name)
             held = overlay.upper(silo, name)
             inode = held.stat().st_ino
-            lower = overlay.records(overlay.machine_dir(silo, name) / "lower.vmdk")[0].path
-            lower_digest = overlay.digest(lower)
-            shutdown.handles(silo, worker.pid, [lease, held, lower])
+            descriptor = overlay.machine_dir(silo, name) / "lower.vmdk"
+            lower_digests = overlay.lower_digests(descriptor)
+            lower = sorted(lower_digests)
+            shutdown.handles(silo, worker.pid, [lease, held, *lower])
             worker.send(signal.SIGSTOP)  # entire actual process, including watchdog
             shutdown.until(worker.stopped, description="not every actual worker thread/watchdog is stopped")
             monitor.send(signal.SIGKILL)  # ONLY monitor, no group/name/CLI force stop
@@ -217,36 +223,36 @@ def test_shutdown_actual_stopped_worker_pins_gc_and_reuse(silo: Silo, basic_imag
             assert shutdown.lease_busy(lease), "surviving worker dropped its inherited OFD"
             shutdown.storage_tool(silo, "remove-image", basic_image)
             shutdown.storage_tool(silo, "prune")
-            assert lower.is_file() and overlay.digest(lower) == lower_digest
+            assert overlay.lower_digests(descriptor) == lower_digests
             operations = procs.query(silo.ws.state_db(), f"SELECT operation_id FROM storage_operation WHERE machine_id='{machine_id}' AND replace(run_id,'-','')='{UUID(run).hex}'")
             assert operations, "collector retired live worker operation"
             for args in [("start", name), ("rm", name, "--force"), ("set", name, "disk=256mib")]:
                 result = silo.run(*args, expect=None, timeout=30)
                 assert result.returncode != 0, (args, result.stdout, result.stderr)
                 assert held.stat().st_ino == inode and shutdown.lease_busy(lease)
-            silo.ws.record("shutdown-orphan-retention", json.dumps({"runId": run, "workerPid": worker.pid, "startTicks": worker.start_ticks, "taskStates": worker.task_states(), "leaseBusy": True, "operations": operations, "upperInode": inode, "lowerSha256": lower_digest}) + "\n")
+            silo.ws.record("shutdown-orphan-retention", json.dumps({"runId": run, "workerPid": worker.pid, "startTicks": worker.start_ticks, "taskStates": worker.task_states(), "leaseBusy": True, "operations": operations, "upperInode": inode, "lowerSha256": {str(path): digest for path, digest in lower_digests.items()}}) + "\n")
             worker.send(signal.SIGCONT)
             worker.reap(code=125)  # unchanged production watchdog, actual wait status
             assert not shutdown.lease_busy(lease)
             silo.rm(name, force=True)
             shutdown.storage_tool(silo, "prune")
-            assert not held.exists() and not lower.exists(), "otherwise-unreachable closure not collected"
+            assert not held.exists() and not any(path.exists() for path in lower), "otherwise-unreachable closure not collected"
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("profile", ["raw", "overlay", "external-data"])
+@pytest.mark.parametrize("profile", ["raw", "layered", "external-data"])
 def test_shutdown_retained_inode_survives_original_path_replacement(silo: Silo, basic_image: str, profile: str) -> None:
     name = "shutdown-path-race"
-    flags = ["--root-profile", overlay.PROFILE] if profile == "overlay" else []
+    flags = []
     data = silo.ws.root / "external-data.raw"
     if profile == "external-data":
         with data.open("wb") as stream:
             stream.truncate(8 * 1024**2)
         flags += ["--disk", str(data)]
     with shutdown.subreaper():
-        run, monitor, worker, lease = boot(silo, basic_image, name, *flags)
+        run, monitor, worker, lease = boot(silo, silo.raw_image(basic_image) if profile == "raw" else basic_image, name, *flags)
         with shutdown.owned_processes(monitor, worker):
-            original = data if profile == "external-data" else overlay.upper(silo, name) if profile == "overlay" else overlay.machine_dir(silo, name) / "root.raw"
+            original = data if profile == "external-data" else writable_root(silo, name)
             pinned = original.with_name("pinned-original.raw")
             original.rename(pinned)
             try:
@@ -290,7 +296,7 @@ def test_shutdown_retained_inode_survives_original_path_replacement(silo: Silo, 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("inject_eio", [False, True], ids=["unmodified-success", "injected-syscall-eio"])
-@pytest.mark.parametrize("profile", ["raw", "overlay", "external-data"])
+@pytest.mark.parametrize("profile", ["raw", "layered", "external-data"])
 def test_shutdown_real_retained_host_fsync(silo: Silo, basic_image: str, inject_eio: bool, profile: str) -> None:
     """Observe the actual successful sync, or inject EIO at that exact syscall."""
     import platform
@@ -300,15 +306,15 @@ def test_shutdown_real_retained_host_fsync(silo: Silo, basic_image: str, inject_
 
     assert platform.machine() == "x86_64", "native injected-EIO lane is qualified only on Linux x86_64"
     name = "shutdown-host-fsync"
-    flags = ["--root-profile", overlay.PROFILE] if profile == "overlay" else []
+    flags = []
     data = silo.ws.root / "unmounted-external-data.raw"
     if profile == "external-data":
         with data.open("wb") as stream:
             stream.truncate(8 * 1024**2)
         flags += ["--disk", str(data)]
-    silo.create(name, basic_image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock", *flags)
+    silo.create(name, silo.raw_image(basic_image) if profile == "raw" else basic_image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock", *flags)
     machine_id = silo.machine_id(name)
-    root = overlay.upper(silo, name) if profile == "overlay" else overlay.machine_dir(silo, name) / "root.raw"
+    root = writable_root(silo, name)
     # The external-Data fault must exercise a non-root backing, not repeat root EIO.
     backings = [data, root] if profile == "external-data" else [root]
     expected = [{"path": str(path), "device": path.stat().st_dev, "inode": path.stat().st_ino} for path in backings]

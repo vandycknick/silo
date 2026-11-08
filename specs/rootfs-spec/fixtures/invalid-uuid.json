@@ -1,8 +1,8 @@
 {
   "schemaVersion":2,
   "root":{
-    "kind":"linux-flat-overlay-v1","discovery":"virtio-block-serial",
-    "lower":{"serial":"silo-root-lower","lengthBytes":268435456,"logicalSectorSize":512,"readOnly":true,"filesystem":"ext4","filesystemUuid":"12345678-1234-4234-8234-123456789abc"},
+    "kind":"linux-erofs-overlay-v1","discovery":"virtio-block-serial",
+    "lower":{"serial":"silo-root-lower","lengthBytes":268435456,"logicalSectorSize":512,"readOnly":true,"filesystem":"erofs","filesystemUuid":"12345678-1234-4234-8234-123456789abc"},
     "upper":{"serial":"silo-root-upper","lengthBytes":67108864,"logicalSectorSize":512,"readOnly":false,"filesystem":"ext4","filesystemUuid":"not-a-uuid"},
     "upperProfile":"silo-upper-ext4-v1","overlayProfile":"silo-overlay-v1","renderingAbi":"linux-overlayfs-mountinfo-v1","temporaryDirectory":{"kind":"disk-backed"}
   },

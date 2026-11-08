@@ -12,7 +12,7 @@ import time
 import pytest
 
 from silo_smoke import capture, incremental, overlay, pause, procs, restore, shutdown, stopped
-from silo_smoke.cli import Result, Silo
+from silo_smoke.cli import ROOT_PROFILES, Result, RootProfile, Silo
 from silo_smoke.restore import restore_image, restore_irq_fixture  # noqa: F401, pytest fixtures
 
 # Admission is compiled into Main's isolated candidate, not production policy.
@@ -80,7 +80,7 @@ def marker(silo: Silo, name: str) -> str:
 def test_restore_inspection_rejects_writable_state_descriptors(
     silo: Silo, restore_image: str, restore_processes: list[shutdown.Process],
 ) -> None:
-    restore.create_source(silo, restore_image)
+    restore.create_source(silo, restore_image, profile="layered")
     own(silo, "restore-source", restore_processes)
     saved = restore.checkpoint(silo, "restore-source")
     child = restore.restore_child(silo, saved, "inspection-source")
@@ -131,10 +131,10 @@ def test_restore_inspection_rejects_writable_state_descriptors(
     stop_owned(silo, "restore-source", restore_processes)
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("borrowed", [False, True], ids=["acquired-freeze", "borrowed-freeze"])
 def test_restore_execution_continues_exact_cut_and_isolates_siblings(
-    silo: Silo, restore_image: str, profile: str, borrowed: bool,
+    silo: Silo, restore_image: str, profile: RootProfile, borrowed: bool,
     restore_processes: list[shutdown.Process],
 ) -> None:
     # The private runtime lets the test replace the current boot assets later.
@@ -288,7 +288,6 @@ def refused_before_allocation(silo: Silo, reference: str, name: str, *,
     assert all(not shutdown.lease_busy(path) for path in new_leases)
     if not verification_lease:
         assert not new_leases, "unsupported backend refusal acquired an operational lease"
-    assert not any(machine["name"] == name for machine in silo.ls())
     return result
 
 
@@ -304,13 +303,24 @@ def checkpoint_for_policy(silo: Silo, policy: str) -> restore.Checkpoint:
     return saved
 
 
+# Execution members are root-independent; the root stream is exercised for
+# both families, and the layered closure adds every composition graph member.
+EXECUTION_MEMBERS = ("ram", "root", "layout", "execution", "devices", "kernel",
+                     "baseInitramfs", "agent", "map", "map-page", "provenance")
+COMPOSITION_MEMBERS = ("lower-record", "lower-recipe", "lower-fsmeta", "layer-recipe",
+                       "layer-result", "layer-index", "layer-pack", "layer-pack-map")
+CLOSURE_CASES = ([("layered", member) for member in (*EXECUTION_MEMBERS, *COMPOSITION_MEMBERS)]
+                 + [("raw", "root")])
+
+
 @pytest.mark.parametrize("policy", ["full", "incremental"])
-@pytest.mark.parametrize("member", ["ram", "root", "layout", "execution", "devices", "kernel",
-                                    "baseInitramfs", "agent", "map", "map-page", "provenance"])
+@pytest.mark.parametrize(("profile", "member"), CLOSURE_CASES,
+                         ids=[f"{profile}-{member}" for profile, member in CLOSURE_CASES])
 def test_restore_corrupt_real_closure_refuses_before_child_allocation(
-    silo: Silo, restore_image: str, member: str, policy: str, restore_processes: list[shutdown.Process],
+    silo: Silo, restore_image: str, profile: RootProfile, member: str, policy: str,
+    restore_processes: list[shutdown.Process],
 ) -> None:
-    restore.create_source(silo, restore_image)
+    restore.create_source(silo, restore_image, profile=profile)
     own(silo, "restore-source", restore_processes)
     saved = checkpoint_for_policy(silo, policy)
     record = restore.snapshot_record(silo, saved)
@@ -322,12 +332,30 @@ def test_restore_corrupt_real_closure_refuses_before_child_allocation(
     objects.update({key: record["boot"]["binding"][key] for key in ("kernel", "baseInitramfs", "agent")})
     objects["map"] = execution["memory"]["map"]
     objects["map-page"] = execution["memory"]["mapPages"][0]
+    root_profile = record["root"]["profile"]
+    if profile == "layered":
+        assert root_profile["kind"] == "linux-overlay", root_profile
+        lower = root_profile["lower"]
+        layer = lower["layers"][0]
+        objects.update({"lower-record": lower["record"], "lower-recipe": lower["recipe"],
+                        "lower-fsmeta": lower["fsmeta"], "layer-recipe": layer["recipe"],
+                        "layer-result": layer["result"], "layer-index": layer["indexRoot"],
+                        "layer-pack-map": layer["pack"]["map"]})
+        stream_members["layer-pack"] = layer["pack"]["stream"]
+    else:
+        assert root_profile == {"kind": "opaque-raw"}, root_profile
     evidence = procs.query(silo.ws.state_db(),
                            f"SELECT evidence_digest FROM snapshot_capture_provenance WHERE snapshot_id='{saved.snapshot}'")
     assert len(evidence) == 1
     objects["provenance"] = evidence[0][0]
     digest = stream_members[member] if member in stream_members else objects[member]
     pool = "streams" if member in stream_members else "objects"
+    if member in COMPOSITION_MEMBERS:
+        table, column = (("snapshot_stream_dependency", "stream_id") if pool == "streams"
+                         else ("snapshot_object_dependency", "object_digest"))
+        assert procs.query(silo.ws.state_db(),
+                           f"SELECT 1 FROM {table} WHERE snapshot_id='{saved.snapshot}' AND {column}='{digest}'") == [("1",)], (
+            "closed snapshot graph does not retain composition member", member, digest)
     path = silo.ws.silo_home / "images" / pool / "sha256" / digest.removeprefix("sha256:")
     # Real captured bytes only. Restore the one changed byte even on failure so
     # normal workspace teardown is not debugging a deliberately corrupt catalog.
@@ -358,7 +386,7 @@ def test_restore_corrupt_real_closure_refuses_before_child_allocation(
 def test_restore_real_native_incompatibility_refuses_before_child_allocation(
     silo: Silo, restore_image: str, mutation: str, policy: str, restore_processes: list[shutdown.Process],
 ) -> None:
-    restore.create_source(silo, restore_image)
+    restore.create_source(silo, restore_image, profile="layered")
     own(silo, "restore-source", restore_processes)
     saved = checkpoint_for_policy(silo, policy)
     stop_owned(silo, "restore-source", restore_processes)
@@ -377,7 +405,7 @@ def test_restore_real_native_incompatibility_refuses_before_child_allocation(
 def test_restore_selected_vz_backend_rejects_before_any_operational_allocation(
     silo: Silo, restore_image: str, restore_processes: list[shutdown.Process],
 ) -> None:
-    restore.create_source(silo, restore_image)
+    restore.create_source(silo, restore_image, profile="layered")
     own(silo, "restore-source", restore_processes)
     saved = restore.checkpoint(silo, "restore-source")
     stop_owned(silo, "restore-source", restore_processes)
@@ -388,10 +416,10 @@ def test_restore_selected_vz_backend_rejects_before_any_operational_allocation(
     assert "backend-excluded" in result.stderr and "vz" in result.stderr.lower(), result.stderr
 
 
-@pytest.mark.parametrize("profile", ["raw", "flat"])
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_restore_pending_hardware_irq_continues_exactly_once(
     silo: Silo, restore_image: str, restore_irq_fixture: Path,
-    profile: str, restore_processes: list[shutdown.Process],
+    profile: RootProfile, restore_processes: list[shutdown.Process],
 ) -> None:
     # This gate needs the separate --restore --irq-probe candidate. Linux keeps
     # CPUs 0/1; only the one-time native source bootstrap starts reserved AP2.

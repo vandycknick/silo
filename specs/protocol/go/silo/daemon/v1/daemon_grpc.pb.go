@@ -297,6 +297,7 @@ const (
 	MachineService_ForkStopped_FullMethodName         = "/silo.daemon.v1.MachineService/ForkStopped"
 	MachineService_SnapshotStopped_FullMethodName     = "/silo.daemon.v1.MachineService/SnapshotStopped"
 	MachineService_UpdateBootAssets_FullMethodName    = "/silo.daemon.v1.MachineService/UpdateBootAssets"
+	MachineService_ExportRawDisk_FullMethodName       = "/silo.daemon.v1.MachineService/ExportRawDisk"
 )
 
 // MachineServiceClient is the client API for MachineService service.
@@ -327,6 +328,8 @@ type MachineServiceClient interface {
 	SnapshotStopped(ctx context.Context, in *CreateStorageSnapshotRequest, opts ...grpc.CallOption) (*StorageSnapshotInfo, error)
 	// Explicit stopped boot-bundle replacement; the root and its platform never change.
 	UpdateBootAssets(ctx context.Context, in *UpdateBootAssetsRequest, opts ...grpc.CallOption) (*MachineSnapshot, error)
+	// Root disk only; never stops, repairs, flattens, or overwrites implicitly.
+	ExportRawDisk(ctx context.Context, in *ExportRawDiskRequest, opts ...grpc.CallOption) (*RawDiskExport, error)
 }
 
 type machineServiceClient struct {
@@ -594,6 +597,16 @@ func (c *machineServiceClient) UpdateBootAssets(ctx context.Context, in *UpdateB
 	return out, nil
 }
 
+func (c *machineServiceClient) ExportRawDisk(ctx context.Context, in *ExportRawDiskRequest, opts ...grpc.CallOption) (*RawDiskExport, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RawDiskExport)
+	err := c.cc.Invoke(ctx, MachineService_ExportRawDisk_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MachineServiceServer is the server API for MachineService service.
 // All implementations must embed UnimplementedMachineServiceServer
 // for forward compatibility.
@@ -622,6 +635,8 @@ type MachineServiceServer interface {
 	SnapshotStopped(context.Context, *CreateStorageSnapshotRequest) (*StorageSnapshotInfo, error)
 	// Explicit stopped boot-bundle replacement; the root and its platform never change.
 	UpdateBootAssets(context.Context, *UpdateBootAssetsRequest) (*MachineSnapshot, error)
+	// Root disk only; never stops, repairs, flattens, or overwrites implicitly.
+	ExportRawDisk(context.Context, *ExportRawDiskRequest) (*RawDiskExport, error)
 	mustEmbedUnimplementedMachineServiceServer()
 }
 
@@ -700,6 +715,9 @@ func (UnimplementedMachineServiceServer) SnapshotStopped(context.Context, *Creat
 }
 func (UnimplementedMachineServiceServer) UpdateBootAssets(context.Context, *UpdateBootAssetsRequest) (*MachineSnapshot, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateBootAssets not implemented")
+}
+func (UnimplementedMachineServiceServer) ExportRawDisk(context.Context, *ExportRawDiskRequest) (*RawDiskExport, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExportRawDisk not implemented")
 }
 func (UnimplementedMachineServiceServer) mustEmbedUnimplementedMachineServiceServer() {}
 func (UnimplementedMachineServiceServer) testEmbeddedByValue()                        {}
@@ -1115,6 +1133,24 @@ func _MachineService_UpdateBootAssets_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MachineService_ExportRawDisk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExportRawDiskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MachineServiceServer).ExportRawDisk(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MachineService_ExportRawDisk_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MachineServiceServer).ExportRawDisk(ctx, req.(*ExportRawDiskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MachineService_ServiceDesc is the grpc.ServiceDesc for MachineService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1201,6 +1237,10 @@ var MachineService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateBootAssets",
 			Handler:    _MachineService_UpdateBootAssets_Handler,
+		},
+		{
+			MethodName: "ExportRawDisk",
+			Handler:    _MachineService_ExportRawDisk_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -44,13 +44,15 @@ from typing import Iterator
 
 import pytest
 
-from . import images, restore, shutdown
+from . import images, restore, shutdown, stopped
 from .cli import Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
 
 PROBE = "/usr/local/bin/restore-network"
 STATE = "/var/lib/restore-network"
+# The upper ext4 keeps the guest-visible tree below this directory.
+UPPER = "/upper"
 LISTEN_PORT = 7301
 # netd's fixed gateway MAC (net/netd/internal/config stackConfig): every frame
 # with any other Ethernet source in a netd capture was emitted by the guest.
@@ -596,12 +598,17 @@ class HostPeers:
 # -- networked source ---------------------------------------------------------------
 
 def create_source(silo: Silo, image: str, name: str, *flags: str) -> dict:
-    """One vCPU, so a single held vCPU thread withholds every guest instruction."""
+    """One vCPU, so a single held vCPU thread withholds every guest instruction.
+
+    The ordinary OCI create gives the default layered root; its writable
+    upper holds the guest's durable witness under `UPPER`.
+    """
     silo.create(name, image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib",
                 "--vsock", "--network", "private", *flags)
     silo.start(name)
     info = silo.wait_ready(name)
     restore.require_restore_candidate(info)
+    assert stopped.record(silo, name)["root"]["kind"] == "linux-overlay"
     return info
 
 
@@ -701,7 +708,7 @@ class Source:
 
     def sealed_progress(self) -> dict:
         disks = list((self.saved.staging / "disks").glob("*.raw"))
-        assert len(disks) == 1, "raw networked source seals exactly one writable disk"
+        assert len(disks) == 1, "layered networked source seals exactly one writable upper"
         return disk_progress(disks[0])
 
     def unchanged(self, silo: Silo) -> None:
@@ -756,8 +763,8 @@ def progress(silo: Silo, name: str) -> dict:
     return json.loads(silo.exec(name, PROBE, "status", STATE, user="root").stdout)
 
 
-def disk_progress(disk: Path, *, path: str = f"{STATE}/progress") -> dict:
-    """Read the durable witness from a stopped raw root without mounting it."""
+def disk_progress(disk: Path, *, path: str = f"{UPPER}{STATE}/progress") -> dict:
+    """Read the durable witness from a stopped layered upper without mounting it."""
     result = subprocess.run(["debugfs", "-R", f"cat {path}", str(disk)],
                             capture_output=True, check=True, timeout=30)
     assert len(result.stdout) == 512, f"durable progress record missing: {result.stderr!r}"

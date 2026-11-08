@@ -103,11 +103,10 @@ impl Machine {
                 .register_launch_storage(&config, run_uuid, &storage)
                 .await?;
             runtime.request_machine_start(&config, &run_id).await?;
-            let prepared_root = match runtime.prepare_machine_root(
-                &config,
-                storage_lease.storage_record(),
-                qualification,
-            ) {
+            let prepared_root = match runtime
+                .prepare_machine_root(&config, storage_lease.storage_record(), qualification)
+                .await
+            {
                 Ok(root) => root,
                 Err(error) => {
                     return Err(finish_failed_start(

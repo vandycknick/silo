@@ -143,7 +143,7 @@ pub fn validate_root_storage_metrics(value: &v1::RootStorageMetrics) -> Result<(
     let required = |field: &str, value: Option<u64>| {
         value.ok_or_else(|| format!("metrics.root_storage.{field} is required"))
     };
-    if value.kind != Some(v1::RootStorageKind::LinuxFlatOverlayV1 as i32)
+    if value.kind != Some(v1::RootStorageKind::LinuxErofsOverlayV1 as i32)
         || value.upper_profile.as_deref()
             != Some(rootfs_spec::UpperProfile::SiloUpperExt4V1.as_str())
     {
@@ -467,7 +467,7 @@ mod tests {
     }
     fn root_metrics() -> v1::RootStorageMetrics {
         v1::RootStorageMetrics {
-            kind: Some(v1::RootStorageKind::LinuxFlatOverlayV1 as i32),
+            kind: Some(v1::RootStorageKind::LinuxErofsOverlayV1 as i32),
             upper_profile: Some("silo-upper-ext4-v1".into()),
             upper_uuid: Some("12345678-1234-4234-8234-123456789abc".into()),
             upper_backing_bytes: Some(134_221_824),

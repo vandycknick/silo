@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from silo_smoke import cloud_disk, images, overlay, procs, shutdown, stopped
-from silo_smoke.cli import TIMINGS_PROPERTY, Silo, release
+from silo_smoke.cli import ROOT_PROFILES, TIMINGS_PROPERTY, RootProfile, Silo, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.daemon import Daemon
 from silo_smoke.distribution_registry import (
@@ -189,11 +189,12 @@ def _gc_source(registry: DistributionRegistry, source_digest: str, graphs: tuple
         assert _graph(registry, "portable/vm", graph.index) == graph
 
 
-def _inspect_and_refuse(consumer: Silo, registry: DistributionRegistry, graph: Graph, *, checkpoint: bool) -> None:
+def _inspect_and_refuse(consumer: Silo, registry: DistributionRegistry, graph: Graph, *, checkpoint: bool,
+                        root_family: str = "opaque-raw") -> None:
     reference = registry.reference("portable/vm", "zstd")
     before = (stopped.catalog(consumer), stopped.inventory(consumer.ws.silo_home), stopped.inventory(consumer.ws.run_root))
     inspected = _json(consumer, "image", "inspect-remote", reference)
-    assert inspected["indexDigest"] == graph.index and inspected["rootFamily"] == "opaque-raw"
+    assert inspected["indexDigest"] == graph.index and inspected["rootFamily"] == root_family
     assert inspected["purpose"] == ("checkpoint" if checkpoint else "image")
     assert inspected["captureKind"] == ("stopped-storage" if checkpoint else None)
     assert inspected["liveRestore"] is False
@@ -279,18 +280,18 @@ def test_converted_artifact_survives_source_oci_deletion_and_registry_gc(stopped
     _, image = convert_image
     reference = _publish_oci(registry, image)
     _start_daemon(source, daemon_mode)
-    converted = _json(source, "image", "convert", reference, "--name", "converted-source")
+    converted = _json(source, "image", "convert", reference, "--disk-format", "raw", "--name", "converted-source")
     assert converted["record"]["process"] == CONVERTED_PROCESS
     stream = converted["record"]["root"]["stream"]["stream"]
-    flat = source.ws.silo_home / "images/streams/sha256" / stream.removeprefix("sha256:")
-    expected_sha, expected_length = overlay.digest(flat), flat.stat().st_size
+    converted_root = source.ws.silo_home / "images/streams/sha256" / stream.removeprefix("sha256:")
+    expected_sha, expected_length = overlay.digest(converted_root), converted_root.stat().st_size
     graphs = _push_encodings(source, registry, "image:converted-source", checkpoint=False)
     _gc_source(registry, image.manifest_digest, graphs, source)
     source.run("image", "remove", "image:converted-source")
     source.run("image", "release", "image:" + converted["id"])
     shutdown.storage_tool(source, "remove-image", reference)
     shutdown.storage_tool(source, "prune")
-    assert not flat.exists(), "the producer's decoded OCI cache must not rescue the consumer"
+    assert not converted_root.exists(), "the producer's decoded OCI cache must not rescue the consumer"
     _start_daemon(consumer, daemon_mode)
     immutable = _pull_both(consumer, registry, graphs, converted, checkpoint=False)
     registry.stop()
@@ -307,13 +308,15 @@ def test_converted_artifact_survives_source_oci_deletion_and_registry_gc(stopped
     stopped.stop(consumer, "converted-child")
 
 
+@pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("daemon_mode", [False, pytest.param(True, marks=pytest.mark.daemon)], ids=["local", "daemon"])
 def test_stopped_checkpoint_exact_closure_boot_and_config_after_registry_gc(stopped_silo: Silo, artifact_destination: Silo,
                                                                          artifact_registry: DistributionRegistry,
-                                                                         overlay_image_bytes: images.OciImage, daemon_mode: bool) -> None:
+                                                                         overlay_image_bytes: images.OciImage, daemon_mode: bool,
+                                                                         profile: RootProfile) -> None:
     source, consumer, registry = stopped_silo, artifact_destination, artifact_registry
     reference = _publish_oci(registry, overlay_image_bytes)
-    source.create("checkpoint-source", reference, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
+    source.create("checkpoint-source", source.root_image(reference, profile), "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
     stopped.install_managed_fixture(source, "checkpoint-source", custom_boot=True)
     _start_daemon(source, daemon_mode)
     source.start("checkpoint-source")
@@ -328,6 +331,16 @@ def test_stopped_checkpoint_exact_closure_boot_and_config_after_registry_gc(stop
     assert len(rows) == 1
     record_bytes = rows[0][0]
     record = json.loads(record_bytes)
+    root_profile = record["root"]["profile"]
+    producer_lower: list[Path] = []
+    if profile == "layered":
+        assert root_profile["kind"] == "linux-overlay" and root_profile["lower"]["layers"], root_profile
+        producer_lower = [source.ws.silo_home / "images/objects/sha256" / root_profile["lower"]["fsmeta"].removeprefix("sha256:")]
+        producer_lower += [source.ws.silo_home / "images/streams/sha256" / layer["pack"]["stream"].removeprefix("sha256:")
+                           for layer in root_profile["lower"]["layers"]]
+        assert all(path.is_file() for path in producer_lower), producer_lower
+    else:
+        assert root_profile == {"kind": "opaque-raw"}, root_profile
     destination = registry.reference("portable/refused", "checkpoint")
     registry_before = registry.stored_blob_digests()
     refusal = source.run("image", "push", "image:checkpoint-source", destination, expect=None)
@@ -338,12 +351,17 @@ def test_stopped_checkpoint_exact_closure_boot_and_config_after_registry_gc(stop
     _gc_source(registry, overlay_image_bytes.manifest_digest, graphs, source)
     source.run("image", "remove", "image:checkpoint-source")
     source.run("snapshot", "remove", "image:" + snapshot["id"])
-    shutdown.storage_tool(source, "remove-image", reference)
+    # Remove every producer OCI selection, including the seeded one with the
+    # same manifest, so no local composition can rescue the consumer.
+    for (selected,) in procs.query(source.ws.state_db(), "SELECT requested_reference FROM image_ref"):
+        shutdown.storage_tool(source, "remove-image", selected)
     shutdown.storage_tool(source, "prune")
-    source_flat = source.ws.silo_home / "images/streams/sha256" / record["root"]["stream"]["stream"].removeprefix("sha256:")
-    assert not source_flat.exists(), "the producer's snapshot cache must be unavailable before acquisition"
+    source_root = source.ws.silo_home / "images/streams/sha256" / record["root"]["stream"]["stream"].removeprefix("sha256:")
+    assert not source_root.exists(), "the producer's snapshot cache must be unavailable before acquisition"
+    assert not any(path.exists() for path in producer_lower), "the producer's composition must be unavailable before acquisition"
     _start_daemon(consumer, daemon_mode)
-    _inspect_and_refuse(consumer, registry, graphs[0], checkpoint=True)
+    _inspect_and_refuse(consumer, registry, graphs[0], checkpoint=True,
+                        root_family="opaque-raw" if profile == "raw" else "linux-overlay")
     immutable = _pull_both(consumer, registry, graphs, snapshot, checkpoint=True)
     actual_rows = procs.query(consumer.ws.state_db(), f"SELECT CAST(record_bytes AS TEXT) FROM storage_snapshot WHERE id='{snapshot['id']}'")
     assert actual_rows == [(record_bytes,)], "canonical snapshot configuration/storage record changed in transport"
@@ -360,6 +378,8 @@ def test_stopped_checkpoint_exact_closure_boot_and_config_after_registry_gc(stop
     stopped.independent(before, *copies)
     for name in ("restored-child", "created-child"):
         assert stopped.record(consumer, name)["boot"] == expected_boot
+        if profile == "layered":
+            assert stopped.record(consumer, name)["root"]["lower"]["record"] == root_profile["lower"]["result"]
         assert stopped.configured_semantics(stopped.configuration(consumer, name)) == expected_config
     consumer.run("snapshot", "remove", immutable)
     shutdown.storage_tool(consumer, "prune")

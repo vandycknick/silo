@@ -239,7 +239,9 @@ async fn executable_digest(path: &Path) -> Result<String, LibVmError> {
         .await
         .map_err(|error| discovery(error.to_string()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 16384];
+    // The buffer crosses read awaits. Keep it out of the capability-query
+    // future embedded in machine inspection and lifecycle operations.
+    let mut buffer = vec![0u8; 16384];
     loop {
         let count = file
             .read(&mut buffer)
@@ -425,7 +427,9 @@ fn protocol(message: impl Into<String>) -> LibVmError {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::capabilities::{bounded_read, collect_child, ResolvedBackendSelection};
+    use crate::runtime::capabilities::{
+        bounded_read, collect_child, digest, executable_digest, ResolvedBackendSelection,
+    };
     use crate::runtime::VirtBackendOverride;
     use std::future::Future;
     use vm_spec::live::LiveBackend;
@@ -463,6 +467,21 @@ mod tests {
                 .scenario_digest
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn executable_digest_hashes_empty_files_and_partial_final_buffers() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("monitor");
+        for contents in [Vec::new(), vec![0x5a; 2 * 16384 + 19]] {
+            std::fs::write(&executable, &contents).unwrap();
+            assert_eq!(
+                executable_digest(&executable).await.unwrap(),
+                digest(&contents)
+            );
+        }
+        std::fs::remove_file(&executable).unwrap();
+        assert!(executable_digest(&executable).await.is_err());
     }
 
     #[tokio::test]

@@ -1173,20 +1173,18 @@ impl crate::store::Store {
             }
             let roles = record.plan.configuration.attachments.len() as u64;
             let (transfer_roles, native_records) = match &record.storage.root {
-                crate::MachineRoot::LinuxOverlay {
-                    lower:
-                        crate::OverlayLower::FlatExt4 {
-                            stream, geometry, ..
-                        },
-                    ..
-                } => {
-                    let occurrences = [crate::storage::vmdk::LowerOccurrence::resolved(
-                        *stream,
-                        self.images_dir.join("streams/sha256").join(stream.hex()),
-                        geometry.length,
-                    )];
-                    let lower = crate::storage::vmdk::FlatLowerPlan::new(&occurrences)?;
-                    (6, lower.preflight(roles)?.record_count())
+                crate::MachineRoot::LinuxOverlay { lower, .. } => {
+                    let launch = crate::store::layer_store::LayerStore::from_store(self.clone())
+                        .launch_lower(lower)
+                        .await?;
+                    let plan = crate::storage::vmdk::FlatLowerPlan::new(&launch.occurrences)?
+                        .preflight(roles)?;
+                    // State roles, the generated descriptor and each unique
+                    // nonempty backing (fsmeta object and pack streams).
+                    (
+                        5 + plan.unique_occurrences().count() as u64,
+                        plan.record_count(),
+                    )
                 }
                 _ => (4, 0),
             };
@@ -1351,6 +1349,7 @@ impl crate::store::Store {
             sqlx::query("INSERT INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO storage_operation_object(operation_id,object_digest) SELECT ?1,object_digest FROM storage_operation_object WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO storage_operation_layer(operation_id,result_id) SELECT ?1,result_id FROM storage_operation_layer WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO storage_operation_lower(operation_id,lower_id) SELECT ?1,lower_id FROM storage_operation_lower WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO storage_operation_cut(operation_id,cut_id) SELECT ?1,cut_id FROM storage_operation_cut WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
             let granule = u64::from(memory.page_granule);
             if !(4096..=65536).contains(&granule)

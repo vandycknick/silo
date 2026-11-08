@@ -143,7 +143,6 @@ impl<'a> NamespaceComposer<'a> {
             },
             next_inode: 0,
             limits,
-            reclaimed: Vec::new(),
         };
         inner.create(
             Vec::new(),
@@ -167,14 +166,9 @@ impl<'a> NamespaceComposer<'a> {
         validate_layer(layer, self.inner.limits)?;
         let occurrence =
             u32::try_from(self.next_layer).map_err(|_| invalid("layer ordinal overflow"))?;
-        self.inner.reclaimed.clear();
         self.inner.apply_layer(layer, occurrence)?;
         self.next_layer = count;
         Ok(self)
-    }
-
-    pub(crate) fn reclaimed_bodies(&self) -> &[BodyOrigin] {
-        &self.inner.reclaimed
     }
 
     pub(crate) fn finish(self) -> ValidatedNamespace {
@@ -213,7 +207,6 @@ struct Composer<'a> {
     tree: ValidatedNamespace,
     next_inode: u64,
     limits: &'a ChangesetLimits,
-    reclaimed: Vec<BodyOrigin>,
 }
 
 #[derive(Clone, Copy)]
@@ -491,10 +484,6 @@ impl Composer<'_> {
             .checked_sub(1)
             .ok_or_else(|| invalid("inode name count underflow"))?;
         if inode.link_count == 0 {
-            if let NamespaceKind::Regular { body } = &inode.kind {
-                crate::changeset::limits::reserve_vec(&mut self.reclaimed, 1)?;
-                self.reclaimed.push(*body);
-            }
             self.tree.inodes.remove(&name.inode);
         }
         Ok(())
@@ -684,80 +673,6 @@ mod tests {
         ChangeEntry, ChangesetError, ChangesetLimits, ContentDigest, EntryKind, LayerChangeset,
         Metadata, MetadataPresence, PayloadRef, Xattr,
     };
-
-    #[test]
-    fn incremental_composition_reclaims_only_the_last_alias_and_matches_batch() {
-        let limits = ChangesetLimits::default();
-        let lower = layer(vec![file(b"target", 3), link(b"alias", b"target")]);
-        let replace = layer(vec![file(b"target", 5)]);
-        let delete_alias = layer(vec![whiteout(b".wh.alias")]);
-        let delete_target = layer(vec![whiteout(b".wh.target")]);
-        let composer = NamespaceComposer::new(&limits)
-            .unwrap()
-            .apply(&lower)
-            .unwrap();
-        assert!(composer.reclaimed_bodies().is_empty());
-        let composer = composer.apply(&replace).unwrap();
-        assert!(
-            composer.reclaimed_bodies().is_empty(),
-            "the old body still has an alias"
-        );
-        assert_eq!(
-            composer.inner.tree,
-            compose(&[&lower, &replace], &limits).unwrap()
-        );
-        let composer = composer.apply(&delete_alias).unwrap();
-        assert_eq!(
-            composer.reclaimed_bodies(),
-            &[BodyOrigin {
-                entry: EntryOrigin {
-                    layer: 0,
-                    ordinal: 0
-                },
-                pack_offset: 0,
-                length: 3,
-            }]
-        );
-        let composer = composer.apply(&delete_target).unwrap();
-        assert_eq!(
-            composer.reclaimed_bodies(),
-            &[BodyOrigin {
-                entry: EntryOrigin {
-                    layer: 1,
-                    ordinal: 0
-                },
-                pack_offset: 0,
-                length: 5,
-            }],
-            "each application reports only that layer's newly dead bodies"
-        );
-        assert_eq!(
-            composer.finish(),
-            compose(&[&lower, &replace, &delete_alias, &delete_target], &limits).unwrap()
-        );
-    }
-
-    #[test]
-    fn incremental_composition_reports_replaced_bodies_from_the_current_occurrence() {
-        let limits = ChangesetLimits::default();
-        let source = layer(vec![file(b"d/child", 3), file(b"d", 5)]);
-        let composer = NamespaceComposer::new(&limits)
-            .unwrap()
-            .apply(&source)
-            .unwrap();
-        assert_eq!(
-            composer.reclaimed_bodies(),
-            &[BodyOrigin {
-                entry: EntryOrigin {
-                    layer: 0,
-                    ordinal: 0
-                },
-                pack_offset: 0,
-                length: 3,
-            }]
-        );
-        assert_eq!(composer.finish(), compose(&[&source], &limits).unwrap());
-    }
 
     #[test]
     fn incremental_composition_enforces_the_existing_layer_occurrence_bound() {

@@ -6,6 +6,7 @@ pub mod erofs;
 mod error;
 mod flat_ext4;
 mod lock;
+pub mod overlay_flatten;
 mod platform;
 mod policy;
 mod progress;
@@ -19,6 +20,5 @@ pub use crate::policy::{RegistryAction, RegistryPolicy, RegistryRule};
 pub use crate::progress::{ProgressEvent, ProgressReporter};
 pub use crate::registry::{ImageConfig, ResolvedImage};
 pub use crate::store::{
-    Materialization, MaterializeOptions, OciMaterializer, RootfsLayerMetadata, RootfsMetadata,
-    StagedRootfs, StagingOperation,
+    MaterializeOptions, OciMaterializer, RootfsLayerMetadata, RootfsMetadata, StagingOperation,
 };

@@ -17,7 +17,7 @@ fn test_empty_filesystem() {
     let (fmt, tmp) = new_formatter();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock();
 
     assert_eq!(sb.magic, SUPERBLOCK_MAGIC);
@@ -51,7 +51,7 @@ fn test_create_and_read_file() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Verify the file exists.
     assert!(reader.exists("/greeting.txt"));
@@ -104,7 +104,7 @@ fn test_nested_directories() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     assert!(reader.exists("/a"));
     assert!(reader.exists("/a/b"));
@@ -193,7 +193,7 @@ fn test_symlinks() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Short symlink should resolve to the target content.
     let data = reader.read_file("/short_link", 0, None).unwrap();
@@ -238,7 +238,7 @@ fn test_unicode_paths_and_symlinks() {
     .unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     assert_eq!(
         reader
             .read_file("/data/\u{65e5}\u{672c}\u{8a9e}.txt", 0, None)
@@ -302,7 +302,7 @@ fn test_remove_operations() {
     fmt.remove("/remove-me").unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     assert!(reader.exists("/directory"));
     assert!(reader.list_dir("/directory").unwrap().is_empty());
     assert!(!reader.exists("/remove-me"));
@@ -363,7 +363,7 @@ fn test_list_directory() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
     let entries = reader.list_dir("/dir").unwrap();
 
     // Should contain exactly our 3 files, sorted.
@@ -395,7 +395,7 @@ fn test_hard_links_roundtrip() {
     fmt.link("/linked.txt", "/original.txt").unwrap();
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Both paths should return the same content.
     let data1 = reader.read_file("/original.txt", 0, None).unwrap();
@@ -428,7 +428,7 @@ fn test_empty_file() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // The file should exist.
     assert!(reader.exists("/empty.bin"));
@@ -467,7 +467,7 @@ fn test_zero_byte_read() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // read_file with count=Some(0) should return empty.
     let data = reader.read_file("/data.bin", 0, Some(0)).unwrap();
@@ -511,7 +511,7 @@ fn test_partial_read() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Read the first 5 bytes.
     let data = reader.read_file("/alpha.txt", 0, Some(5)).unwrap();
@@ -573,7 +573,7 @@ fn test_large_file_multi_block() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Read the full file and verify byte-by-byte.
     let data = reader.read_file("/big.bin", 0, None).unwrap();
@@ -625,7 +625,7 @@ fn test_read_nonexistent_path() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // exists() should return false for nonexistent paths.
     assert!(!reader.exists("/nonexistent"));
@@ -676,7 +676,7 @@ fn test_read_file_on_directory() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // read_file on a directory should return IsDirectory.
     let err = reader.read_file("/mydir", 0, None).unwrap_err();
@@ -709,7 +709,7 @@ fn test_list_dir_on_file() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // list_dir on a regular file should return NotADirectory.
     let err = reader.list_dir("/file.txt").unwrap_err();
@@ -790,7 +790,7 @@ fn test_symlink_loop_detection() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Following the symlink cycle should produce SymlinkLoop.
     let err = reader.read_file("/link_a", 0, None).unwrap_err();
@@ -871,7 +871,7 @@ fn test_symlink_chain() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Reading through the chain should resolve to the real file.
     let data = reader.read_file("/a", 0, None).unwrap();
@@ -944,7 +944,7 @@ fn test_relative_symlinks() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Direct read.
     let data = reader.read_file("/dir/file.txt", 0, None).unwrap();
@@ -1004,7 +1004,7 @@ fn test_xattr_end_to_end() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // The file itself must be readable.
     let data = reader.read_file("/xattr_file.txt", 0, None).unwrap();
@@ -1069,7 +1069,7 @@ fn test_multi_block_group() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Copy superblock values before any mutable borrows.
     let blocks_count = reader.superblock().blocks_count_lo;
@@ -1137,7 +1137,7 @@ fn test_large_directory() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // list_dir must return all 500 entries.
     let entries = reader.list_dir("/bigdir").unwrap();
@@ -1181,7 +1181,7 @@ fn test_read_file_into() {
 
     fmt.close().unwrap();
 
-    let mut reader = Reader::new(tmp.path()).unwrap();
+    let reader = Reader::new(tmp.path()).unwrap();
 
     // Exact-size buffer: should read all bytes.
     {

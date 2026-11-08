@@ -45,7 +45,7 @@ pub enum LibVmError {
     /// A raw root's selected kernel bytes do not establish its direct profile.
     #[error(transparent)]
     DirectKernelRejected(#[from] Box<crate::boot_qualification::DirectKernelRejected>),
-    #[error("backend {backend:?} does not support development flat overlay roots")]
+    #[error("backend {backend:?} does not support layered EROFS overlay roots")]
     OverlayBackendUnsupported { backend: vm_spec::live::LiveBackend },
     #[error("boot admission rejected {source_family:?}/{root_profile:?} on {effective_backend:?}: requires {requirement:?}; remedy: {remedy:?}")]
     BackendAdmissionRejected {
@@ -70,8 +70,23 @@ pub enum LibVmError {
     RootSelectionFailed(Box<crate::image::import_types::RootSelectionFailed>),
     #[error(transparent)]
     DiskImport(#[from] Box<crate::image::import::DiskImportError>),
-    #[error("development flat overlay roots cannot be published or snapshotted")]
-    FlatOverlayPublicationUnsupported,
+    /// A persisted or received root uses a retired or unknown root format.
+    /// Silo never migrates or reinterprets it; recreate it in fresh state.
+    #[error("root profile {profile:?} is retired or unknown; recreate this machine or artifact in a fresh state root")]
+    IncompatibleRootProfile { profile: String },
+    /// A retained layered lower is incomplete locally; explicit image
+    /// acquisition or transfer must restore its exact closure first.
+    #[error("layered lower {lower} requires acquisition of its retained closure: {missing}")]
+    CompositionAcquisitionRequired {
+        lower: crate::storage::identity::LowerResultId,
+        missing: String,
+    },
+    /// Raw export refuses a source whose on-disk filesystem state needs
+    /// recovery; Silo never replays a journal or repairs the source.
+    #[error("raw disk export requires a cleanly stopped source: {reason}")]
+    RawExportRecoveryRequired { reason: String },
+    #[error("raw disk export unsupported: {reason}")]
+    RawExportUnsupported { reason: String },
     /// Names the failing artifact boundary (config, table, transfer map,
     /// chunk, object, record, provenance) and the stable identity involved.
     #[error("VM artifact {boundary} rejected: {message}")]
@@ -80,7 +95,7 @@ pub enum LibVmError {
         message: String,
     },
     #[error(transparent)]
-    ArtifactWire(#[from] oci::vm_artifact::Error),
+    ArtifactWire(oci::vm_artifact::Error),
     #[error("approved VM artifact index {expected} differs from resolved index {actual}")]
     ArtifactTrustMismatch { expected: String, actual: String },
     #[error("signature-required VM artifact policy has no configured signature verifier; digest approval cannot substitute for publisher authentication")]
@@ -369,7 +384,10 @@ impl LibVmError {
             Self::BootBundleAbiUnsupported { .. } => "BootBundleAbiUnsupported",
             Self::RootSelectionFailed(_) => "RootSelectionFailed",
             Self::DiskImport(_) => "DiskImport",
-            Self::FlatOverlayPublicationUnsupported => "FlatOverlayPublicationUnsupported",
+            Self::IncompatibleRootProfile { .. } => "IncompatibleRootProfile",
+            Self::CompositionAcquisitionRequired { .. } => "CompositionAcquisitionRequired",
+            Self::RawExportRecoveryRequired { .. } => "RawExportRecoveryRequired",
+            Self::RawExportUnsupported { .. } => "RawExportUnsupported",
             Self::ArtifactInvalid { .. } => "ArtifactInvalid",
             Self::ArtifactWire(_) => "ArtifactWire",
             Self::ArtifactTrustMismatch { .. } => "ArtifactTrustMismatch",
@@ -444,6 +462,20 @@ impl From<crate::machine::root_disk::RootDiskError> for LibVmError {
     fn from(source: crate::machine::root_disk::RootDiskError) -> Self {
         Self::RootDisk {
             message: source.to_string(),
+        }
+    }
+}
+
+/// A retired or unknown artifact storage profile is the same typed root
+/// compatibility refusal as a retired local root; every other wire failure
+/// stays an artifact error.
+impl From<oci::vm_artifact::Error> for LibVmError {
+    fn from(source: oci::vm_artifact::Error) -> Self {
+        match source {
+            oci::vm_artifact::Error::IncompatibleStorageProfile { profile } => {
+                Self::IncompatibleRootProfile { profile }
+            }
+            source => Self::ArtifactWire(source),
         }
     }
 }

@@ -23,6 +23,7 @@ pub mod set;
 pub mod shell;
 pub mod start;
 pub mod stop;
+pub mod storage;
 pub mod system;
 pub mod template;
 
@@ -56,6 +57,7 @@ pub enum Command {
     Restore(live::Restore),
     RecoverDisks(live::RecoverDisks),
     Image(live::Image),
+    Storage(storage::Cmd),
     Handoff(handoff::Cmd),
     Logs(logs::Cmd),
     Network(network::Cmd),
@@ -101,6 +103,7 @@ impl Command {
             Self::Restore(command) => command.run(context).await,
             Self::RecoverDisks(command) => command.run(context).await,
             Self::Image(command) => command.run(context).await,
+            Self::Storage(command) => command.run(context).await,
             Self::Handoff(command) => command.run(context).await,
             Self::Logs(command) => command.run(context).await,
             Self::Network(command) => command.run(context).await,

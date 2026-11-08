@@ -2,7 +2,7 @@
 
 Fixture (exact, never shrunk): the `restore-execution` image (BASIC Alpine plus
 the static `restore_execution.c` witness), 2 vCPUs, 4096 MiB configured RAM,
-`--network private`, flat-overlay root with a 2 GiB logical upper. Inside the
+`--network private`, default layered root with a 2 GiB logical upper. Inside the
 guest, exactly 1024 x 1 MiB of `/dev/urandom` bytes are written to
 `/fork-budget.payload` with `conv=fsync` before any timed operation, so the
 upper carries 1 GiB of guest-created, nonzero, non-sparse data. The host records

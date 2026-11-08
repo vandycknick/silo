@@ -469,7 +469,7 @@ impl Store {
                     }
                     Some(_) => return Err(invalid("unknown flat materialization state")),
                 }
-                let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1 UNION ALL SELECT 1 FROM image_rootfs_artifact WHERE stream_id=?1 UNION ALL SELECT 1 FROM layer_result WHERE pack_stream=?1)")
+                let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1 UNION ALL SELECT 1 FROM layer_result WHERE pack_stream=?1)")
                     .bind(&cursor).fetch_one(&mut *tx).await?;
                 if busy
                     || crate::store::cache_paths::machine_retains_stream(&mut tx, stream).await?
@@ -610,7 +610,10 @@ async fn exact_members(
     Ok(())
 }
 
-/// Authenticate metadata, not bulk bytes, before destructive collection.
+/// Authenticate structural metadata before destructive collection. Payload
+/// presence and geometry use metadata-only resolution: recovery precedes launch
+/// FD admission and must not open a lower that is also a raw transfer chunk.
+/// Registration and admitted consumers authenticate the exact payload bytes.
 pub(crate) async fn check_catalog(store: &Store) -> Result<(), LibVmError> {
     let pool = StoragePool::open(&store.images_dir)?;
     let incomplete:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_stream s WHERE NOT EXISTS(SELECT 1 FROM stream_representation r WHERE r.stream_id=s.stream_id))").fetch_one(&store.pool).await?;
@@ -651,7 +654,7 @@ pub(crate) async fn check_catalog(store: &Store) -> Result<(), LibVmError> {
             )
             .await?;
             for member in &members {
-                pool.open_object(member)?;
+                pool.lower_object_occurrence(member)?;
             }
             let profiles=sqlx::query_scalar::<_,String>("SELECT encoding FROM stream_representation_profile WHERE stream_id=?1 AND root_digest=?2")
                 .bind(content.stream.to_string()).bind(root.to_string()).fetch_all(&store.pool).await?;
@@ -669,18 +672,20 @@ pub(crate) async fn check_catalog(store: &Store) -> Result<(), LibVmError> {
     }
     let mut cursor = String::new();
     loop {
-        let rows=sqlx::query_as::<_,(String,String)>("SELECT object_digest,stream_id FROM object_stream_representation WHERE object_digest>?1 ORDER BY object_digest LIMIT 256")
+        let rows=sqlx::query_as::<_,(String,i64)>("SELECT b.object_digest,s.length FROM object_stream_representation b JOIN storage_stream s ON s.stream_id=b.stream_id WHERE b.object_digest>?1 ORDER BY b.object_digest LIMIT 256")
             .bind(&cursor).fetch_all(&store.pool).await?;
         if rows.is_empty() {
             break;
         }
-        for (object, stream) in rows {
+        for (object, length) in rows {
             cursor.clone_from(&object);
-            authenticate_object_binding(
-                &pool,
-                object.parse().map_err(invalid)?,
-                stream.parse().map_err(invalid)?,
-            )?;
+            let object = object.parse().map_err(invalid)?;
+            let expected = u64::try_from(length).map_err(invalid)?;
+            if pool.lower_object_occurrence(&object)?.length() != expected {
+                return Err(invalid(
+                    "whole-object stream representation contradicts byte length",
+                ));
+            }
         }
     }
     Ok(())
@@ -692,7 +697,7 @@ pub(crate) async fn stream_reachable(
     connection: &mut sqlx::SqliteConnection,
     stream: StreamId,
 ) -> Result<bool, LibVmError> {
-    let direct:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1 UNION ALL SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM image_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM image_rootfs_artifact WHERE stream_id=?1 UNION ALL SELECT 1 FROM layer_result WHERE pack_stream=?1)")
+    let direct:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=?1 UNION ALL SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM image_stream_dependency WHERE stream_id=?1 UNION ALL SELECT 1 FROM layer_result WHERE pack_stream=?1)")
         .bind(stream.to_string()).fetch_one(&mut *connection).await?;
     if direct {
         return Ok(true);
@@ -737,7 +742,7 @@ async fn object_base_reachable(
     if crate::store::cache_paths::machine_retains_object(connection, object).await? {
         return Ok(true);
     }
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM image_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_capture_provenance WHERE evidence_digest=?1 UNION ALL SELECT 1 FROM snapshot_imported_capture WHERE provenance_digest=?1 OR evidence_digest=?1 UNION ALL SELECT 1 FROM managed_artifact_acquisition a WHERE receipt_digest=?1 AND ((managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id)) OR (managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id))))")
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layer_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM composition_recipe WHERE record_digest=?1 UNION ALL SELECT 1 FROM composition_result WHERE record_digest=?1 OR fsmeta_digest=?1 UNION ALL SELECT 1 FROM storage_operation_object WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM image_object_dependency WHERE object_digest=?1 UNION ALL SELECT 1 FROM snapshot_capture_provenance WHERE evidence_digest=?1 UNION ALL SELECT 1 FROM snapshot_imported_capture WHERE provenance_digest=?1 OR evidence_digest=?1 UNION ALL SELECT 1 FROM managed_artifact_acquisition a WHERE receipt_digest=?1 AND ((managed_kind='image' AND EXISTS(SELECT 1 FROM storage_image WHERE id=a.managed_id)) OR (managed_kind='snapshot' AND EXISTS(SELECT 1 FROM storage_snapshot WHERE id=a.managed_id))))")
         .bind(object.to_string()).fetch_one(connection).await?)
 }
 
@@ -1050,6 +1055,122 @@ pub(crate) mod tests {
             .await
             .unwrap();
         (temp, store, record, info, owner, root)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_recovery_precedes_fd_admission_without_opening_raw_lower_backings() {
+        use crate::storage::limits::FileDescriptorBudgetError;
+        use crate::storage::vmdk::FlatLowerPlan;
+        use crate::storage::StorageError;
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        use nix::sys::resource::{getrlimit, setrlimit, Resource as HostResource};
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(mode) = std::env::var("SILO_RECOVERY_LOWER_FD_CHILD") else {
+            for mode in ["refuse", "raise"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "store::stream_representation::tests::startup_recovery_precedes_fd_admission_without_opening_raw_lower_backings",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("SILO_RECOVERY_LOWER_FD_CHILD", mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+
+        // A small fsmeta object's raw transfer chunk is the object itself.
+        // Retain that exact storage shape, including its whole-object binding.
+        let (temp, store, record, _info, owner, _) = retained(&[7; 512]).await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let object = ObjectDigest::of_bytes(&[7; 512]);
+        store
+            .register_object_stream_representation(owner.id, object, record.root.stream.stream)
+            .await
+            .unwrap();
+        drop(owner);
+        store.pool.close().await;
+        drop(store);
+
+        let watcher = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK).unwrap();
+        for path in [
+            pool.object_path(&object),
+            pool.stream_path(&record.root.stream.stream),
+        ] {
+            watcher
+                .add_watch(
+                    &path,
+                    AddWatchFlags::IN_OPEN | AddWatchFlags::IN_CLOSE_NOWRITE,
+                )
+                .unwrap();
+        }
+        drop(std::fs::File::open(pool.object_path(&object)).unwrap());
+        assert!(watcher
+            .read_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.mask.contains(AddWatchFlags::IN_OPEN)));
+        assert_eq!(
+            watcher.read_events().unwrap_err(),
+            nix::errno::Errno::EAGAIN
+        );
+
+        let (_, original_hard) = getrlimit(HostResource::RLIMIT_NOFILE).unwrap();
+        assert!(original_hard >= 512);
+        let hard = if mode == "refuse" { 256 } else { 512 };
+        setrlimit(HostResource::RLIMIT_NOFILE, 256, hard).unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let _reopened = Store::open(&paths.state_db_path()).await.unwrap();
+        assert_eq!(
+            watcher.read_events().unwrap_err(),
+            nix::errno::Errno::EAGAIN,
+            "startup recovery must not open raw chunks or whole-object backings"
+        );
+        let occurrences = [
+            pool.lower_object_occurrence(&object).unwrap(),
+            pool.lower_occurrence(&record.root.stream.stream).unwrap(),
+        ];
+        let result = FlatLowerPlan::new(&occurrences).unwrap().preflight(0);
+        if mode == "refuse" {
+            assert!(matches!(
+                result,
+                Err(StorageError::FileDescriptorBudget(
+                    FileDescriptorBudgetError::Insufficient {
+                        required: 258,
+                        soft: 256,
+                        hard: 256,
+                    }
+                ))
+            ));
+            assert_eq!(
+                watcher.read_events().unwrap_err(),
+                nix::errno::Errno::EAGAIN
+            );
+        } else {
+            let admitted = result.unwrap();
+            assert_eq!(getrlimit(HostResource::RLIMIT_NOFILE).unwrap(), (512, 512));
+            admitted.verify(&pool).unwrap();
+            assert!(watcher
+                .read_events()
+                .unwrap()
+                .iter()
+                .any(|event| event.mask.contains(AddWatchFlags::IN_OPEN)));
+            let path = pool.object_path(&object);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&path, [8; 512]).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert!(admitted.verify(&pool).is_err());
+        }
     }
 
     #[tokio::test]

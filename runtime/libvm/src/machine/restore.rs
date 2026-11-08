@@ -18,6 +18,7 @@ use crate::machine::lifecycle::{finish_failed_start, started_run_monitor, Failed
 use crate::machine::root_storage::invalid;
 use crate::machine::stopped::PrivateSource;
 use crate::storage::pool::StoragePool;
+use crate::storage::vmdk::{LowerBacking, LowerOccurrence};
 use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord, SnapshotRootProfile};
 use crate::store::restore::RestoreIntent;
 use crate::supervisor::launch::{install_child_inheritance, RestoreLaunch};
@@ -260,8 +261,14 @@ async fn restore_consumer(
     crate::store::operation_store::preflight_launch_storage(
         &storage,
         &consumer.record.configuration.spec,
-        runtime.local_images_dir(),
     )?;
+    // The restored child roots its lower by identity. Register the exact
+    // checkpoint graph (authenticated, exact-loaded) under the consumer.
+    if let Some(lower) = consumer.record.lower() {
+        crate::store::layer_store::LayerStore::from_store(runtime.native_store()?)
+            .publish_snapshot_composition(consumer.operation_id, lower)
+            .await?;
+    }
     let transfer_roles = request.objects.len() as u64
         + request
             .lowers
@@ -590,59 +597,71 @@ fn prepare_lower(
     let SnapshotRootProfile::LinuxOverlay {
         lower,
         lower_geometry,
-        lower_filesystem_uuid,
         ..
     } = &consumer.record.root.profile
     else {
         return Ok(None);
     };
-    // The lower backing is a duplicate of the held authenticated descriptor,
-    // as for local-fork cuts; it outlives `release_closure`.
-    let authenticated = consumer.authenticated_stream(&lower.stream, lower_geometry.length)?;
+    // Every backing is a duplicate of a held authenticated closure descriptor
+    // (fsmeta object, pack streams), as for local-fork cuts; each outlives
+    // `release_closure`. The consumer authenticated the closed graph.
+    let mut occurrences = Vec::with_capacity(lower.layers.len() + 1);
+    occurrences.push(pool.lower_object_occurrence(&lower.fsmeta)?);
+    for layer in &lower.layers {
+        occurrences.push(pool.lower_occurrence(&layer.pack.stream)?);
+    }
     let verified = verify_lower_shape(
-        pool,
-        lower.stream,
+        &occurrences,
         lower_geometry.length,
-        *lower_filesystem_uuid,
         &consumer.record.configuration,
-        authenticated,
+        |backing, length| match backing {
+            LowerBacking::Stream(stream) => {
+                let held = consumer.authenticated_stream(&stream, length)?;
+                Ok((held.file().try_clone()?, held.fingerprint()))
+            }
+            LowerBacking::Object(object) => {
+                let file = consumer.open_object(pool, &object)?;
+                let fingerprint =
+                    crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?);
+                Ok((file, fingerprint))
+            }
+        },
     )?;
     prepare_lower_descriptor(&verified, stage).map(Some)
 }
 
-pub(crate) struct VerifiedLower {
-    descriptor: String,
-    backing: File,
+struct VerifiedBacking {
+    file: File,
     fingerprint: crate::storage::identity_file::SourceFingerprint,
     path: std::path::PathBuf,
     length: u64,
+}
+
+pub(crate) struct VerifiedLower {
+    descriptor: String,
+    backings: Vec<VerifiedBacking>,
     block_id: vm_spec::BlockId,
     native_records: u64,
 }
 
+/// Admit the generated descriptor over `occurrences` (fsmeta first, then
+/// every pack occurrence) and bind each unique nonempty backing to a held
+/// authenticated descriptor of exactly that pool inode.
 fn verify_lower_shape(
-    pool: &StoragePool,
-    stream: crate::storage::identity::StreamId,
+    occurrences: &[LowerOccurrence],
     length: u64,
-    filesystem_uuid: Uuid,
     configuration: &crate::SnapshotConfiguration,
-    authenticated: &crate::storage::stream::AuthenticatedStream,
+    held: impl Fn(
+        LowerBacking,
+        u64,
+    ) -> Result<(File, crate::storage::identity_file::SourceFingerprint), LibVmError>,
 ) -> Result<VerifiedLower, LibVmError> {
-    if authenticated.map().id() != stream || authenticated.length() != length {
+    let plan = crate::storage::vmdk::FlatLowerPlan::new(occurrences)?;
+    if plan.logical_length() != length {
         return Err(invalid(
-            "verified lower stream identity or geometry differs from capture",
+            "verified lower occurrences differ from the captured geometry",
         ));
     }
-    let occurrence = pool.lower_occurrence(&stream)?;
-    if occurrence.length() != length
-        || crate::machine::root_storage::filesystem_uuid(occurrence.path())? != filesystem_uuid
-    {
-        return Err(invalid(
-            "authenticated lower filesystem differs from capture",
-        ));
-    }
-    let occurrences = [occurrence];
-    let plan = crate::storage::vmdk::FlatLowerPlan::new(&occurrences)?;
     let data = configuration
         .spec
         .storage
@@ -651,17 +670,29 @@ fn verify_lower_shape(
         .filter(|disk| disk.role == vm_spec::DiskRole::Data)
         .count() as u64;
     let admitted = plan.preflight(data)?;
-    crate::storage::limits::preflight_fd_budget(admitted.record_count() + 6)
+    let unique = admitted.unique_occurrences().count() as u64;
+    crate::storage::limits::preflight_fd_budget(admitted.record_count() + 5 + unique)
         .map_err(crate::storage::StorageError::from)?;
-    let metadata = authenticated.file().metadata()?;
-    if crate::storage::identity_file::SourceFingerprint::new(&metadata)
-        != authenticated.fingerprint()
-        || metadata.len() != length
-        || metadata.mode() & 0o7777 != 0o400
-        || metadata.nlink() != 1
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-    {
-        return Err(invalid("verified lower lost its immutable inode"));
+    let mut backings = Vec::with_capacity(unique as usize);
+    for occurrence in admitted.unique_occurrences() {
+        let (file, fingerprint) = held(occurrence.backing(), occurrence.length())?;
+        let metadata = file.metadata()?;
+        let pooled = std::fs::symlink_metadata(occurrence.path())?;
+        if crate::storage::identity_file::SourceFingerprint::new(&metadata) != fingerprint
+            || metadata.len() != occurrence.length()
+            || metadata.mode() & 0o7777 != 0o400
+            || metadata.nlink() != 1
+            || metadata.uid() != nix::unistd::geteuid().as_raw()
+            || (metadata.dev(), metadata.ino()) != (pooled.dev(), pooled.ino())
+        {
+            return Err(invalid("verified lower backing lost its immutable inode"));
+        }
+        backings.push(VerifiedBacking {
+            file,
+            fingerprint,
+            path: occurrence.path().to_path_buf(),
+            length: occurrence.length(),
+        });
     }
     let block_id = configuration
         .spec
@@ -674,49 +705,52 @@ fn verify_lower_shape(
         .clone();
     Ok(VerifiedLower {
         descriptor: admitted.descriptor()?,
-        backing: authenticated.file().try_clone()?,
-        fingerprint: crate::storage::identity_file::SourceFingerprint::new(&metadata),
-        path: pool.stream_path(&stream),
-        length,
+        backings,
         block_id,
         native_records: admitted.record_count(),
     })
 }
 
+/// Lower of a local cut: the cut operation pins the retained composition;
+/// every backing is authenticated here (streams by map, fsmeta by streaming
+/// whole-byte SHA-256) and held through descriptor handoff.
 pub(crate) fn verify_local_lower(
     pool: &StoragePool,
     storage: &MachineStorageRecord,
     configuration: &crate::SnapshotConfiguration,
-    streams: &std::collections::BTreeMap<
-        crate::storage::identity::StreamId,
-        crate::storage::stream::AuthenticatedStream,
-    >,
+    lower: Option<&crate::store::composition_store::LaunchLower>,
 ) -> Result<Option<VerifiedLower>, LibVmError> {
-    match &storage.root {
-        MachineRoot::LinuxOverlay {
-            lower:
-                crate::OverlayLower::FlatExt4 {
-                    stream,
-                    geometry,
-                    filesystem_uuid,
-                },
-            ..
-        } => {
-            let source = streams
-                .get(stream)
-                .ok_or_else(|| invalid("fork lower has no authenticated pool owner"))?;
+    match (&storage.root, lower) {
+        (MachineRoot::LinuxOverlay { lower: root, .. }, Some(launch)) => {
+            launch.retained.check_lower(root)?;
             verify_lower_shape(
-                pool,
-                *stream,
-                geometry.length,
-                *filesystem_uuid,
+                &launch.occurrences,
+                root.geometry().length,
                 configuration,
-                source,
+                |backing, length| match backing {
+                    LowerBacking::Stream(stream) => {
+                        let authenticated =
+                            crate::machine::stopped::open_immutable_stream(pool, &stream, length)?;
+                        Ok((
+                            authenticated.file().try_clone()?,
+                            authenticated.fingerprint(),
+                        ))
+                    }
+                    LowerBacking::Object(object) => {
+                        let file = pool.verify_object(&object)?;
+                        let fingerprint = crate::storage::identity_file::SourceFingerprint::new(
+                            &file.metadata()?,
+                        );
+                        Ok((file, fingerprint))
+                    }
+                },
             )
             .map(Some)
         }
-        MachineRoot::LinuxOverlay { .. } => Err(invalid("fork lower profile is not delivered")),
-        MachineRoot::OpaqueRaw { .. } => Ok(None),
+        (MachineRoot::LinuxOverlay { .. }, None) => {
+            Err(invalid("fork lower has no leased retained composition"))
+        }
+        (MachineRoot::OpaqueRaw { .. }, _) => Ok(None),
     }
 }
 
@@ -724,10 +758,12 @@ fn prepare_lower_descriptor(
     verified: &VerifiedLower,
     stage: crate::machine::stopped::OperationStaging,
 ) -> Result<LowerInputs, LibVmError> {
-    if crate::storage::identity_file::SourceFingerprint::new(&verified.backing.metadata()?)
-        != verified.fingerprint
-    {
-        return Err(invalid("verified lower changed before descriptor handoff"));
+    for backing in &verified.backings {
+        if crate::storage::identity_file::SourceFingerprint::new(&backing.file.metadata()?)
+            != backing.fingerprint
+        {
+            return Err(invalid("verified lower changed before descriptor handoff"));
+        }
     }
     let directory = stage.directory()?;
     directory.write_file("lower.vmdk", verified.descriptor.as_bytes())?;
@@ -737,31 +773,39 @@ fn prepare_lower_descriptor(
     nix::sys::stat::fchmod(&descriptor, nix::sys::stat::Mode::S_IRUSR)
         .map_err(std::io::Error::from)?;
     descriptor.sync_all()?;
-    let backing = verified.backing.try_clone()?;
     let descriptor_stat = descriptor.metadata()?;
-    let backing_stat = backing.metadata()?;
-    Ok(LowerInputs {
-        request: vm_spec::restore::RestoreLower {
-            block_id: verified.block_id.clone(),
-            descriptor: vm_spec::restore::RestoreDescriptor {
-                fd: descriptor.as_raw_fd(),
-                file_device: descriptor_stat.dev(),
-                file_inode: descriptor_stat.ino(),
-                length: descriptor_stat.len(),
-            },
-            extents: vec![vm_spec::restore::RestoreExtent {
-                path: verified
-                    .path
-                    .to_str()
-                    .ok_or_else(|| invalid("lower path is not UTF-8"))?
-                    .into(),
-                fd: backing.as_raw_fd(),
-                file_device: backing_stat.dev(),
-                file_inode: backing_stat.ino(),
-                length: verified.length,
-            }],
+    let mut files = Vec::with_capacity(verified.backings.len() + 1);
+    let mut extents = Vec::with_capacity(verified.backings.len());
+    for backing in &verified.backings {
+        let file = backing.file.try_clone()?;
+        let stat = file.metadata()?;
+        extents.push(vm_spec::restore::RestoreExtent {
+            path: backing
+                .path
+                .to_str()
+                .ok_or_else(|| invalid("lower path is not UTF-8"))?
+                .into(),
+            fd: file.as_raw_fd(),
+            file_device: stat.dev(),
+            file_inode: stat.ino(),
+            length: backing.length,
+        });
+        files.push(file);
+    }
+    let request = vm_spec::restore::RestoreLower {
+        block_id: verified.block_id.clone(),
+        descriptor: vm_spec::restore::RestoreDescriptor {
+            fd: descriptor.as_raw_fd(),
+            file_device: descriptor_stat.dev(),
+            file_inode: descriptor_stat.ino(),
+            length: descriptor_stat.len(),
         },
-        files: vec![descriptor, backing],
+        extents,
+    };
+    files.insert(0, descriptor);
+    Ok(LowerInputs {
+        request,
+        files,
         native_records: verified.native_records,
         directory,
         _stage: stage,
@@ -793,8 +837,8 @@ pub(crate) fn storage_from_snapshot(
             temporary_directory,
         } => (
             MachineRoot::LinuxOverlay {
-                lower: crate::OverlayLower::FlatExt4 {
-                    stream: lower.stream,
+                lower: crate::OverlayLower::ErofsComposition {
+                    record: lower.result,
                     geometry: *lower_geometry,
                     filesystem_uuid: *lower_filesystem_uuid,
                 },
@@ -1555,12 +1599,15 @@ mod tests {
         let mut record = snapshot();
         let lower_uuid = uuid::Uuid::new_v4();
         let upper_uuid = uuid::Uuid::new_v4();
-        let lower = record.root.stream.clone();
-        let lower_geometry = record.root.geometry;
+        let lower = crate::store::models::snapshot::tests::composition();
+        let lower_geometry = vm_spec::DiskGeometry {
+            length: 8192,
+            logical_sector_size: 512,
+        };
         record.root.geometry.length = 64 << 20;
         record.root.stream.length = 64 << 20;
         record.root.profile = SnapshotRootProfile::LinuxOverlay {
-            lower,
+            lower: Box::new(lower),
             lower_geometry,
             lower_filesystem_uuid: lower_uuid,
             upper_uuid,
@@ -1577,20 +1624,27 @@ mod tests {
                 attachment(vm_spec::DiskRole::RootUpper, "silo-root-upper", false),
             ],
         });
+        record.configuration.spec.storage.as_mut().unwrap().disks[0].geometry = lower_geometry;
         record.configuration.spec.storage.as_mut().unwrap().disks[1].geometry =
             record.root.geometry;
         let checkpoint = format!("sha256:{}", "03".repeat(32)).parse().unwrap();
         let storage = storage_from_snapshot(&record, checkpoint).unwrap();
         let crate::MachineRoot::LinuxOverlay {
-            lower: crate::OverlayLower::FlatExt4 {
-                filesystem_uuid, ..
-            },
+            lower:
+                crate::OverlayLower::ErofsComposition {
+                    record: restored,
+                    geometry,
+                    filesystem_uuid,
+                },
             upper_uuid: actual_upper,
             ..
         } = &storage.root
         else {
             panic!("wrong restored root");
         };
+        // The child inherits the exact lower identity; nothing is flattened.
+        assert_eq!(*restored, record.lower().unwrap().result);
+        assert_eq!(*geometry, lower_geometry);
         assert_eq!(*filesystem_uuid, lower_uuid);
         assert_eq!(*actual_upper, upper_uuid);
         let mut spec = record.configuration.spec.clone();

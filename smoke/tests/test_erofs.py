@@ -43,7 +43,9 @@ def test_erofs_native_vmdk_mount(
     text = config.read_text()
     for feature in ["EROFS_FS", "EROFS_FS_XATTR", "EROFS_FS_POSIX_ACL", "EROFS_FS_SECURITY", "EXPORTFS"]:
         assert f"CONFIG_{feature}=y\n" in text, feature
-    producer = REPO / "target/debug/examples/erofs_qualification"
+    producer = silo.ws.config.bin_dir / "examples/erofs_qualification"
+    if not producer.is_file():
+        producer = REPO / "target/debug/examples/erofs_qualification"
     assert producer.is_file(), "build libvm example erofs_qualification before qualification"
     fixture_dir = silo.ws.root / "erofs"
     generated = subprocess.run([str(producer), str(fixture_dir), fixture], check=True, capture_output=True, text=True, timeout=300)
@@ -56,7 +58,7 @@ def test_erofs_native_vmdk_mount(
     if fixture != "many":
         args.extend(["--extract", "--device=" + str(fixture_dir / "payload.pack")])
     # erofs-utils admits at most 256 external CLI devices. For 1024 slots,
-    # structural fsck plus actual flattened-device guest reads are mandatory.
+    # structural fsck plus actual composed-device guest reads are mandatory.
     args.append(str(first))
     checked = subprocess.run(args, capture_output=True, text=True, timeout=180)
     silo.ws.record("erofs-fsck", checked.stdout + checked.stderr)
@@ -75,16 +77,16 @@ def test_erofs_native_vmdk_mount(
         initramfs.write_bytes(raw)
         candidate.spec["boot"]["kernel"]["cmdline"] = ["loglevel=6", "rdinit=/init", "silo.erofs_fixture=" + fixture]
         candidate.config.write_text(json.dumps(candidate.spec))
-        candidate.occurrences = [record.path for record in overlay.records(candidate.descriptor)]
+        candidate.occurrences = overlay.lower_occurrences(candidate.descriptor)
         candidate.occurrence_digests = {path: overlay.digest(path) for path in dict.fromkeys(candidate.occurrences)}
         candidate.identities.update(
             kernelSha256=overlay.digest(kernel_snapshot),
             initramfsSha256=hashlib.sha256(raw).hexdigest(),
             compositeInitramfsSha256=hashlib.sha256(raw).hexdigest(),
             resolvedConfigDigest="sha256:" + overlay.digest(config),
-            rootProfile="silo-erofs-v1-candidate-only", fixture=fixture, kernelTrack=track,
+            rootProfile="none", filesystemProfile="silo-erofs-v1", fixture=fixture, kernelTrack=track,
             logicalLowerBytes=candidate.logical_lower_bytes,
-            lowerOccurrences=[{"path": str(path), "sha256": digest} for path, digest in candidate.occurrence_digests.items()],
+            lowerOccurrences=[{"path": str(path), "lengthBytes": path.stat().st_size, "sha256": candidate.occurrence_digests[path]} for path in candidate.occurrences],
         )
         candidate.start()
         deadline = time.monotonic() + 180

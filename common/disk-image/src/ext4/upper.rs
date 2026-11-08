@@ -79,7 +79,7 @@ mod tests {
     }
 
     fn inspect(path: &std::path::Path, result: FormattedUpper) {
-        let mut reader = Reader::new(path).unwrap();
+        let reader = Reader::new(path).unwrap();
         let sb = reader.superblock().clone();
         let geometry =
             UpperGeometry::for_capacity(UpperCapacity::new(result.backing_bytes).unwrap());

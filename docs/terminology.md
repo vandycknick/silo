@@ -221,12 +221,16 @@ flowchart TD
 
 A virtualization backend is the concrete host implementation Silo uses to run a VM.
 
-Current Silo runtime backend selection is internal and host-driven:
+Current Silo runtime backend selection defaults to libkrun on both Linux and
+macOS. Virtualization.framework (`vz`) is an explicit macOS runtime selection:
 
-- macOS uses Apple Virtualization.framework through `vz`
-- Linux uses libkrun/krun through `krun`
+- `krun` supports layered EROFS OCI roots and admitted opaque raw roots.
+- `vz` supports raw roots only. OCI users must explicitly convert with
+  `silo image convert REF --disk-format raw` before creating a machine.
 
-Users do not select a backend in `VmSpec`. `VmSpec` describes the VM, while Silo chooses the host implementation at compile time.
+Users do not select a backend in `VmSpec`. `VmSpec` describes the VM; runtime
+configuration selects the backend, and root/backend admission rejects unsupported
+combinations rather than silently flattening or changing the root family.
 
 In Silo, "backend" is a practical project term. It names the concrete implementation path selected by host platform; it is not meant to replace the more precise ecosystem terms VMM, hypervisor, VM, or KVM.
 
@@ -277,7 +281,7 @@ The **supervisor process** is the lifecycle-owning part of `silo-vmm`. With libk
 
 `virt` is Silo's host virtualization facade, a module inside `silo-vmm`.
 
-It exposes the common Rust API that `silo-vmm` uses to create, start, stop, and communicate with a VM. Each machine runs on one backend driver (`krun` or `vz`); the default is selected per host platform.
+It exposes the common Rust API that `silo-vmm` uses to create, start, stop, and communicate with a VM. Each machine runs on one backend driver (`krun` or `vz`); the runtime defaults to libkrun on both host platforms.
 
 The exported `VirtualMachine` type is Silo's per-instance VM handle. It is not the guest OS and it is not the underlying VMM implementation. It is the API handle used by Silo code to control one VM.
 

@@ -125,6 +125,41 @@ fn encoded(layers: &[Layer<'_>]) -> (File, crate::erofs::EncodedFsmeta) {
 }
 
 #[test]
+fn symlink_target_must_fit_the_kernel_page_link_limit() {
+    for length in [4095, 4096] {
+        let fixture = Fixture::new(
+            vec![entry(
+                b"link",
+                EntryKind::Symlink {
+                    target: vec![b'x'; length],
+                },
+            )],
+            &[],
+        );
+        let layers = [fixture.layer()];
+        let ns = namespace(&layers);
+        let mut output = tempfile::tempfile().unwrap();
+        let result = encode(&ns, &layers, RECIPE, &mut output);
+        if length == 4095 {
+            assert_eq!(
+                validate(&output, &ns, &layers, RECIPE).unwrap(),
+                result.unwrap()
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "4096-byte page-backed symlink would be truncated by Linux"
+            );
+            assert_eq!(
+                output.metadata().unwrap().len(),
+                0,
+                "refuse before writing fsmeta"
+            );
+        }
+    }
+}
+
+#[test]
 fn fixed_profile_golden_bytes_and_uuid_recipe_spelling() {
     // Independently authored field-by-field fixtures, not snapshots emitted by
     // this encoder. Recipe bytes are exactly RECIPE's ASCII bytes, no newline.

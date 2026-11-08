@@ -7,7 +7,8 @@
 //! fields or accepts kernel device-ID aliases. Memory is bounded by the namespace
 //! and fixed I/O buffers, not the number of regular-file chunks.
 
-mod plan;
+pub(crate) mod handles;
+pub(crate) mod plan;
 mod reader;
 mod writer;
 
@@ -95,6 +96,19 @@ pub fn validate(
 ) -> Result<EncodedFsmeta> {
     let plan = crate::erofs::plan::Plan::new(namespace, layers, recipe_id)?;
     crate::erofs::reader::validate(fsmeta, &plan, layers)
+}
+
+/// `validate`, also yielding the kernel export identity of every inode for
+/// callers that interpret OverlayFS handles against this exact lower.
+pub(crate) fn validate_exported(
+    fsmeta: &File,
+    namespace: &ValidatedNamespace,
+    layers: &[Layer<'_>],
+    recipe_id: &str,
+) -> Result<(EncodedFsmeta, handles::ExportHandles)> {
+    let plan = crate::erofs::plan::Plan::new(namespace, layers, recipe_id)?;
+    let encoded = crate::erofs::reader::validate(fsmeta, &plan, layers)?;
+    Ok((encoded, handles::ExportHandles::from_plan(&plan)?))
 }
 
 fn invalid(message: &str) -> ErofsError {

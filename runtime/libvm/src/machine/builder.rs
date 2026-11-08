@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use vm_spec::{Boot, Guest, GuestOs, Hardware, Kernel, Mount, Storage, VmSpec};
 
-use crate::image::{ImageBuilder, ImageSource, MaterializedImage, ResolvedOciImage};
+use crate::image::{
+    ImageBuilder, ImageSource, MaterializedImage, MaterializedRoot, ResolvedOciImage,
+};
 use crate::lock_manager::ManagedLock;
 use crate::machine::root_disk::{copy_private, resize_raw_disk, CopyQualification};
 use crate::machine::{
@@ -24,15 +26,8 @@ use crate::LibVmError;
 const DEFAULT_IMAGE_CPUS: u8 = 1;
 const DEFAULT_IMAGE_MEMORY_MIB: u32 = 512;
 const GENERATED_NAME_ATTEMPTS: u32 = 3;
-
-/// Explicit root materialization choice. Flat overlay is development-only.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RootProfile {
-    #[default]
-    OpaqueRaw,
-    LinuxFlatOverlayV1,
-}
+/// Default private upper backing capacity of a new layered root.
+const DEFAULT_UPPER_CAPACITY: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct MachineCreateRequest {
@@ -48,7 +43,6 @@ struct MachineCreateRequest {
     initramfs: Option<PathBuf>,
     kernel_args: Vec<String>,
     disk_size_bytes: Option<u64>,
-    root_profile: RootProfile,
     temporary_directory: crate::TemporaryDirectoryPolicy,
     nested_virtualization: bool,
     rosetta: Option<bool>,
@@ -76,7 +70,6 @@ fn snapshot_creation_has_overrides(request: &MachineCreateRequest) -> bool {
         || request.initramfs.is_some()
         || !request.kernel_args.is_empty()
         || request.disk_size_bytes.is_some()
-        || request.root_profile != RootProfile::OpaqueRaw
         || request.temporary_directory != crate::TemporaryDirectoryPolicy::DiskBacked
         || request.nested_virtualization
         || request.rosetta.is_some()
@@ -100,6 +93,8 @@ fn snapshot_creation_has_overrides(request: &MachineCreateRequest) -> bool {
 struct SourceOwnership {
     _lease: Option<crate::storage::locks::StorageLock>,
     _managed: Option<crate::store::managed_image_store::ManagedImageConsumer>,
+    /// Consumer lease over the layered lower until the machine row roots it.
+    _lower: Option<crate::store::composition_store::HeldComposition>,
 }
 
 struct MachineCreatePlan {
@@ -186,7 +181,6 @@ impl MachineBuilder {
                 initramfs: None,
                 kernel_args: Vec::new(),
                 disk_size_bytes: None,
-                root_profile: RootProfile::OpaqueRaw,
                 temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
                 nested_virtualization: false,
                 rosetta: None,
@@ -243,12 +237,6 @@ impl MachineBuilder {
     /// Requests OCI userspace selection before acquisition and materialization.
     pub fn platform(mut self, platform: Option<crate::LinuxPlatform>) -> Self {
         self.request.platform = platform;
-        self
-    }
-
-    /// Selects root storage explicitly; opaque raw remains the default.
-    pub fn root_profile(mut self, profile: RootProfile) -> Self {
-        self.request.root_profile = profile;
         self
     }
 
@@ -511,7 +499,10 @@ async fn create_machine_config_with_name(
             reason: "machine image source is required".to_string(),
         });
     };
-    let overlay = request.root_profile == RootProfile::LinuxFlatOverlayV1;
+    // An OCI source always materializes a fresh layered EROFS root; local
+    // disks and managed images inherit the family of their retained root.
+    let mut overlay = matches!(&image_source, ImageSource::Oci(_));
+    let mut layered_image = false;
     let source_family = match &image_source {
         ImageSource::Oci(_) => crate::runtime::boot_assets::SourceFamily::Oci,
         ImageSource::Disk(_) => crate::runtime::boot_assets::SourceFamily::LocalDisk,
@@ -553,6 +544,37 @@ async fn create_machine_config_with_name(
         match collection.resolve(reference).await? {
             crate::ManagedSourceId::Image(id) => {
                 image_source = ImageSource::Managed(crate::ManagedSourceRef::Image(id));
+                let crate::ManagedSourceInfo::Image(info) = collection
+                    .inspect(&crate::ManagedSourceRef::Image(id))
+                    .await?
+                else {
+                    return Err(crate::machine::root_storage::invalid(
+                        "resolved managed image changed kind",
+                    ));
+                };
+                if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
+                    ..
+                } = &info.record.root.profile
+                {
+                    crate::runtime::boot_assets::admit_create_source(
+                        source_family,
+                        crate::StorageProfile::LinuxOverlayV1,
+                        crate::BackendRequirement::KrunOverlay,
+                        runtime.effective_backend(),
+                    )?;
+                    if request.temporary_directory != crate::TemporaryDirectoryPolicy::DiskBacked
+                        || request
+                            .disk_size_bytes
+                            .is_some_and(|size| size != info.record.root.geometry.length)
+                    {
+                        return Err(LibVmError::InvalidCreateRequest {
+                            name,
+                            reason: "a layered image keeps its retained upper capacity and temporary-directory policy".into(),
+                        });
+                    }
+                    overlay = true;
+                    layered_image = true;
+                }
             }
             crate::ManagedSourceId::Snapshot(id) => {
                 if snapshot_creation_has_overrides(&request) {
@@ -643,15 +665,9 @@ async fn create_machine_config_with_name(
 
     let resolved_cpus = request.cpus.unwrap_or(DEFAULT_IMAGE_CPUS);
 
-    if overlay {
-        if !matches!(&image_source, ImageSource::Oci(_)) {
-            return Err(LibVmError::InvalidCreateRequest {
-                name,
-                reason: "flat overlay requires an OCI image source".into(),
-            });
-        }
+    if overlay && !layered_image {
         rootfs_spec::upper_geometry::UpperCapacity::new(
-            request.disk_size_bytes.unwrap_or(4 * 1024 * 1024 * 1024),
+            request.disk_size_bytes.unwrap_or(DEFAULT_UPPER_CAPACITY),
         )
         .map_err(|error| LibVmError::InvalidCreateRequest {
             name: name.clone(),
@@ -661,16 +677,22 @@ async fn create_machine_config_with_name(
         crate::storage::limits::Resource::IncludedDisks
             .sum([2, disk_paths.len() as u64])
             .map_err(crate::storage::StorageError::from)?;
-        runtime.qualify_flat_overlay(kernel.as_deref(), initramfs.as_deref())?;
+        // Fails before any acquisition effect; the admitted tuple table is
+        // the only authority for a new layered root's runtime-selected boot.
+        runtime.qualify_erofs_overlay(kernel.as_deref(), initramfs.as_deref())?;
+    } else if layered_image {
+        crate::storage::limits::Resource::IncludedDisks
+            .sum([2, disk_paths.len() as u64])
+            .map_err(crate::storage::StorageError::from)?;
     } else if request.temporary_directory != crate::TemporaryDirectoryPolicy::DiskBacked {
         return Err(LibVmError::InvalidCreateRequest {
             name,
-            reason: "temporary-directory policy requires flat overlay".into(),
+            reason: "temporary-directory policy applies only to a new OCI layered root".into(),
         });
     }
     let mounts = assign_mount_tags(request.mounts);
     let kernel_cmdline = if overlay {
-        std::iter::once("silo.rootfs=linux-flat-overlay-v1".to_string())
+        std::iter::once(crate::machine::root_storage::ROOT_MARKER.to_string())
             .chain(request.kernel_args)
             .collect()
     } else {
@@ -687,7 +709,7 @@ async fn create_machine_config_with_name(
             crate::machine::root_storage::disk(
                 "upper.raw",
                 vm_spec::DiskRole::RootUpper,
-                request.disk_size_bytes.unwrap_or(4 * 1024 * 1024 * 1024),
+                request.disk_size_bytes.unwrap_or(DEFAULT_UPPER_CAPACITY),
                 "silo-root-upper".into(),
             )?,
         ]
@@ -793,22 +815,87 @@ async fn create_machine_config_with_name(
         Some(image) => runtime.materialize_resolved_oci_image(image).await?,
         None => runtime.materialize_image(&image_source).await?,
     };
-    if materialized.managed.is_some() {
+    let MaterializedImage {
+        root: materialized_root,
+        requested_reference,
+        selected_reference,
+        source_kind,
+        image_id,
+        manifest_digest,
+        config_digest,
+        platform,
+        managed,
+        _lease: source_lease,
+    } = materialized;
+    if managed.is_some() {
         if let Some(kernel) = spec.boot.as_mut().and_then(|boot| boot.kernel.as_mut()) {
             kernel.path = None;
             kernel.initramfs = None;
         }
     }
+    let root = match materialized_root {
+        MaterializedRoot::Layered(held) if overlay && !layered_image => CreateRoot::Fresh(*held),
+        MaterializedRoot::Raw { authenticated, .. } if layered_image => {
+            let consumer = managed.as_ref().ok_or_else(|| {
+                crate::machine::root_storage::invalid("layered image has no managed consumer")
+            })?;
+            let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay {
+                lower,
+                upper_uuid,
+                ext4_profile,
+                overlay_profile,
+                temporary_directory,
+                ..
+            } = &consumer.info.record.root.profile
+            else {
+                return Err(crate::machine::root_storage::invalid(
+                    "managed image family changed after admission",
+                ));
+            };
+            // Register the exact authenticated graph under the consumer's
+            // operation (which pins every graph object and pack), then lease it.
+            let layers = crate::store::layer_store::LayerStore::from_store(runtime.native_store()?);
+            let id = layers
+                .publish_snapshot_composition(consumer.operation_id(), lower)
+                .await?;
+            CreateRoot::Image {
+                held: layers.hold_composition(id).await?,
+                upper: authenticated,
+                upper_uuid: *upper_uuid,
+                ext4_profile: *ext4_profile,
+                overlay_profile: *overlay_profile,
+                temporary_directory: *temporary_directory,
+            }
+        }
+        MaterializedRoot::Raw {
+            stream,
+            size_bytes,
+            authenticated,
+            ..
+        } if !overlay => CreateRoot::Raw {
+            stream,
+            size_bytes,
+            authenticated,
+        },
+        _ => {
+            return Err(crate::machine::root_storage::invalid(
+                "materialized root contradicts the selected source family",
+            ))
+        }
+    };
+    let root_disk_size = match &root {
+        CreateRoot::Raw { size_bytes, .. } => request.disk_size_bytes.unwrap_or(*size_bytes),
+        CreateRoot::Fresh(_) => request.disk_size_bytes.unwrap_or(DEFAULT_UPPER_CAPACITY),
+        CreateRoot::Image { upper, .. } => upper.length(),
+    };
+    crate::storage::limits::validate_disk_length(root_disk_size)
+        .map_err(crate::storage::StorageError::from)?;
     let mut admitted_storage = crate::MachineStorageRecord::opaque_raw(
         crate::PrivatePath::new("root.raw")?,
-        materialized.size_bytes,
-        &materialized.platform,
+        root_disk_size,
+        &platform,
     )?;
-    if let Some(record) = materialized
-        .managed
-        .as_ref()
-        .map(|consumer| &consumer.info.record)
-    {
+    if let Some(record) = managed.as_ref().map(|consumer| &consumer.info.record) {
         admitted_storage.boot = record.boot.clone();
         if let crate::BootProfile::LinuxDirect {
             binding: crate::BootBinding::Pinned { agent, .. },
@@ -835,13 +922,14 @@ async fn create_machine_config_with_name(
             }
             request.agent_mode = Some(request.guest.agent.clone());
         }
-        admitted_storage.profile = crate::StorageProfile::OpaqueRawV1;
-        admitted_storage.backend = crate::BackendRequirement::RawBlock;
-        if let crate::MachineRoot::OpaqueRaw {
-            layout,
-            initial_content,
-            ..
-        } = &mut admitted_storage.root
+        if let (
+            CreateRoot::Raw { .. },
+            crate::MachineRoot::OpaqueRaw {
+                layout,
+                initial_content,
+                ..
+            },
+        ) = (&root, &mut admitted_storage.root)
         {
             *layout = record.root.layout.clone();
             *initial_content = Some(record.root.stream.stream);
@@ -850,11 +938,26 @@ async fn create_machine_config_with_name(
             request.process = record.process.clone();
         }
     }
-    crate::runtime::boot_assets::effective_boot(
-        &admitted_storage,
-        &spec,
-        runtime.effective_backend(),
-    )?;
+    match &root {
+        CreateRoot::Raw { .. } => {
+            crate::runtime::boot_assets::effective_boot(
+                &admitted_storage,
+                &spec,
+                runtime.effective_backend(),
+            )?;
+        }
+        CreateRoot::Fresh(held) | CreateRoot::Image { held, .. } => {
+            crate::machine::root_storage::check_lower_platform(
+                &held.retained().recipe.platform,
+                &admitted_storage.boot,
+            )?;
+            crate::runtime::boot_assets::effective_boot_profile(
+                &admitted_storage.boot,
+                &spec,
+                runtime.effective_backend(),
+            )?;
+        }
+    }
     let _name_lock = runtime.lock_machine_names().await?;
     let mut create = create_machine_guard(
         runtime,
@@ -877,132 +980,118 @@ async fn create_machine_config_with_name(
     if tailscale {
         runtime.ensure_tailscale_directory(create.id)?;
     }
-    let root_disk_size = request.disk_size_bytes.unwrap_or(if overlay {
-        4 * 1024 * 1024 * 1024
-    } else {
-        materialized.size_bytes
-    });
-    crate::storage::limits::validate_disk_length(root_disk_size)
-        .map_err(crate::storage::StorageError::from)?;
     // The immutable import has its own, completed capacity phase. Reserve the
     // later private machine copy separately, on its actual destination device.
     // This worker keeps the original OFD until machine publication has settled.
-    let copy_reservation = if !overlay {
-        let store = runtime.native_store()?;
-        let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
-            crate::machine::root_storage::invalid("new machine directory disappeared")
-        })?;
-        let (operation, lease) = store.begin_stopped_operation("import", &[], &[]).await?;
-        Some((store, operation, lease, directory))
-    } else {
-        None
+    let copy_bytes = match &root {
+        CreateRoot::Raw { size_bytes, .. } => Some((*size_bytes).max(root_disk_size)),
+        CreateRoot::Image { upper, .. } => Some(upper.length()),
+        CreateRoot::Fresh(_) => None,
+    };
+    let copy_reservation = match copy_bytes {
+        Some(bytes) => {
+            let store = runtime.native_store()?;
+            let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
+                crate::machine::root_storage::invalid("new machine directory disappeared")
+            })?;
+            let (operation, lease) = store.begin_stopped_operation("import", &[], &[]).await?;
+            Some((store, operation, lease, directory, bytes))
+        }
+        None => None,
     };
     // Move the guard into this result boundary so every ordinary failure
     // rolls back its private tree before the stopped producer releases space.
     // Publication still owns its own guard and preserves uncertain commits.
     let reservation = copy_reservation.as_ref();
+    let backend = runtime.effective_backend();
     let result = async move {
-        if let Some((store, operation, _, directory)) = reservation {
+        if let Some((store, operation, _, directory, bytes)) = reservation {
             store
-                .reserve_copy_space(
-                    *operation,
-                    materialized.size_bytes.max(root_disk_size),
-                    directory,
-                )
+                .reserve_copy_space(*operation, *bytes, directory)
                 .await?;
         }
-        let (rootfs_path, storage) = if overlay {
-            let stream = materialized.stream.ok_or_else(|| {
-                crate::machine::root_storage::invalid(
-                    "materialized OCI base has no retained stream identity",
-                )
-            })?;
-            let lower_uuid =
-                crate::machine::root_storage::filesystem_uuid(&materialized.rootfs_path)?;
-            let rootfs_path = create.dir().join("upper.raw");
-            let capacity = rootfs_spec::upper_geometry::UpperCapacity::new(root_disk_size)
-                .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
-            let formatted = disk_image::ext4::upper::format_upper(&rootfs_path, capacity)?;
-            let mut storage = crate::MachineStorageRecord::opaque_raw(
-                crate::PrivatePath::new("upper.raw")?,
-                root_disk_size,
-                &materialized.platform,
-            )?;
-            storage.root = crate::MachineRoot::LinuxOverlay {
-                lower: crate::OverlayLower::FlatExt4 {
-                    stream,
-                    geometry: vm_spec::DiskGeometry {
-                        length: materialized.size_bytes,
-                        logical_sector_size: 512,
-                    },
-                    filesystem_uuid: lower_uuid,
-                },
-                upper: crate::PrivatePath::new("upper.raw")?,
-                upper_uuid: formatted.uuid,
-                capacity: root_disk_size,
-                ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
-                overlay_profile: crate::OverlayProfile::SiloOverlayV1,
-                temporary_directory: request.temporary_directory,
-            };
-            storage.profile = crate::StorageProfile::LinuxOverlayV1;
-            storage.backend = crate::BackendRequirement::KrunOverlay;
-            if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
-                *root_selector = crate::RootSelector::ManagedOverlay;
-            }
-            storage.validate()?;
-            (rootfs_path, Some(storage))
-        } else {
-            let rootfs_path = create.dir().join(root_disk_relative_path());
-            let source_file;
-            let source = match &materialized.authenticated {
-                Some(stream) => crate::machine::root_disk::CopySource::Authenticated(stream),
-                None => {
-                    source_file =
-                        crate::storage::stream::open_regular_source(&materialized.rootfs_path)?;
-                    source_file.sync_all()?;
-                    crate::machine::root_disk::CopySource::Unscanned {
-                        file: &source_file,
-                        length: materialized.size_bytes,
-                    }
+        let (rootfs_path, storage) = match &root {
+            CreateRoot::Raw {
+                stream,
+                size_bytes,
+                authenticated,
+            } => {
+                let rootfs_path = create.dir().join(root_disk_relative_path());
+                copy_root(
+                    create.dir(),
+                    crate::machine::root_disk::CopySource::Authenticated(authenticated),
+                    *size_bytes,
+                    "root.raw",
+                )?;
+                if let Some(size_bytes) = request.disk_size_bytes {
+                    resize_raw_disk(&rootfs_path, size_bytes)?;
                 }
-            };
-            let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
-                crate::machine::root_storage::invalid("new machine directory disappeared")
-            })?;
-            let stage_name = format!(".copy-{}", uuid::Uuid::new_v4());
-            let stage = directory.create_dir(&stage_name)?.ok_or_else(|| {
-                crate::machine::root_storage::invalid("private copy staging collision")
-            })?;
-            let mut qualification = CopyQualification::new(32);
-            let mut prepared = copy_private(source, stage, "content", &mut qualification)?;
-            tracing::debug!(
-                method = ?prepared.method(),
-                verification = ?prepared.verification(),
-                file = ?prepared.file(),
-                length = materialized.size_bytes,
-                "prepared private root copy",
-            );
-            prepared.publish(directory.try_clone()?, "root.raw")?;
-            prepared.retain();
-            directory.remove_tree(&stage_name)?;
-            directory.sync()?;
-            if let Some(size_bytes) = request.disk_size_bytes {
-                resize_raw_disk(&rootfs_path, size_bytes)?;
+                if let crate::MachineRoot::OpaqueRaw {
+                    geometry,
+                    initial_content,
+                    ..
+                } = &mut admitted_storage.root
+                {
+                    geometry.length = root_disk_size;
+                    *initial_content = (root_disk_size == *size_bytes).then_some(*stream);
+                }
+                (rootfs_path, admitted_storage)
             }
-            if let crate::MachineRoot::OpaqueRaw {
-                geometry,
-                initial_content,
-                ..
-            } = &mut admitted_storage.root
-            {
-                geometry.length = root_disk_size;
-                *initial_content = if root_disk_size == materialized.size_bytes {
-                    materialized.stream
-                } else {
-                    None
-                };
+            CreateRoot::Fresh(held) => {
+                let rootfs_path = create.dir().join("upper.raw");
+                let capacity = rootfs_spec::upper_geometry::UpperCapacity::new(root_disk_size)
+                    .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))?;
+                let formatted = disk_image::ext4::upper::format_upper(&rootfs_path, capacity)?;
+                let storage = layered_storage(
+                    admitted_storage,
+                    held,
+                    LayeredUpper {
+                        uuid: formatted.uuid,
+                        capacity: root_disk_size,
+                        ext4_profile: crate::Ext4Profile::SiloUpperExt4V1,
+                        overlay_profile: crate::OverlayProfile::SiloOverlayV1,
+                        temporary_directory: request.temporary_directory,
+                    },
+                )?;
+                (rootfs_path, storage)
             }
-            (rootfs_path, Some(admitted_storage))
+            CreateRoot::Image {
+                held,
+                upper,
+                upper_uuid,
+                ext4_profile,
+                overlay_profile,
+                temporary_directory,
+            } => {
+                let rootfs_path = create.dir().join("upper.raw");
+                copy_root(
+                    create.dir(),
+                    crate::machine::root_disk::CopySource::Authenticated(upper),
+                    upper.length(),
+                    "upper.raw",
+                )?;
+                crate::machine::root_storage::validate_upper_file(
+                    &std::fs::File::open(&rootfs_path)?,
+                    *upper_uuid,
+                    upper.length(),
+                )?;
+                let storage = layered_storage(
+                    admitted_storage,
+                    held,
+                    LayeredUpper {
+                        uuid: *upper_uuid,
+                        capacity: upper.length(),
+                        ext4_profile: *ext4_profile,
+                        overlay_profile: *overlay_profile,
+                        temporary_directory: *temporary_directory,
+                    },
+                )?;
+                (rootfs_path, storage)
+            }
+        };
+        let lower_length = match &storage.root {
+            crate::MachineRoot::LinuxOverlay { lower, .. } => Some(lower.geometry().length),
+            crate::MachineRoot::OpaqueRaw { .. } => None,
         };
         if let Some(disks) = create
             .spec
@@ -1012,7 +1101,13 @@ async fn create_machine_config_with_name(
         {
             for disk in disks {
                 match disk.role {
-                    vm_spec::DiskRole::RootLower => disk.geometry.length = materialized.size_bytes,
+                    vm_spec::DiskRole::RootLower => {
+                        disk.geometry.length = lower_length.ok_or_else(|| {
+                            crate::machine::root_storage::invalid(
+                                "lower attachment without a layered root",
+                            )
+                        })?
+                    }
                     vm_spec::DiskRole::Root | vm_spec::DiskRole::RootUpper => {
                         disk.geometry.length = root_disk_size
                     }
@@ -1020,25 +1115,44 @@ async fn create_machine_config_with_name(
                 }
             }
         }
+        if lower_length.is_some() {
+            crate::machine::root_storage::validate_spec(&storage, &create.spec)?;
+            crate::runtime::boot_assets::effective_boot(&storage, &create.spec, backend)?;
+        }
         write_machine_config(create.dir(), &create.name, &create.spec)?;
-
-        let rootfs = machine_rootfs_record(&create, &materialized, rootfs_path, root_disk_size);
+        let rootfs = MachineRootfsRecord {
+            machine_id: create.id,
+            source_kind,
+            requested_reference: requested_reference.clone(),
+            selected_reference,
+            manifest_digest,
+            config_digest,
+            image_id,
+            root_disk_path: rootfs_path,
+            root_disk_size_bytes: root_disk_size,
+            created_at: now_unix(),
+        };
+        let lower = match root {
+            CreateRoot::Fresh(held) | CreateRoot::Image { held, .. } => Some(held),
+            CreateRoot::Raw { .. } => None,
+        };
         create
             .commit(
                 runtime,
                 rootfs,
-                materialized.requested_reference,
-                &materialized.platform,
-                storage,
+                requested_reference,
+                &platform,
+                Some(storage),
                 SourceOwnership {
-                    _lease: materialized._lease,
-                    _managed: materialized.managed,
+                    _lease: source_lease,
+                    _managed: managed,
+                    _lower: lower,
                 },
             )
             .await
     }
     .await;
-    if let Some((store, operation, lease, _directory)) = copy_reservation {
+    if let Some((store, operation, lease, _directory, _)) = copy_reservation {
         let cleanup = async {
             store.release_import_space(operation).await?;
             if result.is_ok() {
@@ -1069,6 +1183,91 @@ async fn create_machine_config_with_name(
         }
     }
     result
+}
+
+/// The root one creation materializes.
+enum CreateRoot {
+    /// A private copy of an authenticated raw image stream.
+    Raw {
+        stream: crate::storage::identity::StreamId,
+        size_bytes: u64,
+        authenticated: crate::storage::stream::AuthenticatedStream,
+    },
+    /// A freshly formatted upper over a new OCI image's retained composition.
+    Fresh(crate::store::composition_store::HeldComposition),
+    /// A private copy of a layered managed image's upper over its exact lower.
+    Image {
+        held: crate::store::composition_store::HeldComposition,
+        upper: crate::storage::stream::AuthenticatedStream,
+        upper_uuid: uuid::Uuid,
+        ext4_profile: crate::Ext4Profile,
+        overlay_profile: crate::OverlayProfile,
+        temporary_directory: crate::TemporaryDirectoryPolicy,
+    },
+}
+
+struct LayeredUpper {
+    uuid: uuid::Uuid,
+    capacity: u64,
+    ext4_profile: crate::Ext4Profile,
+    overlay_profile: crate::OverlayProfile,
+    temporary_directory: crate::TemporaryDirectoryPolicy,
+}
+
+/// The machine root over a held retained lower; its geometry and UUID are the
+/// derived claims of the authenticated composition result.
+fn layered_storage(
+    mut storage: crate::MachineStorageRecord,
+    held: &crate::store::composition_store::HeldComposition,
+    upper: LayeredUpper,
+) -> Result<crate::MachineStorageRecord, LibVmError> {
+    storage.root = crate::MachineRoot::LinuxOverlay {
+        lower: held.retained().overlay_lower(),
+        upper: crate::PrivatePath::new("upper.raw")?,
+        upper_uuid: upper.uuid,
+        capacity: upper.capacity,
+        ext4_profile: upper.ext4_profile,
+        overlay_profile: upper.overlay_profile,
+        temporary_directory: upper.temporary_directory,
+    };
+    storage.profile = crate::StorageProfile::LinuxOverlayV1;
+    storage.backend = crate::BackendRequirement::KrunOverlay;
+    if let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut storage.boot {
+        *root_selector = crate::RootSelector::ManagedOverlay;
+    }
+    storage.validate()?;
+    Ok(storage)
+}
+
+/// Copy an authenticated private root into the machine directory under
+/// `target` through a staged, verified, durably published copy.
+fn copy_root(
+    machine_dir: &Path,
+    source: crate::machine::root_disk::CopySource<'_>,
+    length: u64,
+    target: &str,
+) -> Result<(), LibVmError> {
+    let directory = OwnedDirectory::open_existing_root(machine_dir)?.ok_or_else(|| {
+        crate::machine::root_storage::invalid("new machine directory disappeared")
+    })?;
+    let stage_name = format!(".copy-{}", uuid::Uuid::new_v4());
+    let stage = directory
+        .create_dir(&stage_name)?
+        .ok_or_else(|| crate::machine::root_storage::invalid("private copy staging collision"))?;
+    let mut qualification = CopyQualification::new(32);
+    let mut prepared = copy_private(source, stage, "content", &mut qualification)?;
+    tracing::debug!(
+        method = ?prepared.method(),
+        verification = ?prepared.verification(),
+        file = ?prepared.file(),
+        length,
+        "prepared private root copy",
+    );
+    prepared.publish(directory.try_clone()?, target)?;
+    prepared.retain();
+    directory.remove_tree(&stage_name)?;
+    directory.sync()?;
+    Ok(())
 }
 
 async fn create_machine_guard(
@@ -1177,26 +1376,6 @@ fn canonicalize_existing_path(path: &Path, kind: &str) -> Result<PathBuf, LibVmE
         name: kind.to_string(),
         reason: format!("{kind} path does not exist: {} ({err})", abs.display()),
     })
-}
-
-fn machine_rootfs_record(
-    create: &MachineCreateGuard,
-    image: &MaterializedImage,
-    root_disk_path: PathBuf,
-    root_disk_size_bytes: u64,
-) -> MachineRootfsRecord {
-    MachineRootfsRecord {
-        machine_id: create.id,
-        source_kind: image.source_kind,
-        requested_reference: image.requested_reference.clone(),
-        selected_reference: image.selected_reference.clone(),
-        manifest_digest: image.manifest_digest.clone(),
-        config_digest: image.config_digest.clone(),
-        image_id: image.image_id.clone(),
-        root_disk_path,
-        root_disk_size_bytes,
-        created_at: now_unix(),
-    }
 }
 
 impl MachineCreateGuard {
@@ -1801,7 +1980,6 @@ mod tests {
             initramfs: Some(initramfs),
             kernel_args: Vec::new(),
             disk_size_bytes: None,
-            root_profile: crate::RootProfile::OpaqueRaw,
             temporary_directory: crate::TemporaryDirectoryPolicy::DiskBacked,
             nested_virtualization: false,
             rosetta: None,
@@ -2539,29 +2717,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vmdk_profile_is_explicit_and_unqualified_create_has_no_machine_or_lower_effects() {
+    async fn oci_source_selects_layered_root_and_unqualified_create_has_no_effects() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
         let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
-        assert_eq!(
-            runtime.machine().request.root_profile,
-            crate::RootProfile::OpaqueRaw
-        );
         assert_eq!(
             runtime.machine().request.temporary_directory,
             crate::TemporaryDirectoryPolicy::DiskBacked
         );
         let source = write_base_rootfs(temp.path());
         let mut request = create_request(source.clone(), "unqualified-overlay");
-        request.root_profile = crate::RootProfile::LinuxFlatOverlayV1;
         request.image_source = Some(ImageSource::oci(
             "unreachable.invalid/should-not-resolve:latest",
         ));
+        // No exact boot tuple is admitted, so the source-selected layered root
+        // is refused before resolution, acquisition or any machine effect.
         let error = create_machine_config(&runtime, request).await.unwrap_err();
-        assert!(matches!(
-            error,
-            LibVmError::OverlayBootQualification(_) | LibVmError::OverlayBackendUnsupported { .. }
-        ));
+        assert!(
+            matches!(
+                error,
+                LibVmError::OverlayBootQualification(_)
+                    | LibVmError::OverlayBackendUnsupported { .. }
+                    | LibVmError::BackendAdmissionRejected {
+                        remedy:
+                            crate::runtime::boot_assets::AdmissionRemedy::ExplicitOciToRawConversion,
+                        ..
+                    }
+            ),
+            "{error}"
+        );
         assert!(store
             .machine_config_by_name("unqualified-overlay")
             .await
@@ -2574,19 +2758,63 @@ mod tests {
         assert!(source.exists());
     }
 
+    #[test]
+    fn vz_refuses_ordinary_oci_creation_with_explicit_conversion_remedy() {
+        let error = crate::runtime::boot_assets::admit_create_source(
+            crate::runtime::boot_assets::SourceFamily::Oci,
+            crate::StorageProfile::LinuxOverlayV1,
+            crate::BackendRequirement::KrunOverlay,
+            vm_spec::live::LiveBackend::Vz,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LibVmError::BackendAdmissionRejected {
+                source_family: crate::runtime::boot_assets::SourceFamily::Oci,
+                remedy: crate::runtime::boot_assets::AdmissionRemedy::ExplicitOciToRawConversion,
+                effective_backend: vm_spec::live::LiveBackend::Vz,
+                ..
+            }
+        ));
+        // A layered managed image inherits its family: VZ names krun instead.
+        assert!(matches!(
+            crate::runtime::boot_assets::admit_create_source(
+                crate::runtime::boot_assets::SourceFamily::ManagedImage,
+                crate::StorageProfile::LinuxOverlayV1,
+                crate::BackendRequirement::KrunOverlay,
+                vm_spec::live::LiveBackend::Vz,
+            ),
+            Err(LibVmError::BackendAdmissionRejected {
+                remedy: crate::runtime::boot_assets::AdmissionRemedy::UseKrun,
+                ..
+            })
+        ));
+        crate::runtime::boot_assets::admit_create_source(
+            crate::runtime::boot_assets::SourceFamily::ManagedImage,
+            crate::StorageProfile::OpaqueRawV1,
+            crate::BackendRequirement::RawBlock,
+            vm_spec::live::LiveBackend::Vz,
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
-    async fn vmdk_profile_rejects_imported_disk_and_root_argument_overrides_before_materialization()
-    {
+    async fn raw_sources_refuse_tmpfs_and_layered_roots_refuse_root_arguments_before_materialization(
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
         let (runtime, store) = runtime_with_sqlite_store(paths).await;
         let source = write_base_rootfs(temp.path());
         let mut request = create_request(source, "imported-descriptor");
-        request.root_profile = crate::RootProfile::LinuxFlatOverlayV1;
+        // tmpfs `/tmp` is a policy of a new OCI layered root only.
+        request.temporary_directory = crate::TemporaryDirectoryPolicy::Tmpfs {
+            capacity_bytes: 64 << 20,
+        };
         assert!(matches!(
             create_machine_config(&runtime, request.clone()).await,
             Err(LibVmError::InvalidCreateRequest { .. })
         ));
+        request.temporary_directory = crate::TemporaryDirectoryPolicy::DiskBacked;
         request.image_source = Some(ImageSource::oci(
             "unreachable.invalid/should-not-resolve:latest",
         ));

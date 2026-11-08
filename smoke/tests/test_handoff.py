@@ -16,8 +16,8 @@ from uuid import UUID
 
 import pytest
 
-from silo_smoke import handoff, image_cache, overlay, procs, stopped
-from silo_smoke.cli import TIMINGS_PROPERTY, Silo, release
+from silo_smoke import handoff, image_cache, procs, stopped
+from silo_smoke.cli import TIMINGS_PROPERTY, RootProfile, Silo, release
 from silo_smoke.config import SmokeConfig
 from silo_smoke.daemon import Daemon
 from silo_smoke.handoff import Runtime
@@ -29,7 +29,6 @@ from .test_stopped import stopped_image
 pytestmark = [pytest.mark.linux_only, pytest.mark.daemon]
 
 RESOURCES = ("--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
-PROFILES = {"raw": (), "flat": ("--root-profile", overlay.PROFILE)}
 OWNED = {"state": "owned"}
 NO_PAYLOAD = {"payloads": 0, "payloadBytes": 0}
 MIB = 1024**2
@@ -63,14 +62,14 @@ def runtimes(config: SmokeConfig, registry: LoopbackRegistry, overlay_image_cach
             release(workspace, failed=failed, publish=lambda value: request.node.user_properties.append((TIMINGS_PROPERTY, value)))
 
 
-def _create(runtime: Runtime, image: str, name: str, profile: str) -> UUID:
-    runtime.silo.create(name, image, *RESOURCES, *PROFILES[profile])
+def _create(runtime: Runtime, image: str, name: str, profile: RootProfile) -> UUID:
+    runtime.silo.create(name, runtime.silo.root_image(image, profile), *RESOURCES)
     return UUID(procs.machine_id(runtime.ws, name))
 
 
-def _warm(runtime: Runtime, image: str, profile: str) -> None:
+def _warm(runtime: Runtime, image: str, profile: RootProfile) -> None:
     """Prepare a destination the ordinary way: an unrelated never-booted machine
-    from the same image retains the exact lower stream and pinned boot objects."""
+    from the same image retains the exact lower closure and pinned boot objects."""
     _create(runtime, image, f"warm-{profile}", profile)
     handoff.assert_stopped_unstarted(runtime, f"warm-{profile}")
 
@@ -317,9 +316,9 @@ def test_destination_crash_then_explicit_abort_unfences_only_the_source(runtimes
 def test_direct_return_cycles_recover_after_crash_and_ignore_stale_requests(runtimes: tuple[Runtime, Runtime], stopped_image: str) -> None:
     laptop, cloud = runtimes
     name = "roamer"
-    machine = _create(laptop, stopped_image, name, "flat")
+    machine = _create(laptop, stopped_image, name, "layered")
     for runtime in (laptop, cloud):
-        _warm(runtime, stopped_image, "flat")
+        _warm(runtime, stopped_image, "layered")
     handoff.boot(laptop, name)
     handoff.write_marker(laptop.silo, name, "/handoff-cycle", "laptop-0")
     handoff.stop(laptop, name)

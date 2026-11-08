@@ -18,10 +18,11 @@ use crate::{
     LibVmError,
 };
 
-/// Explicit phase-2 ingest/publication/composition surface. Default roots remain flat.
+/// Explicit ingest/publication surface for layer results; retained
+/// compositions over them live in `crate::store::composition_store`.
 #[derive(Clone)]
 pub struct LayerStore {
-    store: Store,
+    pub(crate) store: Store,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedLayer {
@@ -29,7 +30,22 @@ pub struct RetainedLayer {
     pub recipe: LayerRecipeId,
     pub pack_stream: StreamId,
     pub pack_length: u64,
+    /// Retained paged map root of the pack stream; describing the pack in a
+    /// snapshot or transfer never rehashes its bytes.
+    pub pack_map: ObjectDigest,
     pub index_root: ContentDigest,
+}
+
+/// Every authenticated fact of one retained layer occurrence.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedLayer {
+    pub(crate) changeset: LayerChangeset,
+    pub(crate) result: LayerResult,
+    pub(crate) recipe_digest: ObjectDigest,
+    pub(crate) result_digest: ObjectDigest,
+    pub(crate) index_root: ObjectDigest,
+    pub(crate) index_pages: Vec<ObjectDigest>,
+    pub(crate) pack: crate::store::models::snapshot::SnapshotStream,
 }
 
 /// Payload references remain usable only while this closure owner is alive.
@@ -41,7 +57,8 @@ pub struct HeldNamespace {
     namespace: oci::changeset::namespace::ValidatedNamespace,
     _owner: LayerReadOwner,
 }
-struct LayerReadOwner {
+pub(crate) struct LayerReadOwner {
+    pub(crate) operation: uuid::Uuid,
     _lease: crate::storage::locks::StorageLock,
     _store: Store,
 }
@@ -141,14 +158,14 @@ impl Drop for PublicationStaging {
         }
     }
 }
-struct PublicationFacts {
-    retained: RetainedLayer,
-    diff_id: ContentDigest,
-    recipe_bytes: Vec<u8>,
-    result_bytes: Vec<u8>,
-    recipe_digest: ObjectDigest,
-    result_digest: ObjectDigest,
-    dependencies: BTreeSet<ObjectDigest>,
+pub(crate) struct PublicationFacts {
+    pub(crate) retained: RetainedLayer,
+    pub(crate) diff_id: ContentDigest,
+    pub(crate) recipe_bytes: Vec<u8>,
+    pub(crate) result_bytes: Vec<u8>,
+    pub(crate) recipe_digest: ObjectDigest,
+    pub(crate) result_digest: ObjectDigest,
+    pub(crate) dependencies: BTreeSet<ObjectDigest>,
 }
 struct PreparedLayer {
     facts: PublicationFacts,
@@ -162,6 +179,9 @@ impl LayerStore {
         Ok(Self {
             store: Store::open(&home.join("state.db")).await?,
         })
+    }
+    pub(crate) fn from_store(store: Store) -> Self {
+        Self { store }
     }
     /// Successful ingestion is required; all validation completes before pool publication.
     pub async fn publish(
@@ -211,7 +231,10 @@ impl LayerStore {
         worker.await??;
         result
     }
-    async fn commit_layer(&self, p: &PublicationFacts) -> Result<RetainedLayer, LibVmError> {
+    pub(crate) async fn commit_layer(
+        &self,
+        p: &PublicationFacts,
+    ) -> Result<RetainedLayer, LibVmError> {
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("INSERT INTO layer_recipe(id,diff_id,record_digest,record_bytes) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO NOTHING")
             .bind(p.retained.recipe.to_string()).bind(p.diff_id.to_string()).bind(p.recipe_digest.to_string()).bind(&p.recipe_bytes).execute(&mut *tx).await?;
@@ -226,13 +249,14 @@ impl LayerStore {
         {
             return Err(semantic("immutable recipe contradiction"));
         }
-        let inserted=sqlx::query("INSERT INTO layer_result(id,recipe_id,pack_stream,pack_length,index_root,record_digest,record_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO NOTHING")
-            .bind(p.retained.id.to_string()).bind(p.retained.recipe.to_string()).bind(p.retained.pack_stream.to_string()).bind(int(p.retained.pack_length)?).bind(p.retained.index_root.to_string()).bind(p.result_digest.to_string()).bind(&p.result_bytes).execute(&mut *tx).await?.rows_affected()!=0;
-        let stored=sqlx::query("SELECT recipe_id,pack_stream,pack_length,index_root,record_digest,record_bytes FROM layer_result WHERE id=?1").bind(p.retained.id.to_string()).fetch_one(&mut *tx).await?;
+        let inserted=sqlx::query("INSERT INTO layer_result(id,recipe_id,pack_stream,pack_length,pack_map,index_root,record_digest,record_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO NOTHING")
+            .bind(p.retained.id.to_string()).bind(p.retained.recipe.to_string()).bind(p.retained.pack_stream.to_string()).bind(int(p.retained.pack_length)?).bind(p.retained.pack_map.to_string()).bind(p.retained.index_root.to_string()).bind(p.result_digest.to_string()).bind(&p.result_bytes).execute(&mut *tx).await?.rows_affected()!=0;
+        let stored=sqlx::query("SELECT recipe_id,pack_stream,pack_length,pack_map,index_root,record_digest,record_bytes FROM layer_result WHERE id=?1").bind(p.retained.id.to_string()).fetch_one(&mut *tx).await?;
         if stored.try_get::<Vec<u8>, _>("record_bytes")? != p.result_bytes
             || stored.try_get::<String, _>("recipe_id")? != p.retained.recipe.to_string()
             || stored.try_get::<String, _>("pack_stream")? != p.retained.pack_stream.to_string()
             || stored.try_get::<i64, _>("pack_length")? != int(p.retained.pack_length)?
+            || stored.try_get::<String, _>("pack_map")? != p.retained.pack_map.to_string()
             || stored.try_get::<String, _>("index_root")? != p.retained.index_root.to_string()
             || stored.try_get::<String, _>("record_digest")? != p.result_digest.to_string()
         {
@@ -271,7 +295,7 @@ impl LayerStore {
         limits: &ChangesetLimits,
     ) -> Result<Option<RetainedLayer>, LibVmError> {
         let Some(row) = sqlx::query(
-            "SELECT id,pack_stream,pack_length,index_root FROM layer_result WHERE recipe_id=?1",
+            "SELECT id,pack_stream,pack_length,pack_map,index_root FROM layer_result WHERE recipe_id=?1",
         )
         .bind(recipe.to_string())
         .fetch_optional(&self.store.pool)
@@ -297,6 +321,10 @@ impl LayerStore {
                 .parse()
                 .map_err(semantic)?,
             pack_length: u64::try_from(row.try_get::<i64, _>("pack_length")?).map_err(semantic)?,
+            pack_map: row
+                .try_get::<String, _>("pack_map")?
+                .parse()
+                .map_err(semantic)?,
             index_root: row
                 .try_get::<String, _>("index_root")?
                 .parse()
@@ -388,6 +416,17 @@ impl LayerStore {
         &self,
         results: &[LayerResultId],
     ) -> Result<LayerReadOwner, LibVmError> {
+        self.begin_consumer(results, &[]).await
+    }
+
+    /// One leased consumer operation pinning layer results (their pack streams
+    /// and index objects) and retained compositions. A missing composition row
+    /// is an acquisition requirement, never an implicit regeneration.
+    pub(crate) async fn begin_consumer(
+        &self,
+        results: &[LayerResultId],
+        lowers: &[crate::storage::identity::LowerResultId],
+    ) -> Result<LayerReadOwner, LibVmError> {
         let pool = StoragePool::open_existing(&self.store.images_dir)?.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -399,6 +438,21 @@ impl LayerStore {
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         let lease = pool.lease(operation)?;
         Store::insert_stopped_operation(&mut tx, operation, "import", &lease, &[], &[]).await?;
+        for lower in lowers {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM composition_result WHERE id=?1)")
+                    .bind(lower.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !exists {
+                return Err(LibVmError::CompositionAcquisitionRequired {
+                    lower: *lower,
+                    missing: "retained composition record".into(),
+                });
+            }
+            sqlx::query("INSERT OR IGNORE INTO storage_operation_lower(operation_id,lower_id) VALUES(?1,?2)")
+                .bind(operation.to_string()).bind(lower.to_string()).execute(&mut *tx).await?;
+        }
         for result in results {
             let stream: String =
                 sqlx::query_scalar("SELECT pack_stream FROM layer_result WHERE id=?1")
@@ -414,6 +468,7 @@ impl LayerStore {
         }
         tx.commit().await?;
         Ok(LayerReadOwner {
+            operation,
             _lease: lease,
             _store: self.store.clone(),
         })
@@ -425,8 +480,24 @@ impl LayerStore {
         limits: &ChangesetLimits,
         authenticate_payload: bool,
     ) -> Result<LayerChangeset, LibVmError> {
+        Ok(self
+            .load_pinned_layer(id, limits, authenticate_payload)
+            .await?
+            .changeset)
+    }
+
+    /// Authenticate every retained record, index page and the pack map root
+    /// against the exact catalog dependency set. `authenticate_payload` also
+    /// rehashes pack bytes; consumers that hash the held descriptor
+    /// themselves (composition, VMDK verification) pass `false`.
+    pub(crate) async fn load_pinned_layer(
+        &self,
+        id: LayerResultId,
+        limits: &ChangesetLimits,
+        authenticate_payload: bool,
+    ) -> Result<PinnedLayer, LibVmError> {
         limits.validate()?;
-        let row=sqlx::query("SELECT r.recipe_id,r.pack_stream,r.pack_length,r.index_root,r.record_digest,r.record_bytes,p.diff_id,p.record_digest AS recipe_digest,p.record_bytes AS recipe_bytes FROM layer_result r JOIN layer_recipe p ON p.id=r.recipe_id WHERE r.id=?1")
+        let row=sqlx::query("SELECT r.recipe_id,r.pack_stream,r.pack_length,r.pack_map,r.index_root,r.record_digest,r.record_bytes,p.diff_id,p.record_digest AS recipe_digest,p.record_bytes AS recipe_bytes FROM layer_result r JOIN layer_recipe p ON p.id=r.recipe_id WHERE r.id=?1")
             .bind(id.to_string()).fetch_one(&self.store.pool).await?;
         let recipe: LayerRecipeId = row.try_get::<String, _>("recipe_id")?.parse()?;
         let diff_id: ContentDigest = row.try_get::<String, _>("diff_id")?.parse()?;
@@ -435,6 +506,10 @@ impl LayerStore {
             .parse()
             .map_err(semantic)?;
         let pack_length = u64::try_from(row.try_get::<i64, _>("pack_length")?).map_err(semantic)?;
+        let pack_map: ObjectDigest = row
+            .try_get::<String, _>("pack_map")?
+            .parse()
+            .map_err(semantic)?;
         let index_root: ContentDigest = row.try_get::<String, _>("index_root")?.parse()?;
         if pack_length > limits.max_pack_bytes {
             return Err(oci::changeset::ChangesetError::Limit {
@@ -501,6 +576,7 @@ impl LayerStore {
             let root_digest = object(index_root)?;
             observed.insert(root_digest);
             let root = pool.read_object(&root_digest, oci::changeset::limits::MAX_ROOT_BYTES)?;
+            let mut pages = BTreeSet::new();
             let mut page_error = None;
             let decoded = oci::changeset::decode_index(
                 &root,
@@ -509,6 +585,7 @@ impl LayerStore {
                         oci::changeset::ChangesetError::Invalid(error.to_string())
                     })?;
                     observed.insert(digest);
+                    pages.insert(digest);
                     match pool.read_object(&digest, limits.max_page_bytes) {
                         Ok(bytes) => Ok(bytes),
                         Err(error) => {
@@ -526,10 +603,36 @@ impl LayerStore {
                 return Err(LibVmError::Storage(error));
             }
             let layer = decoded?;
+            // The paged pack map is authenticated against the pack identity
+            // itself, so describing the pack never needs its bytes.
+            let map_root = crate::storage::map::StreamMapRoot::decode(&pool.read_object(
+                &pack_map,
+                crate::storage::limits::Resource::MetadataPageBytes.maximum(),
+            )?)?;
+            if map_root.stream != pack_stream || map_root.length != pack_length {
+                return Err(semantic("pack map root contradicts its pack stream"));
+            }
+            map_root.read_map(&pool)?;
+            observed.insert(pack_map);
+            observed.extend(map_root.pages.iter().copied());
+            pages.remove(&root_digest);
             if layer.pack_length != pack_length || observed != dependencies {
                 return Err(semantic("index or dependency closure contradiction"));
             }
-            Ok(layer)
+            Ok(PinnedLayer {
+                changeset: layer,
+                result: result_record,
+                recipe_digest: ObjectDigest::of_bytes(&recipe_bytes),
+                result_digest: ObjectDigest::of_bytes(&result_bytes),
+                index_root: root_digest,
+                index_pages: pages.into_iter().collect(),
+                pack: crate::store::models::snapshot::SnapshotStream {
+                    stream: pack_stream,
+                    map: pack_map,
+                    map_pages: map_root.pages,
+                    length: pack_length,
+                },
+            })
         })
         .await?
     }
@@ -639,7 +742,22 @@ fn prepare(
     let result_bytes = result.canonical_bytes()?;
     let recipe_digest = ObjectDigest::of_bytes(&recipe_bytes);
     let result_digest = ObjectDigest::of_bytes(&result_bytes);
-    for bytes in [&recipe_bytes, &result_bytes] {
+    // The pack's paged map is retained once with its layer, so later snapshot,
+    // transfer and launch descriptions never rehash the pack bytes.
+    let mut map_pages = Vec::new();
+    let mut map_objects = Vec::new();
+    for page in crate::storage::map::pages(&stream.map) {
+        let page = page?;
+        map_pages.push(ObjectDigest::of_bytes(&page));
+        map_objects.push(page);
+    }
+    let map_root = crate::storage::map::StreamMapRoot::new(&stream.map, map_pages)?.encode()?;
+    let pack_map = ObjectDigest::of_bytes(&map_root);
+    map_objects.push(map_root);
+    for bytes in [&recipe_bytes, &result_bytes]
+        .into_iter()
+        .chain(map_objects.iter())
+    {
         let digest = ObjectDigest::of_bytes(bytes);
         std::fs::write(operation.temporary().join(digest.hex()), bytes)?;
         staged_objects.insert(digest.to_string().parse::<ContentDigest>()?);
@@ -683,6 +801,7 @@ fn prepare(
                 recipe: recipe_id,
                 pack_stream: stream.id,
                 pack_length: stream.length,
+                pack_map,
                 index_root,
             },
             diff_id: staged.changeset().diff_id,
@@ -744,6 +863,7 @@ impl Store {
                 tx.commit().await?;
             }
             crate::store::cache_paths::check_machine_dependencies(&store).await?;
+            crate::store::composition_store::retire_compositions(&store, &pool).await?;
             let mut cursor=String::new();
             loop {
                 let ids=sqlx::query_scalar::<_,String>("SELECT id FROM layer_result WHERE id>?1 ORDER BY id LIMIT 256")
@@ -757,7 +877,7 @@ impl Store {
                     if let Some(stream)=stream {
                         if crate::store::cache_paths::machine_retains_stream(&mut tx,stream.parse::<StreamId>().map_err(semantic)?).await? {continue;}
                     }
-                    sqlx::query("DELETE FROM layer_result WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM layer_occurrence WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_layer WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=layer_result.pack_stream)")
+                    sqlx::query("DELETE FROM layer_result WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM layer_occurrence WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM composition_layer WHERE layer_result_id=?1) AND NOT EXISTS(SELECT 1 FROM storage_operation_layer WHERE result_id=?1) AND NOT EXISTS(SELECT 1 FROM snapshot_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM image_stream_dependency WHERE stream_id=layer_result.pack_stream) AND NOT EXISTS(SELECT 1 FROM storage_operation_stream WHERE stream_id=layer_result.pack_stream)")
                         .bind(&id).execute(&mut *tx).await?;
                 }
                 tx.commit().await?;
@@ -793,6 +913,9 @@ impl Store {
                 }
                 runtime.block_on(store.check_operation_recovery(&pool))?;
                 runtime.block_on(store.check_layer_catalog())?;
+                runtime.block_on(crate::store::composition_store::check_composition_catalog(
+                    &store,
+                ))?;
                 runtime.block_on(crate::store::snapshot_store::check_snapshot_catalog(&store))?;
                 runtime.block_on(crate::store::managed_image_store::check_image_catalog(
                     &store,
@@ -931,7 +1054,7 @@ pub(crate) mod tests {
     fn staged(home: &Path, store: &LayerStore) -> StagedChangeset {
         staged_byte(home, store, b'A')
     }
-    fn staged_byte(home: &Path, store: &LayerStore, byte: u8) -> StagedChangeset {
+    pub(crate) fn staged_byte(home: &Path, store: &LayerStore, byte: u8) -> StagedChangeset {
         let mut bytes = tar();
         bytes[512] = byte;
         let source = home.join("source.tar");
@@ -1237,16 +1360,8 @@ pub(crate) mod tests {
         let report = store.store.prune_images().await.unwrap();
         assert_eq!(report.bytes_removed, 0);
         store.load(a.id, &ChangesetLimits::default()).await.unwrap();
-        // A flat artifact may share a live namespace's layer stream.
-        // Neither GC gate may unlink that pack while the consumer owns it.
-        sqlx::query("INSERT INTO image_manifest(digest,media_type,image_id,platform_os,platform_architecture,config_digest,layer_count,total_size_bytes,created_at) VALUES('fixture-manifest','fixture','fixture-image','linux','amd64','fixture-config',0,4096,0)").execute(&store.store.pool).await.unwrap();
         let pool = StoragePool::open(&store.store.images_dir).unwrap();
-        sqlx::query("INSERT INTO image_rootfs_artifact(image_id,manifest_digest,config_digest,platform_os,platform_architecture,filesystem,rootfs_path,size_bytes,created_at,stream_id,conversion_abi) VALUES('fixture-image','fixture-manifest','fixture-config','linux','amd64','ext4',?1,?2,0,?3,?4)")
-            .bind(pool.stream_path(&a.pack_stream).to_str().unwrap()).bind(a.pack_length as i64).bind(a.pack_stream.to_string()).bind(crate::image::oci::CONVERSION_ABI).execute(&store.store.pool).await.unwrap();
-        let report = store.store.prune_images().await.unwrap();
-        assert_eq!(report.bytes_removed, 0);
         assert!(pool.stream_path(&a.pack_stream).exists());
-        store.load(a.id, &ChangesetLimits::default()).await.unwrap();
         drop(namespace);
         store.store.prune_images().await.unwrap();
         assert_eq!(count(&store, "layer_result").await, 0);

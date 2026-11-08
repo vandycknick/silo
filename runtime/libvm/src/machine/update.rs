@@ -51,7 +51,7 @@ pub struct MachineUpdate {
     pub memory: Option<Memory>,
     /// New desired root disk size in bytes.
     pub root_disk_size: Option<u64>,
-    /// Explicit `/tmp` policy for a stopped flat-overlay machine.
+    /// Explicit `/tmp` policy for a stopped layered-overlay machine.
     pub temporary_directory: Option<crate::TemporaryDirectoryPolicy>,
     /// New nested virtualization setting.
     pub nested_virtualization: Option<bool>,

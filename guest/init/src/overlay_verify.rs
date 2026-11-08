@@ -195,7 +195,7 @@ pub fn verify(
         let mut index = defaults.index;
         let mut metacopy = defaults.metacopy;
         let mut redirect = !defaults.redirect_dir && !defaults.redirect_always_follow;
-        // The module default is AUTO or OFF, never ON. With distinct ext4
+        // The module default is AUTO or OFF, never ON. With distinct EROFS/ext4
         // layer superblocks, the qualified renderer must print xino=on.
         let mut xino = false;
         let mut nfs_export = defaults.nfs_export;
@@ -281,11 +281,29 @@ fn on_off(value: &[u8]) -> Result<bool, &'static str> {
     }
 }
 
-/// Verify the underlying maintenance mount independently of overlay's paths.
+/// Verify the immutable lower's actual filesystem, identity and access.
+pub fn verify_erofs_mount(
+    mountinfo: &[u8],
+    target: &[u8],
+    device: (u32, u32),
+) -> Result<(), &'static str> {
+    verify_maintenance_mount(mountinfo, target, device, b"erofs", true)
+}
+
+/// Verify the writable upper maintenance mount independently of overlay's paths.
 pub fn verify_ext4_mount(
     mountinfo: &[u8],
     target: &[u8],
     device: (u32, u32),
+) -> Result<(), &'static str> {
+    verify_maintenance_mount(mountinfo, target, device, b"ext4", false)
+}
+
+fn verify_maintenance_mount(
+    mountinfo: &[u8],
+    target: &[u8],
+    device: (u32, u32),
+    filesystem: &[u8],
     read_only: bool,
 ) -> Result<(), &'static str> {
     if !mountinfo.is_empty() && !mountinfo.ends_with(b"\n") {
@@ -307,8 +325,8 @@ pub fn verify_ext4_mount(
         if entry.root != b"/" || entry.device != device {
             return Err("overlay: maintenance mount identity mismatch");
         }
-        if entry.filesystem != b"ext4" {
-            return Err("overlay: maintenance mount not ext4");
+        if entry.filesystem != filesystem {
+            return Err("overlay: maintenance filesystem mismatch");
         }
         let flags = entry.flags;
         let options = entry.options;
@@ -335,13 +353,6 @@ pub fn verify_ext4_mount(
             if count != 1 {
                 return Err("overlay: missing maintenance access evidence");
             }
-        }
-        if read_only
-            && !options
-                .split(|byte| *byte == b',')
-                .any(|option| matches!(option, b"noload" | b"norecovery"))
-        {
-            return Err("overlay: lower journal suppression missing");
         }
     }
     if found {
@@ -449,7 +460,7 @@ mod tests {
     }
     #[test]
     fn truncated_or_malformed_final_record_rejects_an_earlier_valid_match() {
-        use crate::overlay_verify::verify_ext4_mount;
+        use crate::overlay_verify::verify_erofs_mount;
         let unrelated = b"21 1 0:21 / /unrelated rw - tmpfs tmpfs rw";
         let mut complete = GOOD.to_vec();
         complete.extend_from_slice(unrelated);
@@ -462,12 +473,11 @@ mod tests {
             assert!(verify(RENDERING_ABI, &truncated, defaults(), paths()).is_err());
             truncated.push(b'\n');
             assert!(verify(RENDERING_ABI, &truncated, defaults(), paths()).is_err());
-            let mut maintenance =
-                b"12 1 254:0 / /lower ro - ext4 /dev/vda ro,norecovery\n".to_vec();
+            let mut maintenance = b"12 1 254:0 / /lower ro - erofs /dev/vda ro\n".to_vec();
             maintenance.extend_from_slice(&unrelated[..cut]);
-            assert!(verify_ext4_mount(&maintenance, b"/lower", (254, 0), true).is_err());
+            assert!(verify_erofs_mount(&maintenance, b"/lower", (254, 0)).is_err());
             maintenance.push(b'\n');
-            assert!(verify_ext4_mount(&maintenance, b"/lower", (254, 0), true).is_err());
+            assert!(verify_erofs_mount(&maintenance, b"/lower", (254, 0)).is_err());
         }
         for malformed in [
             b"21 1 0:x / /unrelated rw - tmpfs tmpfs rw".as_slice(),
@@ -490,18 +500,31 @@ mod tests {
         assert!(verify(RENDERING_ABI, input, defaults(), paths).is_ok());
     }
     #[test]
-    fn maintenance_mount_identity_access_and_noload_are_required() {
-        use crate::overlay_verify::verify_ext4_mount;
-        let good = b"12 1 254:0 / /lower ro - ext4 /dev/vda ro,norecovery\n";
-        assert!(verify_ext4_mount(good, b"/lower", (254, 0), true).is_ok());
-        assert!(verify_ext4_mount(good, b"/lower", (254, 1), true).is_err());
-        assert!(verify_ext4_mount(good, b"/lower", (254, 0), false).is_err());
-        assert!(verify_ext4_mount(
-            b"12 1 254:0 / /lower ro - ext4 /dev/vda ro\n",
-            b"/lower",
-            (254, 0),
-            true
-        )
-        .is_err());
+    fn maintenance_mount_identity_filesystem_and_access_are_required() {
+        use crate::overlay_verify::{verify_erofs_mount, verify_ext4_mount};
+        let good = b"12 1 254:0 / /lower ro - erofs /dev/vda ro\n";
+        assert!(verify_erofs_mount(good, b"/lower", (254, 0)).is_ok());
+        assert!(verify_erofs_mount(good, b"/lower", (254, 1)).is_err());
+        assert!(verify_ext4_mount(good, b"/lower", (254, 0)).is_err());
+        for invalid in [
+            b"12 1 254:0 / /lower ro - ext4 /dev/vda ro,norecovery\n".as_slice(),
+            b"12 1 254:0 / /lower rw - erofs /dev/vda ro\n",
+            b"12 1 254:0 / /lower ro - erofs /dev/vda rw\n",
+            b"12 1 254:0 / /lower ro,ro - erofs /dev/vda ro\n",
+            b"12 1 254:0 /sub /lower ro - erofs /dev/vda ro\n",
+            b"12 1 254:0 / /lower ro - erofs /dev/vda ro\n13 1 254:0 / /lower ro - erofs /dev/vda ro\n",
+        ] {
+            assert!(verify_erofs_mount(invalid, b"/lower", (254, 0)).is_err());
+        }
+        let upper = b"13 1 254:1 / /upper rw - ext4 /dev/vdb rw\n";
+        assert!(verify_ext4_mount(upper, b"/upper", (254, 1)).is_ok());
+        assert!(verify_erofs_mount(upper, b"/upper", (254, 1)).is_err());
+        for invalid in [
+            b"13 1 254:1 / /upper ro - ext4 /dev/vdb rw\n".as_slice(),
+            b"13 1 254:1 / /upper rw - ext4 /dev/vdb ro\n",
+            b"13 1 254:1 / /upper rw - erofs /dev/vdb rw\n",
+        ] {
+            assert!(verify_ext4_mount(invalid, b"/upper", (254, 1)).is_err());
+        }
     }
 }

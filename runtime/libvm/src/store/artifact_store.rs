@@ -77,6 +77,11 @@ async fn commit_owned(
         ));
         drop(roots);
     }
+    let semantic_streams = match &parts.content {
+        VerifiedContent::Image { record, .. } => record.content_dependencies()?.0,
+        VerifiedContent::StoppedSnapshot { record, .. }
+        | VerifiedContent::LiveCheckpoint { record, .. } => record.content_dependencies()?.0,
+    };
     let mut representations = Vec::new();
     for stream in parts.streams.values() {
         let content = crate::store::models::snapshot::SnapshotStream {
@@ -86,24 +91,30 @@ async fn commit_owned(
             map_pages: stream.canonical_pages.clone(),
         };
         bind_held(&stream.file, stream.fingerprint)?;
-        let (published, roots) =
-            pool.publish_stream_file_for_catalog(stream.file.try_clone()?, stream.length)?;
-        if published.id != stream.id || published.map != *stream.map {
-            return Err(invalid(
-                "imported stream publication identity contradiction",
+        // Object-only transfer maps retain encoded chunks, not another
+        // permanent whole-stream inode. In particular fsmeta remains one
+        // ObjectDigest backing, irrespective of its chunked wire encoding.
+        let flat = semantic_streams.contains(&stream.id);
+        if flat {
+            let (published, roots) =
+                pool.publish_stream_file_for_catalog(stream.file.try_clone()?, stream.length)?;
+            if published.id != stream.id || published.map != *stream.map {
+                return Err(invalid(
+                    "imported stream publication identity contradiction",
+                ));
+            }
+            store
+                .pin_published_storage_dependencies(operation, &[stream.id], &[])
+                .await?;
+            mark_flat_present(&mut *store.pool.acquire().await?, &content).await?;
+            fingerprints.push((
+                published.path.clone(),
+                crate::storage::identity_file::SourceFingerprint::new(&std::fs::symlink_metadata(
+                    published.path,
+                )?),
             ));
+            drop(roots);
         }
-        store
-            .pin_published_storage_dependencies(operation, &[stream.id], &[])
-            .await?;
-        mark_flat_present(&mut *store.pool.acquire().await?, &content).await?;
-        fingerprints.push((
-            published.path.clone(),
-            crate::storage::identity_file::SourceFingerprint::new(&std::fs::symlink_metadata(
-                published.path,
-            )?),
-        ));
-        drop(roots);
         for descriptor in &stream.transport.chunks {
             let (published, roots) = pool.publish_object_file_for_catalog(
                 parts.blobs.open(&descriptor.digest)?,
@@ -138,10 +149,24 @@ async fn commit_owned(
                 .await?;
             drop(roots);
         }
-        representations.push(
+        representations.push((
             VerifiedStreamRepresentation::verify(&pool, content, stream.transport.root.0)?
                 .for_import(),
-        );
+            flat,
+        ));
+    }
+    let root = match &parts.content {
+        VerifiedContent::Image { record, .. } => &record.root,
+        VerifiedContent::StoppedSnapshot { record, .. }
+        | VerifiedContent::LiveCheckpoint { record, .. } => &record.root,
+    };
+    if let crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay { lower, .. } =
+        &root.profile
+    {
+        crate::store::layer_store::LayerStore::open(&store.home)
+            .await?
+            .publish_snapshot_composition(operation, lower)
+            .await?;
     }
     let receipt_bytes = parts.receipt.canonical_bytes()?;
     let receipt_digest = ObjectDigest::of_bytes(&receipt_bytes);
@@ -315,8 +340,8 @@ async fn commit_owned(
             .await?;
         }
     }
-    for representation in &representations {
-        insert_representation(&mut tx, representation, true).await?;
+    for (representation, flat) in &representations {
+        insert_representation(&mut tx, representation, *flat).await?;
     }
     for stream in parts.streams.values() {
         let object = ObjectDigest::from_sha256(*stream.sha256.as_bytes());
@@ -596,7 +621,7 @@ fn authenticate_encoding(
         records[2],
         oci::vm_artifact::wire::CONFIG_MEDIA_TYPE,
     )?;
-    let config = oci::vm_artifact::wire::decode_vm_config(records[2]).map_err(invalid)?;
+    let config = oci::vm_artifact::wire::decode_vm_config(records[2])?;
     let expected_kind = match config.content.kind {
         oci::vm_artifact::wire::ContentKind::Image => "image",
         oci::vm_artifact::wire::ContentKind::Snapshot => "snapshot",

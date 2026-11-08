@@ -593,20 +593,55 @@ impl Store {
             .bind(machine_id.to_string())
             .bind(json)
             .execute(&mut **tx).await?;
-        let (streams, objects) = crate::store::cache_paths::storage_pool_dependencies(storage)?;
+        let crate::store::cache_paths::PoolDependencies {
+            streams,
+            objects,
+            lowers,
+        } = crate::store::cache_paths::storage_pool_dependencies(storage)?;
         let generation =
             i64::try_from(storage.storage_generation).map_err(|error| LibVmError::StateDecode {
                 field: "machine_storage.storage_generation",
                 message: error.to_string(),
             })?;
-        sqlx::query("DELETE FROM machine_stream_dependency WHERE machine_id=?1")
-            .bind(machine_id.to_string())
-            .execute(&mut **tx)
-            .await?;
-        sqlx::query("DELETE FROM machine_object_dependency WHERE machine_id=?1")
-            .bind(machine_id.to_string())
-            .execute(&mut **tx)
-            .await?;
+        if let (crate::MachineRoot::LinuxOverlay { lower, .. }, false) =
+            (&storage.root, lowers.is_empty())
+        {
+            // Derived lower claims are checked against the retained canonical
+            // result in the same transaction that roots it.
+            let bytes: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT record_bytes FROM composition_result WHERE id=?1")
+                    .bind(lower.record().to_string())
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            let bytes = bytes.ok_or_else(|| LibVmError::CompositionAcquisitionRequired {
+                lower: lower.record(),
+                missing: "retained composition record".into(),
+            })?;
+            let result = oci::composition::CompositionResult::decode(&bytes).map_err(|error| {
+                LibVmError::StateDecode {
+                    field: "composition_result.record_bytes",
+                    message: error.to_string(),
+                }
+            })?;
+            if lower.geometry().length != result.lower_length
+                || lower.filesystem_uuid() != uuid::Uuid::from_bytes(result.fsmeta.uuid)
+            {
+                return Err(LibVmError::InvalidStorageRecord {
+                    record: "machine-storage",
+                    message: "lower claims contradict the retained composition".into(),
+                });
+            }
+        }
+        for statement in [
+            "DELETE FROM machine_stream_dependency WHERE machine_id=?1",
+            "DELETE FROM machine_object_dependency WHERE machine_id=?1",
+            "DELETE FROM machine_lower_dependency WHERE machine_id=?1",
+        ] {
+            sqlx::query(statement)
+                .bind(machine_id.to_string())
+                .execute(&mut **tx)
+                .await?;
+        }
         for stream in streams {
             sqlx::query("INSERT INTO machine_stream_dependency(machine_id,generation,stream_id) VALUES(?1,?2,?3)")
                 .bind(machine_id.to_string()).bind(generation).bind(stream.to_string()).execute(&mut **tx).await?;
@@ -614,6 +649,10 @@ impl Store {
         for object in objects {
             sqlx::query("INSERT INTO machine_object_dependency(machine_id,generation,object_digest) VALUES(?1,?2,?3)")
                 .bind(machine_id.to_string()).bind(generation).bind(object.to_string()).execute(&mut **tx).await?;
+        }
+        for lower in lowers {
+            sqlx::query("INSERT INTO machine_lower_dependency(machine_id,generation,lower_id) VALUES(?1,?2,?3)")
+                .bind(machine_id.to_string()).bind(generation).bind(lower.to_string()).execute(&mut **tx).await?;
         }
         Ok(())
     }

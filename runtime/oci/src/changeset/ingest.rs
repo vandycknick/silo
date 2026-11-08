@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -11,8 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::changeset::pack::{allocated_bytes, ensure_space, PackWriter};
 use crate::changeset::{
-    validate_layer, ChangesetError, ChangesetLimits, ChangesetResult, ContentDigest, EntryKind,
-    LayerChangeset, PayloadRef,
+    validate_layer, ChangesetError, ChangesetLimits, ChangesetResult, ContentDigest, LayerChangeset,
 };
 use crate::store::StagingDir;
 use crate::StagingOperation;
@@ -46,85 +44,6 @@ impl StagedChangeset {
     }
     pub fn pack_length(&self) -> u64 {
         self.changeset.pack_length
-    }
-
-    /// Transfer verified input into its enclosing flatten operation without
-    /// retaining one independent lease descriptor per layer.
-    pub(crate) fn scope<'a>(
-        self,
-        parent: &'a StagingDir,
-        occurrence: usize,
-    ) -> ChangesetResult<ScopedPack<'a>> {
-        let count = self
-            .changeset
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.kind, EntryKind::Regular(_)))
-            .count();
-        let reserve = (count as u64)
-            .checked_mul(std::mem::size_of::<(u64, PayloadRef)>() as u64)
-            .and_then(|bytes| bytes.checked_mul(2))
-            .ok_or_else(|| {
-                ChangesetError::Invalid("live payload metadata reservation overflows".into())
-            })?;
-        crate::changeset::limits::memory_preflight(reserve)?;
-        let pack_path = parent.path().join(format!("layer-{occurrence}.pack"));
-        let Self {
-            changeset,
-            pack_path: source_path,
-            _staging: child_staging,
-        } = self;
-        let length = changeset.pack_length;
-        let mut payloads = BTreeMap::new();
-        for entry in changeset.entries {
-            if let EntryKind::Regular(payload) = entry.kind {
-                payloads.insert(entry.ordinal, payload);
-            }
-        }
-        // Same private filesystem: atomic no-replace, with no payload copy.
-        std::fs::hard_link(source_path, &pack_path)?;
-        drop(child_staging);
-        Ok(ScopedPack {
-            payloads,
-            length,
-            pack_path,
-            _parent: parent,
-        })
-    }
-}
-
-pub(crate) struct ScopedPack<'a> {
-    payloads: BTreeMap<u64, PayloadRef>,
-    length: u64,
-    pack_path: PathBuf,
-    _parent: &'a StagingDir,
-}
-
-impl ScopedPack<'_> {
-    pub(crate) fn payload(&self, ordinal: u64) -> Option<&PayloadRef> {
-        self.payloads.get(&ordinal)
-    }
-
-    pub(crate) fn discard(&mut self, ordinal: u64) -> bool {
-        self.payloads.remove(&ordinal).is_some()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.payloads.is_empty()
-    }
-
-    pub(crate) fn pack_path(&self) -> &Path {
-        &self.pack_path
-    }
-
-    pub(crate) fn pack_length(&self) -> u64 {
-        self.length
-    }
-}
-
-impl Drop for ScopedPack<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.pack_path);
     }
 }
 
@@ -427,58 +346,6 @@ mod tests {
     fn raw(bytes: &[u8]) -> (tempfile::TempDir, StagedChangeset) {
         let (dir, result) = attempt(bytes, bytes, RAW, &ChangesetLimits::default());
         (dir, result.unwrap())
-    }
-
-    #[test]
-    fn scoped_pack_transfers_the_same_inode_and_releases_its_independent_staging_lock() {
-        use nix::fcntl::{Flock, FlockArg};
-        use std::os::unix::fs::MetadataExt;
-
-        let bytes = finish(member(b"a", b'0', b"A"));
-        let (dir, staged) = raw(&bytes);
-        let original = staged.pack_path().to_owned();
-        let before = std::fs::metadata(&original).unwrap();
-        let parent_root = dir.path().join("flatten");
-        let parent = crate::store::StagingDir::create(&parent_root, &operation()).unwrap();
-        let scoped = staged.scope(&parent, 0).unwrap();
-        let adopted = scoped.pack_path().to_owned();
-        let after = std::fs::metadata(&adopted).unwrap();
-        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
-        assert_eq!(after.nlink(), 1);
-        assert!(!original.exists());
-        assert_eq!(scoped.payload(0).unwrap().length, 1);
-        let child_lease = std::fs::File::open(
-            dir.path()
-                .join("locks/publication/stage-00000000-0000-4000-8000-000000000001.lock"),
-        )
-        .unwrap();
-        let _released = Flock::lock(child_lease, FlockArg::LockExclusiveNonblock).unwrap();
-        let parent_lease = std::fs::File::open(
-            parent_root.join("locks/publication/stage-00000000-0000-4000-8000-000000000001.lock"),
-        )
-        .unwrap();
-        assert!(Flock::lock(parent_lease, FlockArg::LockExclusiveNonblock).is_err());
-        drop(scoped);
-        assert!(!adopted.exists());
-        assert!(parent.path().is_dir());
-    }
-
-    #[test]
-    fn scoped_pack_transfer_refuses_an_existing_name_without_copying_or_removing_it() {
-        let bytes = finish(member(b"a", b'0', b"A"));
-        let (dir, staged) = raw(&bytes);
-        let original = staged.pack_path().to_owned();
-        let parent =
-            crate::store::StagingDir::create(&dir.path().join("flatten"), &operation()).unwrap();
-        let destination = parent.path().join("layer-0.pack");
-        std::fs::write(&destination, b"preserve").unwrap();
-        let result = staged.scope(&parent, 0);
-        assert!(
-            matches!(result, Err(crate::changeset::ChangesetError::Io(error))
-            if error.kind() == std::io::ErrorKind::AlreadyExists)
-        );
-        assert_eq!(std::fs::read(destination).unwrap(), b"preserve");
-        assert!(!original.exists());
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {

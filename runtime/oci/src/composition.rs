@@ -484,6 +484,66 @@ pub fn load_exact(
     retained: &CompositionResult,
     fsmeta: &File,
 ) -> CompositionResultValue<PreparedComposition> {
+    load_retained(
+        recipe,
+        layers,
+        retained,
+        fsmeta,
+        |file, namespace, layers, id| {
+            erofs::validate(file, namespace, layers, id).map(|encoded| (encoded, ()))
+        },
+    )
+    .map(|(_, prepared, ())| prepared)
+}
+
+/// The authenticated namespace of the exact retained lower, validated and
+/// bound like `load_exact`, for rendering it without any source blob.
+pub(crate) fn load_namespace(
+    recipe: &CompositionRecipe,
+    layers: &[Layer<'_>],
+    retained: &CompositionResult,
+    fsmeta: &File,
+) -> CompositionResultValue<ValidatedNamespace> {
+    load_retained(
+        recipe,
+        layers,
+        retained,
+        fsmeta,
+        |file, namespace, layers, id| {
+            erofs::validate(file, namespace, layers, id).map(|encoded| (encoded, ()))
+        },
+    )
+    .map(|(namespace, _, ())| namespace)
+}
+
+/// The exact retained lower as an OverlayFS guest observed it: the
+/// authenticated namespace plus every inode's EROFS export identity.
+pub(crate) fn load_exported(
+    recipe: &CompositionRecipe,
+    layers: &[Layer<'_>],
+    retained: &CompositionResult,
+    fsmeta: &File,
+) -> CompositionResultValue<(ValidatedNamespace, crate::erofs::handles::ExportHandles)> {
+    load_retained(recipe, layers, retained, fsmeta, erofs::validate_exported)
+        .map(|(namespace, _, handles)| (namespace, handles))
+}
+
+/// Shared retained-lower authentication: the storage owner has already
+/// authenticated each held pack's stream and keeps the descriptors immutable;
+/// this re-authenticates indexes and namespace, strictly validates fsmeta and
+/// binds every metadata identity and range to the retained result.
+fn load_retained<T>(
+    recipe: &CompositionRecipe,
+    layers: &[Layer<'_>],
+    retained: &CompositionResult,
+    fsmeta: &File,
+    validate: impl FnOnce(
+        &File,
+        &ValidatedNamespace,
+        &[Layer<'_>],
+        &str,
+    ) -> Result<(EncodedFsmeta, T), ErofsError>,
+) -> CompositionResultValue<(ValidatedNamespace, PreparedComposition, T)> {
     retained.validate_recipe(recipe)?;
     let metadata = fsmeta.metadata()?;
     if !metadata.is_file() || metadata.len() != retained.fsmeta.length {
@@ -491,8 +551,9 @@ pub fn load_exact(
     }
     let namespace = authenticate_namespace(recipe, layers)?;
     let recipe_id = recipe.id()?;
-    let encoded = erofs::validate(fsmeta, &namespace, layers, &recipe_id.to_string())?;
-    prepared(recipe_id, layers, encoded)?.bind_retained(retained)
+    let (encoded, extra) = validate(fsmeta, &namespace, layers, &recipe_id.to_string())?;
+    let bound = prepared(recipe_id, layers, encoded)?.bind_retained(retained)?;
+    Ok((namespace, bound, extra))
 }
 
 /// Regeneration is admissible only if every retained metadata byte identity and

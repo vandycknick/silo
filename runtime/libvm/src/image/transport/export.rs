@@ -84,10 +84,21 @@ impl ExportSource {
     fn open_stream(&self, pool: &StoragePool, stream: &SnapshotStream) -> Result<File, LibVmError> {
         match self {
             Self::Image(consumer) => {
-                if consumer.info.record.root.stream != *stream {
-                    return Err(invalid("record", "image exports only its root stream"));
+                let root = &consumer.info.record.root;
+                let member = root.stream == *stream
+                    || matches!(
+                        &root.profile,
+                        crate::store::models::snapshot::SnapshotRootProfile::LinuxOverlay { lower, .. }
+                            if lower.layers.iter().any(|layer| layer.pack == *stream)
+                    );
+                if !member {
+                    return Err(invalid("record", "image exports only its semantic streams"));
                 }
-                consumer.open_stream(pool)
+                let map = pool.verify_stream(&stream.stream)?;
+                if map.length() != stream.length {
+                    return Err(invalid("record", "image stream length mismatch"));
+                }
+                Ok(pool.open_stream(&stream.stream)?)
             }
             Self::Snapshot(consumer) => consumer.open_stream(pool, &stream.stream, stream.length),
         }
@@ -149,7 +160,7 @@ pub(crate) fn prepare_artifact_export(
 
 /// `prepare_artifact_export` against an explicit complete-closure stream
 /// budget. The whole unique transport-stream closure, semantic streams plus
-/// streamed boot objects, is planned and admitted before any chunk, map,
+/// streamed byte objects, is planned and admitted before any chunk, map,
 /// transfer record or representation is published or registered.
 fn prepare_export_within(
     source: ExportSource,
@@ -163,10 +174,15 @@ fn prepare_export_within(
     let pool = StoragePool::open(&images)?;
     let (operation_id, lease) = source.operation()?;
     let operation = pool.create_operation_with_lease(operation_id, lease)?;
+    semantic.authenticate_lower(
+        |digest, maximum| Ok(pool.read_object(digest, maximum)?),
+        |digest| Ok(pool.open_object(digest)?),
+        |stream| source.open_stream(&pool, stream),
+    )?;
     let provenance = match &source {
-        ExportSource::Snapshot(consumer) if semantic.live() => {
-            Some(select_provenance(consumer, &pool, &semantic)?)
-        }
+        ExportSource::Snapshot(consumer) if semantic.live() => Some(select_provenance(
+            consumer, &pool, &semantic, store, runtime,
+        )?),
         _ => None,
     };
     let roles = semantic.object_roles(provenance.as_ref().map(|(wrapper, evidence)| {
@@ -175,14 +191,15 @@ fn prepare_export_within(
             ObjectDigest::of_bytes(evidence),
         )
     }))?;
-    let mut boot = plan_boot_streams(&pool, &roles)?;
+    let mut object_streams = plan_object_streams(&pool, &roles)?;
     check_transport_streams(
         semantic
             .streams()
             .into_iter()
             .map(|stream| (stream.stream, stream.length))
             .chain(
-                boot.values()
+                object_streams
+                    .values()
                     .map(|planned| (planned.stream.stream, planned.stream.length)),
             ),
         budget,
@@ -253,9 +270,9 @@ fn prepare_export_within(
                     payload,
                 })?;
             }
-            ObjectRole::Streamed => {
-                builder.add_boot_object(boot.remove(digest).ok_or_else(|| {
-                    invalid("object", format!("{digest} boot stream was not planned"))
+            ObjectRole::Streamed | ObjectRole::Fsmeta => {
+                builder.add_streamed_object(object_streams.remove(digest).ok_or_else(|| {
+                    invalid("object", format!("{digest} object stream was not planned"))
                 })?)?
             }
         }
@@ -297,10 +314,10 @@ fn prepare_export_within(
     })
 }
 
-/// One opaque boot object measured for transport in a single authenticated
+/// One opaque byte object measured for transport in a single authenticated
 /// pass: whole SHA-256 against its digest plus its stream map. Nothing is
 /// published or pinned while planning.
-struct BootStream {
+struct ObjectStream {
     digest: ObjectDigest,
     source: AuthenticatedStream,
     stream: SnapshotStream,
@@ -308,18 +325,24 @@ struct BootStream {
     pages: Vec<Vec<u8>>,
 }
 
-fn plan_boot_streams(
+fn plan_object_streams(
     pool: &StoragePool,
     roles: &BTreeMap<ObjectDigest, ObjectRole>,
-) -> Result<BTreeMap<ObjectDigest, BootStream>, LibVmError> {
+) -> Result<BTreeMap<ObjectDigest, ObjectStream>, LibVmError> {
     let mut hasher = StreamHasher::new();
     let mut planned = BTreeMap::new();
     for (digest, role) in roles {
-        if *role != ObjectRole::Streamed {
+        if !matches!(role, ObjectRole::Streamed | ObjectRole::Fsmeta) {
             continue;
         }
         let file = pool.open_object(digest)?;
         let length = file.metadata()?.len();
+        if length > role.maximum() {
+            return Err(invalid(
+                "object",
+                format!("{digest} exceeds its role bound"),
+            ));
+        }
         let (source, sha256) = hasher.authenticate_with_sha256(file, length)?;
         if sha256.as_bytes() != digest.as_bytes() {
             return Err(invalid(
@@ -339,7 +362,7 @@ fn plan_boot_streams(
         };
         planned.insert(
             *digest,
-            BootStream {
+            ObjectStream {
                 digest: *digest,
                 source,
                 stream,
@@ -395,6 +418,8 @@ fn select_provenance(
     consumer: &SnapshotConsumer,
     pool: &StoragePool,
     semantic: &Semantic,
+    store: &Store,
+    runtime: &Handle,
 ) -> Result<(Vec<u8>, Vec<u8>), LibVmError> {
     let record = semantic
         .snapshot_record()
@@ -409,7 +434,12 @@ fn select_provenance(
     let mut candidates = BTreeMap::new();
     for local in &consumer.info.provenance {
         let evidence = pool.read_object(&local.evidence_digest, evidence_limit)?;
-        let (binding, wrapper) = build_local(record, id, &evidence)?;
+        let plan = runtime.block_on(crate::store::snapshot_store::capture_plan(
+            store,
+            id,
+            local.capture_id,
+        ))?;
+        let (binding, wrapper) = build_local(record, id, &evidence, &plan)?;
         let ids = [
             (binding.evidence.machine_id.as_str(), local.machine_id),
             (binding.evidence.run_id.as_str(), local.run_id),
@@ -554,17 +584,17 @@ impl Builder<'_> {
         self.add_stream_row(stream, root, pages, &entries)
     }
 
-    /// Opaque boot bytes travel through their own stream, measured once by
+    /// Whole-byte objects travel through a temporary stream, measured once by
     /// planning. The stream is pinned to the source operation before any
     /// representation lookup.
-    fn add_boot_object(&mut self, boot: BootStream) -> Result<(), LibVmError> {
-        let BootStream {
+    fn add_streamed_object(&mut self, object: ObjectStream) -> Result<(), LibVmError> {
+        let ObjectStream {
             digest,
             source,
             stream,
             root,
             pages,
-        } = boot;
+        } = object;
         let length = stream.length;
         let context = &self.context;
         context
@@ -782,7 +812,7 @@ mod tests {
 
     use crate::image::transport::closure::Semantic;
     use crate::image::transport::export::{
-        check_transport_streams, plan_boot_streams, prepare_export_within, ExportSource,
+        check_transport_streams, plan_object_streams, prepare_export_within, ExportSource,
         PreparedVmArtifact,
     };
     use crate::image::transport::tests::{count, database};
@@ -878,7 +908,7 @@ mod tests {
             .unwrap()
             .object_roles(None)
             .unwrap();
-        let boot = plan_boot_streams(&pool, &roles).unwrap();
+        let boot = plan_object_streams(&pool, &roles).unwrap();
         assert!(!boot.is_empty());
         let complete = check_transport_streams(
             semantic.into_iter().chain(
