@@ -583,10 +583,10 @@ fn candidate_boot_metadata(
             .as_deref()
             .is_some_and(|digest| config["kernel"]["digest"].as_str() == Some(digest))
     });
-    // Missing local-build config provenance is reported, never replaced with a
-    // source-fragment hash, host uname, or a guessed positive qualification.
+    // Missing local-build config provenance remains unavailable; a source
+    // fragment hash or host uname cannot stand in for the build-time gate.
     Ok(serde_json::json!({
-        "qualification": "requires-exact-boot-evidence",
+        "qualification": "kernel-config-build-gate",
         "guestArchitecture": context.host.oci_architecture(),
         "rootProfile": "linux-erofs-overlay-v1",
         "upperProfile": "silo-upper-ext4-v1",
@@ -997,7 +997,7 @@ mod tests {
             candidate["configEvidence"],
             "authenticated-oci-resolved-config"
         );
-        assert_eq!(candidate["qualification"], "requires-exact-boot-evidence");
+        assert_eq!(candidate["qualification"], "kernel-config-build-gate");
         assert_eq!(
             candidate["nativeExecutableDigest"],
             format!("sha256:{}", "e".repeat(64))
@@ -1143,7 +1143,7 @@ mod tests {
         assert_eq!(manifest["version"], "0.1.0");
         assert_eq!(
             manifest["managedOverlayCandidate"]["qualification"],
-            "requires-exact-boot-evidence"
+            "kernel-config-build-gate"
         );
         assert_eq!(
             manifest["managedOverlayCandidate"]["configEvidence"],

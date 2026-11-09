@@ -990,15 +990,16 @@ pub(crate) fn publish_restore_launch_files(
     agent: Option<(crate::initramfs_overlay::CompositeAgent<'_>, &[u8])>,
     durability: &mut crate::machine::builder::ChildDurability,
 ) -> Result<(), LibVmError> {
-    let composite = crate::initramfs_overlay::write_composite_deferred(
+    let composite = crate::initramfs_overlay::write_composite(
         base,
         agent,
+        None,
         &paths.composite_initramfs_path(),
     )
     .map_err(|error| invalid(error.to_string()))?;
     durability.files.push(composite);
     durability.files.push(
-        crate::supervisor::write_launch_spec_deferred(&paths.vm_spec_path(), spec)
+        crate::supervisor::write_launch_spec(&paths.vm_spec_path(), spec)
             .map_err(|error| invalid(error.to_string()))?,
     );
     Ok(())
@@ -1121,11 +1122,16 @@ async fn launch_restored(
         boot.path = Some(pool.object_path(kernel));
         boot.initramfs = Some(paths.composite_initramfs_path());
         let base =
-            crate::boot_qualification::QualifiedAsset::open(&pool.object_path(base_initramfs))
+            crate::owned_boot_assets::OwnedBootAsset::open(&pool.object_path(base_initramfs))
                 .map_err(|error| invalid(error.to_string()))?;
-        let binary = crate::boot_qualification::QualifiedAsset::open(&pool.object_path(agent))
+        let binary = crate::owned_boot_assets::OwnedBootAsset::open(&pool.object_path(agent))
             .map_err(|error| invalid(error.to_string()))?;
-        if base.digest() != *base_initramfs.as_bytes() || binary.digest() != *agent.as_bytes() {
+        if base.digest().map_err(|error| invalid(error.to_string()))? != *base_initramfs.as_bytes()
+            || binary
+                .digest()
+                .map_err(|error| invalid(error.to_string()))?
+                != *agent.as_bytes()
+        {
             return Err(invalid(
                 "restore provenance changed after closure verification",
             ));

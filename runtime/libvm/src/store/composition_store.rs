@@ -153,13 +153,17 @@ impl HeldComposition {
     }
 }
 
-/// A leased launch closure: resolved, not yet hashed, VMDK occurrences
-/// (fsmeta object first, then every pack occurrence). The launch path runs
-/// the VMDK preflight and verification over these while holding the lease.
+/// Resolved VMDK occurrences. Launch callers retain their generation lease
+/// through startup; non-launch readers retain an independent consumer here.
 pub struct LaunchLower {
     pub occurrences: Vec<LowerOccurrence>,
     pub retained: RetainedComposition,
-    _owner: LayerReadOwner,
+    _authority: LowerAuthority,
+}
+
+enum LowerAuthority {
+    Launch,
+    Consumer { _owner: LayerReadOwner },
 }
 
 fn snapshot_graph(
@@ -605,60 +609,121 @@ impl LayerStore {
         .await?
     }
 
-    /// Lease a machine lower for launch and resolve its VMDK occurrences.
+    /// Resolve a lower authorized by the exact existing launch generation.
     /// Records, indexes and pack maps are authenticated here; backing bytes
     /// are hashed by the caller's admitted VMDK plan verification.
-    pub async fn launch_lower(&self, lower: &OverlayLower) -> Result<LaunchLower, LibVmError> {
+    pub(crate) async fn launch_lower(
+        &self,
+        lease: &crate::store::operation_store::LaunchStorageLease,
+        storage: &crate::MachineStorageRecord,
+    ) -> Result<LaunchLower, LibVmError> {
+        if lease.storage_record() != storage {
+            return Err(invalid(
+                "launch lower differs from the leased storage generation",
+            ));
+        }
+        let crate::MachineRoot::LinuxOverlay { lower, .. } = &storage.root else {
+            return Err(invalid(
+                "launch lower requires a layered storage generation",
+            ));
+        };
+        let store = self.clone();
+        let lower = lower.clone();
+        let operation = lease.operation_id();
+        let generation = int(lease.storage_record().storage_generation)?;
+        let lease = lease.lock().duplicate()?;
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(async {
+                let id = lower.record();
+                let (device, inode) = lease.file_identity()?;
+                let authorized: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM storage_operation o JOIN storage_operation_lower l USING(operation_id) WHERE o.operation_id=?1 AND o.kind='launch' AND o.storage_generation=?2 AND o.file_device=?3 AND o.file_inode=?4 AND l.lower_id=?5)",
+                )
+                .bind(operation.to_string())
+                .bind(generation)
+                .bind(device.to_string())
+                .bind(inode.to_string())
+                .bind(id.to_string())
+                .fetch_one(&store.store.pool)
+                .await?;
+                if !authorized {
+                    return Err(invalid("launch lease does not root this retained lower"));
+                }
+                let resolved = store.resolve_lower(&lower, LowerAuthority::Launch).await;
+                // Cancellation may drop the caller's typed lease while this
+                // blocking worker runs. Keep its duplicate until authentication
+                // completes, but do not obstruct failed-start reconciliation.
+                drop(lease);
+                resolved
+            })
+        })
+        .await?
+    }
+
+    /// Non-launch readers (capture budgeting and cut verification) own an
+    /// independent consumer, rather than borrowing a running generation.
+    pub(crate) async fn hold_lower(&self, lower: &OverlayLower) -> Result<LaunchLower, LibVmError> {
         let store = self.clone();
         let lower = lower.clone();
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             runtime.block_on(async {
-                let id = lower.record();
-                let occurrences = store.retained_layers(id).await?;
-                let owner = store.begin_consumer(&occurrences, &[id]).await?;
-                let pool = existing_pool(&store.store)?;
-                let retained = read_retained(&store.store, &pool, id).await?;
-                retained.check_lower(&lower)?;
-                let mut resolved = Vec::with_capacity(retained.layers.len() + 1);
-                let fsmeta = pool
-                    .lower_object_occurrence(&retained.fsmeta())
-                    .map_err(self::retained(id))?;
-                if fsmeta.length() != retained.result.fsmeta.length {
-                    return Err(invalid("retained fsmeta length contradicts its result"));
-                }
-                resolved.push(fsmeta);
-                let mut pinned: Vec<(LayerResultId, PinnedLayer)> = Vec::new();
-                for (layer, range) in retained.layers.iter().zip(&retained.result.packs) {
-                    let pack = match pinned.iter().find(|(other, _)| other == layer) {
-                        Some((_, pinned)) => pinned.pack.clone(),
-                        None => {
-                            let layer_facts = store
-                                .load_pinned_layer(*layer, &ChangesetLimits::default(), false)
-                                .await?;
-                            let pack = layer_facts.pack.clone();
-                            pinned.push((*layer, layer_facts));
-                            pack
-                        }
-                    };
-                    if pack.stream.as_bytes() != range.stream.as_bytes()
-                        || pack.length != range.length
-                    {
-                        return Err(invalid("layer pack contradicts its composition range"));
-                    }
-                    let occurrence = pool
-                        .lower_occurrence(&pack.stream)
-                        .map_err(self::retained(id))?;
-                    resolved.push(occurrence);
-                }
-                Ok(LaunchLower {
-                    occurrences: resolved,
-                    retained,
-                    _owner: owner,
-                })
+                let occurrences = store.retained_layers(lower.record()).await?;
+                let owner = store
+                    .begin_consumer(&occurrences, &[lower.record()])
+                    .await?;
+                store
+                    .resolve_lower(&lower, LowerAuthority::Consumer { _owner: owner })
+                    .await
             })
         })
         .await?
+    }
+
+    async fn resolve_lower(
+        &self,
+        lower: &OverlayLower,
+        authority: LowerAuthority,
+    ) -> Result<LaunchLower, LibVmError> {
+        let id = lower.record();
+        let pool = existing_pool(&self.store)?;
+        let retained = read_retained(&self.store, &pool, id).await?;
+        retained.check_lower(lower)?;
+        let mut resolved = Vec::with_capacity(retained.layers.len() + 1);
+        let fsmeta = pool
+            .lower_object_occurrence(&retained.fsmeta())
+            .map_err(self::retained(id))?;
+        if fsmeta.length() != retained.result.fsmeta.length {
+            return Err(invalid("retained fsmeta length contradicts its result"));
+        }
+        resolved.push(fsmeta);
+        let mut pinned: Vec<(LayerResultId, PinnedLayer)> = Vec::new();
+        for (layer, range) in retained.layers.iter().zip(&retained.result.packs) {
+            let pack = match pinned.iter().find(|(other, _)| other == layer) {
+                Some((_, pinned)) => pinned.pack.clone(),
+                None => {
+                    let layer_facts = self
+                        .load_pinned_layer(*layer, &ChangesetLimits::default(), false)
+                        .await?;
+                    let pack = layer_facts.pack.clone();
+                    pinned.push((*layer, layer_facts));
+                    pack
+                }
+            };
+            if pack.stream.as_bytes() != range.stream.as_bytes() || pack.length != range.length {
+                return Err(invalid("layer pack contradicts its composition range"));
+            }
+            let occurrence = pool
+                .lower_occurrence(&pack.stream)
+                .map_err(self::retained(id))?;
+            resolved.push(occurrence);
+        }
+        Ok(LaunchLower {
+            occurrences: resolved,
+            retained,
+            _authority: authority,
+        })
     }
 
     /// Read the explicit closed graph without creating catalog state. The caller

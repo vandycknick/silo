@@ -1,4 +1,4 @@
-"""Real CLI/KVM private-stage replacement while qualified source FDs are held."""
+"""Real CLI/KVM private-stage replacement while owned source FDs are held."""
 from __future__ import annotations
 
 import json
@@ -55,7 +55,7 @@ def replacement(silo: Silo, reference: str) -> None:
     files['base'] = pool / binding['baseInitramfs'].removeprefix('sha256:')
     identities = {kind: {'device': path.stat().st_dev, 'inode': path.stat().st_ino, 'length': path.stat().st_size, 'sha256': overlay.digest(path)} for kind, path in files.items()}
     command = ['/usr/bin/env', f'SILO_RUNTIME_DIR={private}', str(silo.ws.config.silo), 'start', name]
-    with stopped.syscall_boundary(silo, command, files['native'], 'boot-kernel-copy') as receipt:
+    with stopped.syscall_boundary(silo, command, files['native'], 'boot-kernel-copy', expect_failure=True) as receipt:
         pid = receipt['pid']
         observed = descriptors(pid)
         silo.ws.record('overlay-stage-interception', json.dumps({'receipt': receipt, 'descriptors': observed, 'sourceIdentities': identities}) + '\n')
@@ -67,7 +67,7 @@ def replacement(silo: Silo, reference: str) -> None:
         captured_fds = {}
         for kind, identity in identities.items():
             matches = [fd for fd in observed if (fd['device'], fd['inode']) == (identity['device'], identity['inode'])]
-            assert matches, f'qualified retained {kind} FD absent'
+            assert matches, f'owned retained {kind} FD absent'
             for fd in matches:
                 assert fd['fd'] >= 3 and fd['flags'] & os.O_ACCMODE == os.O_RDONLY and fd['flags'] & os.O_CLOEXEC
                 assert overlay.digest(Path('/proc') / str(pid) / 'fd' / str(fd['fd'])) == identity['sha256']
@@ -83,28 +83,24 @@ def replacement(silo: Silo, reference: str) -> None:
             assert metadata.st_nlink == (0 if kind == 'native' else 1)
             assert overlay.digest(path) == identities[kind]['sha256']
             retained[kind] = {'fd': matches[0]['fd'], 'target': os.readlink(path), 'links': metadata.st_nlink, 'sha256': identities[kind]['sha256']}
-        silo.ws.record('overlay-stage-retained-qualified-assets', json.dumps(retained) + '\n')
+        silo.ws.record('overlay-stage-retained-owned-assets', json.dumps(retained) + '\n')
         (silo.ws.evidence / 'boundary-release').touch()
-        silo.wait_ready(name)
-        actual = {}
-        monitor = procs.vmm_pid(silo.ws, name)
-        assert monitor is not None
-        for kind, pid in [('monitor', monitor), ('worker', overlay.worker_pid(silo, name))]:
-            executable = Path('/proc') / str(pid) / 'exe'
-            metadata = executable.stat()
-            digest = overlay.digest(executable)
-            assert digest == identities['native']['sha256'] and metadata.st_nlink == 0
-            assert (metadata.st_dev, metadata.st_ino) == (identities['native']['device'], identities['native']['inode'])
-            actual[kind] = {'pid': pid, 'sha256': digest, 'target': os.readlink(executable), 'links': metadata.st_nlink, 'device': metadata.st_dev, 'inode': metadata.st_ino}
-        assert overlay.digest(directory / 'kernel-qualified') == identities['kernel']['sha256']
-        assert overlay.digest(directory / 'initramfs', identities['base']['length']) == identities['base']['sha256']
-        overlay.evidence(silo, name)
-        silo.ws.record('overlay-stage-bound-executables', json.dumps(actual) + '\n')
-        silo.stop(name)
-    before = {'runId': procs.run_id(silo.ws, name), 'monitorPid': procs.vmm_pid(silo.ws, name)}
-    refusal = silo.run('start', name, env=environment, expect=None)
-    assert refusal.returncode != 0
-    assert 'unqualified ' + overlay.PROFILE + ' boot tuple' in refusal.stderr and 'native sha256:' + fixture['binarySha256'] in refusal.stderr
-    assert silo.info(name)['state'] == 'stopped'
-    assert before == {'runId': procs.run_id(silo.ws, name), 'monitorPid': procs.vmm_pid(silo.ws, name)}, 'unknown replacement bytes must not allocate a new run'
-    silo.ws.record('overlay-stage-fresh-refusal', json.dumps(before) + '\n' + refusal.stderr)
+    output = (silo.ws.evidence / 'boundary-command.log').read_text()
+    assert 'boot asset changed during inspection or launch' in output
+    assert procs.vmm_pid(silo.ws, name) is None
+    assert overlay.digest(directory / 'kernel-qualified') == identities['kernel']['sha256']
+    assert overlay.digest(directory / 'initramfs', identities['base']['length']) == identities['base']['sha256']
+    silo.ws.record('overlay-stage-replacement-refusal', output)
+    # A fresh launch owns the successor monitor. New monitor bytes are not an admission policy.
+    silo.run('start', name, env=environment)
+    silo.wait_ready(name)
+    actual = {}
+    monitor = procs.vmm_pid(silo.ws, name)
+    assert monitor is not None
+    for kind, pid in [('monitor', monitor), ('worker', overlay.worker_pid(silo, name))]:
+        executable = Path('/proc') / str(pid) / 'exe'
+        assert overlay.digest(executable) == fixture['binarySha256']
+        actual[kind] = {'pid': pid, 'sha256': fixture['binarySha256'], 'target': os.readlink(executable)}
+    overlay.evidence(silo, name)
+    silo.ws.record('overlay-stage-successor-executables', json.dumps(actual) + '\n')
+    silo.stop(name)

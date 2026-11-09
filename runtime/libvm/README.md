@@ -111,25 +111,24 @@ storage generation. `Packaged`, a complete `Files` tuple and an owned `Exact`
 bundle are distinct selections; omitted members never inherit old assets.
 Fresh custom file tuples currently require the base initramfs to match the
 locally packaged schema-2 bootstrap bytes. Unknown custom base ABIs receive
-`BootBundleAbiUnsupported`, not an unsupported boot claim. Previously admitted
+the payload-free `BootBundleAbiUnsupported` refusal, directing clients to select
+the packaged base without exposing host paths or computing diagnostic hashes. Previously admitted
 exact bundles remain usable after packages change. Ordinary configuration
 replacement cannot change kernel/initramfs or agent selection behind the pin.
-Inspection reports the current tuple and, when it can be locally admitted, a
-different packaged replacement without publishing or applying it.
+Inspection reports the current bundle and a different packaged replacement
+using immutable object identities recorded at import; it does not read and
+rehash installed boot assets or publish or apply a replacement.
 
-Raw roots admit their kernel by its own bytes, never by a declared or recorded
-architecture alone. While the selected kernel is hashed, libvm keeps its first
-4 KiB and requires the host's native direct-loader format for the pinned
-kernel architecture: an x86-64 little-endian ELF64 executable `vmlinux` with
+Raw roots admit their kernel from a bounded 4 KiB header, never from a declared
+architecture alone. They require the host's native direct-loader format for the
+pinned architecture: an x86-64 little-endian ELF64 executable `vmlinux` with
 in-file loadable segments, or a little-endian arm64 `Image` whose declared size
-covers the file. Import, creation, updates, exact bundles, replacement
-reporting, capture and every pinned start apply this check to the
-authenticated bytes before publication or launch. Arbitrary data and
-wrong-architecture kernels fail with `DirectKernelRejected`, carrying the
-kernel digest and exact reason. Admission deliberately does not inspect kernel
-configuration: custom kernels need no embedded IKCONFIG, and a kernel missing a
-required filesystem, partition, device or Rosetta capability fails at boot.
-Overlay roots keep their exact reviewed tuple admission instead.
+covers the file. Invalid or foreign images fail with `DirectKernelRejected`,
+carrying the path and exact reason. Kernel configuration is not inspected at
+boot: missing filesystem, partition, device or Rosetta support fails in the
+guest. Overlay roots additionally require Linux 6.6 or newer, read from the held
+kernel. Overlay compatibility is a kernel-config property verified by the
+kernel track's gate at build time, not per boot.
 
 The mandatory schema-2 root bootstrap carries the named root attachment,
 effective geometry, concrete disk-local selector, ext4 filesystem and effective
@@ -544,20 +543,19 @@ retains closure ownership through startup or completed failure cleanup. The
 running machine's semantic root remains the durable retention root. Worker-FD
 lease transfer and certified storage shutdown remain separate lifecycle gates.
 
-Only an exactly admitted kernel/init/native-monitor/profile/architecture/krun
-tuple may launch. VZ, mock and unqualified artifacts fail before materialization
-or launch effects. Admission retains opened
-boot artifacts. Launch copies and hashes the kernel and base initramfs from those
-same descriptors, never reopening the original paths. On Linux it rechecks and
-executes the retained native ELF through `/proc/self/fd/N`, keeping the descriptor
-CLOEXEC in the parent and owned through startup acknowledgement. Worker reexec
-uses `/proc/self/exe`, so atomic runtime restaging cannot switch the already-loaded
-monitor's worker binary. No native executable copy is made per start. Managed
-staging publishes a complete sibling tree by atomic rename/exchange, rather than
-rewriting the live ELF. These guarantees do not promise protection against hostile
-same-UID in-place writers. Root bootstrap is appended independently of agent injection;
-the overlay root marker and fixed serials cannot be replaced by root arguments.
-There is no automatic raw fallback.
+Overlay launch requires Linux 6.6 or newer on krun. Unsupported VZ/mock backends
+and older kernels fail before materialization or launch effects. There is no
+artifact-specific admission list. `owned_boot_assets` retains read-only
+CLOEXEC descriptors, stages the mode-0400 `kernel-qualified` copy and builds the
+composite initramfs from held sources with bounded copies and metadata checks.
+No boot asset is hashed on start or inspect. On Linux launch executes the held
+monitor through `/proc/self/fd/N` after a pre-exec metadata recheck that fails
+closed on mutation or unlink/replacement; it never falls back to a replacement
+pathname. The worker reexecutes `/proc/self/exe`. Managed staging publishes a
+complete sibling tree atomically, not by rewriting a live ELF. These guarantees
+do not protect against hostile same-UID in-place writers. Root bootstrap remains
+independent of agent injection; root markers and fixed serials cannot be
+overridden, and there is no automatic raw fallback.
 
 Stopped `MachineUpdate::root_disk_size(bytes)` publishes a replacement private
 upper generation, preserving its old byte prefix, UUID and journal state.

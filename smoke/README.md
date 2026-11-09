@@ -24,8 +24,8 @@ make smoke SMOKE_ARGS="-k tty_resize --keep"
 ```
 
 Phase 22 makes `linux-erofs-overlay-v1` the libkrun OCI default and removes the
-flat profile and root-profile selector. Exact Linux x86_64 stable 7.2.2 and
-longterm 6.18.48 production-root tuples passed boot/lifecycle and kernel-mutated
+flat profile and root-profile selector. Linux x86_64 stable 7.2.2 and
+longterm 6.18.48 production roots passed boot/lifecycle and kernel-mutated
 flatten export followed by raw boot. Independent umoci extraction used the prior
 raw reference environment; a separate readonly EROFS traversal matched every
 published-corpus row without exclusions. Performance must be remeasured in the
@@ -1210,9 +1210,9 @@ certificate is issued per session with localhost/127.0.0.1 subject alternatives.
 
 `tests/test_overlay.py` drives the normal staged CLI/libvm/monitor/worker path.
 OCI creation now defaults to EROFS overlay on libkrun, with no profile selector.
-Managed overlay still needs an immutable admitted kernel/base-initramfs/
-resolved-config/profile/architecture/attachment tuple; schema support and kernel
-track names do not grant admission.
+Managed overlay requires Linux 6.6 or newer; compatibility is a kernel-config
+property verified by the kernel track's gate at build time, not by per-boot
+artifact qualification. Custom kernels are not rejected for having new hashes.
 
 Prepare the two pure host consumers and stage production binaries after all
 changes have landed:
@@ -1271,8 +1271,8 @@ kernel, set `SILO_SMOKE_KERNEL_CONFIG` to its actual resolved `.config`; Main
 must independently retain the build provenance associating that config with
 the exact tested kernel. Hashing an arbitrary config file is not that proof.
 
-Main reviews this observed evidence, records the immutable exact tuple in the
-qualification table, rebuilds and stages. Then run the real production path:
+Main reviews the observed compatibility evidence and the kernel track's build-time
+configuration gate, then exercises the real production path without rebuilding an artifact allowlist:
 
 ```sh
 make smoke SMOKE_ARGS="-k 'vmdk or overlay' --keep"
@@ -1425,10 +1425,10 @@ remains separately bounded and does not exhaust the workspace filesystem.
 
 ### Native opcode and unsupported-hole-punch proof
 
-Run `test_overlay_native_range_opcode_and_real_fallback` only after the
-corrected signed native pin, rebuilt stage, observed candidate and immutable
-exact kernel/init/**native binary** tuple have completed the qualification flow
-above. The source-copy build command also creates `range-observer`. Then:
+Run `test_overlay_native_range_opcode_and_real_fallback` after staging the
+corrected signed native pin and passing the kernel track's build-time configuration
+gate and the real overlay integration flow above. The source-copy build command
+also creates `range-observer`. Then:
 
 ```sh
 TMPDIR="$HOME/sm" make smoke SMOKE_ARGS="-m slow -k overlay_native_range_opcode_and_real_fallback --keep"
@@ -1482,38 +1482,28 @@ production monitor's `capabilities --backend krun --json` build identity,
 not a duplicate Cargo pin parser. A stale production monitor is rejected
 before archiving.
 
-### Whole private-stage replacement with retained qualified files
+### Whole private-stage replacement with owned boot files
 
-`test_overlay_qualified_stage_replacement_uses_retained_triplet` uses only
-private complete runtime clones, never Main's stage. Its successor contains
-byte-identical kernel/base assets and the existing unqualified reordered
-fixture monitor. The existing child-only Linux x86_64 syscall tracer holds the
-first write to the private launch-kernel temporary file, after admission and
-before any kernel output or composite publication. It records the held syscall
-and requires the pinned kernel/base pool objects and qualified native executable
-as read-only CLOEXEC descriptors with independently checked device/inode/hash
-identities. Earlier capability-query opens are not this boundary.
+`test_overlay_owned_stage_replacement_rechecks_monitor` uses private complete
+runtime clones, never Main's stage. A child-only Linux x86_64 syscall tracer holds
+the first write to the private launch-kernel temporary file, before kernel or
+composite publication. The gate checks that pinned kernel/base pool objects and
+the monitor are held as read-only CLOEXEC descriptors with independent inode and
+content evidence, then atomically swaps the stage and unlinks the retired tree.
 
-While those qualified files are held, it atomically swaps the whole private
-stage and unlinks the retired tree. The native executable must have zero links
-and retain its exact bytes; pinned kernel/base objects stay owned by the image
-pool, independently of the installed stage. After release, the real guest must
-start, its published kernel/base prefix must match, and both actual
-monitor/worker `/proc/PID/exe` must identify the old deleted inode and admitted
-SHA256 observed before replacement.
-A fresh start against the complete successor must reject its actual unknown
-native hash without allocating a new run. The controller retains EXITKILL and
-bounded descendant cleanup; the workspace owns registered VM teardown.
+The pre-exec metadata recheck must refuse the changed monitor before spawning it,
+without hashing or reopening the replaced executable path. Pinned guest assets
+remain owned independently of the stage. A fresh start must then boot with the
+successor monitor; changing a Silo-managed monitor does not require an artifact
+admission record. The controller retains EXITKILL and bounded descendant cleanup.
 
 ```sh
-make smoke SMOKE_ARGS="-k overlay_qualified_stage_replacement_uses_retained_triplet --keep"
+make smoke SMOKE_ARGS="-k overlay_owned_stage_replacement_rechecks_monitor --keep"
 ```
 
-Retained `overlay-stage-*` and `boundary-*` evidence includes the exact held
-syscall, source and destination FD identities, retained asset hashes, actual
-monitor/worker executable identities, CLI output and the fresh-start refusal.
-The gate requires the native retained descriptor to survive stage unlink,
-without treating installed kernel paths as the source of pinned boot objects.
+Retained `overlay-stage-*` and `boundary-*` evidence includes the held syscall,
+source and destination descriptor identities, retained asset hashes, CLI refusal
+and actual successor monitor/worker identities after the fresh successful boot.
 
 Machine/run identity assertions compare parsed UUID values, not compact versus
 hyphenated serialization spellings. Malformed or different identities still

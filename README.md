@@ -56,7 +56,7 @@ silo run ubuntu:24.04 -- uname -a
 reported unusable short-group tail reduce usable capacity. A small growth can
 increase backing length without adding usable space. Resize requires a stopped
 machine; the next boot replays and grows the upper in the guest.
-The profile requires an exactly admitted kernel/init tuple on libkrun and is
+The profile requires Linux 6.6 or newer on libkrun; overlay compatibility is a kernel-config property verified by the kernel track's build-time gate, not per boot, and the profile is
 never silently substituted for raw. VZ rejects direct OCI and layered sources;
 use explicit `silo image convert REF --disk-format raw` and then create from the
 returned managed raw image. Imported disks remain opaque raw roots.
@@ -65,8 +65,8 @@ layer order and repetition, plus the upper and boot closure. Exact OCI
 regeneration is only a digest-gated fallback, not a portability requirement.
 
 The published-builder namespace gate matched all 35,904 independent umoci rows
-through actual readonly EROFS mounts. Exact Linux x86_64 stable 7.2.2 and
-longterm 6.18.48 production-root tuples passed boot, lifecycle and flatten gates.
+through actual readonly EROFS mounts. Linux x86_64 stable 7.2.2 and
+longterm 6.18.48 production roots passed boot, lifecycle and flatten gates.
 The mandatory Phase 24 performance sweep remains outstanding; public live
 execution lanes remain unqualified.
 

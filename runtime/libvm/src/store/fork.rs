@@ -752,7 +752,7 @@ impl Store {
                 }
                 launch_lower = Some(
                     crate::store::layer_store::LayerStore::from_store(self.clone())
-                        .launch_lower(lower)
+                        .hold_lower(lower)
                         .await?,
                 );
                 continue;

@@ -46,7 +46,7 @@ pub(crate) struct VmmLaunch<'a> {
     pub(crate) startup_command: Option<&'a VmmStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
     pub(crate) machine_lock: &'a MachineLifetimeLock,
-    pub(crate) qualification: Option<&'a crate::QualifiedOverlayBoot>,
+    pub(crate) qualification: Option<&'a crate::OwnedOverlayBoot>,
     pub(crate) storage_lease: &'a crate::storage::locks::StorageLock,
     pub(crate) storage_lease_binding: protocol::shutdown::StorageLeaseBinding,
     pub(crate) storage_shutdown: &'a protocol::shutdown::StorageShutdownContext,
@@ -288,8 +288,8 @@ impl VmSupervisor {
     }
 }
 
-fn monitor_command(executable: &Path, qualified: Option<BorrowedFd<'_>>) -> io::Result<Command> {
-    match qualified {
+fn monitor_command(executable: &Path, retained: Option<BorrowedFd<'_>>) -> io::Result<Command> {
+    match retained {
         None => Ok(Command::new(executable)),
         Some(descriptor) => {
             #[cfg(target_os = "linux")]
@@ -559,7 +559,7 @@ pub(crate) fn install_child_inheritance(
         command.pre_exec(move || {
             #[cfg(target_os = "linux")]
             {
-                // nix has no close_range(CLOEXEC). Do not close the qualified
+                // nix has no close_range(CLOEXEC). Do not close the held
                 // executable FD: the kernel resolves it before CLOEXEC applies.
                 if nix::libc::syscall(
                     nix::libc::SYS_close_range,

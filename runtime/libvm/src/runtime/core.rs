@@ -691,29 +691,19 @@ impl Runtime {
         )
     }
 
-    pub(crate) fn qualify_erofs_overlay(
+    pub(crate) fn open_overlay_boot(
         &self,
         kernel: Option<&Path>,
         initramfs: Option<&Path>,
-    ) -> Result<crate::QualifiedOverlayBoot, LibVmError> {
+    ) -> Result<crate::OwnedOverlayBoot, LibVmError> {
         let backend = self.live_query.selection().backend;
         if backend != vm_spec::live::LiveBackend::Krun {
             return Err(LibVmError::OverlayBackendUnsupported { backend });
         }
         let assets = self.resolve_boot_assets(kernel, initramfs)?;
-        let architecture = match std::env::consts::ARCH {
-            "x86_64" => crate::GuestArchitecture::Amd64,
-            "aarch64" => crate::GuestArchitecture::Arm64,
-            arch => {
-                return Err(LibVmError::UnsupportedHostArchitecture {
-                    arch: arch.to_string(),
-                })
-            }
-        };
-        crate::boot_qualification::admit_erofs_overlay(
+        crate::owned_boot_assets::open_overlay_boot(
             &assets.kernel,
             &assets.initramfs,
-            architecture,
             backend,
             self.components.supervisor(),
         )
@@ -1661,11 +1651,11 @@ impl Runtime {
         .map_err(|error| io::Error::other(format!("join holder cleanup owner: {error}")))?
     }
 
-    pub(crate) fn qualify_machine_root(
+    pub(crate) fn open_machine_boot(
         &self,
         config: &MachineConfig,
         storage: &crate::MachineStorageRecord,
-    ) -> Result<Option<crate::QualifiedOverlayBoot>, LibVmError> {
+    ) -> Result<Option<crate::OwnedOverlayBoot>, LibVmError> {
         let pool = crate::storage::pool::StoragePool::open_existing(self.local_images_dir())?;
         let pinned = match &storage.boot {
             crate::BootProfile::LinuxDirect {
@@ -1688,31 +1678,28 @@ impl Runtime {
         };
         if matches!(&storage.root, crate::MachineRoot::LinuxOverlay { .. }) {
             if let Some(pinned) = pinned {
-                return pinned
-                    .assets
-                    .into_overlay_qualification()
-                    .map(Some)
-                    .ok_or_else(|| {
-                        crate::machine::root_storage::invalid(
-                            "pinned overlay boot has no retained qualification",
-                        )
-                    });
+                return pinned.assets.into_overlay_boot().map(Some).ok_or_else(|| {
+                    crate::machine::root_storage::invalid(
+                        "pinned overlay boot has no retained qualification",
+                    )
+                });
             }
             let (kernel, initramfs) = boot_asset_overrides_from_spec(&config.spec);
-            Ok(Some(self.qualify_erofs_overlay(kernel, initramfs)?))
+            Ok(Some(self.open_overlay_boot(kernel, initramfs)?))
         } else {
             Ok(None)
         }
     }
 
-    /// The layered lower is leased (layers, packs and fsmeta) before any VMDK
-    /// preflight and the lease is held by the prepared root through launch.
+    /// Authenticate the layered lower under the existing launch generation.
+    /// The caller retains that authority through monitor startup.
     pub(crate) async fn prepare_machine_root(
         &self,
         config: &MachineConfig,
-        storage: &crate::MachineStorageRecord,
-        qualification: Option<crate::QualifiedOverlayBoot>,
+        lease: &crate::store::operation_store::LaunchStorageLease,
+        qualification: Option<crate::OwnedOverlayBoot>,
     ) -> Result<crate::machine::root_storage::PreparedRoot, LibVmError> {
+        let storage = lease.storage_record();
         let effective =
             boot_assets::effective_boot(storage, &config.spec, self.effective_backend())?;
         let data_disks = config.spec.storage.as_ref().map_or(0, |storage| {
@@ -1723,9 +1710,9 @@ impl Runtime {
                 .count() as u64
         });
         let lower = match &storage.root {
-            crate::MachineRoot::LinuxOverlay { lower, .. } if qualification.is_some() => Some(
+            crate::MachineRoot::LinuxOverlay { .. } if qualification.is_some() => Some(
                 crate::store::layer_store::LayerStore::from_store(self.native_store()?)
-                    .launch_lower(lower)
+                    .launch_lower(lease, storage)
                     .await?,
             ),
             _ => None,
@@ -2068,6 +2055,8 @@ impl Runtime {
                 .supervisor
                 .rosetta_intent_request(config, root.rosetta)
                 .map_err(eyre::Report::msg)?;
+            let mut artifacts =
+                crate::machine::root_storage::LaunchArtifacts::new(&config.machine_dir)?;
             let relative_mount_base = std::env::current_dir()
                 .context("resolve current directory for relative mount sources")?;
             let machine_paths = self.machine_paths(config.id);
@@ -2141,25 +2130,33 @@ impl Runtime {
                     .as_mut()
                     .and_then(|boot| boot.kernel.as_mut())
                     .ok_or_else(|| eyre::eyre!("pinned direct boot has no kernel configuration"))?;
-                kernel.path = Some(crate::machine::root_storage::publish_kernel(
+                let (path, file) = crate::machine::root_storage::publish_kernel(
                     &config.machine_dir,
                     pinned.assets.kernel(),
-                )?);
+                )?;
+                artifacts.files.push(file);
+                kernel.path = Some(path);
                 kernel.initramfs = None;
             }
             if let Some(descriptor) = &root.descriptor {
-                crate::machine::root_storage::publish_descriptor(&config.machine_dir, descriptor)?;
+                artifacts
+                    .files
+                    .push(crate::machine::root_storage::publish_descriptor(
+                        &config.machine_dir,
+                        descriptor,
+                    )?);
             }
             if let Some(qualification) = root.qualification.as_ref().filter(|_| pinned.is_none()) {
-                let kernel_path = crate::machine::root_storage::publish_kernel(
+                let (kernel_path, file) = crate::machine::root_storage::publish_kernel(
                     &config.machine_dir,
                     qualification.kernel_asset(),
                 )?;
+                artifacts.files.push(file);
                 let kernel = launch_spec
                     .boot
                     .as_mut()
                     .and_then(|boot| boot.kernel.as_mut())
-                    .ok_or_else(|| eyre::eyre!("qualified overlay has no direct kernel boot"))?;
+                    .ok_or_else(|| eyre::eyre!("owned overlay has no direct kernel boot"))?;
                 kernel.path = Some(kernel_path);
             } else if pinned.is_none() {
                 self.complete_launch_boot_assets(&mut launch_spec)?;
@@ -2218,7 +2215,7 @@ impl Runtime {
             } else {
                 match root.qualification.as_ref() {
                     Some(qualification) => {
-                        crate::initramfs_overlay::CompositeBase::Qualified(qualification)
+                        crate::initramfs_overlay::CompositeBase::Owned(qualification)
                     }
                     None => crate::initramfs_overlay::CompositeBase::Path(
                         base_path
@@ -2228,20 +2225,25 @@ impl Runtime {
                 }
             };
             let composite_path = machine_paths.composite_initramfs_path();
-            crate::initramfs_overlay::write_composite(
+            let composite = crate::initramfs_overlay::write_composite(
                 base,
                 agent.zip(serialized.as_deref()),
                 Some(&root.bootstrap),
                 &composite_path,
             )?;
+            artifacts.files.push(composite);
             set_launch_initramfs(&mut launch_spec, composite_path);
 
-            supervisor::write_launch_spec(&machine_paths.vm_spec_path(), &launch_spec)?;
+            artifacts.files.push(supervisor::write_launch_spec(
+                &machine_paths.vm_spec_path(),
+                &launch_spec,
+            )?);
             Ok(crate::supervisor::VmmLaunchInputs {
                 agent_enabled,
                 rosetta_intent,
                 asset_directory: self.components.asset_dir().to_path_buf(),
                 storage_shutdown,
+                artifacts,
             })
         };
 
@@ -3637,7 +3639,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_image_creation_refuses_unqualified_layered_boot_without_effects() {
+    async fn resolved_image_creation_refuses_old_overlay_kernel_without_effects() {
         const REFERENCE: &str = "example.invalid/demo:mutable";
         const MANIFEST: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -3660,7 +3662,7 @@ pub(crate) mod tests {
         }
         std::fs::write(
             runtime.components.kernel(),
-            test_utils::direct_kernel::host_kernel("unit-test packaged boot asset"),
+            test_utils::direct_kernel::bzimage("5.15.219"),
         )
         .unwrap();
         let metadata = write_cached_oci_rootfs(&runtime, REFERENCE, MANIFEST, CONFIG).await;
@@ -3676,19 +3678,18 @@ pub(crate) mod tests {
             .await
             .expect("resolve cached image");
         assert_eq!(resolved.selected_reference, metadata.selected_reference);
-        // The OCI source selects the layered root; no exact boot tuple is
-        // admitted, so creation is refused before acquisition or effects.
+        // Kernel compatibility is checked before acquisition or machine effects.
         let error = runtime
             .machine()
             .name("resolved-image")
             .resolved_image(resolved)
             .create()
             .await
-            .expect_err("unqualified layered boot must not create");
+            .expect_err("old overlay kernel must not create");
         assert!(
             matches!(
                 error,
-                LibVmError::OverlayBootQualification(_)
+                LibVmError::BootAsset(_)
                     | LibVmError::OverlayBackendUnsupported { .. }
                     | LibVmError::BackendAdmissionRejected { .. }
             ),

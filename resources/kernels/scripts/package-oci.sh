@@ -138,7 +138,7 @@ jq -n \
                 overlayProfile: "silo-overlay-v1",
                 renderingAbi: "linux-overlayfs-mountinfo-v1",
                 attachmentFamily: "krun-virtio-blk-v1",
-                qualification: "requires-exact-boot-evidence"
+                qualification: "kernel-config-build-gate"
             }
         },
         source: {url: $source_url, digest: ("sha256:" + $source_sha256), key: $source_key},

@@ -23,7 +23,7 @@ additive-migration requirements throughout the implementation plan.
 
 Phase 22 cuts current OCI creation over to `linux-erofs-overlay-v1` on
 libkrun and removes the development flat profile and root-profile selector.
-Exact Linux x86_64 production-root tuples passed boot and lifecycle qualification
+Linux x86_64 production-root boot and lifecycle gates passed
 on stable 7.2.2 and longterm 6.18.48, including kernel-mutated flatten export and
 raw re-import. Public live lanes remain unqualified; performance qualification
 is deferred to the mandatory Phase 24 sweep. The independent published-builder
@@ -1556,23 +1556,19 @@ because both layers keep inode numbers within 32 bits: ext4 inode numbers are
 32-bit, and EROFS inode numbers derive from the 32-byte-slot index into
 fsmeta, which the 4 GiB fsmeta bound keeps below 2^27.
 
-All new managed Linux overlay profiles require an admitted kernel at least Linux
-6.6. Flattened EROFS, which lets the guest read fsmeta and every layer occurrence
-from one block device without `device=` mount options, requires Linux 6.4. The
-`uuid=null` OverlayFS option requires Linux 6.6, so 6.6 is the floor for the
-selected profile. Of the maintained kernel tracks, `stable` (7.2) and
-`longterm` (6.18) satisfy the floor; `longterm5` (5.15) is eligible only for
-opaque raw profiles, never for managed overlay roots. A kernel track name alone
-is not evidence of storage-profile compatibility. The current Silo kernel
-configurations enable OverlayFS and ext4 but neither EROFS nor partition
-scanning; stage 3 adds GPT/MBR scanning and vfat, stage 4 adds and qualifies
-EROFS.
+All new managed Linux overlay profiles require Linux 6.6 or newer, checked
+from the held kernel's version header before machine or storage effects.
+Flattened EROFS requires Linux 6.4; the selected `uuid=null` OverlayFS option
+requires Linux 6.6, establishing the profile floor. The maintained `stable`
+(7.2) and `longterm` (6.18) tracks satisfy it; `longterm5` (5.15) remains
+opaque-raw-only. Overlay compatibility is a kernel-config property verified by
+the kernel track's gate at build time, not by per-boot artifact qualification.
 
 The kernel must build in EROFS external-device/chunk support, xattrs, ACLs,
 security labels and export handles, plus ext4/JBD2, OverlayFS, GPT and MBR
-partition scanning and virtio block. Release metadata qualifies the exact kernel
-artifact, root/profile versions, architecture and attachment families.
-Successful tests widen that matrix; unqualified combinations fail before launch.
+partition scanning and virtio block. The kernel track's build-time gate verifies
+these configuration requirements; launch does not hash kernel, initramfs or
+monitor bytes or consult an artifact admission list.
 Boot-asset upgrades do not silently change an existing machine's persistence
 profile.
 
@@ -2651,11 +2647,11 @@ run under translation on arm64. A budget passes when the median meets it.
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | Changeset/pack/index/fsmeta encoders, byte ABIs, golden corpus  | Qualification is accounted for by the libvm storage owner; the `oci` subsystem implements the encoders. A byte change is an ABI bump with a new golden set |
 | libkrun and `imago` pins, VMDK attach path, discard semantics   | `silo-vmm` owner, through the root `Cargo.toml` pins; every pin change reruns the backend gates                     |
-| Kernel tracks: EROFS, OverlayFS and ext4 feature qualification  | Kernel resources owner; a track is admitted for a profile only with its passing gate record                         |
-| Qualification matrix per release                                | Release owner; one record names the libkrun revision, `imago` version, kernel tracks and reference host specifications each profile passed on |
+| Kernel tracks: EROFS, OverlayFS and ext4 feature compatibility | Kernel resources owner; the track's build-time gate verifies the profile's kernel configuration, while boot checks only the Linux 6.6 floor |
+| Release compatibility evidence | Release owner; records backend revisions, kernel tracks and reference hosts exercised by release gates, never a per-boot artifact allowlist |
 
-The matrix is published with each release. A profile without a passing entry
-for the shipped revision set is not enabled by default in that release.
+The matrix records release evidence. Overlay boots do not consult it or require
+an artifact-specific record; custom kernels meeting the version floor are accepted.
 
 ## Security And Failure Semantics
 
@@ -2770,7 +2766,7 @@ alternatives. New features remain opt-in until their relevant tests pass.
    handoff in both directions.
 4. **Deterministic layered OCI:** enable and qualify EROFS with chunked files,
    device tables, xattrs, ACLs, security labels and export handles in the
-   admitted kernel tracks; payload/index encoder, fsmeta, VMDK descriptor
+   build-gated kernel tracks; payload/index encoder, fsmeta, VMDK descriptor
    identity, cross-host golden digests, exact regeneration fallback and the
    compatibility corpus gate. Flatten export is separately admitted only after
    clean-state checks, kernel-mutated ext4 reading and indexed-overlay namespace
@@ -2896,8 +2892,8 @@ mocked mount or VMM behavior does not qualify a profile.
   Dirty journals and unsupported index/layout state fail before output publication;
   exact snapshots of the same dirty source still succeed without modification.
 - Stop/restart on Linux and macOS hosts preserves one exact upper and lower.
-  Unknown kernels or bootstraps fail admission rather than relying on host
-  developer configuration.
+  Overlay kernels below Linux 6.6 fail before effects; kernel configuration is
+  verified by the track's build-time gate rather than a per-boot artifact record.
 - Writes, boot-time growth of clean and dirty uppers, graceful shutdown, forced
   stop and journal recovery change only private state. Upper and host `ENOSPC`
   are distinguishable. Dirty sources are copied before replay and parent/child

@@ -41,10 +41,10 @@ pub enum LibVmError {
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
     #[error(transparent)]
-    OverlayBootQualification(#[from] crate::boot_qualification::OverlayBootQualificationError),
+    BootAsset(#[from] crate::owned_boot_assets::BootAssetError),
     /// A raw root's selected kernel bytes do not establish its direct profile.
     #[error(transparent)]
-    DirectKernelRejected(#[from] Box<crate::boot_qualification::DirectKernelRejected>),
+    DirectKernelRejected(#[from] Box<crate::owned_boot_assets::DirectKernelRejected>),
     #[error("backend {backend:?} does not support layered EROFS overlay roots")]
     OverlayBackendUnsupported { backend: vm_spec::live::LiveBackend },
     #[error("boot admission rejected {source_family:?}/{root_profile:?} on {effective_backend:?}: requires {requirement:?}; remedy: {remedy:?}")]
@@ -61,11 +61,8 @@ pub enum LibVmError {
     BootAssetsAcquisitionRequired {
         missing: crate::storage::identity::ObjectDigest,
     },
-    #[error("base initramfs {actual} has no admitted schema-2 bootstrap ABI; select the packaged base {expected}")]
-    BootBundleAbiUnsupported {
-        expected: crate::storage::identity::ObjectDigest,
-        actual: crate::storage::identity::ObjectDigest,
-    },
+    #[error("custom base initramfs bytes differ from the supported schema-2 bootstrap; select the packaged base initramfs")]
+    BootBundleAbiUnsupported,
     #[error("root selection {:?} failed: {}", .0.requested, .0.reason)]
     RootSelectionFailed(Box<crate::image::import_types::RootSelectionFailed>),
     #[error(transparent)]
@@ -375,13 +372,13 @@ impl LibVmError {
             Self::LiveFork { .. } => "LiveFork",
             Self::LiveForkNotFound { .. } => "LiveForkNotFound",
             Self::Storage(_) => "Storage",
-            Self::OverlayBootQualification(_) => "OverlayBootQualification",
+            Self::BootAsset(_) => "BootAsset",
             Self::DirectKernelRejected(_) => "DirectKernelRejected",
             Self::OverlayBackendUnsupported { .. } => "OverlayBackendUnsupported",
             Self::BackendAdmissionRejected { .. } => "BackendAdmissionRejected",
             Self::TranslationUnavailable { .. } => "TranslationUnavailable",
             Self::BootAssetsAcquisitionRequired { .. } => "BootAssetsAcquisitionRequired",
-            Self::BootBundleAbiUnsupported { .. } => "BootBundleAbiUnsupported",
+            Self::BootBundleAbiUnsupported => "BootBundleAbiUnsupported",
             Self::RootSelectionFailed(_) => "RootSelectionFailed",
             Self::DiskImport(_) => "DiskImport",
             Self::IncompatibleRootProfile { .. } => "IncompatibleRootProfile",

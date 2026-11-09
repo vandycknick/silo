@@ -17,33 +17,12 @@ pub(crate) fn prepare_launch_spec(input: LaunchSpecInput<'_>) -> eyre::Result<Vm
     Ok(spec)
 }
 
-pub(crate) fn write_launch_spec(path: &Path, spec: &VmSpec) -> eyre::Result<()> {
-    let config = serde_json::to_string_pretty(spec)
-        .with_context(|| format!("serialize vm spec at {}", path.display()))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| eyre::eyre!("launch spec has no parent"))?;
-    let directory = crate::paths::OwnedDirectory::open_existing_root(parent)?
-        .ok_or_else(|| eyre::eyre!("launch directory disappeared"))?;
-    let name = format!(".config-{}.tmp", uuid::Uuid::new_v4().simple());
-    let temporary = parent.join(&name);
-    let result = (|| {
-        directory.write_file(&name, config.as_bytes())?;
-        std::fs::rename(&temporary, path)?;
-        directory.sync()?;
-        Ok::<_, eyre::Report>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result.with_context(|| format!("publish vm spec at {}", path.display()))
-}
+/// Atomically publish the config and retain its exact inode for the launch barrier.
+pub(crate) fn write_launch_spec(path: &Path, spec: &VmSpec) -> eyre::Result<std::fs::File> {
+    use std::io::Write;
 
-pub(crate) fn write_launch_spec_deferred(
-    path: &Path,
-    spec: &VmSpec,
-) -> eyre::Result<std::fs::File> {
-    let config = serde_json::to_vec_pretty(spec)?;
+    let config = serde_json::to_vec_pretty(spec)
+        .with_context(|| format!("serialize vm spec at {}", path.display()))?;
     let parent = path
         .parent()
         .ok_or_else(|| eyre::eyre!("launch spec has no parent"))?;
@@ -53,10 +32,16 @@ pub(crate) fn write_launch_spec_deferred(
         .ok_or_else(|| eyre::eyre!("launch spec has no UTF-8 name"))?;
     let directory = crate::paths::OwnedDirectory::open_existing_root(parent)?
         .ok_or_else(|| eyre::eyre!("launch directory disappeared"))?;
-    directory.write_file_atomic_deferred(name, &config)?;
     directory
-        .open_file(name)?
-        .ok_or_else(|| eyre::eyre!("published launch spec disappeared"))
+        .publish_file_deferred(
+            name,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            |file| {
+                file.write_all(&config)?;
+                Ok(())
+            },
+        )
+        .with_context(|| format!("publish vm spec at {}", path.display()))
 }
 
 fn normalize_mount_sources(spec: &mut VmSpec, relative_mount_base: &Path) -> eyre::Result<()> {

@@ -131,8 +131,8 @@ must reach the guest as its virtio-blk serial on every backend; kernel
 `root=`, `rootfstype=`, `rootflags=` and `rdinit=` arguments, in any spelling
 Linux `next_arg` recognizes (including double quotes), are rejected rather
 than honored, so the trusted `/init` is always the initial executable.
-Missing/invalid bootstrap fails closed. Schema support never grants
-production boot qualification.
+Missing/invalid bootstrap fails closed. Schema support alone does not establish
+the kernel configuration's overlay compatibility.
 
 Inherited descriptors are named by environment variables. Scalar roles hold a
 descriptor number; the generation lease uses the bounded JSON array below:

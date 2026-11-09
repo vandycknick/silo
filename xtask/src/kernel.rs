@@ -578,7 +578,7 @@ fn root_runtime_metadata(
             "overlayProfile": "silo-overlay-v1",
             "renderingAbi": "linux-overlayfs-mountinfo-v1",
             "attachmentFamily": "krun-virtio-blk-v1",
-            "qualification": "requires-exact-boot-evidence"
+            "qualification": "kernel-config-build-gate"
         }
     }))
 }
@@ -1116,7 +1116,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn overlay_kernel_metadata_has_a_floor_but_never_grants_qualification() {
+    fn overlay_kernel_metadata_records_floor_and_build_config_gate() {
         for (track, version, eligible) in [
             ("stable", "7.2.2", true),
             ("longterm", "6.18.48", true),
@@ -1130,7 +1130,7 @@ mod tests {
             assert_eq!(metadata["managedOverlay"]["eligible"], eligible);
             assert_eq!(
                 metadata["managedOverlay"]["qualification"],
-                "requires-exact-boot-evidence"
+                "kernel-config-build-gate"
             );
         }
         let probe = root_runtime_metadata(KernelProfile::Rprobe, "stable", "7.2.2").unwrap();

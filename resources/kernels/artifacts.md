@@ -142,7 +142,7 @@ Changing filenames does not break this contract. Adding a second kernel-image
 layer or changing the meaning of an existing format requires a new artifact
 contract rather than a filename heuristic.
 
-## Managed Root Boot Qualification
+## Managed Root Kernel Compatibility
 
 Workload artifact metadata additionally carries a `rootRuntime` object:
 
@@ -157,16 +157,16 @@ Workload artifact metadata additionally carries a `rootRuntime` object:
     "overlayProfile": "silo-overlay-v1",
     "renderingAbi": "linux-overlayfs-mountinfo-v1",
     "attachmentFamily": "krun-virtio-blk-v1",
-    "qualification": "requires-exact-boot-evidence"
+    "qualification": "kernel-config-build-gate"
   }
 }
 ```
 
-`eligible` is only the numeric Linux >=6.6 prerequisite for workload kernels,
-never a claim that a boot or conformance gate passed. `longterm5` is always
-opaque-raw-only, and `rprobe` is not a workload root candidate. Resolved config
-validation pins built-in EROFS and ext4, ACL/security support, OverlayFS and its
-module defaults. Exact runtime evidence remains required.
+`eligible` records the numeric Linux >=6.6 prerequisite for workload kernels.
+`longterm5` is opaque-raw-only, and `rprobe` is not a workload root candidate.
+Overlay compatibility is a kernel-config property verified by the kernel track's
+gate at build time, not per boot. Resolved config validation pins built-in EROFS
+and ext4, ACL/security support, OverlayFS and its module defaults.
 
 ### Workload Partition and Rosetta Configuration (Qualification Pending)
 
@@ -190,22 +190,18 @@ kernel uses independent fragments and is unchanged.
 The x86_64 stable and longterm configurations were generated and passed the
 resolved-config validator on 2026-11-06; retained evidence is under
 `.tmp/plan/evidence/phase-17/workload-{stable,longterm}-x86_64.config`.
-Arm64 resolved configuration, kernel builds and exact-byte guest qualification
-remain pending. Changed kernel or reusable initramfs bytes cannot reuse the
-observed overlay tuple below, even though the overlay algorithm is unchanged.
-Main must retain the actual resolved Kconfig and boot evidence for the new
-kernel/init tuple before refreshing admission. No qualified hashes are changed
-by this configuration update, and no partitioned-root, VFAT-mount or Rosetta
-runtime pass is claimed.
+Arm64 resolved configuration, kernel builds and guest compatibility gates remain
+pending. No partitioned-root, VFAT-mount or Rosetta runtime pass is claimed by a
+configuration update alone.
 
 ### Raw-root Direct Kernel Admission
 
-Opaque raw roots do not use an exact-byte tuple table. libvm admits the pinned
-kernel from its own bytes, in the same bounded pass that hashes it, whenever a
-raw image is imported, a machine is created or its boot assets are updated, an
-exact bundle is selected, a packaged replacement is reported, a stopped capture
-resolves its boot or a pinned machine starts. A recorded or requested
-architecture is never accepted as evidence on its own.
+libvm checks the pinned kernel's bounded header for native format and
+architecture when selecting raw-root boot assets. It does not hash kernel,
+initramfs or monitor assets on start or inspect. Content-addressed bundle
+identities are computed when importing or capturing assets, not to grant boot
+permission. Packaged-update inspection uses object identities recorded at
+import and never rehashes installed boot files.
 
 The bytes must be the host's direct-loader format from the architecture
 contract above: an x86-64 little-endian ELF64 executable with in-file `PT_LOAD`
@@ -220,59 +216,39 @@ its root needs fails at boot, not at admission. The workload fragments above
 describe what Silo's own kernels build in; passing admission does not qualify a
 boot, and guest gates remain the evidence that a kernel actually boots.
 
-### Exact-byte Overlay Admission
+### Overlay Kernel Floor and Owned Boot Assets
 
+Overlay roots require Linux 6.6 or newer. libvm reads the version from the held
+kernel (the Linux boot protocol header for bzImage, or `linux_banner` in native
+ELF vmlinux) and rejects older or unreadable versions before machine or storage
+effects. Raw roots retain their independent native-format checks. The selected
+backend must support overlay roots; Mock and VZ are rejected before opening
+overlay boot assets. Kernel track gates verify the required configuration at
+build time; launch does not consult an artifact-specific admission list.
 
-Production EROFS-overlay admission is owned by libvm's focused
-`boot_qualification` module, not package metadata or runtime discovery. Its
-immutable reviewed tuples bind exact kernel, reusable base-initramfs and native
-monitor/worker executable bytes, the actual resolved Kconfig digest, kernel
-version, guest architecture, host execution lane, root/upper/overlay profiles,
-rendering ABI and attachment family. An arbitrary custom initramfs or a changed
-kernel fails admission before
-machine/storage effects. A source config hash, `uname`, track, successful
-compilation, environment variable, home/database record or staged manifest
-cannot grant admission. There is no public bypass or unsupported fallback.
-Admission checks the actual selected backend and rejects Mock/VZ before opening
-boot assets. Its non-copyable token retains the qualified source descriptors.
-Qualification and launch copying are bounded by each descriptor's initial
-length, check file identity/size/change timestamps before and after, and hash
-the exact copied bytes. Launch stages the kernel and composes the base
-initramfs from these retained descriptors into private temporary files,
-publishing only after validation succeeds. It never hashes a source pathname
-and then reopens that original pathname for use.
-Cooperative atomic restaging can unlink any retained source, including the
-kernel and reusable base. Only link-count decreases and their ctime changes are
-permitted; all other fingerprint fields must remain stable, and copied bytes
-must still match the original qualified digest. This applies before and after
-the bounded copy, without reopening the replacement pathname.
-Linux launches the retained native executable through `/proc/self/fd/N`, with
-the parent descriptor normalized to at least 3 and kept CLOEXEC. The token is
-retained through spawn and its executable fingerprint is rechecked immediately
-beforehand. Atomic restaging may unlink that old inode; link-removal/ctime-only
-changes require a bounded rehash of the retained inode against the admitted
-native digest. No executable pathname fallback or per-start native binary copy
-is used. The worker reexecutes its loaded image rather than a replaced source
-path. Non-Linux managed-overlay launch remains unadmitted. This relies on
-trusted cooperative atomic publication, not protection from malicious same-UID
-in-place executable modification.
+The `owned_boot_assets` module retains read-only CLOEXEC descriptors. Guest
+asset copies are bounded by their initial length and check file identity, size
+and timestamps before and after copying. The private `kernel-qualified` launch
+copy remains mode 0400; the per-launch composite initramfs is built from the held
+base plus the current root and agent archive. Atomic source publication never
+causes those copies to reopen replacement paths.
 
-The native SHA binds the concrete corrected DISCARD/WRITE_ZEROES implementation.
-An older attachment binary cannot borrow qualification from unchanged
-kernel/init bytes. Retained build evidence also records its signed dependency
-revision and existing capabilities build identity; those provenance strings
-alone never grant admission.
+Linux executes the held monitor via `/proc/self/fd/N`, normalized to at least
+descriptor 3 and kept CLOEXEC in the parent. Immediately before spawn, its
+metadata fingerprint must still match; unlink or replacement that changes it
+fails closed without rehashing or an executable-path fallback. The worker
+reexecutes its loaded image. This relies on cooperative atomic publication, not
+protection from malicious same-UID in-place modification.
 
-Initial qualification uses a controlled smoke-only fixture with the staged real
-monitor and worker, the real upper formatter, current root bootstrap and actual
-candidate kernel/init bytes. It records sysfs identities/geometry, mountinfo,
-current module parameters and the result of init's effective-option verifier.
-Main reviews the retained evidence and actual build/OCI resolved-config identity
-before an exact tuple can be added. The observed tuple below admits only those
-exact bytes. A candidate probe does not prove normal integration: after
-recording the tuple, the positive gate must create and boot through the normal
-CLI/libvm -> monitor -> worker path. No Cargo test launches a guest, and there
-is no second direct-libkrun harness.
+Pinned bundle identities and checkpoint producer identities are independent of
+this version check. Capture receipts retain the monitor digest from its
+capability report. Kernel, reusable initramfs or monitor updates do not require
+recompiling libvm to authorize new artifact bytes.
+
+Real boot and storage gates still exercise the staged monitor/worker, actual
+kernel, upper formatter, effective mount options and device identities. These
+are compatibility evidence, not per-boot authorization records.
+
 
 `linux-overlayfs-mountinfo-v1` decodes omitted index, metacopy, redirect and
 nfs_export settings using the current built-in module parameters, not the
@@ -289,9 +265,9 @@ Layered OCI roots are the libkrun default. Raw disks remain explicit inputs or
 conversion/export products. The development flat lower and root-profile selector
 are removed; incompatible state requires an explicit wipe, not a migration.
 
-### Observed Linux KVM Tuples
+### Observed Linux KVM Compatibility Evidence
 
-The reviewed production boot-admission table binds these exact bytes:
+Historical real boot observations recorded these artifacts:
 
 | Identity | Value |
 | --- | --- |
@@ -323,9 +299,8 @@ The separate two-track encoder matrix passed all ten cases, including 1024
 occurrences and a sparse mapping beyond 2 GiB (`stable-native-prerequisite-gates.log`).
 
 These boot and storage results grant no public live capability. Capture,
-restore, fork and incremental remain unqualified pending the mandatory
-performance sweep. Other native binaries, kernel/initramfs bytes and host lanes
-are not admitted by these tuples.
+restore, fork and incremental remain subject to their independent live-operation
+gates; ordinary overlay boot requires the kernel floor, not these artifact hashes.
 
 
 

@@ -288,7 +288,7 @@ def configured_semantics(value: dict) -> dict:
 
 
 @contextmanager
-def syscall_boundary(silo: Silo, command: list[str], target: Path, boundary: str, *, stdin: Path | None = None, injected_errno: int | None = None):
+def syscall_boundary(silo: Silo, command: list[str], target: Path, boundary: str, *, stdin: Path | None = None, injected_errno: int | None = None, expect_failure: bool = False):
     request = {"command": command, "target": str(target), "boundary": boundary, "machines": str(silo.ws.silo_home / "machines"), "evidence": str(silo.ws.evidence), "release": str(silo.ws.evidence / "boundary-release")}
     source = target.stat()
     source_identity = {"path": str(target), "device": source.st_dev, "inode": source.st_ino}
@@ -314,7 +314,7 @@ def syscall_boundary(silo: Silo, command: list[str], target: Path, boundary: str
             Path(request["release"]).touch()
             assert controller.wait(timeout=180) == 0, "actual syscall gate failed; inspect boundary-controller.log"
             result = json.loads((silo.ws.evidence / "boundary-result.json").read_text())
-            assert (result["returncode"] == 0) == (injected_errno is None), "unexpected real command result; inspect boundary-command.log"
+            assert (result["returncode"] == 0) == (injected_errno is None and not expect_failure), "unexpected real command result; inspect boundary-command.log"
             if injected_errno is not None:
                 injected = json.loads((silo.ws.evidence / "boundary-injected.json").read_text())
                 assert all(injected[key] == value for key, value in receipt.items())

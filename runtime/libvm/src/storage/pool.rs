@@ -375,6 +375,60 @@ impl StoragePool {
         self.objects.path().join(digest.hex())
     }
 
+    /// Record publication's content identity for metadata-only packaged-update discovery.
+    pub(crate) fn record_boot_source(
+        &self,
+        fingerprint: SourceFingerprint,
+        digest: ObjectDigest,
+    ) -> Result<(), StorageError> {
+        let key = serde_json::to_vec(&fingerprint)
+            .map_err(|error| StorageError::InvalidPath(error.to_string()))?;
+        let directory = owned(self.root.ensure_dir("boot-sources"))?;
+        let bytes = serde_json::to_vec(&digest)
+            .map_err(|error| StorageError::InvalidPath(error.to_string()))?;
+        let key = ObjectDigest::of_bytes(&key).hex();
+        if let Some(file) = owned(directory.open_file(&key))? {
+            let mut previous = Vec::new();
+            file.take(1025).read_to_end(&mut previous)?;
+            if previous == bytes {
+                return Ok(());
+            }
+        }
+        owned(directory.write_file_atomic(&key, &bytes))
+    }
+
+    /// Unknown or changed installed files have no recorded replacement identity.
+    pub(crate) fn boot_source_digest(
+        &self,
+        path: &Path,
+    ) -> Result<Option<ObjectDigest>, StorageError> {
+        let Some(directory) = owned(self.root.open_dir("boot-sources"))? else {
+            return Ok(None);
+        };
+        let source = open_regular_source(path)?;
+        let fingerprint = SourceFingerprint::new(&source.metadata()?);
+        let key = serde_json::to_vec(&fingerprint)
+            .map_err(|error| StorageError::InvalidPath(error.to_string()))?;
+        let Some(file) = owned(directory.open_file(&ObjectDigest::of_bytes(&key).hex()))? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.take(1025).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 {
+            return Err(StorageError::InvalidPath(
+                "boot source receipt exceeds metadata bound".into(),
+            ));
+        }
+        let digest: ObjectDigest = serde_json::from_slice(&bytes)
+            .map_err(|error| StorageError::InvalidPath(error.to_string()))?;
+        if existing(&self.objects, &digest.hex())?.is_none()
+            || fingerprint != SourceFingerprint::new(&source.metadata()?)
+        {
+            return Ok(None);
+        }
+        Ok(Some(digest))
+    }
+
     pub fn stream_path(&self, id: &StreamId) -> PathBuf {
         self.streams.path().join(id.hex())
     }
@@ -571,7 +625,7 @@ impl StoragePool {
         .ok_or_else(|| StorageError::InvalidPath("fresh operation lease is busy".into()))
     }
 
-    /// A live child's stable lease is covered by its background barrier.
+    /// The caller must include the lease and its directory in its durability barrier.
     pub(crate) fn lease_deferred(&self, operation: Uuid) -> Result<StorageLock, StorageError> {
         locks::acquire_new_deferred(
             &self.leases,

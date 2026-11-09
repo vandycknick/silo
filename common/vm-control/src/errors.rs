@@ -320,14 +320,11 @@ pub fn native_error_to_status(v: &libvm::LibVmError) -> tonic::Status {
             d.safe_message = reason.clone();
             tonic::Code::FailedPrecondition
         }
-        E::BootBundleAbiUnsupported { expected, actual } => {
+        E::BootBundleAbiUnsupported => {
             d.kind = 4;
             d.code = 14;
             d.safe_message = v.to_string();
-            d.boot_bundle_abi = Some(w::BootBundleAbiUnsupported {
-                expected: expected.to_string(),
-                actual: actual.to_string(),
-            });
+            d.boot_bundle_abi = Some(w::BootBundleAbiUnsupported {});
             tonic::Code::FailedPrecondition
         }
         E::DirectKernelRejected(_) => {
@@ -511,11 +508,8 @@ pub fn status_to_native_error(v: &tonic::Status) -> Result<libvm::LibVmError, Co
         }
         14 => {
             category(tonic::Code::FailedPrecondition, 4, "error.boot_bundle_abi")?;
-            let value = required(d.boot_bundle_abi, "error.boot_bundle_abi")?;
-            E::BootBundleAbiUnsupported {
-                expected: crate::boot::digest_from_wire(&value.expected, "error.expected")?,
-                actual: crate::boot::digest_from_wire(&value.actual, "error.actual")?,
-            }
+            required(d.boot_bundle_abi, "error.boot_bundle_abi")?;
+            E::BootBundleAbiUnsupported
         }
         15 => {
             category(
@@ -1160,18 +1154,6 @@ mod tests {
             libvm::LibVmError::TranslationUnavailable { reason } if reason.contains("rosetta=false")
         ));
 
-        let actual: libvm::storage::identity::ObjectDigest =
-            format!("sha256:{}", "bb".repeat(32)).parse().unwrap();
-        let status_value = native_error_to_status(&libvm::LibVmError::BootBundleAbiUnsupported {
-            expected: missing,
-            actual,
-        });
-        assert_eq!(status_value.code(), tonic::Code::FailedPrecondition);
-        assert!(matches!(
-            status_to_native_error(&status_value).unwrap(),
-            libvm::LibVmError::BootBundleAbiUnsupported { expected, actual: observed }
-                if expected == missing && observed == actual
-        ));
         let rejected = w::ErrorDetail {
             kind: 4,
             code: 9,
@@ -1196,6 +1178,36 @@ mod tests {
         stray.code = 10;
         stray.kind = 1;
         assert!(status_to_native_error(&status(stray, tonic::Code::InvalidArgument)).is_err());
+    }
+
+    #[test]
+    fn boot_bundle_abi_refusal_roundtrips_without_paths_or_asset_hashes() {
+        let refusal = libvm::LibVmError::BootBundleAbiUnsupported;
+        let status_value = native_error_to_status(&refusal);
+        assert_eq!(status_value.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status_value.message(), refusal.to_string());
+        assert!(status_value
+            .message()
+            .contains("select the packaged base initramfs"));
+        assert!(matches!(
+            status_to_native_error(&status_value).unwrap(),
+            libvm::LibVmError::BootBundleAbiUnsupported
+        ));
+        let envelope = RpcStatus::decode(status_value.details()).unwrap();
+        assert_eq!(envelope.details.len(), 1);
+        let detail = w::ErrorDetail::decode(envelope.details[0].value.as_slice()).unwrap();
+        assert_eq!(detail.kind, 4);
+        assert_eq!(detail.code, 14);
+        assert!(detail.reference.is_none());
+        assert_eq!(detail.boot_bundle_abi.as_ref().unwrap().encoded_len(), 0);
+
+        let mut missing_payload = detail.clone();
+        missing_payload.boot_bundle_abi = None;
+        assert!(
+            status_to_native_error(&status(missing_payload, tonic::Code::FailedPrecondition,))
+                .is_err()
+        );
+        assert!(status_to_native_error(&status(detail, tonic::Code::InvalidArgument)).is_err());
     }
 
     #[test]

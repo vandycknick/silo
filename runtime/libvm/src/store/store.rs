@@ -408,6 +408,30 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    pub(crate) async fn leased_layered_machine(
+        db: &Store,
+        paths: &LocalPaths,
+        held: &crate::store::composition_store::HeldComposition,
+    ) -> (
+        MachineConfig,
+        crate::store::operation_store::LaunchStorageLease,
+    ) {
+        let id = MachineId::new();
+        let mut config = machine_from_path(id, "layered-launch".into(), paths.machine(id).dir());
+        std::fs::create_dir_all(&config.machine_dir).unwrap();
+        seed_machine(db, &config).await;
+        let mut storage = db.machine_storage(id).await.unwrap().unwrap();
+        layered_machine(&mut config, &mut storage, held);
+        db.save_machine_config_with_storage(&config, &storage)
+            .await
+            .unwrap();
+        let lease = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        (config, lease)
+    }
+
     /// Turn a seeded raw machine into the exact layered root over `held`:
     /// freshly formatted private upper, launch roots and the root marker.
     pub(crate) fn layered_machine(
@@ -2259,6 +2283,211 @@ pub(crate) mod tests {
         assert_eq!(lowers(&db).await, 0);
         assert!(!fsmeta.exists());
         assert!(!pack.exists());
+    }
+
+    #[tokio::test]
+    async fn launch_publication_barrier_preserves_bytes_modes_and_propagates_sync_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "launch-publications".into(), paths.machine(id).dir());
+        let directory = crate::paths::OwnedDirectory::open_root(&config.machine_dir).unwrap();
+        seed_machine(&db, &config).await;
+        let storage = db.machine_storage(id).await.unwrap().unwrap();
+        let lease = db
+            .register_launch_storage(id, uuid::Uuid::new_v4(), &storage, &config.spec)
+            .await
+            .unwrap();
+        directory
+            .write_file("source-kernel", b"retained kernel bytes")
+            .unwrap();
+        directory
+            .write_file("source-initramfs", b"retained initramfs bytes")
+            .unwrap();
+        let kernel = crate::owned_boot_assets::OwnedBootAsset::open(
+            &config.machine_dir.join("source-kernel"),
+        )
+        .unwrap();
+        let mut artifacts =
+            crate::machine::root_storage::LaunchArtifacts::new(&config.machine_dir).unwrap();
+        let (kernel_path, kernel_file) =
+            crate::machine::root_storage::publish_kernel(&config.machine_dir, &kernel).unwrap();
+        artifacts.files.push(kernel_file);
+        artifacts.files.push(
+            crate::machine::root_storage::publish_descriptor(
+                &config.machine_dir,
+                "published lower descriptor\n",
+            )
+            .unwrap(),
+        );
+        let composite_path = config.machine_dir.join("initramfs");
+        artifacts.files.push(
+            crate::initramfs_overlay::write_composite(
+                crate::initramfs_overlay::CompositeBase::Path(
+                    &config.machine_dir.join("source-initramfs"),
+                ),
+                None,
+                Some(br#"{"root":"unit-publication"}"#),
+                &composite_path,
+            )
+            .unwrap(),
+        );
+        artifacts.files.push(
+            crate::supervisor::write_launch_spec(
+                &config.machine_dir.join("config.json"),
+                &config.spec,
+            )
+            .unwrap(),
+        );
+        assert_eq!(artifacts.files.len(), 4);
+        // One synchronous barrier covers all publications and the existing lease.
+        artifacts.sync(&lease).unwrap();
+        assert_eq!(
+            std::fs::read(kernel_path).unwrap(),
+            b"retained kernel bytes"
+        );
+        assert_eq!(
+            std::fs::read(config.machine_dir.join("lower.vmdk")).unwrap(),
+            b"published lower descriptor\n",
+        );
+        let composite = std::fs::read(composite_path).unwrap();
+        assert!(composite.starts_with(b"retained initramfs bytes"));
+        let bootstrap = br#"{"root":"unit-publication"}"#;
+        assert!(composite
+            .windows(bootstrap.len())
+            .any(|bytes| bytes == bootstrap));
+        assert_eq!(
+            serde_json::from_slice::<VmSpec>(
+                &std::fs::read(config.machine_dir.join("config.json")).unwrap(),
+            )
+            .unwrap(),
+            config.spec,
+        );
+        for (name, mode) in [
+            ("kernel-qualified", 0o400),
+            ("initramfs", 0o600),
+            ("lower.vmdk", 0o600),
+            ("config.json", 0o600),
+        ] {
+            assert_eq!(
+                std::fs::metadata(config.machine_dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode,
+            );
+        }
+        assert_eq!(
+            lease
+                .lock()
+                .durability_file()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        // A real non-syncable descriptor exercises error propagation, not an
+        // injected callback pretending that fsync failed.
+        artifacts
+            .files
+            .push(std::fs::File::open("/dev/null").unwrap());
+        assert!(artifacts.sync(&lease).is_err());
+    }
+
+    #[tokio::test]
+    async fn launch_lease_alone_roots_lower_through_gc_and_prune() {
+        use crate::store::ImageStore;
+
+        let (_temp, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let held = retained_lower(&db, paths.home(), b'G').await;
+        let retained = held.retained().clone();
+        let graph = held.snapshot_composition().unwrap();
+        let (config, lease) = leased_layered_machine(&db, &paths, &held).await;
+        let operation = lease.operation_id();
+        let layers = crate::store::layer_store::LayerStore::from_store(db.clone());
+        let operations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let pool = crate::storage::pool::StoragePool::open(paths.images_dir()).unwrap();
+        let lease_files = std::fs::read_dir(pool.lease_directory().unwrap().path())
+            .unwrap()
+            .count();
+        let resolved = layers
+            .launch_lower(&lease, lease.storage_record())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_operation")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            operations,
+            "resolution must not register a second consumer",
+        );
+        assert_eq!(
+            std::fs::read_dir(pool.lease_directory().unwrap().path())
+                .unwrap()
+                .count(),
+            lease_files,
+            "resolution must not create another lease file",
+        );
+        drop(held);
+        // Remove the machine's independent lower root. The exact running
+        // generation's operation is now the only authority for the graph.
+        db.remove_machine(&config).await.unwrap();
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        for _ in 0..2 {
+            db.recover_image_cache().await.unwrap();
+            db.prune_images().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM composition_result WHERE id=?1")
+                    .bind(retained.id.to_string())
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap(),
+                1,
+            );
+            assert!(pool.verify_object(&retained.fsmeta()).is_ok());
+            assert!(pool.verify_stream(&graph.layers[0].pack.stream).is_ok());
+            crate::storage::vmdk::FlatLowerPlan::new(&resolved.occurrences)
+                .unwrap()
+                .preflight(0)
+                .unwrap()
+                .verify(&pool)
+                .unwrap();
+        }
+        // Retirement is explicit for launch generations, even after all OFDs
+        // close. Prove exclusivity before removing this fixture's final root.
+        drop(resolved);
+        assert!(pool.try_exclusive_lease(operation).unwrap().is_none());
+        drop(lease);
+        let exclusive = pool.try_exclusive_lease(operation).unwrap().unwrap();
+        sqlx::query("DELETE FROM storage_operation WHERE operation_id=?1")
+            .bind(operation.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        drop(exclusive);
+        db.recover_image_cache().await.unwrap();
+        db.prune_images().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM composition_result WHERE id=?1")
+                .bind(retained.id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            0,
+        );
+        assert!(!pool.object_path(&retained.fsmeta()).exists());
+        assert!(!pool.stream_path(&graph.layers[0].pack.stream).exists());
     }
 
     #[tokio::test]

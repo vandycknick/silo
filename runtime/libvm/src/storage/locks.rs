@@ -27,6 +27,9 @@ impl StorageLock {
     pub(crate) fn durability_file(&self) -> io::Result<File> {
         self.file.try_clone()
     }
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
 
     /// Remains CLOEXEC in the parent; only an intended child may clear CLOEXEC.
     pub fn duplicate_inheritable(&self) -> io::Result<OwnedFd> {

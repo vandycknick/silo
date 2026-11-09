@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 
-mod boot_qualification;
 mod constants;
 mod error;
 mod guest_agent;
@@ -13,6 +12,7 @@ mod lock_manager;
 mod machine;
 mod network;
 pub mod node_state;
+mod owned_boot_assets;
 mod paths;
 pub mod planning;
 mod runtime;
@@ -23,10 +23,6 @@ mod store;
 mod supervisor;
 mod utils;
 
-pub use crate::boot_qualification::{
-    DirectKernelRejected, DirectKernelRejection, OverlayBootQualificationError,
-    QualifiedOverlayBoot, UnqualifiedOverlayBootIdentity,
-};
 pub use crate::error::LibVmError;
 pub use crate::image::ext4_admission::Ext4Rejection;
 pub use crate::image::import::{AdmittedDiskImport, DiskImportError, ForeignContainer};
@@ -51,6 +47,9 @@ pub use crate::machine::{
 pub use crate::machine::{
     require_live_operation, LiveCaptureSource, LiveCaptureSummary, LiveObservationReader,
     LiveSnapshot, LiveSnapshotOptions, MachineCapture, MachineCaptureStage, MachineLiveObservation,
+};
+pub use crate::owned_boot_assets::{
+    BootAssetError, DirectKernelRejected, DirectKernelRejection, OwnedOverlayBoot,
 };
 pub use crate::runtime::boot_assets::{AdmissionRemedy, SourceFamily};
 pub use crate::runtime::{

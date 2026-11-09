@@ -1,5 +1,4 @@
-//! Immutable managed-root boot admission. Artifact metadata describes candidates;
-//! only an observed exact boot tuple in this module can admit a production boot.
+//! Owned boot descriptors, immutable launch copies, and bounded kernel inspection.
 
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Write;
@@ -8,318 +7,115 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use rootfs_spec::{OverlayProfile, OverlayRenderingAbi, UpperProfile};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vm_spec::live::LiveBackend;
 
 use crate::GuestArchitecture;
 
-const ROOT_PROFILE: &str = "linux-erofs-overlay-v1";
-const ATTACHMENT_FAMILY: &str = "krun-virtio-blk-v1";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BootIdentity {
-    kernel_sha256: [u8; 32],
-    initramfs_sha256: [u8; 32],
-    native_sha256: [u8; 32],
-    architecture: GuestArchitecture,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AdmittedBoot {
-    identity: BootIdentity,
-    resolved_config_sha256: [u8; 32],
-    kernel_version: (u32, u32, u32),
-    host_os: &'static str,
-    host_arch: &'static str,
-    root_profile: &'static str,
-    upper_profile: UpperProfile,
-    overlay_profile: OverlayProfile,
-    rendering_abi: OverlayRenderingAbi,
-    attachment_family: &'static str,
-    evidence: &'static str,
-}
-
-// Only reviewed real monitor/worker observations admit exact tuples.
-const ADMITTED_BOOTS: &[AdmittedBoot] = &[
-    AdmittedBoot {
-        identity: BootIdentity {
-            kernel_sha256: [
-                0x2c, 0xe7, 0x27, 0x11, 0x36, 0xaf, 0x45, 0x4c, 0x42, 0x78, 0x80, 0x21, 0x2f, 0x08,
-                0x52, 0x71, 0xfc, 0x2f, 0xde, 0xa1, 0x3e, 0xfb, 0x59, 0x9b, 0xa8, 0x2f, 0xf6, 0xeb,
-                0xe4, 0xd6, 0x2d, 0xc7,
-            ],
-            initramfs_sha256: [
-                0xfa, 0x47, 0xab, 0xf6, 0x3a, 0xb4, 0x94, 0x6e, 0xfa, 0xaa, 0xcb, 0x4e, 0x03, 0x26,
-                0xea, 0x3d, 0x1d, 0x95, 0x37, 0x95, 0x44, 0x4b, 0xa9, 0x07, 0x3d, 0xfa, 0x23, 0x40,
-                0x7c, 0xe5, 0x7e, 0x3c,
-            ],
-            native_sha256: [
-                0x1a, 0x0b, 0x61, 0x7a, 0x69, 0xcf, 0xa6, 0xbb, 0xa5, 0xa4, 0x1b, 0x75, 0x5a, 0xcf,
-                0x01, 0x08, 0xfd, 0x81, 0x49, 0x29, 0x9f, 0xa0, 0x23, 0x5d, 0xef, 0x97, 0x92, 0xd8,
-                0x2e, 0xe6, 0x24, 0xb7,
-            ],
-            architecture: GuestArchitecture::Amd64,
-        },
-        resolved_config_sha256: [
-            0xb8, 0x26, 0x47, 0x10, 0x3b, 0x73, 0xac, 0x2f, 0x7f, 0xaf, 0xc3, 0xb1, 0xbd, 0xd6,
-            0xad, 0x92, 0x7b, 0xa2, 0xf1, 0xc6, 0x8e, 0x5b, 0x5f, 0x11, 0xa3, 0xe3, 0xda, 0x4b,
-            0xfd, 0xf5, 0x33, 0xf4,
-        ],
-        kernel_version: (7, 2, 2),
-        host_os: "linux",
-        host_arch: "x86_64",
-        root_profile: ROOT_PROFILE,
-        upper_profile: UpperProfile::SiloUpperExt4V1,
-        overlay_profile: OverlayProfile::SiloOverlayV1,
-        rendering_abi: OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
-        attachment_family: ATTACHMENT_FAMILY,
-        evidence: "phase-22/overlay-candidate-qualification-second: silo-smoke-ih7vf9oo",
-    },
-    AdmittedBoot {
-        identity: BootIdentity {
-            kernel_sha256: [
-                0x69, 0x09, 0x5b, 0x40, 0xe4, 0x89, 0xef, 0xd6, 0x7b, 0x60, 0xae, 0x3a, 0xae, 0x30,
-                0x98, 0x45, 0x4f, 0x39, 0x51, 0x57, 0x27, 0xb1, 0x80, 0xce, 0x65, 0xeb, 0x9a, 0x3e,
-                0xd0, 0xac, 0xe6, 0xba,
-            ],
-            initramfs_sha256: [
-                0xfa, 0x47, 0xab, 0xf6, 0x3a, 0xb4, 0x94, 0x6e, 0xfa, 0xaa, 0xcb, 0x4e, 0x03, 0x26,
-                0xea, 0x3d, 0x1d, 0x95, 0x37, 0x95, 0x44, 0x4b, 0xa9, 0x07, 0x3d, 0xfa, 0x23, 0x40,
-                0x7c, 0xe5, 0x7e, 0x3c,
-            ],
-            native_sha256: [
-                0x1a, 0x0b, 0x61, 0x7a, 0x69, 0xcf, 0xa6, 0xbb, 0xa5, 0xa4, 0x1b, 0x75, 0x5a, 0xcf,
-                0x01, 0x08, 0xfd, 0x81, 0x49, 0x29, 0x9f, 0xa0, 0x23, 0x5d, 0xef, 0x97, 0x92, 0xd8,
-                0x2e, 0xe6, 0x24, 0xb7,
-            ],
-            architecture: GuestArchitecture::Amd64,
-        },
-        resolved_config_sha256: [
-            0x21, 0x84, 0xec, 0xc3, 0xad, 0xae, 0x8b, 0x99, 0xfb, 0x19, 0x4b, 0x6f, 0xc8, 0xc4,
-            0xf0, 0xd1, 0xd3, 0xb4, 0x0e, 0x54, 0x29, 0xa3, 0x00, 0xed, 0xcc, 0xbb, 0x54, 0xd0,
-            0x27, 0x0b, 0x67, 0x8e,
-        ],
-        kernel_version: (6, 18, 48),
-        host_os: "linux",
-        host_arch: "x86_64",
-        root_profile: ROOT_PROFILE,
-        upper_profile: UpperProfile::SiloUpperExt4V1,
-        overlay_profile: OverlayProfile::SiloOverlayV1,
-        rendering_abi: OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
-        attachment_family: ATTACHMENT_FAMILY,
-        evidence: "phase-22/longterm-overlay-candidate-second: silo-smoke-xj57b84z",
-    },
-];
-
-/// Owns qualified sources through launch. Guest assets are staged through checked
-/// copies; Linux executes the retained native descriptor without reopening paths.
+/// Owns guest assets and the monitor descriptor through launch.
 #[derive(Debug)]
-pub struct QualifiedOverlayBoot {
-    admitted: AdmittedBoot,
-    kernel: QualifiedAsset,
-    initramfs: QualifiedAsset,
-    native: QualifiedAsset,
+pub struct OwnedOverlayBoot {
+    kernel: OwnedBootAsset,
+    initramfs: OwnedBootAsset,
+    native: OwnedBootAsset,
 }
 
-impl QualifiedOverlayBoot {
-    pub fn rendering_abi(&self) -> OverlayRenderingAbi {
-        self.admitted.rendering_abi
-    }
-
-    pub fn upper_profile(&self) -> UpperProfile {
-        self.admitted.upper_profile
-    }
-
-    pub fn overlay_profile(&self) -> OverlayProfile {
-        self.admitted.overlay_profile
-    }
-
-    pub fn resolved_config_sha256(&self) -> [u8; 32] {
-        self.admitted.resolved_config_sha256
-    }
-
-    pub fn evidence(&self) -> &'static str {
-        self.admitted.evidence
-    }
-
-    /// Append the exact qualified base to a private composite temporary. The
-    /// root/agent archive is added only after this checked copy succeeds.
-    pub(crate) fn copy_initramfs(
-        &self,
-        output: &mut impl Write,
-    ) -> Result<u64, OverlayBootQualificationError> {
+impl OwnedOverlayBoot {
+    pub(crate) fn copy_initramfs(&self, output: &mut impl Write) -> Result<u64, BootAssetError> {
         self.initramfs.copy_into(output)
     }
 
-    pub(crate) fn kernel_asset(&self) -> &QualifiedAsset {
+    pub(crate) fn kernel_asset(&self) -> &OwnedBootAsset {
         &self.kernel
     }
-
-    pub(crate) fn initramfs_asset(&self) -> &QualifiedAsset {
+    pub(crate) fn initramfs_asset(&self) -> &OwnedBootAsset {
         &self.initramfs
     }
-
-    pub(crate) fn into_boot_assets(self) -> (QualifiedAsset, QualifiedAsset) {
+    pub(crate) fn into_boot_assets(self) -> (OwnedBootAsset, OwnedBootAsset) {
         (self.kernel, self.initramfs)
     }
 
-    /// The actual qualified monitor/worker image, retained CLOEXEC and >=3.
-    /// Its owner must stay alive until the monitor has been spawned. Do not clear
-    /// CLOEXEC in the parent; Linux resolves /proc/self/fd/N before closing it.
+    /// Keep the CLOEXEC descriptor alive until spawn resolves /proc/self/fd/N.
     pub(crate) fn native_executable_fd(&self) -> BorrowedFd<'_> {
         self.native.file.as_fd()
     }
 
-    /// Check immediately before descriptor-based spawn. This protects cooperative
-    /// atomic publication, not hostile same-UID in-place executable mutation.
-    pub(crate) fn recheck_native_executable(&self) -> Result<(), OverlayBootQualificationError> {
+    pub(crate) fn recheck_native_executable(&self) -> Result<(), BootAssetError> {
         self.native.recheck()
     }
 }
 
 #[derive(Debug, Error)]
-pub enum OverlayBootQualificationError {
-    #[error("failed to read managed-overlay boot asset {path}")]
+pub enum BootAssetError {
+    #[error("failed to read boot asset {path}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("managed-overlay boot asset is not a nonempty regular file: {path}")]
+    #[error("boot asset is not a nonempty regular file: {path}")]
     InvalidAsset { path: PathBuf },
-    #[error("managed-overlay boot asset changed during qualification or launch copying: {path}")]
+    #[error("boot asset changed during inspection or launch: {path}")]
     AssetChanged { path: PathBuf },
-    #[error("failed to copy qualified managed-overlay boot asset {path}")]
+    #[error("failed to copy boot asset {path}")]
     Write {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "managed-overlay boot qualification requires the actual krun backend, got {backend:?}"
-    )]
+    #[error("managed-overlay boot requires the krun backend, got {backend:?}")]
     UnsupportedBackend { backend: LiveBackend },
-    #[error("managed-overlay native descriptor launch is not qualified on host {host_os}")]
+    #[error("managed-overlay descriptor launch is unsupported on host {host_os}")]
     UnsupportedHost { host_os: &'static str },
     #[error("managed-overlay native image is not executable: {path}")]
     InvalidExecutable { path: PathBuf },
-    #[error("{identity}")]
-    Unqualified {
-        identity: Box<UnqualifiedOverlayBootIdentity>,
-    },
+    #[error("managed-overlay kernel version {version} is below the required Linux 6.6 floor")]
+    KernelTooOld { version: String },
+    #[error("cannot read managed-overlay kernel version from {path}: {detail}; Linux 6.6 or newer is required")]
+    KernelVersion { path: PathBuf, detail: &'static str },
 }
 
-/// Cold diagnostic identity for a rejected exact tuple. Keeping it boxed avoids
-/// enlarging every successful libvm Result while preserving typed failure data.
-#[derive(Debug, Error)]
-#[error("unqualified {profile} boot tuple: kernel sha256:{kernel_sha256}, base initramfs sha256:{initramfs_sha256}, native sha256:{native_sha256}, guest {architecture:?}, host {host_os}/{host_arch}; exact real monitor/worker qualification is required")]
-pub struct UnqualifiedOverlayBootIdentity {
-    pub profile: &'static str,
-    pub kernel_sha256: String,
-    pub initramfs_sha256: String,
-    pub native_sha256: String,
-    pub architecture: GuestArchitecture,
-    pub host_os: &'static str,
-    pub host_arch: &'static str,
-}
-
-/// Admit reusable kernel/base-initramfs bytes before any machine or storage
-/// effects. The per-launch root/agent archive must be appended only afterwards.
-/// Config identity is bound by the reviewed tuple's exact kernel digest, not by
-/// a caller-supplied or mutable metadata claim.
-pub fn admit_erofs_overlay(
+pub(crate) fn open_overlay_boot(
     kernel: &Path,
     initramfs: &Path,
-    architecture: GuestArchitecture,
     backend: LiveBackend,
     native_executable: &Path,
-) -> Result<QualifiedOverlayBoot, OverlayBootQualificationError> {
+) -> Result<OwnedOverlayBoot, BootAssetError> {
+    check_overlay_backend(backend)?;
+    let kernel = InspectedKernel::from_asset(OwnedBootAsset::open(kernel)?)?;
+    kernel.check_overlay_version()?;
+    Ok(OwnedOverlayBoot {
+        kernel: kernel.asset,
+        initramfs: OwnedBootAsset::open(initramfs)?,
+        native: OwnedBootAsset::open_executable(native_executable)?,
+    })
+}
+
+fn check_overlay_backend(backend: LiveBackend) -> Result<(), BootAssetError> {
     if backend != LiveBackend::Krun {
-        return Err(OverlayBootQualificationError::UnsupportedBackend { backend });
+        return Err(BootAssetError::UnsupportedBackend { backend });
     }
     if !cfg!(target_os = "linux") {
-        return Err(OverlayBootQualificationError::UnsupportedHost {
+        return Err(BootAssetError::UnsupportedHost {
             host_os: std::env::consts::OS,
         });
     }
-    admit_erofs_overlay_assets(
-        QualifiedAsset::open(kernel)?,
-        QualifiedAsset::open(initramfs)?,
-        architecture,
-        backend,
-        native_executable,
-    )
+    Ok(())
 }
 
-/// Qualify the already authenticated held guest assets, never their former paths.
-pub(crate) fn admit_erofs_overlay_assets(
-    kernel: QualifiedAsset,
-    initramfs: QualifiedAsset,
-    architecture: GuestArchitecture,
+pub(crate) fn open_overlay_assets(
+    kernel: InspectedKernel,
+    initramfs: OwnedBootAsset,
     backend: LiveBackend,
     native_executable: &Path,
-) -> Result<QualifiedOverlayBoot, OverlayBootQualificationError> {
-    if backend != LiveBackend::Krun {
-        return Err(OverlayBootQualificationError::UnsupportedBackend { backend });
-    }
-    if !cfg!(target_os = "linux") {
-        return Err(OverlayBootQualificationError::UnsupportedHost {
-            host_os: std::env::consts::OS,
-        });
-    }
-    let native = QualifiedAsset::open_executable(native_executable)?;
-    let identity = BootIdentity {
-        kernel_sha256: kernel.digest,
-        initramfs_sha256: initramfs.digest,
-        native_sha256: native.digest,
-        architecture,
-    };
-    match admitted_boot(
-        identity,
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        ADMITTED_BOOTS,
-    ) {
-        Some(admitted) => Ok(QualifiedOverlayBoot {
-            admitted,
-            kernel,
-            initramfs,
-            native,
-        }),
-        None => Err(OverlayBootQualificationError::Unqualified {
-            identity: Box::new(UnqualifiedOverlayBootIdentity {
-                profile: ROOT_PROFILE,
-                kernel_sha256: hex_digest(identity.kernel_sha256),
-                initramfs_sha256: hex_digest(identity.initramfs_sha256),
-                native_sha256: hex_digest(identity.native_sha256),
-                architecture,
-                host_os: std::env::consts::OS,
-                host_arch: std::env::consts::ARCH,
-            }),
-        }),
-    }
-}
-
-fn admitted_boot(
-    identity: BootIdentity,
-    host_os: &str,
-    host_arch: &str,
-    entries: &[AdmittedBoot],
-) -> Option<AdmittedBoot> {
-    entries.iter().copied().find(|entry| {
-        entry.identity == identity
-            && entry.kernel_version >= (6, 6, 0)
-            && entry.host_os == host_os
-            && entry.host_arch == host_arch
-            && entry.root_profile == ROOT_PROFILE
-            && entry.upper_profile == UpperProfile::SiloUpperExt4V1
-            && entry.overlay_profile == OverlayProfile::SiloOverlayV1
-            && entry.rendering_abi == OverlayRenderingAbi::LinuxOverlayfsMountinfoV1
-            && entry.attachment_family == ATTACHMENT_FAMILY
-            && entry.resolved_config_sha256 != [0; 32]
-            && !entry.evidence.is_empty()
+) -> Result<OwnedOverlayBoot, BootAssetError> {
+    check_overlay_backend(backend)?;
+    kernel.check_overlay_version()?;
+    Ok(OwnedOverlayBoot {
+        kernel: kernel.asset,
+        initramfs,
+        native: OwnedBootAsset::open_executable(native_executable)?,
     })
 }
 
@@ -351,8 +147,7 @@ impl AssetFingerprint {
         }
     }
 
-    // Unlink changes ctime but not byte identity. Callers must still authenticate
-    // the retained descriptor's content; this comparison never waives its digest.
+    // Retained guest descriptors remain authoritative after atomic publication.
     fn unchanged_or_unlinked(self, observed: Self) -> bool {
         if observed == self {
             return true;
@@ -367,16 +162,15 @@ impl AssetFingerprint {
 }
 
 #[derive(Debug)]
-pub(crate) struct QualifiedAsset {
+pub(crate) struct OwnedBootAsset {
     file: File,
     path: PathBuf,
     fingerprint: AssetFingerprint,
-    digest: [u8; 32],
 }
 
-impl QualifiedAsset {
-    pub(crate) fn open(path: &Path) -> Result<Self, OverlayBootQualificationError> {
-        let read_error = |source| OverlayBootQualificationError::Read {
+impl OwnedBootAsset {
+    pub(crate) fn open(path: &Path) -> Result<Self, BootAssetError> {
+        let read_error = |source| BootAssetError::Read {
             path: path.to_path_buf(),
             source,
         };
@@ -388,20 +182,8 @@ impl QualifiedAsset {
         Self::from_open_file(file, path)
     }
 
-    pub(crate) fn from_open_file(
-        file: File,
-        path: &Path,
-    ) -> Result<Self, OverlayBootQualificationError> {
-        Self::from_open_file_observed(file, path, &mut std::io::sink())
-    }
-
-    /// `observer` receives exactly the bytes whose digest this asset records.
-    fn from_open_file_observed(
-        mut file: File,
-        path: &Path,
-        observer: &mut impl Write,
-    ) -> Result<Self, OverlayBootQualificationError> {
-        let read_error = |source| OverlayBootQualificationError::Read {
+    pub(crate) fn from_open_file(mut file: File, path: &Path) -> Result<Self, BootAssetError> {
+        let read_error = |source| BootAssetError::Read {
             path: path.to_path_buf(),
             source,
         };
@@ -413,66 +195,47 @@ impl QualifiedAsset {
         }
         let metadata = file.metadata().map_err(read_error)?;
         if !metadata.is_file() || metadata.len() == 0 {
-            return Err(OverlayBootQualificationError::InvalidAsset {
+            return Err(BootAssetError::InvalidAsset {
                 path: path.to_path_buf(),
             });
         }
         let fingerprint = AssetFingerprint::from_metadata(&metadata);
-        let digest = copy_asset(&file, path, fingerprint, observer)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
             fingerprint,
-            digest,
         })
     }
 
-    fn open_executable(path: &Path) -> Result<Self, OverlayBootQualificationError> {
+    fn open_executable(path: &Path) -> Result<Self, BootAssetError> {
         let asset = Self::open(path)?;
         if asset.fingerprint.mode & 0o111 == 0 {
-            return Err(OverlayBootQualificationError::InvalidExecutable {
+            return Err(BootAssetError::InvalidExecutable {
                 path: path.to_path_buf(),
             });
         }
         Ok(asset)
     }
 
-    fn recheck(&self) -> Result<(), OverlayBootQualificationError> {
-        let metadata =
-            self.file
-                .metadata()
-                .map_err(|source| OverlayBootQualificationError::Read {
-                    path: self.path.clone(),
-                    source,
-                })?;
+    fn recheck(&self) -> Result<(), BootAssetError> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|source| BootAssetError::Read {
+                path: self.path.clone(),
+                source,
+            })?;
         let observed = AssetFingerprint::from_metadata(&metadata);
         if observed == self.fingerprint {
             return Ok(());
         }
-        // Atomic restaging may unlink the old executable without changing its
-        // retained inode's bytes. Permit only link removal/ctime changes, and
-        // authenticate that retained inode again before executing it.
-        if self.fingerprint.unchanged_or_unlinked(observed) {
-            let digest = copy_asset(&self.file, &self.path, observed, &mut std::io::sink())?;
-            if digest == self.digest {
-                return Ok(());
-            }
-        }
-        Err(OverlayBootQualificationError::AssetChanged {
+        Err(BootAssetError::AssetChanged {
             path: self.path.clone(),
         })
     }
 
-    pub(crate) fn copy_into(
-        &self,
-        output: &mut impl Write,
-    ) -> Result<u64, OverlayBootQualificationError> {
-        let digest = copy_asset(&self.file, &self.path, self.fingerprint, output)?;
-        if digest != self.digest {
-            return Err(OverlayBootQualificationError::AssetChanged {
-                path: self.path.clone(),
-            });
-        }
+    pub(crate) fn copy_into(&self, output: &mut impl Write) -> Result<u64, BootAssetError> {
+        copy_asset(&self.file, &self.path, self.fingerprint, output)?;
         Ok(self.fingerprint.length)
     }
 
@@ -480,8 +243,46 @@ impl QualifiedAsset {
         self.fingerprint.length
     }
 
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        self.digest
+    /// Content identity is computed only at capture/publication boundaries.
+    pub(crate) fn digest(&self) -> Result<[u8; 32], BootAssetError> {
+        let mut hasher = DigestWriter(Sha256::new());
+        self.copy_into(&mut hasher)?;
+        Ok(hasher.0.finalize().into())
+    }
+
+    /// Compare the bootstrap ABI input without constructing content identities.
+    pub(crate) fn same_contents(&self, other: &Self) -> Result<bool, BootAssetError> {
+        self.recheck()?;
+        other.recheck()?;
+        if self.fingerprint == other.fingerprint {
+            return Ok(true);
+        }
+        if self.length() != other.length() {
+            return Ok(false);
+        }
+        let mut left = [0; 65536];
+        let mut right = [0; 65536];
+        let mut offset = 0;
+        let mut equal = true;
+        while offset < self.length() {
+            let count = (self.length() - offset).min(left.len() as u64) as usize;
+            for (asset, buffer) in [(self, &mut left[..count]), (other, &mut right[..count])] {
+                asset.file.read_exact_at(buffer, offset).map_err(|source| {
+                    BootAssetError::Read {
+                        path: asset.path.clone(),
+                        source,
+                    }
+                })?;
+            }
+            if left[..count] != right[..count] {
+                equal = false;
+                break;
+            }
+            offset += count as u64;
+        }
+        self.recheck()?;
+        other.recheck()?;
+        Ok(equal)
     }
 
     pub(crate) fn into_source(self) -> (File, PathBuf) {
@@ -494,19 +295,18 @@ fn copy_asset(
     path: &Path,
     expected: AssetFingerprint,
     output: &mut impl Write,
-) -> Result<[u8; 32], OverlayBootQualificationError> {
-    let read_error = |source| OverlayBootQualificationError::Read {
+) -> Result<(), BootAssetError> {
+    let read_error = |source| BootAssetError::Read {
         path: path.to_path_buf(),
         source,
     };
-    let changed = || OverlayBootQualificationError::AssetChanged {
+    let changed = || BootAssetError::AssetChanged {
         path: path.to_path_buf(),
     };
     let observed = AssetFingerprint::from_metadata(&file.metadata().map_err(read_error)?);
     if !expected.unchanged_or_unlinked(observed) {
         return Err(changed());
     }
-    let mut hasher = Sha256::new();
     let mut buffer = [0; 65536];
     let mut offset = 0;
     // The initial fstat length is the hard read bound. A concurrent append can
@@ -519,62 +319,48 @@ fn copy_asset(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(read_error(error)),
         };
-        output.write_all(&buffer[..count]).map_err(|source| {
-            OverlayBootQualificationError::Write {
+        output
+            .write_all(&buffer[..count])
+            .map_err(|source| BootAssetError::Write {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
-        hasher.update(&buffer[..count]);
+            })?;
         offset += count as u64;
     }
     let after_copy = AssetFingerprint::from_metadata(&file.metadata().map_err(read_error)?);
     if !observed.unchanged_or_unlinked(after_copy) {
         return Err(changed());
     }
-    Ok(hasher.finalize().into())
+    Ok(())
 }
 
-fn hex_digest(digest: [u8; 32]) -> String {
-    use std::fmt::Write;
-
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        // Writing to String cannot fail.
-        let _ = write!(output, "{byte:02x}");
+struct DigestWriter(Sha256);
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
     }
-    output
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-// Linux direct-boot kernel admission for raw roots. The kernel is admitted by
-// its own bytes: the host's native direct-loader format and architecture from
-// its boot header. The header is captured while the bytes are hashed, so
-// admission never rereads a path or parses bytes other than the authenticated
-// ones. Filesystem and device capabilities are not inspected; a kernel missing
-// them fails at boot, not here.
-//
-//   hash pass ──► header prefix (≤ 4 KiB) ──► ELF/Image format + architecture
-
-/// ELF program headers must lie in this prefix, as in every linked vmlinux.
 const KERNEL_HEADER_BYTES: usize = 4096;
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 const ARM64_IMAGE_MAGIC: &[u8; 4] = b"ARM\x64";
-/// The arm64 boot protocol header: flags at byte 24, magic at byte 56, ending
-/// with the 32-bit `res5` field at byte 60.
 const ARM64_IMAGE_HEADER_BYTES: usize = 64;
 const ARM64_IMAGE_FLAGS_OFFSET: usize = 24;
 
 #[derive(Debug, Error)]
-#[error("kernel sha256:{kernel_sha256} is not an admissible {architecture:?} Linux direct-boot kernel: {reason}")]
+#[error("kernel {path} is not an admissible {architecture:?} Linux direct-boot kernel: {reason}")]
 pub struct DirectKernelRejected {
-    pub kernel_sha256: String,
+    pub path: PathBuf,
     pub architecture: GuestArchitecture,
     pub reason: DirectKernelRejection,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum DirectKernelRejection {
     #[error("bytes are neither an x86-64 ELF vmlinux nor an arm64 Image")]
@@ -585,48 +371,216 @@ pub enum DirectKernelRejection {
     MalformedHeader { detail: &'static str },
 }
 
-/// A kernel asset plus the bounded header prefix observed while hashing it.
+/// A held kernel and its bounded header, read without hashing the image.
 #[derive(Debug)]
 pub(crate) struct InspectedKernel {
-    asset: QualifiedAsset,
+    asset: OwnedBootAsset,
     header: KernelHeader,
 }
 
 impl InspectedKernel {
-    pub(crate) fn from_open_file(
-        file: File,
-        path: &Path,
-    ) -> Result<Self, OverlayBootQualificationError> {
-        let mut header = KernelHeader::default();
-        let asset = QualifiedAsset::from_open_file_observed(file, path, &mut header)?;
-        Ok(Self { asset, header })
+    pub(crate) fn from_open_file(file: File, path: &Path) -> Result<Self, BootAssetError> {
+        Self::from_asset(OwnedBootAsset::from_open_file(file, path)?)
     }
 
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        self.asset.digest
-    }
-
-    /// Overlay roots are admitted by their exact reviewed tuple instead.
-    pub(crate) fn into_asset(self) -> QualifiedAsset {
-        self.asset
+    fn from_asset(asset: OwnedBootAsset) -> Result<Self, BootAssetError> {
+        let mut bytes = vec![0; KERNEL_HEADER_BYTES.min(asset.length() as usize)];
+        asset
+            .file
+            .read_exact_at(&mut bytes, 0)
+            .map_err(|source| BootAssetError::Read {
+                path: asset.path.clone(),
+                source,
+            })?;
+        asset.recheck()?;
+        Ok(Self {
+            asset,
+            header: KernelHeader(bytes),
+        })
     }
 
     pub(crate) fn admit_direct(
         self,
         architecture: GuestArchitecture,
-    ) -> Result<QualifiedAsset, Box<DirectKernelRejected>> {
+    ) -> Result<OwnedBootAsset, Box<DirectKernelRejected>> {
         match native_kernel_image(&self.header.0, self.asset.length(), architecture) {
             Ok(()) => Ok(self.asset),
             Err(reason) => Err(Box::new(DirectKernelRejected {
-                kernel_sha256: hex_digest(self.asset.digest),
+                path: self.asset.path,
                 architecture,
                 reason,
             })),
         }
     }
+
+    pub(crate) fn check_overlay_version(&self) -> Result<(), BootAssetError> {
+        let invalid = |detail| BootAssetError::KernelVersion {
+            path: self.asset.path.clone(),
+            detail,
+        };
+        let header = &self.header.0;
+        let offset = if header.get(0x202..0x206) == Some(b"HdrS".as_slice()) {
+            header
+                .get(0x20e..0x210)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u16::from_le_bytes)
+                .map(u64::from)
+                .filter(|offset| *offset != 0)
+                .ok_or_else(|| invalid("missing kernel version offset"))?
+                + 0x200
+        } else if header.starts_with(ELF_MAGIC) {
+            self.elf_banner_offset()?
+        } else {
+            return Err(invalid("missing Linux boot protocol version header"));
+        };
+        let mut bytes = [0u8; 256];
+        let count = self
+            .asset
+            .length()
+            .checked_sub(offset)
+            .filter(|length| *length != 0)
+            .ok_or_else(|| invalid("kernel version offset exceeds the file"))?
+            .min(bytes.len() as u64) as usize;
+        self.read_exact(&mut bytes[..count], offset)?;
+        self.asset.recheck()?;
+        let bytes = bytes[..count]
+            .strip_prefix(b"Linux version ")
+            .unwrap_or(&bytes[..count]);
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0 || byte.is_ascii_whitespace())
+            .ok_or_else(|| invalid("unterminated kernel version string"))?;
+        let version = std::str::from_utf8(&bytes[..end])
+            .map_err(|_| invalid("invalid kernel version string"))?;
+        let mut parts = version.split('.');
+        let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let (Some(major), Some(minor)) = (major, minor) else {
+            return Err(invalid("invalid kernel version string"));
+        };
+        if (major, minor) < (6, 6) {
+            return Err(BootAssetError::KernelTooOld {
+                version: version.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Native x86 kernels are ELF vmlinux, whose release lives in linux_banner.
+    /// Read symbol metadata and that one string, never stream the kernel image.
+    fn elf_banner_offset(&self) -> Result<u64, BootAssetError> {
+        let invalid = || BootAssetError::KernelVersion {
+            path: self.asset.path.clone(),
+            detail: "missing or malformed ELF linux_banner",
+        };
+        let field = |bytes: &[u8], offset| {
+            le_bytes(bytes, offset)
+                .map(u64::from_le_bytes)
+                .map_err(|_| invalid())
+        };
+        let header = &self.header.0;
+        if header.get(4..7) != Some([2, 1, 1].as_slice()) {
+            return Err(invalid());
+        }
+        let start = field(header, 40)?;
+        let count = u16::from_le_bytes(le_bytes(header, 60).map_err(|_| invalid())?);
+        let size = u16::from_le_bytes(le_bytes(header, 58).map_err(|_| invalid())?);
+        if size != 64 || count == 0 {
+            return Err(invalid());
+        }
+        let section = |index: u16| -> Result<[u8; 64], BootAssetError> {
+            if index >= count {
+                return Err(invalid());
+            }
+            let offset = start
+                .checked_add(u64::from(index) * 64)
+                .ok_or_else(invalid)?;
+            self.read_array(offset)
+        };
+        for index in 0..count {
+            let symbols = section(index)?;
+            if u32::from_le_bytes(le_bytes(&symbols, 4).map_err(|_| invalid())?) != 2 {
+                continue;
+            }
+            let strings_index = u32::from_le_bytes(le_bytes(&symbols, 40).map_err(|_| invalid())?);
+            let strings = section(u16::try_from(strings_index).map_err(|_| invalid())?)?;
+            let symbols_start = field(&symbols, 24)?;
+            let symbols_length = field(&symbols, 32)?;
+            let strings_start = field(&strings, 24)?;
+            let strings_length = field(&strings, 32)?;
+            if field(&symbols, 56)? != 24 || symbols_length % 24 != 0 {
+                return Err(invalid());
+            }
+            let mut buffer = [0; 24 * 256];
+            let mut offset = 0;
+            while offset < symbols_length {
+                let count = (symbols_length - offset).min(buffer.len() as u64) as usize;
+                self.read_exact(
+                    &mut buffer[..count],
+                    symbols_start.checked_add(offset).ok_or_else(invalid)?,
+                )?;
+                for symbol in buffer[..count].chunks_exact(24) {
+                    if symbol[4] != 0x11 {
+                        continue;
+                    }
+                    let name = u64::from(u32::from_le_bytes(
+                        le_bytes(symbol, 0).map_err(|_| invalid())?,
+                    ));
+                    if name.checked_add(13).is_none_or(|end| end > strings_length) {
+                        continue;
+                    }
+                    let observed: [u8; 13] =
+                        self.read_array(strings_start.checked_add(name).ok_or_else(invalid)?)?;
+                    if &observed != b"linux_banner\0" {
+                        continue;
+                    }
+                    let target = section(u16::from_le_bytes(
+                        le_bytes(symbol, 6).map_err(|_| invalid())?,
+                    ))?;
+                    let address = field(symbol, 8)?;
+                    let displacement = address
+                        .checked_sub(field(&target, 16)?)
+                        .ok_or_else(invalid)?;
+                    if displacement >= field(&target, 32)? {
+                        return Err(invalid());
+                    }
+                    return field(&target, 24)?
+                        .checked_add(displacement)
+                        .ok_or_else(invalid);
+                }
+                offset += count as u64;
+            }
+        }
+        Err(invalid())
+    }
+
+    fn read_exact(&self, bytes: &mut [u8], offset: u64) -> Result<(), BootAssetError> {
+        if offset
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > self.asset.length())
+        {
+            return Err(BootAssetError::KernelVersion {
+                path: self.asset.path.clone(),
+                detail: "kernel metadata exceeds the file",
+            });
+        }
+        self.asset
+            .file
+            .read_exact_at(bytes, offset)
+            .map_err(|source| BootAssetError::Read {
+                path: self.asset.path.clone(),
+                source,
+            })
+    }
+
+    fn read_array<const N: usize>(&self, offset: u64) -> Result<[u8; N], BootAssetError> {
+        let mut bytes = [0; N];
+        self.read_exact(&mut bytes, offset)?;
+        Ok(bytes)
+    }
 }
 
-/// The first `KERNEL_HEADER_BYTES` of the hashed stream.
+/// The first `KERNEL_HEADER_BYTES` of the kernel image.
 #[derive(Debug, Default)]
 struct KernelHeader(Vec<u8>);
 
@@ -758,176 +712,90 @@ fn validate_elf_executable(header: &[u8], length: u64) -> Result<(), DirectKerne
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
-    use crate::boot_qualification::QualifiedOverlayBoot;
-    use crate::boot_qualification::{
-        admit_erofs_overlay, admitted_boot, native_kernel_image, AdmittedBoot, BootIdentity,
-        DirectKernelRejection, InspectedKernel, KernelHeader, OverlayBootQualificationError,
-        QualifiedAsset,
+    use crate::owned_boot_assets::OwnedOverlayBoot;
+    use crate::owned_boot_assets::{
+        native_kernel_image, BootAssetError, DirectKernelRejection, InspectedKernel, KernelHeader,
+        OwnedBootAsset,
     };
     use crate::GuestArchitecture;
-    use rootfs_spec::{OverlayProfile, OverlayRenderingAbi, UpperProfile};
     use std::io::Write;
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     use test_utils::direct_kernel as direct_kernel_fixture;
     use test_utils::direct_kernel::KernelArchitecture;
-    use vm_spec::live::LiveBackend;
-
-    fn entry() -> AdmittedBoot {
-        AdmittedBoot {
-            identity: BootIdentity {
-                kernel_sha256: [1; 32],
-                initramfs_sha256: [2; 32],
-                native_sha256: [4; 32],
-                architecture: GuestArchitecture::Amd64,
-            },
-            resolved_config_sha256: [3; 32],
-            kernel_version: (6, 6, 0),
-            host_os: "linux",
-            host_arch: "x86_64",
-            root_profile: "linux-erofs-overlay-v1",
-            upper_profile: UpperProfile::SiloUpperExt4V1,
-            overlay_profile: OverlayProfile::SiloOverlayV1,
-            rendering_abi: OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
-            attachment_family: "krun-virtio-blk-v1",
-            evidence: "unit-only immutable tuple matching fixture",
-        }
-    }
 
     #[test]
-    fn overlay_boot_qualification_matches_exact_tuple_and_host_lane() {
-        let expected = entry();
-        assert!(admitted_boot(expected.identity, "linux", "x86_64", &[expected]).is_some());
-        for identity in [
-            BootIdentity {
-                kernel_sha256: [4; 32],
-                ..expected.identity
-            },
-            BootIdentity {
-                initramfs_sha256: [4; 32],
-                ..expected.identity
-            },
-            BootIdentity {
-                native_sha256: [5; 32],
-                ..expected.identity
-            },
-            BootIdentity {
-                architecture: GuestArchitecture::Arm64,
-                ..expected.identity
-            },
-        ] {
-            assert!(admitted_boot(identity, "linux", "x86_64", &[expected]).is_none());
-        }
-        assert!(admitted_boot(expected.identity, "macos", "aarch64", &[expected]).is_none());
-        assert!(admitted_boot(expected.identity, "linux", "aarch64", &[expected]).is_none());
-    }
-
-    #[test]
-    fn overlay_boot_qualification_rejects_old_kernel_and_incomplete_contract() {
-        let expected = entry();
-        for invalid in [
-            AdmittedBoot {
-                kernel_version: (5, 15, 219),
-                ..expected
-            },
-            AdmittedBoot {
-                kernel_version: (6, 5, 99),
-                ..expected
-            },
-            AdmittedBoot {
-                root_profile: "opaque-raw-v1",
-                ..expected
-            },
-            AdmittedBoot {
-                attachment_family: "vz",
-                ..expected
-            },
-            AdmittedBoot {
-                resolved_config_sha256: [0; 32],
-                ..expected
-            },
-            AdmittedBoot {
-                evidence: "",
-                ..expected
-            },
-        ] {
-            assert!(admitted_boot(expected.identity, "linux", "x86_64", &[invalid]).is_none());
-        }
-        assert!(admitted_boot(expected.identity, "linux", "x86_64", &[]).is_none());
-    }
-
-    #[test]
-    fn overlay_boot_qualification_hashes_bytes_and_rejects_unknown_assets() {
+    fn owned_boot_compares_base_bytes_without_hashing() {
         let directory = tempfile::tempdir().unwrap();
-        let kernel = directory.path().join("kernel");
-        let initramfs = directory.path().join("initramfs");
-        std::fs::write(&kernel, b"abc").unwrap();
-        std::fs::write(&initramfs, b"candidate base archive").unwrap();
-        std::fs::set_permissions(&kernel, std::fs::Permissions::from_mode(0o500)).unwrap();
-        assert_eq!(
-            crate::boot_qualification::hex_digest(QualifiedAsset::open(&kernel).unwrap().digest),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        let admission = admit_erofs_overlay(
-            &kernel,
-            &initramfs,
-            GuestArchitecture::Amd64,
-            LiveBackend::Krun,
-            &kernel,
-        );
-        if cfg!(target_os = "linux") {
-            let error = admission.expect_err("candidate must not acquire qualification");
-            let OverlayBootQualificationError::Unqualified { identity } = &error else {
-                panic!("expected exact tuple rejection: {error}");
-            };
-            assert_eq!(identity.profile, "linux-erofs-overlay-v1");
-            assert_eq!(identity.architecture, GuestArchitecture::Amd64);
-            assert_eq!(identity.native_sha256, identity.kernel_sha256);
-            assert!(error.to_string().contains(&format!(
-                "kernel sha256:{}, base initramfs sha256:{}, native sha256:{}",
-                identity.kernel_sha256, identity.initramfs_sha256, identity.native_sha256,
-            )));
-        } else {
-            assert!(matches!(
-                admission,
-                Err(OverlayBootQualificationError::UnsupportedHost { .. })
-            ));
-        }
-        std::fs::write(&initramfs, []).unwrap();
+        let left = directory.path().join("left");
+        let right = directory.path().join("right");
+        let original = vec![42; 65536 + 17];
+        std::fs::write(&left, &original).unwrap();
+        std::fs::write(&right, &original).unwrap();
+        let asset = OwnedBootAsset::open(&left).unwrap();
+        assert!(asset.same_contents(&asset).unwrap());
+        assert!(asset
+            .same_contents(&OwnedBootAsset::open(&right).unwrap())
+            .unwrap());
+        let mut changed = original;
+        changed[65536] = 43;
+        std::fs::write(&right, &changed).unwrap();
+        assert!(!asset
+            .same_contents(&OwnedBootAsset::open(&right).unwrap())
+            .unwrap());
+        std::fs::write(&right, b"short").unwrap();
+        assert!(!asset
+            .same_contents(&OwnedBootAsset::open(&right).unwrap())
+            .unwrap());
+        std::fs::write(&left, b"mutated").unwrap();
         assert!(matches!(
-            QualifiedAsset::open(&initramfs),
-            Err(OverlayBootQualificationError::InvalidAsset { .. })
-        ));
-        assert!(matches!(
-            QualifiedAsset::open(directory.path()),
-            Err(OverlayBootQualificationError::InvalidAsset { .. })
-        ));
-        let symlink = directory.path().join("symlink");
-        std::os::unix::fs::symlink(&kernel, &symlink).unwrap();
-        assert!(matches!(
-            QualifiedAsset::open(&symlink),
-            Err(OverlayBootQualificationError::Read { .. })
+            asset.same_contents(&OwnedBootAsset::open(&right).unwrap()),
+            Err(BootAssetError::AssetChanged { .. })
         ));
     }
 
     #[test]
-    fn overlay_boot_qualification_rejects_other_backends_before_opening_assets() {
-        let missing = std::path::Path::new("/nonexistent/overlay-qualification-asset");
-        for backend in [LiveBackend::Mock, LiveBackend::Vz] {
-            assert!(matches!(
-                admit_erofs_overlay(missing, missing, GuestArchitecture::Amd64, backend, missing),
-                Err(OverlayBootQualificationError::UnsupportedBackend { .. })
-            ));
-        }
+    fn owned_boot_rejects_empty_nonregular_and_symlink_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("asset");
+        std::fs::write(&path, []).unwrap();
+        assert!(matches!(
+            OwnedBootAsset::open(&path),
+            Err(BootAssetError::InvalidAsset { .. })
+        ));
+        assert!(matches!(
+            OwnedBootAsset::open(directory.path()),
+            Err(BootAssetError::InvalidAsset { .. })
+        ));
+        std::fs::write(&path, b"asset").unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(matches!(
+            OwnedBootAsset::open(&link),
+            Err(BootAssetError::Read { .. })
+        ));
     }
 
     #[test]
-    fn overlay_boot_qualification_copy_detects_replacement_rewrite_and_truncation() {
+    fn overlay_boot_rejects_other_backends_before_opening_assets() {
+        let missing = std::path::Path::new("/nonexistent/owned-overlay-asset");
+        for backend in [
+            vm_spec::live::LiveBackend::Mock,
+            vm_spec::live::LiveBackend::Vz,
+        ] {
+            assert!(matches!(
+                crate::owned_boot_assets::open_overlay_boot(missing, missing, backend, missing),
+                Err(BootAssetError::UnsupportedBackend { .. })
+            ));
+        }
+    }
+    #[test]
+    fn owned_boot_copy_detects_replacement_rewrite_and_truncation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("kernel");
         std::fs::write(&path, b"original qualified bytes").unwrap();
-        let asset = QualifiedAsset::open(&path).unwrap();
+        let asset = OwnedBootAsset::open(&path).unwrap();
         let mut output = Vec::new();
         assert_eq!(asset.copy_into(&mut output).unwrap(), 24);
         assert_eq!(output, b"original qualified bytes");
@@ -943,23 +811,23 @@ mod tests {
         assert!(copied.is_err() || output == b"original qualified bytes");
         assert_ne!(output, b"unqualified replacement");
 
-        let asset = QualifiedAsset::open(&path).unwrap();
+        let asset = OwnedBootAsset::open(&path).unwrap();
         std::fs::write(&path, b"same inode rewritten").unwrap();
         assert!(matches!(
             asset.copy_into(&mut Vec::new()),
-            Err(OverlayBootQualificationError::AssetChanged { .. })
+            Err(BootAssetError::AssetChanged { .. })
         ));
-        let asset = QualifiedAsset::open(&path).unwrap();
+        let asset = OwnedBootAsset::open(&path).unwrap();
         std::fs::write(&path, []).unwrap();
         assert!(matches!(
             asset.copy_into(&mut Vec::new()),
-            Err(OverlayBootQualificationError::AssetChanged { .. })
+            Err(BootAssetError::AssetChanged { .. })
         ));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn overlay_boot_qualification_copies_retained_assets_after_atomic_parent_replacement() {
+    fn owned_boot_copies_retained_assets_after_atomic_parent_replacement() {
         use std::os::unix::fs::MetadataExt;
 
         let directory = tempfile::tempdir().unwrap();
@@ -973,8 +841,8 @@ mod tests {
         std::fs::write(assets.join("base-initramfs"), &original_initramfs).unwrap();
         std::fs::write(replacement.join("kernel"), b"replacement kernel").unwrap();
         std::fs::write(replacement.join("base-initramfs"), b"replacement base").unwrap();
-        let kernel = QualifiedAsset::open(&assets.join("kernel")).unwrap();
-        let initramfs = QualifiedAsset::open(&assets.join("base-initramfs")).unwrap();
+        let kernel = OwnedBootAsset::open(&assets.join("kernel")).unwrap();
+        let initramfs = OwnedBootAsset::open(&assets.join("base-initramfs")).unwrap();
 
         let parent = std::fs::File::open(directory.path()).unwrap();
         nix::fcntl::renameat2(
@@ -1012,12 +880,12 @@ mod tests {
     }
 
     #[test]
-    fn overlay_boot_qualification_copy_is_bounded_when_source_grows_during_copy() {
+    fn owned_boot_copy_is_bounded_when_source_grows_during_copy() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("base-initramfs");
         let original = vec![42; 2 * 65536 + 13];
         std::fs::write(&path, &original).unwrap();
-        let asset = QualifiedAsset::open(&path).unwrap();
+        let asset = OwnedBootAsset::open(&path).unwrap();
         // Real append I/O to the source during copying proves reads stop at the
         // captured initial length, then reject mutation rather than chase EOF.
         let mut appender = std::fs::OpenOptions::new()
@@ -1026,7 +894,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             asset.copy_into(&mut appender),
-            Err(OverlayBootQualificationError::AssetChanged { .. })
+            Err(BootAssetError::AssetChanged { .. })
         ));
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
@@ -1036,17 +904,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn overlay_boot_qualification_executes_retained_native_inode_across_atomic_replacement() {
+    fn owned_boot_native_preexec_recheck_fails_closed_on_replacement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("native-monitor");
         let shell = std::fs::canonicalize("/bin/sh").unwrap();
         std::fs::copy(shell, &path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let token = QualifiedOverlayBoot {
-            admitted: entry(),
-            kernel: QualifiedAsset::open(&path).unwrap(),
-            initramfs: QualifiedAsset::open(&path).unwrap(),
-            native: QualifiedAsset::open_executable(&path).unwrap(),
+        let token = OwnedOverlayBoot {
+            kernel: OwnedBootAsset::open(&path).unwrap(),
+            initramfs: OwnedBootAsset::open(&path).unwrap(),
+            native: OwnedBootAsset::open_executable(&path).unwrap(),
         };
         token.recheck_native_executable().unwrap();
         let fd = token.native_executable_fd();
@@ -1073,40 +940,155 @@ mod tests {
         std::fs::write(&replacement, b"#!/bin/sh\nexit 99\n").unwrap();
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o500)).unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        token.recheck_native_executable().unwrap();
-        assert_eq!(
-            std::process::Command::new(&path).status().unwrap().code(),
-            Some(99)
-        );
-        // The retained inode was reauthenticated after unlink. Descriptor lookup
-        // still executes the original ELF, and CLOEXEC closes its source FD.
-        assert_eq!(
-            std::process::Command::new(&descriptor_path)
-                .args(["-c", &script])
-                .status()
-                .unwrap()
-                .code(),
-            Some(23)
-        );
+        assert!(matches!(
+            token.recheck_native_executable(),
+            Err(BootAssetError::AssetChanged { .. })
+        ));
     }
 
     #[test]
-    fn overlay_boot_qualification_native_recheck_rejects_in_place_mutation_and_nonexecutable() {
+    fn owned_boot_native_recheck_rejects_in_place_mutation_and_nonexecutable() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("native");
         std::fs::write(&path, b"original native fixture").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
-            QualifiedAsset::open_executable(&path),
-            Err(OverlayBootQualificationError::InvalidExecutable { .. })
+            OwnedBootAsset::open_executable(&path),
+            Err(BootAssetError::InvalidExecutable { .. })
         ));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let asset = QualifiedAsset::open_executable(&path).unwrap();
+        let asset = OwnedBootAsset::open_executable(&path).unwrap();
         std::fs::write(&path, b"changed native fixture!").unwrap();
         assert!(matches!(
             asset.recheck(),
-            Err(OverlayBootQualificationError::AssetChanged { .. })
+            Err(BootAssetError::AssetChanged { .. })
         ));
+    }
+
+    #[test]
+    fn overlay_kernel_floor_rejects_old_and_malformed_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kernel");
+        for version in [
+            "5.15.219",
+            "6.5.99",
+            "6.6.0",
+            "6.18.48-custom",
+            "7.2.2",
+            "",
+            "6",
+            "invalid",
+        ] {
+            std::fs::write(&path, direct_kernel_fixture::bzimage(version)).unwrap();
+            let kernel =
+                InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path)
+                    .unwrap();
+            let result = kernel.check_overlay_version();
+            match version {
+                "5.15.219" | "6.5.99" => {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error, BootAssetError::KernelTooOld { .. }));
+                    assert!(error.to_string().contains(version));
+                    assert!(error.to_string().contains("6.6"));
+                }
+                "6.6.0" | "6.18.48-custom" | "7.2.2" => result.unwrap(),
+                _ => assert!(matches!(result, Err(BootAssetError::KernelVersion { .. }))),
+            }
+        }
+        for bytes in [vec![], vec![0; 128], b"not a Linux kernel".to_vec()] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(
+                InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path)
+                    .and_then(|kernel| kernel.check_overlay_version())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_kernel_floor_reads_native_elf_linux_banner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vmlinux");
+        for version in ["5.15.219", "6.6.0", "7.2.2"] {
+            let mut bytes = direct_kernel_fixture::kernel(KernelArchitecture::Amd64, "native");
+            let banner = bytes.len();
+            bytes.extend_from_slice(format!("Linux version {version} (build)\0").as_bytes());
+            let strings = bytes.len();
+            bytes.extend_from_slice(b"\0linux_banner\0");
+            let strings_length = bytes.len() - strings;
+            let symbols = bytes.len();
+            bytes.extend_from_slice(&[0; 48]);
+            let symbol = symbols + 24;
+            let banner_address = 0xffff_ffff_8100_0000u64 + banner as u64;
+            patch(&mut bytes, symbol, &1u32.to_le_bytes());
+            bytes[symbol + 4] = 0x11;
+            patch(&mut bytes, symbol + 6, &1u16.to_le_bytes());
+            patch(&mut bytes, symbol + 8, &banner_address.to_le_bytes());
+            patch(
+                &mut bytes,
+                symbol + 16,
+                &((strings - banner) as u64).to_le_bytes(),
+            );
+            let sections = bytes.len();
+            bytes.resize(sections + 4 * 64, 0);
+            patch(&mut bytes, 40, &(sections as u64).to_le_bytes());
+            patch(&mut bytes, 58, &64u16.to_le_bytes());
+            patch(&mut bytes, 60, &4u16.to_le_bytes());
+            patch(&mut bytes, sections + 64 + 4, &1u32.to_le_bytes());
+            patch(&mut bytes, sections + 64 + 8, &2u64.to_le_bytes());
+            patch(
+                &mut bytes,
+                sections + 64 + 16,
+                &banner_address.to_le_bytes(),
+            );
+            patch(
+                &mut bytes,
+                sections + 64 + 24,
+                &(banner as u64).to_le_bytes(),
+            );
+            patch(
+                &mut bytes,
+                sections + 64 + 32,
+                &((strings - banner) as u64).to_le_bytes(),
+            );
+            patch(&mut bytes, sections + 128 + 4, &3u32.to_le_bytes());
+            patch(
+                &mut bytes,
+                sections + 128 + 24,
+                &(strings as u64).to_le_bytes(),
+            );
+            patch(
+                &mut bytes,
+                sections + 128 + 32,
+                &(strings_length as u64).to_le_bytes(),
+            );
+            patch(&mut bytes, sections + 192 + 4, &2u32.to_le_bytes());
+            patch(
+                &mut bytes,
+                sections + 192 + 24,
+                &(symbols as u64).to_le_bytes(),
+            );
+            patch(&mut bytes, sections + 192 + 32, &48u64.to_le_bytes());
+            patch(&mut bytes, sections + 192 + 40, &2u32.to_le_bytes());
+            patch(&mut bytes, sections + 192 + 44, &1u32.to_le_bytes());
+            patch(&mut bytes, sections + 192 + 56, &24u64.to_le_bytes());
+            let length = bytes.len() as u64;
+            patch(&mut bytes, 64 + 32, &length.to_le_bytes());
+            patch(&mut bytes, 64 + 40, &length.to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            let kernel =
+                InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path)
+                    .unwrap();
+            let result = kernel.check_overlay_version();
+            if version == "5.15.219" {
+                assert!(
+                    matches!(result, Err(BootAssetError::KernelTooOld { .. })),
+                    "version {version}: {result:?}"
+                );
+            } else {
+                result.unwrap_or_else(|error| panic!("version {version}: {error:?}"));
+            }
+        }
     }
 
     const ARCHITECTURES: [(KernelArchitecture, GuestArchitecture); 2] = [
@@ -1335,36 +1317,16 @@ mod tests {
     }
 
     #[test]
-    fn inspected_kernel_admits_the_authenticated_file_bytes() {
+    fn inspected_kernel_admits_held_file_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("kernel");
-        let (fixture, architecture) = ARCHITECTURES[0];
-        let bytes = direct_kernel_fixture::kernel(fixture, "file");
+        let bytes = direct_kernel_fixture::kernel(KernelArchitecture::Amd64, "file");
         std::fs::write(&path, &bytes).unwrap();
         let kernel =
             InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path).unwrap();
-        let digest = kernel.digest();
-        let asset = kernel.admit_direct(architecture).unwrap();
-        assert_eq!(asset.digest(), digest);
+        let asset = kernel.admit_direct(GuestArchitecture::Amd64).unwrap();
         let mut copy = Vec::new();
         asset.copy_into(&mut copy).unwrap();
         assert_eq!(copy, bytes);
-
-        std::fs::write(&path, b"exact custom kernel").unwrap();
-        let rejected = InspectedKernel::from_open_file(std::fs::File::open(&path).unwrap(), &path)
-            .unwrap()
-            .admit_direct(architecture)
-            .unwrap_err();
-        assert_eq!(rejected.reason, DirectKernelRejection::UnrecognizedFormat);
-        assert_eq!(
-            rejected.kernel_sha256,
-            crate::boot_qualification::hex_digest(sha256(b"exact custom kernel"))
-        );
-        assert!(rejected.to_string().contains(&rejected.kernel_sha256));
-    }
-
-    fn sha256(bytes: &[u8]) -> [u8; 32] {
-        use sha2::Digest;
-        sha2::Sha256::digest(bytes).into()
     }
 }

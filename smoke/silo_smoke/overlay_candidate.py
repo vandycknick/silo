@@ -1,9 +1,9 @@
-"""Controlled candidate qualification through the shipped monitor/worker.
+"""Controlled compatibility evidence through the shipped monitor/worker.
 
-This is deliberately not a libvm admission bypass. It creates disposable launch
-files, never inserts a capability/qualification record, and cannot count as the
-later production-path acceptance. Bootstrap JSON starts from F1's independent
-current fixture, not a second host/guest wire codec.
+This creates disposable launch files without changing the shared runtime or
+granting live capabilities. It does not replace normal production-path acceptance.
+Bootstrap JSON starts from F1's independent current fixture, not a second
+host/guest wire codec.
 """
 from __future__ import annotations
 

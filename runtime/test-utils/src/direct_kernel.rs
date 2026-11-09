@@ -43,6 +43,17 @@ pub fn host_kernel(label: &str) -> Vec<u8> {
     kernel(KernelArchitecture::host(), label)
 }
 
+/// A Linux boot-protocol header carrying a release string, never executed.
+pub fn bzimage(version: &str) -> Vec<u8> {
+    let mut image = vec![0; 0x300];
+    image[0x202..0x206].copy_from_slice(b"HdrS");
+    image[0x20e..0x210].copy_from_slice(&0x100u16.to_le_bytes());
+    image.extend_from_slice(version.as_bytes());
+    image.push(0);
+    image.resize(image.len().max(4096), 0);
+    image
+}
+
 /// A valid native boot header followed by `body`.
 pub fn image(architecture: KernelArchitecture, body: &[u8]) -> Vec<u8> {
     match architecture {

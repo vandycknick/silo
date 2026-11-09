@@ -30,6 +30,7 @@ pub(crate) struct RetainedStorageOperation {
 pub(crate) struct LaunchStorageLease {
     record: RetainedStorageOperation,
     lease: StorageLock,
+    directory: crate::paths::OwnedDirectory,
 }
 impl std::fmt::Debug for LaunchStorageLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,6 +40,9 @@ impl std::fmt::Debug for LaunchStorageLease {
     }
 }
 impl LaunchStorageLease {
+    pub(crate) fn durability_directory(&self) -> &crate::paths::OwnedDirectory {
+        &self.directory
+    }
     pub(crate) fn operation_id(&self) -> Uuid {
         self.record.operation_id
     }
@@ -1413,7 +1417,8 @@ impl Store {
         } = crate::store::cache_paths::storage_pool_dependencies(storage)?;
         let pool = StoragePool::open(&self.images_dir)?;
         let _roots = pool.lock_roots()?;
-        let lease = pool.lease(record.operation_id)?;
+        let lease = pool.lease_deferred(record.operation_id)?;
+        let directory = pool.lease_directory()?;
         let (device, inode) = lease.file_identity()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if restore.is_some() {
@@ -1526,7 +1531,11 @@ impl Store {
             }
         }
         tx.commit().await?;
-        Ok(LaunchStorageLease { record, lease })
+        Ok(LaunchStorageLease {
+            record,
+            lease,
+            directory,
+        })
     }
 
     pub(crate) async fn mark_launch_storage_admitted_inner(
