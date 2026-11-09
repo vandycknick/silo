@@ -918,10 +918,19 @@ pub enum CaptureFullReason {
     DirtyCrossover,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureSeedMethod {
+    Clone,
+    #[default]
+    Rebuild,
+}
+
 /// Native materialization and identity authentication costs, counted separately.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaptureMemoryStats {
+    pub seed_method: CaptureSeedMethod,
     pub logical_bytes: u64,
     pub live_bytes_read: u64,
     pub baseline_bytes_read: u64,
@@ -1038,6 +1047,12 @@ impl CaptureMemoryEvidence {
             })
             .sum();
         if self.stats.logical_bytes != self.packed_length
+            || (self.stats.seed_method == CaptureSeedMethod::Clone
+                && (self.mode != CapturePolicy::Incremental
+                    || self.stats.baseline_bytes_read != 0
+                    || self.stats.baseline_bytes_written != 0
+                    || self.stats.baseline_hole_bytes != 0
+                    || self.stats.extent_queries != 0))
             || self.stats.whole_file_bytes_hashed != 0
             || self.stats.identity_bytes_hashed != identity_bytes
             || self.stats.live_bytes_read > self.packed_length
@@ -2493,5 +2508,45 @@ mod tests {
         let mut record = evidence(&plan());
         record.inventory[0].identity = record.inventory[0].sha256.take();
         assert!(record.validate().is_err());
+    }
+    #[test]
+    fn memory_seed_method_is_required_and_has_exact_wire_values() {
+        use crate::capture::{CaptureMemoryStats, CaptureSeedMethod};
+
+        for (method, wire) in [
+            (CaptureSeedMethod::Clone, "clone"),
+            (CaptureSeedMethod::Rebuild, "rebuild"),
+        ] {
+            let stats = CaptureMemoryStats {
+                seed_method: method,
+                ..Default::default()
+            };
+            let mut value = serde_json::to_value(&stats).unwrap();
+            assert_eq!(value["seedMethod"], wire);
+            assert_eq!(
+                serde_json::from_value::<CaptureMemoryStats>(value.clone()).unwrap(),
+                stats
+            );
+            value.as_object_mut().unwrap().remove("seedMethod");
+            assert!(serde_json::from_value::<CaptureMemoryStats>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn clone_seed_requires_incremental_capture_without_baseline_io() {
+        use crate::capture::CaptureSeedMethod;
+
+        let mut memory = evidence(&plan()).memory.unwrap();
+        memory.stats.seed_method = CaptureSeedMethod::Clone;
+        assert!(memory.validate_capture().is_err());
+        memory.mode = CapturePolicy::Incremental;
+        memory.full_reason = None;
+        memory.baseline = Some(Sha256Digest::of_bytes(b"predecessor"));
+        memory.validate_capture().unwrap();
+        memory.stats.baseline_bytes_read = 1;
+        assert!(memory.validate_capture().is_err());
+        memory.stats.baseline_bytes_read = 0;
+        memory.stats.baseline_bytes_written = 1;
+        assert!(memory.validate_capture().is_err());
     }
 }

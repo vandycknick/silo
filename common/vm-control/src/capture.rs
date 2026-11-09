@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use silod_spec::daemon::v1 as w;
 use vm_spec::capture::{
     CaptureFullReason, CaptureMemoryEvidence, CaptureMemoryStats, CapturePauseDisposition,
-    CaptureStateBinding, Sha256Digest,
+    CaptureSeedMethod, CaptureStateBinding, Sha256Digest,
 };
 use vm_spec::lifecycle::{CapturePolicy, CaptureResumePolicy, Diagnostic, LiveId};
 
@@ -60,6 +60,24 @@ fn full_reason_from_wire(value: i32) -> Result<CaptureFullReason, ConversionErro
     }
 }
 
+fn seed_method_to_wire(value: CaptureSeedMethod) -> i32 {
+    (match value {
+        CaptureSeedMethod::Clone => w::CaptureSeedMethod::Clone,
+        CaptureSeedMethod::Rebuild => w::CaptureSeedMethod::Rebuild,
+    }) as i32
+}
+
+fn seed_method_from_wire(value: i32) -> Result<CaptureSeedMethod, ConversionError> {
+    match w::CaptureSeedMethod::try_from(value) {
+        Ok(w::CaptureSeedMethod::Clone) => Ok(CaptureSeedMethod::Clone),
+        Ok(w::CaptureSeedMethod::Rebuild) => Ok(CaptureSeedMethod::Rebuild),
+        _ => Err(invalid(
+            "capture.memory.stats.seed_method",
+            "unknown or unspecified enum",
+        )),
+    }
+}
+
 fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
     let binding = &value.binding;
     let stats = &value.stats;
@@ -91,6 +109,7 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
             })
             .collect(),
         stats: Some(w::CaptureMemoryStats {
+            seed_method: seed_method_to_wire(stats.seed_method),
             logical_bytes: stats.logical_bytes,
             live_bytes_read: stats.live_bytes_read,
             baseline_bytes_read: stats.baseline_bytes_read,
@@ -168,6 +187,7 @@ fn memory_from_wire(
             })
             .collect::<Result<Vec<_>, ConversionError>>()?,
         stats: CaptureMemoryStats {
+            seed_method: seed_method_from_wire(stats.seed_method)?,
             logical_bytes: stats.logical_bytes,
             live_bytes_read: stats.live_bytes_read,
             baseline_bytes_read: stats.baseline_bytes_read,
@@ -817,5 +837,59 @@ mod tests {
         value.source_outcome = Some(libvm::LiveCaptureSource::Resumed);
         let wire = machine_capture_to_wire(&value).unwrap();
         assert_eq!(machine_capture_from_wire(wire).unwrap(), value);
+    }
+
+    #[test]
+    fn memory_seed_method_round_trips_clone_and_rebuild_receipts() {
+        use vm_spec::capture::CaptureSeedMethod;
+
+        for (method, expected) in [
+            (CaptureSeedMethod::Clone, w::CaptureSeedMethod::Clone),
+            (CaptureSeedMethod::Rebuild, w::CaptureSeedMethod::Rebuild),
+        ] {
+            let mut value = live();
+            let memory = &mut value.capture.memory;
+            memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
+            memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(b"baseline"));
+            memory.full_reason = None;
+            memory.stats.seed_method = method;
+            memory.stats.full_bytes_written = 0;
+            memory.stats.overlay_bytes_written = 4096;
+            let wire = live_snapshot_to_wire(&value).unwrap();
+            assert_eq!(
+                wire.capture
+                    .as_ref()
+                    .unwrap()
+                    .memory
+                    .as_ref()
+                    .unwrap()
+                    .stats
+                    .as_ref()
+                    .unwrap()
+                    .seed_method,
+                expected as i32
+            );
+            assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn memory_seed_method_rejects_unspecified_and_unknown_wire_values() {
+        let wire = live_snapshot_to_wire(&live()).unwrap();
+        for method in [w::CaptureSeedMethod::Unspecified as i32, -1, 3, i32::MAX] {
+            let mut changed = wire.clone();
+            changed
+                .capture
+                .as_mut()
+                .unwrap()
+                .memory
+                .as_mut()
+                .unwrap()
+                .stats
+                .as_mut()
+                .unwrap()
+                .seed_method = method;
+            assert!(live_snapshot_from_wire(changed).is_err(), "method {method}");
+        }
     }
 }

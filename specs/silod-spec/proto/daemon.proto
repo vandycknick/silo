@@ -538,6 +538,7 @@ enum CaptureSourceOutcome { CAPTURE_SOURCE_OUTCOME_UNSPECIFIED = 0; CAPTURE_SOUR
 // relative to the Silo home and is never restore authority.
 enum CaptureFullReason { CAPTURE_FULL_REASON_UNSPECIFIED = 0; CAPTURE_FULL_REASON_REQUESTED = 1; CAPTURE_FULL_REASON_NO_BASELINE = 2; CAPTURE_FULL_REASON_BASELINE_TOKEN = 3; CAPTURE_FULL_REASON_COVERAGE_LOST = 4; CAPTURE_FULL_REASON_DIRTY_CROSSOVER = 5; }
 message CaptureStateBinding { string native_producer = 1; string silo_producer = 2; string profile = 3; string topology = 4; string ram_layout = 5; string source_run = 6; uint64 pause_generation = 7; string capture = 8; }
+enum CaptureSeedMethod { CAPTURE_SEED_METHOD_UNSPECIFIED = 0; CAPTURE_SEED_METHOD_CLONE = 1; CAPTURE_SEED_METHOD_REBUILD = 2; }
 message CaptureMemoryStats {
  uint64 logical_bytes = 1;
  uint64 live_bytes_read = 2;
@@ -552,6 +553,7 @@ message CaptureMemoryStats {
  uint64 extent_queries = 11;
  uint64 identity_bytes_hashed = 12;
  uint64 whole_file_bytes_hashed = 13;
+ CaptureSeedMethod seed_method = 14;
 }
 message CaptureMemoryEvidence {
  uint64 packed_length = 1;

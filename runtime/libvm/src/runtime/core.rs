@@ -108,6 +108,7 @@ pub struct Runtime {
     secret_store: Arc<dyn silo_secrets::SecretStore>,
     secret_provider: Option<crate::HostCommand>,
     machine_scope_recovery: MachineScopeRecovery,
+    pub(crate) open_timing: crate::runtime::start_timeline::RuntimeOpenTiming,
 }
 
 /// Identity for one concrete silo-vmm run.
@@ -146,6 +147,7 @@ impl Runtime {
         config: RuntimeConfig,
         query: Option<crate::LiveCapabilityQuery>,
     ) -> Result<Self, LibVmError> {
+        let discovery_started = std::time::Instant::now();
         let components = resolve_components(&config)?;
         let selection = crate::runtime::capabilities::ResolvedBackendSelection::resolve(
             config.virt_backend.as_ref(),
@@ -158,13 +160,15 @@ impl Runtime {
             live_query.reuse_cache(&query);
         }
         live_query.host_report().await?;
+        let discovery = discovery_started.elapsed();
+        let catalog_started = std::time::Instant::now();
         let roots = config.resolve_roots()?;
         let store = Store::open(&roots.state_db_path()).await?;
         let stored = store.read_or_seed_db_config(&DbConfig::current()).await?;
         crate::runtime::config::validate_db_config(&stored)?;
         let observation_store = crate::store::observation::ObservationStore::existing(&store);
         let paths = LocalPaths::from_roots(roots);
-        let runtime = Self::from_store_resolved(
+        let mut runtime = Self::from_store_resolved(
             paths,
             Arc::new(store),
             config.networking,
@@ -184,6 +188,10 @@ impl Runtime {
         if let Err(error) = crate::machine::live_fork::reconcile_forks(&runtime).await {
             tracing::warn!(%error, "live fork recovery retained uncertainty");
         }
+        runtime.open_timing = crate::runtime::start_timeline::RuntimeOpenTiming {
+            discovery,
+            catalog_recovery: catalog_started.elapsed(),
+        };
         Ok(runtime)
     }
 
@@ -324,6 +332,7 @@ impl Runtime {
             observation_store,
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
+            open_timing: crate::runtime::start_timeline::RuntimeOpenTiming::default(),
         };
         // Opening an installation must not depend on any individual VM's
         // runtime artifacts. Observation belongs to inspect; repair belongs to

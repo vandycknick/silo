@@ -600,7 +600,7 @@ def test_live_checkpoint_publishes_pulls_into_fresh_home_and_restores_exact_cut(
             # expected complete map to the independently retained source map.
             inherited = incremental.authenticated_map(destination, child_checkpoint,
                                                        mode="incremental", baseline=saved, baseline_map=captured_map)
-            assert inherited["stats"]["liveBytesRead"] < child_checkpoint.seal["memory"]["packedLength"]
+            assert inherited["stats"]["liveBytesRead"] <= inherited["stats"]["identityBytesHashed"]
             child_cut = restore.matched_cut(destination, child_checkpoint, initial, profile=profile)
             destination.run("resume", child)
             restore.resumed(destination, child, initial, child_cut)

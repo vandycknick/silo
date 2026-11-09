@@ -1227,7 +1227,7 @@ async fn launch_restored(
     runtime
         .mark_launch_storage_admitted(lease.operation_id())
         .await?;
-    let pending = runtime.supervisor().spawn(&launch).await?;
+    let pending = runtime.supervisor().spawn(&launch, None).await?;
     Ok((pending, lifetime))
 }
 

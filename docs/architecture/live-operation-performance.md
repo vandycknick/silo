@@ -175,6 +175,22 @@ resolver reuses the launch lease instead of registering a second consumer,
 and launch artifacts are synchronized once at the spawn boundary (layered
 start: 13 explicit syncs → 7, raw 9 → 6).
 
+Batch 4c's 2026-11-09 contract keeps the 8 MiB chunk-list identity and defines
+the 1 s incremental target on one contiguous 410 MiB dirty region in a 4 GiB
+guest; scattered dirties may require a full-RAM rehash, exposed through
+`identityBytesHashed`. Incremental RAM capture reflinks the retained baseline
+on CoW lanes and overlays only dirty runs; non-reflink lanes keep rebuilding
+the complete file from the baseline, without a pre-pause copy. Both yield
+the same bytes, and `CaptureMemoryStats.seedMethod` records `clone` or
+`rebuild`. Capture and incremental interruption gates on every lane now
+subtract a separate disk-sealing allowance (sealed upper allocated bytes /
+host-measured sequential SHA-256 rate), in addition to the existing non-CoW
+copy allowance where applicable. Restore and fork-to-Running do not gain
+this allowance. This accounts for the measured Btrfs disk sealing cost of
+1.1–1.2 s for a 2 GiB upper with 1 GiB payload, not a changed RAM target;
+raw timings, both allowances and rate inputs remain in evidence. Attribution:
+`.tmp/plan/research/phase24-incremental-memory-cost.md`, sections 1 and 3.
+
 | Boot, dispatch → agent responsive (s) | ext4 raw | ext4 layered | ratio | Btrfs raw | Btrfs layered | ratio |
 |---|---:|---:|---:|---:|---:|---:|
 | before Batch 4, cold / warm | 0.741 / 0.678 | 0.897 / 0.979 | 1.21 / 1.44 | 0.637 / 0.609 | 0.794 / 0.803 | 1.25 / 1.32 |
@@ -189,3 +205,42 @@ samples happened to hit three times out of five; layered-only cost is the
 30–65 ms visible in the cold medians. Next step: a start span in libvm to
 name the shared event (startup recovery checkpoint, capability subprocess or
 WAL checkpoint are the candidates), then remove it for every start.
+
+## Batch 4c: incremental seed, writeback hints, allowances
+
+Owner decisions: the 1 s incremental target is the defined fixture (contiguous
+410 MiB dirty region); no pre-pause baseline copy on non-reflink hosts; a
+disk-sealing allowance (sealed upper allocated bytes at the host's warm
+SHA-256 rate) joins the copy allowance for capture and incremental.
+
+Changes: the native RAM writer seeds its output by `FICLONE` from the
+retained baseline on CoW lanes and overlays only dirty runs (receipts report
+`seedMethod`); staging writes issue `sync_file_range` hints per 8 MiB so a
+guest flush after resume does not wait on an ext4 journal drain; a start
+timeline line attributes every start stage; recovery no longer checkpoints
+batches that retired nothing; the harness quiesces writeback before every
+sample and measures the hash rate in-process.
+
+| Btrfs, cold / warm (s) | raw | gated | target | |
+|---|---:|---:|---:|---|
+| Capture interruption | 2.46 / 2.46 | 1.84 / 1.84 | 5 | pass |
+| Incremental 10 % | 1.97 / 1.87 | 1.32 / 1.21 | 1 | miss |
+| Restore | 0.54 / 0.36 | | 2 | pass |
+| Fork4 | 2.94 / 2.84 | | 10 | pass |
+| Boot layered / raw | 1.11 / 1.11 | | 1.2 | pass |
+
+Incremental: the memory phase fell from about 1.25 s to about 0.65 s (clone
+seed on all 22 samples); the vCPU pause is 1.81–1.84 s of which disk sealing
+(clone, then read, zero-classify and hash the 1.08 GB upper) is 1.13–1.15 s.
+The single remaining lever is hashing disk chunks in parallel (digests are
+independent; the identity is their ordered list), which would also shorten
+full capture and restore verification.
+
+Boot: with writeback quiesced before every sample the warm bimodality is
+gone (raw 0.41, layered 0.46 on Btrfs); the layered-only start work is the
+15 ms lower resolve.
+
+ext4 lane: the loop backing file on the Btrfs root degraded to 19 562
+extents and 260–455 MB/s (872 MB/s at Batch 3); numbers from this lane on
+2026-11-09 after Batch 4a are invalid until the lane is recreated on a
+`nodatacow` file or a real partition.

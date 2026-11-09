@@ -840,6 +840,12 @@ fn memory_capture(
             .map(|digest| digest.map(vm_spec::capture::Sha256Digest::from_bytes))
             .collect(),
         stats: Box::new(CaptureMemoryStats {
+            seed_method: match stats.seed_method {
+                libkrun::live::RamSeedMethod::Clone => vm_spec::capture::CaptureSeedMethod::Clone,
+                libkrun::live::RamSeedMethod::Rebuild => {
+                    vm_spec::capture::CaptureSeedMethod::Rebuild
+                }
+            },
             logical_bytes: stats.logical_bytes,
             live_bytes_read: stats.live_bytes_read,
             baseline_bytes_read: stats.baseline_bytes_read,

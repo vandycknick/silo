@@ -5,6 +5,7 @@ pub(crate) mod components;
 mod config;
 pub(crate) mod core;
 mod planning;
+pub(crate) mod start_timeline;
 mod transitions;
 
 pub use builder::RuntimeBuilder;

@@ -559,6 +559,12 @@ SILO_SMOKE_BUDGET_DIR=/home/$USER/sm/phase16-ext4 TMPDIR=/home/$USER/sm \
   uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow
 ```
 
+Allowance, gate, writeback and small-file hash-probe unit tests (no guest):
+
+```sh
+uv run --project smoke pytest smoke/tests/test_fork_budget.py -m '' -k 'budget_gate or hash_rate or quiesce or copy_allowance'
+```
+
 The exact fixture, cache method and boundaries are in
 `silo_smoke/fork_budget.py`: `restore-execution` image, 2 vCPUs, 4096 MiB RAM,
 `--network private`, EROFS overlay with a 2 GiB upper holding exactly 1 GiB of
@@ -574,6 +580,17 @@ Historical flat-overlay measurements do not qualify this EROFS fixture. The
 mandatory Phase 24 sweep must retain new measurements; no current performance
 success is inferred from the earlier runs.
 
+Before every dispatch in every cohort (cold, discarded warm-up and warm), the
+shared cache-conditioning step calls `os.sync()`, then polls `/proc/meminfo`
+until `Dirty` + `Writeback` is below 16 MiB or the 30-second post-sync wait
+expires. This keeps the previous sample's teardown writeback out of the measured
+interval without dropping warm page-cache contents; cold samples still perform
+their per-file eviction. Each sample retains `writeback` with
+`dirtyBytesBefore` (before sync), `dirtyBytesAtDispatch` and `waitedSeconds`
+(post-sync polling time). A timeout retains the remaining dirty bytes rather than
+claiming the disk was quiet. Boot pairs retain separate raw/layered records under
+`writeback`, and repeat conditioning before each profile's start.
+
 Gated values: fork4 is CLI dispatch to the last durable child `running` stamp
 (API entry, seal to Running and caller end-to-end are separate fields); capture
 interruption is the larger of the source monitor's conservative staging-to-
@@ -581,12 +598,33 @@ continuation interval and an independent host observation of the guest's
 durable 50 ms witness writes in the source backing. At fixture setup, a real
 `FICLONE` probe between sibling files in the budget workspace selects the lane,
 independently of the capture request's disk copy contract. Reflink lanes subtract
-zero from every gate and budget cold restore. On non-reflink lanes the ADR
-allowance (upper allocated bytes at the measured sequential copy rate) is
-subtracted, and cold restore is recorded but not budgeted. The actual disk-seal
-duration is recorded; restore is dispatch to CLI exit with the child Running and
-ready. Samples, the reference-host record (CPU, memory, kernel, filesystem, input
-hashes, candidate manifest, reflink probe result and errno) and
+zero **copy allowance** and budget cold restore. On non-reflink lanes the ADR
+non-CoW allowance (upper allocated bytes at the measured sequential copy rate)
+is subtracted, and cold restore is recorded but not budgeted. Capture interruption
+and incremental interruption additionally subtract the **disk-sealing allowance**
+on every lane: sealed upper allocated bytes divided by the host's measured
+warm sequential SHA-256 CPU rate. Restore and fork-to-Running receive no
+disk-sealing allowance. Samples keep raw timing and existing copy fields,
+adding `diskSealAllowance`, `diskSealAllowanceSeconds` and the separately
+adjusted `gatedExcessSeconds`; summaries report both allowances and their inputs.
+The measured disk-seal duration is still recorded, not used as the allowance.
+
+The reference-host hash probe writes and fsyncs a fresh 1 GiB `/dev/urandom`
+file in the budget workspace, then hashes it twice using in-process
+`hashlib.sha256` (OpenSSL) over 8 MiB reads without evicting pages, outside all
+timed operations. This avoids PATH-dependent `sha256sum` implementations and
+lets OpenSSL use the host's SHA acceleration. `sequentialHash` in
+`reference-host.json` keeps
+both ordered `passes` (`cold`, then `warm`) with timings, rates, digests and
+mincore residency before/after; `cold` labels the initial pass, not a forced
+cache eviction. The second pass must start fully resident, so its CPU-bound
+rate, not a read-bound cold rate, becomes `sequentialHash.bytesPerSecond`
+(and the top-level seconds, digest and cache evidence). Scratch files are
+removed after probing.
+
+Restore is dispatch to CLI exit with the child Running and ready. Samples, the
+reference-host record (CPU, memory, kernel, filesystem, input hashes, candidate
+manifest, reflink probe result and errno, measured rates) and
 `summary.json`/`summary.md` are written before assertions. Recompute a summary
 with `python -m silo_smoke.fork_budget DIRECTORY`. A running source keeps its
 accepted capture baseline, so every successful fork sample stops and removes
@@ -612,7 +650,7 @@ budgeted for every new gate, including non-reflink incremental capture.
 
 | Pytest selector (`-k`) | Measured boundary and median gate | Additional free-space preflight |
 | --- | --- | --- |
-| `test_fork_budget_incremental_ten_percent_dirty` | Incremental workload interruption, larger of monitor staging-to-continuation interval and independent durable-workload gap, at most 1.0 s after copy allowance | 14 GiB |
+| `test_fork_budget_incremental_ten_percent_dirty` | Incremental workload interruption, larger of monitor staging-to-continuation interval and independent durable-workload gap, at most 1.0 s after non-CoW copy and disk-sealing allowances | 14 GiB |
 | `test_fork_budget_warm_create_stopped_machine` | Prepared-image `silo create` dispatch to command exit, at most 2.0 s, no allowance | 4 GiB |
 | `test_fork_budget_boot_layered_within_raw` | `silo start` dispatch to product trace's first guest-agent-serving event, median layered seconds / median raw seconds at most 1.2 | 6 GiB |
 
@@ -633,15 +671,21 @@ checkpoint establishes the baseline. The current memory probe has fixed
 and overwrites exactly 410 MiB there using `dd if=/dev/urandom bs=1M count=410
 conv=notrunc` before each timed checkpoint. This is 10.009765625 percent of
 configured 4096 MiB RAM, the requested whole-MiB rounding of ten percent.
-Guest kernel, agent and witness activity can dirty additional pages. Samples
+The 1 s target applies to this defined contiguous 410 MiB region under the
+unchanged 8 MiB chunk identity, not arbitrary dirty-page placement. Scattered
+dirty pages can require up to a full-RAM rehash, visible through
+`identityBytesHashed`. Guest kernel, agent and witness activity can dirty
+additional pages. Samples
 record the exact workload byte count and fraction separately from
 `productDirtyFraction`, derived from the product's
 `memory.stats.identityBytesHashed / logicalBytes` at its 8 MiB chunk resolution;
 the product exposes no separate page-granular dirty-fraction field.
 They retain the complete memory receipt, raw interruption, monitor disk-seal
-times and one-upper allowance inputs. A real workspace `FICLONE` probe selects
-zero allowance on reflink filesystems or allocated upper bytes divided by the
-host's measured sequential copy rate otherwise. The target stays 1.0 s.
+times and separate one-upper copy and disk-sealing allowance inputs. The copy
+allowance is zero on reflink filesystems or allocated source-upper bytes divided
+by the host's measured sequential copy rate otherwise. The disk-sealing allowance
+is the actual sealed upper's allocated bytes divided by the measured sequential
+hash rate on every filesystem. The target stays 1.0 s.
 After each sample the source run ends, its machine and previous checkpoint
 alias/retention are removed, and storage is pruned. Except after the last
 sample, the newest checkpoint is restored outside timing with its inherited
@@ -665,7 +709,6 @@ the guest agent is already serving from `/` after init mounted the raw or
 overlay root and executed `switch_root`. This is the earliest host-recorded
 serving-on-root boundary, not a kernel mount timestamp. It intentionally
 precedes full `GuestReportedReady` policy (provisioning and host-verified SSH).
-No product instrumentation change is needed.
 
 Both timing endpoints use host `CLOCK_REALTIME`: harness `time.time_ns()`
 immediately before spawning `silo start`, and the monitor's UTC trace timestamp.
@@ -683,6 +726,29 @@ Ready and full product readiness. Later readiness phases remain diagnostic,
 not part of the gate. `availablePhases` and `unavailablePhases` distinguish
 observed phases from unavailable kernel-start, initramfs and root-switch
 timestamps; none is invented from polling or guest uptime.
+
+Prelaunch attribution comes from one additional CLI stderr line emitted just
+after successful monitor exec: `INFO machine start timeline machine_id=<uuid>
+run_id=<run> runtime_discovery_ms=<n> catalog_open_recovery_ms=<n>
+lifecycle_admission_ms=<n> lower_resolve_authentication_ms=<n> secrets_netd_ms=<n>
+launch_publication_ms=<n> durability_barrier_ms=<n> admit_spawn_ms=<n> total_ms=<n>`.
+The CLI installs a scoped, no-ANSI/no-target tracing formatter; the default filter
+enables this event even without `RUST_LOG`. Boot samples preserve stderr as
+`<machine-name>-start.trace.log` alongside the monitor trace and require exactly
+one timeline with the matching machine and run. Each profile records it under
+`startTimeline`, including `stagesMilliseconds`, `totalMilliseconds` and the
+original marker line/source. All duration fields use host monotonic `Instant`.
+Runtime discovery includes component/backend selection and the capability exec;
+catalog opening includes startup recovery. Those two costs are measured once
+when opening the runtime and attributed to the start using it, not guest boot.
+The remaining stages measure this lifecycle attempt: admission (including locks
+and reconciliation), lower validation/authentication and root preparation,
+secrets/root resize/private netd, launch artifact publication, the durability
+barrier, and storage admission plus command preparation/exec. `total_ms` sums
+runtime opening and this start attempt; it is not CLI dispatch-to-spawn (CLI
+setup, lookup/inspect and any idle time between runtime opening and start are
+excluded). Keep the dispatch-to-generation delta to expose that residual.
+This diagnostic does not change the boot gate or its CLOCK_REALTIME endpoint.
 
 Samples also retain command-exit durations, alternating profile order and both
 complete cache inventories. Machines are stopped after each start (flushing the

@@ -54,12 +54,18 @@ impl Machine {
     }
 
     /// Starts the machine with prebuilt start options.
+    #[tracing::instrument(
+        name = "machine_start",
+        skip_all,
+        fields(machine_id = %self.machine_id(), run_id = tracing::field::Empty)
+    )]
     pub async fn start_with_options(
         &self,
         options: MachineStartOptions,
     ) -> Result<MachineStart, LibVmError> {
         let runtime = self.runtime();
         let supervisor = runtime.supervisor();
+        let mut timeline = crate::runtime::start_timeline::StartTimeline::new(runtime.open_timing);
         let (config, run_id) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
@@ -68,8 +74,10 @@ impl Machine {
                     "an execution-restore child cannot cold boot; retry the retained checkpoint under a new restore run",
                 ));
             }
+            let lower_started = std::time::Instant::now();
             let storage = runtime.validate_machine_storage_for_launch(&config).await?;
             let qualification = runtime.open_machine_boot(&config, &storage)?;
+            timeline.lower_resolve_authentication += lower_started.elapsed();
             let _node_state = crate::node_state::acquire(&config).await?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmm_pid_path();
@@ -98,11 +106,16 @@ impl Machine {
 
             let run_uuid = Uuid::new_v4();
             let run_id = run_uuid.to_string();
+            tracing::Span::current().record("run_id", run_id.as_str());
 
             let storage_lease = runtime
                 .register_launch_storage(&config, run_uuid, &storage)
                 .await?;
             runtime.request_machine_start(&config, &run_id).await?;
+            timeline.lifecycle_admission = timeline
+                .elapsed()
+                .saturating_sub(timeline.lower_resolve_authentication);
+            let lower_started = std::time::Instant::now();
             let prepared_root = match runtime
                 .prepare_machine_root(&config, &storage_lease, qualification)
                 .await
@@ -121,6 +134,8 @@ impl Machine {
                     .await);
                 }
             };
+            timeline.lower_resolve_authentication += lower_started.elapsed();
+            let secrets_started = std::time::Instant::now();
             let (root_disk_resize, mut secrets) = match (|| {
                 let secrets = runtime.resolve_machine_secrets(
                     &config,
@@ -176,6 +191,8 @@ impl Machine {
                 }
             };
             secrets.infrastructure.clear();
+            timeline.secrets_netd = secrets_started.elapsed();
+            let publication_started = std::time::Instant::now();
             let launch_inputs = match runtime.prepare_vmm_launch_inputs(
                 &config,
                 &run_id,
@@ -276,6 +293,8 @@ impl Machine {
                 storage_shutdown: &launch_inputs.storage_shutdown,
                 restore: None,
             };
+            timeline.launch_publication = publication_started.elapsed();
+            let admit_started = std::time::Instant::now();
             if let Err(error) = runtime
                 .mark_launch_storage_admitted(storage_lease.operation_id())
                 .await
@@ -291,9 +310,16 @@ impl Machine {
                 )
                 .await);
             }
+            timeline.admit_spawn = admit_started.elapsed();
             let startup = async {
+                let barrier_started = std::time::Instant::now();
                 launch_inputs.artifacts.sync(&storage_lease)?;
-                supervisor.spawn(&launch).await?.wait().await
+                timeline.durability_barrier = barrier_started.elapsed();
+                supervisor
+                    .spawn(&launch, Some(&mut timeline))
+                    .await?
+                    .wait()
+                    .await
             };
             if let Err(err) = startup.await {
                 return Err(finish_failed_start(

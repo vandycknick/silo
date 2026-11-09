@@ -138,7 +138,12 @@ impl PendingStartup {
 }
 
 impl VmSupervisor {
-    pub(crate) async fn spawn(&self, launch: &VmmLaunch<'_>) -> Result<PendingStartup, LibVmError> {
+    pub(crate) async fn spawn(
+        &self,
+        launch: &VmmLaunch<'_>,
+        timeline: Option<&mut crate::runtime::start_timeline::StartTimeline>,
+    ) -> Result<PendingStartup, LibVmError> {
+        let spawn_started = Instant::now();
         let startup_budget = startup_budget(launch);
         let startup_deadline = Instant::now() + startup_budget;
         let (start_read, start_write) = launch_pipe()?;
@@ -259,6 +264,10 @@ impl VmSupervisor {
             }
         }
         let child = command.spawn()?;
+        if let Some(timeline) = timeline {
+            timeline.admit_spawn += spawn_started.elapsed();
+            timeline.emit(launch.machine_id, launch.run_id);
+        }
 
         drop(start_read);
         drop(sync_write);
