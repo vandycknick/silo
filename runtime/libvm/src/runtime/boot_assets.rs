@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use vm_spec::live::LiveBackend;
 
-use crate::boot_qualification::{InspectedKernel, QualifiedAsset};
+use crate::owned_boot_assets::{InspectedKernel, OwnedBootAsset};
 
 use crate::storage::identity::ObjectDigest;
 use crate::storage::pool::StoragePool;
@@ -336,8 +336,7 @@ pub(crate) fn configured_boot_selection(
     }
 }
 
-/// Report a different locally admitted packaged tuple without publishing,
-/// downloading, repairing or changing any durable boot state.
+/// Report a different packaged bundle using identities recorded at import.
 pub(crate) fn locally_admitted_replacement(
     storage: &MachineStorageRecord,
     spec: &vm_spec::VmSpec,
@@ -346,6 +345,7 @@ pub(crate) fn locally_admitted_replacement(
     let BootProfile::LinuxDirect {
         binding: current,
         kernel_architecture,
+        root_selector,
         ..
     } = &storage.boot
     else {
@@ -354,25 +354,29 @@ pub(crate) fn locally_admitted_replacement(
     let BootBinding::Pinned { agent, .. } = current else {
         return Ok(None);
     };
-    let kernel = qualify_kernel_source(context.default_kernel)?;
-    let initramfs = qualify_capture_source(context.default_initramfs)?;
-    let agent = agent
-        .as_ref()
-        .map(|_| qualify_capture_source(context.default_agent))
-        .transpose()?;
-    let assets = qualify_captured_assets(
-        &storage.boot,
-        kernel,
-        initramfs,
-        context.backend,
-        context.native_executable,
-    )?;
+    let Some(kernel) = context.pool.boot_source_digest(context.default_kernel)? else {
+        return Ok(None);
+    };
+    let Some(base_initramfs) = context.pool.boot_source_digest(context.default_initramfs)? else {
+        return Ok(None);
+    };
+    let agent = match agent {
+        Some(_) => match context.pool.boot_source_digest(context.default_agent)? {
+            Some(digest) => Some(digest),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let inspected = resolve_kernel_object(context.pool, &kernel)?;
+    if *root_selector == crate::RootSelector::ManagedOverlay {
+        inspected.check_overlay_version()?;
+    } else {
+        inspected.admit_direct(*kernel_architecture)?;
+    }
     let replacement = BootBinding::Pinned {
-        kernel: ObjectDigest::from_sha256(assets.kernel().digest()),
-        base_initramfs: ObjectDigest::from_sha256(assets.initramfs().digest()),
-        agent: agent
-            .as_ref()
-            .map(|asset| ObjectDigest::from_sha256(asset.digest())),
+        kernel,
+        base_initramfs,
+        agent,
         architecture: *kernel_architecture,
         abi: DIRECT_BOOT_ABI.to_owned(),
     };
@@ -413,50 +417,48 @@ pub(crate) fn packaged_binding(
         context.native_executable,
     )?;
     Ok(BootBinding::Pinned {
-        kernel: ObjectDigest::from_sha256(assets.kernel().digest()),
-        base_initramfs: ObjectDigest::from_sha256(assets.initramfs().digest()),
+        kernel: ObjectDigest::from_sha256(assets.kernel().digest()?),
+        base_initramfs: ObjectDigest::from_sha256(assets.initramfs().digest()?),
         agent: agent
             .as_ref()
-            .map(|asset| ObjectDigest::from_sha256(asset.digest())),
+            .map(|asset| asset.digest().map(ObjectDigest::from_sha256))
+            .transpose()?,
         architecture: *kernel_architecture,
         abi: DIRECT_BOOT_ABI.to_owned(),
     })
 }
 
-// One short-lived selection owns its retained descriptors; boxing adds an
-// allocation without reducing a collection or long-lived per-machine footprint.
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum CapturedBootAssets {
     Direct {
-        kernel: QualifiedAsset,
-        initramfs: QualifiedAsset,
+        kernel: OwnedBootAsset,
+        initramfs: OwnedBootAsset,
     },
-    Overlay(crate::QualifiedOverlayBoot),
+    Overlay(crate::OwnedOverlayBoot),
 }
 
 impl CapturedBootAssets {
-    pub(crate) fn kernel(&self) -> &QualifiedAsset {
+    pub(crate) fn kernel(&self) -> &OwnedBootAsset {
         match self {
             Self::Direct { kernel, .. } => kernel,
             Self::Overlay(qualification) => qualification.kernel_asset(),
         }
     }
 
-    pub(crate) fn initramfs(&self) -> &QualifiedAsset {
+    pub(crate) fn initramfs(&self) -> &OwnedBootAsset {
         match self {
             Self::Direct { initramfs, .. } => initramfs,
             Self::Overlay(qualification) => qualification.initramfs_asset(),
         }
     }
 
-    pub(crate) fn into_overlay_qualification(self) -> Option<crate::QualifiedOverlayBoot> {
+    pub(crate) fn into_overlay_boot(self) -> Option<crate::OwnedOverlayBoot> {
         match self {
             Self::Overlay(qualification) => Some(qualification),
             Self::Direct { .. } => None,
         }
     }
 
-    fn into_sources(self) -> (QualifiedAsset, QualifiedAsset) {
+    fn into_sources(self) -> (OwnedBootAsset, OwnedBootAsset) {
         match self {
             Self::Direct { kernel, initramfs } => (kernel, initramfs),
             Self::Overlay(qualification) => qualification.into_boot_assets(),
@@ -466,7 +468,7 @@ impl CapturedBootAssets {
 
 pub(crate) struct ResolvedCapturedBoot {
     pub(crate) assets: CapturedBootAssets,
-    pub(crate) agent: Option<QualifiedAsset>,
+    pub(crate) agent: Option<OwnedBootAsset>,
 }
 
 fn invalid_capture(message: impl Into<String>) -> LibVmError {
@@ -596,14 +598,11 @@ pub(crate) fn validate_captured_boot_lane(
     Ok(())
 }
 
-/// Overlay roots are admitted only by their exact reviewed tuple. Raw roots
-/// need no overlay lane or backend tuple, but their kernel bytes must be the
-/// host's native direct-boot format for the pinned kernel architecture.
-/// Capabilities are not inspected; a kernel lacking them fails at boot.
+/// Overlay roots require Linux 6.6 or newer; raw roots retain native-format admission.
 fn qualify_captured_assets(
     boot: &BootProfile,
     kernel: InspectedKernel,
-    initramfs: QualifiedAsset,
+    initramfs: OwnedBootAsset,
     backend: LiveBackend,
     native_executable: &Path,
 ) -> Result<CapturedBootAssets, LibVmError> {
@@ -617,10 +616,9 @@ fn qualify_captured_assets(
     };
     if *root_selector == crate::RootSelector::ManagedOverlay {
         return Ok(CapturedBootAssets::Overlay(
-            crate::boot_qualification::admit_erofs_overlay_assets(
-                kernel.into_asset(),
+            crate::owned_boot_assets::open_overlay_assets(
+                kernel,
                 initramfs,
-                *kernel_architecture,
                 backend,
                 native_executable,
             )?,
@@ -640,26 +638,14 @@ fn open_boot_object(pool: &StoragePool, digest: &ObjectDigest) -> Result<File, L
     })
 }
 
-fn require_object_digest(
-    pool: &StoragePool,
-    digest: &ObjectDigest,
-    observed: [u8; 32],
-) -> Result<(), LibVmError> {
-    if ObjectDigest::from_sha256(observed) != *digest {
-        return Err(crate::storage::StorageError::ContentMismatch(pool.object_path(digest)).into());
-    }
-    Ok(())
-}
-
 /// Authenticate immutable objects without allocating a kernel-sized byte vector.
 /// The caller retains their semantic closure through launch or publication.
 fn resolve_boot_object(
     pool: &StoragePool,
     digest: &ObjectDigest,
-) -> Result<QualifiedAsset, LibVmError> {
+) -> Result<OwnedBootAsset, LibVmError> {
     let asset =
-        QualifiedAsset::from_open_file(open_boot_object(pool, digest)?, &pool.object_path(digest))?;
-    require_object_digest(pool, digest, asset.digest())?;
+        OwnedBootAsset::from_open_file(open_boot_object(pool, digest)?, &pool.object_path(digest))?;
     Ok(asset)
 }
 
@@ -671,7 +657,6 @@ fn resolve_kernel_object(
         open_boot_object(pool, digest)?,
         &pool.object_path(digest),
     )?;
-    require_object_digest(pool, digest, kernel.digest())?;
     Ok(kernel)
 }
 
@@ -811,8 +796,8 @@ fn open_capture_source(path: &Path) -> Result<File, LibVmError> {
     Ok(file)
 }
 
-fn qualify_capture_source(path: &Path) -> Result<QualifiedAsset, LibVmError> {
-    Ok(QualifiedAsset::from_open_file(
+fn qualify_capture_source(path: &Path) -> Result<OwnedBootAsset, LibVmError> {
+    Ok(OwnedBootAsset::from_open_file(
         open_capture_source(path)?,
         path,
     )?)
@@ -830,7 +815,31 @@ async fn ingest_boot_object(
     source: &Path,
     context: &CapturedBootContext<'_>,
 ) -> Result<ObjectDigest, LibVmError> {
+    let packaged = [
+        context.default_kernel,
+        context.default_initramfs,
+        context.default_agent,
+    ]
+    .contains(&source);
+    let retained = if packaged {
+        let retained = file.try_clone()?;
+        let fingerprint =
+            crate::storage::identity_file::SourceFingerprint::new(&retained.metadata()?);
+        Some((retained, fingerprint))
+    } else {
+        None
+    };
     let (object, publication) = context.pool.publish_object_file_for_catalog(file, source)?;
+    if let Some((retained, fingerprint)) = retained {
+        if fingerprint
+            != crate::storage::identity_file::SourceFingerprint::new(&retained.metadata()?)
+        {
+            return Err(crate::storage::StorageError::SourceChanged(source.to_path_buf()).into());
+        }
+        context
+            .pool
+            .record_boot_source(fingerprint, object.digest)?;
+    }
     context
         .store
         .pin_published_storage_dependencies(context.operation_id, &[], &[object.digest])
@@ -840,16 +849,11 @@ async fn ingest_boot_object(
 }
 
 async fn ingest_selected_object(
-    asset: QualifiedAsset,
+    asset: OwnedBootAsset,
     context: &CapturedBootContext<'_>,
 ) -> Result<ObjectDigest, LibVmError> {
-    let expected = ObjectDigest::from_sha256(asset.digest());
     let (file, path) = asset.into_source();
-    let digest = ingest_boot_object(file, &path, context).await?;
-    if digest != expected {
-        return Err(crate::storage::StorageError::ContentMismatch(path).into());
-    }
-    Ok(digest)
+    ingest_boot_object(file, &path, context).await
 }
 /// Resolve a complete creation/update selection and transfer every immutable
 /// member into the caller's existing operation before publishing its tuple.
@@ -933,6 +937,20 @@ async fn pin_boot_profile(
                     "boot bundle digest differs from canonical tuple",
                 ));
             }
+            let mut candidate = boot.clone();
+            if let BootProfile::LinuxDirect {
+                binding: target, ..
+            } = &mut candidate
+            {
+                *target = binding.clone();
+            }
+            validate_direct_boot_profile(&candidate)?;
+            resolve_pinned_profile(
+                &candidate,
+                context.pool,
+                context.backend,
+                context.native_executable,
+            )?;
             pin_binding_dependencies(&binding, &context).await?;
             binding
         }
@@ -959,11 +977,8 @@ async fn pin_boot_profile(
             let initramfs = qualify_capture_source(initramfs)?;
             if matches!(selection, BootAssetSelection::Files { .. }) {
                 let packaged = qualify_capture_source(context.default_initramfs)?;
-                if initramfs.digest() != packaged.digest() {
-                    return Err(LibVmError::BootBundleAbiUnsupported {
-                        expected: ObjectDigest::from_sha256(packaged.digest()),
-                        actual: ObjectDigest::from_sha256(initramfs.digest()),
-                    });
+                if !initramfs.same_contents(&packaged)? {
+                    return Err(LibVmError::BootBundleAbiUnsupported);
                 }
             }
             let agent = agent.map(qualify_capture_source).transpose()?;
@@ -1149,8 +1164,7 @@ pub(crate) async fn capture_boot(
 
 /// Record exact boot bytes for a host-only raw export. This is identity
 /// authentication, not permission to launch the source or the exported disk.
-/// In particular it neither consults the overlay qualification table nor
-/// changes platform, translation, or a source's already pinned selection.
+/// It does not change platform, translation, or an already pinned selection.
 pub(crate) async fn capture_export_boot(
     storage: &MachineStorageRecord,
     spec: &vm_spec::VmSpec,
@@ -1497,7 +1511,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn retained_bytes(asset: &crate::boot_qualification::QualifiedAsset) -> Vec<u8> {
+    fn retained_bytes(asset: &crate::owned_boot_assets::OwnedBootAsset) -> Vec<u8> {
         let mut bytes = Vec::new();
         asset.copy_into(&mut bytes).unwrap();
         bytes
@@ -1953,7 +1967,7 @@ mod tests {
             std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o400)).unwrap();
             std::fs::rename(&replacement, &path).unwrap();
         }
-        let launch_kernel = crate::machine::root_storage::publish_kernel(
+        let (launch_kernel, _kernel_file) = crate::machine::root_storage::publish_kernel(
             fixture.paths.home(),
             resolved.assets.kernel(),
         )
@@ -2259,16 +2273,13 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            error,
-            crate::LibVmError::BootBundleAbiUnsupported { .. }
-        ));
+        assert!(matches!(error, crate::LibVmError::BootBundleAbiUnsupported));
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), 0);
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn local_replacement_inspection_does_not_publish_or_change_the_tuple() {
+    async fn local_replacement_inspection_uses_imported_identities_without_publication() {
         let fixture = CaptureFixture::new().await;
         let (operation, lease) = fixture
             .store
@@ -2296,12 +2307,29 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        let before = fixture.pool.scan_objects().unwrap().count();
         std::fs::write(
             &fixture.kernel,
             test_utils::direct_kernel::host_kernel("new packaged kernel"),
         )
         .unwrap();
+        assert!(
+            crate::runtime::boot_assets::locally_admitted_replacement(
+                &storage,
+                &fixture.spec,
+                context.selection(),
+            )
+            .unwrap()
+            .is_none(),
+            "unimported installed bytes have no recorded bundle identity"
+        );
+        crate::runtime::boot_assets::pin_boot_selection(
+            &fixture.storage,
+            &crate::BootAssetSelection::Packaged,
+            fixture.context(operation),
+        )
+        .await
+        .unwrap();
+        let before = fixture.pool.scan_objects().unwrap().count();
         assert!(crate::runtime::boot_assets::locally_admitted_replacement(
             &storage,
             &fixture.spec,
@@ -2315,7 +2343,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn unadmitted_packaged_kernel_is_never_reported_as_a_replacement() {
+    async fn unimported_packaged_kernel_is_never_reported_as_a_replacement() {
         let fixture = CaptureFixture::new().await;
         let (operation, _lease) = import_operation(&fixture).await;
         let mut storage = fixture.storage.clone();
@@ -2329,14 +2357,13 @@ mod tests {
         let before = fixture.pool.scan_objects().unwrap().count();
         std::fs::write(&fixture.kernel, b"new packaged text").unwrap();
         let context = fixture.context(operation);
-        assert!(matches!(
-            crate::runtime::boot_assets::locally_admitted_replacement(
-                &storage,
-                &fixture.spec,
-                context.selection(),
-            ),
-            Err(crate::LibVmError::DirectKernelRejected(_))
-        ));
+        assert!(crate::runtime::boot_assets::locally_admitted_replacement(
+            &storage,
+            &fixture.spec,
+            context.selection(),
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(fixture.pool.scan_objects().unwrap().count(), before);
     }
 

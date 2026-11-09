@@ -15524,11 +15524,10 @@ func (x *ErrorDetail) GetCheckpointPortability() *RestorePortabilityRefusal {
 	return nil
 }
 
-// A custom base initramfs whose bootstrap ABI is not the locally known packaged one.
+// Custom base initramfs bytes differ from the supported packaged bootstrap.
+// Select the packaged base initramfs. No host paths or asset hashes are exposed.
 type BootBundleAbiUnsupported struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Expected      string                 `protobuf:"bytes,1,opt,name=expected,proto3" json:"expected,omitempty"`
-	Actual        string                 `protobuf:"bytes,2,opt,name=actual,proto3" json:"actual,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15561,20 +15560,6 @@ func (x *BootBundleAbiUnsupported) ProtoReflect() protoreflect.Message {
 // Deprecated: Use BootBundleAbiUnsupported.ProtoReflect.Descriptor instead.
 func (*BootBundleAbiUnsupported) Descriptor() ([]byte, []int) {
 	return file_daemon_proto_rawDescGZIP(), []int{143}
-}
-
-func (x *BootBundleAbiUnsupported) GetExpected() string {
-	if x != nil {
-		return x.Expected
-	}
-	return ""
-}
-
-func (x *BootBundleAbiUnsupported) GetActual() string {
-	if x != nil {
-		return x.Actual
-	}
-	return ""
 }
 
 type RestorePortabilityRefusal struct {
@@ -23473,10 +23458,8 @@ const file_daemon_proto_rawDesc = "" +
 	"\n" +
 	"\b_programB\x11\n" +
 	"\x0f_native_variantB\x18\n" +
-	"\x16_launch_failure_reason\"N\n" +
-	"\x18BootBundleAbiUnsupported\x12\x1a\n" +
-	"\bexpected\x18\x01 \x01(\tR\bexpected\x12\x16\n" +
-	"\x06actual\x18\x02 \x01(\tR\x06actual\"w\n" +
+	"\x16_launch_failure_reason\"8\n" +
+	"\x18BootBundleAbiUnsupportedJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03R\bexpectedR\x06actual\"w\n" +
 	"\x19RestorePortabilityRefusal\x12\x10\n" +
 	"\x03pin\x18\x01 \x01(\tR\x03pin\x12\x1a\n" +
 	"\bexpected\x18\x02 \x01(\tR\bexpected\x12\x16\n" +

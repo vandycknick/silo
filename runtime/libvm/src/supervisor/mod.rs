@@ -22,9 +22,7 @@ pub(crate) mod storage_holder;
 pub use client::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub(crate) use client::{forward_rpc_error, ForwardClientError, VmmClient, VmmClientError};
 pub(crate) use launch::VmmLaunch;
-pub(crate) use launch_spec::{
-    prepare_launch_spec, write_launch_spec, write_launch_spec_deferred, LaunchSpecInput,
-};
+pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecInput};
 
 /// Crate-private adapter for the `silo-vmm` supervisor process.
 #[derive(Debug, Clone)]
@@ -34,12 +32,13 @@ pub(crate) struct VmSupervisor {
     selection: std::sync::Arc<crate::runtime::capabilities::ResolvedBackendSelection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct VmmLaunchInputs {
     pub(crate) agent_enabled: bool,
     pub(crate) rosetta_intent: start_request::VmmRosettaIntent,
     pub(crate) asset_directory: PathBuf,
     pub(crate) storage_shutdown: protocol::shutdown::StorageShutdownContext,
+    pub(crate) artifacts: crate::machine::root_storage::LaunchArtifacts,
 }
 
 impl VmSupervisor {

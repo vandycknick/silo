@@ -80,7 +80,7 @@ fi
 jq -e '.profile == "workload" and .purpose == "workload"' "$temp_dir/workload.json" > /dev/null
 jq -e '.profile == "rprobe" and .purpose == "rosetta-acquisition-probe"' "$temp_dir/rprobe.json" > /dev/null
 jq -e '.rootRuntime.opaqueRaw and .rootRuntime.managedOverlay.eligible and
-    .rootRuntime.managedOverlay.qualification == "requires-exact-boot-evidence" and
+    .rootRuntime.managedOverlay.qualification == "kernel-config-build-gate" and
     .rootRuntime.managedOverlay.renderingAbi == "linux-overlayfs-mountinfo-v1"' \
     "$temp_dir/workload.json" > /dev/null
 jq -e '.rootRuntime.opaqueRaw == false and .rootRuntime.managedOverlay.eligible == false' \

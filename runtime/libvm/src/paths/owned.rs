@@ -298,6 +298,42 @@ impl OwnedDirectory {
         )
     }
 
+    /// Atomically publishes a launch artifact in this directory without syncing.
+    /// The returned descriptor names the published inode, including its final
+    /// permissions. The caller must sync it and this directory before launch.
+    pub(crate) fn publish_file_deferred(
+        &self,
+        name: &str,
+        mode: Mode,
+        write: impl FnOnce(&mut File) -> Result<(), LibVmError>,
+    ) -> Result<File, LibVmError> {
+        if !is_single_component(name) || (mode != PRIVATE_FILE_MODE && mode != Mode::S_IRUSR) {
+            return Err(invalid(&self.path.join(name), "invalid launch publication"));
+        }
+        let temporary = format!(".launch-{}.tmp", uuid::Uuid::new_v4().simple());
+        let path = self.path.join(&temporary);
+        let fd = openat(
+            self.fd(),
+            temporary.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|error| invalid(&path, error))?;
+        let mut file = File::from(fd);
+        let result = (|| {
+            write(&mut file)?;
+            fchmod(&file, mode).map_err(|error| invalid(&path, error))?;
+            nix::fcntl::renameat(self.fd(), temporary.as_str(), self.fd(), name)
+                .map_err(|error| invalid(&self.path.join(name), error))?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = unlinkat(self.fd(), temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
     /// Publishes a complete private file. Interrupted writes remain only in
     /// `.atomic-write`, which callers must exclude from authoritative inventories.
     /// The caller serializes publishers and any abandoned-staging cleanup.
@@ -726,6 +762,37 @@ mod tests {
                 .expect("read private file"),
             b"second"
         );
+    }
+
+    #[test]
+    fn deferred_publication_preserves_previous_artifact_and_cleans_failed_temporary() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = OwnedDirectory::open_root(&temp.path().join("launch")).unwrap();
+        let original = root
+            .publish_file_deferred("kernel-qualified", nix::sys::stat::Mode::S_IRUSR, |file| {
+                file.write_all(b"complete kernel")?;
+                Ok(())
+            })
+            .unwrap();
+        original.sync_all().unwrap();
+        root.sync().unwrap();
+        let error = root
+            .publish_file_deferred("kernel-qualified", nix::sys::stat::Mode::S_IRUSR, |file| {
+                file.write_all(b"partial replacement")?;
+                Err(std::io::Error::other("publication interrupted").into())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("publication interrupted"));
+        assert_eq!(
+            std::fs::read(root.path().join("kernel-qualified")).unwrap(),
+            b"complete kernel",
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert!(root
+            .publish_file_deferred("../escape", nix::sys::stat::Mode::S_IRUSR, |_| Ok(()))
+            .is_err());
     }
 
     #[test]

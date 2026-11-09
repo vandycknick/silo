@@ -678,9 +678,8 @@ async fn create_machine_config_with_name(
         crate::storage::limits::Resource::IncludedDisks
             .sum([2, disk_paths.len() as u64])
             .map_err(crate::storage::StorageError::from)?;
-        // Fails before any acquisition effect; the admitted tuple table is
-        // the only authority for a new layered root's runtime-selected boot.
-        runtime.qualify_erofs_overlay(kernel.as_deref(), initramfs.as_deref())?;
+        // Check the overlay kernel floor before any acquisition effect.
+        runtime.open_overlay_boot(kernel.as_deref(), initramfs.as_deref())?;
     } else if layered_image {
         crate::storage::limits::Resource::IncludedDisks
             .sum([2, disk_paths.len() as u64])
@@ -3164,26 +3163,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oci_source_selects_layered_root_and_unqualified_create_has_no_effects() {
+    async fn oci_source_selects_layered_root_and_old_kernel_create_has_no_effects() {
         let temp = tempfile::tempdir().unwrap();
         let paths = LocalPaths::new(temp.path().join("silo"));
         let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
+        std::fs::write(
+            runtime.asset_directory().join("kernel-default"),
+            test_utils::direct_kernel::bzimage("5.15.219"),
+        )
+        .unwrap();
         assert_eq!(
             runtime.machine().request.temporary_directory,
             crate::TemporaryDirectoryPolicy::DiskBacked
         );
         let source = write_base_rootfs(temp.path());
-        let mut request = create_request(source.clone(), "unqualified-overlay");
+        let mut request = create_request(source.clone(), "old-kernel-overlay");
         request.image_source = Some(ImageSource::oci(
             "unreachable.invalid/should-not-resolve:latest",
         ));
-        // No exact boot tuple is admitted, so the source-selected layered root
-        // is refused before resolution, acquisition or any machine effect.
+        // The overlay kernel floor is checked before resolution or acquisition.
         let error = create_machine_config(&runtime, request).await.unwrap_err();
         assert!(
             matches!(
                 error,
-                LibVmError::OverlayBootQualification(_)
+                LibVmError::BootAsset(_)
                     | LibVmError::OverlayBackendUnsupported { .. }
                     | LibVmError::BackendAdmissionRejected {
                         remedy:
@@ -3194,7 +3197,7 @@ mod tests {
             "{error}"
         );
         assert!(store
-            .machine_config_by_name("unqualified-overlay")
+            .machine_config_by_name("old-kernel-overlay")
             .await
             .unwrap()
             .is_none());

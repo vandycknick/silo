@@ -1,6 +1,6 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 
 use vm_spec::{BlockId, Disk, DiskFormat, DiskGeometry, DiskRole};
@@ -18,11 +18,11 @@ pub(crate) struct PreparedRoot {
     pub(crate) disks: Vec<Disk>,
     pub(crate) bootstrap: Vec<u8>,
     pub(crate) descriptor: Option<String>,
-    pub(crate) qualification: Option<crate::QualifiedOverlayBoot>,
+    pub(crate) qualification: Option<crate::OwnedOverlayBoot>,
     pub(crate) storage: MachineStorageRecord,
     pub(crate) rosetta: rootfs_spec::RosettaMode,
-    /// Lease over the layered lower's layers, packs and fsmeta, held until
-    /// the launched monitor has opened its verified backings.
+    /// Resolved lower protected by the caller's launch-generation lease until
+    /// the monitor has opened its verified backings.
     pub(crate) _lower: Option<LaunchLower>,
 }
 
@@ -108,7 +108,7 @@ pub(crate) fn validate_spec(
         .as_ref()
         .and_then(|boot| boot.kernel.as_ref())
         .map(|kernel| &kernel.cmdline)
-        .ok_or_else(|| invalid("overlay requires qualified direct kernel boot"))?;
+        .ok_or_else(|| invalid("overlay requires direct kernel boot"))?;
     // The token checks above already refused selectors and conflicting
     // markers; the builder-emitted marker must also be a whole argument.
     if !args.iter().any(|arg| arg.as_str() == ROOT_MARKER) {
@@ -255,7 +255,7 @@ pub(crate) fn prepare(
     images_dir: &Path,
     lower: Option<LaunchLower>,
     data_disks: u64,
-    qualification: Option<crate::QualifiedOverlayBoot>,
+    qualification: Option<crate::OwnedOverlayBoot>,
     rosetta: rootfs_spec::RosettaMode,
 ) -> Result<PreparedRoot, LibVmError> {
     storage.validate()?;
@@ -328,9 +328,9 @@ pub(crate) fn prepare(
             temporary_directory,
             ..
         } => {
-            let qualification = qualification
+            qualification
                 .as_ref()
-                .ok_or_else(|| invalid("layered overlay boot was not qualified"))?;
+                .ok_or_else(|| invalid("layered overlay boot has no owned boot assets"))?;
             let launch = lower
                 .as_ref()
                 .ok_or_else(|| invalid("overlay launch has no leased retained composition"))?;
@@ -386,7 +386,7 @@ pub(crate) fn prepare(
                 )?,
                 upper_profile: rootfs_spec::UpperProfile::SiloUpperExt4V1,
                 overlay_profile: rootfs_spec::OverlayProfile::SiloOverlayV1,
-                rendering_abi: qualification.rendering_abi(),
+                rendering_abi: rootfs_spec::OverlayRenderingAbi::LinuxOverlayfsMountinfoV1,
                 temporary_directory,
             };
             (
@@ -424,56 +424,73 @@ pub(crate) fn prepare(
     })
 }
 
-pub(crate) fn publish_descriptor(machine_dir: &Path, descriptor: &str) -> Result<(), LibVmError> {
+/// Retained publication descriptors, flushed together immediately before spawn.
+pub(crate) struct LaunchArtifacts {
+    pub(crate) files: Vec<File>,
+    directory: crate::paths::OwnedDirectory,
+}
+
+impl std::fmt::Debug for LaunchArtifacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchArtifacts")
+            .field("directory", &self.directory.path())
+            .field("files", &self.files.len())
+            .finish()
+    }
+}
+
+impl LaunchArtifacts {
+    pub(crate) fn new(machine_dir: &Path) -> Result<Self, LibVmError> {
+        Ok(Self {
+            files: Vec::with_capacity(4),
+            directory: crate::paths::OwnedDirectory::open_existing_root(machine_dir)?
+                .ok_or_else(|| invalid("machine launch directory disappeared"))?,
+        })
+    }
+
+    pub(crate) fn sync(
+        &self,
+        lease: &crate::store::operation_store::LaunchStorageLease,
+    ) -> Result<(), LibVmError> {
+        // All final metadata and bytes precede all namespace barriers. The
+        // stable lease lives in the pool, not in the machine directory.
+        for file in &self.files {
+            file.sync_all()?;
+        }
+        lease.lock().sync()?;
+        self.directory.sync()?;
+        lease.durability_directory().sync()
+    }
+}
+
+pub(crate) fn publish_descriptor(machine_dir: &Path, descriptor: &str) -> Result<File, LibVmError> {
     let directory = crate::paths::OwnedDirectory::open_existing_root(machine_dir)?
         .ok_or_else(|| invalid("machine directory disappeared before descriptor publication"))?;
-    let name = format!(".lower-{}.tmp", uuid::Uuid::new_v4().simple());
-    let path = machine_dir.join(&name);
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(descriptor.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&path, machine_dir.join("lower.vmdk"))?;
-        directory.sync()?;
-        Ok::<_, LibVmError>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-    result
+    directory.publish_file_deferred(
+        "lower.vmdk",
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        |file| {
+            file.write_all(descriptor.as_bytes())?;
+            Ok(())
+        },
+    )
 }
 
 pub(crate) fn publish_kernel(
     machine_dir: &Path,
-    kernel: &crate::boot_qualification::QualifiedAsset,
-) -> Result<std::path::PathBuf, LibVmError> {
+    kernel: &crate::owned_boot_assets::OwnedBootAsset,
+) -> Result<(std::path::PathBuf, File), LibVmError> {
     let directory = crate::paths::OwnedDirectory::open_existing_root(machine_dir)?
         .ok_or_else(|| invalid("machine directory disappeared before kernel publication"))?;
-    let temporary = machine_dir.join(format!(".kernel-{}.tmp", uuid::Uuid::new_v4().simple()));
-    let destination = machine_dir.join("kernel-qualified");
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        kernel.copy_into(&mut file)?;
-        file.sync_all()?;
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, &destination)?;
-        directory.sync()?;
-        Ok::<_, LibVmError>(destination)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
+    let file = directory.publish_file_deferred(
+        "kernel-qualified",
+        nix::sys::stat::Mode::S_IRUSR,
+        |file| {
+            kernel.copy_into(file)?;
+            Ok(())
+        },
+    )?;
+    Ok((machine_dir.join("kernel-qualified"), file))
 }
 
 #[cfg(test)]
@@ -613,26 +630,54 @@ mod tests {
         assert!(validate_spec(&storage, &changed_lower).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn vmdk_unqualified_root_fails_before_pool_or_private_file_access() {
+    fn vmdk_kernel_version_floor_precedes_pool_or_private_file_access() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().unwrap();
-        let error = match prepare(
-            &storage(),
-            temp.path(),
-            &temp.path().join("missing-pool"),
-            None,
-            0,
-            None,
-            rootfs_spec::RosettaMode::Disabled,
-        ) {
-            Ok(_) => panic!("unqualified root unexpectedly prepared"),
-            Err(error) => error,
+        let kernel = temp.path().join("kernel");
+        let initramfs = temp.path().join("initramfs");
+        let native = temp.path().join("native");
+        std::fs::write(&kernel, test_utils::direct_kernel::bzimage("5.15.219")).unwrap();
+        let open = || {
+            crate::owned_boot_assets::open_overlay_boot(
+                &kernel,
+                &initramfs,
+                vm_spec::live::LiveBackend::Krun,
+                &native,
+            )
         };
-        assert!(matches!(
-            error,
-            crate::LibVmError::InvalidStorageRecord { .. }
-        ));
-        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+        let error = open().unwrap_err();
+        assert!(matches!(error, crate::BootAssetError::KernelTooOld { .. }));
+        assert!(error.to_string().contains("5.15.219"));
+        assert!(error.to_string().contains("6.6"));
+        assert!(!initramfs.exists());
+        assert!(!native.exists());
+        assert!(!temp.path().join("missing-pool").exists());
+
+        std::fs::write(&initramfs, b"base archive").unwrap();
+        std::fs::write(&native, b"held executable").unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o500)).unwrap();
+        for version in ["6.6.0", "6.18.48", "7.2.2"] {
+            std::fs::write(&kernel, test_utils::direct_kernel::bzimage(version)).unwrap();
+            let assets = open().expect("6.6+ kernel passes the overlay floor");
+            let error = match prepare(
+                &storage(),
+                temp.path(),
+                &temp.path().join("missing-pool"),
+                None,
+                0,
+                Some(assets),
+                rootfs_spec::RosettaMode::Disabled,
+            ) {
+                Ok(_) => panic!("root without retained lower unexpectedly prepared"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("no leased retained composition"));
+            assert!(!temp.path().join("missing-pool").exists());
+            assert!(!temp.path().join("upper.raw").exists());
+        }
     }
 
     #[test]
@@ -911,8 +956,24 @@ mod tests {
         let held = crate::store::storage::tests::retained_lower(&store, paths.home(), b'R').await;
         let retained = held.retained().clone();
         let lower = retained.overlay_lower();
+        let (_config, lease) =
+            crate::store::storage::tests::leased_layered_machine(&store, &paths, &held).await;
         let layers = crate::store::layer_store::LayerStore::from_store(store.clone());
-        let launch = layers.launch_lower(&lower).await.unwrap();
+        let launch = layers
+            .launch_lower(&lease, lease.storage_record())
+            .await
+            .unwrap();
+        let foreign_home = tempfile::tempdir().unwrap();
+        let foreign_store =
+            crate::store::Store::new(&crate::paths::LocalPaths::new(foreign_home.path()))
+                .await
+                .unwrap();
+        assert!(
+            crate::store::layer_store::LayerStore::from_store(foreign_store)
+                .launch_lower(&lease, lease.storage_record())
+                .await
+                .is_err()
+        );
         // fsmeta object first, then every pack occurrence; the repeated layer
         // keeps its exact position and shares one retained backing.
         assert_eq!(launch.occurrences.len(), 3);
@@ -933,18 +994,23 @@ mod tests {
             .unwrap();
         assert_eq!(admitted.logical_length(), lower.geometry().length);
         admitted.verify(&pool).unwrap();
-        // Derived claims contradicting the authenticated result never lease.
+        // Neither another generation nor forged lower claims can reuse this authority.
+        let mut forged = lease.storage_record().clone();
+        forged.storage_generation += 1;
+        assert!(layers.launch_lower(&lease, &forged).await.is_err());
+        let mut forged = lease.storage_record().clone();
+        let crate::MachineRoot::LinuxOverlay {
+            lower: forged_lower,
+            ..
+        } = &mut forged.root
+        else {
+            unreachable!("layered fixture");
+        };
         let crate::OverlayLower::ErofsComposition {
-            record, geometry, ..
-        } = lower.clone();
-        assert!(layers
-            .launch_lower(&crate::OverlayLower::ErofsComposition {
-                record,
-                geometry,
-                filesystem_uuid: uuid::Uuid::new_v4(),
-            })
-            .await
-            .is_err());
+            filesystem_uuid, ..
+        } = forged_lower;
+        *filesystem_uuid = uuid::Uuid::new_v4();
+        assert!(layers.launch_lower(&lease, &forged).await.is_err());
         // A retained fsmeta byte change is refused by the held whole-object
         // verification before any descriptor could be handed to a monitor.
         let fsmeta = pool.object_path(&retained.fsmeta());

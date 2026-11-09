@@ -1175,7 +1175,7 @@ impl crate::store::Store {
             let (transfer_roles, native_records) = match &record.storage.root {
                 crate::MachineRoot::LinuxOverlay { lower, .. } => {
                     let launch = crate::store::layer_store::LayerStore::from_store(self.clone())
-                        .launch_lower(lower)
+                        .hold_lower(lower)
                         .await?;
                     let plan = crate::storage::vmdk::FlatLowerPlan::new(&launch.occurrences)?
                         .preflight(roles)?;

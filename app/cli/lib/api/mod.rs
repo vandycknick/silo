@@ -387,7 +387,7 @@ impl AppApi {
         let machine = self.machine(reference).await?;
         let before = machine.inspect().await?;
         crate::commands::start::ensure_startable(&before)?;
-        let options = self.machine_start_options(&machine, true).await?;
+        let options = AppStartOptions::new();
         let start = machine.start_with_options(options).await?;
         if crate::commands::start::requires_guest_readiness(&start.machine) {
             let readiness = machine.wait_ready(readiness_timeout).await?;

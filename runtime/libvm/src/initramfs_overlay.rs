@@ -8,7 +8,7 @@ use cpio::newc::ModeFileType;
 use cpio::NewcBuilder;
 use eyre::Context;
 
-use crate::boot_qualification::QualifiedAsset;
+use crate::owned_boot_assets::OwnedBootAsset;
 
 const DIRECTORY_MODE: u32 = 0o755;
 const AGENT_MODE: u32 = 0o755;
@@ -16,14 +16,14 @@ const CONFIG_MODE: u32 = 0o600;
 
 pub(crate) enum CompositeBase<'a> {
     Path(&'a Path),
-    Qualified(&'a crate::QualifiedOverlayBoot),
-    Retained(&'a QualifiedAsset),
+    Owned(&'a crate::OwnedOverlayBoot),
+    Retained(&'a OwnedBootAsset),
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum CompositeAgent<'a> {
     Path(&'a Path),
-    Retained(&'a QualifiedAsset),
+    Retained(&'a OwnedBootAsset),
 }
 
 pub(crate) fn write_composite(
@@ -31,24 +31,6 @@ pub(crate) fn write_composite(
     agent_payload: Option<(CompositeAgent<'_>, &[u8])>,
     root_bootstrap: Option<&[u8]>,
     destination: &Path,
-) -> eyre::Result<()> {
-    write_composite_with(base, agent_payload, root_bootstrap, destination, true).map(drop)
-}
-
-pub(crate) fn write_composite_deferred(
-    base: CompositeBase<'_>,
-    agent_payload: Option<(CompositeAgent<'_>, &[u8])>,
-    destination: &Path,
-) -> eyre::Result<File> {
-    write_composite_with(base, agent_payload, None, destination, false)
-}
-
-fn write_composite_with(
-    base: CompositeBase<'_>,
-    agent_payload: Option<(CompositeAgent<'_>, &[u8])>,
-    root_bootstrap: Option<&[u8]>,
-    destination: &Path,
-    durable: bool,
 ) -> eyre::Result<File> {
     if let Some(root) = root_bootstrap {
         if root.len() > rootfs_spec::MAX_JSON_BYTES {
@@ -64,7 +46,7 @@ fn write_composite_with(
         }
     }
     let opened_agent = match agent_payload {
-        Some((CompositeAgent::Path(path), _)) => Some(QualifiedAsset::open(path)?),
+        Some((CompositeAgent::Path(path), _)) => Some(OwnedBootAsset::open(path)?),
         _ => None,
     };
     let agent_payload = agent_payload
@@ -104,7 +86,7 @@ fn write_composite_with(
             io::copy(&mut source, &mut output)
                 .with_context(|| format!("copy base initramfs {}", path.display()))?
         }
-        CompositeBase::Qualified(qualification) => qualification.copy_initramfs(&mut output)?,
+        CompositeBase::Owned(assets) => assets.copy_initramfs(&mut output)?,
         CompositeBase::Retained(asset) => asset.copy_into(&mut output)?,
     };
     let padding = (4 - (base_size % 4)) % 4;
@@ -142,9 +124,6 @@ fn write_composite_with(
     }
     cpio::newc::trailer(&mut output).context("write initramfs overlay trailer")?;
     output.flush().context("flush composite initramfs")?;
-    if durable {
-        output.sync_all().context("sync composite initramfs")?;
-    }
 
     fs::rename(&temporary, destination).with_context(|| {
         format!(
@@ -182,7 +161,7 @@ fn write_directory(writer: &mut File, inode: u32) -> eyre::Result<()> {
 
 fn write_agent(
     writer: &mut File,
-    source: &QualifiedAsset,
+    source: &OwnedBootAsset,
     size: u32,
     inode: u32,
 ) -> eyre::Result<()> {
@@ -254,7 +233,7 @@ mod tests {
         std::fs::write(&base, b"base-bytes").expect("write base");
         std::fs::write(&agent, b"agent-bytes").expect("write agent");
 
-        write_composite(
+        let published = write_composite(
             crate::initramfs_overlay::CompositeBase::Path(&base),
             Some((
                 crate::initramfs_overlay::CompositeAgent::Path(&agent),
@@ -266,6 +245,10 @@ mod tests {
         .expect("compose initramfs");
 
         let bytes = std::fs::read(&output).expect("read output");
+        assert_eq!(
+            published.metadata().expect("published metadata").len(),
+            bytes.len() as u64
+        );
         assert_eq!(&bytes[..10], b"base-bytes");
         let overlay_offset = 12;
         assert_eq!(&bytes[10..overlay_offset], &[0, 0]);

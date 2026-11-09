@@ -111,6 +111,16 @@ child barriers before returning, so healthy completed children are durable.
 In-progress or barrier-failed live children can still be constructed even when
 running. This field is not a guest-filesystem cleanliness certificate.
 
+Ordinary starts publish launch files atomically, then synchronously flush the
+retained kernel copy (with its final read-only mode), composite initramfs,
+layered lower descriptor when present, configuration and generation lease in
+one file pass immediately before spawning the monitor. Each containing
+directory is then flushed once: the machine directory and the pool's stable
+lease directory. Raw and layered starts share this barrier. Start never
+acknowledges readiness ahead of it. Layered graph authentication uses that
+same typed generation lease, not a second consumer registration; its operation
+pins root the composition, layers, pack streams and fsmeta through startup.
+
 Readiness uses the same prerequisites after restore and live-capture resume:
 fresh guest `ready` status and, when SSH is configured, a successful listener
 key exchange checked against the machine's immutable host-key pin. Capture

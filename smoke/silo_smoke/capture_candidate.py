@@ -149,21 +149,6 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
         if candidate["live"][operation] != unqualified["live"][operation]:
             raise ValueError(f"candidate changed undelivered operation {operation}")
     monitor_hash = digest(binary)
-    boot = source / "runtime/libvm/src/boot_qualification.rs"
-    boot_text = boot.read_text()
-    admitted = re.search(r"const ADMITTED_BOOTS:.*?\];", boot_text, re.DOTALL)
-    if admitted is None:
-        raise ValueError("missing existing compiled overlay boot tuple")
-    native = re.findall(r"native_sha256:\s*\[.*?\]", admitted.group(), re.DOTALL)
-    if not native or any(
-        "".join(re.findall(r"0x([0-9a-fA-F]{2})", value)).lower() != production_hash
-        for value in native
-    ):
-        raise ValueError("existing boot tuples must bind the staged production monitor")
-    replacement = "native_sha256: [" + ", ".join("0x" + monitor_hash[index:index + 2]
-                                                   for index in range(0, 64, 2)) + "]"
-    rebound = re.sub(r"native_sha256:\s*\[.*?\]", replacement, admitted.group(), flags=re.DOTALL)
-    proof["mutations"].append(replace_once(boot, admitted.group(), rebound))
     compile_candidate("candidate-consumers-build", ["-p", "cli", "--bin", "silo",
                                                      "-p", "libvm", "--examples"])
     if restore:

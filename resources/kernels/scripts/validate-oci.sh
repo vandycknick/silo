@@ -78,7 +78,7 @@ printf '%s\n' "$manifest" | jq -e \
             overlayProfile: "silo-overlay-v1",
             renderingAbi: "linux-overlayfs-mountinfo-v1",
             attachmentFamily: "krun-virtio-blk-v1",
-            qualification: "requires-exact-boot-evidence"
+            qualification: "kernel-config-build-gate"
         } and
         ($config.source.digest | test("^sha256:[0-9a-f]{64}$")) and
         ($config.source.key | test("^sha256-[0-9a-f]{64}$")) and

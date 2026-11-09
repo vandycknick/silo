@@ -69,7 +69,7 @@ impl Machine {
                 ));
             }
             let storage = runtime.validate_machine_storage_for_launch(&config).await?;
-            let qualification = runtime.qualify_machine_root(&config, &storage)?;
+            let qualification = runtime.open_machine_boot(&config, &storage)?;
             let _node_state = crate::node_state::acquire(&config).await?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmm_pid_path();
@@ -104,7 +104,7 @@ impl Machine {
                 .await?;
             runtime.request_machine_start(&config, &run_id).await?;
             let prepared_root = match runtime
-                .prepare_machine_root(&config, storage_lease.storage_record(), qualification)
+                .prepare_machine_root(&config, &storage_lease, qualification)
                 .await
             {
                 Ok(root) => root,
@@ -291,7 +291,10 @@ impl Machine {
                 )
                 .await);
             }
-            let startup = async { supervisor.spawn(&launch).await?.wait().await };
+            let startup = async {
+                launch_inputs.artifacts.sync(&storage_lease)?;
+                supervisor.spawn(&launch).await?.wait().await
+            };
             if let Err(err) = startup.await {
                 return Err(finish_failed_start(
                     runtime,

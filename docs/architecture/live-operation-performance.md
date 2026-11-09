@@ -157,14 +157,35 @@ Attribution from the evidence:
   ext4 journal to drain the unsynchronized capture staging (`data=ordered`).
   Disk sealing alone is 1.1–1.2 s on Btrfs (clone plus full upper hash).
   Report: `.tmp/plan/research/phase24-incremental-memory-cost.md`.
-- **Boot.** Guest time from `vm running` to agent responsive is the same for
-  both profiles (0.20–0.22 s). The whole layered penalty (0.15–0.31 s) is
-  host work before the monitor starts: four additional full hashes of the
-  monitor executable for overlay admission (about 110 MB), a duplicate
-  inspection, a second lower consumer lease, VMDK descriptor publication and
-  per-file syncs. Report: `.tmp/plan/research/phase24-layered-prelaunch-cost.md`.
+- **Boot.** The recorded 0.15–0.31 s host-side layered penalty predates removal of per-boot asset hashing and duplicate CLI inspection; remaining pre-launch work includes a second lower consumer lease, VMDK descriptor publication and per-file syncs, and requires remeasurement (`.tmp/plan/research/phase24-layered-prelaunch-cost.md`).
 - **Ingest.** Prepare runs at roughly 100 MB/s expanded and gets slower per
   GiB as the layer grows; the baseline gunzip runs at about 750 MB/s. The
   prepared-lower create also scales with lower size (6.15 s for 4 GiB), so
   create reads the lower rather than only formatting the upper. Not yet
   attributed.
+
+## Batch 4: boot path
+
+Owner decision 2026-11-09: exact boot-tuple qualification (`ADMITTED_BOOTS`,
+per-start SHA-256 of kernel, initramfs and monitor) is removed. Overlay roots
+require Linux 6.6 or newer, read from the kernel header or ELF
+`linux_banner`; owned asset handling (held FDs, 0400 copies, pre-exec
+replacement recheck) stays. The duplicate start inspection is gone, the lower
+resolver reuses the launch lease instead of registering a second consumer,
+and launch artifacts are synchronized once at the spawn boundary (layered
+start: 13 explicit syncs → 7, raw 9 → 6).
+
+| Boot, dispatch → agent responsive (s) | ext4 raw | ext4 layered | ratio | Btrfs raw | Btrfs layered | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| before Batch 4, cold / warm | 0.741 / 0.678 | 0.897 / 0.979 | 1.21 / 1.44 | 0.637 / 0.609 | 0.794 / 0.803 | 1.25 / 1.32 |
+| 4a tuple removal | 0.568 / 0.509 | 0.678 / 0.721 | 1.19 / 1.42 | 0.518 / 0.443 | 0.585 / 0.537 | 1.13 / 1.21 |
+| 4b lease reuse + coalesced syncs | 0.541 / 0.479 | 0.612 / 0.663 | 1.13 / 1.38 | 0.522 / 0.441 | 0.593 / 0.536 | 1.14 / 1.22 |
+
+Cold passes on both lanes. The warm miss is not layered work: dispatch to
+monitor generation start is bimodal for both profiles (ext4 warm raw
+0.21–0.23 s or 0.41 s; layered 0.23–0.24 s or 0.38–0.40 s; Btrfs 0.17–0.18
+or 0.24–0.31 s). The slow mode is a shared ~170 ms host event that layered
+samples happened to hit three times out of five; layered-only cost is the
+30–65 ms visible in the cold medians. Next step: a start span in libvm to
+name the shared event (startup recovery checkpoint, capability subprocess or
+WAL checkpoint are the candidates), then remove it for every start.

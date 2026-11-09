@@ -115,7 +115,7 @@ def main() -> None:
             assert silo.exec(name, overlay.PROBE, 'read-file', device, str(position), user='root').stdout.strip() == '00' * 512
         silo.stop(name)
         assert data.stat().st_size == SIZE and data.read_bytes() == expected
-        # A different, explicitly unqualified monitor only observes real parsed
+        # A separately built observer monitor only observes real parsed
         # opcodes; the successful public production run above is not replaced.
         data.write_bytes(original)
         candidate = Candidate(silo, request['image'], fault='range-observer', data=data, range_request=f'{operation}:{offset}:{length}')
@@ -140,7 +140,7 @@ def main() -> None:
         assert covered == offset + length, requests
         assert data.stat().st_size == SIZE and data.read_bytes() == expected
         assert list(mountpoint.iterdir()) == [data] and data.stat().st_size <= SIZE
-        ws.record('overlay-range-complete', json.dumps({'backing': backing, 'operation': operation, 'offset': offset, 'length': length, 'logicalLength': SIZE, 'nativeOpcode': opcode, 'nativeFlags': expected_flags, 'observedNativeRequests': observed, 'nativeRequests': requests, 'nativeIdentity': candidate.identities, 'productionPath': 'unmodified staged CLI/libvm/monitor/worker; stop/reopen/capacity/guest read', 'observerPath': 'COPY-only actual parsed opcode/flags; never admitted or staged'}) + '\n')
+        ws.record('overlay-range-complete', json.dumps({'backing': backing, 'operation': operation, 'offset': offset, 'length': length, 'logicalLength': SIZE, 'nativeOpcode': opcode, 'nativeFlags': expected_flags, 'observedNativeRequests': observed, 'nativeRequests': requests, 'nativeIdentity': candidate.identities, 'productionPath': 'unmodified staged CLI/libvm/monitor/worker; stop/reopen/capacity/guest read', 'observerPath': 'COPY-only actual parsed opcode/flags; never installed into the shared stage'}) + '\n')
         failed = False
     finally:
         try:
