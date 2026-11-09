@@ -31,14 +31,17 @@ pub struct LiveForkOptions {
 }
 
 impl LiveForkOptions {
-    pub fn validate(&self) -> Result<(), LibVmError> {
+    fn capture_options(&self) -> crate::LiveSnapshotOptions {
         crate::LiveSnapshotOptions {
             name: None,
             resume_policy: self.resume_policy,
             policy: self.policy,
             dirty_crossover_percent: self.dirty_crossover_percent,
         }
-        .validate()?;
+    }
+
+    pub fn validate(&self) -> Result<(), LibVmError> {
+        self.capture_options().validate()?;
         let refused = |message: &str| LibVmError::LiveFork {
             operation_id: self.operation_id.to_string(),
             message: message.into(),
@@ -155,6 +158,8 @@ pub struct ForkChildResult {
     pub machine_id: MachineId,
     pub run_id: MachineRunId,
     pub outcome: ForkChildOutcome,
+    /// Absent until construction has produced a machine record.
+    pub durability: Option<crate::MachineDurability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,16 +395,7 @@ async fn create_fork(
         return runtime.inspect_fork(operation).await;
     }
     match source
-        .submit_capture(
-            &observation,
-            capture,
-            crate::LiveSnapshotOptions {
-                name: None,
-                resume_policy: options.resume_policy,
-                policy: options.policy,
-                dirty_crossover_percent: options.dirty_crossover_percent,
-            },
-        )
+        .submit_capture(&observation, capture, options.capture_options())
         .await
     {
         Ok(vm_spec::lifecycle::LiveCommandResult::Capture(
@@ -601,7 +597,9 @@ async fn create_fork(
             .fork_result(operation)
             .await?
             .ok_or_else(|| fork_error(operation, "fork result disappeared"))?;
-        if result.stage == ForkStage::Finished || tokio::time::Instant::now() >= deadline {
+        if launches.is_empty()
+            && (result.stage == ForkStage::Finished || tokio::time::Instant::now() >= deadline)
+        {
             return Ok(result);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1284,6 +1282,19 @@ pub(crate) async fn reconcile_forks(runtime: &Runtime) -> Result<(), LibVmError>
 #[cfg(test)]
 mod tests {
     use crate::machine::live_fork::{project_destination, ForkDestination};
+
+    #[test]
+    fn fork_capture_request_has_no_checkpoint_alias() {
+        let options = crate::store::fork::tests::options(&["child"]);
+        let capture = options.capture_options();
+        assert_eq!(capture.name, None);
+        assert_eq!(capture.resume_policy, options.resume_policy);
+        assert_eq!(capture.policy, options.policy);
+        assert_eq!(
+            capture.dirty_crossover_percent,
+            options.dirty_crossover_percent
+        );
+    }
 
     #[test]
     fn fork_options_validate_default_limit_duplicates_and_explicit_larger_batches() {

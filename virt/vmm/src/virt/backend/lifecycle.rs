@@ -2098,6 +2098,7 @@ mod tests {
             ram,
             layout,
             writers_closed,
+            chunk_digests,
             ..
         } = machine
             .stage(
@@ -2115,6 +2116,17 @@ mod tests {
         assert_eq!(ram_binding, binding);
         assert_eq!((ram.identity(), ram.length), (outputs.ram, 64 * 1024));
         assert_eq!(layout.identity(), outputs.layout);
+        let ram_bytes = std::fs::read(staging.directory.join("memory.ram")).expect("RAM");
+        let expected: Vec<_> = ram_bytes
+            .chunks(vm_spec::capture::STREAM_CHUNK_BYTES as usize)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .any(|byte| *byte != 0)
+                    .then(|| vm_spec::capture::Sha256Digest::of_bytes(chunk))
+            })
+            .collect();
+        assert_eq!(chunk_digests, expected);
         let layout_bytes =
             std::fs::read(staging.directory.join("memory-layout.json")).expect("layout");
         assert_eq!(layout_bytes.len() as u64, layout.length);
@@ -2144,7 +2156,7 @@ mod tests {
         assert_eq!(observed.pause.cut, Some(cut));
         assert_eq!(observed.pause.current, Some(cut));
 
-        // After the (monitor's) durable seal: accept the exact read-only pair.
+        // After the monitor records the capture: accept the exact read-only pair.
         let accepted = machine
             .rights(operation, accept(&staging, operation), staging.sealed())
             .await

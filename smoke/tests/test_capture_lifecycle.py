@@ -218,7 +218,8 @@ def run_request(silo: Silo, command: dict) -> subprocess.CompletedProcess[str]:
 
 
 @contextmanager
-def captured(silo: Silo, image: str, boundary: str, policy: str) -> Iterator[Run]:
+def captured(silo: Silo, image: str, boundary: str, policy: str,
+             *, observe_syncs: bool = False) -> Iterator[Run]:
     """Boot a traced source, start the real CLI capture and hold `boundary`."""
     silo.create(NAME, image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib",
                 "--vsock", "--network", "none")
@@ -235,6 +236,7 @@ def captured(silo: Silo, image: str, boundary: str, policy: str) -> Iterator[Run
         "target": str(target), "boundary": boundary,
         "machines": str(silo.ws.silo_home / "machines"),
         "evidence": str(evidence), "release": str(evidence / "boundary-release"),
+        "observeCaptureSyncs": observe_syncs,
     }) + "\n")
     owned: list[shutdown.Process] = []
     counter = None
@@ -266,7 +268,7 @@ def captured(silo: Silo, image: str, boundary: str, policy: str) -> Iterator[Run
             owned.append(manager)
             held = trace.wait("boundary-held.json")
             assert held["injectedReturn"] is False, held
-            assert held["pid"] in {process.pid for process in processes.values()}, held
+            assert held["pid"] in {process.pid for process in [*processes.values(), manager]}, held
             if "captureDirectory" in held:
                 directory = Path(held["captureDirectory"])
             else:
@@ -302,11 +304,11 @@ def test_capture_manager_death_leaves_the_recorded_policy_to_the_monitor(
     """Gap 3: the capture manager dies before the seal while monitor and
     worker survive. Without any manager the monitor seals and continues
     exactly under the recorded policy; a later manager only reconciles."""
-    with captured(silo, lifecycle_image, "capture-execution-sync", policy) as run:
+    with captured(silo, lifecycle_image, "capture-execution-write", policy) as run:
         run.manager.send(signal.SIGKILL)
         run.manager.wait()
         assert run.trace.wait("capture-manager-result.json")["code"] == -signal.SIGKILL
-        # From here until the monitor's durable continuation record no libvm
+        # From here until the monitor's completed continuation record no libvm
         # manager process exists: no CLI or live request is issued.
         run.trace.release()
         run.wait_logged("monitor did not finish the recorded continuation without its manager",
@@ -364,16 +366,16 @@ def test_capture_manager_death_leaves_the_recorded_policy_to_the_monitor(
         run.finish()
 
 
-@pytest.mark.parametrize("boundary", ["capture-execution-sync", "capture-seal-sync"])
+@pytest.mark.parametrize("boundary", ["capture-execution-write", "capture-record-settle"])
 def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
     silo: Silo, lifecycle_image: str, boundary: str,
 ) -> None:
     """Gap 3: an actual `silo stop` admitted while resume-if-acquired capture
-    is held before the seal (worker execution-state fsync) or after the seal
-    link (monitor seal directory fsync). Stop never resumes or thaws; an
+    is held before the record (worker execution-state write) or after its
+    link (monitor temporary-link removal). Stop never resumes or thaws; an
     unsealed capture never becomes coherent, a linked seal still publishes
     and its continuation is unknown."""
-    sealed = boundary == "capture-seal-sync"
+    sealed = boundary == "capture-record-settle"
     with captured(silo, lifecycle_image, boundary, "resume") as run:
         seal_bytes = None
         if sealed:
@@ -431,10 +433,10 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
     silo: Silo, lifecycle_image: str,
 ) -> None:
     """Gap 3, resume-if-acquired: a real CancelOperation is admitted while the
-    seal is linked but not yet durable, so the capture's cancel token is set
+    record is linked but not yet settled, so the capture's cancel token is set
     before ClockOnly release, handshake and Thaw. Cancel loses; the started
     continuation finishes normally and no sealed byte changes."""
-    with captured(silo, lifecycle_image, "capture-seal-sync", "resume") as run:
+    with captured(silo, lifecycle_image, "capture-record-settle", "resume") as run:
         seal_bytes = (run.directory / "vm.capture.json").read_bytes()
         seal = json.loads(seal_bytes)
         run.coherent(seal)
@@ -454,7 +456,7 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
             run.wait_logged("monitor did not admit the cancel while sealing",
                             "live cancellation admitted", cancel_id, run.plan["captureId"],
                             alive=canceller)
-            assert canceller.poll() is None, "joined cancel answered before the seal was durable"
+            assert canceller.poll() is None, "joined cancel answered before record settlement"
             run.trace.release()
             output, errors = canceller.communicate(timeout=90)
         finally:
@@ -500,10 +502,10 @@ def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unkn
     silo: Silo, lifecycle_image: str,
 ) -> None:
     """Gap 4: the monitor is held writing `vm.capture-source.json` after a
-    durable seal and a completed native preserve. While the exact run lives,
+    coherent record and a completed native preserve. While the exact run lives,
     managers publish and stay Pending without inventing an outcome or
     resuming; once that run ends without the record, the outcome is unknown."""
-    with captured(silo, lifecycle_image, "capture-source-sync", "preserve") as run:
+    with captured(silo, lifecycle_image, "capture-source-write", "preserve") as run:
         assert Path(run.held["target"]).name == ".vm.capture-source.json.tmp", run.held
         seal_bytes = (run.directory / "vm.capture.json").read_bytes()
         seal = json.loads(seal_bytes)
@@ -512,7 +514,7 @@ def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unkn
         assert not final.exists()
         run.counter.stationary()
         rows = shutdown.until(run.provenance, timeout=120,
-                              description="manager did not publish the durable seal while continuation was pending")
+                              description="manager did not publish the coherent cut while continuation was pending")
         assert len(rows) == 1 and json.loads(rows[0][1]) == seal
         record = run.capture_record()
         assert record["state"] == {"state": "published", "snapshot": rows[0][0]}, record
@@ -545,6 +547,57 @@ def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unkn
         assert run.resume_requests() == 0, "a manager resumed a source with an unknown outcome"
         run.ended_silently()
         run.finish()
+
+
+def test_checkpoint_publication_syncs_real_pool_fds_before_catalog_acknowledgment(
+    silo: Silo, lifecycle_image: str,
+) -> None:
+    """Observe successful kernel barriers on the published inodes, not a mock."""
+    with captured(silo, lifecycle_image, "capture-pool-directory-sync", "preserve",
+                  observe_syncs=True) as run:
+        seal_bytes = (run.directory / "vm.capture.json").read_bytes()
+        seal = json.loads(seal_bytes)
+        run.coherent(seal)
+        assert "cut" not in seal and "cut" not in run.plan
+        run.trace.release()
+        value = run.manager_snapshot()
+        run.published(seal, value)
+        run.finish()
+        observations = [json.loads(line) for line in
+                        (silo.ws.evidence / "capture-syncs.jsonl").read_text().splitlines()]
+        successful = [entry for entry in observations if entry["returned"] == 0]
+        assert not [entry for entry in observations
+                    if str(run.directory) in entry["path"]], observations
+        pool = silo.ws.silo_home / "images"
+        expected = []
+        for entry in seal["inventory"]:
+            stream = entry["role"] == "memory.ram" or entry["role"].endswith(".raw")
+            identity = entry["identity"] if stream else entry["sha256"]
+            expected.append(pool / ("streams" if stream else "objects") / "sha256" / identity[7:])
+        expected.append(pool / "objects/sha256" / digest(seal_bytes)[7:])
+        rows = procs.query(silo.ws.state_db(),
+                           "SELECT record_digest FROM storage_snapshot WHERE id='"
+                           + value["snapshot"]["id"] + "'")
+        assert len(rows) == 1
+        expected.append(pool / "objects/sha256" / rows[0][0][7:])
+        for path in expected:
+            metadata = path.stat()
+            barriers = [entry for entry in successful
+                        if (entry["device"], entry["inode"]) == (metadata.st_dev, metadata.st_ino)]
+            assert barriers, f"published pool inode was never synced: {path}"
+            parent = path.parent.stat()
+            assert any(entry["directory"]
+                       and (entry["device"], entry["inode"]) == (parent.st_dev, parent.st_ino)
+                       and entry["startedNs"] >= barriers[-1]["finishedNs"]
+                       for entry in successful), f"publication directory not synced after payload: {path}"
+        assert any(entry["directory"] and Path(entry["path"]).parent == pool / "tmp"
+                   for entry in successful), "relocation staging directory was not synced"
+        assert any(Path(entry["path"]) in (silo.ws.silo_home / "state.db",
+                                          silo.ws.silo_home / "state.db-wal")
+                   and entry["startedNs"] > max(item["finishedNs"] for item in successful
+                                               if item["directory"] and Path(item["path"]) in
+                                               (pool / "objects/sha256", pool / "streams/sha256"))
+                   for entry in successful), "catalog durability did not follow pool publication"
 
 
 def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(

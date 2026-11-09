@@ -5,6 +5,7 @@
 //! capture, launch, pause or reservation authority.
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::sync::Arc;
 
 use oci::vm_artifact::wire::{canonical_bytes, decode_record, strict_value, RecordRef};
 use serde::{Deserialize, Serialize};
@@ -155,8 +156,8 @@ fn writable_streams(
 }
 
 /// Reconstruct the portable wrapper for a local seal from the checkpoint's own
-/// configuration: local inventory is execution, devices, RAM, layout, then
-/// every writable attachment in order. Disks are paired by position, never by
+/// configuration: fixed state roles followed by every writable attachment and
+/// its chunk map in order. Disks are paired by position, never by
 /// byte equality, which is ambiguous for identical disks.
 pub(crate) fn build_local(
     record: &SnapshotRecord,
@@ -172,7 +173,7 @@ pub(crate) fn build_local(
         .inventory
         .get(FIXED_ROLES.len()..)
         .ok_or_else(|| failure("capture inventory lacks its fixed state roles"))?;
-    if disks.len() != sealed.len() {
+    if disks.len() != sealed.len() * 2 {
         return Err(failure(
             "capture inventory disk count differs from writable attachments",
         ));
@@ -184,10 +185,10 @@ pub(crate) fn build_local(
         evidence: RecordRef::of_bytes(evidence_bytes),
         plan: plan.clone(),
         disks: disks
-            .iter()
+            .chunks_exact(2)
             .zip(&sealed)
-            .map(|(entry, (index, _, _))| PortableCaptureDisk {
-                role: entry.role.clone(),
+            .map(|(entries, (index, _, _))| PortableCaptureDisk {
+                role: entries[0].role.clone(),
                 attachment_index: *index,
             })
             .collect(),
@@ -307,19 +308,26 @@ pub(crate) fn verify_portable_binding(
     }
     let sealed = writable_streams(record, &configuration)?;
     let disk_entries = &inventory[FIXED_ROLES.len()..];
-    if disk_entries.len() != sealed.len() || wrapper.disks.len() != sealed.len() {
+    if disk_entries.len() != sealed.len() * 2 || wrapper.disks.len() != sealed.len() {
         return Err(failure(
             "sealed disk inventory omits or adds a writable attachment",
         ));
     }
     let mut disks = Vec::with_capacity(sealed.len());
-    for ((entry, declared), (index, stream, length)) in
-        disk_entries.iter().zip(&wrapper.disks).zip(&sealed)
+    for ((entries, declared), (index, stream, length)) in disk_entries
+        .chunks_exact(2)
+        .zip(&wrapper.disks)
+        .zip(&sealed)
     {
-        if !matches!(entry.role, CaptureRole::Disk(_))
+        let entry = &entries[0];
+        let CaptureRole::Disk(name) = &entry.role else {
+            return Err(failure("sealed disk inventory has a non-disk role"));
+        };
+        if entries[1].role != CaptureRole::DiskMap(name.clone())
             || declared.role != entry.role
             || declared.attachment_index != *index
             || entry.length != *length
+            || entry.identity != Some(Sha256Digest::from_bytes(*stream.as_bytes()))
         {
             return Err(failure(
                 "sealed disk role, attachment order or length differs from the checkpoint",
@@ -336,11 +344,10 @@ pub(crate) fn verify_portable_binding(
     })
 }
 
-/// Whole-byte measurements of the received closure. Stream hashes are
-/// measured during decode/materialization, never copied from inventory.
+/// Authenticated decoded chunk maps measured during ingest, never copied from
+/// the capture inventory. Whole-byte transport digests are checked separately.
 pub(crate) struct MeasuredCapture<'a> {
-    pub(crate) stream_sha256: &'a BTreeMap<StreamId, Sha256Digest>,
-    pub(crate) ram_map: &'a crate::storage::stream::StreamMap,
+    pub(crate) stream_maps: &'a BTreeMap<StreamId, Arc<crate::storage::stream::StreamMap>>,
     pub(crate) layout: &'a [u8],
     pub(crate) execution: &'a File,
     pub(crate) devices: &'a File,
@@ -360,19 +367,35 @@ pub(crate) fn verify_portable_capture(
         .as_ref()
         .ok_or_else(|| failure("coherent seal lacks RAM evidence"))?;
     let inventory = &binding.evidence.inventory;
-    let stream_sha = |stream: &StreamId| {
+    let stream_map = |stream: &StreamId| {
         measured
-            .stream_sha256
+            .stream_maps
             .get(stream)
-            .copied()
             .ok_or_else(|| failure(format!("stream {stream} was not measured")))
     };
     for (entry, stream) in &binding.disks {
-        if stream_sha(stream)? != entry.sha256 {
+        let map = stream_map(stream)?;
+        if map.id() != *stream
+            || map.length() != entry.length
+            || entry.identity != Some(Sha256Digest::from_bytes(*map.id().as_bytes()))
+        {
             return Err(failure(format!(
-                "writable disk {} whole-byte SHA-256 differs from its seal",
+                "writable disk {} stream identity differs from its seal",
                 entry.role.relative_path()
             )));
+        }
+        let CaptureRole::Disk(name) = &entry.role else {
+            return Err(failure("sealed disk binding has a non-disk role"));
+        };
+        let map_bytes = map.canonical_bytes()?;
+        let map_entry = inventory
+            .iter()
+            .find(|entry| entry.role == CaptureRole::DiskMap(name.clone()))
+            .ok_or_else(|| failure("sealed disk lacks its chunk map"))?;
+        if map_entry.length != map_bytes.len() as u64
+            || map_entry.sha256 != Some(Sha256Digest::of_bytes(&map_bytes))
+        {
+            return Err(failure("complete disk map differs from its seal"));
         }
     }
     let state = |role: CaptureRole| {
@@ -382,17 +405,20 @@ pub(crate) fn verify_portable_capture(
             .ok_or_else(|| failure("capture inventory lacks a fixed role"))
     };
     let ram = state(CaptureRole::Ram)?;
-    if stream_sha(&execution.memory.stream)? != ram.sha256 || ram.length != execution.memory.length
+    let ram_map = stream_map(&execution.memory.stream)?;
+    if ram_map.id() != execution.memory.stream
+        || ram.identity != Some(Sha256Digest::from_bytes(*ram_map.id().as_bytes()))
+        || ram.length != execution.memory.length
     {
         return Err(failure(
-            "RAM whole-byte SHA-256 or length differs from its seal",
+            "RAM stream identity or length differs from its seal",
         ));
     }
     let map = state(CaptureRole::RamMap)?;
-    let map_bytes = measured.ram_map.canonical_bytes()?;
-    if measured.ram_map.id() != execution.memory.stream
+    let map_bytes = ram_map.canonical_bytes()?;
+    if ram_map.id() != execution.memory.stream
         || map.length != map_bytes.len() as u64
-        || map.sha256 != Sha256Digest::of_bytes(&map_bytes)
+        || map.sha256 != Some(Sha256Digest::of_bytes(&map_bytes))
     {
         return Err(failure("complete RAM map differs from its seal"));
     }
@@ -417,7 +443,7 @@ pub(crate) fn verify_portable_capture(
         ),
     ] {
         let entry = state(role)?;
-        if entry.sha256.as_bytes() != object.as_bytes()
+        if entry.sha256 != Some(Sha256Digest::from_bytes(*object.as_bytes()))
             || entry.length != length
             || length > maximum
         {
@@ -453,6 +479,7 @@ fn same(left: &Sha256Digest, right: &ObjectDigest) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use vm_spec::capture::{CaptureEvidence, Sha256Digest};
 
@@ -462,6 +489,7 @@ mod tests {
     };
     use crate::storage::identity::{SnapshotId, StreamId};
     use crate::storage::pool::StoragePool;
+    use crate::storage::stream::{Chunk, StreamMap};
     use crate::store::models::snapshot::{SnapshotCaptureKind, SnapshotRecord};
     use crate::store::snapshot_store::SnapshotRef;
 
@@ -690,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_measurements_bind_disks_ram_layout_and_native_headers() {
+    async fn stream_measurements_bind_disks_ram_layout_and_native_headers() {
         let published = published().await;
         let record = &published.record;
         let (binding, _) =
@@ -698,10 +726,10 @@ mod tests {
         let SnapshotCaptureKind::LiveExecution { execution } = &record.capture else {
             panic!("live checkpoint expected");
         };
-        let mut sha = BTreeMap::new();
+        let mut maps = BTreeMap::new();
         for stream in record.streams() {
-            let bytes = std::fs::read(published.pool.stream_path(&stream.stream)).unwrap();
-            sha.insert(stream.stream, Sha256Digest::of_bytes(&bytes));
+            let map = published.pool.verify_stream(&stream.stream).unwrap();
+            maps.insert(stream.stream, Arc::new(map));
         }
         let layout = published
             .pool
@@ -709,11 +737,7 @@ mod tests {
             .unwrap();
         let execution_file = published.pool.verify_object(&execution.execution).unwrap();
         let devices_file = published.pool.verify_object(&execution.devices).unwrap();
-        let ram_map = published
-            .pool
-            .verify_stream(&execution.memory.stream)
-            .unwrap();
-        let measured = |sha: &BTreeMap<StreamId, Sha256Digest>,
+        let measured = |maps: &BTreeMap<StreamId, Arc<StreamMap>>,
                         layout: &[u8],
                         swap: bool|
          -> Result<(), crate::LibVmError> {
@@ -726,38 +750,49 @@ mod tests {
                 record,
                 &binding,
                 &MeasuredCapture {
-                    stream_sha256: sha,
-                    ram_map: &ram_map,
+                    stream_maps: maps,
                     layout,
                     execution: first,
                     devices: second,
                 },
             )
         };
-        measured(&sha, layout.as_slice(), false).unwrap();
+        measured(&maps, layout.as_slice(), false).unwrap();
         assert!(
-            measured(&sha, layout.as_slice(), true).is_err(),
+            measured(&maps, layout.as_slice(), true).is_err(),
             "swapped state objects"
         );
-        let mut ram = sha.clone();
+        let wrong_map = |length: u64, bytes: &[u8]| {
+            Arc::new(
+                StreamMap::new(
+                    length,
+                    vec![
+                        Chunk::Data(crate::storage::identity::ObjectDigest::of_bytes(bytes));
+                        length.div_ceil(crate::storage::limits::CHUNK_SIZE as u64) as usize
+                    ],
+                )
+                .unwrap(),
+            )
+        };
+        let mut ram = maps.clone();
         ram.insert(
             execution.memory.stream,
-            Sha256Digest::of_bytes(b"valid id, wrong bytes"),
+            wrong_map(execution.memory.length, b"valid id, wrong bytes"),
         );
         assert!(
             measured(&ram, layout.as_slice(), false).is_err(),
-            "RAM whole-byte SHA"
+            "RAM stream identity"
         );
-        let mut disk = sha.clone();
+        let mut disk = maps.clone();
         disk.insert(
             record.root.stream.stream,
-            Sha256Digest::of_bytes(b"other disk"),
+            wrong_map(record.root.stream.length, b"other disk"),
         );
         assert!(
             measured(&disk, layout.as_slice(), false).is_err(),
-            "writable disk SHA"
+            "writable disk stream identity"
         );
-        let mut missing = sha.clone();
+        let mut missing = maps.clone();
         missing.remove(&record.root.stream.stream);
         assert!(
             measured(&missing, layout.as_slice(), false).is_err(),
@@ -766,7 +801,7 @@ mod tests {
         let mut tampered = layout.clone();
         tampered.push(b' ');
         assert!(
-            measured(&sha, tampered.as_slice(), false).is_err(),
+            measured(&maps, tampered.as_slice(), false).is_err(),
             "layout bytes"
         );
     }

@@ -345,7 +345,7 @@ impl StoragePool {
     /// Authenticate a stream through its pinned pool directory and return the
     /// exact hashed descriptor. A caller that later relies on it must bind its
     /// fingerprint to a state observed before this hash began.
-    pub(crate) fn authenticate_stream(
+    pub(crate) fn authenticate_stream_full(
         &self,
         id: &StreamId,
     ) -> Result<AuthenticatedStream, StorageError> {
@@ -357,22 +357,6 @@ impl StoragePool {
             return Err(StorageError::ContentMismatch(self.stream_path(id)));
         }
         Ok(authenticated)
-    }
-
-    /// Measure whole-byte SHA only where live RAM needs both identities.
-    /// Both results authenticate the same held inode in the same scan.
-    pub(crate) fn authenticate_stream_with_sha256(
-        &self,
-        id: &StreamId,
-    ) -> Result<(AuthenticatedStream, vm_spec::capture::Sha256Digest), StorageError> {
-        let file = self.open_stream(id)?;
-        let length = file.metadata()?.len();
-        Resource::ArtifactStreamBytes.check(length)?;
-        let (authenticated, sha256) = StreamHasher::new().authenticate_with_sha256(file, length)?;
-        if authenticated.map().id() != *id {
-            return Err(StorageError::ContentMismatch(self.stream_path(id)));
-        }
-        Ok((authenticated, sha256))
     }
 
     /// Open a sealed stream through its retained parent. The caller must
@@ -587,6 +571,22 @@ impl StoragePool {
         .ok_or_else(|| StorageError::InvalidPath("fresh operation lease is busy".into()))
     }
 
+    /// A live child's stable lease is covered by its background barrier.
+    pub(crate) fn lease_deferred(&self, operation: Uuid) -> Result<StorageLock, StorageError> {
+        locks::acquire_new_deferred(
+            &self.leases,
+            &format!("{operation}.lease"),
+            FlockArg::LockSharedNonblock,
+        )?
+        .ok_or_else(|| StorageError::InvalidPath("fresh operation lease is busy".into()))
+    }
+
+    pub(crate) fn lease_directory(&self) -> Result<OwnedDirectory, StorageError> {
+        self.leases
+            .try_clone()
+            .map_err(|error| StorageError::InvalidPath(error.to_string()))
+    }
+
     /// Rejoin a registered operation without creating or replacing its lease.
     pub(crate) fn existing_lease(&self, operation: Uuid) -> Result<StorageLock, StorageError> {
         locks::acquire_existing(
@@ -653,16 +653,46 @@ impl StoragePool {
         id: Uuid,
         lease: StorageLock,
     ) -> Result<OperationPaths, StorageError> {
+        self.create_operation_with_lease_sync(id, lease, true)
+    }
+
+    pub(crate) fn create_operation_with_lease_deferred(
+        &self,
+        id: Uuid,
+        lease: StorageLock,
+    ) -> Result<OperationPaths, StorageError> {
+        self.create_operation_with_lease_sync(id, lease, false)
+    }
+
+    fn create_operation_with_lease_sync(
+        &self,
+        id: Uuid,
+        lease: StorageLock,
+        sync: bool,
+    ) -> Result<OperationPaths, StorageError> {
         let home =
             self.root.path().parent().ok_or_else(|| {
                 StorageError::InvalidPath("images directory has no parent".into())
             })?;
-        let home = owned(OwnedDirectory::open_root(home))?;
-        let operations = owned(home.ensure_dir("operations"))?;
+        let home = owned(OwnedDirectory::open_existing_root(home))?
+            .ok_or_else(|| StorageError::InvalidPath("operation home disappeared".into()))?;
+        let operations = owned(if sync {
+            home.ensure_dir("operations")
+        } else {
+            home.ensure_dir_deferred("operations")
+        })?;
         let name = id.to_string();
-        let durable = owned(operations.create_dir(&name))?
-            .ok_or_else(|| StorageError::InvalidPath("operation ID collision".into()))?;
-        let temporary = match owned(self.temporary.create_dir(&name)) {
+        let durable = owned(if sync {
+            operations.create_dir(&name)
+        } else {
+            operations.create_dir_deferred(&name)
+        })?
+        .ok_or_else(|| StorageError::InvalidPath("operation ID collision".into()))?;
+        let temporary = match owned(if sync {
+            self.temporary.create_dir(&name)
+        } else {
+            self.temporary.create_dir_deferred(&name)
+        }) {
             Ok(Some(directory)) => directory,
             result => {
                 owned(operations.remove_tree(&name))?;
@@ -751,30 +781,20 @@ impl StoragePool {
         ))
     }
 
-    /// Publish complete RAM using the monitor's authenticated canonical map.
-    /// Whole-file authentication is independent of reused chunk identities.
+    /// Publish complete RAM, authenticating its canonical chunk map rather than
+    /// a whole-file digest. Transported blobs acquire byte digests at export.
     pub(crate) fn publish_sealed_ram_for_catalog(
         &self,
         input: &File,
         map: &StreamMap,
-        expected_sha256: vm_spec::capture::Sha256Digest,
     ) -> Result<(StreamId, StorageLock), StorageError> {
-        use std::os::unix::fs::FileExt;
         let before = SourceFingerprint::new(&input.metadata()?);
         if input.metadata()?.len() != map.length() {
             return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
         }
         let (staging, file) = self.stage()?;
-        let mut buffer = vec![0u8; crate::storage::limits::CHUNK_SIZE];
-        let mut offset = 0;
-        while offset < map.length() {
-            let length = (map.length() - offset).min(buffer.len() as u64) as usize;
-            input.read_exact_at(&mut buffer[..length], offset)?;
-            crate::storage::stream::write_sparse_at(&file, &buffer[..length], offset)?;
-            offset += length as u64;
-        }
-        file.set_len(map.length())?;
-        if crate::storage::stream::whole_file_sha256(&file)? != expected_sha256
+        let mut hasher = StreamHasher::new();
+        if hasher.copy_file_and_hash(input, map.length(), &file)?.map != *map
             || SourceFingerprint::new(&input.metadata()?) != before
         {
             return Err(StorageError::ContentMismatch(self.stream_path(&map.id())));
@@ -790,7 +810,7 @@ impl StoragePool {
         let verified = if let Some(existing) = existing(&self.streams, &name)? {
             let fingerprint = SourceFingerprint::new(&existing.metadata()?);
             if existing.metadata()?.len() != map.length()
-                || crate::storage::stream::whole_file_sha256(&existing)? != expected_sha256
+                || hasher.hash_open_file(&existing, map.length())?.map != *map
                 || SourceFingerprint::new(&existing.metadata()?) != fingerprint
             {
                 return Err(StorageError::ContentMismatch(self.stream_path(&id)));
@@ -1599,7 +1619,6 @@ mod tests {
     #[test]
     fn sealed_ram_map_preserves_explicit_zero_and_short_final_chunk() {
         use crate::storage::stream::{Chunk, StreamMap};
-        use vm_spec::capture::Sha256Digest;
         let dir = tempfile::tempdir().unwrap();
         let pool = StoragePool::open(&dir.path().join("images")).unwrap();
         let chunk_size = crate::storage::limits::CHUNK_SIZE;
@@ -1621,26 +1640,25 @@ mod tests {
         )
         .unwrap();
         let (published, roots) = pool
-            .publish_sealed_ram_for_catalog(
-                &std::fs::File::open(&candidate).unwrap(),
-                &map,
-                Sha256Digest::of_bytes(&old),
-            )
+            .publish_sealed_ram_for_catalog(&std::fs::File::open(&candidate).unwrap(), &map)
             .unwrap();
         drop(roots);
         std::fs::remove_file(&baseline.path).unwrap();
         assert_eq!(pool.verify_stream(&published).unwrap(), map);
         assert_eq!(std::fs::read(pool.stream_path(&published)).unwrap(), old);
         assert_eq!(map.chunks()[1], Chunk::Zero);
+        let forged = StreamMap::new(map.length(), vec![Chunk::Zero; map.chunks().len()]).unwrap();
+        assert!(pool
+            .publish_sealed_ram_for_catalog(
+                &std::fs::File::open(&candidate).unwrap(),
+                &forged,
+            )
+            .is_err(), "the chunk-list identity must authenticate the RAM bytes");
         let mut corrupt = old;
         corrupt[0] ^= 1;
         std::fs::write(&candidate, &corrupt).unwrap();
         assert!(pool
-            .publish_sealed_ram_for_catalog(
-                &std::fs::File::open(&candidate).unwrap(),
-                &map,
-                Sha256Digest::of_bytes(b"wrong bytes"),
-            )
+            .publish_sealed_ram_for_catalog(&std::fs::File::open(&candidate).unwrap(), &map,)
             .is_err());
     }
 

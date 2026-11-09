@@ -24,20 +24,15 @@ use crate::store::restore::RestoreIntent;
 use crate::supervisor::launch::{install_child_inheritance, RestoreLaunch};
 use crate::{
     DiskStorage, ExternalResourcePolicy, LibVmError, Machine, MachineRoot, MachineStorageRecord,
-    RestoreOptions, Runtime, RuntimeConfig, SnapshotRef, SnapshotStore,
+    RestoreOptions, Runtime, SnapshotRef, SnapshotStore,
 };
 
 pub(crate) async fn preflight_execution(
-    config: &RuntimeConfig,
+    query: &crate::LiveCapabilityQuery,
     record: &SnapshotRecord,
     policy: &ExternalResourcePolicy,
 ) -> Result<(), LibVmError> {
-    crate::require_host_live_operation(
-        &crate::LiveCapabilityQuery::open(config)?
-            .host_report()
-            .await?,
-        LiveOperation::Restore,
-    )?;
+    crate::require_host_live_operation(&query.host_report().await?, LiveOperation::Restore)?;
     validate_profile(record, policy)?;
     Ok(())
 }
@@ -86,15 +81,20 @@ pub(crate) async fn restore_owned(
     }
     let store = runtime.native_store()?;
     let snapshots = SnapshotStore::from_store(Arc::new(store.clone()));
-    let mut consumer = snapshots.consume(&reference).await?;
-    let result = restore_consumer(
-        &runtime,
-        &snapshots,
-        &mut consumer,
-        options,
-        preview,
-        host_report,
-    )
+    let consumer = snapshots.consume_shape(&reference).await?;
+    let result = async {
+        let shape = snapshots.prepare_restore_shape(&consumer).await?;
+        restore_consumer(
+            &runtime,
+            &snapshots,
+            &consumer,
+            options,
+            preview,
+            host_report,
+            shape,
+        )
+        .await
+    }
     .await;
     drop(consumer);
     let pool = StoragePool::open(runtime.local_images_dir())?;
@@ -118,11 +118,13 @@ pub(crate) async fn restore_owned(
 async fn restore_consumer(
     runtime: &Runtime,
     snapshots: &SnapshotStore,
-    consumer: &mut crate::store::snapshot_store::SnapshotConsumer,
+    consumer: &crate::store::snapshot_store::SnapshotConsumer,
     options: RestoreOptions,
     preview: SnapshotRecord,
     host_report: LiveHostReport,
+    inspection_shape: crate::store::snapshot_store::RestoreInspectionShape,
 ) -> Result<Machine, LibVmError> {
+    let shape = inspection_shape.shape();
     if consumer.record != preview {
         return Err(invalid(
             "checkpoint alias changed between preflight and verification",
@@ -142,25 +144,19 @@ async fn restore_consumer(
     } else {
         0
     };
-    // The consumer still holds its authenticated closure descriptors until
-    // every input below is open; they are part of this process peak.
+    // Byte authentication retains closure descriptors through private copy.
     crate::storage::limits::preflight_fd_budget(
         3 * transfer_roles
             + 3 * consumer.record.disks.len() as u64
             + 32
-            + consumer.retained_descriptors(),
+            + shape.retained_descriptors(),
     )
     .map_err(crate::storage::StorageError::from)?;
-    // `consume` measured both RAM identities in one pass. Reopen its exact
-    // held inode with that measured SHA, never the evidence inventory SHA.
-    // Object digests already are whole-byte SHA-256 identities.
-    let (ram, ram_sha256) =
-        consumer.open_ram(&pool, &execution.memory.stream, execution.memory.length)?;
-    let ram_map_bytes = consumer
-        .authenticated_stream(&execution.memory.stream, execution.memory.length)?
-        .map()
+    let ram = shape.open_stream(&pool, &execution.memory.stream, execution.memory.length)?;
+    let ram_map_bytes = shape
+        .stream_map(&execution.memory.stream)?
         .canonical_bytes()?;
-    let map_stage = crate::machine::stopped::OperationStaging::new(
+    let map_stage = crate::machine::stopped::OperationStaging::new_deferred(
         &pool,
         consumer.operation_id,
         &consumer.lease,
@@ -175,20 +171,20 @@ async fn restore_consumer(
     drop(roots);
     let objects = [
         ram,
-        consumer.open_object(&pool, &execution.layout)?,
-        consumer.open_object(&pool, &execution.execution)?,
-        consumer.open_object(&pool, &execution.devices)?,
+        shape.open_object(&pool, &execution.layout)?,
+        shape.open_object(&pool, &execution.execution)?,
+        shape.open_object(&pool, &execution.devices)?,
         pool.open_object(&ram_map.digest)?,
     ];
     let digests = [
-        ram_sha256,
+        Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
         Sha256Digest::from_bytes(*execution.layout.as_bytes()),
         Sha256Digest::from_bytes(*execution.execution.as_bytes()),
         Sha256Digest::from_bytes(*execution.devices.as_bytes()),
         Sha256Digest::from_bytes(*ram_map.digest.as_bytes()),
     ];
     let mut descriptors = Vec::with_capacity(5);
-    for ((file, role), sha256) in objects.iter().zip(RestoreObjectRole::ALL).zip(digests) {
+    for ((file, role), identity) in objects.iter().zip(RestoreObjectRole::ALL).zip(digests) {
         let metadata = file.metadata()?;
         if metadata.mode() & 0o7777 != 0o400
             || metadata.nlink() != 1
@@ -204,10 +200,10 @@ async fn restore_consumer(
             file_device: metadata.dev(),
             file_inode: metadata.ino(),
             length: metadata.len(),
-            sha256,
+            identity,
         });
     }
-    let lower_inputs = prepare_lower(&pool, consumer, map_stage)?;
+    let lower_inputs = prepare_lower(&pool, consumer, map_stage, shape)?;
     let request = RestoreRequest {
         version: vm_spec::restore::RESTORE_REQUEST_VERSION,
         checkpoint: Sha256Digest::from_bytes(*consumer.info.id.as_bytes()),
@@ -241,10 +237,15 @@ async fn restore_consumer(
         consumer.record.configuration.network,
         crate::store::models::MachineNetworkConfig::None
     );
-    let inspected_executable = crate::storage::identity::ObjectDigest::from_sha256(
-        *crate::storage::stream::whole_file_sha256(&executable)?.as_bytes(),
-    );
-    let inspection = inspect(&executable, &request, network).await?;
+    let inspected_executable = runtime
+        .live_capability_query()
+        .held_executable_digest(&executable)
+        .await?;
+    let images = runtime.local_images_dir().to_path_buf();
+    let shape = tokio::task::spawn_blocking(move || inspection_shape.complete(&images));
+    let (inspection, shape) = tokio::try_join!(inspect(&executable, &request, network), async {
+        shape.await?
+    },)?;
     if inspection.lane != host_report.lane {
         return Err(invalid(
             "native restore inspection lane differs from the selected host capability report",
@@ -280,19 +281,20 @@ async fn restore_consumer(
         .map_or(0, |lower| lower.native_records);
     let descriptor_peak = (3 * transfer_roles).max(native_records + transfer_roles)
         + 3 * request.configuration.attachments.len() as u64
-        + 32;
-    // Held closure descriptors are released below, before the ledger charge
-    // for `descriptor_peak`, but are still open while sources are opened.
-    crate::storage::limits::preflight_fd_budget(descriptor_peak + consumer.retained_descriptors())
+        + 32
+        + shape.retained_descriptors();
+    // Charge the closure authentication and construction descriptor sets
+    // together until their deterministic join.
+    crate::storage::limits::preflight_fd_budget(descriptor_peak)
         .map_err(crate::storage::StorageError::from)?;
-    // Each writable input reuses the closure's authenticated map on its own
-    // descriptor; private copying still scans and compares the output.
+    // Copy against structurally verified maps while full byte authentication
+    // runs concurrently. Both must succeed before publication.
     let mut sources = vec![PrivateSource::Authenticated {
         path: crate::PrivatePath::new(match &storage.root {
             MachineRoot::OpaqueRaw { .. } => "root.raw",
             _ => "upper.raw",
         })?,
-        stream: consumer.open_copy_source(
+        stream: shape.open_copy_source(
             &pool,
             &consumer.record.root.stream.stream,
             consumer.record.root.geometry.length,
@@ -302,7 +304,7 @@ async fn restore_consumer(
         if disk.writable {
             sources.push(PrivateSource::Authenticated {
                 path: crate::PrivatePath::new(format!("disk-{}.raw", disk.order))?,
-                stream: consumer.open_copy_source(
+                stream: shape.open_copy_source(
                     &pool,
                     &disk.content.stream,
                     disk.geometry.length,
@@ -310,9 +312,6 @@ async fn restore_consumer(
             });
         }
     }
-    // Every authenticated input now has its own descriptor; the lease keeps the
-    // closure pinned. Only `descriptor_peak` remains to be charged.
-    consumer.release_closure();
     let disk_peak = restore_disk_peak(runtime, &sources, &consumer.record)?;
     let memory = snapshots
         .reserve_restore_resources(
@@ -350,6 +349,8 @@ async fn restore_consumer(
             executable,
             executable_identity,
             lower_inputs,
+            shared_qualification: None,
+            authentication: Some(RestoreAuthentication::new(snapshots.clone(), shape)),
         },
         name,
         run,
@@ -368,6 +369,29 @@ struct PreparedRestore {
     executable: File,
     executable_identity: crate::storage::identity_file::SourceFingerprint,
     lower_inputs: Option<LowerInputs>,
+    authentication: Option<RestoreAuthentication>,
+    shared_qualification: Option<Arc<crate::machine::root_disk::SharedCopyQualification>>,
+}
+
+pub(crate) struct RestoreAuthentication {
+    snapshots: SnapshotStore,
+    shape: crate::store::snapshot_store::ShapeVerifiedClosure,
+}
+
+impl RestoreAuthentication {
+    pub(crate) fn new(
+        snapshots: SnapshotStore,
+        shape: crate::store::snapshot_store::ShapeVerifiedClosure,
+    ) -> Self {
+        Self { snapshots, shape }
+    }
+
+    pub(crate) async fn authenticate(self) -> Result<(), LibVmError> {
+        self.snapshots
+            .authenticate_closure_bytes(self.shape)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Both snapshot and local-cut restore use this exact construction, generation
@@ -389,6 +413,8 @@ async fn execute_prepared(
         executable,
         executable_identity,
         lower_inputs,
+        authentication,
+        shared_qualification,
     } = prepared;
     let store = runtime.native_store()?;
     let snapshots = SnapshotStore::from_store(Arc::new(store.clone()));
@@ -399,16 +425,24 @@ async fn execute_prepared(
             intent: intent.clone(),
         })
         .await?;
-    let config = crate::machine::builder::publish_restored_child(
+    let (config, mut durability) = crate::machine::builder::publish_restored_child(
         runtime,
-        name,
-        configuration,
-        storage,
-        sources,
-        intent.consumer_operation,
+        crate::machine::builder::ChildConstruction {
+            name,
+            configuration,
+            storage,
+            sources,
+            operation_id: intent.consumer_operation,
+            shared_qualification,
+        },
         run,
+        authentication,
     )
     .await?;
+    let pool = StoragePool::open(runtime.local_images_dir())?;
+    let consumer_lease = pool.existing_lease(intent.consumer_operation)?;
+    durability.files.push(consumer_lease.durability_file()?);
+    durability.launch_directories.push(pool.lease_directory()?);
     store
         .child_event(intent.consumer_operation, "prepared")
         .await?;
@@ -424,8 +458,9 @@ async fn execute_prepared(
             &destination,
             "lower.vmdk",
         )?;
-        destination.sync()?;
-        lower.directory.sync()?;
+        if let Some(descriptor) = lower.files.first() {
+            durability.files.push(descriptor.try_clone()?);
+        }
     }
     let lease = snapshots
         .register_restore_generation(&config, run, &storage, &intent)
@@ -442,63 +477,84 @@ async fn execute_prepared(
         executable_identity,
         lowers: lower_inputs.map(|lower| lower.files).unwrap_or_default(),
     };
-    let startup = launch_restored(runtime, &config, run, &storage, &mut launch, &lease).await;
-    let (_lock, config, result, _lifetime) = match startup {
-        Ok((pending, lifetime)) => {
-            let (lock, config, result) =
-                await_restored_start(runtime, config.id, run, lock, pending).await?;
-            (lock, config, result, Some(lifetime))
-        }
-        Err(error) => (lock, config, Err(error), None),
-    };
+    let startup = launch_restored(
+        runtime,
+        &config,
+        run,
+        &storage,
+        &mut launch,
+        &lease,
+        &mut durability,
+    )
+    .await;
+    let durability = durability.spawn();
+    let machine_id = config.id;
     let result = async {
-        result?;
-        let run_id = run.to_string();
-        let monitor = started_run_monitor(runtime, &config, &run_id, lease.operation_id())?;
-        let started = monitor
-            .started_at()
-            .ok_or_else(|| invalid("restored monitor has no stable generation"))?;
-        runtime
-            .mark_machine_monitor_ready(config.id, run_id, monitor.pid(), started)
-            .await
+        let (_lock, config, result, _lifetime) = match startup {
+            Ok((pending, lifetime)) => {
+                let (lock, config, result) =
+                    await_restored_start(runtime, config.id, run, lock, pending).await?;
+                (lock, config, result, Some(lifetime))
+            }
+            Err(error) => (lock, config, Err(error), None),
+        };
+        let result = async {
+            result?;
+            let run_id = run.to_string();
+            let monitor = started_run_monitor(runtime, &config, &run_id, lease.operation_id())?;
+            let started = monitor
+                .started_at()
+                .ok_or_else(|| invalid("restored monitor has no stable generation"))?;
+            runtime
+                .mark_machine_monitor_ready(config.id, run_id, monitor.pid(), started)
+                .await
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                store
+                    .child_event(intent.consumer_operation, "running")
+                    .await?;
+                Ok(Machine::new(runtime.clone(), config.id))
+            }
+            Err(error) => {
+                // Failed-start cleanup can delete the child and its monitor/live
+                // records. Retain the exact run's original failure before that
+                // destructive boundary; cleanup uncertainty remains independent.
+                let error = match store
+                    .record_fork_child_failure(config.id, run, &error)
+                    .await
+                {
+                    Ok(()) => error,
+                    Err(retain) => LibVmError::MachineStartCleanupFailed {
+                        primary: error.to_string(),
+                        cleanup: format!("retain fork restore failure: {retain}"),
+                    },
+                };
+                let error = finish_failed_start(
+                    runtime,
+                    &config,
+                    &run.to_string(),
+                    Some(FailedStartState::Error),
+                    None,
+                    lease,
+                    error,
+                )
+                .await;
+                // A failed or uncertain cleanup retains the exact generation and its
+                // charges in the journal. No new run or ordinary start is attempted.
+                Err(error)
+            }
+        }
     }
     .await;
-    match result {
-        Ok(()) => {
-            store
-                .child_event(intent.consumer_operation, "running")
-                .await?;
-            Ok(Machine::new(runtime.clone(), config.id))
-        }
-        Err(error) => {
-            // Failed-start cleanup can delete the child and its monitor/live
-            // records. Retain the exact run's original failure before that
-            // destructive boundary; cleanup uncertainty remains independent.
-            let error = match store
-                .record_fork_child_failure(config.id, run, &error)
-                .await
-            {
-                Ok(()) => error,
-                Err(retain) => LibVmError::MachineStartCleanupFailed {
-                    primary: error.to_string(),
-                    cleanup: format!("retain fork restore failure: {retain}"),
-                },
-            };
-            let error = finish_failed_start(
-                runtime,
-                &config,
-                &run.to_string(),
-                Some(FailedStartState::Error),
-                None,
-                lease,
-                error,
-            )
-            .await;
-            // A failed or uncertain cleanup retains the exact generation and its
-            // charges in the journal. No new run or ordinary start is attempted.
-            Err(error)
-        }
+    // Running is recorded before waiting, preserving the activation measurement.
+    // A failed persistence barrier leaves a Running child constructed, rather
+    // than turning successful activation into a failed-start cleanup.
+    if let Err(error) = durability.await {
+        tracing::warn!(machine = %machine_id, %error, "child durability task failed");
     }
+    result
 }
 
 /// Wait without mutation authority, then authenticate the durable generation
@@ -593,6 +649,7 @@ fn prepare_lower(
     pool: &StoragePool,
     consumer: &crate::store::snapshot_store::SnapshotConsumer,
     stage: crate::machine::stopped::OperationStaging,
+    shape: &crate::store::snapshot_store::ShapeVerifiedClosure,
 ) -> Result<Option<LowerInputs>, LibVmError> {
     let SnapshotRootProfile::LinuxOverlay {
         lower,
@@ -602,9 +659,8 @@ fn prepare_lower(
     else {
         return Ok(None);
     };
-    // Every backing is a duplicate of a held authenticated closure descriptor
-    // (fsmeta object, pack streams), as for local-fork cuts; each outlives
-    // `release_closure`. The consumer authenticated the closed graph.
+    // Bind lower inputs to the shape-held inodes. Full authentication joins
+    // private copying before the child is published.
     let mut occurrences = Vec::with_capacity(lower.layers.len() + 1);
     occurrences.push(pool.lower_object_occurrence(&lower.fsmeta)?);
     for layer in &lower.layers {
@@ -616,11 +672,13 @@ fn prepare_lower(
         &consumer.record.configuration,
         |backing, length| match backing {
             LowerBacking::Stream(stream) => {
-                let held = consumer.authenticated_stream(&stream, length)?;
-                Ok((held.file().try_clone()?, held.fingerprint()))
+                let file = shape.open_stream(pool, &stream, length)?;
+                let fingerprint =
+                    crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?);
+                Ok((file, fingerprint))
             }
             LowerBacking::Object(object) => {
-                let file = consumer.open_object(pool, &object)?;
+                let file = shape.open_object(pool, &object)?;
                 let fingerprint =
                     crate::storage::identity_file::SourceFingerprint::new(&file.metadata()?);
                 Ok((file, fingerprint))
@@ -766,13 +824,12 @@ fn prepare_lower_descriptor(
         }
     }
     let directory = stage.directory()?;
-    directory.write_file("lower.vmdk", verified.descriptor.as_bytes())?;
+    directory.write_file_atomic_deferred("lower.vmdk", verified.descriptor.as_bytes())?;
     let descriptor = directory
         .open_file("lower.vmdk")?
         .ok_or_else(|| invalid("restore lower descriptor disappeared"))?;
     nix::sys::stat::fchmod(&descriptor, nix::sys::stat::Mode::S_IRUSR)
         .map_err(std::io::Error::from)?;
-    descriptor.sync_all()?;
     let descriptor_stat = descriptor.metadata()?;
     let mut files = Vec::with_capacity(verified.backings.len() + 1);
     let mut extents = Vec::with_capacity(verified.backings.len());
@@ -926,6 +983,27 @@ fn restore_disk_peak(
     Ok(required)
 }
 
+pub(crate) fn publish_restore_launch_files(
+    paths: &crate::paths::MachinePaths,
+    spec: &vm_spec::VmSpec,
+    base: crate::initramfs_overlay::CompositeBase<'_>,
+    agent: Option<(crate::initramfs_overlay::CompositeAgent<'_>, &[u8])>,
+    durability: &mut crate::machine::builder::ChildDurability,
+) -> Result<(), LibVmError> {
+    let composite = crate::initramfs_overlay::write_composite_deferred(
+        base,
+        agent,
+        &paths.composite_initramfs_path(),
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    durability.files.push(composite);
+    durability.files.push(
+        crate::supervisor::write_launch_spec_deferred(&paths.vm_spec_path(), spec)
+            .map_err(|error| invalid(error.to_string()))?,
+    );
+    Ok(())
+}
+
 async fn launch_restored(
     runtime: &Runtime,
     config: &crate::store::models::MachineConfig,
@@ -933,6 +1011,7 @@ async fn launch_restored(
     storage: &MachineStorageRecord,
     restore: &mut RestoreLaunch,
     lease: &crate::store::operation_store::LaunchStorageLease,
+    durability: &mut crate::machine::builder::ChildDurability,
 ) -> Result<
     (
         crate::supervisor::launch::PendingStartup,
@@ -941,7 +1020,11 @@ async fn launch_restored(
     LibVmError,
 > {
     let paths = runtime.machine_paths(config.id);
-    runtime.ensure_machine_runtime_directories(config.id)?;
+    let directories = runtime.local_paths().child_launch_directories(config.id)?;
+    durability
+        .launch_directories
+        .extend(directories.directories);
+    durability.launch_parents.extend(directories.parents);
     let lifetime = crate::lock_manager::MachineLifetimeLock::try_acquire(&paths.vmm_lock_path())?
         .ok_or_else(|| LibVmError::MachineAlreadyRunning {
         reference: config.name.clone(),
@@ -952,8 +1035,35 @@ async fn launch_restored(
         &crate::EgressCredentials::default(),
     )?;
     let network = runtime
-        .prepare_machine_network(config, &run.to_string(), &secrets)
+        .prepare_machine_network(
+            config,
+            &run.to_string(),
+            &secrets,
+            crate::MachineDurability::Constructed,
+        )
         .await?;
+    if let crate::network::VmmNetworkAttachment::UnixDatagram { path, .. } = &network {
+        let directory = crate::paths::OwnedDirectory::open_existing_root(
+            path.parent()
+                .ok_or_else(|| invalid("network socket has no parent"))?,
+        )?
+        .ok_or_else(|| invalid("network runtime disappeared"))?;
+        if let Some(policy) = directory.open_file("network-policy.json")? {
+            durability.files.push(policy);
+        }
+        let parent = crate::paths::OwnedDirectory::open_existing_root(
+            directory
+                .path()
+                .parent()
+                .ok_or_else(|| invalid("network runtime has no parent"))?,
+        )?
+        .ok_or_else(|| invalid("network runtime parent disappeared"))?;
+        let logs = crate::paths::OwnedDirectory::open_existing_root(&paths.network_logs_dir())?
+            .ok_or_else(|| invalid("network logs disappeared"))?;
+        durability
+            .launch_directories
+            .extend([directory, parent, logs]);
+    }
     secrets.infrastructure.clear();
     restore.request.ssh_trusted_ca = Some(
         secrets
@@ -1053,19 +1163,23 @@ async fn launch_restored(
     })
     .map_err(|error| invalid(error.to_string()))?;
     let provenance = serde_json::to_vec(&provenance).map_err(|error| invalid(error.to_string()))?;
-    crate::initramfs_overlay::write_composite(
+    publish_restore_launch_files(
+        &paths,
+        &spec,
         crate::initramfs_overlay::CompositeBase::Retained(&base),
         Some((
             crate::initramfs_overlay::CompositeAgent::Retained(&agent),
             &provenance,
         )),
-        None,
-        &paths.composite_initramfs_path(),
-    )
-    .map_err(|error| invalid(error.to_string()))?;
-    crate::supervisor::write_launch_spec(&paths.vm_spec_path(), &spec)
-        .map_err(|error| invalid(error.to_string()))?;
-    let logs = runtime.local_paths().machine_logs_directory(config.id)?;
+        durability,
+    )?;
+    let logs = crate::paths::OwnedDirectory::open_existing_root(
+        paths
+            .serial_log_path()
+            .parent()
+            .ok_or_else(|| invalid("serial log has no parent"))?,
+    )?
+    .ok_or_else(|| invalid("child log directory disappeared"))?;
     let (file_device, file_inode) = lease.file_identity()?;
     let run_id = run.to_string();
     let pidfile = paths.vmm_pid_path();
@@ -1152,7 +1266,9 @@ async fn inspect(
         }))
         .collect();
     install_child_inheritance(&mut command, descriptors)?;
-    let mut child = tokio::process::Command::from(command).spawn()?;
+    let mut child = tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .spawn()?;
     let (Some(mut stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -1248,6 +1364,7 @@ pub(crate) struct VerifiedForkRestore {
     executable_identity: crate::storage::identity_file::SourceFingerprint,
     inspected_executable: crate::storage::identity::ObjectDigest,
     lane: vm_spec::live::LiveLane,
+    shared_qualification: Arc<crate::machine::root_disk::SharedCopyQualification>,
 }
 
 pub(crate) async fn prepare_fork_restore(
@@ -1260,9 +1377,10 @@ pub(crate) async fn prepare_fork_restore(
         crate::storage::stream::open_regular_source(runtime.supervisor().executable())?;
     let executable_identity =
         crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?);
-    let inspected_executable = crate::storage::identity::ObjectDigest::from_sha256(
-        *crate::storage::stream::whole_file_sha256(&executable)?.as_bytes(),
-    );
+    let inspected_executable = runtime
+        .live_capability_query()
+        .held_executable_digest(&executable)
+        .await?;
     if crate::storage::identity_file::SourceFingerprint::new(&executable.metadata()?)
         != executable_identity
     {
@@ -1270,12 +1388,16 @@ pub(crate) async fn prepare_fork_restore(
             "fork monitor executable changed during authentication",
         ));
     }
+    let shared_qualification = Arc::new(crate::machine::root_disk::SharedCopyQualification::new(
+        cut.directory(),
+    )?);
     Ok(VerifiedForkRestore {
         cut,
         executable,
         executable_identity,
         inspected_executable,
         lane: host.lane,
+        shared_qualification,
     })
 }
 
@@ -1366,7 +1488,7 @@ pub(crate) async fn restore_reserved_fork_child(
         .lower
         .as_ref()
         .map(|lower| {
-            let stage = crate::machine::stopped::OperationStaging::new(
+            let stage = crate::machine::stopped::OperationStaging::new_deferred(
                 &pool,
                 child.consumer_id,
                 &consumer_lease,
@@ -1397,7 +1519,7 @@ pub(crate) async fn restore_reserved_fork_child(
             file_device: identity.device,
             file_inode: identity.inode,
             length: identity.length,
-            sha256: identity.sha256,
+            identity: identity.identity,
         });
         files.push(file);
     }
@@ -1466,6 +1588,8 @@ pub(crate) async fn restore_reserved_fork_child(
             executable,
             executable_identity,
             lower_inputs,
+            authentication: None,
+            shared_qualification: Some(Arc::clone(&prepared.shared_qualification)),
         },
         child.result.name,
         Uuid::parse_str(child.result.run_id.as_str())

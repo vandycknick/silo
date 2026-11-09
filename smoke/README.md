@@ -228,9 +228,10 @@ source continuation, acquired and borrowed pause authority, sealed-file
 immutability, independent retained RAM, and retention through source/alias
 removal, home relocation and GC. Unsupported readonly virtiofs must be refused
 before staging or freezing. The child-only syscall tracer holds real capture
-durability boundaries for manager/monitor/worker death, including pool-file sync,
-pool publication and catalog commit. The catalog boundary is an actual WAL sync
-after the candidate identity becomes visible, before capture provenance commits.
+write and record-settlement boundaries for manager/monitor/worker death, plus
+pool-file sync, pool publication and catalog checkpoint barriers. The catalog
+boundary is an actual WAL sync after capture provenance commits but before
+the checkpoint can be acknowledged.
 Pre-seal cancellation waits for the monitor's exact request-admission event
 before releasing the held syscall; it verifies acquired-resume, acquired-preserve
 and borrowed-pause policies. Post-seal cancellation preserves the known seal.
@@ -244,6 +245,11 @@ vsock muxer exercises genuine continuation deadlines without injected errors
 or changed timeouts. The failure oracle checks the coherent published seal,
 Error fences and the source's durable workload counter, not survival of an
 exec session whose readiness has been invalidated.
+The checkpoint durability gate records successful `fsync`/`fdatasync` calls
+through real `/proc/<tid>/fd` device/inode observations. Every captured pool
+payload must have a file barrier and a later publication-directory barrier,
+followed by the catalog barrier. Capture staging must have none.
+
 
 ### Execution restore and retained closure (Phase 15)
 
@@ -465,11 +471,15 @@ Gated values: fork4 is CLI dispatch to the last durable child `running` stamp
 (API entry, seal to Running and caller end-to-end are separate fields); capture
 interruption is the larger of the source monitor's conservative staging-to-
 continuation interval and an independent host observation of the guest's
-durable 50 ms witness writes in the source backing; without a clone contract
-the ADR allowance (upper allocated bytes at the measured sequential copy rate)
-is subtracted and the actual disk-seal duration recorded; restore is dispatch
-to CLI exit with the child Running and ready. Samples, the reference-host record
-(CPU, memory, kernel, filesystem, input hashes, candidate manifest) and
+durable 50 ms witness writes in the source backing. At fixture setup, a real
+`FICLONE` probe between sibling files in the budget workspace selects the lane,
+independently of the capture request's disk copy contract. Reflink lanes subtract
+zero from every gate and budget cold restore. On non-reflink lanes the ADR
+allowance (upper allocated bytes at the measured sequential copy rate) is
+subtracted, and cold restore is recorded but not budgeted. The actual disk-seal
+duration is recorded; restore is dispatch to CLI exit with the child Running and
+ready. Samples, the reference-host record (CPU, memory, kernel, filesystem, input
+hashes, candidate manifest, reflink probe result and errno) and
 `summary.json`/`summary.md` are written before assertions. Recompute a summary
 with `python -m silo_smoke.fork_budget DIRECTORY`. A running source keeps its
 accepted capture baseline, so every successful fork sample stops and removes

@@ -153,7 +153,12 @@ impl Machine {
             };
 
             let resolved_network = match runtime
-                .prepare_machine_network(&config, &run_id, &secrets)
+                .prepare_machine_network(
+                    &config,
+                    &run_id,
+                    &secrets,
+                    crate::MachineDurability::Durable,
+                )
                 .await
             {
                 Ok(network) => network,

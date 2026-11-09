@@ -170,6 +170,26 @@ async fn check_collision(
 }
 
 impl Store {
+    async fn checkpoint_handoff(&self, record: &HandoffRecord) -> Result<(), LibVmError> {
+        if record.prepared.is_none() && record.authorization.is_none() && record.terminal.is_none()
+        {
+            return Ok(());
+        }
+        // A peer may act on these receipts after this host loses power. NORMAL
+        // commits alone are insufficient, including when replaying a commit
+        // whose earlier checkpoint failed or whose waiter was cancelled.
+        self.checkpoint_catalog().await
+    }
+
+    async fn commit_handoff(
+        &self,
+        tx: Transaction<'_, Sqlite>,
+        record: &HandoffRecord,
+    ) -> Result<(), LibVmError> {
+        tx.commit().await?;
+        self.checkpoint_handoff(record).await
+    }
+
     pub(crate) async fn runtime_id(&self) -> Result<RuntimeId, LibVmError> {
         let value: String = sqlx::query_scalar("SELECT runtime_id FROM db_config WHERE id=1")
             .fetch_one(&self.pool)
@@ -200,6 +220,9 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let record = read(&mut tx, operation).await?;
         tx.commit().await?;
+        if let Some(record) = &record {
+            self.checkpoint_handoff(record).await?;
+        }
         Ok(record)
     }
     /// Persist approved intent and its GC identity while the machine may run.
@@ -212,7 +235,7 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(record) = read(&mut tx, intent.operation).await? {
             check(&record, intent, HandoffRole::Source)?;
-            tx.commit().await?;
+            self.commit_handoff(tx, &record).await?;
             return Ok(record);
         }
         let current = storage(&mut tx, intent.source_machine)
@@ -225,7 +248,7 @@ impl Store {
         let mut record = fresh(intent, HandoffRole::Source);
         record.phase = HandoffPhase::Intended;
         write(&mut tx, &record, true).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(record)
     }
     /// Caller holds the source lifecycle lock before beginning this transition.
@@ -240,7 +263,7 @@ impl Store {
         if let Some(record) = &existing {
             check(record, intent, HandoffRole::Source)?;
             if record.phase != HandoffPhase::Intended {
-                tx.commit().await?;
+                self.commit_handoff(tx, record).await?;
                 return Ok(record.clone());
             }
         }
@@ -257,7 +280,7 @@ impl Store {
         Self::write_machine_storage(&mut tx, intent.source_machine, &current).await?;
         let record = fresh(intent, HandoffRole::Source);
         write(&mut tx, &record, existing.is_none()).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(record)
     }
     pub(crate) async fn receive_handoff(
@@ -275,13 +298,13 @@ impl Store {
                 }
                 .into());
             }
-            tx.commit().await?;
+            self.commit_handoff(tx, &record).await?;
             return Ok(record);
         }
         check_collision(&mut tx, intent).await?;
         let record = fresh(intent, HandoffRole::Destination);
         write(&mut tx, &record, true).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(record)
     }
     pub(crate) async fn bind_handoff_capture(
@@ -317,7 +340,7 @@ impl Store {
             if previous != binding {
                 return Err(HandoffError::ReceiptMismatch.into());
             }
-            tx.commit().await?;
+            self.commit_handoff(tx, &record).await?;
             return Ok(record);
         }
         if role == HandoffRole::Source {
@@ -339,7 +362,7 @@ impl Store {
         }
         record.binding = Some(binding.clone());
         write(&mut tx, &record, false).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(record)
     }
     /// Files and dependency pins must already be durable under this operation.
@@ -365,7 +388,7 @@ impl Store {
         }
         if let Some(receipt) = &record.prepared {
             let receipt = receipt.clone();
-            tx.commit().await?;
+            self.commit_handoff(tx, &record).await?;
             return Ok(receipt);
         }
         if record.phase != HandoffPhase::Receiving {
@@ -379,7 +402,7 @@ impl Store {
         record.prepared = Some(receipt.clone());
         record.phase = HandoffPhase::Prepared;
         write(&mut tx, &record, false).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(receipt)
     }
     pub(crate) async fn fence_handoff_source(
@@ -413,7 +436,7 @@ impl Store {
         }
         if let Some(auth) = &record.authorization {
             let auth = auth.clone();
-            tx.commit().await?;
+            self.commit_handoff(tx, &record).await?;
             return Ok(auth);
         }
         if record.phase != HandoffPhase::Captured {
@@ -448,7 +471,7 @@ impl Store {
         record.authorization = Some(authorization.clone());
         record.phase = HandoffPhase::Fenced;
         write(&mut tx, &record, false).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(authorization)
     }
     pub(crate) async fn abort_handoff_destination(
@@ -462,8 +485,9 @@ impl Store {
         let insert = previous.is_none();
         let mut record = previous.unwrap_or_else(|| fresh(intent, HandoffRole::Destination));
         check(&record, intent, HandoffRole::Destination)?;
-        if let Some(receipt) = record.terminal {
-            tx.commit().await?;
+        if let Some(receipt) = &record.terminal {
+            let receipt = receipt.clone();
+            self.commit_handoff(tx, &record).await?;
             return Ok(receipt);
         }
         let receipt = TerminalReceipt {
@@ -475,7 +499,7 @@ impl Store {
         record.phase = HandoffPhase::Aborted;
         record.terminal = Some(receipt.clone());
         write(&mut tx, &record, insert).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(receipt)
     }
     pub(crate) async fn resolve_handoff_source(
@@ -495,7 +519,7 @@ impl Store {
             if previous != receipt {
                 return Err(HandoffError::ReceiptMismatch.into());
             }
-            tx.commit().await?;
+            self.commit_handoff(tx, &record).await?;
             return Ok(record);
         }
         if receipt
@@ -512,7 +536,7 @@ impl Store {
             record.phase = HandoffPhase::Aborted;
             record.terminal = Some(receipt.clone());
             write(&mut tx, &record, false).await?;
-            tx.commit().await?;
+            self.commit_handoff(tx, &record).await?;
             return Ok(record);
         }
         let mut current = storage(&mut tx, intent.source_machine)
@@ -558,7 +582,7 @@ impl Store {
         record.terminal = Some(receipt.clone());
         Self::write_machine_storage(&mut tx, intent.source_machine, &current).await?;
         write(&mut tx, &record, false).await?;
-        tx.commit().await?;
+        self.commit_handoff(tx, &record).await?;
         Ok(record)
     }
     /// Holds BEGIN IMMEDIATE from collision admission through complete publication.
@@ -597,6 +621,7 @@ impl Store {
             check_collision(&mut tx, intent).await?;
         }
         Ok(HandoffDestinationCommit {
+            store: self,
             tx,
             record,
             authorization: authorization.clone(),
@@ -605,6 +630,7 @@ impl Store {
 }
 
 pub(crate) struct HandoffDestinationCommit<'a> {
+    store: &'a Store,
     tx: Transaction<'a, Sqlite>,
     record: HandoffRecord,
     authorization: CommitAuthorization,
@@ -620,8 +646,9 @@ impl<'a> HandoffDestinationCommit<'a> {
         Ok(&mut self.tx)
     }
     pub(crate) async fn commit(mut self) -> Result<TerminalReceipt, LibVmError> {
-        if let Some(receipt) = self.record.terminal {
-            self.tx.commit().await?;
+        if let Some(receipt) = &self.record.terminal {
+            let receipt = receipt.clone();
+            self.store.commit_handoff(self.tx, &self.record).await?;
             return Ok(receipt);
         }
         let intent = &self.record.intent;
@@ -645,7 +672,7 @@ impl<'a> HandoffDestinationCommit<'a> {
         self.record.authorization = Some(self.authorization);
         self.record.terminal = Some(receipt.clone());
         write(&mut self.tx, &self.record, false).await?;
-        self.tx.commit().await?;
+        self.store.commit_handoff(self.tx, &self.record).await?;
         Ok(receipt)
     }
 }
@@ -749,11 +776,14 @@ mod tests {
             .await
             .unwrap()
     }
-    async fn publish(
-        store: &Store,
+    async fn publication<'a>(
+        store: &'a Store,
         auth: &CommitAuthorization,
         intent: &HandoffIntent,
-    ) -> TerminalReceipt {
+    ) -> (
+        crate::store::handoff_store::HandoffDestinationCommit<'a>,
+        crate::storage::locks::StorageLock,
+    ) {
         let config = config(store, intent.destination_machine);
         let state = state(config.id);
         let mut storage = crate::MachineStorageRecord::opaque_raw(
@@ -762,7 +792,7 @@ mod tests {
             &oci::Platform::host().unwrap(),
         )
         .unwrap();
-        let _boot = store.pin_test_boot(&mut storage).await.unwrap();
+        let boot = store.pin_test_boot(&mut storage).await.unwrap();
         storage.ownership_epoch = intent.destination_epoch().unwrap().get();
         let mut commit = store.begin_handoff_destination_commit(auth).await.unwrap();
         assert!(commit.terminal_receipt().is_none());
@@ -774,7 +804,125 @@ mod tests {
         Store::write_machine_storage(tx, config.id, &storage)
             .await
             .unwrap();
-        commit.commit().await.unwrap()
+        (commit, boot)
+    }
+    async fn publish(
+        store: &Store,
+        auth: &CommitAuthorization,
+        intent: &HandoffIntent,
+    ) -> TerminalReceipt {
+        let (publication, _boot) = publication(store, auth, intent).await;
+        publication.commit().await.unwrap()
+    }
+
+    async fn hold_catalog_snapshot(store: &Store) -> sqlx::Transaction<'_, sqlx::Sqlite> {
+        let mut reader = store.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM handoff_operation")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        reader
+    }
+
+    #[tokio::test]
+    async fn handoff_receipts_checkpoint_before_acknowledgment_and_retry_after_partial_checkpoint()
+    {
+        let (_adir, a) = catalog().await;
+        let (_bdir, b) = catalog().await;
+        let machine = MachineId::new();
+        seed(&a, machine).await;
+        let intent = new_intent(&a, &b, machine, 0).await;
+        a.reserve_handoff_source(&intent).await.unwrap();
+        b.receive_handoff(&intent).await.unwrap();
+        let binding = binding(&intent);
+        a.bind_handoff_capture(&binding).await.unwrap();
+        b.offer_handoff_capture(&binding).await.unwrap();
+
+        let reader = hold_catalog_snapshot(&b).await;
+        assert!(b.prepare_handoff_destination(&binding).await.is_err());
+        assert!(b.prepare_handoff_destination(&binding).await.is_err());
+        assert!(b.get_handoff(intent.operation).await.is_err());
+        reader.rollback().await.unwrap();
+        let prepared = b.prepare_handoff_destination(&binding).await.unwrap();
+
+        let reader = hold_catalog_snapshot(&a).await;
+        assert!(a.fence_handoff_source(&prepared).await.is_err());
+        assert!(a.fence_handoff_source(&prepared).await.is_err());
+        assert!(a.get_handoff(intent.operation).await.is_err());
+        reader.rollback().await.unwrap();
+        let auth = a.fence_handoff_source(&prepared).await.unwrap();
+
+        let reader = hold_catalog_snapshot(&b).await;
+        let (commit, _boot) = publication(&b, &auth, &intent).await;
+        assert!(commit.commit().await.is_err());
+        let replay = b.begin_handoff_destination_commit(&auth).await.unwrap();
+        assert!(replay.commit().await.is_err());
+        assert!(b.get_handoff(intent.operation).await.is_err());
+        reader.rollback().await.unwrap();
+        let committed = b
+            .begin_handoff_destination_commit(&auth)
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+
+        let reader = hold_catalog_snapshot(&a).await;
+        assert!(a.resolve_handoff_source(&committed).await.is_err());
+        assert!(a.resolve_handoff_source(&committed).await.is_err());
+        assert!(a.get_handoff(intent.operation).await.is_err());
+        reader.rollback().await.unwrap();
+        let resolved = a.resolve_handoff_source(&committed).await.unwrap();
+        assert_eq!(resolved.terminal, Some(committed));
+        assert!(matches!(
+            a.machine_storage(machine).await.unwrap().unwrap().ownership,
+            MachineOwnership::Relocated { .. }
+        ));
+        assert_eq!(
+            b.machine_storage(machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .ownership_epoch,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_abort_checkpoints_negative_authority_before_unfencing() {
+        for reserved in [false, true] {
+            let (_adir, a) = catalog().await;
+            let (_bdir, b) = catalog().await;
+            let machine = MachineId::new();
+            seed(&a, machine).await;
+            let intent = new_intent(&a, &b, machine, 0).await;
+            a.begin_handoff_source(&intent).await.unwrap();
+            if reserved {
+                a.reserve_handoff_source(&intent).await.unwrap();
+            }
+
+            let reader = hold_catalog_snapshot(&b).await;
+            assert!(b.abort_handoff_destination(&intent).await.is_err());
+            assert!(b.abort_handoff_destination(&intent).await.is_err());
+            assert!(b.get_handoff(intent.operation).await.is_err());
+            reader.rollback().await.unwrap();
+            let aborted = b.abort_handoff_destination(&intent).await.unwrap();
+
+            let reader = hold_catalog_snapshot(&a).await;
+            assert!(a.resolve_handoff_source(&aborted).await.is_err());
+            assert!(a.resolve_handoff_source(&aborted).await.is_err());
+            assert!(a.get_handoff(intent.operation).await.is_err());
+            reader.rollback().await.unwrap();
+            let resolved = a.resolve_handoff_source(&aborted).await.unwrap();
+            assert_eq!(resolved.terminal, Some(aborted));
+            assert!(a
+                .machine_storage(machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .ownership
+                .is_owned());
+        }
     }
 
     #[tokio::test]
@@ -1306,8 +1454,8 @@ mod tests {
         storage.ownership_epoch = 1;
         let commit = async {
             let mut publication = b.begin_handoff_destination_commit(&auth).await?;
-            if let Some(terminal) = publication.terminal_receipt() {
-                return Ok::<_, crate::LibVmError>(terminal.clone());
+            if publication.terminal_receipt().is_some() {
+                return publication.commit().await;
             }
             let tx = publication.transaction()?;
             sqlx::query("INSERT INTO machine_config(id,name,config_json) VALUES(?1,?2,jsonb(?3))")
@@ -1322,15 +1470,35 @@ mod tests {
             publication.commit().await
         };
         let (commit, abort) = tokio::join!(commit, b.abort_handoff_destination(&intent));
-        let abort = abort.unwrap();
-        match abort.decision {
-            HandoffDecision::Committed => assert_eq!(commit.unwrap(), abort),
+        // Competing PASSIVE checkpoints may be busy even after the decision
+        // commits. Replay after both competitors finish must stabilize that
+        // same decision, never replace it.
+        let stable = b.abort_handoff_destination(&intent).await.unwrap();
+        match abort {
+            Ok(receipt) => assert_eq!(receipt, stable),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("catalog WAL checkpoint is incomplete"),
+                "{error}"
+            ),
+        }
+        match stable.decision {
+            HandoffDecision::Committed => match commit {
+                Ok(receipt) => assert_eq!(receipt, stable),
+                Err(error) => assert!(
+                    error
+                        .to_string()
+                        .contains("catalog WAL checkpoint is incomplete"),
+                    "{error}"
+                ),
+            },
             HandoffDecision::Aborted => {
                 assert!(commit.is_err());
                 assert!(b.machine_config(machine).await.unwrap().is_none());
             }
         }
-        a.resolve_handoff_source(&abort).await.unwrap();
+        a.resolve_handoff_source(&stable).await.unwrap();
         let source = a.machine_storage(machine).await.unwrap().unwrap();
         let destination = b.machine_storage(machine).await.unwrap();
         assert_eq!(
@@ -1338,6 +1506,6 @@ mod tests {
                 + usize::from(destination.is_some_and(|record| record.ownership.is_owned())),
             1
         );
-        assert_eq!(b.abort_handoff_destination(&intent).await.unwrap(), abort);
+        assert_eq!(b.abort_handoff_destination(&intent).await.unwrap(), stable);
     }
 }

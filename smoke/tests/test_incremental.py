@@ -207,7 +207,7 @@ def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
     incremental.authenticated_map(silo, cold, mode="full", reason="no-baseline")
 
 
-@pytest.mark.parametrize("boundary", ["capture-ram-sync", "capture-dirty-harvest"],
+@pytest.mark.parametrize("boundary", ["capture-ram-write", "capture-dirty-harvest"],
                          ids=["abandoned-union", "post-effect-coverage-lost"])
 def test_capture_dirty_union_and_coverage_recovery(
     silo: Silo, incremental_image: str, boundary: str,  # noqa: F811
@@ -264,7 +264,7 @@ def test_capture_dirty_union_and_coverage_recovery(
             directory = attempts.pop()
             plan = json.loads((directory / "request.json").read_bytes())
             assert plan["policy"] == "incremental" and plan["runId"] == baseline.source_info["run_id"]
-            if boundary == "capture-ram-sync":
+            if boundary == "capture-ram-write":
                 assert held["injectedReturn"] is False
                 assert Path(held["target"]).parent == directory
                 cancel_id = str(uuid4())
@@ -298,7 +298,7 @@ def test_capture_dirty_union_and_coverage_recovery(
             ended = shutdown.until(lambda: record("capture-manager-result.json"), timeout=90,
                                    description="incremental manager did not finish")
             assert silo.info(SOURCE)["state"] == "paused"
-            if boundary == "capture-ram-sync":
+            if boundary == "capture-ram-write":
                 assert ended["code"] != 0
                 assert not procs.query(silo.ws.state_db(),
                     f"SELECT snapshot_id FROM snapshot_capture_provenance WHERE capture_id='{plan['captureId']}'")

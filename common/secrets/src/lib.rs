@@ -258,6 +258,15 @@ pub trait SecretStore: Send + Sync + fmt::Debug {
     ) -> Result<(), SecretError> {
         self.update_scope(scope, operation)
     }
+    /// Initialize a newly constructed scope without a persistence barrier.
+    /// The caller must retain and sync the published file and its directory.
+    fn initialize_scope_deferred(
+        &self,
+        _scope: &SecretScope,
+        _operation: &mut dyn FnMut(&mut dyn SecretScopeTransaction) -> Result<(), SecretError>,
+    ) -> Result<(), SecretError> {
+        Err(SecretError::Unsupported)
+    }
     /// Run an atomic scope operation. Errors discard changes; implementations
     /// must serialize this with ordinary reads, writes, and scope deletion.
     fn update_scope(
@@ -487,6 +496,13 @@ impl ScopeTransaction {
     pub fn commit(mut self) -> Result<(), SecretError> {
         self.persist()
     }
+    fn commit_deferred(mut self) -> Result<(), SecretError> {
+        if self.dirty {
+            write_records_with(&self.path, &self.records, false)?;
+            self.dirty = false;
+        }
+        Ok(())
+    }
     /// Persist a checkpoint without releasing the scope lock. Remote token
     /// rotation is irreversible, so providers save each successful rotation
     /// before attempting another remote operation.
@@ -544,6 +560,15 @@ impl SecretStore for FileStore {
         let parent = path.parent().ok_or(SecretError::NotFound)?;
         secure_directory(parent)?;
         self.update_scope(scope, operation)
+    }
+    fn initialize_scope_deferred(
+        &self,
+        scope: &SecretScope,
+        operation: &mut dyn FnMut(&mut dyn SecretScopeTransaction) -> Result<(), SecretError>,
+    ) -> Result<(), SecretError> {
+        let mut transaction = self.begin_transaction(scope)?;
+        operation(&mut transaction)?;
+        transaction.commit_deferred()
     }
     fn update_scope(
         &self,
@@ -634,6 +659,14 @@ fn read_records(path: &Path) -> Result<BTreeMap<String, Value>, SecretError> {
 }
 
 fn write_records(path: &Path, records: &BTreeMap<String, Value>) -> Result<(), SecretError> {
+    write_records_with(path, records, true)
+}
+
+fn write_records_with(
+    path: &Path,
+    records: &BTreeMap<String, Value>,
+    durable: bool,
+) -> Result<(), SecretError> {
     let parent = path.parent().ok_or(SecretError::NotFound)?;
     let filename = path
         .file_name()
@@ -658,9 +691,13 @@ fn write_records(path: &Path, records: &BTreeMap<String, Value>) -> Result<(), S
         .ok_or_else(|| SecretError::Internal("temporary file namespace exhausted".into()))??;
     let result = (|| {
         file.write_all(&body)?;
-        file.sync_all()?;
+        if durable {
+            file.sync_all()?;
+        }
         fs::rename(&temp, path)?;
-        File::open(parent)?.sync_all()?;
+        if durable {
+            File::open(parent)?.sync_all()?;
+        }
         Ok(())
     })();
     if result.is_err() {

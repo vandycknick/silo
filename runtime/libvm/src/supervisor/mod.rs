@@ -22,7 +22,9 @@ pub(crate) mod storage_holder;
 pub use client::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub(crate) use client::{forward_rpc_error, ForwardClientError, VmmClient, VmmClientError};
 pub(crate) use launch::VmmLaunch;
-pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecInput};
+pub(crate) use launch_spec::{
+    prepare_launch_spec, write_launch_spec, write_launch_spec_deferred, LaunchSpecInput,
+};
 
 /// Crate-private adapter for the `silo-vmm` supervisor process.
 #[derive(Debug, Clone)]

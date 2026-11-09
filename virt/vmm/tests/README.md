@@ -132,38 +132,36 @@ unless requested, rather than silently passing when assets or a hypervisor are a
 
 ## Capture verification ownership
 
-The monitor authenticates capture outputs only at `CaptureVerify`, after native
-execution/RAM completion has closed all four output writers. One owned RAM
-thread overlaps the existing blocking stage's serial remaining-role lane.
-Neither the coherent seal nor source continuation can begin until the RAM
-thread has been joined and both lanes have released their scratch. A role
-failure cancels a child token, not the operation's cancellation token, and
-joining preserves the original I/O failure rather than its sibling's induced
-`Interrupted` error. Thread creation errors remain I/O errors; thread panic is
-reported as a typed verification I/O error.
+At `CaptureVerify`, native execution/RAM completion must already have closed
+all four output writers. RAM is never read back: the monitor resolves the
+worker's chunk digests and affected-chunk bitmap against the exact retained
+baseline map, then checks the prepared inode, layout and length. Full capture
+requires every chunk to be authoritative; incremental zero receipts replace
+dirty baseline chunks, including a short final chunk.
 
-The resource increment is explicit: a 1 MiB remaining-role SHA buffer and one
-1 MiB requested RAM-thread stack. The existing 8 MiB RAM buffer still computes
-the exact whole-file SHA over every byte. Full capture hashes every identity
-chunk; incremental capture reuses the authenticated map for unaffected chunks
-and hashes complete affected chunks (including explicit zeros and a short tail).
-The complete `memory.map.json` (named wire role `ram-map`) uses ADR 0014's
-existing canonical stream schema, is outside the 1 MiB control records,
-and is charged within the 64 MiB staged
-metadata allowance. At 1 TiB each decoded map has 131072 entries; retained and
-candidate maps have bounded operation/run lifetimes, not a TTL. Result release
-does not release the source's accepted baseline or its map. Restores inherit
-their verified map and child-local native token without scanning live child RAM
-or clearing restore-time dirties. At most two authentication file descriptors
-are open at once. That descriptor peak is below
-the four native output descriptors already admitted during capture preparation;
-held staging directories and the launch lease are unchanged.
+Sparse disk copies hash each 8 MiB logical chunk while copying, skip complete
+holes without reading, and publish `disks/<name>.map.json`. Clones retain a
+single chunk-authentication scan because no copy bytes traverse the monitor.
+RAM and disk inventory entries carry stream `identity`, never byte `sha256`;
+small state and complete map entries retain whole-file SHA-256.
 
-Real-file module regressions cover inventory order and byte-derived digests,
-prepared-inode/length/layout failures, actual staging charges, a role failure
-while RAM retains its descriptor, cancellation with both owners active, and
-typed thread-join failure. The ownership cases use channels rather than sleeps,
-and do not require a hypervisor or a simulated virtualization backend:
+Capture writes and closes files, maps and the coherent `vm.capture.json` record
+without file or directory durability barriers. There is no `cut` field or
+durability mode. Coherence still requires all seven observed cut facts.
+Checkpoint pool publication owns durability; fork children retain their
+independent background barriers.
+
+The complete `memory.map.json` (wire role `ram-map`) and disk maps use ADR
+0014's canonical stream schema. The evidence bound includes a complete 1 TiB
+RAM chunk receipt in addition to its control metadata. Maps and bounded
+evidence remain charged against the pre-freeze staging reservation and the
+64 MiB state allowance. Retained and candidate maps have operation/run
+lifetimes, not a TTL; result release never discards the source's baseline.
+
+Real-file module regressions cover stream identities independently recomputed
+from sparse disk source bytes, full/incremental RAM receipt assembly, private
+inodes, cancellation, layout/length failures, staged allocation accounting,
+canonical map inventory and write-once publication:
 
 ```sh
 cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm live::coordinator::capture::tests::

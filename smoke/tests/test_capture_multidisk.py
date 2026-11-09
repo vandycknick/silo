@@ -80,7 +80,7 @@ def test_capture_multidisk_dirty_matched_cut_and_independent_sealed_bytes(
 ) -> None:
     name, roles = create(silo, multidisk_image, profile)
     source_paths = stopped.writable_paths(silo, name)
-    with multidisk.traced_capture(silo, name, source_paths["root"], "capture-execution-sync",
+    with multidisk.traced_capture(silo, name, source_paths["root"], "capture-execution-write",
                                  preserve=False) as trace:
         original, boot_id, generation = running(silo, name, trace)
         workload = multidisk.Workload(silo, name)

@@ -251,7 +251,7 @@ pub(crate) fn verified_ram_map(
     }
     let mut bytes = vec![0; object.length as usize];
     file.read_exact_at(&mut bytes, 0)?;
-    if vm_spec::capture::Sha256Digest::of_bytes(&bytes) != object.sha256 {
+    if vm_spec::capture::Sha256Digest::of_bytes(&bytes) != object.identity {
         return Err(invalid("restore RAM map differs from its sealed SHA"));
     }
     let map = vm_spec::capture::StreamMap::decode(&bytes).map_err(invalid)?;
@@ -337,7 +337,8 @@ mod tests {
             vm_spec::capture::Sha256Digest::of_bytes(b"different stream");
         assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
         let mut wrong = launch.request.clone();
-        wrong.objects[4].sha256 = vm_spec::capture::Sha256Digest::of_bytes(b"different full file");
+        wrong.objects[4].identity =
+            vm_spec::capture::Sha256Digest::of_bytes(b"different full file");
         assert!(verified_ram_map(&wrong, &launch.files.objects[4]).is_err());
         let mut wrong = launch.request.clone();
         wrong.objects[4].length += 1;

@@ -82,6 +82,14 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
         baseline: value.baseline.as_ref().map(ToString::to_string),
         full_reason: value.full_reason.map(full_reason_to_wire),
         dirty_chunks: value.dirty_chunks.clone(),
+        chunk_digests: value
+            .chunk_digests
+            .iter()
+            .map(|digest| match digest {
+                Some(digest) => digest.as_bytes().to_vec(),
+                None => Vec::new(),
+            })
+            .collect(),
         stats: Some(w::CaptureMemoryStats {
             logical_bytes: stats.logical_bytes,
             live_bytes_read: stats.live_bytes_read,
@@ -143,6 +151,22 @@ fn memory_from_wire(
             .transpose()?,
         full_reason: value.full_reason.map(full_reason_from_wire).transpose()?,
         dirty_chunks: value.dirty_chunks,
+        chunk_digests: value
+            .chunk_digests
+            .into_iter()
+            .map(|bytes| {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                let digest: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    invalid(
+                        "capture.memory.chunk_digests",
+                        "expected an empty entry or exactly 32 digest bytes",
+                    )
+                })?;
+                Ok(Some(Sha256Digest::from_bytes(digest)))
+            })
+            .collect::<Result<Vec<_>, ConversionError>>()?,
         stats: CaptureMemoryStats {
             logical_bytes: stats.logical_bytes,
             live_bytes_read: stats.live_bytes_read,
@@ -457,12 +481,23 @@ mod tests {
     fn memory() -> vm_spec::capture::CaptureMemoryEvidence {
         let digest: vm_spec::capture::Sha256Digest =
             format!("sha256:{}", "d".repeat(64)).parse().unwrap();
-        let length = vm_spec::capture::STREAM_CHUNK_BYTES;
+        let length = 3 * vm_spec::capture::STREAM_CHUNK_BYTES;
+        let chunk_digests = vec![
+            Some(digest),
+            None,
+            Some(vm_spec::capture::Sha256Digest::of_bytes(b"last chunk")),
+        ];
+        let mut identity = vm_spec::capture::StreamIdentity::new();
+        for chunk in &chunk_digests {
+            identity
+                .push_digest(vm_spec::capture::STREAM_CHUNK_BYTES, *chunk)
+                .unwrap();
+        }
         vm_spec::capture::CaptureMemoryEvidence {
             packed_length: length,
             page_granule: 4096,
             regions: 1,
-            ram_stream: digest,
+            ram_stream: identity.finish(),
             binding: vm_spec::capture::CaptureStateBinding {
                 native_producer: "native-test-producer".into(),
                 silo_producer: digest,
@@ -476,13 +511,14 @@ mod tests {
             mode: vm_spec::lifecycle::CapturePolicy::Full,
             baseline: None,
             full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
-            dirty_chunks: vec![1],
+            dirty_chunks: vec![7],
+            chunk_digests,
             stats: vm_spec::capture::CaptureMemoryStats {
                 logical_bytes: length,
                 live_bytes_read: length,
                 full_bytes_written: length,
                 identity_bytes_hashed: length,
-                whole_file_bytes_hashed: length,
+                whole_file_bytes_hashed: 0,
                 ..Default::default()
             },
         }
@@ -557,6 +593,87 @@ mod tests {
         memory.mode = w::CapturePolicy::Incremental as i32;
         memory.full_reason = None;
         assert!(live_snapshot_from_wire(incremental).is_err());
+    }
+
+    #[test]
+    fn memory_chunk_digests_round_trip_mixed_entries_and_reject_wrong_widths() {
+        let value = live();
+        let wire = live_snapshot_to_wire(&value).unwrap();
+        let chunks = &wire
+            .capture
+            .as_ref()
+            .unwrap()
+            .memory
+            .as_ref()
+            .unwrap()
+            .chunk_digests;
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[0].as_slice(),
+            value.capture.memory.chunk_digests[0].unwrap().as_bytes()
+        );
+        assert!(chunks[1].is_empty());
+        assert_eq!(
+            chunks[2].as_slice(),
+            value.capture.memory.chunk_digests[2].unwrap().as_bytes()
+        );
+        assert_eq!(live_snapshot_from_wire(wire.clone()).unwrap(), value);
+        for length in [1, 31, 33, 64] {
+            let mut invalid = wire.clone();
+            invalid
+                .capture
+                .as_mut()
+                .unwrap()
+                .memory
+                .as_mut()
+                .unwrap()
+                .chunk_digests[1] = vec![0x51; length];
+            assert!(
+                live_snapshot_from_wire(invalid).is_err(),
+                "digest width {length}"
+            );
+        }
+        let mut missing = wire;
+        missing
+            .capture
+            .as_mut()
+            .unwrap()
+            .memory
+            .as_mut()
+            .unwrap()
+            .chunk_digests
+            .pop();
+        assert!(
+            live_snapshot_from_wire(missing).is_err(),
+            "chunk count is part of the receipt"
+        );
+    }
+
+    #[test]
+    fn incremental_receipt_preserves_unaffected_chunk_digest_entries() {
+        let mut value = live();
+        let memory = &mut value.capture.memory;
+        memory.mode = vm_spec::lifecycle::CapturePolicy::Incremental;
+        memory.baseline = Some(vm_spec::capture::Sha256Digest::of_bytes(
+            b"retained baseline",
+        ));
+        memory.full_reason = None;
+        memory.dirty_chunks = vec![0b101];
+        memory.stats.full_bytes_written = 0;
+        memory.stats.overlay_bytes_written = 2 * vm_spec::capture::STREAM_CHUNK_BYTES;
+        memory.stats.identity_bytes_hashed = 2 * vm_spec::capture::STREAM_CHUNK_BYTES;
+        memory.validate_capture().unwrap();
+        let wire = live_snapshot_to_wire(&value).unwrap();
+        assert!(wire
+            .capture
+            .as_ref()
+            .unwrap()
+            .memory
+            .as_ref()
+            .unwrap()
+            .chunk_digests[1]
+            .is_empty());
+        assert_eq!(live_snapshot_from_wire(wire).unwrap(), value);
     }
 
     #[test]

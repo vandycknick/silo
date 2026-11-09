@@ -38,7 +38,7 @@ pub const CAPTURE_DEVICES_FILE: &str = "devices.state";
 pub const CAPTURE_RAM_FILE: &str = "memory.ram";
 pub const CAPTURE_LAYOUT_FILE: &str = "memory-layout.json";
 pub const CAPTURE_RAM_MAP_FILE: &str = "memory.map.json";
-/// Complete canonical map bound, separate from the 1 MiB control records.
+/// Complete canonical RAM map bound.
 pub const MAX_RAM_MAP_BYTES: usize =
     (MAX_CAPTURE_RAM_BYTES / STREAM_CHUNK_BYTES) as usize * 74 + 256;
 pub const CAPTURE_EVIDENCE_FILE: &str = "vm.capture.json";
@@ -48,7 +48,7 @@ pub const CAPTURE_SOURCE_FILE: &str = "vm.capture-source.json";
 pub const CAPTURE_EVIDENCE_TEMPORARY_FILE: &str = ".vm.capture.json.tmp";
 pub const CAPTURE_SOURCE_TEMPORARY_FILE: &str = ".vm.capture-source.json.tmp";
 /// Upper bound for one JSON control record (plan, evidence, continuation).
-pub const MAX_CAPTURE_RECORD_BYTES: usize = 1 << 20;
+pub const MAX_CAPTURE_RECORD_BYTES: usize = (1 << 20) + MAX_RAM_MAP_BYTES;
 /// ADR 0021 `Resource Limits`: staged state and evidence allowance.
 pub const CAPTURE_STATE_RESERVE_BYTES: u64 = 64 << 20;
 /// ADR 0021 `Resource Limits`: metadata charge of a qualified clone.
@@ -151,6 +151,22 @@ impl<'de> Deserialize<'de> for Sha256Digest {
     }
 }
 
+/// Exact zero classification without alignment requirements or scratch allocation.
+pub fn is_all_zero(bytes: &[u8]) -> bool {
+    let mut blocks = bytes.chunks_exact(64);
+    for block in &mut blocks {
+        let bits = block.chunks_exact(8).fold(0u64, |bits, word| {
+            bits | u64::from_ne_bytes([
+                word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
+            ])
+        });
+        if bits != 0 {
+            return false;
+        }
+    }
+    blocks.remainder().iter().all(|byte| *byte == 0)
+}
+
 /// Streaming ADR 0014 `stream` identity: 8 MiB decoded chunks, `zero` only
 /// for an entirely zero chunk, SHA-256 of `silo:stream:v1\n` followed by the
 /// RFC 8785 canonical map. Holds no map, so a 1 TiB stream costs O(1) memory.
@@ -184,7 +200,7 @@ impl StreamIdentity {
     /// [`STREAM_CHUNK_BYTES`]; empty chunks do not exist.
     pub fn push_chunk(&mut self, bytes: &[u8]) -> Result<(), String> {
         let length = u64::try_from(bytes.len()).map_err(|_| invalid("chunk length overflow"))?;
-        let digest = if bytes.iter().all(|byte| *byte == 0) {
+        let digest = if is_all_zero(bytes) {
             None
         } else {
             Some(Sha256Digest::of_bytes(bytes))
@@ -419,6 +435,7 @@ pub enum CaptureRole {
     Layout,
     RamMap,
     Disk(CaptureDiskName),
+    DiskMap(CaptureDiskName),
 }
 
 impl CaptureRole {
@@ -430,6 +447,7 @@ impl CaptureRole {
             Self::Layout => CAPTURE_LAYOUT_FILE.into(),
             Self::RamMap => CAPTURE_RAM_MAP_FILE.into(),
             Self::Disk(name) => format!("{CAPTURE_DISKS_DIRECTORY}/{}", name.file_name()),
+            Self::DiskMap(name) => format!("{CAPTURE_DISKS_DIRECTORY}/{}.map.json", name.as_str()),
         }
     }
 }
@@ -448,9 +466,14 @@ impl FromStr for CaptureRole {
                 let name = other
                     .strip_prefix(CAPTURE_DISKS_DIRECTORY)
                     .and_then(|rest| rest.strip_prefix('/'))
-                    .and_then(|rest| rest.strip_suffix(".raw"))
                     .ok_or_else(|| invalid(format!("unknown capture role {other:?}")))?;
-                Self::Disk(CaptureDiskName::new(name)?)
+                if let Some(name) = name.strip_suffix(".raw") {
+                    Self::Disk(CaptureDiskName::new(name)?)
+                } else if let Some(name) = name.strip_suffix(".map.json") {
+                    Self::DiskMap(CaptureDiskName::new(name)?)
+                } else {
+                    return Err(invalid(format!("unknown capture role {other:?}")));
+                }
             }
         })
     }
@@ -861,11 +884,10 @@ impl CapturePlan {
             CaptureRole::Layout,
             CaptureRole::RamMap,
         ];
-        roles.extend(
-            self.disks
-                .iter()
-                .map(|disk| CaptureRole::Disk(disk.name.clone())),
-        );
+        for disk in &self.disks {
+            roles.push(CaptureRole::Disk(disk.name.clone()));
+            roles.push(CaptureRole::DiskMap(disk.name.clone()));
+        }
         roles
     }
 }
@@ -912,6 +934,7 @@ pub struct CaptureMemoryStats {
     pub explicit_zero_bytes_written: u64,
     pub extent_queries: u64,
     pub identity_bytes_hashed: u64,
+    /// Always zero on local capture; byte SHA is reserved for transported blobs.
     pub whole_file_bytes_hashed: u64,
 }
 
@@ -932,6 +955,8 @@ pub struct CaptureMemoryEvidence {
     pub full_reason: Option<CaptureFullReason>,
     /// One bit per 8 MiB chunk, least-significant bit first, zero tail padding.
     pub dirty_chunks: Vec<u8>,
+    /// Writer-computed digests; clean incremental chunks are non-authoritative `None`.
+    pub chunk_digests: Vec<Option<Sha256Digest>>,
     pub stats: CaptureMemoryStats,
 }
 
@@ -961,6 +986,20 @@ impl CaptureMemoryEvidence {
             ));
         }
         validate_dirty_chunks(self.packed_length, &self.dirty_chunks)?;
+        let count = self.packed_length.div_ceil(STREAM_CHUNK_BYTES) as usize;
+        if self.chunk_digests.len() != count
+            || self
+                .chunk_digests
+                .iter()
+                .enumerate()
+                .any(|(index, digest)| {
+                    self.dirty_chunks[index / 8] & (1 << (index % 8)) == 0 && digest.is_some()
+                })
+        {
+            return Err(invalid(
+                "RAM receipt chunk count or clean chunk digest is invalid",
+            ));
+        }
         match self.mode {
             CapturePolicy::Full if self.baseline.is_some() || self.full_reason.is_none() => {
                 return Err(invalid(
@@ -975,12 +1014,23 @@ impl CaptureMemoryEvidence {
             _ => {}
         }
         if self.mode == CapturePolicy::Full {
-            let count = self.packed_length.div_ceil(STREAM_CHUNK_BYTES) as usize;
             if (0..count).any(|index| self.dirty_chunks[index / 8] & (1 << (index % 8)) == 0) {
                 return Err(invalid("full RAM capture must affect every chunk"));
             }
+            let mut identity = StreamIdentity::new();
+            for (index, digest) in self.chunk_digests.iter().enumerate() {
+                identity.push_digest(
+                    (self.packed_length - index as u64 * STREAM_CHUNK_BYTES)
+                        .min(STREAM_CHUNK_BYTES),
+                    *digest,
+                )?;
+            }
+            if identity.finish() != self.ram_stream {
+                return Err(invalid(
+                    "full RAM receipt identity differs from its chunk digests",
+                ));
+            }
         }
-        let count = self.packed_length.div_ceil(STREAM_CHUNK_BYTES) as usize;
         let identity_bytes: u64 = (0..count)
             .filter(|index| self.dirty_chunks[index / 8] & (1 << (index % 8)) != 0)
             .map(|index| {
@@ -988,7 +1038,7 @@ impl CaptureMemoryEvidence {
             })
             .sum();
         if self.stats.logical_bytes != self.packed_length
-            || self.stats.whole_file_bytes_hashed != self.packed_length
+            || self.stats.whole_file_bytes_hashed != 0
             || self.stats.identity_bytes_hashed != identity_bytes
             || self.stats.live_bytes_read > self.packed_length
             || self.stats.baseline_bytes_read > self.packed_length
@@ -1039,7 +1089,10 @@ pub fn full_dirty_chunks(length: u64) -> Result<Vec<u8>, String> {
 pub struct CaptureInventoryEntry {
     pub role: CaptureRole,
     pub length: u64,
-    pub sha256: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1205,15 +1258,46 @@ impl CaptureEvidence {
                 }
                 let mut state_bytes = 0u64;
                 for (index, entry) in self.inventory.iter().enumerate() {
+                    let stream = matches!(entry.role, CaptureRole::Ram | CaptureRole::Disk(_));
+                    if entry.identity.is_some() != stream || entry.sha256.is_some() == stream {
+                        return Err(invalid(
+                            "stream roles require identity, small state requires sha256",
+                        ));
+                    }
+                    if entry.role == CaptureRole::Ram && entry.identity != Some(memory.ram_stream) {
+                        return Err(invalid(
+                            "RAM inventory identity differs from its memory receipt",
+                        ));
+                    }
+                    let paired = match &entry.role {
+                        CaptureRole::Disk(name) => self.inventory.iter().any(|other| {
+                            matches!(&other.role, CaptureRole::DiskMap(other) if other == name)
+                        }),
+                        CaptureRole::DiskMap(name) => self.inventory.iter().any(|other| {
+                            matches!(&other.role, CaptureRole::Disk(other) if other == name)
+                        }),
+                        _ => true,
+                    };
+                    if !paired {
+                        return Err(invalid(
+                            "captured disk and its complete map must travel together",
+                        ));
+                    }
                     if self.inventory[..index]
                         .iter()
                         .any(|other| other.role == entry.role)
                     {
                         return Err(invalid("capture inventory repeats a role"));
                     }
-                    if entry.role == CaptureRole::RamMap && entry.length > MAX_RAM_MAP_BYTES as u64
-                    {
-                        return Err(invalid("complete RAM map exceeds its metadata bound"));
+                    let map_limit = match entry.role {
+                        CaptureRole::RamMap => Some(MAX_RAM_MAP_BYTES as u64),
+                        CaptureRole::DiskMap(_) => {
+                            Some((MAX_STREAM_BYTES / STREAM_CHUNK_BYTES) * 74 + 256)
+                        }
+                        _ => None,
+                    };
+                    if map_limit.is_some_and(|limit| entry.length > limit) {
+                        return Err(invalid("complete stream map exceeds its metadata bound"));
                     }
                     match &entry.role {
                         CaptureRole::Ram if entry.length != memory.packed_length => {
@@ -1222,7 +1306,8 @@ impl CaptureEvidence {
                         CaptureRole::Execution
                         | CaptureRole::Devices
                         | CaptureRole::Layout
-                        | CaptureRole::RamMap => {
+                        | CaptureRole::RamMap
+                        | CaptureRole::DiskMap(_) => {
                             if entry.length == 0 {
                                 return Err(invalid("captured state files are nonempty"));
                             }
@@ -1410,7 +1495,7 @@ impl CaptureSourceRecord {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaptureSealed {
     pub capture_id: LiveId,
-    /// SHA-256 of the exact durable `vm.capture.json` bytes.
+    /// SHA-256 of the exact completed `vm.capture.json` bytes.
     pub evidence_sha256: Sha256Digest,
     /// Historical cut token; never current Resume authority by itself.
     pub cut_token: PauseToken,
@@ -1497,10 +1582,10 @@ pub struct CaptureEvidenceReference {
 pub struct CaptureObservation {
     pub continuation: CaptureContinuation,
     pub release: CaptureReleaseState,
-    /// Present once a durable `vm.capture.json` (coherent or failed) exists.
+    /// Present once `vm.capture.json` is complete.
     #[serde(deserialize_with = "required")]
     pub evidence: Option<CaptureEvidenceReference>,
-    /// Present once a durable `vm.capture-source.json` exists.
+    /// Present once a completed `vm.capture-source.json` exists.
     #[serde(deserialize_with = "required")]
     pub source_record_sha256: Option<Sha256Digest>,
 }
@@ -1671,7 +1756,9 @@ mod tests {
                 packed_length: 1 << 30,
                 page_granule: 4096,
                 regions: 1,
-                ram_stream: digest,
+                ram_stream: StreamMap::new(1 << 30, vec![Some(digest); 128])
+                    .unwrap()
+                    .id(),
                 binding: CaptureStateBinding {
                     native_producer: "libkrun".into(),
                     silo_producer: digest,
@@ -1686,9 +1773,13 @@ mod tests {
                 baseline: None,
                 full_reason: Some(CaptureFullReason::Requested),
                 dirty_chunks: crate::capture::full_dirty_chunks(1 << 30).unwrap(),
+                chunk_digests: vec![
+                    Some(digest);
+                    (1u64 << 30).div_ceil(STREAM_CHUNK_BYTES) as usize
+                ],
                 stats: CaptureMemoryStats {
                     logical_bytes: 1 << 30,
-                    whole_file_bytes_hashed: 1 << 30,
+                    whole_file_bytes_hashed: 0,
                     identity_bytes_hashed: 1 << 30,
                     ..Default::default()
                 },
@@ -1708,8 +1799,18 @@ mod tests {
                         }
                         _ => 100,
                     },
+                    sha256: (!matches!(role, CaptureRole::Ram | CaptureRole::Disk(_)))
+                        .then_some(digest),
+                    identity: match role {
+                        CaptureRole::Ram => Some(
+                            StreamMap::new(1 << 30, vec![Some(digest); 128])
+                                .unwrap()
+                                .id(),
+                        ),
+                        CaptureRole::Disk(_) => Some(digest),
+                        _ => None,
+                    },
                     role,
-                    sha256: digest,
                 })
                 .collect(),
             started_at_unix_ms: 10,
@@ -1742,6 +1843,31 @@ mod tests {
             format!("sha256:{}", "gg".repeat(32)),
         ] {
             assert!(bad.parse::<Sha256Digest>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn zero_classification_is_exact_at_every_word_block_and_tail_position() {
+        assert!(is_all_zero(&[]));
+        for full_blocks in 0..=2 {
+            for tail in 0..=70 {
+                let length = full_blocks * 64 + tail;
+                for alignment in 0..8 {
+                    let mut storage = vec![0u8; alignment + length];
+                    let bytes = &mut storage[alignment..];
+                    assert!(is_all_zero(bytes), "length={length}, alignment={alignment}");
+                    for position in 0..length {
+                        for value in [1, 0x80, 0xff] {
+                            bytes[position] = value;
+                            assert!(
+                                !is_all_zero(bytes),
+                                "length={length}, alignment={alignment}, position={position}, value={value}"
+                            );
+                        }
+                        bytes[position] = 0;
+                    }
+                }
+            }
         }
     }
 
@@ -2085,7 +2211,7 @@ mod tests {
                 file_device: 1,
                 file_inode: 1 + index as u64,
                 length: entry.length,
-                sha256: entry.sha256,
+                identity: entry.identity.or(entry.sha256).unwrap(),
             }
         });
         RestoreRequest {
@@ -2130,7 +2256,7 @@ mod tests {
         wrong.lowers[0].extents[0].file_inode = wrong.objects[0].file_inode;
         assert!(wrong.validate().is_err());
         let mut wrong = request.clone();
-        wrong.objects[2].sha256 = Sha256Digest::of_bytes(b"other execution");
+        wrong.objects[2].identity = Sha256Digest::of_bytes(b"other execution");
         assert!(wrong.validate().is_err());
         let mut wrong = request.clone();
         wrong.start_paused = false;
@@ -2260,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn ram_metadata_at_one_tib_is_bounded_outside_control_records() {
+    fn one_tib_ram_map_and_writer_receipt_fit_their_metadata_bounds() {
         let count = (MAX_CAPTURE_RAM_BYTES / STREAM_CHUNK_BYTES) as usize;
         let bitmap = full_dirty_chunks(MAX_CAPTURE_RAM_BYTES).unwrap();
         assert_eq!(bitmap.len(), 16384);
@@ -2275,10 +2401,24 @@ mod tests {
         )
         .unwrap();
         let encoded = map.canonical_bytes().unwrap();
-        assert!(encoded.len() > MAX_CAPTURE_RECORD_BYTES);
+        assert!(encoded.len() > (1 << 20));
         assert!(encoded.len() < MAX_RAM_MAP_BYTES);
         assert!((MAX_RAM_MAP_BYTES as u64) < CAPTURE_STATE_RESERVE_BYTES);
         assert_eq!(StreamMap::decode(&encoded).unwrap(), map);
+        let mut record = evidence(&plan());
+        let memory = record.memory.as_mut().unwrap();
+        memory.packed_length = MAX_CAPTURE_RAM_BYTES;
+        memory.dirty_chunks = bitmap;
+        memory.chunk_digests = map.chunks().to_vec();
+        memory.ram_stream = map.id();
+        memory.stats.logical_bytes = MAX_CAPTURE_RAM_BYTES;
+        memory.stats.identity_bytes_hashed = MAX_CAPTURE_RAM_BYTES;
+        record.inventory[2].length = MAX_CAPTURE_RAM_BYTES;
+        record.inventory[2].identity = Some(map.id());
+        record.inventory[4].length = encoded.len() as u64;
+        let bytes = record.canonical_bytes().unwrap();
+        assert!(bytes.len() < MAX_CAPTURE_RECORD_BYTES);
+        CaptureEvidence::decode(&bytes).unwrap();
     }
 
     #[test]
@@ -2313,5 +2453,45 @@ mod tests {
         memory.stats.identity_bytes_hashed += 1;
         memory.page_granule = 0;
         assert!(memory.validate_capture().is_err());
+    }
+
+    #[test]
+    fn capture_records_have_no_durability_mode() {
+        let plan = plan();
+        let bytes = plan.canonical_bytes().unwrap();
+        assert_eq!(CapturePlan::decode(&bytes).unwrap(), plan);
+        let record = evidence(&plan);
+        record
+            .validate_against_plan(&plan, &Sha256Digest::of_bytes(&bytes))
+            .unwrap();
+        let encoded = record.canonical_bytes().unwrap();
+        assert_eq!(CaptureEvidence::decode(&encoded).unwrap(), record);
+        for bytes in [&bytes, &encoded] {
+            let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert!(value.get("cut").is_none());
+        }
+    }
+
+    #[test]
+    fn stream_inventory_and_restore_use_only_stream_identity() {
+        let mut request = restore_request();
+        request.validate().unwrap();
+        let ram = request
+            .evidence
+            .inventory
+            .iter()
+            .find(|entry| entry.role == CaptureRole::Ram)
+            .unwrap();
+        let encoded = serde_json::to_value(ram).unwrap();
+        assert!(encoded.get("sha256").is_none());
+        assert!(encoded.get("identity").is_some());
+        request.objects[0].identity = Sha256Digest::of_bytes(b"wrong stream");
+        assert!(request.validate().is_err());
+        let mut record = evidence(&plan());
+        record.inventory[2].sha256 = Some(Sha256Digest::of_bytes(b"byte sha"));
+        assert!(record.validate().is_err());
+        let mut record = evidence(&plan());
+        record.inventory[0].identity = record.inventory[0].sha256.take();
+        assert!(record.validate().is_err());
     }
 }

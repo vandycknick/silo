@@ -20,6 +20,7 @@ use crate::store::models::{
     MachineConfig, MachineId, MachineNetworkConfig as ModelMachineNetworkConfig,
     MachineRootfsRecord,
 };
+use crate::store::{MachineStore, NetworkStore};
 use crate::utils::now_unix;
 use crate::LibVmError;
 
@@ -974,6 +975,7 @@ async fn create_machine_config_with_name(
             agent_mode: request.agent_mode,
         },
         None,
+        crate::MachineDurability::Durable,
     )
     .await?;
 
@@ -1255,7 +1257,14 @@ fn copy_root(
         .create_dir(&stage_name)?
         .ok_or_else(|| crate::machine::root_storage::invalid("private copy staging collision"))?;
     let mut qualification = CopyQualification::new(32);
-    let mut prepared = copy_private(source, stage, "content", &mut qualification)?;
+    let mut prepared = copy_private(
+        source,
+        stage,
+        "content",
+        &mut qualification,
+        crate::storage::stream::CopyWriteback::Buffered,
+    )?;
+    prepared.file().sync_all()?;
     tracing::debug!(
         method = ?prepared.method(),
         verification = ?prepared.verification(),
@@ -1270,10 +1279,39 @@ fn copy_root(
     Ok(())
 }
 
+fn write_owned_machine_config(
+    machine_dir: &Path,
+    name: &str,
+    spec: &VmSpec,
+    durability: crate::MachineDurability,
+) -> Result<(), LibVmError> {
+    let bytes =
+        serde_json::to_vec_pretty(spec).map_err(|source| LibVmError::VmSpecSerializeFailed {
+            name: name.to_string(),
+            source,
+        })?;
+    let directory = OwnedDirectory::open_existing_root(machine_dir)?
+        .ok_or_else(|| crate::machine::root_storage::invalid("machine directory disappeared"))?;
+    let path = crate::paths::vm_spec_path_in(machine_dir);
+    let file = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            crate::machine::root_storage::invalid("machine config has no UTF-8 filename")
+        })?;
+    if durability == crate::MachineDurability::Constructed {
+        directory.write_file_atomic_deferred(file, &bytes)?;
+    } else {
+        directory.write_file_atomic(file, &bytes)?;
+    }
+    Ok(())
+}
+
 async fn create_machine_guard(
     runtime: &Runtime,
     plan: MachineCreatePlan,
     stopped_operation: Option<uuid::Uuid>,
+    durability: crate::MachineDurability,
 ) -> Result<MachineCreateGuard, LibVmError> {
     let MachineCreatePlan {
         name,
@@ -1327,20 +1365,20 @@ async fn create_machine_guard(
         secret_store: runtime.secret_store_arc(),
     };
 
-    create.create_machine_dir(runtime)?;
+    create.create_machine_dir(runtime, durability)?;
     if let Some(operation) = stopped_operation {
         runtime
             .native_store()?
             .preserve_stopped_operation(operation, create.id)
             .await?;
     }
-    crate::ssh_ca::resolve(runtime.secret_store(), id, true).map_err(|error| {
-        LibVmError::MachinePreparationFailed {
+    crate::ssh_ca::resolve_with_durability(runtime.secret_store(), id, true, durability).map_err(
+        |error| LibVmError::MachinePreparationFailed {
             reference: create.name.clone(),
             message: format!("create machine SSH CA: {error}"),
-        }
-    })?;
-    write_machine_config(create.dir(), &create.name, &create.spec)?;
+        },
+    )?;
+    write_owned_machine_config(create.dir(), &create.name, &create.spec, durability)?;
 
     Ok(create)
 }
@@ -1383,8 +1421,18 @@ impl MachineCreateGuard {
         &self.machine_dir
     }
 
-    fn create_machine_dir(&mut self, runtime: &Runtime) -> Result<(), LibVmError> {
-        self.machine_parent = Some(runtime.local_paths().create_machine_data_dir(self.id)?);
+    fn create_machine_dir(
+        &mut self,
+        runtime: &Runtime,
+        durability: crate::MachineDurability,
+    ) -> Result<(), LibVmError> {
+        self.machine_parent = Some(if durability == crate::MachineDurability::Constructed {
+            runtime
+                .local_paths()
+                .create_machine_data_dir_deferred(self.id)?
+        } else {
+            runtime.local_paths().create_machine_data_dir(self.id)?
+        });
         Ok(())
     }
 
@@ -1647,52 +1695,66 @@ pub(crate) async fn publish_stopped_child(
     sources: Vec<crate::machine::stopped::PrivateSource>,
     operation_id: uuid::Uuid,
 ) -> Result<MachineConfig, LibVmError> {
-    publish_checkpoint_child(
+    let (config, durability) = publish_checkpoint_child(
         runtime,
-        name,
-        configuration,
-        storage,
-        sources,
-        operation_id,
+        ChildConstruction {
+            name,
+            configuration,
+            storage,
+            sources,
+            operation_id,
+            shared_qualification: None,
+        },
+        None,
         None,
     )
-    .await
+    .await?;
+    durability.complete().await?;
+    Ok(config)
 }
 
 pub(crate) async fn publish_restored_child(
     runtime: &Runtime,
-    name: String,
-    configuration: crate::SnapshotConfiguration,
-    storage: crate::MachineStorageRecord,
-    sources: Vec<crate::machine::stopped::PrivateSource>,
-    operation_id: uuid::Uuid,
+    construction: ChildConstruction,
     run_id: uuid::Uuid,
-) -> Result<MachineConfig, LibVmError> {
-    publish_checkpoint_child(
-        runtime,
-        name,
-        configuration,
-        storage,
-        sources,
-        operation_id,
-        Some(run_id),
-    )
-    .await
+    authentication: Option<crate::machine::restore::RestoreAuthentication>,
+) -> Result<(MachineConfig, ChildDurability), LibVmError> {
+    publish_checkpoint_child(runtime, construction, Some(run_id), authentication).await
+}
+
+pub(crate) struct ChildConstruction {
+    pub(crate) name: String,
+    pub(crate) configuration: crate::SnapshotConfiguration,
+    pub(crate) storage: crate::MachineStorageRecord,
+    pub(crate) sources: Vec<crate::machine::stopped::PrivateSource>,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) shared_qualification:
+        Option<std::sync::Arc<crate::machine::root_disk::SharedCopyQualification>>,
 }
 
 async fn publish_checkpoint_child(
     runtime: &Runtime,
-    name: String,
-    configuration: crate::SnapshotConfiguration,
-    mut storage: crate::MachineStorageRecord,
-    sources: Vec<crate::machine::stopped::PrivateSource>,
-    operation_id: uuid::Uuid,
+    construction: ChildConstruction,
     restore_run: Option<uuid::Uuid>,
-) -> Result<MachineConfig, LibVmError> {
+    authentication: Option<crate::machine::restore::RestoreAuthentication>,
+) -> Result<(MachineConfig, ChildDurability), LibVmError> {
+    let ChildConstruction {
+        name,
+        configuration,
+        mut storage,
+        sources,
+        operation_id,
+        shared_qualification,
+    } = construction;
     runtime
         .validate_machine_network_config(&configuration.network)
         .await?;
     runtime.validate_tailscale_vsock(&configuration.network, &configuration.spec)?;
+    let durability = if restore_run.is_some() {
+        crate::MachineDurability::Constructed
+    } else {
+        crate::MachineDurability::Durable
+    };
     let mut create = create_machine_guard(
         runtime,
         MachineCreatePlan {
@@ -1708,28 +1770,55 @@ async fn publish_checkpoint_child(
             agent_mode: configuration.agent_mode,
         },
         Some(operation_id),
+        durability,
     )
     .await?;
     let directory = OwnedDirectory::open_existing_root(create.dir())?.ok_or_else(|| {
         crate::machine::root_storage::invalid("new machine directory disappeared")
     })?;
     let stage_name = format!(".copy-{}", uuid::Uuid::new_v4());
-    let stage = directory
-        .create_dir(&stage_name)?
-        .ok_or_else(|| crate::machine::root_storage::invalid("private copy staging collision"))?;
-    let mut qualification = CopyQualification::new(32);
-    for (index, source) in sources.into_iter().enumerate() {
-        let target = match &mut storage.root {
-            crate::MachineRoot::OpaqueRaw { path, .. } if index == 0 => {
-                *path = crate::PrivatePath::new("root.raw")?;
-                path.clone()
-            }
-            crate::MachineRoot::LinuxOverlay { upper, .. } if index == 0 => {
-                *upper = crate::PrivatePath::new("upper.raw")?;
-                upper.clone()
-            }
-            _ => {
-                let disk = storage
+    let stage = if durability == crate::MachineDurability::Constructed {
+        directory.create_dir_deferred(&stage_name)?
+    } else {
+        directory.create_dir(&stage_name)?
+    }
+    .ok_or_else(|| crate::machine::root_storage::invalid("private copy staging collision"))?;
+    let mut qualification = if restore_run.is_some() {
+        CopyQualification::live(shared_qualification)
+    } else {
+        CopyQualification::new(32)
+    };
+    let writeback = if restore_run.is_some() {
+        crate::storage::stream::CopyWriteback::Direct
+    } else {
+        crate::storage::stream::CopyWriteback::Buffered
+    };
+    let handle = tokio::runtime::Handle::current();
+    let private_files = std::thread::scope(|scope| {
+        let authentication = authentication
+            .map(|authentication| {
+                std::thread::Builder::new()
+                    .name("restore-authentication".into())
+                    .stack_size(256 * 1024)
+                    .spawn_scoped(scope, move || {
+                        handle.block_on(authentication.authenticate())
+                    })
+            })
+            .transpose()?;
+        let copied = (|| -> Result<Vec<std::fs::File>, LibVmError> {
+            let mut private_files = Vec::with_capacity(sources.len());
+            for (index, source) in sources.into_iter().enumerate() {
+                let target = match &mut storage.root {
+                    crate::MachineRoot::OpaqueRaw { path, .. } if index == 0 => {
+                        *path = crate::PrivatePath::new("root.raw")?;
+                        path.clone()
+                    }
+                    crate::MachineRoot::LinuxOverlay { upper, .. } if index == 0 => {
+                        *upper = crate::PrivatePath::new("upper.raw")?;
+                        upper.clone()
+                    }
+                    _ => {
+                        let disk = storage
                     .disks
                     .iter_mut()
                     .find(|disk| {
@@ -1741,32 +1830,46 @@ async fn publish_checkpoint_child(
                             "private capture has no managed disk role",
                         )
                     })?;
-                let target = crate::PrivatePath::new(format!("disk-{}.raw", disk.id))?;
-                if let crate::DiskStorage::ManagedWritable { path, .. } = &mut disk.storage {
-                    *path = target.clone();
-                }
-                target
+                        let target = crate::PrivatePath::new(format!("disk-{}.raw", disk.id))?;
+                        if let crate::DiskStorage::ManagedWritable { path, .. } = &mut disk.storage
+                        {
+                            *path = target.clone();
+                        }
+                        target
+                    }
+                };
+                let target_name = target.as_path().to_str().ok_or_else(|| {
+                    crate::machine::root_storage::invalid("child private path is not UTF-8")
+                })?;
+                let length = source.length();
+                let mut prepared = source.prepare(
+                    stage.try_clone()?,
+                    &format!("file-{index}"),
+                    &mut qualification,
+                    writeback,
+                )?;
+                tracing::debug!(
+                    method = ?prepared.method(),
+                    verification = ?prepared.verification(),
+                    file = ?prepared.file(),
+                    length,
+                    "prepared stopped private attachment",
+                );
+                private_files.push(prepared.file().try_clone()?);
+                prepared.publish_constructed(directory.try_clone()?, target_name)?;
+                prepared.retain();
             }
-        };
-        let target_name = target.as_path().to_str().ok_or_else(|| {
-            crate::machine::root_storage::invalid("child private path is not UTF-8")
-        })?;
-        let mut prepared = copy_private(
-            source.copy_source(),
-            stage.try_clone()?,
-            &format!("file-{index}"),
-            &mut qualification,
-        )?;
-        tracing::debug!(
-            method = ?prepared.method(),
-            verification = ?prepared.verification(),
-            file = ?prepared.file(),
-            length = source.length(),
-            "prepared stopped private attachment",
-        );
-        prepared.publish(directory.try_clone()?, target_name)?;
-        prepared.retain();
-    }
+            Ok(private_files)
+        })();
+        if let Some(authentication) = authentication {
+            let authenticated = authentication
+                .join()
+                .map_err(|_| std::io::Error::other("restore authentication worker panicked"))?;
+            // Authentication is authoritative even when private copying also failed.
+            authenticated?;
+        }
+        copied
+    })?;
     directory.remove_tree(&stage_name)?;
     if restore_run.is_some() {
         crate::machine::restore::project_restore_disks(
@@ -1781,8 +1884,7 @@ async fn publish_checkpoint_child(
             runtime.local_images_dir(),
         )?;
     }
-    write_machine_config(create.dir(), &create.name, &create.spec)?;
-    directory.sync()?;
+    write_owned_machine_config(create.dir(), &create.name, &create.spec, durability)?;
     storage.validate()?;
     let (root, length) = match &storage.root {
         crate::MachineRoot::OpaqueRaw { path, geometry, .. } => (path, geometry.length),
@@ -1818,11 +1920,206 @@ async fn publish_checkpoint_child(
         state.status = crate::store::models::MachineRuntimeState::Restoring;
         state.run_id = Some(run_id.to_string());
     }
+    let mut files = private_files;
+    if restore_run.is_none() {
+        files.push(std::fs::File::open(crate::paths::vm_spec_path_in(
+            create.dir(),
+        ))?);
+    }
+    files.push(
+        directory.open_file("secrets.json")?.ok_or_else(|| {
+            crate::machine::root_storage::invalid("child SSH CA scope disappeared")
+        })?,
+    );
+    let parent = create
+        .machine_parent
+        .as_ref()
+        .ok_or_else(|| crate::machine::root_storage::invalid("child has no owned parent"))?
+        .try_clone()?;
     create.preserve = true;
-    runtime
-        .add_machine_record_with_rootfs(&config, &state, &rootfs, &storage)
+    let store = runtime.native_store()?;
+    store
+        .add_machine_with_rootfs_inner(
+            &config,
+            &state,
+            &rootfs,
+            &storage,
+            crate::MachineDurability::Constructed,
+        )
         .await?;
-    Ok(config)
+    let durability = ChildDurability {
+        machine: config.id,
+        consumer: Some(operation_id),
+        files,
+        directory,
+        launch_directories: Vec::new(),
+        launch_parents: Vec::new(),
+        parent,
+        home: OwnedDirectory::open_existing_root(runtime.local_home())?
+            .ok_or_else(|| crate::machine::root_storage::invalid("child home disappeared"))?,
+        store,
+    };
+    Ok((config, durability))
+}
+
+/// The construction transaction publishes a startable `constructed` row.
+/// Its owner retains the open copies until file and directory barriers finish,
+/// then records `durable` in a separate transaction. A failed barrier leaves
+/// recovery authority intact, never retries a guest start or claims persistence.
+pub(crate) struct ChildDurability {
+    machine: MachineId,
+    consumer: Option<uuid::Uuid>,
+    pub(crate) files: Vec<std::fs::File>,
+    directory: OwnedDirectory,
+    pub(crate) launch_directories: Vec<OwnedDirectory>,
+    pub(crate) launch_parents: Vec<std::fs::File>,
+    parent: OwnedDirectory,
+    home: OwnedDirectory,
+    store: crate::store::Store,
+}
+
+impl ChildDurability {
+    pub(crate) async fn adopt(
+        runtime: &Runtime,
+        config: &MachineConfig,
+    ) -> Result<Self, LibVmError> {
+        let invalid = crate::machine::root_storage::invalid;
+        let store = runtime.native_store()?;
+        let directory = OwnedDirectory::open_existing_root(&config.machine_dir)?
+            .ok_or_else(|| invalid("constructed child directory disappeared"))?;
+        // Reconstruct the construction barrier's artifact inventory, not the
+        // directory inventory: runtime lock files are not private launch inputs.
+        let storage = runtime.machine_storage_record(config.id).await?;
+        let (root, length) = crate::machine::stopped::root_private(&storage);
+        let mut files = Vec::with_capacity(storage.disks.len() + 5);
+        files.push(crate::machine::stopped::open_private(&directory, root, length)?.file);
+        for disk in &storage.disks {
+            if let crate::DiskStorage::ManagedWritable { path, geometry } = &disk.storage {
+                files.push(
+                    crate::machine::stopped::open_private(&directory, path, geometry.length)?.file,
+                );
+            }
+        }
+        for name in ["config.json", "secrets.json"] {
+            files.push(directory.open_file(name)?.ok_or_else(|| {
+                crate::machine::root_storage::invalid(format!(
+                    "constructed child {name} disappeared"
+                ))
+            })?);
+        }
+        // These launch artifacts are only enrolled when they were produced.
+        for name in ["initramfs", "lower.vmdk"] {
+            if let Some(file) = directory.open_file(name)? {
+                files.push(file);
+            }
+        }
+        let mut launch = runtime.local_paths().child_launch_directories(config.id)?;
+        // The original owner may have created the run root without syncing its
+        // parent. Its existence alone does not prove that directory entry durable.
+        if let Some(parent) = runtime.local_paths().run_root().parent() {
+            launch.parents.push(std::fs::File::open(parent)?);
+        }
+        let mut launch_directories = launch.directories;
+        let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
+        for operation in store.launch_storage_operations(config.id).await? {
+            files.push(
+                pool.existing_lease(operation.operation_id)?
+                    .durability_file()?,
+            );
+        }
+        launch_directories.push(pool.lease_directory()?);
+        if let Some(attachment) = store.network_attachment(config.id).await? {
+            let network = runtime
+                .local_paths()
+                .network(&attachment.network_instance_id)?;
+            if let Some(network) = OwnedDirectory::open_existing_root(network.runtime_dir())? {
+                if let Some(policy) = network.open_file("network-policy.json")? {
+                    files.push(policy);
+                }
+                launch_directories.push(network);
+            }
+            if let Some(parent) = network.runtime_dir().parent() {
+                if let Some(parent) = OwnedDirectory::open_existing_root(parent)? {
+                    launch_directories.push(parent);
+                }
+            }
+            if let Some(logs) = OwnedDirectory::open_existing_root(
+                &runtime.machine_paths(config.id).network_logs_dir(),
+            )? {
+                launch_directories.push(logs);
+            }
+        }
+        Ok(Self {
+            machine: config.id,
+            consumer: None,
+            files,
+            directory,
+            launch_directories,
+            launch_parents: launch.parents,
+            parent: OwnedDirectory::open_existing_root(
+                config
+                    .machine_dir
+                    .parent()
+                    .ok_or_else(|| invalid("child has no parent"))?,
+            )?
+            .ok_or_else(|| invalid("child parent disappeared"))?,
+            home: OwnedDirectory::open_existing_root(runtime.local_home())?
+                .ok_or_else(|| invalid("child home disappeared"))?,
+            store,
+        })
+    }
+
+    pub(crate) fn spawn(self) -> tokio::task::JoinHandle<Result<(), LibVmError>> {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let machine = self.machine;
+            let result = handle.block_on(self.complete());
+            if let Err(error) = &result {
+                tracing::warn!(%machine, %error, "child durability completion failed");
+            }
+            result
+        })
+    }
+
+    async fn complete(self) -> Result<(), LibVmError> {
+        sync_child_files(&self.files, &self.launch_directories, |_| {})?;
+        for parent in &self.launch_parents {
+            parent.sync_all()?;
+        }
+        if let Some(captures) = self.directory.open_dir("captures")? {
+            captures.sync()?;
+        }
+        if let Some(staging) = self.directory.open_dir(".atomic-write")? {
+            staging.sync()?;
+        }
+        self.directory.sync()?;
+        self.parent.sync()?;
+        self.home.sync()?;
+        if self.store.mark_child_durable(self.machine).await? {
+            if let Some(consumer) = self.consumer {
+                self.store.child_event(consumer, "durable").await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sync_child_files(
+    files: &[std::fs::File],
+    directories: &[OwnedDirectory],
+    mut synced: impl FnMut(&std::fs::File),
+) -> Result<(), LibVmError> {
+    for file in files {
+        file.sync_all()?;
+        synced(file);
+    }
+    for directory in directories {
+        if let Some(staging) = directory.open_dir(".atomic-write")? {
+            staging.sync()?;
+        }
+        directory.sync()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1846,6 +2143,155 @@ mod tests {
     use crate::{
         ImageSource, LibVmError, MachineRetention, Memory, ProcessConfig, RuntimeNetworkingConfig,
     };
+
+    #[tokio::test]
+    async fn live_child_barrier_retains_launch_files_and_stopped_publication_syncs_inline() {
+        use crate::machine::builder::{
+            publish_checkpoint_child, publish_stopped_child, sync_child_files, ChildConstruction,
+        };
+        use crate::machine::stopped::{FencedSource, OperationStaging, PrivateSource};
+        use crate::storage::pool::StoragePool;
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temporary.path().join("home"));
+        let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
+        let source = create_machine_config(
+            &runtime,
+            create_request(write_base_rootfs(temporary.path()), "launch-source"),
+        )
+        .await
+        .unwrap();
+        let storage = store.machine_storage(source.id).await.unwrap().unwrap();
+        let configuration = crate::SnapshotConfiguration::capture(&source).unwrap();
+        let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
+        for live in [false, true] {
+            let (operation, lease) = store
+                .begin_stopped_operation("fork", &[], &[])
+                .await
+                .unwrap();
+            let staging = OperationStaging::new(&pool, operation, &lease).unwrap();
+            let file =
+                crate::storage::stream::open_regular_source(&source.machine_dir.join("root.raw"))
+                    .unwrap();
+            let sources = vec![PrivateSource::Fenced(FencedSource {
+                path: crate::PrivatePath::new("root.raw").unwrap(),
+                length: file.metadata().unwrap().len(),
+                file,
+            })];
+            if live {
+                let (child, mut durability) = publish_checkpoint_child(
+                    &runtime,
+                    ChildConstruction {
+                        name: "live-launch-child".into(),
+                        configuration: configuration.clone(),
+                        storage: storage.clone(),
+                        sources,
+                        operation_id: operation,
+                        shared_qualification: None,
+                    },
+                    Some(uuid::Uuid::new_v4()),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    store.machine_durability(child.id).await.unwrap(),
+                    Some(crate::MachineDurability::Constructed)
+                );
+                let directories = paths.child_launch_directories(child.id).unwrap();
+                durability
+                    .launch_directories
+                    .extend(directories.directories);
+                durability.launch_parents.extend(directories.parents);
+                let launch = runtime.machine_paths(child.id);
+                assert_eq!(
+                    std::fs::metadata(launch.vm_spec_path())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                    0o600,
+                    "construction must publish private config before deferred launch replacement"
+                );
+                let base = temporary.path().join("base-initramfs");
+                std::fs::write(&base, b"base initramfs").unwrap();
+                crate::machine::restore::publish_restore_launch_files(
+                    &launch,
+                    &child.spec,
+                    crate::initramfs_overlay::CompositeBase::Path(&base),
+                    None,
+                    &mut durability,
+                )
+                .unwrap();
+                let expected = [
+                    child.machine_dir.join("root.raw"),
+                    child.machine_dir.join("secrets.json"),
+                    launch.composite_initramfs_path(),
+                    launch.vm_spec_path(),
+                ];
+                let expected: Vec<_> = expected
+                    .into_iter()
+                    .map(|path| {
+                        let metadata = std::fs::metadata(path).unwrap();
+                        (metadata.dev(), metadata.ino())
+                    })
+                    .collect();
+                let mut synced = Vec::new();
+                sync_child_files(&durability.files, &durability.launch_directories, |file| {
+                    let metadata = file.metadata().unwrap();
+                    synced.push((metadata.dev(), metadata.ino()));
+                })
+                .unwrap();
+                for identity in expected {
+                    assert!(
+                        synced.contains(&identity),
+                        "launch file absent from child barrier"
+                    );
+                }
+                assert!(durability
+                    .launch_directories
+                    .iter()
+                    .any(|directory| directory.path() == launch.machine_run_dir()));
+                assert!(durability.launch_directories.iter().any(
+                    |directory| directory.path() == launch.serial_log_path().parent().unwrap()
+                ));
+                durability.complete().await.unwrap();
+                assert_eq!(
+                    store.machine_durability(child.id).await.unwrap(),
+                    Some(crate::MachineDurability::Durable)
+                );
+            } else {
+                let child = publish_stopped_child(
+                    &runtime,
+                    "stopped-launch-child".into(),
+                    configuration.clone(),
+                    storage.clone(),
+                    sources,
+                    operation,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    store.machine_durability(child.id).await.unwrap(),
+                    Some(crate::MachineDurability::Durable),
+                    "stopped child must finish the inline barrier before returning"
+                );
+                assert!(child.machine_dir.join("secrets.json").is_file());
+                assert_eq!(
+                    std::fs::metadata(crate::paths::vm_spec_path_in(&child.machine_dir))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                    0o600
+                );
+            }
+            drop(staging);
+            store.finish_stopped_operation(operation).await.unwrap();
+            drop(lease);
+        }
+    }
 
     fn sample_vm_spec() -> VmSpec {
         VmSpec {
@@ -1952,6 +2398,7 @@ mod tests {
                 agent_mode: None,
             },
             None,
+            crate::MachineDurability::Durable,
         )
         .await
     }
@@ -3079,5 +3526,198 @@ mod tests {
         assert!(
             matches!(error, LibVmError::InvalidCreateRequest { reason, .. } if reason.contains("complete captured configuration"))
         );
+    }
+    #[tokio::test]
+    async fn checkpoint_child_is_constructed_until_private_file_sync_completes() {
+        use crate::machine::builder::publish_checkpoint_child;
+        use crate::machine::stopped::{FencedSource, OperationStaging, PrivateSource};
+        use crate::storage::pool::StoragePool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let (runtime, store) = runtime_with_sqlite_store(paths).await;
+        let request = create_request(write_base_rootfs(temp.path()), "durability-source");
+        let source = create_machine_config(&runtime, request).await.unwrap();
+        let storage = store.machine_storage(source.id).await.unwrap().unwrap();
+        let configuration = crate::SnapshotConfiguration::capture(&source).unwrap();
+        let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
+
+        for fail in [false, true] {
+            let (operation, lease) = store
+                .begin_stopped_operation("fork", &[], &[])
+                .await
+                .unwrap();
+            let staging = OperationStaging::new(&pool, operation, &lease).unwrap();
+            let file =
+                crate::storage::stream::open_regular_source(&source.machine_dir.join("root.raw"))
+                    .unwrap();
+            let length = file.metadata().unwrap().len();
+            let (child, mut durability) = publish_checkpoint_child(
+                &runtime,
+                crate::machine::builder::ChildConstruction {
+                    name: format!("durability-{fail}"),
+                    configuration: configuration.clone(),
+                    storage: storage.clone(),
+                    sources: vec![PrivateSource::Fenced(FencedSource {
+                        path: crate::PrivatePath::new("root.raw").unwrap(),
+                        file,
+                        length,
+                    })],
+                    operation_id: operation,
+                    shared_qualification: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store.machine_durability(child.id).await.unwrap(),
+                Some(crate::MachineDurability::Constructed),
+            );
+            assert!(child.machine_dir.join("root.raw").is_file());
+            if fail {
+                // A real descriptor whose fsync fails, not a mocked sync result.
+                durability
+                    .files
+                    .push(std::fs::File::open("/dev/null").unwrap());
+                assert!(durability.spawn().await.unwrap().is_err());
+                assert_eq!(
+                    store.machine_durability(child.id).await.unwrap(),
+                    Some(crate::MachineDurability::Constructed),
+                );
+            } else {
+                durability.spawn().await.unwrap().unwrap();
+                assert_eq!(
+                    store.machine_durability(child.id).await.unwrap(),
+                    Some(crate::MachineDurability::Durable),
+                );
+                let state = store.machine_state(child.id).await.unwrap().unwrap();
+                let rootfs = store.machine_rootfs(child.id).await.unwrap().unwrap();
+                let storage = store.machine_storage(child.id).await.unwrap().unwrap();
+                assert!(
+                    store
+                        .add_machine_with_rootfs_inner(
+                            &child,
+                            &state,
+                            &rootfs,
+                            &storage,
+                            crate::MachineDurability::Constructed,
+                        )
+                        .await
+                        .is_err(),
+                    "construction cannot replace an existing machine"
+                );
+                assert_eq!(
+                    store.machine_durability(child.id).await.unwrap(),
+                    Some(crate::MachineDurability::Durable),
+                );
+            }
+            drop(staging);
+            store.finish_stopped_operation(operation).await.unwrap();
+            drop(lease);
+        }
+    }
+    #[tokio::test]
+    async fn restart_deletes_constructed_child_without_starting_it() {
+        use crate::machine::builder::{publish_checkpoint_child, ChildConstruction};
+        use crate::machine::stopped::{FencedSource, OperationStaging, PrivateSource};
+        use crate::storage::pool::StoragePool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
+        let source = create_machine_config(
+            &runtime,
+            create_request(write_base_rootfs(temp.path()), "durable-source"),
+        )
+        .await
+        .unwrap();
+        let storage = store.machine_storage(source.id).await.unwrap().unwrap();
+        let pool = StoragePool::open(runtime.local_images_dir()).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("fork", &[], &[])
+            .await
+            .unwrap();
+        let staging = OperationStaging::new(&pool, operation, &lease).unwrap();
+        let file =
+            crate::storage::stream::open_regular_source(&source.machine_dir.join("root.raw"))
+                .unwrap();
+        let length = file.metadata().unwrap().len();
+        let (child, durability) = publish_checkpoint_child(
+            &runtime,
+            ChildConstruction {
+                name: "crashed-constructed-child".into(),
+                configuration: crate::SnapshotConfiguration::capture(&source).unwrap(),
+                storage,
+                sources: vec![PrivateSource::Fenced(FencedSource {
+                    path: crate::PrivatePath::new("root.raw").unwrap(),
+                    file,
+                    length,
+                })],
+                operation_id: operation,
+                shared_qualification: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.machine_durability(child.id).await.unwrap(),
+            Some(crate::MachineDurability::Constructed)
+        );
+        let run_tree = paths.machine(child.id).machine_run_dir().to_path_buf();
+        assert!(!run_tree.exists(), "construction must not attempt a start");
+        // Lose the actual barrier owner without ever synchronizing or rewriting
+        // its constructed row, exactly the persisted state left by a crash.
+        drop(durability);
+        drop(staging);
+        drop(lease);
+        drop(runtime);
+
+        let assets = crate::runtime::components::test_components(paths.home());
+        std::fs::set_permissions(assets.agent(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = test_utils::mock_vmm_binary();
+        let components = crate::ResolvedRuntimeComponents::from_paths(
+            binary.to_path_buf(),
+            binary.to_path_buf(),
+            assets.kernel().to_path_buf(),
+            assets.initramfs().to_path_buf(),
+            assets.agent().to_path_buf(),
+            assets.asset_dir().to_path_buf(),
+        )
+        .unwrap();
+        let scenario = temp.path().join("recovery-scenario.json");
+        test_utils::Scenario::default().write_to(&scenario).unwrap();
+        std::fs::set_permissions(
+            paths.roots().run_root(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let config = crate::RuntimeConfig::local(paths.home())
+            .with_run_root(paths.roots().run_root())
+            .with_runtime_components(components)
+            .with_mock_vmm(scenario);
+        let reopened = Runtime::new(config).await.unwrap();
+        assert!(store.machine_config(child.id).await.unwrap().is_none());
+        assert!(store.machine_state(child.id).await.unwrap().is_none());
+        assert!(store.machine_storage(child.id).await.unwrap().is_none());
+        assert!(
+            !child.machine_dir.exists(),
+            "recovery must delete the private child tree"
+        );
+        assert!(
+            !run_tree.exists(),
+            "recovery must never start a constructed child"
+        );
+        assert!(matches!(
+            reopened
+                .get_machine(&crate::MachineRef::parse("crashed-constructed-child").unwrap())
+                .await,
+            Err(LibVmError::MachineNotFound { .. }),
+        ));
+        assert!(store.machine_config(source.id).await.unwrap().is_some());
+        assert!(source.machine_dir.join("root.raw").is_file());
     }
 }

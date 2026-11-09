@@ -41,6 +41,7 @@ pub(super) struct NetworkDriverContext<'a> {
     pub(super) config: &'a RuntimeNetworkingConfig,
     pub(super) netd_path: &'a Path,
     pub(super) egress_credentials: &'a ResolvedSecrets,
+    pub(super) durability: crate::MachineDurability,
 }
 
 #[async_trait]

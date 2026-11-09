@@ -49,6 +49,15 @@ pub(crate) fn resolve(
     id: MachineId,
     create: bool,
 ) -> Result<CaPair, SecretError> {
+    resolve_with_durability(store, id, create, crate::MachineDurability::Durable)
+}
+
+pub(crate) fn resolve_with_durability(
+    store: &dyn SecretStore,
+    id: MachineId,
+    create: bool,
+    durability: crate::MachineDurability,
+) -> Result<CaPair, SecretError> {
     let private_name = SecretName::new(PRIVATE)?;
     let public_name = SecretName::new(PUBLIC)?;
     let mut result = None;
@@ -78,7 +87,9 @@ pub(crate) fn resolve(
         result = Some(pair);
         Ok(())
     };
-    if create {
+    if create && durability == crate::MachineDurability::Constructed {
+        store.initialize_scope_deferred(&scope(id)?, &mut operation)?;
+    } else if create {
         store.initialize_scope(&scope(id)?, &mut operation)?;
     } else {
         store.update_scope(&scope(id)?, &mut operation)?;

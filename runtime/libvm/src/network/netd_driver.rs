@@ -101,8 +101,31 @@ async fn prepare_netd_runtime(
     let network_id = MachineId::new().to_string();
     let network_paths = paths.network(&network_id)?;
     let machine_paths = paths.machine(metadata.id);
-    let runtime_directory = paths.ensure_network_run_dir(&network_id)?;
-    let log_directory = paths.ensure_machine_network_logs_dir(metadata.id)?;
+    let (runtime_directory, log_directory) =
+        if ctx.durability == crate::MachineDurability::Constructed {
+            let root = crate::paths::OwnedDirectory::open_root_deferred(paths.run_root())?;
+            let runtime = root
+                .ensure_dir_deferred("networks")?
+                .ensure_dir_deferred(&network_id)?;
+            let logs = crate::paths::OwnedDirectory::open_existing_root(
+                machine_paths.network_logs_dir().parent().ok_or_else(|| {
+                    LibVmError::NetworkRuntime {
+                        reference: metadata.name.clone(),
+                        message: "network logs have no parent".into(),
+                    }
+                })?,
+            )?
+            .ok_or_else(|| LibVmError::NetworkRuntime {
+                reference: metadata.name.clone(),
+                message: "child logs disappeared".into(),
+            })?;
+            (runtime, logs.ensure_dir_deferred("network")?)
+        } else {
+            (
+                paths.ensure_network_run_dir(&network_id)?,
+                paths.ensure_machine_network_logs_dir(metadata.id)?,
+            )
+        };
     let mut startup = NetdStartupGuard::new(paths.clone(), network_id.clone());
     // std creates non-inheritable pipes on both macOS and Linux, coordinating
     // its pipe+fcntl fallback with concurrent std::process launches.
@@ -123,7 +146,13 @@ async fn prepare_netd_runtime(
     let log_path = machine_paths.network_service_log_path();
     let policy_path = if let Some(policy) = request.policy() {
         let path = network_paths.policy_path();
-        write_runtime_policy_file(&metadata.name, policy, &runtime_directory, &path)?;
+        write_runtime_policy_file(
+            &metadata.name,
+            policy,
+            &runtime_directory,
+            &path,
+            ctx.durability,
+        )?;
         Some(path)
     } else {
         None
@@ -477,6 +506,7 @@ fn write_runtime_policy_file(
     policy: &NetworkPolicy,
     runtime_directory: &crate::paths::OwnedDirectory,
     path: &Path,
+    durability: crate::MachineDurability,
 ) -> Result<(), LibVmError> {
     let normalized = policy
         .clone()
@@ -498,12 +528,15 @@ fn write_runtime_policy_file(
                 path.display()
             ),
         })?;
-    runtime_directory
-        .write_file(file_name, &bytes)
-        .map_err(|err| LibVmError::NetworkRuntime {
-            reference: machine_name.into(),
-            message: format!("write generated network policy {}: {err}", path.display()),
-        })
+    (if durability == crate::MachineDurability::Constructed {
+        runtime_directory.write_file_atomic_deferred(file_name, &bytes)
+    } else {
+        runtime_directory.write_file(file_name, &bytes)
+    })
+    .map_err(|err| LibVmError::NetworkRuntime {
+        reference: machine_name.into(),
+        message: format!("write generated network policy {}: {err}", path.display()),
+    })
 }
 
 #[derive(Deserialize)]
@@ -924,6 +957,7 @@ mod tests {
             &policy,
             &directory,
             &file,
+            crate::MachineDurability::Durable,
         )
         .unwrap();
         let generated = silo_policy::NetworkPolicy::from_json_file(file).unwrap();
@@ -1308,6 +1342,7 @@ netd log: /tmp/silo/netd.log";
             config: &networking,
             netd_path: &netd,
             egress_credentials: &launch,
+            durability: crate::MachineDurability::Durable,
         };
 
         let attachment =
@@ -1544,6 +1579,7 @@ os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
                 config: &networking,
                 netd_path: &executable,
                 egress_credentials: &launch,
+                durability: crate::MachineDurability::Durable,
             };
             let request = NetworkAttachmentRequest::private(Some(&policy), None);
             let start = std::time::Instant::now();

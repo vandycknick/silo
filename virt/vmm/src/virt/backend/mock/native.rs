@@ -489,8 +489,6 @@ fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> Result<(), NativeFail
 }
 
 fn receipt(file: &File) -> Result<OutputReceipt, NativeFailure> {
-    file.sync_all()
-        .map_err(|error| participant(&format!("native output sync: {error}")))?;
     let metadata = file
         .metadata()
         .map_err(|error| participant(&format!("output metadata: {error}")))?;
@@ -502,7 +500,14 @@ fn receipt(file: &File) -> Result<OutputReceipt, NativeFailure> {
 }
 
 /// Deterministic guest RAM content, written in bounded chunks.
-fn write_ram(file: &File, length: u64) -> Result<(), NativeFailure> {
+fn write_ram(
+    file: &File,
+    length: u64,
+) -> Result<Vec<Option<vm_spec::capture::Sha256Digest>>, NativeFailure> {
+    use vm_spec::capture::{is_all_zero, Sha256Digest, STREAM_CHUNK_BYTES};
+    let mut digests = Vec::with_capacity(length.div_ceil(STREAM_CHUNK_BYTES) as usize);
+    let mut hasher = sha2::Sha256::new();
+    let mut zero = true;
     let mut chunk = vec![0_u8; WRITE_CHUNK];
     let mut offset = 0;
     while offset < length {
@@ -513,9 +518,16 @@ fn write_ram(file: &File, length: u64) -> Result<(), NativeFailure> {
             *byte = (page % 251) as u8 ^ (index as u8);
         }
         write_all_at(file, &chunk[..count], offset)?;
+        hasher.update(&chunk[..count]);
+        zero &= is_all_zero(&chunk[..count]);
         offset += count as u64;
+        if offset % STREAM_CHUNK_BYTES == 0 || offset == length {
+            let digest = hasher.finalize_reset().into();
+            digests.push((!zero).then(|| Sha256Digest::from_bytes(digest)));
+            zero = true;
+        }
     }
-    Ok(())
+    Ok(digests)
 }
 
 impl NativeLifecycle for ScenarioNative {
@@ -858,6 +870,7 @@ impl NativeLifecycle for ScenarioNative {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn capture_execution(
         &self,
         token: &ScenarioToken,
@@ -1008,7 +1021,7 @@ impl NativeLifecycle for ScenarioNative {
             // A partial image: the failure retains both writers.
             let partial = write_ram(&ram, (length / 2).max(PAGE).min(length));
             let failure = match partial {
-                Ok(()) => participant("scripted RAM image write failure (ENOSPC)"),
+                Ok(_) => participant("scripted RAM image write failure (ENOSPC)"),
                 Err(failure) => failure,
             };
             let entry = self.capture(&mut model, capture)?;
@@ -1016,10 +1029,11 @@ impl NativeLifecycle for ScenarioNative {
             entry.retained = Some((ram, layout));
             return Err(failure);
         }
-        let written = write_ram(&ram, length)
-            .and_then(|()| write_all_at(&layout, &layout_bytes, 0))
-            .and_then(|()| Ok((receipt(&ram)?, receipt(&layout)?)));
-        let (ram_receipt, layout_receipt) = match written {
+        let written = write_ram(&ram, length).and_then(|chunk_digests| {
+            write_all_at(&layout, &layout_bytes, 0)?;
+            Ok((receipt(&ram)?, receipt(&layout)?, chunk_digests))
+        });
+        let (ram_receipt, layout_receipt, chunk_digests) = match written {
             Ok(receipts) => receipts,
             Err(failure) => {
                 let entry = self.capture(&mut model, capture)?;
@@ -1044,13 +1058,15 @@ impl NativeLifecycle for ScenarioNative {
             full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
             dirty_chunks: vm_spec::capture::full_dirty_chunks(length)
                 .map_err(|error| participant(&error))?,
-            stats: vm_spec::capture::CaptureMemoryStats {
+            chunk_digests,
+            stats: Box::new(vm_spec::capture::CaptureMemoryStats {
                 logical_bytes: length,
                 live_bytes_read: length,
                 full_bytes_written: length,
                 layout_bytes_written: layout_bytes.len() as u64,
+                identity_bytes_hashed: length,
                 ..Default::default()
-            },
+            }),
         };
         entry.memory = Some(memory.clone());
         entry.state = CaptureState::CandidateComplete;

@@ -1,4 +1,4 @@
-mod builder;
+pub(crate) mod builder;
 mod config;
 mod forward;
 mod guest;
@@ -39,8 +39,8 @@ pub use forward::{
 pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
 pub use handle::Machine;
 pub use inspect::{
-    MachineBootMode, MachineBootReport, MachineData, MachineInventoryEntry, MachineIssue,
-    MachineIssueComponent, MachineObservation, MachineProvisionFailurePolicy,
+    MachineBootMode, MachineBootReport, MachineData, MachineDurability, MachineInventoryEntry,
+    MachineIssue, MachineIssueComponent, MachineObservation, MachineProvisionFailurePolicy,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
     MachineProvisionStepStatus, MachineRootfs, MachineStatus, MachineTailscale,
 };

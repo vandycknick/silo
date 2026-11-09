@@ -4,9 +4,9 @@
 //! re-resolving a pathname: the data directory is opened once, then each
 //! component below it is created exclusively (`O_EXCL`/`mkdirat`) and opened
 //! with `O_NOFOLLOW`. Directories are 0700 and files 0600, owned by the
-//! monitor's euid. Records are written exactly once: temporary file, sync,
-//! no-replace `linkat`, removal of the owned temporary name, single-link
-//! check, directory sync. Nothing here ever unlinks a payload or a record.
+//! monitor's euid. Records use no-replace `linkat` and single-link settlement.
+//! Capture writers close without durability barriers; publication belongs to libvm.
+//! RAM identity comes from the worker receipt; disk copies hash while writing.
 //!
 //! ```text
 //!   data-dir ─► captures/ ─► <id>/ ─┬─ request.json (once, before freeze)
@@ -25,18 +25,18 @@ use std::path::{Path, PathBuf};
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, AtFlags, OFlag};
 use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
-use nix::unistd::{fsync, ftruncate, geteuid, linkat, lseek, unlinkat, UnlinkatFlags, Whence};
+use nix::unistd::{ftruncate, geteuid, linkat, lseek, unlinkat, UnlinkatFlags, Whence};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use vm_spec::capture::{
-    CaptureDiskCopy, CaptureRole, Sha256Digest, StreamIdentity, CAPTURES_DIRECTORY,
+    CaptureDiskCopy, CaptureRole, Sha256Digest, StreamMap, CAPTURES_DIRECTORY,
     CAPTURE_DISKS_DIRECTORY, CAPTURE_REQUEST_FILE, MAX_CAPTURE_RAM_BYTES, MAX_CAPTURE_RECORD_BYTES,
     STREAM_CHUNK_BYTES,
 };
 use vm_spec::lifecycle::LiveId;
 
 /// Bounded copy buffer: one allocation per disk copy, never RAM-sized.
-const COPY_BUFFER_BYTES: usize = 1 << 20;
+const COPY_BUFFER_BYTES: usize = STREAM_CHUNK_BYTES as usize;
 /// Native canonical layouts are bounded at 64 KiB.
 const MAX_LAYOUT_BYTES: u64 = 64 * 1024;
 
@@ -136,16 +136,14 @@ pub(crate) struct CaptureStaging {
 /// Outcome of a write-once record.
 #[derive(Debug)]
 pub(crate) enum RecordCommit {
-    /// The final name is the single link of the written inode, the
-    /// temporary name is gone and the directory is synchronized.
-    Durable,
-    /// Visible under its final name, but its completed single-link layout or
-    /// its directory sync could not be established: neither durable success
-    /// nor absence. The bytes are never overwritten or removed.
+    /// The final name is the written inode's single link and the temporary is gone.
+    Complete,
+    /// Visible but single-link settlement could not be established.
+    /// The bytes are never overwritten or removed.
     Uncertain(io::Error),
 }
 
-/// A sealed disk role, synchronized and closed for writing.
+/// A disk role closed for writing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiskCopyMethod {
     Clone,
@@ -190,11 +188,8 @@ impl CaptureStaging {
     pub(crate) fn create(data_dir: &Path, capture: &LiveId) -> io::Result<Self> {
         let data = open(data_dir, directory_flags(), Mode::empty())?;
         let captures = private_child(&data, CAPTURES_DIRECTORY, false)?;
-        fsync(&data)?;
         let directory = private_child(&captures, capture.as_str(), true)?;
-        fsync(&captures)?;
         let disks = private_child(&directory, CAPTURE_DISKS_DIRECTORY, true)?;
-        fsync(&directory)?;
         Ok(Self {
             directory,
             disks,
@@ -206,7 +201,7 @@ impl CaptureStaging {
         &self.path
     }
 
-    /// `request.json`, exactly once and durable before any freeze.
+    /// Write and close `request.json` exactly once.
     pub(crate) fn write_request(&self, bytes: &[u8]) -> io::Result<Sha256Digest> {
         let mut file = File::from(openat(
             &self.directory,
@@ -216,9 +211,7 @@ impl CaptureStaging {
         )?);
         fchmod(&file, private_mode())?;
         file.write_all(bytes)?;
-        file.sync_all()?;
         drop(file);
-        fsync(&self.directory)?;
         Ok(Sha256Digest::of_bytes(bytes))
     }
 
@@ -268,14 +261,14 @@ impl CaptureStaging {
     fn locate(&self, role: &CaptureRole) -> (&OwnedFd, String) {
         match role {
             CaptureRole::Disk(name) => (&self.disks, name.file_name()),
+            CaptureRole::DiskMap(name) => (&self.disks, format!("{}.map.json", name.as_str())),
             other => (&self.directory, other.relative_path()),
         }
     }
 
-    /// Seal one writable disk: clone or sparse-copy exactly `length` bytes
-    /// from the held, paused source into a fresh private role, synchronize
-    /// it and close the writer. Holes stay holes; all-zero data is not
-    /// written into a fresh destination (which already reads as zeros).
+    /// Clone or sparse-copy exactly `length` bytes from the held paused source.
+    /// Publish its chunk map and close writers.
+    /// Holes stay holes; zero data is not written into a fresh destination.
     pub(crate) fn copy_disk(
         &self,
         role: &CaptureRole,
@@ -294,14 +287,21 @@ impl CaptureStaging {
         if cancel.is_cancelled() {
             return Err(DiskCopyError::Cancelled);
         }
-        let method = match self.clone_disk(source, &name) {
-            Ok(()) => DiskCopyMethod::Clone,
+        let (method, map) = match self.clone_disk(source, &name) {
+            Ok(()) => {
+                drop(self.reopen_disk_writer(&name)?);
+                let (cloned, _) = self.open_sealed(role)?;
+                (
+                    DiskCopyMethod::Clone,
+                    stream_disk(&cloned, None, length, cancel)?,
+                )
+            }
             Err(error) if clone_unsupported(&error) => match copy {
                 CaptureDiskCopy::Clone => return Err(DiskCopyError::CloneRequired(error)),
-                CaptureDiskCopy::Copy => {
-                    self.sparse_copy(source, &name, length, cancel)?;
-                    DiskCopyMethod::SparseCopy
-                }
+                CaptureDiskCopy::Copy => (
+                    DiskCopyMethod::SparseCopy,
+                    self.sparse_copy(source, &name, length, cancel)?,
+                ),
             },
             Err(error) => return Err(error.into()),
         };
@@ -311,11 +311,14 @@ impl CaptureStaging {
         {
             return Err(invalid("sealed disk differs in length or aliases its source").into());
         }
-        written.sync_all()?;
         drop(written);
         if source.metadata()?.len() != length {
             return Err(invalid("capture source changed length during its copy").into());
         }
+        let CaptureRole::Disk(disk) = role else {
+            return Err(invalid("disk copy requires a disk role").into());
+        };
+        self.publish_map(&CaptureRole::DiskMap(disk.clone()), &map)?;
         Ok(method)
     }
 
@@ -383,7 +386,7 @@ impl CaptureStaging {
         name: &str,
         length: u64,
         cancel: &CancellationToken,
-    ) -> Result<(), DiskCopyError> {
+    ) -> Result<StreamMap, DiskCopyError> {
         let destination = File::from(openat(
             &self.disks,
             name,
@@ -393,40 +396,13 @@ impl CaptureStaging {
         fchmod(&destination, private_mode())?;
         let total = i64::try_from(length).map_err(|_| invalid("disk length overflow"))?;
         ftruncate(&destination, total)?;
-        let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
-        let mut offset = 0u64;
-        while offset < length {
-            if cancel.is_cancelled() {
-                return Err(DiskCopyError::Cancelled);
-            }
-            let (data, end) = match next_extent(source, offset, length)? {
-                Some(extent) => extent,
-                None => break,
-            };
-            let mut position = data;
-            while position < end {
-                if cancel.is_cancelled() {
-                    return Err(DiskCopyError::Cancelled);
-                }
-                let span = usize::try_from((end - position).min(COPY_BUFFER_BYTES as u64))
-                    .map_err(|_| invalid("copy span overflow"))?;
-                let chunk = &mut buffer[..span];
-                source.read_exact_at(chunk, position)?;
-                if chunk.iter().any(|byte| *byte != 0) {
-                    destination.write_all_at(chunk, position)?;
-                }
-                position += span as u64;
-            }
-            offset = end;
-        }
-        destination.sync_all()?;
-        Ok(())
+        let map = stream_disk(source, Some(&destination), length, cancel)?;
+        Ok(map)
     }
 
-    /// Synchronize both held directories (entries of every staged role).
-    pub(crate) fn sync_directories(&self) -> io::Result<()> {
-        fsync(&self.disks)?;
-        fsync(&self.directory)?;
+    pub(crate) fn publish_map(&self, role: &CaptureRole, map: &StreamMap) -> io::Result<()> {
+        let mut output = self.create_output(role)?;
+        map.write_canonical(&mut output)?;
         Ok(())
     }
 
@@ -447,8 +423,8 @@ impl CaptureStaging {
     /// settlement), never removed.
     ///
     /// ```text
-    ///   temporary ─write,fsync─► linkat(final) ─► settle: final is ours,
-    ///   remove our temporary, single link, directory fsync ─► Durable
+    ///   temporary ─write─► linkat(final) ─► settle: final is ours,
+    ///   remove temporary, single link ─► Complete
     ///                                   └─ cannot establish ─► Uncertain
     /// ```
     ///
@@ -476,18 +452,18 @@ impl CaptureStaging {
         }
         // The final name is visible: from here no outcome removes it.
         match self.settle_record(name, temporary, identity) {
-            Ok(()) => Ok(RecordCommit::Durable),
+            Ok(()) => Ok(RecordCommit::Complete),
             Err(first) => {
                 tracing::warn!(error = %first, name, "capture record is visible but unsettled; retrying settlement once");
                 Ok(match self.settle_record(name, temporary, identity) {
-                    Ok(()) => RecordCommit::Durable,
+                    Ok(()) => RecordCommit::Complete,
                     Err(_) => RecordCommit::Uncertain(first),
                 })
             }
         }
     }
 
-    /// Create, fill and synchronize the exclusive temporary record.
+    /// Create and fill the exclusive temporary.
     fn write_temporary(&self, temporary: &str, bytes: &[u8]) -> io::Result<FileFacts> {
         let mut file = File::from(openat(
             &self.directory,
@@ -497,7 +473,6 @@ impl CaptureStaging {
         )?);
         fchmod(&file, private_mode())?;
         file.write_all(bytes)?;
-        file.sync_all()?;
         FileFacts::of(&file)
     }
 
@@ -512,11 +487,8 @@ impl CaptureStaging {
         .map_err(Into::into)
     }
 
-    /// Establish the completed layout of a linked record, then make it
-    /// durable: the final name holds exactly the written inode, the owned
-    /// temporary name is absent (removed only while it still names that
-    /// inode), the record has a single link, then the directory is synced.
-    /// A directory sync never stands in for a removal that did not happen.
+    /// Establish the completed layout: the final name holds the written inode,
+    /// the owned temporary is absent and the record has a single link.
     fn settle_record(&self, name: &str, temporary: &str, identity: FileFacts) -> io::Result<()> {
         let record = self.open_entry(name)?;
         if !same_inode(FileFacts::of(&record)?, identity) {
@@ -537,7 +509,6 @@ impl CaptureStaging {
             Err(error) => return Err(error),
         }
         validate_private_file(&record)?;
-        fsync(&self.directory)?;
         Ok(())
     }
 
@@ -616,131 +587,150 @@ fn next_extent(source: &File, offset: u64, length: u64) -> io::Result<Option<(u6
     Ok(Some((data, hole.min(length))))
 }
 
-/// Whole-file SHA-256 plus, for RAM, the ADR 0014 stream identity, in one
-/// bounded sequential pass (8 MiB RAM scratch, 1 MiB for other roles).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HashedFile {
-    pub(crate) length: u64,
-    pub(crate) sha256: Sha256Digest,
-    pub(crate) stream: Option<Sha256Digest>,
-    pub(crate) map: Option<vm_spec::capture::StreamMap>,
-    pub(crate) identity_bytes_hashed: u64,
+#[cfg(target_os = "linux")]
+fn start_writeback(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let offset = i64::try_from(offset).map_err(|_| invalid("writeback offset overflow"))?;
+    let length = i64::try_from(length).map_err(|_| invalid("writeback length overflow"))?;
+    // nix does not expose sync_file_range; this hint borrows the held fd and
+    // starts writeback only, without waiting for persistence.
+    let result = unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            offset,
+            length,
+            libc::SYNC_FILE_RANGE_WRITE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
-pub(crate) struct Hasher {
-    buffer: Vec<u8>,
-    baseline: Option<std::sync::Arc<vm_spec::capture::StreamMap>>,
-    dirty_chunks: Option<Vec<u8>>,
-}
-
-impl Hasher {
-    pub(crate) fn new() -> Self {
-        Self {
-            buffer: vec![0u8; STREAM_CHUNK_BYTES as usize],
-            baseline: None,
-            dirty_chunks: None,
-        }
+/// Copy and classify each disk chunk once. Whole holes need no reads.
+fn stream_disk(
+    source: &File,
+    destination: Option<&File>,
+    length: u64,
+    cancel: &CancellationToken,
+) -> Result<StreamMap, DiskCopyError> {
+    if cancel.is_cancelled() {
+        return Err(DiskCopyError::Cancelled);
     }
-
-    /// Whole-file SHA only, using the smaller serial-role lane scratch.
-    pub(crate) fn whole_file() -> Self {
-        Self {
-            buffer: vec![0u8; WHOLE_FILE_HASH_BUFFER_BYTES],
-            baseline: None,
-            dirty_chunks: None,
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    let mut chunks = Vec::with_capacity(length.div_ceil(STREAM_CHUNK_BYTES) as usize);
+    let mut extent = next_extent(source, 0, length)?;
+    let mut offset = 0;
+    while offset < length {
+        if cancel.is_cancelled() {
+            return Err(DiskCopyError::Cancelled);
         }
-    }
-
-    pub(crate) fn reuse(
-        &mut self,
-        baseline: std::sync::Arc<vm_spec::capture::StreamMap>,
-        dirty_chunks: Vec<u8>,
-    ) {
-        self.baseline = Some(baseline);
-        self.dirty_chunks = Some(dirty_chunks);
-    }
-    pub(crate) fn hash(
-        &mut self,
-        file: &File,
-        length: u64,
-        stream: bool,
-        cancel: &CancellationToken,
-    ) -> io::Result<HashedFile> {
-        use sha2::Digest as _;
-        if stream && self.buffer.len() as u64 != STREAM_CHUNK_BYTES {
-            return Err(invalid("stream hashing requires canonical chunk scratch"));
+        let end = (offset + STREAM_CHUNK_BYTES).min(length);
+        if extent.is_none_or(|(data, _)| data >= end) {
+            chunks.push(None);
+            offset = end;
+            continue;
         }
-        let mut whole = sha2::Sha256::new();
-        let mut identity = stream.then(StreamIdentity::new);
-        if stream {
-            if let Some(baseline) = &self.baseline {
-                if baseline.length() != length {
-                    return Err(invalid("baseline map length differs from candidate"));
-                }
-                vm_spec::capture::validate_dirty_chunks(
-                    length,
-                    self.dirty_chunks
-                        .as_deref()
-                        .ok_or_else(|| invalid("baseline lacks affected coverage"))?,
-                )
-                .map_err(invalid)?;
+        let chunk = &mut buffer[..(end - offset) as usize];
+        chunk.fill(0);
+        while let Some((data, data_end)) = extent {
+            if data >= end {
+                break;
             }
+            let start = data.max(offset);
+            let stop = data_end.min(end);
+            let bytes = &mut chunk[(start - offset) as usize..(stop - offset) as usize];
+            source.read_exact_at(bytes, start)?;
+            if let Some(destination) = destination {
+                if !vm_spec::capture::is_all_zero(bytes) {
+                    destination.write_all_at(bytes, start)?;
+                }
+                #[cfg(target_os = "linux")]
+                if let Err(error) = start_writeback(destination, start, stop - start) {
+                    tracing::debug!(%error, "capture disk writeback hint failed");
+                }
+            }
+            if data_end > end {
+                break;
+            }
+            extent = next_extent(source, data_end, length)?;
         }
-        let mut chunks = Vec::new();
-        let mut identity_bytes_hashed = 0;
-        let mut offset = 0u64;
-        while offset < length {
-            if cancel.is_cancelled() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "hashing cancelled",
+        chunks.push(if vm_spec::capture::is_all_zero(chunk) {
+            None
+        } else {
+            Some(Sha256Digest::of_bytes(chunk))
+        });
+        offset = end;
+    }
+    if source.metadata()?.len() != length {
+        return Err(invalid("disk changed length during capture").into());
+    }
+    StreamMap::new(length, chunks).map_err(|error| invalid(error).into())
+}
+
+/// Resolve writer receipts without opening RAM.
+pub(crate) fn assemble_ram_map(
+    length: u64,
+    dirty: &[u8],
+    digests: &[Option<Sha256Digest>],
+    baseline: Option<&StreamMap>,
+) -> io::Result<StreamMap> {
+    vm_spec::capture::validate_dirty_chunks(length, dirty).map_err(invalid)?;
+    let count = length.div_ceil(STREAM_CHUNK_BYTES) as usize;
+    if digests.len() != count || baseline.is_some_and(|map| map.length() != length) {
+        return Err(invalid(
+            "RAM receipt or baseline length differs from its layout",
+        ));
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for (index, digest) in digests.iter().enumerate() {
+        if dirty[index / 8] & (1 << (index % 8)) != 0 {
+            chunks.push(*digest);
+        } else {
+            if digest.is_some() {
+                return Err(invalid(
+                    "clean RAM receipt carries a non-authoritative digest",
                 ));
             }
-            let span = usize::try_from((length - offset).min(self.buffer.len() as u64))
-                .map_err(|_| invalid("hash span overflow"))?;
-            let chunk = &mut self.buffer[..span];
-            file.read_exact_at(chunk, offset)?;
-            whole.update(&*chunk);
-            if let Some(identity) = identity.as_mut() {
-                let index = chunks.len();
-                let reused = self.baseline.as_ref().filter(|_| {
-                    self.dirty_chunks
-                        .as_ref()
-                        .is_some_and(|bits| bits[index / 8] & (1 << (index % 8)) == 0)
-                });
-                let digest = if let Some(baseline) = reused {
-                    *baseline
-                        .chunks()
-                        .get(index)
-                        .ok_or_else(|| invalid("baseline chunk is missing"))?
-                } else {
-                    identity_bytes_hashed += span as u64;
-                    if chunk.iter().all(|byte| *byte == 0) {
-                        None
-                    } else {
-                        Some(Sha256Digest::of_bytes(chunk))
-                    }
-                };
-                identity.push_digest(span as u64, digest).map_err(invalid)?;
-                chunks.push(digest);
-            }
-            offset += span as u64;
+            chunks.push(
+                *baseline
+                    .and_then(|map| map.chunks().get(index))
+                    .ok_or_else(|| invalid("clean RAM chunk lacks its baseline"))?,
+            );
         }
-        if file.metadata()?.len() != length {
-            return Err(invalid("staged file changed length while hashed"));
-        }
-        Ok(HashedFile {
-            length,
-            sha256: Sha256Digest::from_bytes(whole.finalize().into()),
-            stream: identity.map(StreamIdentity::finish),
-            map: if stream {
-                Some(vm_spec::capture::StreamMap::new(length, chunks).map_err(invalid)?)
-            } else {
-                None
-            },
-            identity_bytes_hashed,
-        })
     }
+    StreamMap::new(length, chunks).map_err(invalid)
+}
+
+/// Small state roles retain whole-file SHA-256 authentication.
+pub(crate) fn hash_state(
+    file: &File,
+    length: u64,
+    cancel: &CancellationToken,
+) -> io::Result<Sha256Digest> {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    let mut buffer = vec![0; WHOLE_FILE_HASH_BUFFER_BYTES];
+    let mut offset = 0;
+    while offset < length {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "state hashing cancelled",
+            ));
+        }
+        let span = (length - offset).min(buffer.len() as u64) as usize;
+        file.read_exact_at(&mut buffer[..span], offset)?;
+        hash.update(&buffer[..span]);
+        offset += span as u64;
+    }
+    if file.metadata()?.len() != length {
+        return Err(invalid("state file changed length while hashed"));
+    }
+    Ok(Sha256Digest::from_bytes(hash.finalize().into()))
 }
 
 /// Geometry of the native canonical RAM layout (`memory-layout.json`).
@@ -827,21 +817,21 @@ pub(crate) fn parse_layout(bytes: &[u8]) -> io::Result<LayoutGeometry> {
 #[cfg(test)]
 mod tests {
     use std::fs::{File, OpenOptions};
-    use std::io::{self, Write};
+    use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
     use tokio_util::sync::CancellationToken;
     use vm_spec::capture::{
-        CaptureDiskCopy, CaptureDiskName, CaptureRole, Sha256Digest, StreamIdentity,
+        CaptureDiskCopy, CaptureDiskName, CaptureRole, Sha256Digest, StreamIdentity, StreamMap,
         CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE, CAPTURE_REQUEST_FILE,
         STREAM_CHUNK_BYTES,
     };
     use vm_spec::lifecycle::LiveId;
 
     use crate::live::staging::{
-        parse_layout, CaptureStaging, DiskCopyError, DiskCopyMethod, FileFacts, Hasher,
-        RecordCommit,
+        assemble_ram_map, parse_layout, CaptureStaging, DiskCopyError, DiskCopyMethod, FileFacts,
+        RecordCommit, COPY_BUFFER_BYTES,
     };
 
     struct Root(PathBuf);
@@ -913,7 +903,7 @@ mod tests {
                     b"first"
                 )
                 .unwrap(),
-            RecordCommit::Durable
+            RecordCommit::Complete
         ));
         assert!(
             staging
@@ -1025,11 +1015,12 @@ mod tests {
                 file.metadata().unwrap().ino()
             )
         );
-        let mut hasher = Hasher::new();
         let cancel = CancellationToken::new();
-        let left = hasher.hash(&file, length, false, &cancel).unwrap();
-        let right = hasher.hash(&sealed, length, false, &cancel).unwrap();
-        assert_eq!(left.sha256, right.sha256);
+        let left = independent_map(&file, length);
+        let right = independent_map(&sealed, length);
+        assert_eq!(left, right);
+        let map_bytes = std::fs::read(staging.path().join("disks/data0.map.json")).unwrap();
+        assert_eq!(StreamMap::decode(&map_bytes).unwrap(), left);
         if method == DiskCopyMethod::SparseCopy {
             assert!(
                 sealed.metadata().unwrap().blocks() * 512 < length,
@@ -1038,8 +1029,7 @@ mod tests {
         }
         // Raw isolation: a later source write never reaches the sealed role.
         file.write_all_at(b"after", 0).unwrap();
-        let unchanged = hasher.hash(&sealed, length, false, &cancel).unwrap();
-        assert_eq!(unchanged.sha256, right.sha256);
+        assert_eq!(independent_map(&sealed, length), right);
         assert!(
             staging
                 .copy_disk(&role, &file, length, CaptureDiskCopy::Copy, &cancel)
@@ -1103,38 +1093,6 @@ mod tests {
     }
 
     #[test]
-    fn hashing_computes_whole_file_and_stream_identity_in_one_pass() {
-        let root = root();
-        let length = 2 * STREAM_CHUNK_BYTES + 4096;
-        let file = source(&root, "ram", length, &[(STREAM_CHUNK_BYTES + 5, b"page")]);
-        let result = Hasher::new()
-            .hash(&file, length, true, &CancellationToken::new())
-            .unwrap();
-        let mut bytes = vec![0u8; length as usize];
-        file.read_exact_at(&mut bytes, 0).unwrap();
-        assert_eq!(result.sha256, Sha256Digest::of_bytes(&bytes));
-        let mut identity = StreamIdentity::new();
-        for chunk in bytes.chunks(STREAM_CHUNK_BYTES as usize) {
-            identity.push_chunk(chunk).unwrap();
-        }
-        assert_eq!(result.stream, Some(identity.finish()));
-        // Non-stream roles use smaller scratch, but authenticate the same
-        // sparse bytes and short tail independently of read chunk size.
-        let whole = Hasher::whole_file()
-            .hash(&file, length, false, &CancellationToken::new())
-            .unwrap();
-        assert_eq!(whole.length, result.length);
-        assert_eq!(whole.sha256, result.sha256);
-        assert_eq!(whole.stream, None);
-        assert!(Hasher::whole_file()
-            .hash(&file, length, true, &CancellationToken::new())
-            .is_err());
-        assert!(Hasher::new()
-            .hash(&file, length + 1, true, &CancellationToken::new())
-            .is_err());
-    }
-
-    #[test]
     fn sealed_files_must_be_private_single_link_regular_files() {
         let root = root();
         let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
@@ -1181,7 +1139,7 @@ mod tests {
         }
     }
 
-    /// Both names linked to the synchronized record: exactly the state a
+    /// Both names linked to the written record: exactly the state a
     /// failed temporary unlink after a successful `linkat` leaves behind.
     fn linked_with_temporary(staging: &CaptureStaging, bytes: &[u8]) -> FileFacts {
         let identity = staging
@@ -1200,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lingering_temporary_link_is_removed_before_the_record_is_durable() {
+    fn a_lingering_temporary_link_is_removed_before_the_record_is_complete() {
         let root = root();
         let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
         let identity = linked_with_temporary(&staging, b"sealed");
@@ -1244,7 +1202,7 @@ mod tests {
     #[test]
     fn unestablished_record_layouts_stay_uncertain_and_untouched() {
         // The temporary name was replaced by a file this commit never wrote:
-        // it is not removed, and the record is not declared durable.
+        // it is not removed, and the record is not declared complete.
         let root = root();
         let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
         let identity = linked_with_temporary(&staging, b"sealed");
@@ -1318,7 +1276,7 @@ mod tests {
                     b"sealed"
                 )
                 .unwrap(),
-            RecordCommit::Durable
+            RecordCommit::Complete
         ));
         assert_eq!(links(&staging, CAPTURE_EVIDENCE_FILE), 1);
         assert!(!staging
@@ -1327,67 +1285,147 @@ mod tests {
             .exists());
     }
 
+    fn independent_map(file: &File, length: u64) -> StreamMap {
+        let mut bytes = vec![0; length as usize];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        let chunks = bytes
+            .chunks(STREAM_CHUNK_BYTES as usize)
+            .map(|chunk| {
+                (!vm_spec::capture::is_all_zero(chunk)).then(|| Sha256Digest::of_bytes(chunk))
+            })
+            .collect();
+        let map = StreamMap::new(length, chunks).unwrap();
+        let mut identity = StreamIdentity::new();
+        for chunk in bytes.chunks(STREAM_CHUNK_BYTES as usize) {
+            identity.push_chunk(chunk).unwrap();
+        }
+        assert_eq!(map.id(), identity.finish());
+        map
+    }
+
     #[test]
-    fn incremental_identity_reuses_clean_chunks_and_resolves_explicit_zero_and_short_tail() {
-        use std::sync::Arc;
+    fn full_ram_receipt_builds_map_without_a_file() {
+        let length = 2 * STREAM_CHUNK_BYTES + 4096;
+        let digests = [
+            Some(Sha256Digest::of_bytes(b"first")),
+            None,
+            Some(Sha256Digest::of_bytes(b"tail")),
+        ];
+        let map = assemble_ram_map(length, &[0b111], &digests, None).unwrap();
+        assert_eq!(map.length(), length);
+        assert_eq!(map.chunks(), &digests);
+        let mut identity = StreamIdentity::new();
+        identity
+            .push_digest(STREAM_CHUNK_BYTES, digests[0])
+            .unwrap();
+        identity.push_digest(STREAM_CHUNK_BYTES, None).unwrap();
+        identity.push_digest(4096, digests[2]).unwrap();
+        assert_eq!(map.id(), identity.finish());
+        assert!(assemble_ram_map(length, &[0b110], &digests, None).is_err());
+        assert!(assemble_ram_map(length, &[0b111], &digests[..2], None).is_err());
+        assert!(assemble_ram_map(length, &[0b1000_0111], &digests, None).is_err());
+    }
+
+    #[test]
+    fn incremental_ram_receipt_resolves_clean_zero_and_tail_chunks() {
+        let length = 2 * STREAM_CHUNK_BYTES + 4096;
+        let old = Some(Sha256Digest::of_bytes(b"baseline"));
+        let tail = Some(Sha256Digest::of_bytes(b"new-tail"));
+        let baseline = StreamMap::new(length, vec![old, old, old]).unwrap();
+        let receipt = [None, None, tail];
+        let map = assemble_ram_map(length, &[0b110], &receipt, Some(&baseline)).unwrap();
+        assert_eq!(map.chunks(), &[old, None, tail]);
+        let unchanged = assemble_ram_map(length, &[0], &[None; 3], Some(&map)).unwrap();
+        assert_eq!(unchanged, map);
+        assert!(assemble_ram_map(length, &[0b110], &[old, None, tail], Some(&baseline)).is_err());
+        assert!(assemble_ram_map(length, &[0b110], &receipt, None).is_err());
+        let short = StreamMap::new(STREAM_CHUNK_BYTES, vec![old]).unwrap();
+        assert!(assemble_ram_map(length, &[0b110], &receipt, Some(&short)).is_err());
+    }
+
+    #[test]
+    fn capture_writes_maps_and_a_single_link_record() {
         let root = root();
         let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
-        let file = staging.create_output(&CaptureRole::Ram).unwrap();
-        let length = 2 * STREAM_CHUNK_BYTES + 4096;
-        file.set_len(length).unwrap();
-        let data = vec![0x51; STREAM_CHUNK_BYTES as usize];
-        file.write_all_at(&data, 0).unwrap();
-        file.write_all_at(&data, STREAM_CHUNK_BYTES).unwrap();
-        file.write_all_at(&[0x19; 4096], 2 * STREAM_CHUNK_BYTES)
-            .unwrap();
-        let full = Hasher::new()
-            .hash(&file, length, true, &CancellationToken::new())
-            .unwrap();
-        let baseline = Arc::new(full.map.unwrap());
-        file.write_all_at(&vec![0; STREAM_CHUNK_BYTES as usize], STREAM_CHUNK_BYTES)
-            .unwrap();
-        file.write_all_at(&[0; 4096], 2 * STREAM_CHUNK_BYTES)
-            .unwrap();
-        file.write_all_at(&[3], length - 1).unwrap();
-        let mut hasher = Hasher::new();
-        hasher.reuse(baseline.clone(), vec![0b110]);
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
+        staging.write_request(b"request").unwrap();
+        let map = StreamMap::new(4096, vec![None]).unwrap();
+        staging.publish_map(&CaptureRole::RamMap, &map).unwrap();
+        assert!(matches!(
+            staging
+                .commit_record(
+                    CAPTURE_EVIDENCE_FILE,
+                    CAPTURE_EVIDENCE_TEMPORARY_FILE,
+                    b"fork-cut",
+                )
+                .unwrap(),
+            RecordCommit::Complete
+        ));
         assert_eq!(
-            hasher
-                .hash(&file, length, true, &cancelled)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Interrupted
+            staging.read_record(CAPTURE_EVIDENCE_FILE).unwrap(),
+            b"fork-cut"
         );
-        let incremental = hasher
-            .hash(&file, length, true, &CancellationToken::new())
-            .unwrap();
-        let independently_full = Hasher::new()
-            .hash(&file, length, true, &CancellationToken::new())
-            .unwrap();
-        assert_eq!(incremental.stream, independently_full.stream);
-        assert_eq!(incremental.sha256, independently_full.sha256);
-        assert_eq!(incremental.map, independently_full.map);
-        assert_eq!(incremental.identity_bytes_hashed, STREAM_CHUNK_BYTES + 4096);
-        let map = incremental.map.unwrap();
-        assert_eq!(map.chunks()[0], baseline.chunks()[0]);
-        assert_eq!(map.chunks()[1], None);
-        assert!(map.chunks()[2].is_some());
-        let mut unchanged = Hasher::new();
-        unchanged.reuse(Arc::new(map), vec![0]);
-        let reused = unchanged
-            .hash(&file, length, true, &CancellationToken::new())
-            .unwrap();
-        assert_eq!(reused.identity_bytes_hashed, 0);
-        assert_eq!(reused.sha256, independently_full.sha256);
-        let mut bad = Hasher::new();
-        bad.reuse(baseline, vec![0x80]);
         assert_eq!(
-            bad.hash(&file, length, true, &CancellationToken::new())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
+            std::fs::read(staging.path().join("memory.map.json")).unwrap(),
+            map.canonical_bytes().unwrap()
         );
+    }
+
+    #[test]
+    fn sparse_copy_identities_cover_empty_holes_crossings_and_data_tails() {
+        let root = root();
+        let chunk = STREAM_CHUNK_BYTES;
+        type Writes<'a> = &'a [(u64, &'a [u8])];
+        let cases: &[(u64, Writes)] = &[
+            (0, &[]),
+            (1, &[]),
+            (70, &[]),
+            (2 * chunk + 19, &[]),
+            (2 * chunk + 19, &[(17, b"data before trailing hole")]),
+            (
+                4 * chunk + 19,
+                &[
+                    (chunk - 2, b"crosses a chunk boundary"),
+                    (3 * chunk + 4097, b"mixed span"),
+                    (4 * chunk + 15, b"tail"),
+                ],
+            ),
+        ];
+        for (index, (length, writes)) in cases.iter().enumerate() {
+            let file = source(&root, &format!("source-{index}"), *length, writes);
+            let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+            let map = staging
+                .sparse_copy(&file, "data0.raw", *length, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(map, independent_map(&file, *length), "case {index}");
+            let (sealed, _) = staging.open_sealed(&disk("data0")).unwrap();
+            assert_eq!(map, independent_map(&sealed, *length), "case {index}");
+        }
+    }
+
+    #[test]
+    fn sparse_copy_preserves_completed_runs_mixed_holes_and_short_tail() {
+        let root = root();
+        let length = 3 * STREAM_CHUNK_BYTES + 71;
+        let data = vec![0x91; STREAM_CHUNK_BYTES as usize + 4096];
+        let zeroes = vec![0; COPY_BUFFER_BYTES];
+        drop(source(
+            &root,
+            "copy-source",
+            length,
+            &[
+                (3, &data),
+                (STREAM_CHUNK_BYTES + (2 << 20), &zeroes),
+                (length - 3, b"end"),
+            ],
+        ));
+        let file = File::open(root.0.join("copy-source")).unwrap();
+        let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
+        let map = staging
+            .sparse_copy(&file, "data0.raw", length, &CancellationToken::new())
+            .unwrap();
+        let (sealed, facts) = staging.open_sealed(&disk("data0")).unwrap();
+        assert_eq!(facts.length, length);
+        assert_eq!(map, independent_map(&file, length));
+        assert_eq!(map, independent_map(&sealed, length));
     }
 }

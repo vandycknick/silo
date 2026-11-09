@@ -132,6 +132,7 @@ def restore_child(silo: Silo, saved: Checkpoint | str, name: str) -> dict:
     reference = saved.reference if isinstance(saved, Checkpoint) else saved
     restore(silo, reference, name, expect=0)
     child = silo.wait_ready(name)
+    assert child["durability"] == "durable", child
     if isinstance(saved, Checkpoint):
         assert child["id"] != saved.source_info["id"]
         assert child["run_id"] and child["run_id"] != saved.source_info["run_id"]

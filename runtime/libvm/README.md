@@ -683,6 +683,18 @@ children never constructed, and report capture, source continuation and each
 child independently. Wait expiry is not cancellation. Cancellation prevents new
 submissions but does not stop a child that completed activation. Running is a
 historical outcome; use ordinary machine observation for later liveness.
+
+Fork and execution-restore calls record Running before joining each child's
+independent durability barrier, and do not return with barriers still pending.
+The returned child durability is `durable` after a successful barrier or remains
+`constructed` on barrier failure; persistence failure does not stop a Running
+child. Startup recovery adopts and completes barriers for constructed children
+with live monitors or retained run leases. Adoption reconstructs the original
+barrier's private-copy and launch-artifact inventory, excluding runtime lock
+files and other unrelated machine-directory entries. It removes an incomplete
+child only after ordinary run-liveness reconciliation proves that no live owner
+remains.
+
 Capture dispatch and the durable cancellation fence share the source machine
 lock, so cancellation committed before dispatch also rejects capture retries.
 Shared monitor preparation failures before child submission become construction

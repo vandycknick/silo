@@ -39,6 +39,26 @@ pub(crate) fn write_launch_spec(path: &Path, spec: &VmSpec) -> eyre::Result<()> 
     result.with_context(|| format!("publish vm spec at {}", path.display()))
 }
 
+pub(crate) fn write_launch_spec_deferred(
+    path: &Path,
+    spec: &VmSpec,
+) -> eyre::Result<std::fs::File> {
+    let config = serde_json::to_vec_pretty(spec)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre::eyre!("launch spec has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| eyre::eyre!("launch spec has no UTF-8 name"))?;
+    let directory = crate::paths::OwnedDirectory::open_existing_root(parent)?
+        .ok_or_else(|| eyre::eyre!("launch directory disappeared"))?;
+    directory.write_file_atomic_deferred(name, &config)?;
+    directory
+        .open_file(name)?
+        .ok_or_else(|| eyre::eyre!("published launch spec disappeared"))
+}
+
 fn normalize_mount_sources(spec: &mut VmSpec, relative_mount_base: &Path) -> eyre::Result<()> {
     for mount in &mut spec.mounts {
         let resolved = resolve_mount_location(&mount.source)

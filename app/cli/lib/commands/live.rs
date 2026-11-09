@@ -1205,6 +1205,7 @@ mod tests {
                         .parse()
                         .unwrap(),
                     outcome,
+                    durability: Some(libvm::MachineDurability::Constructed),
                 })
                 .collect(),
         }
@@ -1215,6 +1216,10 @@ mod tests {
         use libvm::{ForkChildOutcome as Child, ForkSourceOutcome as Source};
         let running = || [Child::Running, Child::Running];
         let ok = result(Source::Resumed, running());
+        assert_eq!(
+            serde_json::to_value(&ok).unwrap()["children"][0]["durability"],
+            "constructed"
+        );
         silo_vm_control::fork::validate_result(&ok).unwrap();
         live_fork_status(&ok, CaptureResumePolicy::ResumeIfAcquired).unwrap();
         live_fork_status(

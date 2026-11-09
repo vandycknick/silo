@@ -1,8 +1,8 @@
 //! Framing for the private monitor↔worker lifecycle socket.
 //!
 //! One connected `AF_UNIX` stream pair per worker generation. Every frame is a
-//! four-byte big-endian length followed by 1..=16 KiB of JSON encoding one
-//! closed, tagged enum.
+//! four-byte big-endian length followed by bounded JSON encoding one closed,
+//! tagged enum.
 //!
 //! Descriptors travel only monitor→worker, only with the closed commands that
 //! carry a fixed typed set ([`RightsKind`]), and only attached to the first
@@ -33,8 +33,8 @@ use crate::virt::lifecycle::{
     LifecycleCommand, LifecycleRejection, LifecycleRights,
 };
 
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
-/// Includes the bounded 1 TiB affected bitmap and exact native producer binding.
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
+/// Includes the bounded 1 TiB chunk digest list and exact native producer binding.
 pub(crate) const MAX_FRAME: usize = vm_spec::capture::MAX_CAPTURE_RECORD_BYTES;
 /// The largest typed descriptor set of any command.
 pub(crate) const MAX_RIGHTS: usize = 5;
@@ -663,10 +663,15 @@ mod tests {
             baseline: None,
             full_reason: Some(CaptureFullReason::Requested),
             dirty_chunks: full_dirty_chunks(MAX_CAPTURE_RAM_BYTES).unwrap(),
+            chunk_digests: vec![
+                Some(vm_spec::capture::Sha256Digest::from_bytes([0xff; 32]));
+                MAX_CAPTURE_RAM_BYTES.div_ceil(vm_spec::capture::STREAM_CHUNK_BYTES)
+                    as usize
+            ],
             stats: Box::new(CaptureMemoryStats {
                 logical_bytes: MAX_CAPTURE_RAM_BYTES,
                 identity_bytes_hashed: MAX_CAPTURE_RAM_BYTES,
-                whole_file_bytes_hashed: MAX_CAPTURE_RAM_BYTES,
+                whole_file_bytes_hashed: 0,
                 ..Default::default()
             }),
         };

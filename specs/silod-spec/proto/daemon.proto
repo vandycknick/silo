@@ -523,7 +523,7 @@ message LiveActivity { string operation_id = 1; string request_id = 2; LiveComma
 message LiveLifecycle { CurrentPause current_pause = 1; LiveActivity activity = 2; LiveFailure error = 3; }
 message PauseEstablished { PauseToken token = 1; uint64 freeze_epoch = 2; GuestFreezeObservation guest = 3; bool capture_eligible = 4; }
 enum OperationKind { OPERATION_KIND_UNSPECIFIED = 0; OPERATION_KIND_PAUSE = 1; OPERATION_KIND_CAPTURE = 2; }
-// A Capture succeeds exactly when its vm.capture.json seal is durable. The cut
+// A Capture succeeds exactly when its coherent vm.capture.json record is complete. The cut
 // token is historical evidence, never current Resume authority.
 message CaptureSealed { string capture_id = 1; string evidence_sha256 = 2; PauseToken cut_token = 3; }
 message LiveOperationRecord { string operation_id = 1; OperationKind kind = 2; oneof outcome { google.protobuf.Empty in_progress = 3; PauseEstablished succeeded = 4; LiveFailure failed = 5; CaptureSealed capture_sealed = 6; } }
@@ -563,6 +563,8 @@ message CaptureMemoryEvidence {
  optional CaptureFullReason full_reason = 8;
  bytes dirty_chunks = 9;
  CaptureMemoryStats stats = 10;
+ // One entry per logical chunk: 32-byte SHA-256, or empty for zero/unaffected.
+ repeated bytes chunk_digests = 11;
 }
 message LiveCaptureSummary { string capture_id = 1; string machine_id = 2; string run_id = 3; CaptureResumePolicy resume_policy = 4; CapturePauseDisposition pause = 5; CaptureSourceOutcome source_outcome = 6; optional string source_error = 7; bool released = 8; string staging = 9; CaptureMemoryEvidence memory = 10; }
 message LiveSnapshotInfo { StorageSnapshotInfo snapshot = 1; LiveCaptureSummary capture = 2; }
@@ -604,7 +606,9 @@ message ForkChildFailure { ForkFailurePhase phase = 1; string diagnostic = 2; }
 // running records completion of this exact launch, not current machine state.
 message ForkChildOutcome { oneof outcome { google.protobuf.Empty pending = 1; google.protobuf.Empty constructing = 2; google.protobuf.Empty activating = 3; google.protobuf.Empty running = 4; ForkChildFailure failed = 5; google.protobuf.Empty cancelled = 6; string abandoned = 7; string recovery_pending = 8; } }
 // Reserved identities are named even when the child was never created.
-message ForkChildResult { uint32 index = 1; string name = 2; string machine_id = 3; string run_id = 4; ForkChildOutcome outcome = 5; }
+// Durability is independent from the historical Running completion receipt.
+enum MachineDurability { MACHINE_DURABILITY_UNSPECIFIED = 0; MACHINE_DURABILITY_CONSTRUCTED = 1; MACHINE_DURABILITY_DURABLE = 2; }
+message ForkChildResult { uint32 index = 1; string name = 2; string machine_id = 3; string run_id = 4; ForkChildOutcome outcome = 5; optional MachineDurability durability = 6; }
 message LiveForkResult { string operation_id = 1; string source_machine_id = 2; string source_run_id = 3; string capture_id = 4; ForkStage stage = 5; bool cancellation_requested = 6; ForkCaptureOutcome capture = 7; ForkSourceOutcome source = 8; RestoreResourcePolicy resources = 9; repeated ForkChildResult children = 10; }
 enum StorageCaptureKind { STORAGE_CAPTURE_KIND_UNSPECIFIED = 0; STORAGE_CAPTURE_KIND_STOPPED_STORAGE = 1; STORAGE_CAPTURE_KIND_LIVE_EXECUTION = 2; }
 // Capture provenance is catalog metadata outside snapshot identity.

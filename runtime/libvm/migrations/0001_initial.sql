@@ -72,6 +72,7 @@ BEGIN SELECT RAISE(ABORT, 'handoff binding is immutable'); END;
 CREATE TABLE machine_config (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL UNIQUE,
+    durability          TEXT NOT NULL DEFAULT 'durable' CHECK (durability IN ('constructed', 'durable')),
     config_json         BLOB NOT NULL
 );
 
@@ -79,6 +80,18 @@ CREATE TABLE machine_state (
     machine_id          TEXT PRIMARY KEY REFERENCES machine_config(id) ON DELETE CASCADE,
     status              TEXT NOT NULL,
     state_json          BLOB NOT NULL
+);
+
+-- Local-only authentication receipts. Transport always authenticates bytes anew.
+CREATE TABLE verified_object (
+    stream_sha256 TEXT PRIMARY KEY NOT NULL,
+    dev INTEGER NOT NULL,
+    ino INTEGER NOT NULL,
+    len INTEGER NOT NULL,
+    mode INTEGER NOT NULL,
+    ctime_sec INTEGER NOT NULL,
+    ctime_nsec INTEGER NOT NULL,
+    verified_at TEXT NOT NULL
 );
 
 -- Command history is immutable intent plus a separately retained response.

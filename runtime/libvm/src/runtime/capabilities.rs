@@ -1,7 +1,7 @@
 //! Machine-less discovery and the exact selection shared with monitor start.
 use std::collections::VecDeque;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,6 +166,40 @@ impl LiveCapabilityQuery {
         })
     }
 
+    pub(crate) fn reuse_cache(&mut self, previous: &Self) {
+        self.cache = previous.cache.clone();
+    }
+
+    /// Reuse discovery's byte authentication while binding the held executable
+    /// used by native inspection and launch to the same stat identity.
+    pub(crate) async fn held_executable_digest(
+        &self,
+        file: &std::fs::File,
+    ) -> Result<crate::storage::identity::ObjectDigest, LibVmError> {
+        let stat = ExecutableStat::read(&self.executable)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| discovery(error.to_string()))?;
+        if (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            (metadata.mtime(), metadata.mtime_nsec()),
+            (metadata.ctime(), metadata.ctime_nsec()),
+        ) != (stat.device, stat.inode, stat.length, stat.mtime, stat.ctime)
+        {
+            return Err(discovery("held monitor differs from capability executable"));
+        }
+        let cache = self.cache.lock().await;
+        let (_, digest) = cache
+            .executable
+            .as_ref()
+            .filter(|(known, _)| known == &stat)
+            .ok_or_else(|| discovery("monitor executable changed after capability discovery"))?;
+        crate::storage::identity::parse_hex(digest.as_bytes())
+            .map(crate::storage::identity::ObjectDigest::from_sha256)
+            .map_err(|error| discovery(error.to_string()))
+    }
     pub(crate) fn selection(&self) -> &Arc<ResolvedBackendSelection> {
         &self.selection
     }
@@ -223,36 +257,38 @@ impl LiveCapabilityQuery {
                 "capability report does not match exact backend/scenario selection",
             ));
         }
-        // Runtime host admission can change within one boot. Never cache a
-        // positive report; only immutable product exclusions are reusable.
-        if LiveOperation::ALL.iter().all(|operation| matches!(report.live.get(*operation).availability,
-            LiveAvailability::Unsupported { ref reason } if matches!(reason.code, LiveReasonCode::NotDelivered | LiveReasonCode::BackendExcluded))) {
-            if cache.entries.len() == CACHE_LIMIT { cache.entries.pop_front(); }
-            cache.entries.push_back((key, report.clone()));
+        // Discovery is process-scoped. Native inspection and launch perform
+        // admission again; repeated observations reuse the exact executable,
+        // boot and backend selection rather than executing another monitor.
+        if cache.entries.len() == CACHE_LIMIT {
+            cache.entries.pop_front();
         }
+        cache.entries.push_back((key, report.clone()));
         Ok(report)
     }
 }
 
 async fn executable_digest(path: &Path) -> Result<String, LibVmError> {
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|error| discovery(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    // The buffer crosses read awaits. Keep it out of the capability-query
-    // future embedded in machine inspection and lifecycle operations.
-    let mut buffer = vec![0u8; 16384];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .await
-            .map_err(|error| discovery(error.to_string()))?;
-        if count == 0 {
-            break;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(path).map_err(|error| discovery(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut offset = 0u64;
+        loop {
+            let count = match file.read_at(&mut buffer, offset) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(discovery(error.to_string())),
+            };
+            hasher.update(&buffer[..count]);
+            offset += count as u64;
         }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(hex(&hasher.finalize()))
+        Ok(hex(&hasher.finalize()))
+    })
+    .await
+    .map_err(|error| discovery(format!("executable digest worker stopped: {error}")))?
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -434,6 +470,55 @@ mod tests {
     use std::future::Future;
     use vm_spec::live::LiveBackend;
 
+    #[tokio::test]
+    async fn restore_discovery_reuses_supported_report_and_executable_digest() {
+        use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};
+        let temporary = tempfile::tempdir().unwrap();
+        let scenario_path = temporary.path().join("scenario.json");
+        let supported = LiveCapability {
+            native: true,
+            availability: LiveAvailability::Supported,
+        };
+        test_utils::Scenario {
+            live: Some(test_utils::LiveScenario {
+                lane: LiveLane::KvmX86_64,
+                host: LiveCapabilityVector {
+                    pause: supported.clone(),
+                    capture: supported.clone(),
+                    restore: supported.clone(),
+                    fork: supported.clone(),
+                    incremental: supported,
+                },
+                machine: None,
+            }),
+            ..test_utils::Scenario::default()
+        }
+        .write_to(&scenario_path)
+        .unwrap();
+        let config = crate::RuntimeConfig::local(temporary.path().join("home"))
+            .with_supervisor_path(test_utils::mock_vmm_binary())
+            .with_mock_vmm(&scenario_path);
+        let query = crate::LiveCapabilityQuery::open(&config).unwrap();
+        let first = query.host_report().await.unwrap();
+        let file = std::fs::File::open(test_utils::mock_vmm_binary()).unwrap();
+        let digest = query.held_executable_digest(&file).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(query.host_report().await.unwrap(), first);
+            assert_eq!(query.held_executable_digest(&file).await.unwrap(), digest);
+        }
+        let mut initialized = crate::LiveCapabilityQuery::open(&config).unwrap();
+        initialized.reuse_cache(&query);
+        assert_eq!(initialized.host_report().await.unwrap(), first);
+        let cache = query.cache.lock().await;
+        assert_eq!(
+            cache.entries.len(),
+            1,
+            "supported restore must take the cache-hit path"
+        );
+        assert_eq!(cache.executable.as_ref().unwrap().1, digest.hex());
+        assert!(!temporary.path().join("home").exists());
+    }
+
     #[test]
     fn live_capabilities_scenario_selection_is_exact_and_missing_never_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -473,7 +558,8 @@ mod tests {
     async fn executable_digest_hashes_empty_files_and_partial_final_buffers() {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("monitor");
-        for contents in [Vec::new(), vec![0x5a; 2 * 16384 + 19]] {
+        for length in [0, 1, 65535, 65536, 65537, 2 * 65536 + 19] {
+            let contents: Vec<_> = (0..length).map(|index| (index % 251) as u8).collect();
             std::fs::write(&executable, &contents).unwrap();
             assert_eq!(
                 executable_digest(&executable).await.unwrap(),

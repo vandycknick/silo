@@ -131,14 +131,32 @@ impl Runtime {
 
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
+        Self::open_with_capability_query(config, None).await
+    }
+
+    /// Initialize using the process's observation-only discovery cache.
+    pub async fn new_with_capability_query(
+        config: RuntimeConfig,
+        query: crate::LiveCapabilityQuery,
+    ) -> Result<Self, LibVmError> {
+        Self::open_with_capability_query(config, Some(query)).await
+    }
+
+    async fn open_with_capability_query(
+        config: RuntimeConfig,
+        query: Option<crate::LiveCapabilityQuery>,
+    ) -> Result<Self, LibVmError> {
         let components = resolve_components(&config)?;
         let selection = crate::runtime::capabilities::ResolvedBackendSelection::resolve(
             config.virt_backend.as_ref(),
         )?;
-        let live_query = crate::runtime::capabilities::LiveCapabilityQuery::resolved(
+        let mut live_query = crate::runtime::capabilities::LiveCapabilityQuery::resolved(
             components.supervisor().to_path_buf(),
             selection,
         )?;
+        if let Some(query) = query {
+            live_query.reuse_cache(&query);
+        }
         live_query.host_report().await?;
         let roots = config.resolve_roots()?;
         let store = Store::open(&roots.state_db_path()).await?;
@@ -156,7 +174,8 @@ impl Runtime {
             Some(Arc::new(observation_store)),
         )
         .await?;
-        // Capture-aware recovery: a crash after a durable seal must still
+        runtime.recover_constructed_children().await?;
+        // Capture-aware recovery: a crash after a coherent record must still
         // publish, and an ended unsealed attempt is abandoned. Captures of a
         // live run stay owned by it. Uncertainty is retained, never fatal.
         if let Err(error) = crate::machine::live_capture::reconcile_captures(&runtime, None).await {
@@ -166,6 +185,59 @@ impl Runtime {
             tracing::warn!(%error, "live fork recovery retained uncertainty");
         }
         Ok(runtime)
+    }
+
+    async fn recover_constructed_children(&self) -> Result<(), LibVmError> {
+        let store = self.native_store()?;
+        for id in store.constructed_machines().await? {
+            let (lock, config) = match self.lock_machine_config(id).await {
+                Ok(locked) => locked,
+                Err(LibVmError::MachineNotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            if store.machine_durability(id).await? != Some(crate::MachineDurability::Constructed) {
+                continue;
+            }
+            // The ordinary recovery path proves both monitor and storage-lease
+            // termination. A live or uncertain owner must never be killed.
+            let status = self.reconcile_machine_runtime_locked(&config).await?;
+            if status.is_active()
+                || !MachineLifetimeLock::available_existing(
+                    &self.machine_paths(id).vmm_lock_path(),
+                )?
+            {
+                tracing::info!(machine = %id, "adopting running child's durability barrier");
+                let barrier = match crate::machine::builder::ChildDurability::adopt(self, &config)
+                    .await
+                {
+                    Ok(barrier) => barrier.spawn(),
+                    Err(error) => {
+                        tracing::warn!(machine = %id, %error, "live child durability adoption failed");
+                        continue;
+                    }
+                };
+                drop(lock);
+                match barrier.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(machine = %id, %error, "adopted child durability barrier failed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(machine = %id, %error, "adopted child durability task failed");
+                    }
+                }
+                continue;
+            }
+            drop(lock);
+            tracing::warn!(machine = %id, "deleting child without completed durability after restart");
+            // Removal rechecks liveness under its own lock. A concurrent start
+            // wins over cleanup, rather than being killed by recovery.
+            match Machine::new(self.clone(), id).remove().await {
+                Ok(()) | Err(LibVmError::MachineAlreadyRunning { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Opens the default local runtime from the process environment.
@@ -333,6 +405,12 @@ impl Runtime {
     /// Host-scoped capabilities for this runtime's frozen next-start selection.
     pub async fn live_capabilities(&self) -> Result<vm_spec::live::LiveHostReport, LibVmError> {
         self.live_query.host_report().await
+    }
+
+    /// Reuse this runtime's stat-keyed executable digest for observation-only
+    /// preflight gates. Each host report still probes mutable host admission.
+    pub fn live_capability_query(&self) -> &crate::runtime::capabilities::LiveCapabilityQuery {
+        &self.live_query
     }
 
     /// Observe through the initialized pool without reopening/recovering storage.
@@ -1953,6 +2031,7 @@ impl Runtime {
         config: &MachineConfig,
         run_id: &str,
         egress_credentials: &crate::secrets::ResolvedSecrets,
+        durability: crate::MachineDurability,
     ) -> Result<VmmNetworkAttachment, LibVmError> {
         prepare_network_runtime(
             &self.paths,
@@ -1962,6 +2041,7 @@ impl Runtime {
             &self.networking,
             self.components.netd(),
             egress_credentials,
+            durability,
         )
         .await
     }
@@ -2538,6 +2618,13 @@ impl Runtime {
             provision_report,
             state,
         );
+        if let Some(store) = self.optional_native_store() {
+            data.durability = store.machine_durability(machine_id).await?.ok_or_else(|| {
+                LibVmError::MachineNotFound {
+                    reference: machine_id.to_string(),
+                }
+            })?;
+        }
         data.storage = storage;
         data.storage_stop_outcome = data.storage.as_ref().map(|storage| storage.stop_outcome);
         data.boot_profile = data.storage.as_ref().map(|storage| storage.boot.clone());

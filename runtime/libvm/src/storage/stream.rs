@@ -3,12 +3,12 @@
 //! File scans use one chunk buffer and one monotonic extent cursor. Ordinary
 //! scans do no byte hashing proportional to hole length; optional whole-file
 //! SHA-256 also feeds logical holes without reading them from the filesystem.
-//! Streaming output is independently authenticated before the caller syncs and
-//! publishes it; allocation, physical reads and logical hashing are separate costs.
+//! Streaming copies authenticate their source chunks while writing; durability
+//! and publication belong to the caller.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -143,20 +143,11 @@ pub struct StreamStats {
 pub struct StreamScan {
     pub map: StreamMap,
     pub stats: StreamStats,
-    /// Independent completed-output scan for streaming copies.
-    pub verification_stats: Option<StreamStats>,
 }
 
-/// Costs of copying an already authenticated source and independently
-/// authenticating its completed output. Source hashes are reused, not rerun.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamCopyScan {
-    pub stats: StreamStats,
-    pub verification_stats: StreamStats,
-}
-
-/// An operation-scoped byte-authenticated map, inseparable from its held inode.
-/// Only the scanner can construct one; reopening shares the map, not an OFD.
+/// An operation-scoped stream map, inseparable from its held inode. Receipt
+/// constructors require the caller to supply trusted map authority; byte
+/// authentication must complete before publishing or starting the consumer.
 pub(crate) struct AuthenticatedStream {
     file: File,
     fingerprint: SourceFingerprint,
@@ -164,6 +155,34 @@ pub(crate) struct AuthenticatedStream {
 }
 
 impl AuthenticatedStream {
+    /// Adopt a structurally verified receipt while byte authentication runs
+    /// concurrently. This does not independently authenticate the file's bytes.
+    pub(crate) fn from_receipt(file: File, map: StreamMap) -> Result<Self, StorageError> {
+        let fingerprint = SourceFingerprint::new(&file.metadata()?);
+        Self::from_verified_fingerprint(file, Arc::new(map), fingerprint)
+    }
+
+    /// Reuse authentication authority for the exact inode state supplied by
+    /// the caller, without reading its bytes again.
+    pub(crate) fn from_verified_fingerprint(
+        file: File,
+        map: Arc<StreamMap>,
+        fingerprint: SourceFingerprint,
+    ) -> Result<Self, StorageError> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.len() != map.length()
+            || SourceFingerprint::new(&metadata) != fingerprint
+        {
+            return Err(invalid_data("verified stream fingerprint or geometry changed").into());
+        }
+        Ok(Self {
+            file,
+            fingerprint,
+            map,
+        })
+    }
+
     pub(crate) fn file(&self) -> &File {
         &self.file
     }
@@ -226,10 +245,52 @@ pub(crate) fn whole_file_sha256(file: &File) -> Result<Sha256Digest, StorageErro
     Ok(Sha256Digest::from_bytes(hash.finalize().into()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyWriteback {
+    Buffered,
+    Direct,
+}
+
+const COPY_BLOCK_SIZE: usize = 4096;
+
+#[repr(C, align(4096))]
+#[derive(Clone)]
+struct AlignedBlock([u8; COPY_BLOCK_SIZE]);
+
+struct ChunkBuffer(Vec<AlignedBlock>);
+
+impl Deref for ChunkBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // AlignedBlock has exactly one initialized 4096-byte array and no
+        // padding. The vector owns contiguous blocks for this borrow.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!((*self.0.as_ptr()).0).cast::<u8>(),
+                self.0.len() * COPY_BLOCK_SIZE,
+            )
+        }
+    }
+}
+
+impl DerefMut for ChunkBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // The exclusive vector borrow also exclusively owns all block bytes.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                std::ptr::addr_of_mut!((*self.0.as_mut_ptr()).0).cast::<u8>(),
+                self.0.len() * COPY_BLOCK_SIZE,
+            )
+        }
+    }
+}
+
 /// Reuses one fixed 8 MiB allocation across chunks and successive streams.
 /// The decoded map is bounded by the 4 TiB artifact admission bound.
 pub struct StreamHasher {
-    buffer: Vec<u8>,
+    buffer: ChunkBuffer,
+    writeback: CopyWriteback,
 }
 
 impl Default for StreamHasher {
@@ -240,8 +301,16 @@ impl Default for StreamHasher {
 
 impl StreamHasher {
     pub fn new() -> Self {
+        Self::with_writeback(CopyWriteback::Buffered)
+    }
+
+    pub(crate) fn with_writeback(writeback: CopyWriteback) -> Self {
         Self {
-            buffer: vec![0; CHUNK_SIZE],
+            buffer: ChunkBuffer(vec![
+                AlignedBlock([0; COPY_BLOCK_SIZE]);
+                CHUNK_SIZE / COPY_BLOCK_SIZE
+            ]),
+            writeback,
         }
     }
 
@@ -327,85 +396,39 @@ impl StreamHasher {
         ))
     }
 
-    /// Reuse source map authority, never destination verification. Read every
-    /// reported data extent, even in a map-zero chunk, so copying does not
-    /// silently discard bytes if the authenticated source has changed.
+    /// Compare the copy-time canonical chunk map with the recorded source map.
+    /// Read every data extent, including map-zero chunks, so changed source
+    /// bytes cannot be silently omitted. The completed output is not re-read.
     pub(crate) fn copy_authenticated(
         &mut self,
         source: &AuthenticatedStream,
         output: &File,
-    ) -> Result<StreamCopyScan, StorageError> {
-        let length = source.length();
-        Resource::ArtifactStreamBytes.check(length)?;
+    ) -> Result<StreamScan, StorageError> {
         let metadata = source.file().metadata()?;
-        if !metadata.is_file()
-            || metadata.len() != length
-            || SourceFingerprint::new(&metadata) != source.fingerprint()
-        {
+        if SourceFingerprint::new(&metadata) != source.fingerprint() {
             return Err(invalid_data("authenticated copy source changed").into());
         }
-        let flags = OFlag::from_bits_truncate(fcntl(source.file(), FcntlArg::F_GETFL)?);
-        if flags & OFlag::O_ACCMODE == OFlag::O_WRONLY {
-            return Err(invalid_data("stream source requires read access").into());
-        }
         validate_copy_output(&metadata, output)?;
-        let mut stats = StreamStats {
-            allocated_bytes: metadata
-                .blocks()
-                .checked_mul(512)
-                .ok_or_else(|| invalid_data("allocated stream length overflow"))?,
-            ..StreamStats::default()
-        };
-        let mut extents = Extents::new(source.file(), length);
-        let mut data = extents.next(0)?;
-        let mut offset = 0;
-        while offset < length {
-            let end = (offset + CHUNK_SIZE as u64).min(length);
-            if data.as_ref().is_none_or(|range| range.start >= end) {
-                offset = end;
-                continue;
-            }
-            let bytes = &mut self.buffer[..(end - offset) as usize];
-            bytes.fill(0);
-            while let Some(range) = data.as_ref() {
-                if range.start >= end {
-                    break;
-                }
-                let start = range.start;
-                let read_end = range.end.min(end);
-                let extent_end = range.end;
-                read_exact_at(
-                    source.file(),
-                    &mut bytes[(start - offset) as usize..(read_end - offset) as usize],
-                    start,
-                )?;
-                stats.bytes_read += read_end - start;
-                data = if read_end == extent_end {
-                    extents.next(read_end)?
-                } else {
-                    Some(read_end..extent_end)
-                };
-            }
-            write_sparse_at(output, bytes, offset)?;
-            offset = end;
-        }
-        stats.extent_queries = extents.queries;
-        output.set_len(length)?;
-        let verification = self.hash_open_file(output, length)?;
-        if verification.map != *source.map() {
-            return Err(invalid_data("completed stream output does not match source map").into());
+        let scan = self.scan_file(
+            source.file(),
+            source.length(),
+            Some(output),
+            Extents::new(source.file(), source.length()),
+            None,
+        )?;
+        if scan.map != *source.map() {
+            return Err(
+                invalid_data("copy-time stream chunks do not match source identity").into(),
+            );
         }
         if SourceFingerprint::new(&source.file().metadata()?) != source.fingerprint() {
-            return Err(invalid_data("stream source changed during output verification").into());
+            return Err(invalid_data("stream source changed during copy").into());
         }
-        Ok(StreamCopyScan {
-            stats,
-            verification_stats: verification.stats,
-        })
+        output.set_len(source.length())?;
+        Ok(scan)
     }
 
-    /// Copy to a fresh empty read/write staging file, then independently scan
-    /// the completed output and compare the complete logical map and length.
+    /// Copy to a fresh staging file and compute the canonical map while writing.
     /// File/directory synchronization and publication belong to the caller.
     pub fn copy_file_and_hash(
         &mut self,
@@ -415,7 +438,7 @@ impl StreamHasher {
     ) -> Result<StreamScan, StorageError> {
         let source_metadata = source.metadata()?;
         validate_copy_output(&source_metadata, output)?;
-        let mut scan = self.scan_file(
+        let scan = self.scan_file(
             source,
             length,
             Some(output),
@@ -424,14 +447,9 @@ impl StreamHasher {
         )?;
         // A trailing hole does not otherwise extend the completed file.
         output.set_len(length)?;
-        let verification = self.hash_open_file(output, length)?;
-        if verification.map != scan.map {
-            return Err(invalid_data("completed stream output does not match source map").into());
-        }
         if SourceFingerprint::new(&source_metadata) != SourceFingerprint::new(&source.metadata()?) {
-            return Err(invalid_data("stream source changed during output verification").into());
+            return Err(invalid_data("stream source changed during copy").into());
         }
-        scan.verification_stats = Some(verification.stats);
         Ok(scan)
     }
 
@@ -443,6 +461,9 @@ impl StreamHasher {
         mut extents: Extents<'_>,
         mut sha256: Option<&mut Sha256>,
     ) -> Result<StreamScan, StorageError> {
+        let mut output = output
+            .map(|file| CopyOutput::new(file, self.writeback))
+            .transpose()?;
         Resource::ArtifactStreamBytes.check(length)?;
         let metadata = source.metadata()?;
         if !metadata.is_file() || metadata.len() != length {
@@ -476,7 +497,13 @@ impl StreamHasher {
                 offset = end;
                 continue;
             }
-            let bytes = &mut self.buffer[..(end - offset) as usize];
+            let logical_length = (end - offset) as usize;
+            let buffer_length = if output.as_ref().is_some_and(|output| output.direct) {
+                logical_length.div_ceil(COPY_BLOCK_SIZE) * COPY_BLOCK_SIZE
+            } else {
+                logical_length
+            };
+            let bytes = &mut self.buffer[..buffer_length];
             bytes.fill(0);
             while let Some(range) = data.as_ref() {
                 if range.start >= end {
@@ -498,18 +525,27 @@ impl StreamHasher {
                 };
             }
             if let Some(sha256) = sha256.as_mut() {
-                sha256.update(&*bytes);
-                stats.whole_bytes_hashed += bytes.len() as u64;
+                sha256.update(&bytes[..logical_length]);
+                stats.whole_bytes_hashed += logical_length as u64;
             }
-            let chunk = classify_chunk(bytes);
+            let chunk = classify_chunk(&bytes[..logical_length]);
             if matches!(chunk, Chunk::Data(_)) {
-                stats.logical_bytes_hashed += bytes.len() as u64;
-                if let Some(output) = output {
-                    write_sparse_at(output, bytes, offset)?;
+                stats.logical_bytes_hashed += logical_length as u64;
+                if let Some(output) = output.as_mut() {
+                    output.write(bytes, offset)?;
+                    #[cfg(target_os = "linux")]
+                    if !output.direct {
+                        if let Err(error) = start_writeback(output.file, offset, end - offset) {
+                            tracing::debug!(%error, offset, length = end - offset, "start private copy writeback");
+                        }
+                    }
                 }
             }
             chunks.push(chunk);
             offset = end;
+        }
+        if let Some(output) = output {
+            output.finish()?;
         }
         if fingerprint != SourceFingerprint::new(&source.metadata()?) {
             return Err(invalid_data("stream source changed during scan").into());
@@ -518,7 +554,6 @@ impl StreamHasher {
         Ok(StreamScan {
             map: StreamMap::new(length, chunks)?,
             stats,
-            verification_stats: None,
         })
     }
 
@@ -549,8 +584,8 @@ impl StreamHasher {
 fn validate_copy_output(source: &std::fs::Metadata, output: &File) -> Result<(), StorageError> {
     let metadata = output.metadata()?;
     let flags = OFlag::from_bits_truncate(fcntl(output, FcntlArg::F_GETFL)?);
-    if flags.contains(OFlag::O_APPEND) || flags & OFlag::O_ACCMODE != OFlag::O_RDWR {
-        return Err(invalid_data("stream output requires non-append read/write access").into());
+    if flags.contains(OFlag::O_APPEND) || flags & OFlag::O_ACCMODE == OFlag::O_RDONLY {
+        return Err(invalid_data("stream output requires non-append write access").into());
     }
     if !metadata.is_file()
         || metadata.len() != 0
@@ -562,7 +597,7 @@ fn validate_copy_output(source: &std::fs::Metadata, output: &File) -> Result<(),
 }
 
 fn classify_chunk(bytes: &[u8]) -> Chunk {
-    if bytes.iter().all(|byte| *byte == 0) {
+    if vm_spec::capture::is_all_zero(bytes) {
         Chunk::Zero
     } else {
         Chunk::Data(ObjectDigest::of_bytes(bytes))
@@ -689,6 +724,126 @@ fn write_exact_at(file: &File, mut bytes: &[u8], mut offset: u64) -> io::Result<
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn start_writeback(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let offset = i64::try_from(offset).map_err(|_| invalid_data("writeback offset overflow"))?;
+    let length = i64::try_from(length).map_err(|_| invalid_data("writeback length overflow"))?;
+    // nix has no sync_file_range wrapper. This only hints writeback, not durability.
+    // SAFETY: the held descriptor and checked ranges remain valid for this call.
+    let result = unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            offset,
+            length,
+            libc::SYNC_FILE_RANGE_WRITE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+struct CopyOutput<'a> {
+    file: &'a File,
+    original_flags: OFlag,
+    configured: bool,
+    direct: bool,
+}
+
+impl<'a> CopyOutput<'a> {
+    fn new(file: &'a File, writeback: CopyWriteback) -> io::Result<Self> {
+        let original_flags = if writeback == CopyWriteback::Direct {
+            OFlag::from_bits_truncate(fcntl(file, FcntlArg::F_GETFL)?)
+        } else {
+            OFlag::empty()
+        };
+        let direct = if writeback == CopyWriteback::Direct {
+            match set_direct(file, original_flags, true) {
+                Ok(()) => true,
+                Err(error) if error.raw_os_error() == Some(Errno::EINVAL as i32) => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        Ok(Self {
+            file,
+            original_flags,
+            configured: direct,
+            direct,
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8], offset: u64) -> io::Result<()> {
+        match write_sparse_at(self.file, bytes, offset) {
+            Err(error) if self.direct && error.raw_os_error() == Some(Errno::EINVAL as i32) => {
+                // Retry the same bytes at the same offsets. A partial direct
+                // write cannot change the chunk identity or omit its suffix.
+                set_direct(self.file, self.original_flags, false)?;
+                self.direct = false;
+                write_sparse_at(self.file, bytes, offset)
+            }
+            result => result,
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if self.configured {
+            restore_copy_flags(self.file, self.original_flags)?;
+            self.configured = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CopyOutput<'_> {
+    fn drop(&mut self) {
+        if self.configured {
+            if let Err(error) = restore_copy_flags(self.file, self.original_flags) {
+                tracing::warn!(%error, "restore private copy descriptor flags");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_direct(file: &File, flags: OFlag, enabled: bool) -> io::Result<()> {
+    let flags = if enabled {
+        flags | OFlag::O_DIRECT
+    } else {
+        flags & !OFlag::O_DIRECT
+    };
+    fcntl(file, FcntlArg::F_SETFL(flags))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn restore_copy_flags(file: &File, flags: OFlag) -> io::Result<()> {
+    fcntl(file, FcntlArg::F_SETFL(flags))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_direct(file: &File, _flags: OFlag, enabled: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // nix has no F_NOCACHE argument. This controls only our fresh private file.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, i32::from(enabled)) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restore_copy_flags(file: &File, flags: OFlag) -> io::Result<()> {
+    set_direct(file, flags, false)
+}
+
 pub(crate) fn write_sparse_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
     // Bounded subchunk runs avoid materializing 8 MiB for a single tiny write.
     // Adjacent nonzero blocks share one write; allocation granularity remains
@@ -697,7 +852,7 @@ pub(crate) fn write_sparse_at(file: &File, bytes: &[u8], offset: u64) -> io::Res
     let mut run = None;
     for (index, block) in bytes.chunks(BLOCK).enumerate() {
         let start = index * BLOCK;
-        if block.iter().any(|byte| *byte != 0) {
+        if !vm_spec::capture::is_all_zero(block) {
             if run.is_none() {
                 run = Some(start);
             }
@@ -734,7 +889,7 @@ mod tests {
     use crate::storage::identity::ObjectDigest;
     use crate::storage::limits::CHUNK_SIZE;
     use crate::storage::stream::{
-        read_exact_at, write_exact_at, Chunk, Extents, StreamHasher, StreamMap,
+        read_exact_at, write_exact_at, AuthenticatedStream, Chunk, Extents, StreamHasher, StreamMap,
     };
     use crate::storage::StorageError;
 
@@ -962,7 +1117,6 @@ mod tests {
             .unwrap();
         assert_eq!(scan.map, expected);
         assert_eq!(scan.stats.logical_bytes_hashed, bytes.len() as u64);
-        assert!(scan.verification_stats.is_some());
         assert_eq!(output.metadata().unwrap().len(), bytes.len() as u64);
         assert!(output.metadata().unwrap().blocks() * 512 < CHUNK_SIZE as u64);
         let mut actual = vec![0; bytes.len()];
@@ -993,7 +1147,6 @@ mod tests {
             assert_eq!(scan.map.length(), length);
             assert!(scan.map.chunks().iter().all(|chunk| *chunk == Chunk::Zero));
             assert_eq!(scan.stats.logical_bytes_hashed, 0);
-            assert_eq!(scan.verification_stats.unwrap().logical_bytes_hashed, 0);
             assert_eq!(output.metadata().unwrap().blocks(), 0);
         }
         let source = tempfile::tempfile().unwrap();
@@ -1052,11 +1205,6 @@ mod tests {
         assert_eq!(scan.stats.logical_bytes_hashed, 3 * CHUNK_SIZE as u64);
         assert!(scan.stats.allocated_bytes < 1024 * 1024);
         assert!(scan.stats.extent_queries <= 16);
-        let verified = scan.verification_stats.unwrap();
-        assert!(verified.bytes_read < 1024 * 1024);
-        assert_eq!(verified.logical_bytes_hashed, 3 * CHUNK_SIZE as u64);
-        assert!(verified.allocated_bytes < 1024 * 1024);
-        assert!(verified.extent_queries <= 16);
         assert_eq!(output.metadata().unwrap().len(), length);
         for (offset, bytes) in writes {
             let mut actual = vec![0; bytes.len()];
@@ -1209,13 +1357,8 @@ mod tests {
         assert_eq!(reopened_position.stream_position().unwrap(), 0);
         let output = tempfile::tempfile().unwrap();
         let scan = hasher.copy_authenticated(&reopened, &output).unwrap();
-        assert_eq!(scan.stats.logical_bytes_hashed, 0);
+        assert_eq!(scan.stats.logical_bytes_hashed, CHUNK_SIZE as u64 + 19);
         assert_eq!(scan.stats.whole_bytes_hashed, 0);
-        assert_eq!(
-            scan.verification_stats.logical_bytes_hashed,
-            CHUNK_SIZE as u64 + 19
-        );
-        assert_eq!(scan.verification_stats.whole_bytes_hashed, 0);
         assert_eq!(output.metadata().unwrap().len(), length);
         assert!(output.metadata().unwrap().blocks() * 512 < CHUNK_SIZE as u64);
         assert_eq!(
@@ -1241,7 +1384,6 @@ mod tests {
             let output = tempfile::tempfile().unwrap();
             let scan = hasher.copy_authenticated(&authenticated, &output).unwrap();
             assert_eq!(scan.stats.logical_bytes_hashed, 0);
-            assert_eq!(scan.verification_stats.logical_bytes_hashed, 0);
             assert_eq!(output.metadata().unwrap().len(), length);
             assert_eq!(output.metadata().unwrap().blocks(), 0);
         }
@@ -1260,7 +1402,7 @@ mod tests {
         let error = hasher
             .copy_authenticated(&authenticated, &output)
             .unwrap_err();
-        assert!(error.to_string().contains("completed stream output"));
+        assert!(error.to_string().contains("copy-time stream chunks"));
         let mut bytes = [0; 3];
         output.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(&bytes, b"abc");
@@ -1287,6 +1429,67 @@ mod tests {
     }
 
     #[test]
+    fn receipt_copy_rejects_corrupt_source_without_reading_output() {
+        let mut hasher = StreamHasher::new();
+        let source = tempfile::tempfile().unwrap();
+        source.write_all_at(b"original", 0).unwrap();
+        let expected = hasher.hash_open_file(&source, 8).unwrap().map;
+        source.write_all_at(b"corrupt!", 0).unwrap();
+        let receipt = AuthenticatedStream::from_receipt(source, expected).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        // An output read-back would fail with EBADF, not an identity mismatch.
+        let output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(directory.path().join("private"))
+            .unwrap();
+        let error = hasher.copy_authenticated(&receipt, &output).unwrap_err();
+        assert!(error.to_string().contains("copy-time stream chunks"));
+        let good = hasher.hash_open_file(receipt.file(), 8).unwrap().map;
+        let receipt =
+            AuthenticatedStream::from_receipt(receipt.file().try_clone().unwrap(), good).unwrap();
+        let output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(directory.path().join("good"))
+            .unwrap();
+        assert!(hasher.copy_authenticated(&receipt, &output).is_ok());
+    }
+
+    #[test]
+    fn trusted_stream_constructors_bind_exact_inode_state_and_geometry() {
+        use std::sync::Arc;
+
+        use crate::storage::identity_file::SourceFingerprint;
+
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(b"abc", 0).unwrap();
+        let map = Arc::new(StreamHasher::new().hash_open_file(&file, 3).unwrap().map);
+        let fingerprint = SourceFingerprint::new(&file.metadata().unwrap());
+        let held = AuthenticatedStream::from_verified_fingerprint(
+            file.try_clone().unwrap(),
+            Arc::clone(&map),
+            fingerprint,
+        )
+        .unwrap();
+        assert_eq!(held.map(), map.as_ref());
+        let other = tempfile::tempfile().unwrap();
+        other.write_all_at(b"abc", 0).unwrap();
+        assert!(AuthenticatedStream::from_verified_fingerprint(
+            other,
+            Arc::clone(&map),
+            fingerprint,
+        )
+        .is_err());
+        let wrong_length = StreamMap::new(2, vec![Chunk::Zero]).unwrap();
+        assert!(
+            AuthenticatedStream::from_receipt(file.try_clone().unwrap(), wrong_length,).is_err()
+        );
+        file.set_len(4).unwrap();
+        assert!(AuthenticatedStream::from_verified_fingerprint(file, map, fingerprint).is_err());
+    }
+
+    #[test]
     fn authenticated_source_reopen_and_owned_metadata_refresh_fail_closed() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1308,5 +1511,76 @@ mod tests {
         std::fs::write(&renamed, b"changed").unwrap();
         assert!(authenticated.refresh_after_owned_metadata_change().is_err());
         assert!(authenticated.reopen(File::open(&renamed).unwrap()).is_err());
+    }
+    #[test]
+    fn direct_copy_keeps_exact_chunk_identity_sparse_tails_and_descriptor_flags() {
+        use crate::storage::stream::CopyWriteback;
+        use nix::fcntl::{fcntl, FcntlArg};
+
+        let mut hasher = StreamHasher::with_writeback(CopyWriteback::Direct);
+        assert!((hasher.buffer.as_ptr() as usize).is_multiple_of(4096));
+        assert_eq!(hasher.buffer.len(), CHUNK_SIZE);
+        for length in [0, 1, 4095, 4096, 4097, CHUNK_SIZE + 19] {
+            let mut bytes = vec![0; length];
+            if length != 0 {
+                bytes[0] = 0x41;
+                bytes[length - 1] = 0x42;
+            }
+            let source = tempfile::tempfile().unwrap();
+            source.write_all_at(&bytes, 0).unwrap();
+            let expected = StreamHasher::new().hash_reader(bytes.as_slice()).unwrap();
+            let receipt = AuthenticatedStream::from_receipt(source, expected.clone()).unwrap();
+            let output = tempfile::tempfile().unwrap();
+            let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
+            let scan = hasher.copy_authenticated(&receipt, &output).unwrap();
+            assert_eq!(scan.map, expected);
+            assert_eq!(scan.stats.whole_bytes_hashed, 0);
+            assert_eq!(output.metadata().unwrap().len(), length as u64);
+            assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
+            let mut actual = vec![0; length];
+            output.read_exact_at(&mut actual, 0).unwrap();
+            assert_eq!(actual, bytes);
+        }
+    }
+
+    #[test]
+    fn direct_copy_retries_real_unaligned_einval_and_restores_flags() {
+        use crate::storage::stream::{CopyOutput, CopyWriteback};
+        use nix::fcntl::{fcntl, FcntlArg};
+
+        let output = tempfile::tempfile().unwrap();
+        let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
+        let mut writer = CopyOutput::new(&output, CopyWriteback::Direct).unwrap();
+        let rejected = output
+            .write_at(b"probe", 1)
+            .is_err_and(|error| error.raw_os_error() == Some(nix::errno::Errno::EINVAL as i32));
+        writer.write(b"retry", 1).unwrap();
+        if rejected {
+            assert!(!writer.direct);
+        }
+        writer.finish().unwrap();
+        assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
+        let mut bytes = [0; 6];
+        output.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"\0retry");
+    }
+
+    #[test]
+    fn direct_copy_corruption_still_fails_without_retaining_direct_descriptor_flags() {
+        use crate::storage::stream::CopyWriteback;
+        use nix::fcntl::{fcntl, FcntlArg};
+
+        let source = tempfile::tempfile().unwrap();
+        source.write_all_at(b"original", 0).unwrap();
+        let map = StreamHasher::new().hash_open_file(&source, 8).unwrap().map;
+        source.write_all_at(b"corrupt!", 0).unwrap();
+        let receipt = AuthenticatedStream::from_receipt(source, map).unwrap();
+        let output = tempfile::tempfile().unwrap();
+        let flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
+        let error = StreamHasher::with_writeback(CopyWriteback::Direct)
+            .copy_authenticated(&receipt, &output)
+            .unwrap_err();
+        assert!(error.to_string().contains("copy-time stream chunks"));
+        assert_eq!(fcntl(&output, FcntlArg::F_GETFL).unwrap(), flags);
     }
 }

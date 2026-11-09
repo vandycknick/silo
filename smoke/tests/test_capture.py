@@ -208,14 +208,14 @@ def test_capture_rejects_readonly_virtiofs_before_freeze(silo: Silo, capture_ima
 @pytest.mark.parametrize(("boundary", "victim", "capture_policy"), [
     (boundary, victim, "full")
     for boundary in (
-        "capture-disk-sync", "capture-execution-sync", "capture-ram-sync",
-        "capture-seal-publish", "capture-seal-sync", "capture-source-sync",
+        "capture-disk-copy", "capture-execution-write", "capture-ram-write",
+        "capture-seal-publish", "capture-record-settle", "capture-source-write",
         "capture-pool-sync", "capture-pool-rename", "capture-pool-directory-sync",
         "capture-catalog-commit",
     )
     for victim in ("manager", "monitor", "krun-worker")
-] + [("capture-source-sync", "cancel", "full")]
-  + [("capture-execution-sync", policy, "full") for policy in
+] + [("capture-source-write", "cancel", "full")]
+  + [("capture-execution-write", policy, "full") for policy in
      ("cancel-resume", "cancel-preserve", "cancel-borrow")]
   + [(boundary, "manager", "incremental") for boundary in (
       "capture-pool-sync", "capture-pool-rename", "capture-pool-directory-sync",
@@ -305,7 +305,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
                          held_path if held_path.parent.name == "captures" else held_path.parent)
             plan = json.loads((directory / "request.json").read_bytes())
             assert plan["runId"] == running["run_id"]
-            if (boundary in {"capture-seal-publish", "capture-seal-sync", "capture-source-sync"}
+            if (boundary in {"capture-seal-publish", "capture-record-settle", "capture-source-write"}
                     or "captureDirectory" in held):
                 seal_path = directory / (
                     ".vm.capture.json.tmp" if boundary == "capture-seal-publish" else "vm.capture.json")

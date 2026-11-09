@@ -136,7 +136,13 @@ impl MachineStore for Store {
         let _roots = pool.lock_roots_shared()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
-        Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
+        Self::insert_machine_config_and_state(
+            &mut tx,
+            config,
+            initial_state,
+            crate::MachineDurability::Durable,
+        )
+        .await?;
         Self::write_machine_storage(&mut tx, config.id, &storage).await?;
         tx.commit().await?;
         Ok(())
@@ -161,6 +167,7 @@ impl MachineStore for Store {
                 &initial_state,
                 &rootfs,
                 &storage,
+                crate::MachineDurability::Durable,
             ))
         })
         .await?
@@ -397,11 +404,60 @@ impl MachineStore for Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        // The caller releases the machine's reusable lock slot after this.
+        self.checkpoint_catalog().await?;
         Ok(())
     }
 }
 
 impl Store {
+    pub(crate) async fn machine_durability(
+        &self,
+        machine: MachineId,
+    ) -> Result<Option<crate::MachineDurability>, LibVmError> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT durability FROM machine_config WHERE id=?1")
+                .bind(machine.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        value
+            .map(|value| match value.as_str() {
+                "constructed" => Ok(crate::MachineDurability::Constructed),
+                "durable" => Ok(crate::MachineDurability::Durable),
+                _ => Err(crate::machine::root_storage::invalid(
+                    "invalid machine durability",
+                )),
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn constructed_machines(&self) -> Result<Vec<MachineId>, LibVmError> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM machine_config WHERE durability='constructed' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        ids.into_iter()
+            .map(|id| {
+                id.parse::<MachineId>()
+                    .map_err(|error| crate::machine::root_storage::invalid(error.to_string()))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn mark_child_durable(&self, machine: MachineId) -> Result<bool, LibVmError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query(
+            "UPDATE machine_config SET durability='durable' WHERE id=?1 AND durability='constructed'",
+        )
+        .bind(machine.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() == 1;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
     /// Unit-store fixtures own real immutable objects and a real operation OFD.
     /// The caller keeps this lease until its machine publication commits.
     #[cfg(test)]
@@ -449,12 +505,13 @@ impl Store {
         self.finish_stopped_operation(operation).await?;
         Ok(lease)
     }
-    async fn add_machine_with_rootfs_inner(
+    pub(crate) async fn add_machine_with_rootfs_inner(
         &self,
         config: &MachineConfig,
         initial_state: &MachineState,
         rootfs: &MachineRootfsRecord,
         storage: &crate::MachineStorageRecord,
+        durability: crate::MachineDurability,
     ) -> Result<(), LibVmError> {
         if initial_state.machine_id != config.id {
             return Err(LibVmError::InvalidCreateRequest {
@@ -512,7 +569,7 @@ impl Store {
         // transaction upgrade racing another child's publication.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         self.check_cleaning_dependencies(&mut tx, &paths).await?;
-        Self::insert_machine_config_and_state(&mut tx, config, initial_state).await?;
+        Self::insert_machine_config_and_state(&mut tx, config, initial_state, durability).await?;
         Self::insert_machine_rootfs(&mut tx, rootfs).await?;
         Self::write_machine_storage(&mut tx, config.id, storage).await?;
         tx.commit().await?;
@@ -660,14 +717,19 @@ impl Store {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         config: &MachineConfig,
         initial_state: &MachineState,
+        durability: crate::MachineDurability,
     ) -> Result<(), LibVmError> {
         sqlx::query(
-            "INSERT INTO machine_config (id, name, config_json)
-             VALUES (?1, ?2, jsonb(?3))",
+            "INSERT INTO machine_config (id, name, config_json, durability)
+             VALUES (?1, ?2, jsonb(?3), ?4)",
         )
         .bind(config.id.to_string())
         .bind(&config.name)
         .bind(Self::serialize("machine_config.config_json", config)?)
+        .bind(match durability {
+            crate::MachineDurability::Constructed => "constructed",
+            crate::MachineDurability::Durable => "durable",
+        })
         .execute(&mut **tx)
         .await
         .map_err(|err| Self::map_add_machine_error(err, &config.name))?;

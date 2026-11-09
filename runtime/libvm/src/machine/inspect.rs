@@ -125,6 +125,14 @@ pub struct MachineInventoryEntry {
     pub issues: Vec<MachineIssue>,
 }
 
+/// Crash persistence is independent of whether a child is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineDurability {
+    Constructed,
+    Durable,
+}
+
 /// Public machine snapshot returned by inspect and mutation operations.
 ///
 /// `MachineData` is an owned read model, not a live handle and not a SQLite
@@ -145,6 +153,8 @@ pub struct MachineData {
     pub spec: VmSpec,
     /// Retention policy recorded for this machine.
     pub retention: MachineRetention,
+    /// Private-copy persistence, independent of lifecycle status.
+    pub durability: MachineDurability,
     /// Durable desired process settings. This is not applied by this stage.
     pub process: ProcessConfig,
     /// Selected machine template, when creation used one.
@@ -229,6 +239,7 @@ impl MachineData {
             name,
             spec,
             retention: MachineRetention::Persistent,
+            durability: MachineDurability::Durable,
             process: ProcessConfig::default(),
             template_name: None,
             agent_mode: None,
@@ -294,6 +305,7 @@ impl MachineData {
             name: config.name,
             spec: config.spec,
             retention: config.retention,
+            durability: MachineDurability::Durable,
             process: config.process,
             template_name: config.template_name,
             agent_mode: config.agent_mode,

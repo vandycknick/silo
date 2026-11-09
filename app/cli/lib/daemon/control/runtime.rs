@@ -266,9 +266,24 @@ impl w::runtime_service_server::RuntimeService for Service {
             resources: silo_vm_control::stopped::restore_resources_from_wire(value.resources)
                 .map_err(conversion)?,
         };
-        libvm::preflight_restore_snapshot(&self.config, &reference, &options.external_resources)
-            .await
-            .map_err(native)?;
+        let query = match self.runtime.get() {
+            Some(runtime) => runtime.live_capability_query(),
+            None => {
+                self.live_query
+                    .get_or_try_init(|| async {
+                        libvm::LiveCapabilityQuery::open(&self.config).map_err(native)
+                    })
+                    .await?
+            }
+        };
+        libvm::preflight_restore_snapshot(
+            &self.config,
+            query,
+            &reference,
+            &options.external_resources,
+        )
+        .await
+        .map_err(native)?;
         let state = self.clone();
         let result = self
             .mutate(&r, true, async move {
