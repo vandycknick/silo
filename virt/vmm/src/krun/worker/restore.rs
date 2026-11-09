@@ -447,7 +447,13 @@ pub(crate) mod tests {
             file_device: 1,
             file_inode: 100 + index as u64,
             length: if index == 0 { 4096 } else { 5 },
-            sha256: digest,
+            identity: if index == 0 {
+                vm_spec::capture::StreamMap::new(4096, vec![Some(digest)])
+                    .unwrap()
+                    .id()
+            } else {
+                digest
+            },
         });
         let evidence = CaptureEvidence {
             version: 1,
@@ -471,7 +477,7 @@ pub(crate) mod tests {
                 packed_length: 4096,
                 page_granule: 4096,
                 regions: 1,
-                ram_stream: digest,
+                ram_stream: objects[0].identity,
                 binding: CaptureStateBinding {
                     native_producer: "unit-test-state-producer".to_string(),
                     silo_producer: digest,
@@ -486,9 +492,10 @@ pub(crate) mod tests {
                 baseline: None,
                 full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
                 dirty_chunks: vm_spec::capture::full_dirty_chunks(4096).unwrap(),
+                chunk_digests: vec![Some(digest)],
                 stats: vm_spec::capture::CaptureMemoryStats {
                     logical_bytes: 4096,
-                    whole_file_bytes_hashed: 4096,
+                    whole_file_bytes_hashed: 0,
                     identity_bytes_hashed: 4096,
                     ..Default::default()
                 },
@@ -498,7 +505,8 @@ pub(crate) mod tests {
                 .map(|object| CaptureInventoryEntry {
                     role: object.role.capture_role(),
                     length: object.length,
-                    sha256: object.sha256,
+                    sha256: (object.role != RestoreObjectRole::Ram).then_some(object.identity),
+                    identity: (object.role == RestoreObjectRole::Ram).then_some(object.identity),
                 })
                 .collect(),
             started_at_unix_ms: 1,
@@ -540,6 +548,7 @@ pub(crate) mod tests {
         request.objects[4].length = map_bytes.len() as u64;
         request.evidence.inventory[4].length = map_bytes.len() as u64;
         request.evidence.memory.as_mut().unwrap().ram_stream = map.id();
+        request.evidence.memory.as_mut().unwrap().chunk_digests = map.chunks().to_vec();
         let objects = std::array::from_fn(|index| {
             let path = directory.join(format!("restore-object-{index}"));
             let bytes = if index == 4 {
@@ -554,8 +563,13 @@ pub(crate) mod tests {
             object.fd = file.as_raw_fd();
             object.file_device = metadata.dev();
             object.file_inode = metadata.ino();
-            object.sha256 = Sha256Digest::of_bytes(&bytes);
-            request.evidence.inventory[index].sha256 = object.sha256;
+            if object.role == RestoreObjectRole::Ram {
+                object.identity = map.id();
+                request.evidence.inventory[index].identity = Some(object.identity);
+            } else {
+                object.identity = Sha256Digest::of_bytes(&bytes);
+                request.evidence.inventory[index].sha256 = Some(object.identity);
+            }
             file
         });
         request.validate().unwrap();

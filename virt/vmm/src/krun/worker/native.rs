@@ -384,6 +384,7 @@ impl NativeLifecycle for KrunNative {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn capture_execution(
         &self,
         token: &PauseToken,
@@ -791,6 +792,7 @@ fn memory_capture(
         ));
     }
     let mut dirty_chunks = vec![0u8; chunks.div_ceil(8)];
+    let mut identity_bytes_hashed = 0;
     for index in completed.ram.affected_chunks() {
         if index >= chunks {
             return Err(NativeFailure::with_detail(
@@ -799,6 +801,14 @@ fn memory_capture(
             ));
         }
         dirty_chunks[index / 8] |= 1 << (index % 8);
+        identity_bytes_hashed += (completed.ram.packed_len() - index as u64 * STREAM_CHUNK_BYTES)
+            .min(STREAM_CHUNK_BYTES);
+    }
+    if completed.ram.chunk_digests().len() != chunks {
+        return Err(NativeFailure::with_detail(
+            NativeFailureKind::Unexpected,
+            "native chunk digest count does not match RAM",
+        ));
     }
     let stats = completed.ram.stats();
     let [ram, layout] = completed
@@ -823,7 +833,13 @@ fn memory_capture(
         },
         full_reason,
         dirty_chunks,
-        stats: CaptureMemoryStats {
+        chunk_digests: completed
+            .ram
+            .chunk_digests()
+            .iter()
+            .map(|digest| digest.map(vm_spec::capture::Sha256Digest::from_bytes))
+            .collect(),
+        stats: Box::new(CaptureMemoryStats {
             logical_bytes: stats.logical_bytes,
             live_bytes_read: stats.live_bytes_read,
             baseline_bytes_read: stats.baseline_bytes_read,
@@ -835,8 +851,9 @@ fn memory_capture(
             zero_bytes_omitted: stats.zero_bytes_omitted,
             explicit_zero_bytes_written: stats.explicit_zero_bytes_written,
             extent_queries: stats.extent_queries,
+            identity_bytes_hashed,
             ..CaptureMemoryStats::default()
-        },
+        }),
     })
 }
 

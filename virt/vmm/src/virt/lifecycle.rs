@@ -87,7 +87,7 @@ pub enum LifecycleCommand {
         timeout: Duration,
     },
     /// Accept the sealed RAM/layout as the native baseline. Legal only after
-    /// the durable seal. Carries [`LifecycleRights::SealedMemory`].
+    /// the coherent record. Carries [`LifecycleRights::SealedMemory`].
     AcceptCapture {
         operation: Uuid,
         ram: OutputIdentity,
@@ -945,6 +945,7 @@ pub enum CommandOutcome {
         baseline: Option<vm_spec::capture::Sha256Digest>,
         full_reason: Option<vm_spec::capture::CaptureFullReason>,
         dirty_chunks: Vec<u8>,
+        chunk_digests: Vec<Option<vm_spec::capture::Sha256Digest>>,
         /// Keep capture-only counters out of every retained command's inline size.
         stats: Box<vm_spec::capture::CaptureMemoryStats>,
     },

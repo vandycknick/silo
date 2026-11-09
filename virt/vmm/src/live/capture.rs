@@ -3,9 +3,9 @@
 //! ```text
 //!  admit ─► prepare[staging, request.json, 4 outputs + launch-lease pin ─► worker]
 //!        ─► pause[acquire: drain → freeze(e) → native Capture pause | borrow user pause]
-//!        ─► flush[exact cut] ─► disks[clone/copy every writable role, sync]
-//!        ─► execution+devices ─► full RAM ─► native facts ─► verify[hash, layout, sync]
-//!        ─► seal[cancel/stop linearized; write-once vm.capture.json; dir fsync]
+//!        ─► flush[exact cut] ─► disks[clone/copy, chunk map]
+//!        ─► execution+devices ─► RAM receipt ─► verify[inodes, maps, layout, small state]
+//!        ─► record[cancel/stop linearized; write-once coherent record]
 //!        ═══ capture succeeded ═══ (cancel no longer has effect)
 //!        ─► accept baseline ─► continue[resume-if-acquired | preserve] ─► vm.capture-source.json
 //!
@@ -32,7 +32,7 @@ use vm_spec::capture::{
     CaptureEvidenceReference, CaptureInventoryEntry, CaptureLaunchLease, CaptureMemoryEvidence,
     CapturePauseAuthority, CapturePauseDisposition, CapturePlan, CaptureRecordOutcome,
     CaptureReleaseDisposition, CaptureReleaseState, CaptureReleased, CaptureRole, CaptureSealed,
-    CaptureSourceOutcome, CaptureSourceRecord, CaptureStateBinding, Sha256Digest,
+    CaptureSourceOutcome, CaptureSourceRecord, CaptureStateBinding, Sha256Digest, StreamMap,
     CAPTURE_CLONE_RESERVE_BYTES, CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE,
     CAPTURE_LAYOUT_FILE, CAPTURE_RECORD_VERSION, CAPTURE_SOURCE_FILE,
     CAPTURE_SOURCE_TEMPORARY_FILE, CAPTURE_STATE_RESERVE_BYTES, MAX_CAPTURE_RECORD_BYTES,
@@ -53,7 +53,8 @@ use crate::live::coordinator::{
 use crate::live::gate::DrainError;
 use crate::live::journal::{CaptureBinding, Eligibility, Phase, WorkerPreparation};
 use crate::live::staging::{
-    parse_layout, CaptureStaging, DiskCopyError, Hasher, LayoutGeometry, RecordCommit,
+    assemble_ram_map, hash_state, parse_layout, CaptureStaging, DiskCopyError, LayoutGeometry,
+    RecordCommit,
 };
 use crate::state::ReadyAgentIdentity;
 use crate::virt::lifecycle::{
@@ -67,9 +68,6 @@ use crate::virt::lifecycle::{
 
 /// Bound for the native canonical RAM layout read during verification.
 const MAX_LAYOUT_BYTES: u64 = 64 * 1024;
-
-/// One owned RAM authentication thread, never a thread per role.
-const VERIFY_THREAD_STACK_BYTES: usize = 1 << 20;
 
 /// This run's trusted capture identity, fixed at monitor startup.
 #[derive(Debug)]
@@ -334,7 +332,6 @@ struct Verified {
     /// Actual staged bytes charged against the reservation, before the seal.
     staged_bytes: u64,
     map: Arc<vm_spec::capture::StreamMap>,
-    identity_bytes_hashed: u64,
 }
 
 /// A token tripped by cancel or stop for blocking stages; the watcher ends
@@ -518,7 +515,7 @@ impl LiveCoordinator {
                 Abort::Failed(failure(
                     LiveFailureCode::CaptureVerificationFailed,
                     LiveStage::CaptureVerify,
-                    "capture has no durable request record",
+                    "capture has no request record",
                 ))
             })
     }
@@ -582,7 +579,7 @@ impl LiveCoordinator {
         .map_err(|error| staging_failed(format!("staging task failed: {error}")))?;
         let (staging, request, files) =
             created.map_err(|error| staging_failed(format!("create capture staging: {error}")))?;
-        tracing::info!(operation = %run.operation, path = %staging.path().display(), "capture staging and request.json are durable");
+        tracing::info!(operation = %run.operation, path = %staging.path().display(), "capture staging and request.json are written");
         run.staging = Some(Arc::new(staging));
         run.request_digest = Some(request);
 
@@ -1119,11 +1116,10 @@ impl LiveCoordinator {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
         });
-        let reuse = match &receipt {
+        let retained = match &receipt {
             CommandOutcome::MemoryCaptured {
                 mode: vm_spec::lifecycle::CapturePolicy::Incremental,
                 baseline: Some(expected),
-                dirty_chunks,
                 binding,
                 ..
             } => {
@@ -1136,7 +1132,7 @@ impl LiveCoordinator {
                         "incremental receipt differs from the exact retained map/layout".into(),
                     ));
                 }
-                Some((baseline.map, dirty_chunks.clone()))
+                Some(baseline.map)
             }
             CommandOutcome::MemoryCaptured {
                 mode: vm_spec::lifecycle::CapturePolicy::Full,
@@ -1144,10 +1140,23 @@ impl LiveCoordinator {
             } => None,
             _ => return Err(fail("native memory mode or baseline is malformed".into())),
         };
+        let CommandOutcome::MemoryCaptured {
+            ram,
+            dirty_chunks,
+            chunk_digests,
+            ..
+        } = &receipt
+        else {
+            return Err(fail("native memory receipt has the wrong role".into()));
+        };
+        let map = Arc::new(
+            assemble_ram_map(ram.length, dirty_chunks, chunk_digests, retained.as_deref())
+                .map_err(|error| fail(error.to_string()))?,
+        );
         let (abort, watcher) = abort_token(&run.cancel, &self.stop);
         let verified = tokio::task::spawn_blocking({
             let abort = abort.clone();
-            move || verify_staging(&staging, &roles, &disks, outputs, ram_limit, reuse, &abort)
+            move || verify_staging(&staging, &roles, &disks, outputs, ram_limit, map, &abort)
         })
         .await;
         watcher.abort();
@@ -1175,14 +1184,13 @@ impl LiveCoordinator {
             baseline,
             full_reason,
             dirty_chunks,
-            mut stats,
+            chunk_digests,
+            stats,
             ..
         } = receipt
         else {
             return Err(fail("native memory receipt has the wrong role".into()));
         };
-        stats.identity_bytes_hashed = verified.identity_bytes_hashed;
-        stats.whole_file_bytes_hashed = verified.packed_length;
         run.resolved_map = Some(verified.map);
         run.memory = Some(CaptureMemoryEvidence {
             packed_length: verified.packed_length,
@@ -1193,6 +1201,7 @@ impl LiveCoordinator {
             baseline,
             full_reason,
             dirty_chunks,
+            chunk_digests,
             stats: *stats,
             binding: CaptureStateBinding {
                 native_producer: binding.native_producer,
@@ -1206,7 +1215,7 @@ impl LiveCoordinator {
             },
         });
         run.inventory = verified.inventory;
-        // Every role was copied, closed, re-identified, hashed and synced.
+        // Every role was copied, closed and re-identified.
         run.facts.disk_copies_sealed = true;
         self.checkpoint(run, LiveStage::CaptureVerify)?;
         Ok(verified.staged_bytes)
@@ -1410,8 +1419,7 @@ impl LiveCoordinator {
         };
         let evidence_sha256 = Sha256Digest::of_bytes(&bytes);
         // The commit is bounded blocking work that is never abandoned midway.
-        // It reports Durable only once the record is the single link of the
-        // linked inode, the temporary name is gone and the directory synced.
+        // Complete means that the record's final name is its only link.
         let committed = tokio::task::spawn_blocking({
             let staging = staging.clone();
             move || {
@@ -1424,7 +1432,7 @@ impl LiveCoordinator {
         })
         .await;
         match committed {
-            Ok(Ok(RecordCommit::Durable)) => {}
+            Ok(Ok(RecordCommit::Complete)) => {}
             Ok(Ok(RecordCommit::Uncertain(error))) => {
                 return self.seal_uncertain(run, error.to_string());
             }
@@ -1496,7 +1504,7 @@ impl LiveCoordinator {
         }
     }
 
-    /// The record is visible but its durability is unknown: never claim
+    /// The record is visible but unsettled: never claim
     /// success, never overwrite or remove it, never continue the source.
     /// Stay fenced in Error until stop; libvm reconciles the files.
     fn seal_uncertain(&self, run: Run, detail: String) {
@@ -1505,7 +1513,7 @@ impl LiveCoordinator {
             LiveStage::CaptureSeal,
             detail,
         );
-        tracing::error!(operation = %run.operation, cause = %cause, "capture seal durability is uncertain");
+        tracing::error!(operation = %run.operation, cause = %cause, "capture record settlement is uncertain");
         let mut inner = self.lock();
         inner.held = None;
         let published = matches!(
@@ -2038,7 +2046,7 @@ impl LiveCoordinator {
         })
         .await;
         match committed {
-            Ok(Ok(RecordCommit::Durable)) => {
+            Ok(Ok(RecordCommit::Complete)) => {
                 if let Some(facts) = self.lock().journal.capture_mut(&run.operation) {
                     facts.evidence = Some(CaptureEvidenceReference {
                         outcome: CaptureRecordOutcome::Failed,
@@ -2047,7 +2055,7 @@ impl LiveCoordinator {
                 }
             }
             Ok(Ok(RecordCommit::Uncertain(error))) => {
-                tracing::warn!(%error, operation = %run.operation, "failed capture record durability uncertain")
+                tracing::warn!(%error, operation = %run.operation, "failed capture record settlement uncertain")
             }
             Ok(Err(error)) => {
                 tracing::warn!(%error, operation = %run.operation, "could not write failed capture record")
@@ -2273,13 +2281,13 @@ impl LiveCoordinator {
         })
         .await;
         match committed {
-            Ok(Ok(RecordCommit::Durable)) => {
+            Ok(Ok(RecordCommit::Complete)) => {
                 if let Some(facts) = self.lock().journal.capture_mut(&run.operation) {
                     facts.source_record = Some(sha256);
                 }
             }
             Ok(Ok(RecordCommit::Uncertain(error))) => {
-                tracing::warn!(%error, operation = %run.operation, "capture source record durability uncertain")
+                tracing::warn!(%error, operation = %run.operation, "capture source record settlement uncertain")
             }
             Ok(Err(error)) => {
                 tracing::warn!(%error, operation = %run.operation, "could not write capture source record")
@@ -2397,111 +2405,40 @@ impl LiveCoordinator {
     }
 }
 
-/// Reopen every staged role read-only, check identity, ownership, mode,
-/// single link and length, parse the RAM layout, hash every byte (RAM also
-/// to its stream identity), then synchronize files and directories.
-///
-/// Also measures the staged bytes charged against libvm's reservation, once
-/// every role and directory is synced: the allocated bytes of the capture and
-/// `disks/` directories, `request.json`, RAM, layout and state, plus each
-/// `Copy`-planned disk's allocated bytes (conservatively all of a clone's
-/// shared extents, since its host has no qualified clone contract). A
-/// `Clone`-planned disk is charged the contract's metadata bytes: it must be
-/// a clone (see [`CaptureDiskCopy`]) and was reserved at exactly that.
+/// Validate closed writer fingerprints and lengths, resolve stream identities
+/// from the recorded maps, and authenticate only the small state roles.
 fn verify_staging(
     staging: &CaptureStaging,
     roles: &[CaptureRole],
     disks: &[CaptureDiskPlan],
     outputs: CaptureOutputIdentities,
     ram_limit: u64,
-    reuse: Option<(Arc<vm_spec::capture::StreamMap>, Vec<u8>)>,
+    map: Arc<StreamMap>,
     abort: &CancellationToken,
 ) -> io::Result<Verified> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
     let staged_request_bytes = staging.request_allocation()?;
-    let ram_input = roles
-        .iter()
-        .enumerate()
-        .find(|(_, role)| **role == CaptureRole::Ram);
-    let ram_index = ram_input.map(|(index, _)| index);
-    let (ram_role, (mut inventory, state_bytes, mut staged_bytes, geometry)) = authenticate_lanes(
-        abort,
-        |abort| {
-            ram_input
-                .map(|(_, role)| {
-                    let mut hasher = Hasher::new();
-                    if let Some((map, bitmap)) = reuse {
-                        hasher.reuse(map, bitmap);
-                    }
-                    verify_role(staging, role, disks, outputs, &mut hasher, abort)
-                })
-                .transpose()
-        },
-        |abort| {
-            let mut hasher = Hasher::whole_file();
-            let mut inventory = Vec::with_capacity(roles.len());
-            let mut state_bytes = 0u64;
-            let mut staged_bytes = staged_request_bytes;
-            let mut geometry = None;
-            for (index, role) in roles.iter().enumerate() {
-                if Some(index) == ram_index || *role == CaptureRole::RamMap {
-                    continue;
-                }
-                let verified = verify_role(staging, role, disks, outputs, &mut hasher, abort)?;
-                state_bytes = state_bytes.saturating_add(verified.state_bytes);
-                staged_bytes = staged_bytes.saturating_add(verified.staged_bytes);
-                geometry = verified.geometry.or(geometry);
-                inventory.push(verified.entry);
-            }
-            Ok((inventory, state_bytes, staged_bytes, geometry))
-        },
-    )?;
-    // The serial lane already reduced its roles in admitted order. Insert
-    let resolved = ram_role
-        .as_ref()
-        .and_then(|role| role.map.clone())
-        .ok_or_else(|| invalid("complete RAM map is missing".into()))?;
-    let identity_bytes_hashed = ram_role
-        .as_ref()
-        .map_or(0, |role| role.identity_bytes_hashed);
     if roles.contains(&CaptureRole::RamMap) {
-        use std::io::Write as _;
-        let mut output = staging.create_output(&CaptureRole::RamMap)?;
-        resolved.write_canonical(&mut output)?;
-        output.flush()?;
-        output.sync_all()?;
-        drop(output);
+        staging.publish_map(&CaptureRole::RamMap, &map)?;
     }
-    // the fixed-size RAM result without a second inventory allocation.
-    let ram = match (ram_index, ram_role) {
-        (Some(index), Some(role)) => {
-            let ram = role.stream.map(|stream| (role.entry.length, stream));
-            staged_bytes = staged_bytes.saturating_add(role.staged_bytes);
-            inventory.push(role.entry);
-            inventory
-                .get_mut(index..)
-                .ok_or_else(|| invalid("authenticated RAM position is missing".into()))?
-                .rotate_right(1);
-            ram
+    let mut inventory = Vec::with_capacity(roles.len());
+    let mut state_bytes = 0u64;
+    let mut staged_bytes = staged_request_bytes;
+    let mut geometry = None;
+    let mut ram = None;
+    for role in roles {
+        let verified = verify_role(staging, role, disks, outputs, &map, abort)?;
+        state_bytes = state_bytes.saturating_add(verified.state_bytes);
+        staged_bytes = staged_bytes.saturating_add(verified.staged_bytes);
+        geometry = verified.geometry.or(geometry);
+        if *role == CaptureRole::Ram {
+            ram = verified
+                .entry
+                .identity
+                .map(|identity| (verified.entry.length, identity));
         }
-        _ => None,
-    };
-    let mut state_bytes = state_bytes;
-    if let Some(index) = roles.iter().position(|role| *role == CaptureRole::RamMap) {
-        let mut hasher = Hasher::whole_file();
-        let role = verify_role(
-            staging,
-            &CaptureRole::RamMap,
-            disks,
-            outputs,
-            &mut hasher,
-            abort,
-        )?;
-        state_bytes = state_bytes.saturating_add(role.state_bytes);
-        staged_bytes = staged_bytes.saturating_add(role.staged_bytes);
-        inventory.insert(index, role.entry);
+        inventory.push(verified.entry);
     }
-    staging.sync_directories()?;
     staged_bytes = staged_bytes.saturating_add(staging.directory_allocation()?);
     if state_bytes > CAPTURE_STATE_RESERVE_BYTES {
         return Err(invalid("captured state exceeds its 64 MiB reserve".into()));
@@ -2521,8 +2458,7 @@ fn verify_staging(
         regions: geometry.regions,
         ram_stream,
         staged_bytes,
-        map: resolved,
-        identity_bytes_hashed,
+        map,
     })
 }
 
@@ -2533,9 +2469,6 @@ struct VerifiedRole {
     state_bytes: u64,
     staged_bytes: u64,
     geometry: Option<LayoutGeometry>,
-    stream: Option<Sha256Digest>,
-    map: Option<Arc<vm_spec::capture::StreamMap>>,
-    identity_bytes_hashed: u64,
 }
 
 fn verify_role(
@@ -2543,17 +2476,23 @@ fn verify_role(
     role: &CaptureRole,
     disks: &[CaptureDiskPlan],
     outputs: CaptureOutputIdentities,
-    hasher: &mut Hasher,
+    ram_map: &StreamMap,
     abort: &CancellationToken,
 ) -> io::Result<VerifiedRole> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+    if abort.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "capture verification cancelled",
+        ));
+    }
     let (file, facts) = staging.open_sealed(role)?;
     let prepared = match role {
         CaptureRole::Execution => Some(outputs.execution),
         CaptureRole::Devices => Some(outputs.devices),
         CaptureRole::Ram => Some(outputs.ram),
         CaptureRole::Layout => Some(outputs.layout),
-        CaptureRole::Disk(_) | CaptureRole::RamMap => None,
+        CaptureRole::Disk(_) | CaptureRole::RamMap | CaptureRole::DiskMap(_) => None,
     };
     if let Some(expected) = prepared {
         if (facts.device, facts.inode) != (expected.device, expected.inode) {
@@ -2578,14 +2517,21 @@ fn verify_role(
             role.relative_path()
         )));
     }
-    if *role == CaptureRole::RamMap && facts.length > vm_spec::capture::MAX_RAM_MAP_BYTES as u64 {
+    if matches!(role, CaptureRole::RamMap | CaptureRole::DiskMap(_))
+        && facts.length
+            > (vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES) * 74 + 256
+    {
         return Err(invalid(
             "complete RAM map exceeds its metadata bound".into(),
         ));
     }
     let state_bytes = if matches!(
         role,
-        CaptureRole::Execution | CaptureRole::Devices | CaptureRole::Layout | CaptureRole::RamMap
+        CaptureRole::Execution
+            | CaptureRole::Devices
+            | CaptureRole::Layout
+            | CaptureRole::RamMap
+            | CaptureRole::DiskMap(_)
     ) {
         if facts.length == 0 {
             return Err(invalid(format!("{} is empty", role.relative_path())));
@@ -2606,9 +2552,35 @@ fn verify_role(
     } else {
         None
     };
-    let hashed = hasher.hash(&file, facts.length, *role == CaptureRole::Ram, abort)?;
-    // fsync of the exact inode; native and copy writers are closed.
-    file.sync_all()?;
+    let (sha256, identity) = match role {
+        CaptureRole::Ram => {
+            if facts.length != ram_map.length() {
+                return Err(invalid(
+                    "RAM receipt length differs from the closed file".into(),
+                ));
+            }
+            (None, Some(ram_map.id()))
+        }
+        CaptureRole::Disk(name) => {
+            let (map_file, map_facts) = staging.open_sealed(&CaptureRole::DiskMap(name.clone()))?;
+            let limit = (vm_spec::capture::MAX_STREAM_BYTES / vm_spec::capture::STREAM_CHUNK_BYTES)
+                * 74
+                + 256;
+            if map_facts.length > limit {
+                return Err(invalid("disk map exceeds its metadata bound".into()));
+            }
+            let mut bytes = vec![0; map_facts.length as usize];
+            std::os::unix::fs::FileExt::read_exact_at(&map_file, &mut bytes, 0)?;
+            let map = StreamMap::decode(&bytes).map_err(invalid)?;
+            if map.length() != facts.length {
+                return Err(invalid(
+                    "disk map length differs from its closed file".into(),
+                ));
+            }
+            (None, Some(map.id()))
+        }
+        _ => (Some(hash_state(&file, facts.length, abort)?), None),
+    };
     let staged_bytes = match disk.map(|disk| disk.copy) {
         Some(CaptureDiskCopy::Clone) => CAPTURE_CLONE_RESERVE_BYTES,
         Some(CaptureDiskCopy::Copy) | None => {
@@ -2618,77 +2590,13 @@ fn verify_role(
     Ok(VerifiedRole {
         entry: CaptureInventoryEntry {
             role: role.clone(),
-            length: hashed.length,
-            sha256: hashed.sha256,
+            length: facts.length,
+            sha256,
+            identity,
         },
         state_bytes,
         staged_bytes,
         geometry,
-        stream: hashed.stream,
-        map: hashed.map.map(Arc::new),
-        identity_bytes_hashed: hashed.identity_bytes_hashed,
-    })
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("RAM authentication thread panicked")]
-struct AuthenticationThreadPanicked;
-
-/// Cancel the sibling on an error or unwind, but not on successful completion.
-struct AuthenticationOwner<'a> {
-    abort: &'a CancellationToken,
-    completed: bool,
-}
-
-impl Drop for AuthenticationOwner<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.abort.cancel();
-        }
-    }
-}
-
-fn authenticate_lane<R>(
-    abort: &CancellationToken,
-    authenticate: impl FnOnce(&CancellationToken) -> io::Result<R>,
-) -> io::Result<R> {
-    let mut owner = AuthenticationOwner {
-        abort,
-        completed: false,
-    };
-    let result = authenticate(abort);
-    owner.completed = result.is_ok();
-    result
-}
-
-/// Both owners finish inside the existing blocking stage. A lane failure
-/// stops its sibling through a child token, without cancelling the capture's
-/// external token or replacing the original I/O error with that interruption.
-fn authenticate_lanes<R: Send, S>(
-    abort: &CancellationToken,
-    ram: impl FnOnce(&CancellationToken) -> io::Result<R> + Send,
-    remaining: impl FnOnce(&CancellationToken) -> io::Result<S>,
-) -> io::Result<(R, S)> {
-    let abort = abort.child_token();
-    std::thread::scope(|scope| {
-        let ram_owner = std::thread::Builder::new()
-            .name("capture-ram-auth".into())
-            .stack_size(VERIFY_THREAD_STACK_BYTES)
-            .spawn_scoped(scope, || authenticate_lane(&abort, ram))?;
-        let remaining = authenticate_lane(&abort, remaining);
-        // No early return is permitted between spawn and this explicit join.
-        let ram = ram_owner
-            .join()
-            .map_err(|_| io::Error::other(AuthenticationThreadPanicked))
-            .and_then(|result| result);
-        match (ram, remaining) {
-            (Ok(ram), Ok(remaining)) => Ok((ram, remaining)),
-            (Err(ram), Err(remaining)) if ram.kind() == io::ErrorKind::Interrupted => {
-                Err(remaining)
-            }
-            (Err(ram), _) => Err(ram),
-            (_, Err(remaining)) => Err(remaining),
-        }
     })
 }
 
@@ -2729,24 +2637,21 @@ fn staging_budget(reserved: u64, staged: u64) -> Result<u64, LiveFailure> {
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
-    use std::io::{self, Write};
+    use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::Arc;
 
     use tokio_util::sync::CancellationToken;
     use vm_spec::capture::{
-        CaptureDiskCopy, CaptureDiskName, CaptureDiskPlan, CaptureRole,
+        CaptureDiskCopy, CaptureDiskName, CaptureDiskPlan, CaptureRole, Sha256Digest, StreamMap,
         CAPTURE_CLONE_RESERVE_BYTES, CAPTURE_REQUEST_FILE, CAPTURE_STATE_RESERVE_BYTES,
         MAX_CAPTURE_RECORD_BYTES,
     };
     use vm_spec::lifecycle::{LiveFailureCode, LiveId, LiveStage};
 
-    use crate::live::coordinator::capture::{
-        authenticate_lanes, staging_budget, verify_role, verify_staging,
-    };
-    use crate::live::staging::{CaptureStaging, Hasher};
+    use crate::live::coordinator::capture::{staging_budget, verify_staging};
+    use crate::live::staging::CaptureStaging;
     use crate::virt::lifecycle::{CaptureOutputIdentities, OutputIdentity};
 
     struct Root(PathBuf);
@@ -2847,6 +2752,7 @@ mod tests {
             CaptureRole::Ram,
             CaptureRole::Layout,
             disk,
+            CaptureRole::DiskMap(CaptureDiskName::new("data").unwrap()),
         ];
         Staged {
             _root: root,
@@ -2867,6 +2773,10 @@ mod tests {
         }]
     }
 
+    fn ram_map() -> Arc<StreamMap> {
+        Arc::new(StreamMap::new(8192, vec![Some(Sha256Digest::of_bytes(&[7; 8192]))]).unwrap())
+    }
+
     fn allocated(path: &Path) -> u64 {
         std::fs::metadata(path).unwrap().blocks() * 512
     }
@@ -2881,11 +2791,11 @@ mod tests {
             &disks,
             outputs,
             1 << 20,
-            None,
+            ram_map(),
             &CancellationToken::new(),
         )
         .unwrap();
-        assert_eq!(verified.inventory.len(), 5);
+        assert_eq!(verified.inventory.len(), 6);
         assert_eq!(
             verified
                 .inventory
@@ -2897,20 +2807,24 @@ mod tests {
         for entry in &verified.inventory {
             let bytes = std::fs::read(staging.path().join(entry.role.relative_path())).unwrap();
             assert_eq!(entry.length, bytes.len() as u64);
-            assert_eq!(
-                entry.sha256,
-                vm_spec::capture::Sha256Digest::of_bytes(&bytes)
-            );
+            if let Some(digest) = entry.sha256 {
+                assert_eq!(digest, Sha256Digest::of_bytes(&bytes));
+                assert!(entry.identity.is_none());
+            } else {
+                let mut identity = vm_spec::capture::StreamIdentity::new();
+                for chunk in bytes.chunks(vm_spec::capture::STREAM_CHUNK_BYTES as usize) {
+                    identity.push_chunk(chunk).unwrap();
+                }
+                assert_eq!(entry.identity, Some(identity.finish()));
+            }
         }
         assert_eq!(verified.packed_length, 8192);
         assert_eq!(verified.regions, 1);
         let ram = &verified.inventory[2];
         assert_eq!(ram.role, CaptureRole::Ram);
         assert_eq!(ram.length, 8192);
-        assert_eq!(
-            ram.sha256,
-            vm_spec::capture::Sha256Digest::of_bytes(&[7u8; 8192])
-        );
+        assert_eq!(ram.sha256, None);
+        assert_eq!(ram.identity, Some(ram_map().id()));
 
         // RAM beyond the planned memory is refused.
         assert!(verify_staging(
@@ -2919,7 +2833,7 @@ mod tests {
             &disks,
             outputs,
             4096,
-            None,
+            ram_map(),
             &CancellationToken::new()
         )
         .is_err());
@@ -2932,7 +2846,7 @@ mod tests {
             &disks,
             swapped,
             1 << 20,
-            None,
+            ram_map(),
             &CancellationToken::new()
         )
         .is_err());
@@ -2944,7 +2858,7 @@ mod tests {
             &wrong,
             outputs,
             1 << 20,
-            None,
+            ram_map(),
             &CancellationToken::new()
         )
         .is_err());
@@ -2957,7 +2871,7 @@ mod tests {
             &disks,
             outputs,
             1 << 20,
-            None,
+            ram_map(),
             &CancellationToken::new()
         )
         .is_err());
@@ -2977,7 +2891,7 @@ mod tests {
             &disks,
             outputs,
             1 << 20,
-            None,
+            ram_map(),
             &CancellationToken::new()
         )
         .is_err());
@@ -2993,7 +2907,7 @@ mod tests {
                 &disk_plan(SOURCE_BYTES, copy),
                 staged.outputs,
                 PLANNED_RAM,
-                None,
+                ram_map(),
                 &CancellationToken::new(),
             )
             .unwrap()
@@ -3005,6 +2919,7 @@ mod tests {
             directory.to_path_buf(),
             directory.join("disks"),
             directory.join(CAPTURE_REQUEST_FILE),
+            directory.join(staged.roles[5].relative_path()),
         ]
         .into_iter()
         .chain(
@@ -3036,7 +2951,7 @@ mod tests {
             &disk_plan(SOURCE_BYTES, CaptureDiskCopy::Copy),
             staged.outputs,
             PLANNED_RAM,
-            None,
+            ram_map(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -3064,7 +2979,7 @@ mod tests {
             &disk_plan(SOURCE_BYTES, CaptureDiskCopy::Copy),
             staged.outputs,
             PLANNED_RAM,
-            None,
+            ram_map(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -3142,148 +3057,6 @@ mod tests {
     }
 
     #[test]
-    fn authentication_failure_joins_ram_and_preserves_the_inode_error() {
-        let (_root, staging, outputs, _roles) = staged();
-        let abort = CancellationToken::new();
-        let (ram_opened, wait_ram_opened) = mpsc::sync_channel(1);
-        let (release_ram, wait_release_ram) = mpsc::sync_channel(1);
-        let (role_failed, wait_role_failed) = mpsc::sync_channel(1);
-        let (ram_finished, wait_ram_finished) = mpsc::sync_channel(1);
-        std::thread::scope(|scope| {
-            let (staging, abort) = (&staging, &abort);
-            let owner = scope.spawn(move || {
-                authenticate_lanes(
-                    abort,
-                    move |abort| {
-                        // Retain an actual role FD while the other lane fails.
-                        let (file, facts) = staging.open_sealed(&CaptureRole::Ram)?;
-                        ram_opened.send(()).unwrap();
-                        wait_release_ram
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap();
-                        let result = Hasher::new().hash(&file, facts.length, true, abort);
-                        drop(file);
-                        ram_finished.send(()).unwrap();
-                        result
-                    },
-                    move |abort| {
-                        wait_ram_opened
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap();
-                        let mut swapped = outputs;
-                        swapped.execution = outputs.devices;
-                        let result = verify_role(
-                            staging,
-                            &CaptureRole::Execution,
-                            &[],
-                            swapped,
-                            &mut Hasher::whole_file(),
-                            abort,
-                        );
-                        role_failed.send(()).unwrap();
-                        result
-                    },
-                )
-            });
-            wait_role_failed
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-            // The failed owner cannot return while its RAM sibling owns the FD.
-            assert!(!owner.is_finished());
-            release_ram.send(()).unwrap();
-            let error = owner.join().unwrap().unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(
-                error
-                    .to_string()
-                    .contains("execution.state is not the prepared output inode"),
-                "{error}"
-            );
-            wait_ram_finished.try_recv().unwrap();
-        });
-        // Sibling interruption is internal, not capture cancellation.
-        assert!(!abort.is_cancelled());
-    }
-
-    #[test]
-    fn authentication_cancellation_joins_both_real_file_owners() {
-        let (_root, staging, _outputs, _roles) = staged();
-        let abort = CancellationToken::new();
-        let (ram_opened, wait_ram_opened) = mpsc::sync_channel(1);
-        let (release_ram, wait_release_ram) = mpsc::sync_channel(1);
-        let (other_opened, wait_other_opened) = mpsc::sync_channel(1);
-        let (release_other, wait_release_other) = mpsc::sync_channel(1);
-        let (other_finished, wait_other_finished) = mpsc::sync_channel(1);
-        let (ram_finished, wait_ram_finished) = mpsc::sync_channel(1);
-        std::thread::scope(|scope| {
-            let (staging, abort) = (&staging, &abort);
-            let owner = scope.spawn(move || {
-                authenticate_lanes(
-                    abort,
-                    move |abort| {
-                        let (file, facts) = staging.open_sealed(&CaptureRole::Ram)?;
-                        ram_opened.send(()).unwrap();
-                        wait_release_ram
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap();
-                        let result = Hasher::new().hash(&file, facts.length, true, abort);
-                        drop(file);
-                        ram_finished.send(()).unwrap();
-                        result
-                    },
-                    move |abort| {
-                        let (file, facts) = staging.open_sealed(&CaptureRole::Execution)?;
-                        other_opened.send(()).unwrap();
-                        wait_release_other
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap();
-                        let result = Hasher::whole_file().hash(&file, facts.length, false, abort);
-                        drop(file);
-                        other_finished.send(()).unwrap();
-                        result
-                    },
-                )
-            });
-            wait_ram_opened
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-            wait_other_opened
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-            abort.cancel();
-            release_other.send(()).unwrap();
-            wait_other_finished
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-            assert!(!owner.is_finished());
-            release_ram.send(()).unwrap();
-            let error = owner.join().unwrap().unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-            wait_ram_finished.try_recv().unwrap();
-        });
-    }
-
-    #[test]
-    fn authentication_thread_panic_is_a_typed_join_error() {
-        use crate::live::coordinator::capture::AuthenticationThreadPanicked;
-
-        let (_root, staging, _outputs, _roles) = staged();
-        let error = authenticate_lanes(
-            &CancellationToken::new(),
-            |_| -> io::Result<()> { panic!("authentication owner failed") },
-            |abort| {
-                let (file, facts) = staging.open_sealed(&CaptureRole::Execution)?;
-                Hasher::whole_file().hash(&file, facts.length, false, abort)
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(error
-            .get_ref()
-            .is_some_and(|error| error.is::<AuthenticationThreadPanicked>()));
-    }
-
-    #[test]
     fn complete_map_sidecar_is_canonical_authenticated_and_part_of_staged_inventory() {
         let (_root, staging, outputs, mut roles) = staged();
         roles.insert(4, CaptureRole::RamMap);
@@ -3294,7 +3067,7 @@ mod tests {
             &disks,
             outputs,
             PLANNED_RAM,
-            None,
+            ram_map(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -3303,12 +3076,11 @@ mod tests {
         assert_eq!(map.canonical_bytes().unwrap(), bytes);
         assert_eq!(map.id(), verified.ram_stream);
         assert_eq!(&map, verified.map.as_ref());
-        assert_eq!(verified.identity_bytes_hashed, 8192);
         assert_eq!(verified.inventory[4].role, CaptureRole::RamMap);
         assert_eq!(verified.inventory[4].length, bytes.len() as u64);
         assert_eq!(
             verified.inventory[4].sha256,
-            vm_spec::capture::Sha256Digest::of_bytes(&bytes)
+            Some(vm_spec::capture::Sha256Digest::of_bytes(&bytes))
         );
         assert_eq!(
             std::fs::metadata(staging.path().join("memory.map.json"))

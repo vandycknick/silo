@@ -1213,7 +1213,7 @@ async fn live_capture_seals_exact_evidence_then_resumes_the_source() {
             operation_id: request.clone()
         }
     );
-    // Every inventory digest is the actual staged byte content.
+    // Stream entries bind canonical chunk identities; small state binds bytes.
     for entry in &evidence.inventory {
         let bytes = std::fs::read(directory.join(entry.role.relative_path())).unwrap();
         assert_eq!(
@@ -1222,7 +1222,16 @@ async fn live_capture_seals_exact_evidence_then_resumes_the_source() {
             "{}",
             entry.role.relative_path()
         );
-        assert_eq!(Sha256Digest::of_bytes(&bytes), entry.sha256);
+        if let Some(digest) = entry.sha256 {
+            assert_eq!(Sha256Digest::of_bytes(&bytes), digest);
+            assert!(entry.identity.is_none());
+        } else {
+            let mut identity = StreamIdentity::new();
+            for chunk in bytes.chunks(STREAM_CHUNK_BYTES as usize) {
+                identity.push_chunk(chunk).unwrap();
+            }
+            assert_eq!(Some(identity.finish()), entry.identity);
+        }
     }
     // The sealed disk is the paused source's bytes, in a private inode.
     let sealed_disk = std::fs::read(directory.join("disks/root.raw")).unwrap();
@@ -1239,7 +1248,7 @@ async fn live_capture_seals_exact_evidence_then_resumes_the_source() {
     );
     assert_eq!(mode & 0o7777, 0o600);
 
-    // Continuation is a separate fact with its own durable record.
+    // Continuation is a separate fact with its own record.
     let facts = observation.capture.clone().unwrap();
     assert!(matches!(
         facts.continuation,
@@ -1295,6 +1304,61 @@ async fn live_capture_seals_exact_evidence_then_resumes_the_source() {
         directory.join(CAPTURE_EVIDENCE_FILE).exists(),
         "release never removes staging"
     );
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_capture_records_all_facts_and_stream_identities() {
+    use vm_spec::capture::*;
+    let harness = Harness::start(Some(serde_json::json!({}))).await;
+    let request = live_id(Uuid::new_v4());
+    let plan = harness.capture_plan(
+        &request,
+        CapturePauseAuthority::Acquire,
+        CaptureResumePolicy::ResumeIfAcquired,
+    );
+    harness.capture(plan.clone()).await;
+    let observation = harness.capture_settled(&request).await;
+    sealed(&observation);
+    assert_eq!(observation.state, VmLifecycleState::Running);
+    let directory = harness.capture_dir(&request);
+    let bytes = std::fs::read(directory.join(CAPTURE_EVIDENCE_FILE)).unwrap();
+    let evidence = CaptureEvidence::decode(&bytes).unwrap();
+    assert!(serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap()
+        .get("cut")
+        .is_none());
+    assert_eq!(evidence.facts(), [true; 7]);
+    evidence
+        .validate_against_plan(
+            &plan,
+            &Sha256Digest::of_bytes(&plan.canonical_bytes().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(
+        evidence
+            .memory
+            .as_ref()
+            .unwrap()
+            .stats
+            .whole_file_bytes_hashed,
+        0
+    );
+    assert_eq!(
+        evidence
+            .inventory
+            .iter()
+            .map(|entry| &entry.role)
+            .collect::<Vec<_>>(),
+        plan.roles().iter().collect::<Vec<_>>()
+    );
+    for entry in &evidence.inventory {
+        if matches!(entry.role, CaptureRole::Ram | CaptureRole::Disk(_)) {
+            assert!(entry.identity.is_some());
+            assert!(entry.sha256.is_none());
+        }
+    }
+    assert!(directory.join("disks/root.map.json").exists());
     harness.stop().await;
 }
 

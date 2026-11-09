@@ -24,6 +24,9 @@ impl StorageLock {
             file: self.file.try_clone()?,
         })
     }
+    pub(crate) fn durability_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
 
     /// Remains CLOEXEC in the parent; only an intended child may clear CLOEXEC.
     pub fn duplicate_inheritable(&self) -> io::Result<OwnedFd> {
@@ -46,7 +49,7 @@ pub(crate) fn acquire(
     name: &str,
     argument: FlockArg,
 ) -> Result<Option<StorageLock>, StorageError> {
-    acquire_mode(directory, name, argument, true, false)
+    acquire_mode(directory, name, argument, true, false, true)
 }
 
 pub(crate) fn acquire_existing(
@@ -54,7 +57,7 @@ pub(crate) fn acquire_existing(
     name: &str,
     argument: FlockArg,
 ) -> Result<Option<StorageLock>, StorageError> {
-    acquire_mode(directory, name, argument, false, false)
+    acquire_mode(directory, name, argument, false, false, true)
 }
 
 pub(crate) fn acquire_new(
@@ -62,7 +65,15 @@ pub(crate) fn acquire_new(
     name: &str,
     argument: FlockArg,
 ) -> Result<Option<StorageLock>, StorageError> {
-    acquire_mode(directory, name, argument, true, true)
+    acquire_mode(directory, name, argument, true, true, true)
+}
+
+pub(crate) fn acquire_new_deferred(
+    directory: &OwnedDirectory,
+    name: &str,
+    argument: FlockArg,
+) -> Result<Option<StorageLock>, StorageError> {
+    acquire_mode(directory, name, argument, true, true, false)
 }
 
 fn acquire_mode(
@@ -71,6 +82,7 @@ fn acquire_mode(
     argument: FlockArg,
     create: bool,
     exclusive_create: bool,
+    durable: bool,
 ) -> Result<Option<StorageLock>, StorageError> {
     let flags = OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
     let mode = Mode::S_IRUSR | Mode::S_IWUSR;
@@ -105,7 +117,7 @@ fn acquire_mode(
         )));
     }
     let file = File::from(fd);
-    if created {
+    if created && durable {
         file.sync_all()?;
         directory
             .sync()
@@ -141,6 +153,43 @@ mod tests {
 
     use crate::paths::OwnedDirectory;
     use crate::storage::locks::{acquire, blocking};
+
+    #[test]
+    fn deferred_lease_keeps_private_exclusive_identity_and_barrier_ownership() {
+        use crate::storage::locks::{acquire_existing, acquire_new_deferred};
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = OwnedDirectory::open_root(&temporary.path().join("leases")).unwrap();
+        let lease = acquire_new_deferred(&directory, "child.lease", FlockArg::LockSharedNonblock)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path().join("child.lease"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert!(
+            acquire_new_deferred(&directory, "child.lease", FlockArg::LockSharedNonblock).is_err()
+        );
+        let barrier = lease.durability_file().unwrap();
+        drop(lease);
+        assert!(
+            acquire_existing(&directory, "child.lease", FlockArg::LockExclusiveNonblock)
+                .unwrap()
+                .is_none()
+        );
+        barrier.sync_all().unwrap();
+        directory.sync().unwrap();
+        drop(barrier);
+        assert!(
+            acquire_existing(&directory, "child.lease", FlockArg::LockExclusiveNonblock)
+                .unwrap()
+                .is_some()
+        );
+    }
 
     fn isolated(name: &str) -> bool {
         if std::env::var("SILO_LEASE_TEST_CHILD").as_deref() == Ok(name) {

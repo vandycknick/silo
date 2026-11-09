@@ -178,6 +178,7 @@ def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
     assert result is not None and result["stage"] == "finished" and not result["cancellationRequested"]
     assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
     assert fork.outcomes(result) == ["running"] * len(NAMES), result
+    assert all(child["durability"] == "durable" for child in result["children"]), result
     assert UUID(result["sourceMachineId"]) == UUID(prepared.info["id"])
     assert UUID(result["sourceRunId"]) == UUID(prepared.info["run_id"])
     fork.journal_matches(silo, result)
@@ -395,7 +396,7 @@ def capture_dirs(silo: Silo, machine_id: str) -> set[str]:
 
 def staged_lines(silo: Silo, machine_id: str) -> int:
     path = fork.source_trace(silo, machine_id)
-    return sum(1 for line in path.read_text(errors="replace").splitlines() if fork.STAGING_DURABLE in line)
+    return sum(1 for line in path.read_text(errors="replace").splitlines() if fork.STAGING_WRITTEN in line)
 
 
 def ledger(silo: Silo) -> dict[str, bytes]:
@@ -514,7 +515,7 @@ def test_fork_whole_batch_refusal_counts_another_homes_admitted_batch_then_pre_s
     assert alone < available and alone + batch_bytes(ram, other_count) > available
     other_names = [f"b{index}" for index in range(other_count)]
     create(other_silo, restore_image, profile="layered", memory="1gib")
-    traced = fork.TracedSource(other_silo, SOURCE, other_names, "capture-execution-sync",
+    traced = fork.TracedSource(other_silo, SOURCE, other_names, "capture-execution-write",
                                "--max-children", str(other_count), "--private-write-percent", "100")
     try:
         other = witness_source(other_silo)
@@ -570,7 +571,7 @@ def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest
 ) -> None:
     names = NAMES[:2]
     create(silo, restore_image, profile="layered")
-    traced = fork.TracedSource(silo, SOURCE, names, "capture-source-sync")
+    traced = fork.TracedSource(silo, SOURCE, names, "capture-source-write")
     try:
         prepared = witness_source(silo)
         traced.fork()
@@ -614,7 +615,7 @@ def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
 ) -> None:
     names = NAMES[:2]
     create(silo, restore_image, profile="layered")
-    traced = fork.TracedSource(silo, SOURCE, names, "capture-execution-sync")
+    traced = fork.TracedSource(silo, SOURCE, names, "capture-execution-write")
     try:
         prepared = witness_source(silo)
         traced.fork()

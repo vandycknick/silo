@@ -252,22 +252,24 @@ pub async fn preflight_stopped(
     result.and(closed)
 }
 
+/// Observe restore admission before writable initialization. Reuse the
+/// runtime's capability query when initialized; a config-only caller supplies
+/// its discovery query without opening a runtime or catalog for mutation.
 pub async fn preflight_restore_snapshot(
     config: &RuntimeConfig,
+    query: &crate::LiveCapabilityQuery,
     reference: &SnapshotRef,
     policy: &ExternalResourcePolicy,
 ) -> Result<(), LibVmError> {
     if !crate::LiveObservationReader::open(config)?.catalog_exists()? {
         crate::require_host_live_operation(
-            &crate::LiveCapabilityQuery::open(config)?
-                .host_report()
-                .await?,
+            &query.host_report().await?,
             vm_spec::live::LiveOperation::Restore,
         )?;
     }
     let record = crate::store::snapshot_store::observe_snapshot_record(config, reference).await?;
     if matches!(record.capture, SnapshotCaptureKind::LiveExecution { .. }) {
-        return crate::machine::restore::preflight_execution(config, &record, policy).await;
+        return crate::machine::restore::preflight_execution(query, &record, policy).await;
     }
     check_policy(&record.external_requirements, policy)?;
     let storage = storage_from_snapshot(&record)?;
@@ -441,7 +443,7 @@ pub(crate) struct FencedSource {
 /// One writable role of a constructed child and the authority its bytes carry.
 pub(crate) enum PrivateSource {
     Fenced(FencedSource),
-    /// A byte-authenticated inode whose map the completed copy must reproduce.
+    /// A recorded stream map whose chunks the streaming copy checks while writing.
     Authenticated {
         path: crate::PrivatePath,
         stream: crate::storage::stream::AuthenticatedStream,
@@ -470,16 +472,34 @@ impl PrivateSource {
         }
     }
 
-    pub(crate) fn copy_source(&self) -> crate::machine::root_disk::CopySource<'_> {
-        match self {
-            Self::Fenced(source) => crate::machine::root_disk::CopySource::Unscanned {
-                file: &source.file,
-                length: source.length,
-            },
-            Self::Authenticated { stream, .. } => {
-                crate::machine::root_disk::CopySource::Authenticated(stream)
-            }
-        }
+    pub(crate) fn prepare(
+        self,
+        directory: OwnedDirectory,
+        name: &str,
+        qualification: &mut crate::machine::root_disk::CopyQualification,
+        writeback: crate::storage::stream::CopyWriteback,
+    ) -> Result<crate::machine::root_disk::PreparedPrivateCopy, LibVmError> {
+        use crate::machine::root_disk::{copy_private, CopySource};
+        let copy = match self {
+            Self::Fenced(source) => copy_private(
+                CopySource::Unscanned {
+                    file: &source.file,
+                    length: source.length,
+                },
+                directory,
+                name,
+                qualification,
+                writeback,
+            )?,
+            Self::Authenticated { stream, .. } => copy_private(
+                CopySource::Authenticated(&stream),
+                directory,
+                name,
+                qualification,
+                writeback,
+            )?,
+        };
+        Ok(copy)
     }
 }
 
@@ -1429,6 +1449,7 @@ pub(crate) struct OperationStaging {
     name: String,
     _paths: crate::storage::pool::OperationPaths,
     cleaned: bool,
+    durability: crate::MachineDurability,
 }
 
 impl OperationStaging {
@@ -1437,7 +1458,33 @@ impl OperationStaging {
         operation: Uuid,
         lease: &StorageLock,
     ) -> Result<Self, LibVmError> {
-        let paths = pool.create_operation_with_lease(operation, lease.duplicate()?)?;
+        Self::new_with_durability(pool, operation, lease, crate::MachineDurability::Durable)
+    }
+
+    pub(crate) fn new_deferred(
+        pool: &StoragePool,
+        operation: Uuid,
+        lease: &StorageLock,
+    ) -> Result<Self, LibVmError> {
+        Self::new_with_durability(
+            pool,
+            operation,
+            lease,
+            crate::MachineDurability::Constructed,
+        )
+    }
+
+    fn new_with_durability(
+        pool: &StoragePool,
+        operation: Uuid,
+        lease: &StorageLock,
+        durability: crate::MachineDurability,
+    ) -> Result<Self, LibVmError> {
+        let paths = if durability == crate::MachineDurability::Constructed {
+            pool.create_operation_with_lease_deferred(operation, lease.duplicate()?)?
+        } else {
+            pool.create_operation_with_lease(operation, lease.duplicate()?)?
+        };
         let parent = paths
             .temporary
             .parent()
@@ -1449,6 +1496,7 @@ impl OperationStaging {
             name: operation.to_string(),
             _paths: paths,
             cleaned: false,
+            durability,
         })
     }
     pub(crate) fn directory(&self) -> Result<OwnedDirectory, LibVmError> {
@@ -1460,7 +1508,9 @@ impl OperationStaging {
     fn cleanup(&mut self) -> Result<(), LibVmError> {
         if !self.cleaned {
             self.parent.remove_tree(&self.name)?;
-            self.parent.sync()?;
+            if self.durability == crate::MachineDurability::Durable {
+                self.parent.sync()?;
+            }
             self.cleaned = true;
         }
         Ok(())

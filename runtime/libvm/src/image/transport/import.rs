@@ -328,19 +328,15 @@ pub(crate) fn verify_imported_artifact(
                             .map(|object: &VerifiedObject| &object.file)
                             .ok_or_else(|| invalid("object", format!("{digest} is not held")))
                     };
-                    let stream_sha256 = streams
+                    let stream_maps = streams
                         .values()
-                        .map(|stream: &VerifiedStream| (stream.id, stream.sha256))
+                        .map(|stream: &VerifiedStream| (stream.id, Arc::clone(&stream.map)))
                         .collect();
                     verify_portable_capture(
                         &record,
                         &binding,
                         &MeasuredCapture {
-                            stream_sha256: &stream_sha256,
-                            ram_map: &streams
-                                .get(&execution.memory.stream)
-                                .ok_or_else(|| invalid("RAM map", "missing verified stream map"))?
-                                .map,
+                            stream_maps: &stream_maps,
                             layout: &layout,
                             execution: held(&execution.execution)?,
                             devices: held(&execution.devices)?,

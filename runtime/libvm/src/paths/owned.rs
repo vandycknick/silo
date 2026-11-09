@@ -26,6 +26,12 @@ pub(crate) enum AtomicWritePhase {
     Published,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sync {
+    Durable,
+    Deferred,
+}
+
 impl OwnedDirectory {
     pub(crate) fn fd(&self) -> &OwnedFd {
         &self.fd
@@ -56,6 +62,14 @@ impl OwnedDirectory {
     }
 
     pub(crate) fn open_root(path: &Path) -> Result<Self, LibVmError> {
+        Self::open_root_with(path, Sync::Durable)
+    }
+
+    pub(crate) fn open_root_deferred(path: &Path) -> Result<Self, LibVmError> {
+        Self::open_root_with(path, Sync::Deferred)
+    }
+
+    fn open_root_with(path: &Path, sync: Sync) -> Result<Self, LibVmError> {
         let parent = path
             .parent()
             .ok_or_else(|| invalid(path, "has no parent directory"))?;
@@ -74,8 +88,10 @@ impl OwnedDirectory {
         let fd = open_directory(path)?;
         if created {
             fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(path, error))?;
-            sync_directory(&fd, path)?;
-            sync_directory(&open_directory(parent)?, parent)?;
+            if sync == Sync::Durable {
+                sync_directory(&fd, path)?;
+                sync_directory(&open_directory(parent)?, parent)?;
+            }
         }
         validate_directory(&fd, path, created)?;
         Ok(Self {
@@ -103,6 +119,14 @@ impl OwnedDirectory {
     }
 
     pub(crate) fn ensure_dir(&self, name: &str) -> Result<Self, LibVmError> {
+        self.ensure_dir_with(name, Sync::Durable)
+    }
+
+    pub(crate) fn ensure_dir_deferred(&self, name: &str) -> Result<Self, LibVmError> {
+        self.ensure_dir_with(name, Sync::Deferred)
+    }
+
+    fn ensure_dir_with(&self, name: &str, sync: Sync) -> Result<Self, LibVmError> {
         if !is_single_component(name) {
             return Err(invalid(
                 &self.path.join(name),
@@ -124,7 +148,9 @@ impl OwnedDirectory {
         .map_err(|error| invalid(&path, error))?;
         if created {
             fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(&path, error))?;
-            sync_directory(&self.fd, &self.path)?;
+            if sync == Sync::Durable {
+                sync_directory(&self.fd, &self.path)?;
+            }
         }
         validate_directory(&fd, &path, true)?;
         Ok(Self { fd, path })
@@ -132,6 +158,14 @@ impl OwnedDirectory {
 
     /// Creates one private child directory, returning `None` when it already exists.
     pub(crate) fn create_dir(&self, name: &str) -> Result<Option<Self>, LibVmError> {
+        self.create_dir_with(name, Sync::Durable)
+    }
+
+    pub(crate) fn create_dir_deferred(&self, name: &str) -> Result<Option<Self>, LibVmError> {
+        self.create_dir_with(name, Sync::Deferred)
+    }
+
+    fn create_dir_with(&self, name: &str, sync: Sync) -> Result<Option<Self>, LibVmError> {
         if !is_single_component(name) {
             return Err(invalid(
                 &self.path.join(name),
@@ -157,7 +191,9 @@ impl OwnedDirectory {
         .map_err(|error| invalid(&path, error))?;
         fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(&path, error))?;
         validate_directory(&fd, &path, true)?;
-        sync_directory(&self.fd, &self.path)?;
+        if sync == Sync::Durable {
+            sync_directory(&self.fd, &self.path)?;
+        }
         Ok(Some(Self { fd, path }))
     }
 
@@ -269,10 +305,28 @@ impl OwnedDirectory {
         self.write_file_atomic_with(name, contents, |_| {})
     }
 
+    pub(crate) fn write_file_atomic_deferred(
+        &self,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<(), LibVmError> {
+        self.write_file_atomic_sync(name, contents, Sync::Deferred, |_| {})
+    }
+
     pub(crate) fn write_file_atomic_with(
         &self,
         name: &str,
         contents: &[u8],
+        checkpoint: impl FnMut(AtomicWritePhase),
+    ) -> Result<(), LibVmError> {
+        self.write_file_atomic_sync(name, contents, Sync::Durable, checkpoint)
+    }
+
+    fn write_file_atomic_sync(
+        &self,
+        name: &str,
+        contents: &[u8],
+        sync: Sync,
         mut checkpoint: impl FnMut(AtomicWritePhase),
     ) -> Result<(), LibVmError> {
         if !is_single_component(name) || name == ".atomic-write" {
@@ -280,7 +334,7 @@ impl OwnedDirectory {
         }
         // Refuse non-private/non-regular existing entries before replacement.
         let _existing = self.open_file(name)?;
-        let staging = self.ensure_dir(".atomic-write")?;
+        let staging = self.ensure_dir_with(".atomic-write", sync)?;
         let temporary = uuid::Uuid::new_v4().to_string();
         let path = staging.path.join(&temporary);
         let fd = openat(
@@ -297,13 +351,18 @@ impl OwnedDirectory {
             let mut file = File::from(fd);
             file.write_all(contents)
                 .map_err(|error| invalid(&path, error))?;
-            file.sync_all().map_err(|error| invalid(&path, error))?;
-            checkpoint(AtomicWritePhase::Synced);
+            if sync == Sync::Durable {
+                file.sync_all().map_err(|error| invalid(&path, error))?;
+                checkpoint(AtomicWritePhase::Synced);
+            }
             nix::fcntl::renameat(staging.fd(), temporary.as_str(), self.fd(), name)
                 .map_err(|error| invalid(&self.path.join(name), error))?;
             checkpoint(AtomicWritePhase::Published);
-            self.sync()?;
-            staging.sync()
+            if sync == Sync::Durable {
+                self.sync()?;
+                staging.sync()?;
+            }
+            Ok(())
         })();
         if result.is_err() {
             // Never remove the authoritative name after a successful rename.
@@ -552,6 +611,68 @@ mod tests {
     use crate::paths::OwnedDirectory;
 
     #[test]
+    fn deferred_root_preserves_private_directory_validation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("parent").join("owned");
+        let directory = OwnedDirectory::open_root_deferred(&path).unwrap();
+        assert_eq!(directory.path(), path);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        drop(directory);
+        OwnedDirectory::open_root_deferred(&path).unwrap();
+        let target = temporary.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = temporary.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert!(OwnedDirectory::open_root_deferred(&link).is_err());
+        let file = temporary.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(OwnedDirectory::open_root_deferred(&file).is_err());
+    }
+
+    #[test]
+    fn deferred_publication_keeps_atomicity_and_validation_without_sync_phase() {
+        use crate::paths::owned::{AtomicWritePhase, Sync};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = OwnedDirectory::open_root(&temporary.path().join("owned")).unwrap();
+        let directory = root.ensure_dir_deferred("cut").unwrap();
+        let mut phases = Vec::new();
+        directory
+            .write_file_atomic_sync("receipt", b"closed", Sync::Deferred, |phase| {
+                phases.push(phase)
+            })
+            .unwrap();
+        assert_eq!(
+            phases,
+            [AtomicWritePhase::Staged, AtomicWritePhase::Published]
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("receipt")).unwrap(),
+            b"closed"
+        );
+        directory
+            .write_file_atomic_deferred("receipt", b"replacement")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join("receipt")).unwrap(),
+            b"replacement"
+        );
+        assert!(root.ensure_dir_deferred("../escape").is_err());
+        assert!(directory
+            .write_file_atomic_deferred("../escape", b"bad")
+            .is_err());
+        let target = temporary.path().join("target");
+        std::fs::write(&target, b"safe").unwrap();
+        symlink(&target, directory.path().join("symlink")).unwrap();
+        assert!(directory
+            .write_file_atomic_deferred("symlink", b"bad")
+            .is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"safe");
+    }
+
+    #[test]
     fn immutable_cut_payload_modes_do_not_weaken_private_control_file_checks() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = OwnedDirectory::open_root(&temporary.path().join("owned")).unwrap();
@@ -769,5 +890,24 @@ mod tests {
         .is_err());
         assert!(replacement.path().is_dir());
         assert!(moved.is_dir());
+    }
+    #[test]
+    fn deferred_directory_creation_keeps_collision_and_symlink_checks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = OwnedDirectory::open_root(&temp.path().join("root")).unwrap();
+        let child = root.create_dir_deferred("child").unwrap().unwrap();
+        assert_eq!(
+            std::fs::metadata(child.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert!(root.create_dir_deferred("child").unwrap().is_none());
+        symlink(child.path(), root.path().join("alias")).unwrap();
+        assert!(root.create_dir_deferred("alias").is_err());
     }
 }

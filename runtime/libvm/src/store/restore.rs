@@ -1343,7 +1343,7 @@ impl crate::store::Store {
             .find(|file| file.role == vm_spec::capture::CaptureRole::Ram)
             .ok_or_else(|| invalid("fork cut lacks RAM role"))?;
         for pending in &inventory.pending {
-            let lease = pool.lease(pending.consumer_id)?;
+            let lease = pool.lease_deferred(pending.consumer_id)?;
             let (device, inode) = lease.file_identity()?;
             sqlx::query("INSERT INTO storage_operation(operation_id,schema,kind,state,file_device,file_inode,record_json) VALUES(?1,1,'import','staging',?2,?3,jsonb('{}'))").bind(pending.consumer_id.to_string()).bind(device.to_string()).bind(inode.to_string()).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO storage_operation_stream(operation_id,stream_id) SELECT ?1,stream_id FROM storage_operation_stream WHERE operation_id=?2").bind(pending.consumer_id.to_string()).bind(operation.to_string()).execute(&mut *tx).await?;
@@ -1404,7 +1404,7 @@ impl crate::store::Store {
         .await?;
         tx.commit().await?;
         let json = self.capture_budget_document(operation).await?;
-        directory.write_file_atomic(&budget_name(self, operation)?, json.as_bytes())?;
+        directory.write_file_atomic_deferred(&budget_name(self, operation)?, json.as_bytes())?;
         Ok(())
     }
 
@@ -1679,13 +1679,18 @@ impl crate::store::Store {
 mod tests {
     use crate::store::restore::{RestoreBudget, RestoreMemoryCharge};
 
-    #[tokio::test]
-    async fn restore_consumer_initializes_first_machine_parent_without_bypassing_admission() {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    struct CheckpointRequestFixture {
+        capture: crate::store::capture::tests::Fixture,
+        consumer: crate::store::snapshot_store::SnapshotConsumer,
+        request: vm_spec::restore::RestoreRequest,
+        _files: [std::fs::File; 5],
+    }
 
+    async fn checkpoint_request_fixture() -> CheckpointRequestFixture {
         use crate::storage::pool::StoragePool;
         use crate::store::capture::tests::{fixture, seal};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
         use vm_spec::capture::{CaptureConfiguration, Sha256Digest};
         use vm_spec::restore::{RestoreObject, RestoreObjectRole, RestoreRequest};
 
@@ -1710,19 +1715,19 @@ mod tests {
         else {
             panic!("fixture must be an execution checkpoint");
         };
-        let (ram, ram_sha256) = consumer
-            .open_ram(&pool, &execution.memory.stream, execution.memory.length)
+        let ram = consumer
+            .open_stream(&pool, &execution.memory.stream, execution.memory.length)
             .unwrap();
         let files = [
             ram,
-            consumer.open_object(&pool, &execution.layout).unwrap(),
-            consumer.open_object(&pool, &execution.execution).unwrap(),
-            consumer.open_object(&pool, &execution.devices).unwrap(),
+            pool.open_object(&execution.layout).unwrap(),
+            pool.open_object(&execution.execution).unwrap(),
+            pool.open_object(&execution.devices).unwrap(),
             std::fs::File::open(sealed.path().join(vm_spec::capture::CAPTURE_RAM_MAP_FILE))
                 .unwrap(),
         ];
         let digests = [
-            ram_sha256,
+            Sha256Digest::from_bytes(*execution.memory.stream.as_bytes()),
             Sha256Digest::from_bytes(*execution.layout.as_bytes()),
             Sha256Digest::from_bytes(*execution.execution.as_bytes()),
             Sha256Digest::from_bytes(*execution.devices.as_bytes()),
@@ -1731,13 +1736,14 @@ mod tests {
                 .iter()
                 .find(|entry| entry.role == vm_spec::capture::CaptureRole::RamMap)
                 .unwrap()
-                .sha256,
+                .sha256
+                .unwrap(),
         ];
         let objects: Vec<_> = files
             .iter()
             .zip(RestoreObjectRole::ALL)
             .zip(digests)
-            .map(|((file, role), sha256)| {
+            .map(|((file, role), identity)| {
                 let metadata = file.metadata().unwrap();
                 RestoreObject {
                     role,
@@ -1745,7 +1751,7 @@ mod tests {
                     file_device: metadata.dev(),
                     file_inode: metadata.ino(),
                     length: metadata.len(),
-                    sha256,
+                    identity,
                 }
             })
             .collect();
@@ -1770,6 +1776,27 @@ mod tests {
             hook: None,
         };
         request.validate().unwrap();
+        CheckpointRequestFixture {
+            capture: fixture,
+            consumer,
+            request,
+            _files: files,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_consumer_initializes_first_machine_parent_without_bypassing_admission() {
+        use crate::storage::pool::StoragePool;
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let CheckpointRequestFixture {
+            capture: fixture,
+            consumer,
+            request,
+            _files,
+        } = checkpoint_request_fixture().await;
+        let snapshots = &fixture.snapshots;
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
         let policy = crate::RestoreResourcePolicy {
             memory: crate::RestoreMemoryPolicy::AllowOvercommit,
             ..Default::default()
@@ -2749,5 +2776,157 @@ mod tests {
         ledger.remove_tree("broken.json").unwrap();
         ledger.write_file_atomic("unknown", b"{}").unwrap();
         assert!(RestoreBudget::read(&ledger).is_err());
+    }
+    #[tokio::test]
+    async fn corrupt_ram_restore_reports_authentication_and_rolls_back_child_and_reservation() {
+        use crate::machine::builder::{publish_restored_child, ChildConstruction};
+        use crate::machine::restore::{storage_from_snapshot, RestoreAuthentication};
+        use crate::machine::stopped::{FencedSource, PrivateSource};
+        use crate::storage::pool::StoragePool;
+        use crate::store::snapshot_store::SnapshotConsumer;
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+
+        let CheckpointRequestFixture {
+            capture: fixture,
+            consumer: initial_consumer,
+            request,
+            _files,
+        } = checkpoint_request_fixture().await;
+        let snapshots = &fixture.snapshots;
+        let reference = crate::SnapshotRef::Id(initial_consumer.info.id);
+        let pool = StoragePool::open(&snapshots.store.images_dir).unwrap();
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &initial_consumer.record.capture
+        else {
+            panic!("fixture must be an execution checkpoint");
+        };
+        let ram_path = pool.stream_path(&execution.memory.stream);
+        drop(initial_consumer);
+        snapshots
+            .store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+
+        let reader = std::fs::File::open(&ram_path).unwrap();
+        let mut first = [0];
+        reader.read_exact_at(&mut first, 0).unwrap();
+        std::fs::set_permissions(&ram_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&ram_path)
+            .unwrap();
+        writer.write_all_at(&[first[0] ^ 1], 0).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        std::fs::set_permissions(&ram_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let paths = crate::paths::LocalPaths::new(snapshots.store.home.clone());
+        let runtime = crate::Runtime::from_store(
+            paths.clone(),
+            snapshots.store.clone(),
+            crate::RuntimeNetworkingConfig::default(),
+            crate::RegistryPolicy::default(),
+            crate::runtime::components::test_components(paths.home()),
+            None,
+        )
+        .await
+        .unwrap();
+        let machines = snapshots.store.home.join("machines");
+        let before = std::fs::read_dir(&machines)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for fail_copy in [false, true] {
+            let consumer: SnapshotConsumer = snapshots.consume_shape(&reference).await.unwrap();
+            let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+            let root = &consumer.record.root;
+            let stream = shape
+                .open_copy_source(&pool, &root.stream.stream, root.geometry.length)
+                .unwrap();
+            let path = crate::PrivatePath::new("root.raw").unwrap();
+            let source = if fail_copy {
+                // Force a real construction error as well. The authentication
+                // error must still win the scoped join deterministically.
+                PrivateSource::Fenced(FencedSource {
+                    path,
+                    file: stream.file().try_clone().unwrap(),
+                    length: stream.length() + 512,
+                })
+            } else {
+                PrivateSource::Authenticated { path, stream }
+            };
+            let descriptor_peak = 64 + shape.retained_descriptors();
+            snapshots
+                .reserve_restore_resources(
+                    &consumer,
+                    &request,
+                    vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES + root.geometry.length,
+                    descriptor_peak,
+                    crate::RestoreResourcePolicy {
+                        memory: crate::RestoreMemoryPolicy::AllowOvercommit,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let operation = consumer.operation_id;
+            let name = format!("corrupt-ram-child-{fail_copy}");
+            let result = publish_restored_child(
+                &runtime,
+                ChildConstruction {
+                    name: name.clone(),
+                    configuration: consumer.record.configuration.clone(),
+                    storage: storage_from_snapshot(&consumer.record, consumer.info.id).unwrap(),
+                    sources: vec![source],
+                    operation_id: operation,
+                    shared_qualification: None,
+                },
+                uuid::Uuid::new_v4(),
+                Some(RestoreAuthentication::new(snapshots.clone(), shape)),
+            )
+            .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("corrupt RAM must reject construction"),
+            };
+            assert!(
+                matches!(&error, crate::LibVmError::Storage(crate::storage::StorageError::ContentMismatch(path)) if path == &ram_path),
+                "restore must report RAM authentication, not copying: {error:?}",
+            );
+            drop(consumer);
+            snapshots
+                .store
+                .retire_abandoned_storage_operations(&pool)
+                .await
+                .unwrap();
+            let after = std::fs::read_dir(&machines)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                after, before,
+                "failed authentication leaked a private child tree"
+            );
+            let children: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM machine_config WHERE name=?1")
+                    .bind(name)
+                    .fetch_one(&snapshots.store.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(children, 0);
+            let retained: i64 = sqlx::query_scalar(
+                "SELECT (SELECT count(*) FROM storage_operation WHERE operation_id=?1) +
+                        (SELECT count(*) FROM restore_memory_reservation WHERE operation_id=?1)",
+            )
+            .bind(operation.to_string())
+            .fetch_one(&snapshots.store.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                retained, 0,
+                "failed construction retained its owner or reservation"
+            );
+        }
     }
 }

@@ -221,10 +221,21 @@ Operation deadlines are never extended by parked freshness or transport retries.
 ## Live Capture Ownership
 
 `live/capture.rs` coordinates workload freeze, native pause and provider drain,
-disk flush/copy, execution/device state and RAM sealing. The worker receives
+disk flush/copy, execution/device state and RAM capture. The worker receives
 owned output descriptors over its lifecycle socket. Capture staging is private
-(`0700` directories, `0600` files); the write-once `vm.capture.json` publishes
-the seven cut facts only after the outputs are sealed and synchronized.
+(`0700` directories, `0600` files). The plan and write-once `vm.capture.json`
+have one capture mode: writers close without synchronizing files or directories.
+Coherent records require all seven positively observed cut facts.
+
+The worker supplies RAM chunk digests with an affected-chunk bitmap. The
+monitor resolves clean incremental chunks from its exact retained baseline
+map, checks the closed RAM inode and layout length, and never reads RAM back.
+Sparse disk copies compute each 8 MiB chunk digest while copying, skipping
+whole holes without reads. A qualified reflink/clonefile still requires a
+single scan of the clone to derive its chunk map. RAM and disks record only
+their canonical stream `identity`; small state and map roles retain byte
+`sha256`. Disk map roles (`disks/<name>.map.json`) immediately follow their
+disk in the closed inventory; RAM retains `memory.map.json` (`ram-map`).
 
 libvm reserves staging space before freeze. Admission validates the held source
 identities and lengths, not a second allocation sample while the guest can still
@@ -242,9 +253,13 @@ the continuation policy; cancellation after sealing cannot discard the cut.
 libvm verifies the sealed closure and native envelope bindings before publishing
 a `live-execution` snapshot. Publication serializes concurrent consumers and
 retains independent pool RAM, dependency roots and native baseline leases.
-Reconciliation can publish a durable cut even when source continuation is
+Reconciliation can publish a coherent cut even when source continuation is
 unknown; uncertainty does not authorize releasing a live owner's storage.
 Terminal staging reclamation preserves the capture evidence separately.
+Checkpoint publication synchronizes every immutable pool payload and its
+publication directories before the catalog's stable-storage barrier. Local
+fork retention instead relocates without durability barriers; each fork child
+retains its independent background durability barrier.
 
 ## Execution Restore Ownership
 

@@ -23,12 +23,19 @@ Measured boundaries (all reported; the gated value is named):
   the last child's durable `running` stamp. API entry to Running, seal to
   Running and caller end-to-end (dispatch to exit) are recorded separately.
 - capture interruption (gated): the larger of the source monitor's
-  conservative staging-durable..continuation-finished interval and the
-  host-observed gap in the guest witness's durable writes. Without a clone
-  contract the ADR allowance adds the upper's allocated bytes at the host's
-  measured sequential copy rate; the actual disk-seal duration is recorded too.
-- restore (gated): `silo restore` dispatch to its exit with the child already
-  Running and ready (or the first later Running+ready observation).
+  conservative staging-written..continuation-finished interval and the
+  host-observed gap in the guest witness's durable writes.
+- restore: `silo restore` dispatch to its exit with the child already Running
+  and ready (or the first later Running+ready observation). Cold restore is
+  recorded on every lane but gated only when the workspace supports reflinks.
+
+A real FICLONE probe of sibling files in the budget workspace selects the lane
+at fixture setup, independently of the capture request's disk copy contract.
+Without reflinks, the gated value subtracts the upper's allocated bytes at the
+host's measured sequential copy rate: one upper for capture, one sealed upper
+for restore, one sealed upper per child for fork4. Reflink lanes subtract zero.
+Samples and summaries retain raw and gated values, allowance inputs and actual
+disk-seal durations; targets do not change.
 
 A running source keeps its accepted capture baseline, and a local cut retires
 only after that exact source run ends. Each successful fork sample therefore
@@ -42,6 +49,8 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -49,6 +58,7 @@ import platform
 import shutil
 import statistics
 import subprocess
+import tempfile
 import time
 
 from . import overlay, page_cache
@@ -92,6 +102,23 @@ def _findmnt(path: Path) -> dict:
     return mounts[0]
 
 
+def reflink_probe(directory: Path) -> dict:
+    """Probe the budget filesystem, cleaning up both sibling files on every exit."""
+    error_number = None
+    with tempfile.NamedTemporaryFile(dir=directory, prefix="budget-reflink-source-") as source, \
+            tempfile.NamedTemporaryFile(dir=directory, prefix="budget-reflink-destination-") as destination:
+        source.write(b"\xa5" * 4096)
+        source.flush()
+        try:
+            fcntl.ioctl(destination.fileno(), 0x40049409, source.fileno())  # FICLONE
+        except OSError as error:
+            if error.errno not in {errno.EOPNOTSUPP, errno.EXDEV, errno.EINVAL}:
+                raise
+            error_number = error.errno
+    return {"method": "FICLONE", "directory": str(directory),
+            "reflink": error_number is None, "errno": error_number}
+
+
 def reference_host(silo: Silo) -> dict:
     """Reference-host record (ADR 0014 acceptance budgets): hardware, filesystem, inputs."""
     cpu = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines()
@@ -121,6 +148,7 @@ def reference_host(silo: Silo) -> dict:
         "cpu": cpu, "logicalCpus": os.cpu_count(), "memTotalKiB": int(memory),
         "kernel": platform.release(), "machine": platform.machine(),
         "workspace": str(silo.ws.root), "filesystem": filesystem,
+        "reflinkProbe": reflink_probe(silo.ws.root),
         "inputs": {name: {"path": str(path), "sha256": _digest(path)} for name, path in inputs.items()},
         "guestKernelConfig": kernel_config, "candidate": candidate,
     }
@@ -196,6 +224,22 @@ def sequential_copy_rate(silo: Silo, path: Path) -> dict:
             "bytesPerSecond": allocated / seconds}
 
 
+def gated_timing(seconds: float, *, allocated_bytes: int, bytes_per_second: float,
+                 reflink: bool, copies: int = 1) -> dict:
+    """Subtract only the ADR's unavoidable private-copy cost, without clamping."""
+    allowance = 0.0 if reflink else copies * allocated_bytes / bytes_per_second
+    return {
+        "copyAllowance": {
+            "lane": "reflink" if reflink else "non-reflink",
+            "reflink": reflink, "upperAllocatedBytes": allocated_bytes,
+            "privateCopies": copies, "copyBytes": copies * allocated_bytes,
+            "bytesPerSecond": bytes_per_second,
+        },
+        "nonCowAllowanceSeconds": allowance,
+        "gatedExcessSeconds": seconds - allowance,
+    }
+
+
 def owned_inputs(silo: Silo) -> list[Path]:
     return page_cache.inputs(silo.ws.silo_home, silo.ws.config.runtime_dir, silo.ws.config.silo)
 
@@ -223,20 +267,27 @@ def summarize(samples: list[dict]) -> dict:
     """Median of five, min/max, per cohort; never mixes cold and warm."""
     summary: dict = {"targets": TARGETS, "metrics": {}, "pass": {}}
     metrics = {
-        "fork4": lambda sample: sample["fork4"]["dispatchToRunningSeconds"],
-        "captureInterruption": lambda sample: sample["capture"]["gatedExcessSeconds"],
-        "restore": lambda sample: sample["restore"]["dispatchToRunningSeconds"],
+        "fork4": ("fork4", "dispatchToRunningSeconds"),
+        "captureInterruption": ("capture", "interruptionSeconds"),
+        "restore": ("restore", "dispatchToRunningSeconds"),
     }
-    for metric, value in metrics.items():
+    for metric, (record, raw_key) in metrics.items():
         for cohort in ("cold", "warm"):
-            chosen = [value(sample) for sample in samples
-                      if sample["cohort"] == cohort and metric in sample.get("gates", ())]
+            chosen = [sample for sample in samples
+                      if sample["cohort"] == cohort and record in sample]
             if not chosen:
                 continue
             assert len(chosen) == SAMPLES, (metric, cohort, len(chosen))
-            described = describe(chosen)
+            described = describe([sample[record][raw_key] for sample in chosen])
+            described["gatedMedian"] = statistics.median(
+                sample[record]["gatedExcessSeconds"] for sample in chosen)
+            described["nonCowAllowanceSeconds"] = describe(
+                [sample[record]["nonCowAllowanceSeconds"] for sample in chosen])
+            described["allowanceInputs"] = [sample[record]["copyAllowance"] for sample in chosen]
+            described["budgeted"] = all(metric in sample["gates"] for sample in chosen)
             summary["metrics"].setdefault(metric, {})[cohort] = described
-            summary["pass"][f"{metric}/{cohort}"] = described["median"] <= TARGETS[metric]
+            if described["budgeted"]:
+                summary["pass"][f"{metric}/{cohort}"] = described["gatedMedian"] <= TARGETS[metric]
     summary["cacheLabels"] = sorted({f"{sample['cohort']}:{sample['cache']['label']}" for sample in samples})
     summary["coldFullyEvicted"] = all(sample["cache"]["label"] == "cold" for sample in samples
                                       if sample["cohort"] == "cold")
@@ -245,13 +296,15 @@ def summarize(samples: list[dict]) -> dict:
 
 
 def markdown(summary: dict, host: dict) -> str:
-    lines = ["| Metric | Cohort | Median s | Min s | Max s | Target s | Result |",
-             "| --- | --- | --- | --- | --- | --- | --- |"]
+    lines = ["| Metric | Cohort | Raw median s | Gated median s | Min s | Max s | Target s | Result |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for metric, cohorts in summary["metrics"].items():
         for cohort, value in cohorts.items():
-            lines.append(f"| {metric} | {cohort} | {value['median']:.3f} | {value['min']:.3f} | "
-                         f"{value['max']:.3f} | {TARGETS[metric]:.1f} | "
-                         f"{'pass' if summary['pass'][f'{metric}/{cohort}'] else 'FAIL'} |")
+            result = summary["pass"].get(f"{metric}/{cohort}")
+            verdict = "recorded (not budgeted)" if result is None else ("pass" if result else "FAIL")
+            lines.append(f"| {metric} | {cohort} | {value['median']:.3f} | "
+                         f"{value['gatedMedian']:.3f} | {value['min']:.3f} | "
+                         f"{value['max']:.3f} | {TARGETS[metric]:.1f} | {verdict} |")
     lines += ["", f"Host: {host['cpu']}, {host['logicalCpus']} CPUs, {host['memTotalKiB']} KiB, "
               f"kernel {host['kernel']}, {host['filesystem']['fstype']} at {host['filesystem']['target']}.",
               f"Cache labels: {', '.join(summary['cacheLabels'])}."]
@@ -269,6 +322,13 @@ class Evidence:
 
     def record(self, name: str, value: object) -> None:
         (self.directory / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+    def allowance(self, metric: str, timing: dict) -> None:
+        self.host.setdefault("nonCowAllowances", {})[metric] = {
+            **timing["copyAllowance"],
+            "nonCowAllowanceSeconds": timing["nonCowAllowanceSeconds"],
+        }
+        self.record("reference-host.json", self.host)
 
     def sample(self, value: dict) -> None:
         self.samples.append(value)

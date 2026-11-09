@@ -1,5 +1,6 @@
 //! Durable fork identities, independent outcomes and operation-owned local cuts.
 use std::fs::File;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 
 use serde::{Deserialize, Serialize};
@@ -54,7 +55,7 @@ pub(crate) struct LocalCutFile {
     pub device: u64,
     pub inode: u64,
     pub length: u64,
-    pub sha256: Sha256Digest,
+    pub identity: Sha256Digest,
     pub fingerprint: crate::storage::identity_file::SourceFingerprint,
 }
 
@@ -73,10 +74,8 @@ pub(crate) struct LocalCut {
     pub relocated: bool,
 }
 
-/// Writable cut disks this process authenticated against the seal evidence
-/// in the same traversal that derived their canonical maps, then held
-/// continuously through controlled relocation. The fork loop owns it from
-/// retention until the same operation opens its cut; nothing persists it.
+/// Receipt-bound writable disk maps held through this operation's relocation.
+/// Each child's streaming copy authenticates its chunks on first use.
 pub(crate) struct AuthenticatedCutDisks {
     operation_id: Uuid,
     cut_id: Sha256Digest,
@@ -125,6 +124,10 @@ pub(crate) struct VerifiedRestoreCut {
     pub lower: Option<crate::machine::restore::VerifiedLower>,
 }
 impl VerifiedRestoreCut {
+    pub(crate) fn directory(&self) -> &crate::paths::OwnedDirectory {
+        &self.directory
+    }
+
     /// The held descriptor of one role, parallel to `record.files`.
     #[cfg(test)]
     pub(crate) fn held_file(&self, index: usize) -> Option<&File> {
@@ -189,7 +192,7 @@ impl LocalCut {
         let inventory = self
             .files
             .iter()
-            .map(|file| (&file.role, file.length, file.sha256))
+            .map(|file| (&file.role, file.length, file.identity))
             .collect::<Vec<_>>();
         let mut bytes = b"silo:local-fork-cut:v1\0".to_vec();
         bytes.extend(
@@ -257,6 +260,11 @@ impl Store {
                 Ok(child)
             })
             .collect::<Result<_, LibVmError>>()?;
+        for child in &mut result.children {
+            if let Some(durability) = self.machine_durability(child.machine_id).await? {
+                child.durability = Some(durability);
+            }
+        }
         if operation.is_nil()
             || result.operation_id != operation
             || options.operation_id != operation
@@ -373,6 +381,7 @@ impl Store {
                     .parse()
                     .map_err(|error: uuid::Error| invalid(error.to_string()))?,
                 outcome: ForkChildOutcome::Pending,
+                durability: None,
             };
             children.push(result);
         }
@@ -546,7 +555,7 @@ impl Store {
                 if record.source_ram.role != CaptureRole::Ram
                     || record.source_ram.inode == 0
                     || record.source_ram.length != ram.length
-                    || record.source_ram.sha256 != ram.sha256
+                    || record.source_ram.identity != ram.identity
                 {
                     return Err(invalid(
                         "local cut source/final RAM identities contradict the seal",
@@ -562,7 +571,7 @@ impl Store {
                         .any(|(file, entry)| {
                             file.role != entry.role
                                 || file.length != entry.length
-                                || file.sha256 != entry.sha256
+                                || Some(file.identity) != entry.identity.or(entry.sha256)
                                 || file.inode == 0
                         })
                 {
@@ -594,10 +603,8 @@ impl Store {
         Ok(())
     }
 
-    /// `retained` is this operation's own seal-time disk authentication, if
-    /// the caller still owns it. Without it (restart, another process, lost
-    /// handoff) each writable disk is authenticated again: one traversal that
-    /// checks the evidence-bound SHA-256 and derives the map children share.
+    /// Reopen the structurally accepted receipt and its immutable role inodes.
+    /// Stream bytes are authenticated while constructing each private child.
     pub(crate) async fn open_local_cut(
         &self,
         operation: Uuid,
@@ -637,7 +644,6 @@ impl Store {
         )?
         .ok_or_else(|| invalid("fork cut directory missing"))?;
         let mut held = Vec::with_capacity(record.files.len());
-        let mut hasher = None;
         for role in &record.files {
             let relative = role.role.relative_path();
             let file = match relative.split_once('/') {
@@ -672,15 +678,42 @@ impl Store {
                     authenticated.reopen(file)?
                 }
                 None => {
-                    let (stream, digest) = hasher
-                        .get_or_insert_with(crate::storage::stream::StreamHasher::new)
-                        .authenticate_with_sha256(file, role.length)?;
-                    if digest != role.sha256 || stream.fingerprint() != role.fingerprint {
-                        return Err(invalid(
-                            "local cut disk differs from its sealed evidence digest",
-                        ));
+                    let map_role = match &role.role {
+                        CaptureRole::Disk(name) => CaptureRole::DiskMap(name.clone()),
+                        _ => return Err(invalid("local cut disk role is invalid")),
+                    };
+                    let map_entry = record
+                        .files
+                        .iter()
+                        .find(|entry| entry.role == map_role)
+                        .ok_or_else(|| invalid("local cut disk map is missing"))?;
+                    let relative = map_role.relative_path();
+                    let (parent, name) = relative
+                        .split_once('/')
+                        .ok_or_else(|| invalid("local cut disk map path is invalid"))?;
+                    let map_file = directory
+                        .open_dir(parent)?
+                        .ok_or_else(|| invalid("local cut disk map parent is missing"))?
+                        .open_immutable_file(name)?
+                        .ok_or_else(|| invalid("local cut disk map is missing"))?;
+                    if crate::storage::identity_file::SourceFingerprint::new(&map_file.metadata()?)
+                        != map_entry.fingerprint
+                    {
+                        return Err(invalid("local cut disk map inode changed"));
                     }
-                    stream
+                    let mut bytes = Vec::new();
+                    std::io::Read::take(&map_file, map_entry.length + 1).read_to_end(&mut bytes)?;
+                    if Sha256Digest::of_bytes(&bytes) != map_entry.identity {
+                        return Err(invalid("local cut disk map digest differs from receipt"));
+                    }
+                    let map = crate::storage::stream::StreamMap::decode(&bytes)?;
+                    if map.length() != role.length
+                        || map.id().as_bytes() != role.identity.as_bytes()
+                        || map.canonical_bytes()? != bytes
+                    {
+                        return Err(invalid("local cut disk identity differs from receipt"));
+                    }
+                    crate::storage::stream::AuthenticatedStream::from_receipt(file, map)?
                 }
             };
             held.push(HeldCutRole::Disk(stream));
@@ -809,6 +842,16 @@ impl Store {
                     self.set_fork_child(operation, index, ForkChildOutcome::Running)
                         .await?
                 }
+                "prepared" => {
+                    sqlx::query("UPDATE live_fork_child SET result_json=jsonb_set(result_json,'$.durability',(SELECT durability FROM machine_config WHERE id=live_fork_child.machine_id)) WHERE operation_id=?1 AND child_index=?2")
+                        .bind(operation.to_string()).bind(i64::from(index))
+                        .execute(&self.pool).await?;
+                }
+                "durable" => {
+                    sqlx::query("UPDATE live_fork_child SET result_json=jsonb_set(result_json,'$.durability','durable') WHERE operation_id=?1 AND child_index=?2")
+                        .bind(operation.to_string()).bind(i64::from(index))
+                        .execute(&self.pool).await?;
+                }
                 _ => {}
             }
             self.fork_event(operation, Some(index), phase).await?;
@@ -898,7 +941,9 @@ impl Store {
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 let finished:bool=sqlx::query_scalar("SELECT json_extract(result_json,'$.stage')='finished' FROM live_fork WHERE operation_id=?1").bind(&cursor).fetch_one(&mut *tx).await?;
                 let dependent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation o JOIN live_fork f ON o.operation_id=f.capture_id WHERE f.operation_id=?1 UNION ALL SELECT 1 FROM live_fork_child c JOIN storage_operation o ON o.operation_id=c.consumer_id OR o.operation_id=c.launch_id OR (o.machine_id=c.machine_id AND o.run_id=c.run_id) WHERE c.operation_id=?1 UNION ALL SELECT 1 FROM live_fork_child WHERE operation_id=?1 AND name_reserved=1 UNION ALL SELECT 1 FROM storage_operation_cut d JOIN local_cut l ON l.cut_id=d.cut_id WHERE l.operation_id=?1 AND d.operation_id!=?1)").bind(&cursor).fetch_one(&mut *tx).await?;
-                if !finished || dependent {
+                let constructed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM live_fork_child c JOIN machine_config m ON m.id=c.machine_id WHERE c.operation_id=?1 AND m.durability='constructed')")
+                    .bind(&cursor).fetch_one(&mut *tx).await?;
+                if !finished || dependent || constructed {
                     tx.commit().await?;
                     continue;
                 }

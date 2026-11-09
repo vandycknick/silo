@@ -32,6 +32,24 @@ pub(crate) fn write_composite(
     root_bootstrap: Option<&[u8]>,
     destination: &Path,
 ) -> eyre::Result<()> {
+    write_composite_with(base, agent_payload, root_bootstrap, destination, true).map(drop)
+}
+
+pub(crate) fn write_composite_deferred(
+    base: CompositeBase<'_>,
+    agent_payload: Option<(CompositeAgent<'_>, &[u8])>,
+    destination: &Path,
+) -> eyre::Result<File> {
+    write_composite_with(base, agent_payload, None, destination, false)
+}
+
+fn write_composite_with(
+    base: CompositeBase<'_>,
+    agent_payload: Option<(CompositeAgent<'_>, &[u8])>,
+    root_bootstrap: Option<&[u8]>,
+    destination: &Path,
+    durable: bool,
+) -> eyre::Result<File> {
     if let Some(root) = root_bootstrap {
         if root.len() > rootfs_spec::MAX_JSON_BYTES {
             eyre::bail!("root bootstrap exceeds bounded wire limit");
@@ -124,8 +142,9 @@ pub(crate) fn write_composite(
     }
     cpio::newc::trailer(&mut output).context("write initramfs overlay trailer")?;
     output.flush().context("flush composite initramfs")?;
-    output.sync_all().context("sync composite initramfs")?;
-    drop(output);
+    if durable {
+        output.sync_all().context("sync composite initramfs")?;
+    }
 
     fs::rename(&temporary, destination).with_context(|| {
         format!(
@@ -135,7 +154,7 @@ pub(crate) fn write_composite(
         )
     })?;
     guard.disarm();
-    Ok(())
+    Ok(output)
 }
 
 fn entry(name: &str, inode: u32, mode: u32, file_type: ModeFileType) -> NewcBuilder {

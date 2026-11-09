@@ -139,7 +139,11 @@ impl Store {
                 Box::pin(async move {
                     // Native SQLite ownership of catalog.lock is installed
                     // before these database-touching PRAGMAs can run.
-                    sqlx::raw_sql("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
+                    // WAL+NORMAL stays consistent after any crash. Only commits
+                    // since the previous WAL checkpoint may be lost on power
+                    // loss, never on process crash. This deliberately avoids
+                    // ext4 data=ordered commit fsyncs draining dirty private copies.
+                    sqlx::raw_sql("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
                         .execute(connection).await?;
                     Ok(())
                 })
@@ -155,6 +159,20 @@ impl Store {
             }
         }
         Ok(pool)
+    }
+
+    /// Complete a power-loss durability boundary after the catalog commit.
+    pub(crate) async fn checkpoint_catalog(&self) -> Result<(), LibVmError> {
+        let (busy, logged, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+                .fetch_one(&self.pool)
+                .await?;
+        // PASSIVE can report success while an older reader prevents copying
+        // every frame. Only a completed checkpoint proves the boundary stable.
+        if busy != 0 || logged != checkpointed {
+            return Err(std::io::Error::other("catalog WAL checkpoint is incomplete").into());
+        }
+        Ok(())
     }
 
     fn sqlite_options(path: &Path) -> SqliteConnectOptions {
@@ -935,6 +953,30 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn machine_removal_checkpoints_before_releasing_its_identity() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let id = MachineId::new();
+        let config = machine_from_path(id, "removed".to_owned(), paths.machine(id).dir());
+        seed_machine(&db, &config).await;
+        let mut reader = db.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM machine_config")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        let error = db.remove_machine(&config).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("catalog WAL checkpoint is incomplete"),
+            "{error}"
+        );
+        assert!(db.machine_config(id).await.unwrap().is_none());
+        reader.rollback().await.unwrap();
+        db.remove_machine(&config).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn remove_machine_cascades_network_attachment() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -1528,7 +1570,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledged_connections_use_wal_full_and_fullfsync() {
+    async fn acknowledged_connections_use_wal_normal_and_fullfsync() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.unwrap();
         let mut first = db.pool.acquire().await.unwrap();
@@ -1546,9 +1588,14 @@ pub(crate) mod tests {
                 .fetch_one(&mut **connection)
                 .await
                 .unwrap();
+            let checkpoint_fullfsync: i64 = sqlx::query_scalar("PRAGMA checkpoint_fullfsync")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
             assert_eq!(journal, "wal");
-            assert_eq!(sync, 2);
+            assert_eq!(sync, 1);
             assert_eq!(fullfsync, 1);
+            assert_eq!(checkpoint_fullfsync, 1);
         }
     }
 

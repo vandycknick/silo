@@ -108,7 +108,8 @@ pub(crate) struct MemoryCapture {
     pub(crate) baseline: Option<vm_spec::capture::Sha256Digest>,
     pub(crate) full_reason: Option<vm_spec::capture::CaptureFullReason>,
     pub(crate) dirty_chunks: Vec<u8>,
-    pub(crate) stats: vm_spec::capture::CaptureMemoryStats,
+    pub(crate) chunk_digests: Vec<Option<vm_spec::capture::Sha256Digest>>,
+    pub(crate) stats: Box<vm_spec::capture::CaptureMemoryStats>,
 }
 
 impl MemoryCapture {
@@ -118,6 +119,18 @@ impl MemoryCapture {
         if self.memory_generation == 0
             || self.stats.logical_bytes != self.ram.length
             || validate_dirty_chunks(self.ram.length, &self.dirty_chunks).is_err()
+            || self.chunk_digests.len() as u64 != self.ram.length.div_ceil(STREAM_CHUNK_BYTES)
+            || self
+                .chunk_digests
+                .iter()
+                .enumerate()
+                .any(|(index, digest)| {
+                    digest.is_some()
+                        && self
+                            .dirty_chunks
+                            .get(index / 8)
+                            .is_none_or(|byte| byte & (1 << (index % 8)) == 0)
+                })
         {
             return false;
         }
@@ -3106,6 +3119,10 @@ impl<N: NativeLifecycle> Shared<N> {
         devices: File,
         deadline: Instant,
     ) -> CommandOutcome {
+        let Some(()) = self.with_capture(capture, |_| ()) else {
+            drop((execution, devices));
+            return Self::missing_capture();
+        };
         let binding = self.native.native_producer().and_then(|native_producer| {
             Ok(CaptureStateBinding {
                 native_producer,
@@ -3232,7 +3249,8 @@ impl<N: NativeLifecycle> Shared<N> {
                             baseline: memory.baseline,
                             full_reason: memory.full_reason,
                             dirty_chunks: memory.dirty_chunks.clone(),
-                            stats: Box::new(memory.stats.clone()),
+                            chunk_digests: memory.chunk_digests.clone(),
+                            stats: memory.stats.clone(),
                         }
                     }
                     (CaptureProgress::Failed { stage, failure }, _) => {
@@ -3937,10 +3955,11 @@ mod tests {
                 baseline: None,
                 full_reason: Some(vm_spec::capture::CaptureFullReason::Requested),
                 dirty_chunks: vec![1],
-                stats: vm_spec::capture::CaptureMemoryStats {
+                chunk_digests: vec![None],
+                stats: Box::new(vm_spec::capture::CaptureMemoryStats {
                     logical_bytes: 4096,
                     ..Default::default()
-                },
+                }),
             },
         }
     }
@@ -4575,7 +4594,7 @@ mod tests {
 
     #[test]
     fn candidate_projection_rejects_wrong_policy_baseline_coverage_and_bounds() {
-        for defect in 0..6 {
+        for defect in 0..7 {
             let mut journal = Journal::<(), u32>::default();
             let capture = Uuid::new_v4();
             let binding = memory_pending(&mut journal, capture);
@@ -4592,6 +4611,7 @@ mod tests {
                         Some(vm_spec::capture::Sha256Digest::of_bytes(b"wrong baseline"))
                 }
                 4 => memory.stats.logical_bytes += 1,
+                5 => memory.chunk_digests.clear(),
                 _ => memory.full_reason = Some(vm_spec::capture::CaptureFullReason::NoBaseline),
             }
             let revision = journal.pending_revision(capture).unwrap();
@@ -4601,5 +4621,31 @@ mod tests {
                 CaptureProgress::Failed { .. }
             ));
         }
+    }
+
+    #[test]
+    fn incremental_candidate_rejects_digests_for_unaffected_chunks() {
+        use vm_spec::capture::{Sha256Digest, STREAM_CHUNK_BYTES};
+        use vm_spec::lifecycle::CapturePolicy;
+        let mut journal = Journal::<(), u32>::default();
+        let capture = Uuid::new_v4();
+        let binding = memory_pending(&mut journal, capture);
+        let mut preparation = journal.captures[&capture].preparation.clone();
+        let baseline = Sha256Digest::of_bytes(b"baseline");
+        preparation.policy = CapturePolicy::Incremental;
+        preparation.baseline = Some(Digest32(*baseline.as_bytes()));
+        let NativeCaptureStatus::CandidateComplete { mut memory, .. } = candidate(&binding) else {
+            panic!("candidate");
+        };
+        memory.mode = CapturePolicy::Incremental;
+        memory.baseline = Some(baseline);
+        memory.full_reason = None;
+        memory.ram.length = STREAM_CHUNK_BYTES + 4096;
+        memory.stats.logical_bytes = memory.ram.length;
+        memory.dirty_chunks = vec![1];
+        memory.chunk_digests = vec![None, None];
+        assert!(memory.valid_for(&preparation));
+        memory.chunk_digests[1] = Some(Sha256Digest::of_bytes(b"unaffected"));
+        assert!(!memory.valid_for(&preparation));
     }
 }

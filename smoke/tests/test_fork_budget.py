@@ -10,6 +10,8 @@ build; a budget failure blocks qualification, it never relaxes a target.
 from __future__ import annotations
 
 from collections.abc import Iterator
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -47,6 +49,12 @@ def budget_silo(config: SmokeConfig, registry: LoopbackRegistry,
     finally:
         release(workspace, failed=request.session.testsfailed > 0,
                 publish=lambda summary: request.node.user_properties.append((TIMINGS_PROPERTY, summary)))
+
+
+@pytest.fixture
+def budget_host(silo: Silo) -> dict:
+    """Probe the selected budget workspace once, before any timed operation."""
+    return fork_budget.reference_host(silo)
 
 
 def budget_source(silo: Silo, image: str, name: str = SOURCE) -> dict:
@@ -102,7 +110,7 @@ def restart_source(silo: Silo, name: str) -> tuple[dict, dict]:
 
 
 def test_fork_budget_full_capture_interruption_and_four_child_fork(
-    silo: Silo, restore_image: str,  # noqa: F811
+    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
 ) -> None:
     """One source, payload written once; every sample ends with its children
     and the source stopped, removed/pruned, so at most one 4 GiB cut exists.
@@ -111,7 +119,8 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
     only after that exact source run ends. The source is restarted with a new
     witness before the next sample and the observer is rebuilt on that run.
     """
-    host = fork_budget.reference_host(silo)
+    host = budget_host
+    reflink = host["reflinkProbe"]["reflink"]
     evidence = fork_budget.Evidence("fork4-capture", host)
     source = budget_source(silo, restore_image)
     info, initial, upper = source["info"], source["initial"], source["upper"]
@@ -151,12 +160,19 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
             finally:
                 observer.close()
             directory = fork.cut_directory(silo, call.operation)
-            plan = json.loads((directory / "request.json").read_bytes())
-            copies = sorted({disk["copy"] for disk in plan["disks"]})
-            assert copies and set(copies) <= {"clone", "copy"}, plan["disks"]
-            clone = copies == ["clone"]
-            allowance = 0.0 if clone else allocated / rate["bytesPerSecond"]
+            sealed_uppers = list((directory / "disks").glob("*.raw"))
+            assert len(sealed_uppers) == 1, "root-only fixture must seal exactly one upper"
+            sealed_allocated = sealed_uppers[0].stat().st_blocks * 512
+            fork_seconds = (running - call.dispatched_ns) / 1e9
+            fork_timing = fork_budget.gated_timing(
+                fork_seconds, allocated_bytes=sealed_allocated, bytes_per_second=rate["bytesPerSecond"],
+                reflink=reflink, copies=fork_budget.CHILDREN)
             interruption = max(product["conservativeSeconds"], observed["hostGapSeconds"])
+            capture_timing = fork_budget.gated_timing(
+                interruption, allocated_bytes=allocated, bytes_per_second=rate["bytesPerSecond"],
+                reflink=reflink)
+            evidence.allowance("fork4", fork_timing)
+            evidence.allowance("captureInterruption", capture_timing)
             pause_stamp = found[fork.PAUSE_ESTABLISHED][0][0]
             disk_seal = [(stamp - pause_stamp) / 1e9 for stamp, _ in found[fork.DISK_SEALED]]
             ram = (directory / "memory.ram").stat()
@@ -170,7 +186,7 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
                 "cohort": cohort, "index": index, "operation": call.operation, "sourceRun": info["run_id"],
                 "gates": ["fork4", "captureInterruption"], "cache": cache, "space": space, "upper": upper_now,
                 "fork4": {
-                    "dispatchToRunningSeconds": (running - call.dispatched_ns) / 1e9,
+                    "dispatchToRunningSeconds": fork_seconds, **fork_timing,
                     "apiEntryToRunningSeconds": (running - stamps[(None, "api_entered")]) / 1e9,
                     "admissionSeconds": (stamps[(None, "admission_committed")]
                                          - stamps[(None, "api_entered")]) / 1e9,
@@ -180,9 +196,8 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
                 },
                 "capture": {
                     "captureId": result["captureId"], "product": product, "hostObserved": observed,
-                    "interruptionSeconds": interruption, "diskCopy": copies, "cloneContract": clone,
-                    "upperAllocatedBytes": allocated, "nonCowAllowanceSeconds": allowance,
-                    "gatedExcessSeconds": interruption - allowance,
+                    "interruptionSeconds": interruption, "reflink": reflink,
+                    "upperAllocatedBytes": allocated, **capture_timing,
                     "pauseToDiskSealedSeconds": disk_seal,
                     "monitorLines": {key: [line for _, line in values] for key, values in found.items()},
                     "ram": {"logicalBytes": ram.st_size, "allocatedBytes": ram.st_blocks * 512},
@@ -203,8 +218,11 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
         f"budget median over ADR target blocks admission; evidence: {evidence.directory}", summary["pass"])
 
 
-def test_fork_budget_restore_to_running(silo: Silo, restore_image: str) -> None:  # noqa: F811
-    host = fork_budget.reference_host(silo)
+def test_fork_budget_restore_to_running(
+    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
+) -> None:
+    host = budget_host
+    reflink = host["reflinkProbe"]["reflink"]
     evidence = fork_budget.Evidence("restore", host)
     source = budget_source(silo, restore_image)
     initial = source["initial"]
@@ -214,7 +232,16 @@ def test_fork_budget_restore_to_running(silo: Silo, restore_image: str) -> None:
     assert value["snapshot"]["captureKind"] == "live-execution", value
     assert value["capture"]["sourceOutcome"] == "resumed", value
     reference = "image:" + value["snapshot"]["id"]
-    evidence.record("fixture.json", {**fixture, "checkpoint": value})
+    relative = Path(value["capture"]["staging"])
+    assert not relative.is_absolute() and ".." not in relative.parts
+    directory = silo.ws.silo_home / relative
+    sealed_uppers = list((directory / "disks").glob("*.raw"))
+    assert len(sealed_uppers) == 1, "root-only fixture must seal exactly one upper"
+    sealed_upper = sealed_uppers[0]
+    sealed_proof = fork_budget.upper_proof(sealed_upper)
+    rate = fork_budget.sequential_copy_rate(silo, sealed_upper)
+    evidence.record("fixture.json", {**fixture, "checkpoint": value, "sealedUpper": sealed_proof,
+                                     "sequentialCopy": rate})
     for cohort, index in fork_budget.SCHEDULE:
         name = f"br-{cohort}-{index}"
         space = fork_budget.headroom(silo, 2 * GIB + 2 * GIB)
@@ -239,10 +266,15 @@ def test_fork_budget_restore_to_running(silo: Silo, restore_image: str) -> None:
         prepared = lifecycle.first(found, lifecycle.PREPARED).realtime_ns
         started = lifecycle.first(found, lifecycle.STARTED).realtime_ns
         witness_continues(silo, name, initial)
+        timing = fork_budget.gated_timing(
+            (running - dispatched) / 1e9, allocated_bytes=sealed_proof["allocatedBytes"],
+            bytes_per_second=rate["bytesPerSecond"], reflink=reflink)
+        evidence.allowance("restore", timing)
         evidence.sample({
-            "cohort": cohort, "index": index, "machine": machine, "gates": ["restore"],
+            "cohort": cohort, "index": index, "machine": machine,
+            "gates": ["restore"] if cohort != "cold" or reflink else [],
             "cache": cache, "space": space,
-            "restore": {"dispatchToRunningSeconds": (running - dispatched) / 1e9,
+            "restore": {"dispatchToRunningSeconds": (running - dispatched) / 1e9, **timing,
                         "callerEndToEndSeconds": (exited - dispatched) / 1e9,
                         "runningAtExit": running == exited,
                         "monitorPreparedToStartedSeconds": (started - prepared) / 1e9},
@@ -253,3 +285,107 @@ def test_fork_budget_restore_to_running(silo: Silo, restore_image: str) -> None:
     stopped.stop(silo, SOURCE, require_clean=False)
     assert all(summary["pass"].values()), (
         f"restore median over ADR target blocks admission; evidence: {evidence.directory}", summary["pass"])
+
+
+@pytest.mark.parametrize(
+    ("reflink", "copies", "allocated", "seconds", "expected_allowance", "expected_gated"),
+    [
+        (False, 1, 1024, 6.0, 4.0, 2.0),
+        (False, 4, 1024, 25.0, 16.0, 9.0),
+        (True, 1, 1024, 6.0, 0.0, 6.0),
+        (True, 4, 1024, 25.0, 0.0, 25.0),
+        (False, 1, 0, 1.0, 0.0, 1.0),
+        (False, 1, 1024, 1.0, 4.0, -3.0),
+    ],
+)
+def test_copy_allowance_arithmetic(reflink: bool, copies: int, allocated: int, seconds: float,
+                                   expected_allowance: float, expected_gated: float) -> None:
+    timing = fork_budget.gated_timing(
+        seconds, allocated_bytes=allocated, bytes_per_second=256.0,
+        reflink=reflink, copies=copies)
+    assert timing["nonCowAllowanceSeconds"] == expected_allowance
+    assert timing["gatedExcessSeconds"] == expected_gated
+    assert timing["copyAllowance"] == {
+        "lane": "reflink" if reflink else "non-reflink", "reflink": reflink,
+        "upperAllocatedBytes": allocated, "privateCopies": copies,
+        "copyBytes": allocated * copies, "bytesPerSecond": 256.0,
+    }
+
+
+@pytest.mark.parametrize("reflink", [False, True], ids=["ext4", "btrfs"])
+def test_copy_allowance_summary_gates(reflink: bool) -> None:
+    samples = []
+    for cohort in ("cold", "warm-up", "warm"):
+        for index in range(fork_budget.SAMPLES if cohort != "warm-up" else 1):
+            # Raw restore exceeds 2 s; one non-CoW copy leaves exactly 2 s.
+            restore_timing = fork_budget.gated_timing(
+                6.0, allocated_bytes=1024, bytes_per_second=256.0, reflink=reflink)
+            # Four private copies leave 9 s against the 10 s fork4 target.
+            fork_timing = fork_budget.gated_timing(
+                25.0, allocated_bytes=1024, bytes_per_second=256.0,
+                reflink=reflink, copies=fork_budget.CHILDREN)
+            samples.append({
+                "cohort": cohort, "index": index, "cache": {"label": cohort},
+                "gates": ["fork4", "captureInterruption", "restore"]
+                if cohort != "cold" or reflink else ["fork4", "captureInterruption"],
+                "restore": {"dispatchToRunningSeconds": 6.0, **restore_timing},
+                "fork4": {"dispatchToRunningSeconds": 25.0, **fork_timing},
+                "capture": {"interruptionSeconds": 6.0, **restore_timing},
+            })
+    summary = fork_budget.summarize(samples)
+    for cohort in ("cold", "warm"):
+        restored = summary["metrics"]["restore"][cohort]
+        forked = summary["metrics"]["fork4"][cohort]
+        captured = summary["metrics"]["captureInterruption"][cohort]
+        assert restored["samples"] == fork_budget.SAMPLES
+        assert restored["median"] == 6.0
+        assert restored["gatedMedian"] == (6.0 if reflink else 2.0)
+        assert forked["median"] == 25.0
+        assert forked["gatedMedian"] == (25.0 if reflink else 9.0)
+        assert captured["gatedMedian"] == (6.0 if reflink else 2.0)
+        assert restored["nonCowAllowanceSeconds"]["median"] == (0.0 if reflink else 4.0)
+        assert forked["nonCowAllowanceSeconds"]["median"] == (0.0 if reflink else 16.0)
+        assert captured["nonCowAllowanceSeconds"]["median"] == (0.0 if reflink else 4.0)
+        assert restored["allowanceInputs"] == [restore_timing["copyAllowance"]] * fork_budget.SAMPLES
+        assert forked["allowanceInputs"] == [fork_timing["copyAllowance"]] * fork_budget.SAMPLES
+        assert captured["allowanceInputs"] == [restore_timing["copyAllowance"]] * fork_budget.SAMPLES
+        assert summary["pass"][f"fork4/{cohort}"] is (not reflink)
+        assert summary["pass"][f"captureInterruption/{cohort}"] is (not reflink)
+        assert restored["budgeted"] is (cohort != "cold" or reflink)
+    assert summary["pass"]["restore/warm"] is (not reflink)
+    if reflink:
+        assert summary["pass"]["restore/cold"] is False
+    else:
+        assert "restore/cold" not in summary["pass"]
+
+
+def test_reflink_probe_and_reference_host_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the real filesystem as the oracle, not the capture request contract."""
+    source = tmp_path / "source"
+    source.write_bytes(b"\xa5" * 4096)
+    expected_errno = None
+    with source.open("rb") as src, (tmp_path / "destination").open("wb") as dst:
+        try:
+            fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())
+        except OSError as error:
+            assert error.errno in {errno.EOPNOTSUPP, errno.EXDEV, errno.EINVAL}
+            expected_errno = error.errno
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    probe = fork_budget.reflink_probe(workspace)
+    assert probe == {
+        "method": "FICLONE", "directory": str(workspace),
+        "reflink": expected_errno is None, "errno": expected_errno,
+    }
+    assert list(workspace.iterdir()) == [], "probe left files in the budget workspace"
+    monkeypatch.setenv(fork_budget.EVIDENCE_VARIABLE, str(tmp_path))
+    evidence = fork_budget.Evidence("probe", {"reflinkProbe": probe})
+    record = json.loads((evidence.directory / "reference-host.json").read_text())
+    assert record["reflinkProbe"] == probe
+
+
+def test_reflink_probe_rejects_missing_workspace(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        fork_budget.reflink_probe(tmp_path / "missing")

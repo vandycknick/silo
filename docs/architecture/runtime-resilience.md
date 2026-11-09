@@ -6,6 +6,16 @@ Opening libvm validates the installation and global storage. Missing/invalid
 runtime components, incompatible state databases, and database-wide I/O failures
 remain fatal. Opening the runtime does not reconcile every VM.
 
+The SQLite catalog uses WAL with `synchronous=NORMAL` (`fullfsync` and
+`checkpoint_fullfsync` remain enabled): every crash leaves it consistent and a
+process crash loses no committed transactions, but power loss or an OS crash
+may lose transactions since the previous WAL checkpoint. Avoiding a commit
+fsync is deliberate: ext4 `data=ordered` drains all dirty private-copy data on
+each journal commit. Checkpoint publication and handoff receipt/ownership
+boundaries explicitly checkpoint before acknowledgment or replay; an incomplete
+checkpoint is an error, never a claim of power-loss durability. Destructive
+collection checkpoints retired roots and cleanup/eviction authority before unlink.
+
 `Runtime::inventory()` and `Runtime::inspect_inventory()` return indexed identity
 plus best-effort machine details. An individually undecodable configuration is an
 entry with `data: None` and configuration issues, not a failed fleet inventory.

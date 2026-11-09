@@ -424,6 +424,12 @@ mod tests {
         let fixture = Fixture::new(false, true).await;
         let before = crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await;
         let baseline = bytes(&root(&fixture.home, &fixture.source));
+        let store = fixture.runtime.native_store().unwrap();
+        let source_durability = store
+            .machine_durability(fixture.source.machine_id())
+            .await
+            .unwrap();
+        assert_eq!(source_durability, Some(crate::MachineDurability::Durable));
         assert!(fixture
             .source
             .fork_stopped(ForkOptions {
@@ -445,6 +451,13 @@ mod tests {
             before
         );
         assert_eq!(bytes(&root(&fixture.home, &fixture.source)), baseline);
+        assert_eq!(
+            store
+                .machine_durability(fixture.source.machine_id())
+                .await
+                .unwrap(),
+            source_durability
+        );
         let info = fixture
             .source
             .snapshot_stopped(SnapshotOptions {
@@ -466,11 +479,19 @@ mod tests {
             )
             .await
             .expect("stopped child with explicit requirements");
+        assert_eq!(
+            store.machine_durability(child.machine_id()).await.unwrap(),
+            Some(crate::MachineDurability::Durable)
+        );
         // Required mapping refusal must precede monitor execution. These bytes
         // are deliberately nonbootable, so no native invocation can pass this.
         let before_start =
             crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await;
         assert!(child.start().await.is_err());
+        assert_eq!(
+            store.machine_durability(child.machine_id()).await.unwrap(),
+            Some(crate::MachineDurability::Durable)
+        );
         assert_eq!(
             crate::machine::stopped_storage::live_catalog::snapshot(&fixture.home).await,
             before_start

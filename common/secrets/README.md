@@ -57,3 +57,10 @@ Production `silo secret provide --store-file <path>` refreshes only OpenAI Codex
 backing keys through the fixed OpenAI endpoint. Local HTTP verification injects
 an endpoint into the internal handler in test-only processes, without adding a
 production endpoint flag or environment override.
+
+New live restore/fork children initialize their machine SSH CA scope by atomic
+replacement without an inline file or directory sync. The child's background
+durability barrier retains the published `secrets.json` inode and syncs it before
+its machine directory and before recording the child as durable. Stopped-machine
+construction and ordinary secret updates still complete file and directory
+barriers inline. In particular, OAuth token rotation never uses deferred writes.

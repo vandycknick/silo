@@ -72,7 +72,9 @@ pub struct RestoreObject {
     pub file_device: u64,
     pub file_inode: u64,
     pub length: u64,
-    pub sha256: Sha256Digest,
+    /// RAM uses its canonical chunk-list stream identity. Small state objects
+    /// use the whole-byte SHA-256 recorded for their role.
+    pub identity: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,7 +148,11 @@ impl RestoreRequest {
                 .iter()
                 .find(|entry| entry.role == object.role.capture_role())
                 .ok_or_else(|| "restore object is absent from the captured cut".to_string())?;
-            if object.length != inventory.length || object.sha256 != inventory.sha256 {
+            let identity = match object.role {
+                RestoreObjectRole::Ram => inventory.identity,
+                _ => inventory.sha256,
+            };
+            if object.length != inventory.length || Some(object.identity) != identity {
                 return Err("restore object identity differs from the captured cut".into());
             }
         }

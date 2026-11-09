@@ -454,6 +454,22 @@ impl Store {
                 &self.home,
             )
             .await?;
+            tx.commit().await?;
+            // Stabilize the observed absence, not an earlier catalog snapshot.
+            self.checkpoint_catalog().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let retained_capture: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_operation WHERE operation_id=?1 AND kind IN ('capture','live-fork'))")
+                .bind(name).fetch_one(&mut *tx).await?;
+            if retained_capture {
+                tx.commit().await?;
+                continue;
+            }
+            crate::store::ensure_cache_paths_unreferenced(
+                &mut tx,
+                &[candidate.path().to_path_buf()],
+                &self.home,
+            )
+            .await?;
             candidate.remove()?;
             tx.commit().await?;
         }
@@ -528,6 +544,7 @@ impl Store {
             // Publish retryable deletion intent before touching bytes. A crash
             // must not resurrect a catalog row naming an already unlinked file.
             tx.commit().await?;
+            self.checkpoint_catalog().await?;
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             crate::store::ensure_cache_paths_unreferenced(
                 &mut tx,
@@ -1638,6 +1655,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_stabilizes_retired_roots_before_removing_bytes() {
+        for kind in ["stream", "object", "staging"] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = Store::new(&LocalPaths::new(temp.path().join("home")))
+                .await
+                .unwrap();
+            let pool = StoragePool::open(&db.images_dir).unwrap();
+            let (operation, lease) = db
+                .begin_stopped_operation("import", &[], &[])
+                .await
+                .unwrap();
+            let owner = if kind == "staging" {
+                Some(
+                    pool.create_operation_with_lease(operation, lease.duplicate().unwrap())
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let source = temp.path().join("source");
+            fs::write(&source, b"must survive an incomplete checkpoint").unwrap();
+            let path = match kind {
+                "stream" => {
+                    let (stream, roots) = pool.publish_stream_for_catalog(&source).unwrap();
+                    db.pin_published_storage_dependencies(operation, &[stream.id], &[])
+                        .await
+                        .unwrap();
+                    drop(roots);
+                    stream.path
+                }
+                "object" => {
+                    let (object, roots) = pool.publish_object_for_catalog(&source).unwrap();
+                    db.pin_published_storage_dependencies(operation, &[], &[object.digest])
+                        .await
+                        .unwrap();
+                    drop(roots);
+                    object.path
+                }
+                _ => {
+                    let owner = owner.as_ref().unwrap();
+                    fs::write(owner.temporary.join("private"), b"staging").unwrap();
+                    owner.temporary.clone()
+                }
+            };
+            let mut reader = db.pool.begin().await.unwrap();
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_operation")
+                .fetch_one(&mut *reader)
+                .await
+                .unwrap();
+            drop(owner);
+            drop(lease);
+            let error = if kind == "object" {
+                db.recover_layer_objects().await.unwrap_err()
+            } else {
+                db.prune_image_cache(false).await.unwrap_err()
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("catalog WAL checkpoint is incomplete"),
+                "{kind}: {error}"
+            );
+            assert!(
+                path.exists(),
+                "{kind} bytes were removed before the barrier"
+            );
+            reader.rollback().await.unwrap();
+            if kind == "object" {
+                db.recover_layer_objects().await.unwrap();
+            } else {
+                db.prune_image_cache(false).await.unwrap();
+            }
+            assert!(!path.exists(), "{kind} collection did not resume");
+        }
     }
 
     #[tokio::test]

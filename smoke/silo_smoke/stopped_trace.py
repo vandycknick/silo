@@ -181,6 +181,8 @@ def main() -> None:
     copy_pending = {}
     copy_totals = {}
     observe_copies = request.get("observeCaptureCopies", False)
+    observe_syncs = request.get("observeCaptureSyncs", False)
+    sync_pending = {}
     # A fixed sleep at every empty WNOHANG poll adds a millisecond to nearly
     # every syscall stop, including boot-asset authentication before the copy.
     # Block SIGCHLD only in the controller, then wait for actual stop readiness.
@@ -197,13 +199,12 @@ def main() -> None:
         "destination-sync": {74, 75},
         "publication-rename": {316},
         "destination-directory-sync": {74, 316},
-        "capture-disk-sync": {74, 75},
-        "capture-execution-sync": {74, 75},
-        "capture-ram-sync": {74, 75},
+        "capture-execution-write": {1, 18, 20},
+        "capture-ram-write": {1, 18, 20},
         "capture-dirty-harvest": {16},
         "capture-seal-publish": {265},
-        "capture-seal-sync": {74, 75, 265},
-        "capture-source-sync": {74, 75},
+        "capture-record-settle": {263},
+        "capture-source-write": {1, 18, 20},
         "capture-disk-copy": {1, 16, 18, 20},
         "capture-pool-sync": {74, 75},
         "capture-pool-rename": {316},
@@ -422,6 +423,27 @@ def main() -> None:
             info = SyscallInfo()
             ptrace(0x420E, tid, ctypes.sizeof(info), ctypes.byref(info))
             injected_result = None
+            if info.op == 1 and observe_syncs and int(info.data[0]) in (74, 75):
+                fd = int(info.data[1])
+                try:
+                    fd_path = Path(f"/proc/{tid}/fd/{fd}")
+                    metadata = fd_path.stat()
+                    sync_pending[tid] = {
+                        "pid": group, "tid": tid, "syscall": int(info.data[0]), "fd": fd,
+                        "path": os.readlink(fd_path), "device": metadata.st_dev,
+                        "inode": metadata.st_ino, "directory": stat.S_ISDIR(metadata.st_mode),
+                        "startedNs": time.monotonic_ns(),
+                    }
+                except ProcessLookupError:
+                    raise
+                except OSError:
+                    tracee_status(tid)
+            if info.op == 2 and tid in sync_pending:
+                observation = sync_pending.pop(tid)
+                observation.update(returned=ctypes.c_longlong(info.data[0]).value,
+                                   finishedNs=time.monotonic_ns())
+                with (evidence / "capture-syncs.jsonl").open("a") as output:
+                    output.write(json.dumps(observation) + "\n")
             if info.op == 2 and tid in pending_injection:
                 registers = Registers()
                 ptrace(12, tid, 0, ctypes.byref(registers))
@@ -631,7 +653,7 @@ def main() -> None:
                             published = connection.execute(
                                 "SELECT 1 FROM snapshot_capture_provenance WHERE capture_id=?",
                                 (capture_id,)).fetchone()
-                        catalog_commit = row is not None and row[0] is not None and published is None
+                        catalog_commit = row is not None and row[0] is not None and published is not None
                 selected = ((boundary == "source-sync" and syscall in (74, 75) and source)
                             or (boundary == "source-read" and syscall in (0, 5, 8, 17) and source)
                             or (boundary == "boot-kernel-copy" and syscall in (1, 18, 20)
@@ -641,12 +663,12 @@ def main() -> None:
                             or (boundary == "destination-sync" and owned_copy and syscall in (74, 75))
                             or (boundary == "publication-rename" and publication)
                             or (boundary == "destination-directory-sync" and publication_seen and syscall == 74 and (owned_stage or owned_child) and metadata is not None and stat.S_ISDIR(metadata.st_mode))
-                            or (boundary == "capture-disk-sync" and capture_disk and syscall in (74, 75))
-                            or (boundary == "capture-execution-sync" and capture_file and actual_path.name == "execution.state" and syscall in (74, 75))
-                            or (boundary == "capture-ram-sync" and capture_file and actual_path.name == "memory.ram" and syscall in (74, 75))
+                            or (boundary == "capture-execution-write" and capture_file and actual_path.name == "execution.state" and syscall in (1, 18, 20))
+                            or (boundary == "capture-ram-write" and capture_file and actual_path.name == "memory.ram" and syscall in (1, 18, 20))
                             or (boundary == "capture-seal-publish" and seal_publish)
-                            or (boundary == "capture-seal-sync" and publication_seen and capture_directory and syscall in (74, 75))
-                            or (boundary == "capture-source-sync" and capture_file and actual_path.name == ".vm.capture-source.json.tmp" and syscall in (74, 75))
+                            or (boundary == "capture-record-settle" and capture_directory and syscall == 263
+                                and tracee_name(tid, int(info.data[2])) == b".vm.capture.json.tmp")
+                            or (boundary == "capture-source-write" and capture_file and actual_path.name == ".vm.capture-source.json.tmp" and syscall in (1, 18, 20))
                             or (boundary == "capture-disk-copy" and copy_call
                                 and actual_path.name == request.get("captureDiskName", actual_path.name))
                             or (pool_boundary and publication_directory is not None)
@@ -677,7 +699,7 @@ def main() -> None:
         deliver = stopped if stopped not in (signal.SIGTRAP, signal.SIGSTOP, signal.SIGTRAP | 0x80) else 0
         # After the required boundary/checked injected return, retain
         # lifecycle tracing and EXITKILL without stopping every syscall.
-        resume(24 if event != 6 and (not matched or observe_net or tid in pending_injection) else 7, tid, deliver)
+        resume(24 if event != 6 and (not matched or observe_net or observe_syncs or tid in pending_injection) else 7, tid, deliver)
 
     def cancelled(_signal, _frame) -> None:
         raise InterruptedError("owned stopped boundary controller cancelled")
@@ -687,7 +709,7 @@ def main() -> None:
         while True:
             assert time.monotonic() < deadline, f"actual operation exceeded 240s: {tracked}; announced: {dict(+unaccounted)}; lost stops: {awaiting_terminal}"
             if held is not None and Path(request["release"]).is_file():
-                resume(24 if observe_net or held in pending_injection else 7, held)
+                resume(24 if observe_net or observe_syncs or held in pending_injection else 7, held)
             try:
                 tid, status = os.waitpid(-1, os.WNOHANG | 0x40000000)
             except ChildProcessError:

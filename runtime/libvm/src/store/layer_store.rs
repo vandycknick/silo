@@ -655,15 +655,15 @@ impl LayerStore {
         let limits = *limits;
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
+            let context = store.store.layer_worker_context();
+            #[cfg(test)]
+            context.hit(WorkerPoint::Compose)?;
+            let _context = context;
             let owner = runtime.block_on(store.begin_layer_consumer(&results))?;
             let mut layers = Vec::with_capacity(results.len());
             for id in results {
                 layers.push(runtime.block_on(store.load_pinned(id, &limits, true))?);
             }
-            let context = store.store.layer_worker_context();
-            #[cfg(test)]
-            context.hit(WorkerPoint::Compose)?;
-            let _context = context;
             let namespace =
                 oci::changeset::namespace::compose(&layers.iter().collect::<Vec<_>>(), &limits)
                     .map_err(LibVmError::Namespace)?;
@@ -949,9 +949,25 @@ impl Store {
                         &store.home,
                     )
                     .await?;
+                    tx.commit().await?;
+                    // Stabilize the observed root removals before unlink, then
+                    // recheck after reacquiring the SQLite writer fence.
+                    store.checkpoint_catalog().await?;
+                    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+                    crate::store::ensure_cache_paths_unreferenced(
+                        &mut tx,
+                        &candidates,
+                        &store.home,
+                    )
+                    .await?;
                     #[cfg(test)]
                     _context.hit(WorkerPoint::RecoveryDelete)?;
                     for digest in orphaned {
+                        if crate::store::stream_representation::object_reachable(&mut tx, digest)
+                            .await?
+                        {
+                            continue;
+                        }
                         pool.remove_object(&digest)?;
                     }
                     tx.commit().await?;

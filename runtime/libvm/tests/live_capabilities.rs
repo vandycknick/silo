@@ -356,6 +356,58 @@ fn unsupported(
 }
 
 #[tokio::test]
+async fn startup_adopts_constructed_machine_with_live_scenario_run() {
+    let fixture = Fixture::new(&scenario(Some(LiveReasonCode::NotDelivered), false)).await;
+    let before = fixture.machine.inspect().await.expect("inspect live run");
+    // The live run creates runtime coordination files that are deliberately
+    // outside the private-copy/launch-artifact durability inventory.
+    assert!(fixture
+        .home
+        .join("machines")
+        .join(fixture.machine.id())
+        .join("node-state.lock")
+        .is_file());
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(fixture.home.join("state.db"))
+        .create_if_missing(false);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    // Retain the real monitor, launch lease and private files, with exactly
+    // the catalog state left when a manager loses its durability task.
+    sqlx::query("UPDATE machine_config SET durability='constructed' WHERE id=?")
+        .bind(fixture.machine.id())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+
+    let reopened = Runtime::new(fixture.config.clone())
+        .await
+        .expect("recover live child");
+    let adopted = reopened
+        .get_machine(&fixture.reference())
+        .await
+        .expect("child retained");
+    let after = adopted.inspect().await.expect("inspect adopted child");
+    assert_eq!(after.durability, libvm::MachineDurability::Durable);
+    assert_eq!(
+        after.run_id, before.run_id,
+        "recovery must not restart the child"
+    );
+    assert_eq!(after.status, before.status);
+    assert!(fixture
+        .home
+        .join("machines")
+        .join(fixture.machine.id())
+        .join("root.raw")
+        .is_file());
+    assert!(
+        kill(fixture.pid, None).is_ok(),
+        "recovery killed the live monitor"
+    );
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn live_capabilities_query_freezes_selection_and_rewritten_scenario_changes_new_identity() {
     let temp = tempfile::tempdir().expect("private root");
     let path = temp.path().join("scenario.json");
@@ -795,6 +847,48 @@ async fn pause_independent_manager_recovers_lost_receipt_replay_conflict_and_sto
     }
     machine.stop().await.unwrap();
     assert_eq!(machine.inspect().await.unwrap().status.label(), "stopped");
+}
+
+#[tokio::test]
+async fn operation_polling_adds_no_journal_rows_while_explicit_get_operation_still_does() {
+    use vm_spec::lifecycle::*;
+    let fixture = Fixture::new(&pause_scenario(Default::default())).await;
+    let count = || async {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(fixture.home.join("state.db"))
+            .read_only(true)
+            .create_if_missing(false);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM live_command")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        count
+    };
+    assert_eq!(count().await, 0);
+    // `pause` journals the Pause intent once, then polls GetOperation until the
+    // pause is established. Those polls must leave no command history.
+    let established = fixture
+        .machine
+        .pause(&fixture.machine.observe_live().await.unwrap())
+        .await
+        .unwrap();
+    let current = established.lifecycle.current_pause.unwrap();
+    assert_eq!(count().await, 1, "polling journaled GetOperation records");
+    // An explicit GetOperation request keeps its durable replay identity.
+    let fresh = fixture.machine.observe_live().await.unwrap();
+    let operation = fixture
+        .machine
+        .get_operation(&fresh, uuid::Uuid::new_v4(), current.operation_id.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        operation,
+        LiveCommandResult::GetOperation(GetOperationOutcome::Observation { .. })
+    ));
+    assert_eq!(count().await, 2);
+    fixture.machine.stop().await.unwrap();
 }
 
 #[tokio::test]

@@ -261,9 +261,12 @@ impl ControlState {
                 let command = std::env::current_exe()
                     .and_then(|path| path.canonicalize())
                     .map_err(|_| Status::unavailable("silo executable path unavailable"))?;
-                let runtime = Runtime::new(self.config.clone().with_runtime_components(components))
-                    .await
-                    .map_err(native)?;
+                let config = self.config.clone().with_runtime_components(components);
+                let runtime = match self.live_query.get() {
+                    Some(query) => Runtime::new_with_capability_query(config, query.clone()).await,
+                    None => Runtime::new(config).await,
+                }
+                .map_err(native)?;
                 let store = runtime.local_home().join("secrets.json");
                 Ok::<_, Status>(
                     runtime.with_secret_provider(

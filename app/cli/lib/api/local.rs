@@ -40,13 +40,15 @@ impl LocalVmService {
     }
 
     pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
-        if let Self::Uninitialized { config, .. } = self {
+        if let Self::Uninitialized { config, query } = self {
             let config = config
                 .take()
                 .ok_or_else(|| eyre::eyre!("local runtime configuration was not initialized"))?;
-            let runtime = Runtime::new(config)
-                .await
-                .context("initialize local libvm adapter")?;
+            let runtime = match query.get() {
+                Some(query) => Runtime::new_with_capability_query(config, query.clone()).await,
+                None => Runtime::new(config).await,
+            }
+            .context("initialize local libvm adapter")?;
             let provider = libvm::HostCommand::new(
                 std::env::current_exe().context("resolve CLI binary path")?,
             )
@@ -319,11 +321,19 @@ impl LocalVmService {
         options.name = silo_vm_control::stopped::name(options.name)?;
         if let Self::Uninitialized {
             config: Some(config),
-            ..
+            query,
         } = self
         {
-            libvm::preflight_restore_snapshot(config, &reference, &options.external_resources)
+            let query = query
+                .get_or_try_init(|| async { libvm::LiveCapabilityQuery::open(config) })
                 .await?;
+            libvm::preflight_restore_snapshot(
+                config,
+                query,
+                &reference,
+                &options.external_resources,
+            )
+            .await?;
         }
         Ok(self
             .runtime()

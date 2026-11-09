@@ -379,15 +379,23 @@ A capture runs in this order; each step completes before the next begins:
    worker freezes host writers, harvests dirty coverage, and streams RAM into
    the staging file. A changed-to-zero page is written as an explicit zero,
    never omitted.
-5. **Seal.** The monitor synchronizes every staged file, writes
-   `vm.capture.json` to a temporary file in the capture directory, synchronizes
-   it, renames it into place and synchronizes the directory. A capture is
-   **sealed** when a durable `vm.capture.json` with `captureOutcome: coherent`
-   and all seven facts true exists; a record with `captureOutcome: failed` is
-   written the same way for diagnosis and is not a seal. The sealed inventory
-   (every staged file named in `vm.capture.json`) and the record itself never
-   change afterwards; the continuation record of step 6 is the only file
-   added to the directory after the seal.
+5. **Record.** The staged digests are computed while the bytes are written:
+   the worker hashes each RAM chunk as it streams it and the monitor hashes
+   each disk chunk as it copies it; no staged file is read back to be
+   verified. The monitor closes every writer, writes `vm.capture.json` to a
+   temporary file in the capture directory and renames it into place. The
+   monitor synchronizes nothing: durability belongs to libvm, at publication
+   for a named checkpoint and in each child's background barrier for a fork.
+   A capture is **recorded** when `vm.capture.json` with `captureOutcome:
+   coherent` and all seven facts true exists; a record with `captureOutcome:
+   failed` is written the same way for diagnosis and is not a coherent
+   record. The recorded inventory (every staged file named in
+   `vm.capture.json`) and the record itself never change afterwards; the
+   continuation record of step 6 is the only file added to the directory
+   after the record. A host crash before libvm has published (checkpoint) or
+   made every child durable (fork) loses that capture and nothing else; the
+   source continues or is recovered by its own rules. Elsewhere in this
+   document "sealed" means "recorded" in this sense.
 6. **Continue the source.** Under `resumePolicy: resume-if-acquired` the
    capture owns the pause: the worker accepts the new baseline and resumes
    the exact token, the monitor re-handshakes the agent and sends `Thaw`.
@@ -465,9 +473,16 @@ first instruction.
 ### Identity and chains
 
 RAM is a logical stream under [ADR 0014](0014-layered-oci-image-storage.md)'s `stream` identity: 8 MiB decoded
-chunks, `zero` only for an entirely zero chunk. The layout record is
-identified separately and binds the stream to its guest-physical geometry;
-identical bytes at different addresses are different memory.
+chunks, `zero` only for an entirely zero chunk. The stream's identity is the
+SHA-256 of its ordered chunk-digest list with the stream length, computed
+from the chunk map; it is not the SHA-256 of the file's bytes. The all-zero
+chunk has one constant digest, so hashing a sparse RAM image costs its data
+chunks only, and an incremental capture hashes only the chunks it rewrote.
+A published artifact blob additionally records the whole-file SHA-256 of the
+bytes it transports, computed at publication, never on the pause path. The
+layout record is identified separately and binds the stream to its
+guest-physical geometry; identical bytes at different addresses are different
+memory.
 
 An incremental checkpoint is published with a complete resolved chunk map that
 reuses unchanged chunk objects from its predecessor. The parent is lineage, not
@@ -525,8 +540,20 @@ optimization is never a reason to omit memory from a capture.
 
 ### Inputs
 
-libvm verifies the checkpoint closure, trust policy and compatibility profile
-before allocating anything for a child. It then creates the child's machine
+libvm verifies the checkpoint closure's shape, trust policy and compatibility
+profile before allocating anything for a child: every member is present with
+its recorded length, role and lineage; nothing is read in full yet. Byte
+authentication of the RAM stream and the sealed disks then runs concurrently
+with the construction of the child's private disk copies; a failed
+authentication rolls the owned child allocation back and reports the
+authentication error, never a construction error. A content object that
+libvm itself verified and sealed earlier is reused without re-reading when
+its recorded inode, length, mode `0400` and change time still match; a
+mismatch re-authenticates. Silent corruption that preserves inode metadata,
+including the change time, is outside this local warm-reuse trust boundary;
+transport still authenticates every byte. Objects that leave the host
+(publication, export, handoff) are always re-read in full. libvm creates the
+child's machine
 directory, private raw copies of every sealed disk, fresh network reservations
 and sockets, the composite initramfs for provenance only, and the leases for
 the RAM file, lower and boot assets. It passes the resolved restore inputs to
@@ -534,6 +561,11 @@ the monitor in the [ADR 0018](0018-silo-vmm-contract.md) start request: checkpoi
 layout, execution and device-state objects as inherited read-only
 descriptors; the private disk roles; the compatibility profile; the
 activation configuration; and `startPaused: true`.
+
+A restored child's private copies follow the fork rule: hashed as written,
+recorded `constructed` when complete, started on that record, and moved to
+`durable` by a background synchronization; a child without a durable record
+after a runtime restart is deleted by recovery, never started.
 
 Private disk copies are role-selected paths under the child's data directory;
 the RAM file, layout, execution and device-state objects are leased content
@@ -673,10 +705,26 @@ this timer exception changes neither kernel builds nor the support matrix.
 ## Fork
 
 Fork is one capture followed by N restores. libvm performs the capture, pins
-the sealed RAM file and disk cut under a recoverable operation root, then
-restores each child subject to the admitted resource budgets. A local fork may use [ADR 0014](0014-layered-oci-image-storage.md)'s
-qualified clone and copy identity rules without computing durable chunk
-identities first; a named checkpoint is not required, an operation root is.
+the recorded RAM file and disk cut under a recoverable operation root, then
+restores each child subject to the admitted resource budgets. A local fork
+uses [ADR 0014](0014-layered-oci-image-storage.md)'s qualified clone and copy
+identity rules without computing durable chunk identities first; a named
+checkpoint is not required, an operation root is. libvm validates the cut's
+receipt structurally (run and configuration correlation, roles, lengths,
+chunk counts, token binding) and does not re-read the cut before
+constructing children; the bytes are authenticated when they are first used
+(the RAM stream on restore, each disk as it is copied). The cut is never
+published as a checkpoint; it exists only until every child is durable.
+
+Each child's private disk copy is hashed as it is written and compared with
+the cut's identity; a mismatch fails that child. The child's construction is
+recorded as `constructed`, not yet durable, as soon as its copies are
+complete, and the child may start on that record. Its durability barrier
+(file and directory synchronization) completes in the background and moves
+the record to `durable`; a child that still lacks a durable record after a
+runtime restart is deleted by recovery, never started. The fork completes
+when every child is `Running` and reports durability separately. A fork cut
+is collectable once every child is `durable`.
 
 The result names every child and its outcome and the source's continuation
 outcome. Before the capture seals, every child fails together. After it seals,
@@ -956,9 +1004,12 @@ evidence; a crash before the seal leaves no admissible capture, a crash after
 it permits libvm to complete publication from the sealed files.
 
 libvm reconciles `vm.capture.json` by validating run and configuration
-correlation, re-reading every staged digest, computing canonical stream
-identities, and committing. It does not infer capture success from process
-exit, from a file's existence or from an RPC that returned before the seal.
+correlation and the structural consistency of the inventory (roles, lengths,
+chunk counts, chunk-list identities recomputed from the recorded chunk
+digests) and committing. It re-reads staged bytes in full only when they
+leave the host (publication, export, handoff) or when a consumer first uses
+them. It does not infer capture success from process exit, from a file's
+existence or from an RPC that returned before the seal.
 
 ### ADR 0018 additions
 
@@ -1082,12 +1133,16 @@ cold and warm cache recorded separately, as the median of five runs with
 minimum and maximum reported; a budget passes when the median meets it. The
 target pause durations are: full capture of a 4 GiB machine with a 1 GiB
 nonzero upper on APFS or reflink-capable Linux within 5 s of workload
-interruption; the same on Linux without reflinks within 5 s plus the upper's
-allocated bytes at the host's sequential copy rate; an incremental capture
-with 10 percent dirty within 1 s; restore to `Running` within 2 s; a fork of
-four children to `Running` within 10 s. If the non-CoW Linux copy cost exceeds
-the owner's acceptance budget when measured, that measurement is the evidence
-to reopen qcow2 upper generations in [ADR 0014](0014-layered-oci-image-storage.md); nothing else is.
+interruption; an incremental capture with 10 percent dirty within 1 s;
+restore to `Running` within 2 s; a fork of four children to `Running` within
+10 s. On Linux without reflinks every one of these budgets is extended by the
+**non-CoW copy allowance**: the allocated bytes of each private raw copy the
+operation must make (the upper for capture and incremental capture, one
+private upper for restore, one per child for fork) at the host's measured
+sequential copy rate. The cold-cache restore figure is recorded on every lane
+and budgeted on the reflink-capable lanes. Raw clone and copy remains the
+disk representation; qcow2 upper generations are not reopened by these
+measurements.
 
 ## libkrun Fork Commit Series
 

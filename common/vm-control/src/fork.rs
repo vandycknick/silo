@@ -352,6 +352,10 @@ fn child_result_to_wire(value: &ForkChildResult) -> w::ForkChildResult {
         machine_id: value.machine_id.to_string(),
         run_id: value.run_id.to_string(),
         outcome: Some(child_outcome_to_wire(&value.outcome)),
+        durability: value.durability.map(|value| match value {
+            libvm::MachineDurability::Constructed => w::MachineDurability::Constructed as i32,
+            libvm::MachineDurability::Durable => w::MachineDurability::Durable as i32,
+        }),
     }
 }
 
@@ -362,6 +366,17 @@ fn child_result_from_wire(value: w::ForkChildResult) -> Result<ForkChildResult, 
         run_id: run_id(&value.run_id, "fork.child.run_id")?,
         outcome: child_outcome_from_wire(required(value.outcome, "fork.child.outcome")?)?,
         name: value.name,
+        durability: value
+            .durability
+            .map(|value| match w::MachineDurability::try_from(value) {
+                Ok(w::MachineDurability::Constructed) => Ok(libvm::MachineDurability::Constructed),
+                Ok(w::MachineDurability::Durable) => Ok(libvm::MachineDurability::Durable),
+                _ => Err(invalid(
+                    "fork.child.durability",
+                    "unknown or unspecified durability",
+                )),
+            })
+            .transpose()?,
     })
 }
 
@@ -651,6 +666,7 @@ mod tests {
             machine_id: machine(index),
             run_id: run(index),
             outcome,
+            durability: None,
         }
     }
 
@@ -901,6 +917,12 @@ mod tests {
         case.stage = 99;
         cases.push(("unknown stage", case));
         let mut case = valid.clone();
+        case.children[0].durability = Some(w::MachineDurability::Unspecified as i32);
+        cases.push(("unspecified durability", case));
+        let mut case = valid.clone();
+        case.children[0].durability = Some(99);
+        cases.push(("unknown durability", case));
+        let mut case = valid.clone();
         case.children[1].outcome = Some(w::ForkChildOutcome {
             outcome: Some(w::fork_child_outcome::Outcome::Failed(
                 w::ForkChildFailure {
@@ -1014,5 +1036,20 @@ mod tests {
         let mut resources = options();
         resources.resources = libvm::RestoreResourcePolicy::default();
         assert!(validate_creation(&result, &resources).is_err());
+    }
+
+    #[test]
+    fn child_durability_round_trips_independently_of_running_completion() {
+        for durability in [
+            None,
+            Some(libvm::MachineDurability::Constructed),
+            Some(libvm::MachineDurability::Durable),
+        ] {
+            let mut value = partial();
+            value.children[0].outcome = ForkChildOutcome::Running;
+            value.children[0].durability = durability;
+            let wire = result_to_wire(&value).unwrap();
+            assert_eq!(result_from_wire(wire).unwrap(), value);
+        }
     }
 }

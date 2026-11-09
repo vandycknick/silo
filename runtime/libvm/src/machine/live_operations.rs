@@ -255,6 +255,49 @@ impl Machine {
         .await
     }
 
+    /// Observe retained operation authority without adding durable command
+    /// history. Explicit `get_operation` requests and recovery retain their
+    /// journaled replay semantics.
+    pub(crate) async fn observe_operation(
+        &self,
+        observation: &MachineLiveObservation,
+        operation_id: LiveId,
+    ) -> Result<LiveCommandResult, LibVmError> {
+        if observation.report().machine_id != Uuid::from(self.machine_id()).to_string() {
+            return Err(LibVmError::LiveObservation {
+                reference: self.id(),
+                message: "observation belongs to another machine".into(),
+            });
+        }
+        let command = LiveCommand::GetOperation(GetOperationCommand {
+            envelope: envelope(observation, Uuid::new_v4())?,
+            operation_id,
+        });
+        if let Some(rejection) = require_new_command(observation, &command)? {
+            return Ok(rejection);
+        }
+        let runtime = self.runtime();
+        {
+            let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            let fresh = runtime.observe_live(&MachineRef::id(config.id)).await?;
+            require_same_observation(observation, &fresh)?;
+            if let Some(rejection) = require_new_command(&fresh, &command)? {
+                return Ok(rejection);
+            }
+        }
+        let result = runtime
+            .supervisor()
+            .client(self.machine_id())
+            .lifecycle(command)
+            .await
+            .map_err(|error| protocol(format!("operation observation: {error}")))?;
+        if !matches!(result, LiveCommandResult::GetOperation(_)) {
+            return Err(protocol("monitor returned another command's response"));
+        }
+        result.validate().map_err(protocol)?;
+        Ok(result)
+    }
+
     pub async fn cancel_operation(
         &self,
         observation: &MachineLiveObservation,
@@ -331,10 +374,7 @@ impl Machine {
         loop {
             let fresh = self.observe_live().await?;
             require_same_observation(observation, &fresh)?;
-            match self
-                .get_operation(&fresh, Uuid::new_v4(), operation_id.clone())
-                .await?
-            {
+            match self.observe_operation(&fresh, operation_id.clone()).await? {
                 LiveCommandResult::GetOperation(GetOperationOutcome::Observation {
                     observation: observed,
                 }) => match observed.operation.outcome.clone() {

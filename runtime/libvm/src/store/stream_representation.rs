@@ -490,6 +490,8 @@ impl Store {
                     .execute(&mut *tx)
                     .await?;
                 tx.commit().await?;
+                // Recovery must retain eviction authority if the flat is gone.
+                self.checkpoint_catalog().await?;
                 let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 crate::store::ensure_cache_paths_unreferenced(&mut tx, &[path], &self.home).await?;
                 if pool.remove_stream(&stream)? {
@@ -522,7 +524,7 @@ fn authenticate_flat_if_present(
     if !path.try_exists()? {
         return Ok(None);
     }
-    let authenticated = pool.authenticate_stream(&content.stream)?;
+    let authenticated = pool.authenticate_stream_full(&content.stream)?;
     if authenticated.map().length() != content.length {
         return Err(invalid("flat stream contradicts canonical length"));
     }
@@ -889,13 +891,14 @@ impl Store {
                     break;
                 }
                 let _roots = pool.lock_roots()?;
-                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 for value in candidates {
+                    let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                     cursor.clone_from(&value);
                     let digest: ObjectDigest = value.parse().map_err(invalid)?;
                     let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_cache_entry e WHERE kind=?1 AND digest=?2 AND (?3 OR last_used_at<=?4) AND NOT EXISTS(SELECT 1 FROM storage_operation_cache p WHERE p.kind=e.kind AND p.digest=e.digest))")
                         .bind(kind.as_str()).bind(&value).bind(pressure).bind(cutoff).fetch_one(&mut *tx).await?;
                     if !eligible {
+                        tx.commit().await?;
                         continue;
                     }
                     let path = self
@@ -903,6 +906,23 @@ impl Store {
                         .join(kind.directory())
                         .join("sha256")
                         .join(digest.hex());
+                    crate::store::ensure_cache_paths_unreferenced(
+                        &mut tx,
+                        std::slice::from_ref(&path),
+                        &self.home,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    // Persist this observed pin absence before unlink, then
+                    // recheck admission under a fresh SQLite writer fence.
+                    self.checkpoint_catalog().await?;
+                    let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                    let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_cache_entry e WHERE kind=?1 AND digest=?2 AND (?3 OR last_used_at<=?4) AND NOT EXISTS(SELECT 1 FROM storage_operation_cache p WHERE p.kind=e.kind AND p.digest=e.digest))")
+                        .bind(kind.as_str()).bind(&value).bind(pressure).bind(cutoff).fetch_one(&mut *tx).await?;
+                    if !eligible {
+                        tx.commit().await?;
+                        continue;
+                    }
                     crate::store::ensure_cache_paths_unreferenced(
                         &mut tx,
                         std::slice::from_ref(&path),
@@ -932,8 +952,8 @@ impl Store {
                         .bind(value)
                         .execute(&mut *tx)
                         .await?;
+                    tx.commit().await?;
                 }
-                tx.commit().await?;
             }
         }
         let _ = pool;
@@ -1319,11 +1339,28 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(store.prune_transport_caches(&pool, true).await.unwrap(), 0);
         assert!(path.exists());
+        let mut reader = store.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_cache_entry")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
         drop(owner);
         store
             .retire_abandoned_storage_operations(&pool)
             .await
             .unwrap();
+        let error = store
+            .prune_transport_caches(&pool, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("catalog WAL checkpoint is incomplete"),
+            "{error}"
+        );
+        assert!(path.exists());
+        reader.rollback().await.unwrap();
         assert_eq!(store.prune_transport_caches(&pool, false).await.unwrap(), 6);
         assert!(!path.exists());
         assert!(pool.object_path(&canonical).exists());
@@ -1486,6 +1523,34 @@ pub(crate) mod tests {
         store.recover_layer_objects().await.unwrap();
         assert!(!pool.object_path(&root).exists());
         assert!(!pool.object_path(&object).exists());
+    }
+
+    #[tokio::test]
+    async fn flat_eviction_stabilizes_recovery_authority_before_unlink() {
+        let (_temp, store, record, _info, owner, _) = retained(&[7; 512]).await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        let path = pool.stream_path(&record.root.stream.stream);
+        let mut reader = store.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_stream")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        let error = store.evict_flat_materializations().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("catalog WAL checkpoint is incomplete"),
+            "{error}"
+        );
+        assert!(path.exists());
+        reader.rollback().await.unwrap();
+        assert_eq!(store.evict_flat_materializations().await.unwrap(), 512);
+        assert!(!path.exists());
     }
 
     #[tokio::test]

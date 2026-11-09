@@ -15,6 +15,11 @@ const STATE_DB_FILE_NAME: &str = "state.db";
 const IMAGES_DIR_NAME: &str = "images";
 const LOCKS_DIR_NAME: &str = "locks";
 
+pub(crate) struct ChildLaunchDirectories {
+    pub(crate) directories: Vec<OwnedDirectory>,
+    pub(crate) parents: Vec<File>,
+}
+
 /// The two roots of a local runtime.
 ///
 /// ```text
@@ -120,6 +125,10 @@ impl LocalPaths {
         self.roots.home()
     }
 
+    pub(crate) fn run_root(&self) -> &Path {
+        self.roots.run_root()
+    }
+
     #[cfg(test)]
     pub(crate) fn state_db_path(&self) -> PathBuf {
         self.roots.state_db_path()
@@ -153,6 +162,52 @@ impl LocalPaths {
         Ok(())
     }
 
+    /// Prepare all child launch directories without an ext4 journal barrier.
+    /// Returned descriptors are ordered leaf-first for ChildDurability.
+    pub(crate) fn child_launch_directories(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<ChildLaunchDirectories, LibVmError> {
+        let mut missing_parents = Vec::new();
+        let mut path = self.roots.run_root();
+        loop {
+            match std::fs::metadata(path) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent =
+                        path.parent()
+                            .ok_or_else(|| LibVmError::MachinePreparationFailed {
+                                reference: machine_id.to_string(),
+                                message: "run root has no existing ancestor".into(),
+                            })?;
+                    missing_parents.push(parent.to_path_buf());
+                    path = parent;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let run = OwnedDirectory::open_root_deferred(self.roots.run_root())?;
+        let runs = run.ensure_dir_deferred(MACHINES_DIR_NAME)?;
+        let child_run = runs.ensure_dir_deferred(&machine_id.to_string())?;
+        let home = OwnedDirectory::open_existing_root(self.roots.home())?.ok_or_else(|| {
+            LibVmError::MachinePreparationFailed {
+                reference: machine_id.to_string(),
+                message: "machine home disappeared".into(),
+            }
+        })?;
+        let logs = home.ensure_dir_deferred(LOGS_DIR_NAME)?;
+        let machines = logs.ensure_dir_deferred(MACHINES_DIR_NAME)?;
+        let child_logs = machines.ensure_dir_deferred(&machine_id.to_string())?;
+        let parents = missing_parents
+            .iter()
+            .map(File::open)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ChildLaunchDirectories {
+            directories: vec![child_run, runs, run, child_logs, machines, logs, home],
+            parents,
+        })
+    }
+
     /// Creates a machine data directory and returns its validated containing directory.
     pub(crate) fn create_machine_data_dir(
         &self,
@@ -166,6 +221,27 @@ impl LocalPaths {
                 id: machine_id.to_string(),
             })?;
         machine.ensure_dir("captures")?;
+        Ok(machines)
+    }
+
+    /// Construct a live child without flushing sibling copies on this filesystem.
+    pub(crate) fn create_machine_data_dir_deferred(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<OwnedDirectory, LibVmError> {
+        let root = OwnedDirectory::open_existing_root(self.roots.home())?.ok_or_else(|| {
+            LibVmError::MachinePreparationFailed {
+                reference: machine_id.to_string(),
+                message: "machine home disappeared".into(),
+            }
+        })?;
+        let machines = root.ensure_dir_deferred(MACHINES_DIR_NAME)?;
+        let machine = machines
+            .create_dir_deferred(&machine_id.to_string())?
+            .ok_or_else(|| LibVmError::MachineIdAlreadyExists {
+                id: machine_id.to_string(),
+            })?;
+        machine.ensure_dir_deferred("captures")?;
         Ok(machines)
     }
 
@@ -502,5 +578,23 @@ mod tests {
 
         assert!(machine_socket.as_os_str().len() < 104);
         assert!(network_socket.as_os_str().len() < 104);
+    }
+    #[test]
+    fn deferred_machine_data_directory_keeps_private_modes_and_exclusive_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = LocalPaths::new(temp.path().join("home"));
+        let _home = crate::paths::OwnedDirectory::open_root(paths.home()).unwrap();
+        let id = MachineId::new();
+        let parent = paths.create_machine_data_dir_deferred(id).unwrap();
+        let child = parent.open_dir(&id.to_string()).unwrap().unwrap();
+        for directory in [child.path().to_path_buf(), child.path().join("captures")] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+        }
+        assert!(paths.create_machine_data_dir_deferred(id).is_err());
     }
 }

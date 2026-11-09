@@ -383,8 +383,8 @@ hands its storage leases to the monitor before submitting `Capture`. The
 monitor closes every writer before publishing the result.
 
 `vm.capture.json` is written once per capture, mode 0600, by writing a
-temporary file in the capture directory, synchronizing it, renaming it into
-place and synchronizing the directory. Version 1 carries `machineId`,
+temporary file in the capture directory, publishing its final name without
+replacement and settling its single link. Version 1 carries `machineId`,
 `runId`, `captureId`, the pause token, the configuration and attachment
 digest, RAM geometry, the staged output inventory with sizes and digests,
 timestamps, `captureOutcome` (`coherent` or `failed`), `error`, and the
@@ -392,10 +392,14 @@ booleans `workloadsFrozen`, `vcpusPaused`, `devicesQuiesced`,
 `hostWritersDrained`, `hostFlushCompleted`, `diskCopiesSealed` and
 `memoryStateSealed`. Each boolean records a positively observed fact; a
 false, missing or malformed field cannot yield `coherent`. A capture is
-**sealed** when this durable record exists with `captureOutcome: coherent`
+**sealed** when this complete record exists with `captureOutcome: coherent`
 and all seven facts true; a `failed` record is diagnostic, not a seal. The
 file is immutable once written. It is versioned by addition only. It does not
 replace `vm.exit.json`, and `captureOutcome` is not a stop outcome.
+The monitor synchronizes neither capture payloads nor records. libvm provides
+checkpoint durability at content-pool publication and the catalog barrier;
+fork children provide their independent background durability barriers.
+
 
 `vm.capture-source.json` is written the same way, after the source's
 continuation step, with `version`, `machineId`, `runId`, `captureId`, the

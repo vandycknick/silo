@@ -43,7 +43,7 @@ fn object(request: &RestoreRequest, role: RestoreObjectRole) -> io::Result<State
         .ok_or_else(|| invalid(format!("restore object {role:?} is missing")))?;
     Ok(StateObjectIdentity {
         length: object.length,
-        sha256: *object.sha256.as_bytes(),
+        sha256: *object.identity.as_bytes(),
     })
 }
 

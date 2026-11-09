@@ -3,6 +3,11 @@
 //! exact bytes; this module owns semantic export, verified import and the
 //! public orchestration around them.
 //!
+//! RAM and disk identities are hashes of their canonical chunk lists and logical
+//! lengths, not whole-file byte hashes. Export computes each transported blob's
+//! digest over its exact encoded bytes; import verifies those blob digests before
+//! accepting the decoded stream identity. Small state objects retain byte hashes.
+//!
 //! Admission: before any payload is fetched, an acquisition reserves its
 //! logical worst-case disk peak (cache, decoded staging and catalog copies)
 //! on the shared cross-home ledger; export admits its complete unique stream
@@ -1881,6 +1886,49 @@ pub(crate) mod tests {
         assert!(config.minimum_capabilities.live_restore);
         assert!(config.capture_provenance.is_some());
         let good = transfer(&prepared.graph, &prepared.payloads());
+        // Blob digests measure the transported encoding at export, independently
+        // of RAM and disk chunk-list identities in the capture inventory.
+        let (rows, _) = stream_rows(&prepared.graph, config.streams.digest);
+        for row in &rows {
+            for entry in transfer_entries(&prepared.graph, row).0 {
+                if let ChunkEntry::Data { encoded, .. } = entry {
+                    let bytes = &good.blobs[&encoded.digest];
+                    assert_eq!(ContentDigest::of_bytes(bytes), encoded.digest);
+                    assert_eq!(bytes.len() as u64, encoded.size);
+                }
+            }
+        }
+        // Ingest refuses bytes that differ from their transported blob digest,
+        // even when the semantic stream identity and approved index match.
+        let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+            &source_record.capture
+        else {
+            panic!("live checkpoint expected");
+        };
+        let ram = rows
+            .iter()
+            .find(|row| row.stream == identity(execution.memory.stream))
+            .unwrap();
+        let ram_blob = transfer_entries(&prepared.graph, ram)
+            .0
+            .into_iter()
+            .find_map(|entry| match entry {
+                ChunkEntry::Data { encoded, .. } => Some(encoded),
+                ChunkEntry::Zero { .. } => None,
+            })
+            .unwrap();
+        let (_corrupt_temp, corrupt_destination) = home().await;
+        let corrupt_staging = stage(&corrupt_destination, &good).await;
+        let path = corrupt_destination
+            .images_path()
+            .join("transport/sha256")
+            .join(object(ram_blob.digest).hex());
+        let mut corrupted = good.blobs[&ram_blob.digest].clone();
+        corrupted[0] ^= 0xff;
+        std::fs::write(path, corrupted).unwrap();
+        assert!(verify(&good, corrupt_staging, index_digest(&good))
+            .await
+            .is_err());
         let (_destination_temp, destination) = home().await;
         let staging = stage(&destination, &good).await;
         let verified = verify(&good, staging, index_digest(&good)).await.unwrap();

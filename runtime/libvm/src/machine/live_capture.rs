@@ -89,7 +89,7 @@ impl LiveSnapshotOptions {
 }
 
 /// Source continuation as libvm knows it. `Unknown` means the run ended
-/// without a durable continuation record; it is never resolved by resuming.
+/// without a continuation record; it is never resolved by resuming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LiveCaptureSource {
@@ -133,7 +133,7 @@ pub struct LiveSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MachineCaptureStage {
-    /// Reserved and submitted; no durable seal has been verified yet.
+    /// Reserved and submitted; no coherent record has been verified yet.
     Reserved,
     Sealed,
     /// The checkpoint is published; continuation or release is outstanding.
@@ -513,7 +513,7 @@ fn request_digest(record: &CaptureRecord) -> Result<Sha256Digest, LibVmError> {
 
 /// A coherent, plan-correlated seal on disk. Storage re-verifies every byte
 /// before publication; this only decides publish versus abandon.
-fn durable_seal(
+fn coherent_record(
     runtime: &Runtime,
     record: &CaptureRecord,
 ) -> Result<Option<CaptureEvidence>, LibVmError> {
@@ -540,13 +540,13 @@ fn durable_seal(
     Ok(Some(evidence))
 }
 
-/// The durable continuation record, correlated with the seal. A malformed or
+/// The continuation record, correlated with the coherent record. A malformed or
 /// foreign record fails closed for continuation only; the seal stays valid.
 fn source_record(
     runtime: &Runtime,
     record: &CaptureRecord,
 ) -> Result<Option<CaptureSourceRecord>, LibVmError> {
-    let Some(evidence) = durable_seal(runtime, record)? else {
+    let Some(evidence) = coherent_record(runtime, record)? else {
         return Ok(None);
     };
     let Some(staging) = open_staging(runtime, record)? else {
@@ -610,7 +610,7 @@ async fn observe_capture(
     capture: &LiveId,
 ) -> Result<MonitorCapture, LibVmError> {
     match machine
-        .get_operation(observation, Uuid::new_v4(), capture.clone())
+        .observe_operation(observation, capture.clone())
         .await?
     {
         LiveCommandResult::GetOperation(GetOperationOutcome::Observation { observation }) => {
@@ -875,7 +875,7 @@ pub(crate) async fn advance(
     let record = if !matches!(
         record.state,
         CaptureState::Published { .. } | CaptureState::Local { .. }
-    ) && durable_seal(runtime, &record)?.is_some()
+    ) && coherent_record(runtime, &record)?.is_some()
     {
         if let Some(disks) = retain_or_publish(runtime, &snapshots, &record).await? {
             *retained = Some(disks);
@@ -964,14 +964,14 @@ pub(crate) async fn advance(
                     return Ok(CaptureProgress::Abandoned(reason));
                 }
                 Some(progress) => return Ok(progress),
-                None => durable_seal(runtime, &record)?.is_some(),
+                None => coherent_record(runtime, &record)?.is_some(),
             },
         };
     if !sealed {
-        // The run ended without a durable coherent seal: no admissible capture.
+        // The run ended without a coherent record: no admissible capture.
         snapshots.abandon_capture(capture_id).await?;
         return Ok(CaptureProgress::Abandoned(
-            "run ended before a durable coherent seal".into(),
+            "run ended before a coherent capture record".into(),
         ));
     }
     if !published {
@@ -1099,6 +1099,7 @@ async fn finished(
     snapshot: &crate::storage::identity::SnapshotId,
 ) -> Result<CaptureProgress, LibVmError> {
     let info = snapshots.inspect(&SnapshotRef::Id(*snapshot)).await?;
+    runtime.native_store()?.checkpoint_catalog().await?;
     Ok(CaptureProgress::Finished(Box::new(LiveSnapshot {
         snapshot: info,
         capture: summary(runtime, record)?,
@@ -1375,6 +1376,17 @@ mod tests {
                 assert!(options.validate().is_err());
             }
         }
+    }
+
+    #[test]
+    fn named_snapshot_uses_the_same_capture_contract() {
+        let mut options = crate::LiveSnapshotOptions {
+            name: Some("checkpoint".into()),
+            ..Default::default()
+        };
+        options.validate().unwrap();
+        options.name = None;
+        options.validate().unwrap();
     }
 
     #[test]

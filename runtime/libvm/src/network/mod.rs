@@ -81,6 +81,7 @@ impl VmmNetworkAttachment {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_network_runtime(
     paths: &LocalPaths,
     store: &dyn DataStore,
@@ -89,6 +90,7 @@ pub(crate) async fn prepare_network_runtime(
     config: &RuntimeNetworkingConfig,
     netd_path: &Path,
     egress_credentials: &ResolvedSecrets,
+    durability: crate::MachineDurability,
 ) -> Result<VmmNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, store, metadata, false).await?;
 
@@ -110,6 +112,7 @@ pub(crate) async fn prepare_network_runtime(
                     config,
                     netd_path,
                     egress_credentials,
+                    durability,
                 },
                 &request,
             )
@@ -776,6 +779,7 @@ mod tests {
             &RuntimeNetworkingConfig::default(),
             Path::new("/tmp/netd"),
             &crate::secrets::ResolvedSecrets::default(),
+            crate::MachineDurability::Durable,
         )
         .await
         .expect_err("named attachment API should be required");

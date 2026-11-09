@@ -41,9 +41,13 @@ _DIAGNOSED = {"failed", "abandoned", "recovery-pending", "resume-failed", "unkno
 PARENT_PHASES = ("api_entered", "admission_committed", "capture_submitted", "seal_authenticated",
                  "source_settled", "finished")
 CHILD_PHASES = ("constructing", "prepared", "activating", "running")
+# Durability completes in the background after `prepared`; it is ordered
+# against nothing but its own child's construction and the call window.
+CHILD_BACKGROUND_PHASES = ("durable",)
 RESULT_KEYS = {"operationId", "sourceMachineId", "sourceRunId", "captureId", "stage",
                "cancellationRequested", "capture", "source", "resources", "children"}
-CHILD_KEYS = {"index", "name", "machineId", "runId", "outcome"}
+CHILD_KEYS = {"index", "name", "machineId", "runId", "outcome", "durability"}
+CHILD_DURABILITY = {None, "constructed", "durable"}
 FORK_TIMEOUT = 600
 MIB = 1024 * 1024
 
@@ -91,6 +95,7 @@ def validate(result: object, *, operation: str, names: list[str]) -> dict:
         kind = _outcome(child["outcome"], CHILD_KINDS, f"child {index}")
         if kind == "failed":
             assert child["outcome"].get("phase") in FAILURE_PHASES, child
+        assert child["durability"] in CHILD_DURABILITY, child
     assert len(machines) == len(runs) == len(names), "reserved child identities must be unique"
     assert _uuid(result["sourceMachineId"], "source") not in machines
     assert _uuid(result["sourceRunId"], "source run") not in runs
@@ -314,7 +319,8 @@ def events(silo: Silo, operation: str) -> dict[tuple[int | None, str], int]:
     for index, phase, stamp in rows:
         key = (int(index) if index != "" else None, phase)
         assert key not in found, f"duplicate fork phase {key}"
-        assert phase in (CHILD_PHASES if key[0] is not None else PARENT_PHASES), key
+        allowed = (CHILD_PHASES + CHILD_BACKGROUND_PHASES) if key[0] is not None else PARENT_PHASES
+        assert phase in allowed, key
         found[key] = int(stamp)
     return found
 
@@ -359,8 +365,12 @@ def ordered_events(call: Call, stamps: dict[tuple[int | None, str], int], *,
         assert child == sorted(child), (index, stamps)
         assert stamps[(None, "seal_authenticated")] <= child[0], "child construction preceded the seal"
         assert child[-1] <= stamps[(None, "finished")]
-    # The same CLOCK_MONOTONIC brackets every durable stamp.
-    assert call.dispatched_ns <= min(stamps.values()) <= max(stamps.values()) <= call.exited_ns, (
+        if (index, "durable") in stamps:
+            assert stamps[(index, "prepared")] <= stamps[(index, "durable")], (index, stamps)
+    # Running remains the measured activation point, but every barrier must also
+    # have completed before the caller exits.
+    observed = list(stamps.values())
+    assert call.dispatched_ns <= min(observed) <= max(observed) <= call.exited_ns, (
         call.dispatched_ns, stamps, call.exited_ns)
 
 
@@ -551,7 +561,7 @@ def sharing(silo: Silo, names: list[str], ram: Path, *, source: str | None = Non
 # -- source capture boundaries from the source monitor's own trace ----------------
 
 _TRACE_LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z\s+(\w+)\s+(.*)$")
-STAGING_DURABLE = "capture staging and request.json are durable"
+STAGING_WRITTEN = "capture staging and request.json are written"
 PAUSE_ESTABLISHED = "capture pause established"
 SEALED = "capture sealed"
 PAUSE_RELEASED = "capture pause released with ClockOnly"
@@ -568,7 +578,7 @@ def _realtime_ns(seconds: str, fraction: str | None) -> int:
     return int(whole.timestamp()) * 1_000_000_000 + int((fraction or "0").ljust(9, "0"))
 
 
-_CAPTURE_EVENTS = (STAGING_DURABLE, PAUSE_ESTABLISHED, SEALED, PAUSE_RELEASED, CONTINUATION_FINISHED)
+_CAPTURE_EVENTS = (STAGING_WRITTEN, PAUSE_ESTABLISHED, SEALED, PAUSE_RELEASED, CONTINUATION_FINISHED)
 
 
 def capture_events(silo: Silo, source_id: str, capture_id: str) -> dict[str, list[tuple[int, str]]]:
@@ -581,7 +591,7 @@ def capture_events(silo: Silo, source_id: str, capture_id: str) -> dict[str, lis
     lines = source_trace(silo, source_id).read_text(errors="replace").splitlines()
     spellings = (str(UUID(capture_id)), UUID(capture_id).hex)
     staged = [line for line in lines
-              if STAGING_DURABLE in line and any(spelling in line for spelling in spellings)]
+              if STAGING_WRITTEN in line and any(spelling in line for spelling in spellings)]
     assert len(staged) == 1, f"source monitor staged capture {capture_id} {len(staged)} times"
     match = re.search(r"\boperation=(\S+)", staged[0])
     assert match is not None, staged[0]
@@ -601,20 +611,20 @@ def capture_events(silo: Silo, source_id: str, capture_id: str) -> dict[str, lis
             disks.append((stamp, line))
     for name in _CAPTURE_EVENTS:
         assert len(found.get(name, [])) == 1, (name, found.get(name))
-    first, sealed = found[STAGING_DURABLE][0][0], found[SEALED][0][0]
+    first, sealed = found[STAGING_WRITTEN][0][0], found[SEALED][0][0]
     found[DISK_SEALED] = [entry for entry in disks if first <= entry[0] <= sealed]
     return found
 
 
 def product_interruption(found: dict[str, list[tuple[int, str]]]) -> dict:
-    """Conservative monitor-reported interruption: staging durable (before the
+    """Conservative monitor-reported interruption: staging written (before the
     guest freeze) through continuation finished (after thaw and readiness)."""
     stamp = {name: values[0][0] for name, values in found.items() if name != DISK_SEALED}
-    order = [stamp[name] for name in (STAGING_DURABLE, PAUSE_ESTABLISHED, SEALED, PAUSE_RELEASED,
+    order = [stamp[name] for name in (STAGING_WRITTEN, PAUSE_ESTABLISHED, SEALED, PAUSE_RELEASED,
                                       CONTINUATION_FINISHED)]
     assert order == sorted(order), found
     return {
-        "conservativeSeconds": (stamp[CONTINUATION_FINISHED] - stamp[STAGING_DURABLE]) / 1e9,
+        "conservativeSeconds": (stamp[CONTINUATION_FINISHED] - stamp[STAGING_WRITTEN]) / 1e9,
         "vcpuPausedSeconds": (stamp[PAUSE_RELEASED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
         "pauseToSealSeconds": (stamp[SEALED] - stamp[PAUSE_ESTABLISHED]) / 1e9,
         "clock": "monitor trace CLOCK_REALTIME",

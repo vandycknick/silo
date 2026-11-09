@@ -30,6 +30,7 @@ impl FileIdentity {
 pub(crate) struct SourceFingerprint {
     identity: FileIdentity,
     length: u64,
+    mode: u32,
     mtime: (i64, i64),
     ctime: (i64, i64),
 }
@@ -39,9 +40,22 @@ impl SourceFingerprint {
         Self {
             identity: FileIdentity::from_metadata(metadata),
             length: metadata.len(),
+            mode: metadata.mode(),
             mtime: (metadata.mtime(), metadata.mtime_nsec()),
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
         }
+    }
+
+    /// SQLite stores unsigned device/inode bits in signed INTEGER columns.
+    pub(crate) fn verification_key(&self) -> [i64; 6] {
+        [
+            self.identity.device as i64,
+            self.identity.inode as i64,
+            self.length as i64,
+            i64::from(self.mode),
+            self.ctime.0,
+            self.ctime.1,
+        ]
     }
 
     pub(crate) fn same_contents_after_metadata_change(&self, metadata: &Metadata) -> bool {

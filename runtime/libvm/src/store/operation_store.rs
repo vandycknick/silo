@@ -1210,6 +1210,7 @@ impl Store {
                         sqlx::query("UPDATE storage_operation SET state='cleaning' WHERE operation_id=?1 AND kind='capture'")
                             .bind(&cursor).execute(&mut *tx).await?;
                         tx.commit().await?;
+                        self.checkpoint_catalog().await?;
                         #[cfg(test)]
                         if let Some(hook) = &self.layer_hook {
                             hook.hit(
@@ -1284,6 +1285,7 @@ impl Store {
                     if let Some((machine, cleanup)) = removed_machine {
                         let candidate_json: String = row.try_get("record_json")?;
                         tx.commit().await?;
+                        self.checkpoint_catalog().await?;
                         #[cfg(test)]
                         if let Some(hook) = &self.layer_hook {
                             hook.hit(
@@ -1842,6 +1844,58 @@ mod tests {
         ] {
             assert!(crate::store::operation_store::commit_candidate(&value.to_string()).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn stopped_cleanup_stabilizes_authority_before_detaching_machine() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(&LocalPaths::new(temp.path().join("home")))
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        let (operation, lease) = store
+            .begin_stopped_operation("fork", &[], &[])
+            .await
+            .unwrap();
+        let machine = crate::MachineId::new();
+        let directory = crate::paths::machine_data_dir_in(&store.home, machine);
+        let machines =
+            crate::paths::OwnedDirectory::open_root(&store.home.join("machines")).unwrap();
+        machines
+            .ensure_dir(&machine.to_string())
+            .unwrap()
+            .write_file("root.raw", b"private candidate")
+            .unwrap();
+        store
+            .preserve_stopped_operation(operation, machine)
+            .await
+            .unwrap();
+        let mut reader = store.pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM storage_operation")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        drop(lease);
+        let error = store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("catalog WAL checkpoint is incomplete"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("root.raw")).unwrap(),
+            b"private candidate"
+        );
+        reader.rollback().await.unwrap();
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert!(!directory.exists());
     }
 
     #[tokio::test]

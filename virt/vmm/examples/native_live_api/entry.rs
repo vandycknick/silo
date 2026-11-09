@@ -832,6 +832,7 @@ impl Commands {
             "writers_closed":memory.ram.writers_closed(),"mode":format!("{:?}",memory.ram.mode()),
             "full_reason":format!("{:?}",memory.full_reason),"memory_generation":memory.memory_generation,
             "output_identities":memory.ram.output_identities(),"affected_chunks":memory.ram.affected_chunks().collect::<Vec<_>>(),
+            "chunk_digests":memory.ram.chunk_digests(),
             "stats":{"logical_bytes":stats.logical_bytes,"live_bytes_read":stats.live_bytes_read,
                 "baseline_bytes_read":stats.baseline_bytes_read,"baseline_bytes_written":stats.baseline_bytes_written,
                 "overlay_bytes_written":stats.overlay_bytes_written,"full_bytes_written":stats.full_bytes_written,
