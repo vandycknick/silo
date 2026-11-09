@@ -240,7 +240,20 @@ Boot: with writeback quiesced before every sample the warm bimodality is
 gone (raw 0.41, layered 0.46 on Btrfs); the layered-only start work is the
 15 ms lower resolve.
 
-ext4 lane: the loop backing file on the Btrfs root degraded to 19 562
-extents and 260–455 MB/s (872 MB/s at Batch 3); numbers from this lane on
-2026-11-09 after Batch 4a are invalid until the lane is recreated on a
-`nodatacow` file or a real partition.
+ext4 lane: the original loop backing file on the Btrfs root degraded to
+19 562 extents and 260–455 MB/s (872 MB/s at Batch 3); it was replaced by a
+fresh image (854 MB/s copy, 1.67 GB/s hash) and the four cohorts rerun:
+
+| ext4 fresh lane, cold / warm (s) | raw | gated | target | |
+|---|---:|---:|---:|---|
+| Capture interruption | 3.83 / 2.41 | 1.90 / 0.49 | 5 | pass |
+| Incremental 10 % | 4.51 / 3.23 | 2.63 / 1.35 | 1 | miss |
+| Restore | 3.48 / 3.20 | 1.67 (recorded) / 1.38 | 2 | pass |
+| Fork4 | 10.77 / 11.25 | 5.68 / 6.16 | 10 | pass |
+| Boot layered / raw | 1.05 / 1.11 | | 1.2 | pass |
+
+Incremental on ext4 uses the rebuild path (no reflink): vCPU pause
+2.2–2.9 s, of which disk sealing is 1.0–1.3 s. The post-resume stall that
+the writeback hints target fell from 4–5 s to 0.6–1.4 s, and two of eleven
+samples still show 2–3 s of host-side pre-pause latency on the conservative
+clock.
