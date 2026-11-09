@@ -173,7 +173,8 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
             interruption = max(product["conservativeSeconds"], observed["hostGapSeconds"])
             capture_timing = fork_budget.gated_timing(
                 interruption, allocated_bytes=allocated, bytes_per_second=rate["bytesPerSecond"],
-                reflink=reflink)
+                reflink=reflink, sealed_allocated_bytes=sealed_allocated,
+                hash_bytes_per_second=host["sequentialHash"]["bytesPerSecond"])
             evidence.allowance("fork4", fork_timing)
             evidence.allowance("captureInterruption", capture_timing)
             pause_stamp = found[fork.PAUSE_ESTABLISHED][0][0]
@@ -188,6 +189,7 @@ def test_fork_budget_full_capture_interruption_and_four_child_fork(
             evidence.sample({
                 "cohort": cohort, "index": index, "operation": call.operation, "sourceRun": info["run_id"],
                 "gates": ["fork4", "captureInterruption"], "cache": cache, "space": space, "upper": upper_now,
+                "writeback": cache["writeback"],
                 "fork4": {
                     "dispatchToRunningSeconds": fork_seconds, **fork_timing,
                     "apiEntryToRunningSeconds": (running - stamps[(None, "api_entered")]) / 1e9,
@@ -276,7 +278,7 @@ def test_fork_budget_restore_to_running(
         evidence.sample({
             "cohort": cohort, "index": index, "machine": machine,
             "gates": ["restore"] if cohort != "cold" or reflink else [],
-            "cache": cache, "space": space,
+            "cache": cache, "writeback": cache["writeback"], "space": space,
             "restore": {"dispatchToRunningSeconds": (running - dispatched) / 1e9, **timing,
                         "callerEndToEndSeconds": (exited - dispatched) / 1e9,
                         "runningAtExit": running == exited,
@@ -291,12 +293,15 @@ def test_fork_budget_restore_to_running(
 
 
 def budget_dispatch(silo: Silo, *args: str,
-                    clock: Callable[[], int] = time.monotonic_ns) -> tuple[str, int, int]:
+                    clock: Callable[[], int] = time.monotonic_ns,
+                    stderr_path: Path | None = None) -> tuple[str, int, int]:
     """Exact CLI dispatch/exit stamps in the selected host clock, excluding evidence."""
     command, environment = [str(silo.ws.config.silo), *args], silo.ws.env()
     dispatched = clock()
     completed = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=240)
     exited = clock()
+    if stderr_path is not None:
+        stderr_path.write_text(completed.stderr)
     silo.ws.record("budget-dispatch", json.dumps({
         "args": args, "exit": completed.returncode,
         "stdout": completed.stdout, "stderr": completed.stderr}) + "\n")
@@ -381,17 +386,32 @@ def test_fork_budget_incremental_ten_percent_dirty(
             finally:
                 observer.close()
             interruption = max(product["conservativeSeconds"], observed["hostGapSeconds"])
+            sealed_uppers = list((directory / "disks").glob("*.raw"))
+            assert len(sealed_uppers) == 1, "root-only fixture must seal exactly one upper"
+            sealed_allocated = sealed_uppers[0].stat().st_blocks * 512
             timing = fork_budget.gated_timing(
                 interruption, allocated_bytes=allocated, bytes_per_second=rate["bytesPerSecond"],
-                reflink=host["reflinkProbe"]["reflink"])
+                reflink=host["reflinkProbe"]["reflink"], sealed_allocated_bytes=sealed_allocated,
+                hash_bytes_per_second=host["sequentialHash"]["bytesPerSecond"])
             evidence.allowance("incremental", timing)
             stats = memory["stats"]
+            assert stats["seedMethod"] == (
+                "clone" if host["reflinkProbe"]["reflink"] else "rebuild"), stats
+            assert stats["wholeFileBytesHashed"] == 0, stats
+            assert stats["overlayBytesWritten"] <= stats["liveBytesRead"] <= stats["identityBytesHashed"], stats
+            if host["reflinkProbe"]["reflink"]:
+                assert stats["liveBytesRead"] == stats["identityBytesHashed"], stats
+                assert all(stats[field] == 0 for field in (
+                    "baselineBytesRead", "baselineBytesWritten", "baselineHoleBytes", "extentQueries")), stats
+            else:
+                assert stats["liveBytesRead"] == stats["overlayBytesWritten"], stats
             dirty_fraction = stats["identityBytesHashed"] / stats["logicalBytes"]
             pause_stamp = found[fork.PAUSE_ESTABLISHED][0][0]
             witness_continues(silo, SOURCE, initial)
             evidence.sample({
                 "cohort": cohort, "index": index, "gates": ["incremental"],
                 "cache": cache, "space": space, "fixture": fixture, "upper": upper_now,
+                "writeback": cache["writeback"],
                 "sourceRun": info["run_id"], "checkpoint": value,
                 "incremental": {
                     "interruptionSeconds": interruption, **timing,
@@ -403,6 +423,7 @@ def test_fork_budget_incremental_ten_percent_dirty(
                     "productDirtyFraction": dirty_fraction,
                     "productDirtyFractionBasis": "memory.stats.identityBytesHashed / logicalBytes (8 MiB chunks)",
                     "memory": memory,
+                    "seedProbe": host["reflinkProbe"],
                     "pauseToDiskSealedSeconds": [(stamp - pause_stamp) / 1e9
                                                 for stamp, _ in found[fork.DISK_SEALED]],
                     "monitorLines": {key: [line for _, line in values] for key, values in found.items()},
@@ -466,7 +487,7 @@ def test_fork_budget_warm_create_stopped_machine(
         assert silo.info(name)["state"] == "stopped", record
         evidence.sample({
             "cohort": cohort, "index": index, "gates": ["warmCreate"],
-            "cache": cache, "space": space, "fixture": fixture,
+            "cache": cache, "writeback": cache["writeback"], "space": space, "fixture": fixture,
             "warmCreate": {"dispatchToExitSeconds": (exited - dispatched) / 1e9,
                            "marker": "create CLI exit, machine stopped", "machine": record,
                            "nonCowAllowanceSeconds": 0.0},
@@ -510,7 +531,9 @@ def test_fork_budget_boot_layered_within_raw(
             # Cold eviction is repeated before both starts, so order alone
             # cannot warm the second profile's runtime/lower inputs.
             caches[profile] = fork_budget.cache_state(silo, cohort)
-            _, dispatched, exited = budget_dispatch(silo, "start", name, clock=time.time_ns)
+            start_trace = evidence.directory / f"{name}-start.trace.log"
+            _, dispatched, exited = budget_dispatch(
+                silo, "start", name, clock=time.time_ns, stderr_path=start_trace)
             # Liveness only: the timed endpoint is the product's own trace,
             # not this later CLI observation (nor its polling cadence).
             info = silo.wait_ready(name, poll_interval=0.02)
@@ -526,9 +549,12 @@ def test_fork_budget_boot_layered_within_raw(
             timings[profile] = {
                 **fork_budget.boot_timing(
                     text, trace=trace, machine_id=info["id"], run_id=info["run_id"],
-                    dispatched_ns=dispatched, exited_ns=exited),
+                    dispatched_ns=dispatched, exited_ns=exited,
+                    start_text=start_trace.read_text(errors="replace"), start_trace=start_trace),
                 "runId": info["run_id"], "root": roots[profile],
+                "writeback": caches[profile]["writeback"],
                 "traceEvidence": str(evidence_trace),
+                "startTraceEvidence": str(start_trace),
             }
         # Retain both full inventories; the aggregate label must not hide a
         # partially resident profile in a nominally cold pair.
@@ -538,6 +564,7 @@ def test_fork_budget_boot_layered_within_raw(
         evidence.sample({
             "cohort": cohort, "index": index, "gates": ["bootLayeredRatio"],
             "cache": cache, "space": space, "fixture": fixture, "order": profiles,
+            "writeback": {profile: caches[profile]["writeback"] for profile in profiles},
             "bootLayered": timings["layered"], "bootRaw": timings["raw"],
         })
         for name in names.values():
@@ -547,6 +574,73 @@ def test_fork_budget_boot_layered_within_raw(
     shutdown.storage_tool(silo, "prune")
     summary = evidence.finish()
     assert all(summary["pass"].values()), (str(evidence.directory), summary["pass"])
+
+
+def test_quiesce_writeback_real_meminfo_record() -> None:
+    record = fork_budget.quiesce_writeback(timeout_seconds=0)
+    assert set(record) == {"dirtyBytesBefore", "dirtyBytesAtDispatch", "waitedSeconds"}
+    assert isinstance(record["dirtyBytesBefore"], int) and record["dirtyBytesBefore"] >= 0
+    assert isinstance(record["dirtyBytesAtDispatch"], int) and record["dirtyBytesAtDispatch"] >= 0
+    assert isinstance(record["waitedSeconds"], float) and record["waitedSeconds"] >= 0
+    assert fork_budget.writeback_bytes(Path("/proc/meminfo").read_text()) >= 0
+
+
+@pytest.mark.parametrize(
+    ("dirty_kib", "writeback_kib", "timeout", "waits"),
+    [(15360, 0, 1.0, False), (15360, 1024, 0.01, True),
+     (16384, 1, 0.01, True), (16384, 0, 0.0, True)],
+    ids=["below-threshold", "at-threshold", "above-threshold", "at-timeout"],
+)
+def test_quiesce_writeback_threshold_and_timeout(
+    tmp_path: Path, dirty_kib: int, writeback_kib: int, timeout: float, waits: bool,
+) -> None:
+    # A real file supplies a stable parsed counter, not a mocked clock or proc read.
+    text = (f"MemTotal: 1048576 kB\nDirty: {dirty_kib} kB\n"
+            f"Writeback: {writeback_kib} kB\nWritebackTmp: 999999 kB\n")
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(text)
+    expected = (dirty_kib + writeback_kib) * 1024
+    assert fork_budget.writeback_bytes(text) == expected
+    record = fork_budget.quiesce_writeback(meminfo=meminfo, timeout_seconds=timeout)
+    assert record["dirtyBytesBefore"] == record["dirtyBytesAtDispatch"] == expected
+    if waits:
+        assert record["waitedSeconds"] >= timeout
+    else:
+        assert record["waitedSeconds"] < timeout
+
+
+@pytest.mark.parametrize("text", [
+    "", "Dirty: 1 kB\n", "Dirty: -1 kB\nWriteback: 0 kB\n",
+    "Dirty: 1 MB\nWriteback: 0 kB\n", "Dirty: invalid kB\nWriteback: 0 kB\n",
+    "Dirty: 1 kB\nDirty: 2 kB\nWriteback: 0 kB\n",
+], ids=["empty", "missing-counter", "negative", "wrong-unit", "not-integer", "duplicate"])
+def test_quiesce_writeback_rejects_invalid_meminfo(text: str) -> None:
+    with pytest.raises(ValueError):
+        fork_budget.writeback_bytes(text)
+
+
+def test_hash_rate_probe_uses_warm_second_pass(tmp_path: Path) -> None:
+    size = 8 * 1024 * 1024 + 17
+    probe = fork_budget.sequential_hash_rate(tmp_path / "hash-probe", size_bytes=size)
+    assert probe["bytes"] == size
+    assert probe["method"] == (
+        "hashlib.sha256 (OpenSSL), 8 MiB reads twice, fresh /dev/urandom + fsync, "
+        "no eviction; warm second pass")
+    cold, warm = probe["passes"]
+    assert [cold["label"], warm["label"]] == ["cold", "warm"]
+    assert cold["sha256"] == warm["sha256"] == probe["sha256"]
+    assert len(probe["sha256"]) == 64
+    assert probe["seconds"] == warm["seconds"]
+    assert probe["bytesPerSecond"] == warm["bytesPerSecond"] == size / warm["seconds"]
+    assert probe["cache"] == warm["cache"]
+    for measured in (cold, warm):
+        assert measured["seconds"] > 0
+        assert measured["bytesPerSecond"] == size / measured["seconds"]
+        assert measured["cache"]["method"] == "mincore only, no eviction"
+        assert measured["cache"]["logicalBytes"] == size
+        assert measured["cacheAfter"]["residentBytesAfter"] == size
+    assert warm["cache"]["residentBytesBefore"] == warm["cache"]["residentBytesAfter"] == size
+    assert list(tmp_path.iterdir()) == [], "hash probe left scratch files behind"
 
 
 @pytest.mark.parametrize(
@@ -566,6 +660,7 @@ def test_copy_allowance_arithmetic(reflink: bool, copies: int, allocated: int, s
         seconds, allocated_bytes=allocated, bytes_per_second=256.0,
         reflink=reflink, copies=copies)
     assert timing["nonCowAllowanceSeconds"] == expected_allowance
+    assert timing["diskSealAllowanceSeconds"] == 0.0
     assert timing["gatedExcessSeconds"] == expected_gated
     assert timing["copyAllowance"] == {
         "lane": "reflink" if reflink else "non-reflink", "reflink": reflink,
@@ -586,13 +681,16 @@ def test_copy_allowance_summary_gates(reflink: bool) -> None:
             fork_timing = fork_budget.gated_timing(
                 25.0, allocated_bytes=1024, bytes_per_second=256.0,
                 reflink=reflink, copies=fork_budget.CHILDREN)
+            capture_timing = fork_budget.gated_timing(
+                6.0, allocated_bytes=1024, bytes_per_second=256.0, reflink=reflink,
+                sealed_allocated_bytes=512, hash_bytes_per_second=512.0)
             samples.append({
                 "cohort": cohort, "index": index, "cache": {"label": cohort},
                 "gates": ["fork4", "captureInterruption", "restore"]
                 if cohort != "cold" or reflink else ["fork4", "captureInterruption"],
                 "restore": {"dispatchToRunningSeconds": 6.0, **restore_timing},
                 "fork4": {"dispatchToRunningSeconds": 25.0, **fork_timing},
-                "capture": {"interruptionSeconds": 6.0, **restore_timing},
+                "capture": {"interruptionSeconds": 6.0, **capture_timing},
             })
     summary = fork_budget.summarize(samples)
     for cohort in ("cold", "warm"):
@@ -604,15 +702,20 @@ def test_copy_allowance_summary_gates(reflink: bool) -> None:
         assert restored["gatedMedian"] == (6.0 if reflink else 2.0)
         assert forked["median"] == 25.0
         assert forked["gatedMedian"] == (25.0 if reflink else 9.0)
-        assert captured["gatedMedian"] == (6.0 if reflink else 2.0)
+        assert captured["gatedMedian"] == (5.0 if reflink else 1.0)
         assert restored["nonCowAllowanceSeconds"]["median"] == (0.0 if reflink else 4.0)
         assert forked["nonCowAllowanceSeconds"]["median"] == (0.0 if reflink else 16.0)
         assert captured["nonCowAllowanceSeconds"]["median"] == (0.0 if reflink else 4.0)
+        assert captured["diskSealAllowanceSeconds"]["median"] == 1.0
+        assert captured["diskSealAllowanceInputs"] == [
+            capture_timing["diskSealAllowance"]] * fork_budget.SAMPLES
+        assert "diskSealAllowanceSeconds" not in restored
+        assert "diskSealAllowanceSeconds" not in forked
         assert restored["allowanceInputs"] == [restore_timing["copyAllowance"]] * fork_budget.SAMPLES
         assert forked["allowanceInputs"] == [fork_timing["copyAllowance"]] * fork_budget.SAMPLES
-        assert captured["allowanceInputs"] == [restore_timing["copyAllowance"]] * fork_budget.SAMPLES
+        assert captured["allowanceInputs"] == [capture_timing["copyAllowance"]] * fork_budget.SAMPLES
         assert summary["pass"][f"fork4/{cohort}"] is (not reflink)
-        assert summary["pass"][f"captureInterruption/{cohort}"] is (not reflink)
+        assert summary["pass"][f"captureInterruption/{cohort}"] is True
         assert restored["budgeted"] is (cohort != "cold" or reflink)
     assert summary["pass"]["restore/warm"] is (not reflink)
     if reflink:
@@ -622,26 +725,62 @@ def test_copy_allowance_summary_gates(reflink: bool) -> None:
 
 
 @pytest.mark.parametrize("reflink", [False, True], ids=["copy", "reflink"])
-@pytest.mark.parametrize("excess", [1.0, 1.0000001], ids=["boundary", "over"])
-def test_incremental_budget_gate_copy_allowance(reflink: bool, excess: float) -> None:
+@pytest.mark.parametrize("metric,record,target", [
+    ("incremental", "incremental", 1.0), ("captureInterruption", "capture", 5.0),
+])
+@pytest.mark.parametrize("over", [0.0, 0.0000001], ids=["boundary", "over"])
+def test_interruption_budget_gate_copy_allowance_and_disk_sealing(
+    reflink: bool, metric: str, record: str, target: float, over: float,
+) -> None:
     allowance = 0.0 if reflink else 4.0
-    seconds = excess + allowance
+    excess = target + over
+    seconds = excess + allowance + 2.0
     timing = fork_budget.gated_timing(
-        seconds, allocated_bytes=1024, bytes_per_second=256.0, reflink=reflink)
+        seconds, allocated_bytes=1024, bytes_per_second=256.0, reflink=reflink,
+        sealed_allocated_bytes=1024, hash_bytes_per_second=512.0)
     samples = [{
-        "cohort": cohort, "index": index, "cache": {"label": cohort}, "gates": ["incremental"],
-        "incremental": {"interruptionSeconds": seconds, **timing},
+        "cohort": cohort, "index": index, "cache": {"label": cohort}, "gates": [metric],
+        record: {"interruptionSeconds": seconds, **timing},
     } for cohort, index in fork_budget.SCHEDULE]
     summary = fork_budget.summarize(samples)
     for cohort in ("cold", "warm"):
-        metric = summary["metrics"]["incremental"][cohort]
-        assert metric["samples"] == fork_budget.SAMPLES
-        assert metric["median"] == seconds
-        assert metric["gatedMedian"] == pytest.approx(excess)
-        assert metric["nonCowAllowanceSeconds"]["median"] == allowance
-        assert metric["allowanceInputs"] == [timing["copyAllowance"]] * fork_budget.SAMPLES
-        assert metric["budgeted"] is True
-        assert summary["pass"][f"incremental/{cohort}"] is (excess <= 1.0)
+        measured = summary["metrics"][metric][cohort]
+        assert measured["samples"] == fork_budget.SAMPLES
+        assert measured["median"] == seconds
+        assert measured["gatedMedian"] == pytest.approx(excess)
+        assert measured["nonCowAllowanceSeconds"]["median"] == allowance
+        assert measured["allowanceInputs"] == [timing["copyAllowance"]] * fork_budget.SAMPLES
+        assert measured["diskSealAllowanceSeconds"]["median"] == 2.0
+        assert measured["diskSealAllowanceInputs"] == [
+            timing["diskSealAllowance"]] * fork_budget.SAMPLES
+        assert measured["budgeted"] is True
+        assert summary["pass"][f"{metric}/{cohort}"] is (over == 0.0)
+
+
+@pytest.mark.parametrize("reflink", [False, True], ids=["copy", "reflink"])
+@pytest.mark.parametrize("sealed_bytes", [0, 1024], ids=["no-seal", "seal"])
+@pytest.mark.parametrize("rate", [0.0, -1.0, float("nan")], ids=["zero", "negative", "nan"])
+def test_hash_rate_rejects_invalid_rate(reflink: bool, sealed_bytes: int, rate: float) -> None:
+    with pytest.raises(ValueError, match="hash_bytes_per_second must be positive"):
+        fork_budget.gated_timing(
+            5.0, allocated_bytes=1024, bytes_per_second=256.0, reflink=reflink,
+            sealed_allocated_bytes=sealed_bytes, hash_bytes_per_second=rate)
+
+
+def test_hash_rate_required_for_disk_sealing() -> None:
+    with pytest.raises(ValueError, match="sealed allocated bytes require hash_bytes_per_second"):
+        fork_budget.gated_timing(
+            5.0, allocated_bytes=1024, bytes_per_second=256.0, reflink=True,
+            sealed_allocated_bytes=1024)
+
+
+def test_budget_gate_disk_seal_allowance_not_clamped() -> None:
+    timing = fork_budget.gated_timing(
+        1.0, allocated_bytes=1024, bytes_per_second=256.0, reflink=False,
+        sealed_allocated_bytes=512, hash_bytes_per_second=256.0)
+    assert timing["nonCowAllowanceSeconds"] == 4.0
+    assert timing["diskSealAllowanceSeconds"] == 2.0
+    assert timing["gatedExcessSeconds"] == -5.0
 
 
 @pytest.mark.parametrize("seconds", [2.0, 2.0000001], ids=["boundary", "over"])
@@ -854,6 +993,32 @@ def test_evidence_budget_gate_custom_summary(
     assert json.loads((evidence.directory / "samples.jsonl").read_text()) == {"value": 1}
 
 
+def test_budget_gate_records_separate_allowances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(fork_budget.EVIDENCE_VARIABLE, str(tmp_path))
+    host = {"sequentialHash": {"bytesPerSecond": 512.0}}
+    evidence = fork_budget.Evidence("allowances", host)
+    timing = fork_budget.gated_timing(
+        7.0, allocated_bytes=1024, bytes_per_second=256.0, reflink=False,
+        sealed_allocated_bytes=1024, hash_bytes_per_second=host["sequentialHash"]["bytesPerSecond"])
+    evidence.allowance("incremental", timing)
+    evidence.sample({"incremental": {"interruptionSeconds": 7.0, **timing}})
+    record = json.loads((evidence.directory / "reference-host.json").read_text())
+    assert record["sequentialHash"] == host["sequentialHash"]
+    assert record["nonCowAllowances"]["incremental"] == {
+        **timing["copyAllowance"], "nonCowAllowanceSeconds": 4.0,
+    }
+    assert record["diskSealAllowances"]["incremental"] == {
+        **timing["diskSealAllowance"], "diskSealAllowanceSeconds": 2.0,
+    }
+    sample = json.loads((evidence.directory / "samples.jsonl").read_text())["incremental"]
+    assert sample["interruptionSeconds"] == 7.0
+    assert sample["nonCowAllowanceSeconds"] == 4.0
+    assert sample["diskSealAllowanceSeconds"] == 2.0
+    assert sample["gatedExcessSeconds"] == 1.0
+
+
 def test_reflink_probe_and_reference_host_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -884,3 +1049,63 @@ def test_reflink_probe_and_reference_host_record(
 def test_reflink_probe_rejects_missing_workspace(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         fork_budget.reflink_probe(tmp_path / "missing")
+
+
+# The production formatter's UTC, no-target, no-ANSI structured line shape.
+# Timing values are a deterministic parser fixture, not benchmark measurements.
+START_TIMELINE_SAMPLE = (
+    f"1970-01-01T00:00:01.090000Z  INFO machine start timeline machine_id={BOOT_MACHINE_ID} "
+    'run_id="run" runtime_discovery_ms=10.25 catalog_open_recovery_ms=20.5 '
+    "lifecycle_admission_ms=5.0 lower_resolve_authentication_ms=4.25 secrets_netd_ms=30.0 "
+    "launch_publication_ms=5.0 durability_barrier_ms=10.0 admit_spawn_ms=4.0 total_ms=90.0"
+)
+
+
+def test_start_timeline_parser_selects_machine_and_run() -> None:
+    other_run = START_TIMELINE_SAMPLE.replace('run_id="run"', 'run_id="old"')
+    other_machine = START_TIMELINE_SAMPLE.replace(BOOT_MACHINE_ID, str(UUID(int=1)))
+    timeline = fork_budget.start_timeline(
+        "\n".join(["malformed", other_run, other_machine, START_TIMELINE_SAMPLE]),
+        source=Path("start.trace.log"), machine_id=UUID(BOOT_MACHINE_ID).hex, run_id="run")
+    assert timeline["machineId"] == BOOT_MACHINE_ID
+    assert timeline["runId"] == "run"
+    assert timeline["totalMilliseconds"] == 90.0
+    assert timeline["stagesMilliseconds"] == {
+        "runtime_discovery": 10.25, "catalog_open_recovery": 20.5,
+        "lifecycle_admission": 5.0, "lower_resolve_authentication": 4.25,
+        "secrets_netd": 30.0, "launch_publication": 5.0,
+        "durability_barrier": 10.0, "admit_spawn": 4.0,
+    }
+    assert timeline["marker"]["line"] == START_TIMELINE_SAMPLE
+    assert timeline["marker"]["source"] == "start.trace.log"
+
+
+@pytest.mark.parametrize("text", [
+    "", "not a trace", START_TIMELINE_SAMPLE + "\n" + START_TIMELINE_SAMPLE,
+    START_TIMELINE_SAMPLE.replace("admit_spawn_ms=4.0 ", ""),
+    START_TIMELINE_SAMPLE.replace("admit_spawn_ms=4.0", "admit_spawn_ms=invalid"),
+    START_TIMELINE_SAMPLE.replace("admit_spawn_ms=4.0", "admit_spawn_ms=NaN"),
+    START_TIMELINE_SAMPLE.replace("admit_spawn_ms=4.0", "admit_spawn_ms=inf"),
+    START_TIMELINE_SAMPLE.replace("admit_spawn_ms=4.0", "admit_spawn_ms=-1"),
+    START_TIMELINE_SAMPLE.replace("total_ms=90.0", "total_ms=1.0"),
+], ids=["empty", "malformed", "duplicate", "missing-stage", "invalid", "nan", "infinite",
+        "negative", "inconsistent-total"])
+def test_start_timeline_parser_rejects_invalid_durations(text: str) -> None:
+    with pytest.raises(AssertionError):
+        fork_budget.start_timeline(
+            text, source=Path("start.trace.log"), machine_id=BOOT_MACHINE_ID, run_id="run")
+
+
+def test_start_timeline_boot_sample_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(fork_budget.EVIDENCE_VARIABLE, str(tmp_path))
+    timing = fork_budget.boot_timing(
+        BOOT_TRACE, trace=Path("vm.trace.log"), machine_id=BOOT_MACHINE_ID, run_id="run",
+        dispatched_ns=1_000_000_000, exited_ns=1_250_000_000,
+        start_text=START_TIMELINE_SAMPLE, start_trace=Path("start.trace.log"))
+    evidence = fork_budget.Evidence("start-timeline", {})
+    evidence.sample({"cohort": "warm", "index": 0, "bootRaw": timing, "bootLayered": timing})
+    sample = json.loads((evidence.directory / "samples.jsonl").read_text())
+    for profile in ("bootRaw", "bootLayered"):
+        assert sample[profile]["startTimeline"]["stagesMilliseconds"]["secrets_netd"] == 30.0
+        assert sample[profile]["startTimeline"]["marker"]["line"] == START_TIMELINE_SAMPLE
+        assert sample[profile]["dispatchToReadySeconds"] == 0.5

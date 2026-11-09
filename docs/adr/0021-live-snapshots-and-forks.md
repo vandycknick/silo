@@ -442,6 +442,13 @@ capture. Harvested dirties survive an abandoned attempt; a failed re-arm
 invalidates the baseline and the next capture is full. The default crossover
 to a full capture is 60 percent dirty coverage; the operation may lower it.
 
+On CoW lanes, incremental RAM capture seeds a fresh private output by reflink
+from the exact retained immutable baseline and overlays only dirty runs,
+including explicit changed-to-zero writes. Without reflink support it
+rebuilds the complete file from the baseline as before; no baseline copy is
+prepared before pause. Both paths produce the same complete RAM bytes and
+chunk identity. `CaptureMemoryStats.seedMethod` records `clone` or `rebuild`.
+
 A restored machine seeds its own baseline from the immutable RAM file it was
 restored from and arms tracking before any restore-time write, so a
 checkpoint-restore-recapture cycle does not rescan unchanged memory. This
@@ -492,6 +499,12 @@ chunks where the host supports it, a full write otherwise); that file is the
 mapping target. A changed page costs a rehash of its 8 MiB identity chunk;
 this is accepted hash and transfer amplification, not the dirty-tracking
 granule.
+The 1 s incremental budget below is measured on the defined fixture: one
+contiguous 410 MiB dirty region in a 4 GiB guest, under this unchanged 8 MiB
+chunk identity. Scattered dirty placement can legitimately affect every chunk
+and require up to a full-RAM rehash, even at the same dirty-page fraction.
+`identityBytesHashed` reports the affected identity-byte coverage so this
+placement-dependent cost is visible, not hidden by the fixture's target.
 
 Lazy restore through `userfaultfd` is not part of this contract. File-private
 mapping already demand-pages local memory. Every byte of a checkpoint is
@@ -1133,16 +1146,25 @@ cold and warm cache recorded separately, as the median of five runs with
 minimum and maximum reported; a budget passes when the median meets it. The
 target pause durations are: full capture of a 4 GiB machine with a 1 GiB
 nonzero upper on APFS or reflink-capable Linux within 5 s of workload
-interruption; an incremental capture with 10 percent dirty within 1 s;
+interruption; an incremental capture of the defined contiguous 410 MiB dirty
+region in a 4 GiB guest (10 percent rounded to whole MiB) within 1 s;
 restore to `Running` within 2 s; a fork of four children to `Running` within
 10 s. On Linux without reflinks every one of these budgets is extended by the
 **non-CoW copy allowance**: the allocated bytes of each private raw copy the
 operation must make (the upper for capture and incremental capture, one
 private upper for restore, one per child for fork) at the host's measured
-sequential copy rate. The cold-cache restore figure is recorded on every lane
-and budgeted on the reflink-capable lanes. Raw clone and copy remains the
-disk representation; qcow2 upper generations are not reopened by these
-measurements.
+sequential copy rate. In addition, full capture interruption and incremental
+capture interruption on **every lane** are extended by the **disk-sealing
+allowance**: the sealed upper's allocated bytes at the host's measured
+sequential SHA-256 hash rate. Restore and fork-to-Running do not receive this
+allowance; the capture-interruption gate within a fork does. On 2026-11-09,
+Btrfs disk sealing alone measured 1.1–1.2 s for the fixture's 2 GiB logical
+upper with 1 GiB payload, despite a successful reflink. Raw interruption,
+non-CoW copy allowance, disk-sealing allowance and gated excess are reported
+separately, with their measured rate inputs. The cold-cache restore figure is
+recorded on every lane and budgeted on the reflink-capable lanes. Raw clone
+and copy remains the disk representation; qcow2 upper generations are not
+reopened by these measurements.
 
 ## libkrun Fork Commit Series
 

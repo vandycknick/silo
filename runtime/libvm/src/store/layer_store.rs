@@ -939,6 +939,13 @@ impl Store {
                             orphaned.push(digest);
                         }
                     }
+                    // A fully retained batch has no unlink to authorize. In
+                    // particular it needs neither a WAL checkpoint nor a
+                    // second writer transaction on every runtime open.
+                    if orphaned.is_empty() {
+                        tx.commit().await?;
+                        return Ok::<_, LibVmError>(());
+                    }
                     let candidates = orphaned
                         .iter()
                         .map(|digest| pool.object_path(digest))
@@ -1158,6 +1165,35 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(count(&store, "layer_result").await, 1);
         store.recover().await.unwrap();
+        assert_eq!(
+            store
+                .load(retained.id, &ChangesetLimits::default())
+                .await
+                .unwrap()
+                .pack_length,
+            4096
+        );
+    }
+    #[tokio::test]
+    async fn retained_object_recovery_skips_checkpoint_and_delete_fence() {
+        use crate::store::layer_store::WorkerPoint;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = LayerStore::open(temp.path()).await.unwrap();
+        let retained = store
+            .publish(staged(temp.path(), &store), &ChangesetLimits::default())
+            .await
+            .unwrap();
+        let pool = StoragePool::open(&store.store.images_dir).unwrap();
+        let before = pool.scan_objects().unwrap().count();
+        assert!(before > 0);
+        let (mut entered, _release) = hook(&mut store, WorkerPoint::RecoveryDelete, true);
+        store.store.recover_layer_objects().await.unwrap();
+        assert!(
+            entered.try_recv().is_err(),
+            "retained batch entered the delete fence"
+        );
+        assert_eq!(pool.scan_objects().unwrap().count(), before);
         assert_eq!(
             store
                 .load(retained.id, &ChangesetLimits::default())

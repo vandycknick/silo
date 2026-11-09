@@ -10,11 +10,13 @@ the upper's logical, allocated and nonzero bytes separately; a 1 GiB-capacity
 upper could not hold that payload plus ext4 metadata, hence the 2 GiB capacity.
 
 Cohorts: five `cold` samples, one discarded `warm-up`, five `warm` samples,
-strictly sequential. Before each cold dispatch every owned input file (this
-workspace's Silo home, the selected runtime directory and CLI) is fsynced and
-`POSIX_FADV_DONTNEED`-evicted per file, with mincore(2) evidence; no global
-drop_caches and no sudo. Pages still mapped by live processes (the running
-source) cannot be evicted, so such samples are labelled `partial-cold`. A fork
+strictly sequential. Every dispatch first syncs host writeback and waits up to
+30 seconds for Dirty + Writeback to fall below 16 MiB. Before each cold dispatch
+every owned input file (this workspace's Silo home, the selected runtime
+directory and CLI) is fsynced and `POSIX_FADV_DONTNEED`-evicted per file,
+with mincore(2) evidence; no global drop_caches and no sudo. Pages still mapped
+by live processes (the running source) cannot be evicted, so such samples are
+labelled `partial-cold`. A fork
 writes its fresh capture RAM during the timed window; that warming is part of
 the measured operation and is never re-evicted.
 
@@ -37,9 +39,11 @@ A real FICLONE probe of sibling files in the budget workspace selects the lane
 at fixture setup, independently of the capture request's disk copy contract.
 Without reflinks, the gated value subtracts the upper's allocated bytes at the
 host's measured sequential copy rate: one upper for capture, one sealed upper
-for restore, one sealed upper per child for fork4. Reflink lanes subtract zero.
-Samples and summaries retain raw and gated values, allowance inputs and actual
-disk-seal durations; targets do not change.
+for restore, one sealed upper per child for fork4. Reflink lanes subtract zero
+copy allowance. Capture interruption and incremental capture also subtract the
+sealed upper's allocated bytes at the host's measured warm sequential SHA-256
+CPU rate on every lane. Samples and summaries retain raw and gated values, both
+allowances and their inputs, and actual disk-seal durations; targets do not change.
 
 A running source keeps its accepted capture baseline, and a local cut retires
 only after that exact source run ends. Each successful fork sample therefore
@@ -57,7 +61,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import fcntl
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -90,15 +96,18 @@ class Metric:
     record: str
     raw_key: str
     copy_allowance: bool = False
+    disk_seal_allowance: bool = False
     denominator: str | None = None
     unit: str = "s"
 
 
 METRICS = {
     "fork4": Metric("fork4", "dispatchToRunningSeconds", copy_allowance=True),
-    "captureInterruption": Metric("capture", "interruptionSeconds", copy_allowance=True),
+    "captureInterruption": Metric("capture", "interruptionSeconds", copy_allowance=True,
+                                  disk_seal_allowance=True),
     "restore": Metric("restore", "dispatchToRunningSeconds", copy_allowance=True),
-    "incremental": Metric("incremental", "interruptionSeconds", copy_allowance=True),
+    "incremental": Metric("incremental", "interruptionSeconds", copy_allowance=True,
+                          disk_seal_allowance=True),
     "warmCreate": Metric("warmCreate", "dispatchToExitSeconds"),
     "bootLayered": Metric("bootLayered", "dispatchToReadySeconds"),
     "bootRaw": Metric("bootRaw", "dispatchToReadySeconds"),
@@ -121,8 +130,43 @@ BOOT_PHASES = (
 )
 
 
+START_TIMELINE = "machine start timeline"
+START_STAGES = (
+    "runtime_discovery", "catalog_open_recovery", "lifecycle_admission",
+    "lower_resolve_authentication", "secrets_netd", "launch_publication",
+    "durability_barrier", "admit_spawn",
+)
+
+
+def start_timeline(text: str, *, source: Path, machine_id: str, run_id: str) -> dict:
+    """The CLI's single spawn event, with monotonic (not wall-clock) stage costs."""
+    machine_id = str(UUID(machine_id))
+    found = [event for event in restore_lifecycle.events(text, names=(START_TIMELINE,))
+             if event.fields.get("machine_id") == machine_id
+             and event.fields.get("run_id") == run_id]
+    assert len(found) == 1, ("expected one matching start timeline", source, machine_id, run_id)
+    event = found[0]
+    fields = (*START_STAGES, "total")
+    assert all(stage + "_ms" in event.fields for stage in fields), event.line
+    try:
+        durations = {stage: float(event.fields[stage + "_ms"]) for stage in fields}
+    except ValueError as error:
+        raise AssertionError(("invalid start timeline duration", event.line)) from error
+    assert all(math.isfinite(value) and value >= 0 for value in durations.values()), event.line
+    assert sum(durations[stage] for stage in START_STAGES) <= durations["total"] + 0.001, event.line
+    return {
+        "machineId": machine_id, "runId": run_id,
+        "stagesMilliseconds": {stage: durations[stage] for stage in START_STAGES},
+        "totalMilliseconds": durations["total"],
+        "clock": "host monotonic Instant; runtime opening plus this start attempt",
+        "marker": {"source": str(source), "line": event.line,
+                   "linePattern": START_TIMELINE + " machine_id=<id> run_id=<run> ..."},
+    }
+
+
 def boot_timing(text: str, *, trace: Path, machine_id: str, run_id: str,
-                dispatched_ns: int, exited_ns: int) -> dict:
+                dispatched_ns: int, exited_ns: int, start_text: str | None = None,
+                start_trace: Path | None = None) -> dict:
     """Start dispatch to the first product agent-serving event in this generation.
 
     Both endpoints use host CLOCK_REALTIME: time.time_ns immediately before
@@ -180,6 +224,9 @@ def boot_timing(text: str, *, trace: Path, machine_id: str, run_id: str,
         "unavailablePhases": [phase for phase, _, _ in BOOT_PHASES if phase not in available]
                              + ["kernelStart", "initramfs", "rootSwitch"],
         "phases": deltas,
+        **({"startTimeline": start_timeline(
+            start_text, source=start_trace if start_trace is not None else trace,
+            machine_id=machine_id, run_id=run_id)} if start_text is not None else {}),
     }
 
 
@@ -250,11 +297,13 @@ def reference_host(silo: Silo) -> dict:
     if configured:
         path = Path(configured).resolve(strict=True)
         kernel_config = {"path": str(path), "sha256": _digest(path)}
+    headroom(silo, GIB)
     return {
         "cpu": cpu, "logicalCpus": os.cpu_count(), "memTotalKiB": int(memory),
         "kernel": platform.release(), "machine": platform.machine(),
         "workspace": str(silo.ws.root), "filesystem": filesystem,
         "reflinkProbe": reflink_probe(silo.ws.root),
+        "sequentialHash": sequential_hash_rate(silo.ws.root / "budget-sequential-hash.raw"),
         "inputs": {name: {"path": str(path), "sha256": _digest(path)} for name, path in inputs.items()},
         "guestKernelConfig": kernel_config, "candidate": candidate,
     }
@@ -330,10 +379,54 @@ def sequential_copy_rate(silo: Silo, path: Path) -> dict:
             "bytesPerSecond": allocated / seconds}
 
 
+def sequential_hash_rate(path: Path, *, size_bytes: int = GIB) -> dict:
+    """Hash a fresh random file twice, using the page-cache-resident second pass."""
+    if size_bytes <= 0:
+        raise ValueError("hash probe size_bytes must be positive")
+    passes: list[dict] = []
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + "-") as scratch:
+        probe = Path(scratch.name)
+        subprocess.run(["dd", "if=/dev/urandom", f"of={probe}", "bs=1M",
+                        f"count={size_bytes}", "iflag=count_bytes", "conv=fsync", "status=none"],
+                       check=True, timeout=240)
+        assert probe.stat().st_size == size_bytes, probe
+        for label in ("cold", "warm"):
+            cache = page_cache.residency([probe])
+            if label == "warm":
+                assert cache["residentBytesAfter"] == size_bytes, (
+                    "hash allowance requires a fully resident warm pass", cache)
+            started = time.monotonic()
+            digest = hashlib.sha256()
+            with probe.open("rb") as source:
+                while block := source.read(8 * 1024 * 1024):
+                    digest.update(block)
+            seconds = time.monotonic() - started
+            passes.append({
+                "label": label, "seconds": seconds, "bytesPerSecond": size_bytes / seconds,
+                "sha256": digest.hexdigest(), "cache": cache,
+                "cacheAfter": page_cache.residency([probe]),
+            })
+        assert passes[0]["sha256"] == passes[1]["sha256"], passes
+    warm = passes[1]
+    return {
+        "method": ("hashlib.sha256 (OpenSSL), 8 MiB reads twice, fresh /dev/urandom + fsync, "
+                   "no eviction; warm second pass"),
+        "bytes": size_bytes, "seconds": warm["seconds"], "bytesPerSecond": warm["bytesPerSecond"],
+        "sha256": warm["sha256"], "cache": warm["cache"], "passes": passes,
+    }
+
+
 def gated_timing(seconds: float, *, allocated_bytes: int, bytes_per_second: float,
-                 reflink: bool, copies: int = 1) -> dict:
-    """Subtract only the ADR's unavoidable private-copy cost, without clamping."""
+                 reflink: bool, copies: int = 1, sealed_allocated_bytes: int = 0,
+                 hash_bytes_per_second: float | None = None) -> dict:
+    """Subtract the ADR's separate copy and disk-sealing costs, without clamping."""
+    if hash_bytes_per_second is not None and not hash_bytes_per_second > 0:
+        raise ValueError("hash_bytes_per_second must be positive")
+    if sealed_allocated_bytes and hash_bytes_per_second is None:
+        raise ValueError("sealed allocated bytes require hash_bytes_per_second")
     allowance = 0.0 if reflink else copies * allocated_bytes / bytes_per_second
+    seal_allowance = (sealed_allocated_bytes / hash_bytes_per_second
+                      if hash_bytes_per_second is not None else 0.0)
     return {
         "copyAllowance": {
             "lane": "reflink" if reflink else "non-reflink",
@@ -342,7 +435,12 @@ def gated_timing(seconds: float, *, allocated_bytes: int, bytes_per_second: floa
             "bytesPerSecond": bytes_per_second,
         },
         "nonCowAllowanceSeconds": allowance,
-        "gatedExcessSeconds": seconds - allowance,
+        "diskSealAllowance": {
+            "sealedAllocatedBytes": sealed_allocated_bytes,
+            "bytesPerSecond": hash_bytes_per_second,
+        },
+        "diskSealAllowanceSeconds": seal_allowance,
+        "gatedExcessSeconds": seconds - allowance - seal_allowance,
     }
 
 
@@ -350,10 +448,51 @@ def owned_inputs(silo: Silo) -> list[Path]:
     return page_cache.inputs(silo.ws.silo_home, silo.ws.config.runtime_dir, silo.ws.config.silo)
 
 
+def writeback_bytes(meminfo: str) -> int:
+    """Parse Linux meminfo's Dirty + Writeback counters (kB means 1024 bytes)."""
+    counters: dict[str, int] = {}
+    for line in meminfo.splitlines():
+        key, separator, value = line.partition(":")
+        if key not in {"Dirty", "Writeback"}:
+            continue
+        fields = value.split()
+        if not separator or len(fields) != 2 or fields[1] != "kB" or key in counters:
+            raise ValueError(f"invalid writeback counter: {line!r}")
+        count = int(fields[0])
+        if count < 0:
+            raise ValueError(f"negative writeback counter: {line!r}")
+        counters[key] = count * 1024
+    if counters.keys() != {"Dirty", "Writeback"}:
+        raise ValueError("meminfo must contain Dirty and Writeback counters")
+    return sum(counters.values())
+
+
+def quiesce_writeback(*, threshold_bytes: int = 16 * 1024 * 1024,
+                      timeout_seconds: float = 30.0,
+                      meminfo: Path = Path("/proc/meminfo")) -> dict:
+    """Sync, then bound the post-sync wait for host Dirty + Writeback to settle."""
+    if threshold_bytes <= 0:
+        raise ValueError("writeback threshold_bytes must be positive")
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+        raise ValueError("writeback timeout_seconds must be finite and nonnegative")
+    before = writeback_bytes(meminfo.read_text())
+    os.sync()
+    started = time.monotonic()
+    while True:
+        dirty = writeback_bytes(meminfo.read_text())
+        waited = time.monotonic() - started
+        if dirty < threshold_bytes or waited >= timeout_seconds:
+            return {"dirtyBytesBefore": before, "dirtyBytesAtDispatch": dirty,
+                    "waitedSeconds": waited}
+        time.sleep(min(0.1, timeout_seconds - waited))
+
+
+
 def cache_state(silo: Silo, cohort: str) -> dict:
-    """Per-file eviction/residency evidence, retained whole in the sample record."""
+    """Condition cache residency and quiesce writeback outside the timed window."""
     paths = owned_inputs(silo)
-    return page_cache.evict(paths) if cohort == "cold" else page_cache.residency(paths)
+    cache = page_cache.evict(paths) if cohort == "cold" else page_cache.residency(paths)
+    return {**cache, "writeback": quiesce_writeback()}
 
 
 def headroom(silo: Silo, required: int) -> dict:
@@ -395,6 +534,11 @@ def summarize(samples: list[dict]) -> dict:
                 described["nonCowAllowanceSeconds"] = describe(
                     [sample[spec.record]["nonCowAllowanceSeconds"] for sample in chosen])
                 described["allowanceInputs"] = [sample[spec.record]["copyAllowance"] for sample in chosen]
+            if spec.disk_seal_allowance:
+                described["diskSealAllowanceSeconds"] = describe(
+                    [sample[spec.record]["diskSealAllowanceSeconds"] for sample in chosen])
+                described["diskSealAllowanceInputs"] = [
+                    sample[spec.record]["diskSealAllowance"] for sample in chosen]
             described["budgeted"] = all(metric in sample["gates"] for sample in chosen)
             summary["metrics"].setdefault(metric, {})[cohort] = described
             if described["budgeted"]:
@@ -444,6 +588,10 @@ class Evidence:
         self.host.setdefault("nonCowAllowances", {})[metric] = {
             **timing["copyAllowance"],
             "nonCowAllowanceSeconds": timing["nonCowAllowanceSeconds"],
+        }
+        self.host.setdefault("diskSealAllowances", {})[metric] = {
+            **timing["diskSealAllowance"],
+            "diskSealAllowanceSeconds": timing["diskSealAllowanceSeconds"],
         }
         self.record("reference-host.json", self.host)
 

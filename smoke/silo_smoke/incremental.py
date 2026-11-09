@@ -15,7 +15,7 @@ import subprocess
 
 import pytest
 
-from . import images, overlay, procs, restore, stopped
+from . import fork_budget, images, overlay, procs, restore, stopped
 from .cli import Silo
 from .config import REPO, SmokeConfig
 from .registry import LoopbackRegistry
@@ -134,18 +134,30 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
             actual = "zero" if not any(data) else "sha256:" + hashlib.sha256(data).hexdigest()
             assert expected == actual, (index, expected, actual)
         assert not ram.read(1)
-    for role, digest, size in (("memory.ram", "sha256:" + whole.hexdigest(), length),
-                               ("ram-map", "sha256:" + hashlib.sha256(encoded).hexdigest(), len(encoded))):
-        inventory = [entry for entry in saved.seal["inventory"] if entry["role"] == role]
-        assert len(inventory) == 1 and inventory[0]["length"] == size and inventory[0]["sha256"] == digest
+    ram_inventory = [entry for entry in saved.seal["inventory"] if entry["role"] == "memory.ram"]
+    assert len(ram_inventory) == 1 and ram_inventory[0]["length"] == length
+    assert ram_inventory[0]["identity"] == stream and ram_inventory[0].get("sha256") is None
+    map_inventory = [entry for entry in saved.seal["inventory"] if entry["role"] == "ram-map"]
+    assert len(map_inventory) == 1 and map_inventory[0]["length"] == len(encoded)
+    assert map_inventory[0]["sha256"] == "sha256:" + hashlib.sha256(encoded).hexdigest()
     stats = evidence["stats"]
-    assert stats["logicalBytes"] == length and stats["wholeFileBytesHashed"] == length
-    assert stats["identityBytesHashed"] == sum(min(CHUNK, length - index * CHUNK) for index in affected)
+    assert stats["logicalBytes"] == length and stats["wholeFileBytesHashed"] == 0
+    coverage = sum(min(CHUNK, length - index * CHUNK) for index in affected)
+    assert stats["identityBytesHashed"] == coverage
+    probe = None
     if mode == "incremental":
-        assert stats["fullBytesWritten"] == 0 and stats["liveBytesRead"] < length
-        assert stats["identityBytesHashed"] < length, "native reuse hid a full identity scan"
+        probe = fork_budget.reflink_probe(saved.staging)
+        assert stats["seedMethod"] == ("clone" if probe["reflink"] else "rebuild"), (stats, probe)
+        assert stats["fullBytesWritten"] == 0
+        assert stats["overlayBytesWritten"] <= stats["liveBytesRead"] <= coverage <= length
+        if probe["reflink"]:
+            assert stats["liveBytesRead"] == coverage
+            assert all(stats[field] == 0 for field in (
+                "baselineBytesRead", "baselineBytesWritten", "baselineHoleBytes", "extentQueries"))
+        else:
+            assert stats["liveBytesRead"] == stats["overlayBytesWritten"]
     else:
-        assert stats["liveBytesRead"] == length
+        assert stats["seedMethod"] == "rebuild" and stats["liveBytesRead"] == length
     record = restore.snapshot_record(silo, saved)
     assert record["execution"]["memory"]["stream"] == stream
     dependencies = procs.query(silo.ws.state_db(),
@@ -157,7 +169,7 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     assert not immutable.samefile(saved.staging / "memory.ram")
     silo.ws.record("incremental-authentication", json.dumps({"snapshot": saved.snapshot,
         "mapBytes": len(encoded), "chunks": chunks, "affectedChunks": sorted(affected),
-        "memory": evidence}, sort_keys=True) + "\n")
+        "memory": evidence, "seedProbe": probe}, sort_keys=True) + "\n")
     return {"map": complete, "affected": affected, "stats": stats}
 
 

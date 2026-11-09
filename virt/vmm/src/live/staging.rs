@@ -7,6 +7,9 @@
 //! monitor's euid. Records use no-replace `linkat` and single-link settlement.
 //! Capture writers close without durability barriers; publication belongs to libvm.
 //! RAM identity comes from the worker receipt; disk copies hash while writing.
+//! On Linux, monitor-written output starts nonblocking writeback after each complete
+//! 8 MiB region containing writes. Holes, short tails and reflinks need no hint;
+//! hint failures never affect capture success or establish durability.
 //!
 //! ```text
 //!   data-dir ─► captures/ ─► <id>/ ─┬─ request.json (once, before freeze)
@@ -203,14 +206,14 @@ impl CaptureStaging {
 
     /// Write and close `request.json` exactly once.
     pub(crate) fn write_request(&self, bytes: &[u8]) -> io::Result<Sha256Digest> {
-        let mut file = File::from(openat(
+        let file = File::from(openat(
             &self.directory,
             CAPTURE_REQUEST_FILE,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             private_mode(),
         )?);
         fchmod(&file, private_mode())?;
-        file.write_all(bytes)?;
+        StagingWriter::new(&file, start_writeback).write_all(bytes)?;
         drop(file);
         Ok(Sha256Digest::of_bytes(bytes))
     }
@@ -401,8 +404,8 @@ impl CaptureStaging {
     }
 
     pub(crate) fn publish_map(&self, role: &CaptureRole, map: &StreamMap) -> io::Result<()> {
-        let mut output = self.create_output(role)?;
-        map.write_canonical(&mut output)?;
+        let output = self.create_output(role)?;
+        map.write_canonical(&mut StagingWriter::new(&output, start_writeback))?;
         Ok(())
     }
 
@@ -465,14 +468,14 @@ impl CaptureStaging {
 
     /// Create and fill the exclusive temporary.
     fn write_temporary(&self, temporary: &str, bytes: &[u8]) -> io::Result<FileFacts> {
-        let mut file = File::from(openat(
+        let file = File::from(openat(
             &self.directory,
             temporary,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             private_mode(),
         )?);
         fchmod(&file, private_mode())?;
-        file.write_all(bytes)?;
+        StagingWriter::new(&file, start_writeback).write_all(bytes)?;
         FileFacts::of(&file)
     }
 
@@ -587,26 +590,106 @@ fn next_extent(source: &File, offset: u64, length: u64) -> io::Result<Option<(u6
     Ok(Some((data, hole.min(length))))
 }
 
-#[cfg(target_os = "linux")]
 fn start_writeback(file: &File, offset: u64, length: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
 
-    let offset = i64::try_from(offset).map_err(|_| invalid("writeback offset overflow"))?;
-    let length = i64::try_from(length).map_err(|_| invalid("writeback length overflow"))?;
-    // nix does not expose sync_file_range; this hint borrows the held fd and
-    // starts writeback only, without waiting for persistence.
-    let result = unsafe {
-        libc::sync_file_range(
-            file.as_raw_fd(),
-            offset,
-            length,
-            libc::SYNC_FILE_RANGE_WRITE,
-        )
-    };
-    if result == 0 {
+        let offset = i64::try_from(offset).map_err(|_| invalid("writeback offset overflow"))?;
+        let length = i64::try_from(length).map_err(|_| invalid("writeback length overflow"))?;
+        // nix does not expose sync_file_range; this hint borrows the held fd and
+        // starts writeback only, without waiting for persistence.
+        let result = unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                offset,
+                length,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, offset, length);
         Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    }
+}
+
+/// A monotonic staging writer. Sparse copies explicitly finish each logical
+/// chunk; sequential record/map writes finish regions as bytes are accepted.
+struct StagingWriter<'a, F> {
+    file: &'a File,
+    writeback: F,
+    offset: u64,
+    dirty_start: Option<u64>,
+    dirty_end: u64,
+}
+
+impl<'a, F: FnMut(&File, u64, u64) -> io::Result<()>> StagingWriter<'a, F> {
+    fn new(file: &'a File, writeback: F) -> Self {
+        Self {
+            file,
+            writeback,
+            offset: 0,
+            dirty_start: None,
+            dirty_end: 0,
+        }
+    }
+
+    fn written(&mut self, offset: u64, end: u64) {
+        if end > offset {
+            self.dirty_start.get_or_insert(offset);
+            self.dirty_end = end;
+        }
+    }
+
+    fn write_all_at(&mut self, bytes: &[u8], offset: u64) -> io::Result<()> {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| invalid("staging write offset overflow"))?;
+        self.file.write_all_at(bytes, offset)?;
+        self.written(offset, end);
+        Ok(())
+    }
+
+    fn complete_through(&mut self, end: u64) {
+        while let Some(start) = self.dirty_start {
+            let region = start / STREAM_CHUNK_BYTES * STREAM_CHUNK_BYTES;
+            let Some(stop) = region.checked_add(STREAM_CHUNK_BYTES) else {
+                break;
+            };
+            if stop > end {
+                break;
+            }
+            if let Err(error) = (self.writeback)(self.file, region, STREAM_CHUNK_BYTES) {
+                tracing::debug!(%error, offset = region, "capture staging writeback hint failed");
+            }
+            self.dirty_start = (stop < self.dirty_end).then_some(stop);
+        }
+    }
+}
+
+impl<F: FnMut(&File, u64, u64) -> io::Result<()>> Write for StagingWriter<'_, F> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.file.write_at(bytes, self.offset)?;
+        let end = self
+            .offset
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("staging write offset overflow"))?;
+        self.written(self.offset, end);
+        self.offset = end;
+        self.complete_through(end);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Writes go directly to the file; publication owns durability barriers.
+        Ok(())
     }
 }
 
@@ -620,6 +703,7 @@ fn stream_disk(
     if cancel.is_cancelled() {
         return Err(DiskCopyError::Cancelled);
     }
+    let mut destination = destination.map(|file| StagingWriter::new(file, start_writeback));
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     let mut chunks = Vec::with_capacity(length.div_ceil(STREAM_CHUNK_BYTES) as usize);
     let mut extent = next_extent(source, 0, length)?;
@@ -644,19 +728,18 @@ fn stream_disk(
             let stop = data_end.min(end);
             let bytes = &mut chunk[(start - offset) as usize..(stop - offset) as usize];
             source.read_exact_at(bytes, start)?;
-            if let Some(destination) = destination {
+            if let Some(destination) = destination.as_mut() {
                 if !vm_spec::capture::is_all_zero(bytes) {
                     destination.write_all_at(bytes, start)?;
-                }
-                #[cfg(target_os = "linux")]
-                if let Err(error) = start_writeback(destination, start, stop - start) {
-                    tracing::debug!(%error, "capture disk writeback hint failed");
                 }
             }
             if data_end > end {
                 break;
             }
             extent = next_extent(source, data_end, length)?;
+        }
+        if let Some(destination) = destination.as_mut() {
+            destination.complete_through(end);
         }
         chunks.push(if vm_spec::capture::is_all_zero(chunk) {
             None
@@ -833,6 +916,8 @@ mod tests {
         assemble_ram_map, parse_layout, CaptureStaging, DiskCopyError, DiskCopyMethod, FileFacts,
         RecordCommit, COPY_BUFFER_BYTES,
     };
+    #[cfg(target_os = "linux")]
+    use crate::live::staging::{start_writeback, StagingWriter};
 
     struct Root(PathBuf);
 
@@ -1427,5 +1512,93 @@ mod tests {
         assert_eq!(facts.length, length);
         assert_eq!(map, independent_map(&file, length));
         assert_eq!(map, independent_map(&sealed, length));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_writer_hints_completed_sparse_regions_once() {
+        let root = root();
+        let chunk = STREAM_CHUNK_BYTES;
+        let length = 3 * chunk + 17;
+        let output = source(&root, "hint-output", length, &[]);
+        let mut calls = Vec::new();
+        let mut writer = StagingWriter::new(&output, |file: &File, offset, length| {
+            // Both extents must be written before this region is hinted.
+            let mut tail = [0; 4];
+            file.read_exact_at(&mut tail, offset + chunk - 4).unwrap();
+            assert_eq!(&tail, b"last");
+            calls.push((offset, length));
+            start_writeback(file, offset, length)
+        });
+        writer.write_all_at(b"first", 13).unwrap();
+        writer.complete_through(chunk - 1);
+        writer.write_all_at(b"last", chunk - 4).unwrap();
+        writer.complete_through(chunk);
+        writer.write_all_at(b"middle", chunk + 4096).unwrap();
+        writer.write_all_at(b"last", 2 * chunk - 4).unwrap();
+        writer.complete_through(2 * chunk);
+        // A completely sparse region and the final short tail need no hint.
+        writer.complete_through(3 * chunk);
+        writer.write_all_at(b"tail", length - 4).unwrap();
+        writer.complete_through(length);
+        assert_eq!(calls, vec![(0, chunk), (chunk, chunk)]);
+        let mut head = [0; 5];
+        output.read_exact_at(&mut head, 13).unwrap();
+        assert_eq!(&head, b"first");
+        let mut tail = [0; 4];
+        output.read_exact_at(&mut tail, length - 4).unwrap();
+        assert_eq!(&tail, b"tail");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_writer_hints_each_sequential_region_on_a_real_file() {
+        let root = root();
+        let chunk = STREAM_CHUNK_BYTES;
+        let length = 2 * chunk + 17;
+        let data = vec![0x73; length as usize];
+        let mut input = source(&root, "hint-input", length, &[(0, &data)]);
+        let output = source(&root, "hint-output", 0, &[]);
+        let mut calls = Vec::new();
+        let mut writer = StagingWriter::new(&output, |file: &File, offset, length| {
+            let mut last = [0];
+            file.read_exact_at(&mut last, offset + length - 1).unwrap();
+            assert_eq!(last, [0x73], "region must be written before hinting");
+            calls.push((offset, length));
+            start_writeback(file, offset, length)
+        });
+        assert_eq!(std::io::copy(&mut input, &mut writer).unwrap(), length);
+        writer.flush().unwrap();
+        assert_eq!(calls, vec![(0, chunk), (chunk, chunk)]);
+        assert_eq!(
+            independent_map(&output, length),
+            independent_map(&input, length)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_writer_ignores_syscall_einval_and_finishes_copy() {
+        let root = root();
+        let chunk = STREAM_CHUNK_BYTES;
+        let length = 2 * chunk + 17;
+        let data = vec![0x91; length as usize];
+        let mut input = source(&root, "einval-input", length, &[(0, &data)]);
+        let output = source(&root, "einval-output", 0, &[]);
+        let mut calls = Vec::new();
+        let mut writer = StagingWriter::new(&output, |file: &File, offset, length| {
+            calls.push((offset, length));
+            // The same syscall on this real tempfile rejects an overflowing
+            // signed range. No filesystem or syscall result is mocked.
+            let error = start_writeback(file, i64::MAX as u64, length).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(nix::errno::Errno::EINVAL as i32));
+            Err(error)
+        });
+        assert_eq!(std::io::copy(&mut input, &mut writer).unwrap(), length);
+        assert_eq!(calls, vec![(0, chunk), (chunk, chunk)]);
+        assert_eq!(
+            independent_map(&output, length),
+            independent_map(&input, length)
+        );
     }
 }
