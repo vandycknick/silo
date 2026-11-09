@@ -974,12 +974,8 @@ def capabilities_cohort(args, _echo) -> dict:
         "actual host capability schema")
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         require(value["live"][operation]["native"] is True, "Main has not qualified/flipped the exercised native lane")
-        expected = ({"status": "supported"} if operation == "pause" else
-                    {"status": "unsupported", "reason": {
-                        "code": "lane-not-qualified" if operation in ("capture", "restore") else "not-delivered",
-                        "subject": None}})
-        require(value["live"][operation]["availability"] == expected,
-                "public capture stays unqualified until the combined live admission gates pass")
+        require(value["live"][operation]["availability"] == {"status": "supported"},
+                f"Phase 24 production qualification must admit {operation}")
     return {"command": command, "elapsed_ns": time.monotonic_ns() - started,
         "exit_status": result.returncode, "monitor_sha256": digest(args.monitor),
         "actual_json": value, "guest_started": False}

@@ -202,19 +202,29 @@ grants public pause. Runtime files or environment variables cannot grant it.
 
 ### Full live capture (Phase 14)
 
-`tests/test_capture.py` requires an isolated test-only capture candidate.
-Production capture remains `lane-not-qualified`; no runtime file grants it.
+`tests/test_capture.py` uses an isolated test-only capture candidate.
+Phase 24 admits production capture only for the exact compiled Linux KVM
+x86_64 build; no runtime file grants it.
 Build with `python -m silo_smoke.capture_candidate --destination PATH --runtime
 STAGED_RUNTIME` through `uv run --project smoke` with `PYTHONPATH=smoke`.
 The destination must be outside the repository and staged runtime, with matching
 Cargo ancestor depth and build environment. The builder checks native/build
 identity equality and leaves the production stage unchanged.
 
-Phase 15 restore gates use the same builder with `--restore`. It requires
-production capture and restore to be delivered but still `lane-not-qualified`,
-then admits only pause, capture and restore in the copied compilation.
-Fork and incremental admission remain unchanged. This is test isolation,
-not production qualification; use the resulting private CLI and runtime together.
+Phase 15 restore gates use the same builder with `--restore`. The requested
+operations must be delivered and native, but production may already qualify
+them. The builder admits only pause, capture and restore in the copied
+compilation, leaving unrequested operations unqualified and the production
+record and stage untouched. This is test isolation, not production
+qualification; use the resulting private CLI and runtime together.
+
+`test_native_capabilities.py` checks the **production** qualification policy,
+not the candidate's deliberately admitted operation set. For a mixed candidate
+suite, set `SILO_SMOKE_PRODUCTION_RUNTIME_DIR` to the staged production runtime
+so its `bin/silo-vmm` receives the ordinary, launch-environment and mutable-grant
+queries. Without that override, these production-only cases explicitly skip a
+candidate only when its adjacent `candidate-manifest.json` binds the selected
+runtime and monitor hash. A `supported` report alone never permits a skip.
 
 Point `SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR` at the candidate's `bin`
 and `runtime` directories, then run:
@@ -235,6 +245,11 @@ the checkpoint can be acknowledged.
 Pre-seal cancellation waits for the monitor's exact request-admission event
 before releasing the held syscall; it verifies acquired-resume, acquired-preserve
 and borrowed-pause policies. Post-seal cancellation preserves the known seal.
+The cancellation gate held at temporary-seal unlink verifies the two names are
+the same private inode with exactly two links. After release the normal immutable
+inventory still requires a single link, identical seal bytes and disappearance
+of that temporary name. Crash recovery must preserve and publish any linked
+coherent seal; it must not silently downgrade the two-link crash window.
 These are process-crash tests, not physical power-loss simulation. Retain failed
 workspaces; archive evidence before pruning completed generated payloads.
 
@@ -323,6 +338,12 @@ target listener and a durable progress record. A preserving live checkpoint is
 restored with the real `silo restore`. The workspace selects netd's own packet
 capture (`networking.drivers.netd.pcap`); the child's capture and trace log are
 followed from creation so destroyed children keep their evidence.
+Before first launch, the network fixture materializes its fixed-size progress
+record in the stopped private ext4 **upper**, including namespace and extents.
+Seeding only the OCI lower would require guest OverlayFS copy-up, whose
+directory metadata can remain journal-only even after the witness's
+`fdatasync`. The independent `debugfs` oracle intentionally never replays that
+journal and still requires the exact record and same-process progress.
 The capture is nanosecond classic pcap with `LINKTYPE_ETHERNET=1`, recorded
 at netd's vfkit datagram connection in both directions, before ingress switch
 filtering and after successful egress writes. Original Ethernet headers,
@@ -332,6 +353,10 @@ ingress MACs and observed egress before Ethernet headers were added, so it
 cannot satisfy this oracle and is rejected. Capture write failures terminate
 the attachment and are reported on close rather than silently losing evidence.
 
+The positive case waits up to the normal 90-second readiness bound for the
+final `restore activation started` event before asserting the full sequence.
+CLI success can precede the asynchronous trace follower's next poll; no
+acknowledgement or ordering assertion is omitted when waiting for those bytes.
 Order evidence is the child monitor's `restore ...` trace events (listed in
 `silo_smoke/restore_lifecycle.py`). Wire evidence is netd's capture and, under
 `stopped_trace` with `observeNetEgress`, every native `virtio-net` send toward
@@ -363,9 +388,10 @@ fail, never skip.
 
 `tests/test_fork.py` needs an isolated candidate that also admits delivered
 live fork: `python -m silo_smoke.capture_candidate --destination PATH --runtime
-STAGED_RUNTIME --restore --fork`. It requires production fork to be delivered,
-native and still `lane-not-qualified`, admits pause, capture, restore and fork
-only in the private compiled copy, and leaves the production stage unchanged.
+STAGED_RUNTIME --restore --fork`. It requires production fork to be delivered
+and native, whether already qualified or not, admits pause, capture, restore
+and fork only in the private compiled copy, and leaves the production
+qualification record and stage unchanged.
 Point `SILO_SMOKE_BIN_DIR`/`SILO_SMOKE_RUNTIME_DIR` at it, then run:
 
 ```sh
@@ -408,6 +434,11 @@ the harness's own dispatch/exit clock; the authenticated local cut under
   A's batch that alone fits is refused with the reported requirement including
   home B's batch. Home B is then cancelled before its seal: no child or cut, its
   ledger records gone and the source `unchanged` and still running.
+  Both batches are sized against `MemAvailable` minus the existing same-euid
+  ledger reservations, including capture scratch, pending children and
+  inode-deduplicated bound RAM. Existing homes are neither cleared nor ignored.
+  The pre-seal gate remains the native `pwrite64` into `execution.state`;
+  cancellation is checked when that execution stage completes, before sealing.
 - Post-seal cancellation (held at the source continuation record) leaves every
   child Running or Cancelled. Manager SIGKILL before the seal recovers one cut
   (never a recapture) and abandons every child; SIGKILL right after the first
@@ -795,8 +826,9 @@ uv run --project smoke pytest smoke/tests/test_restore.py -m slow \
   -k 'corrupt_real_closure or real_native_incompatibility' --keep
 ```
 
-The builder refuses missing/dirty native provenance, mismatched build identity,
-IRQ diagnostic candidates and a production lane that is not still unqualified.
+The builder refuses missing/dirty native provenance, mismatched build identity
+and IRQ diagnostic candidates. Production may already qualify the requested
+operations; its qualification record and staged executable must stay untouched.
 `--incremental` requires `--restore`; `--fork` may additionally admit the local
 fork functional gates in the same isolated compilation. The resulting CLI,
 monitor and helper examples must be used together. No runtime flag grants
@@ -834,6 +866,9 @@ an explicitly recorded syscall fault, never injected success or synthetic RAM.
 
 The host-writer case requires an observed `/dev/hvc0` serial token, byte-exact
 bidirectional vsock transport and actual balloon free-page-report completions.
+The CLI's stderr also carries reconciliation diagnostics. The echo still requires
+byte-identical stdout and exit zero; stderr may contain only the exact
+`ActiveLease` cache-cleanup deferral diagnostic, never guest errors.
 It decodes the bounded saved device queues, reads their real used indices and
 entries from sealed RAM and requires the reporting ring's chunks in the dirty
 bitmap. An explicit full capture at the same borrowed pause must have identical
@@ -1942,6 +1977,11 @@ The negative syscall matrix injects exactly one EIO/ENOSPC/EACCES at actual
 source sync, child copy/FICLONE, child file sync, no-replace rename or
 post-publication directory sync. Scope is the held source inode or the newly
 owned child `.copy-UUID/file-0`/parent FD, never an arbitrary path or read result.
+The coalesced file-sync gate follows that first attachment to its final
+`root.raw`/`upper.raw` name. At this barrier the SQL-visible child is already
+complete but `constructed`; independent hashes and inode checks still apply.
+An injected barrier failure must be reported, and fresh-runtime reconciliation
+must retire that stopped, non-durable child before the retry.
 `boundary-injected.json` labels the exact errno as injected syscall failure,
 not physical media/power-loss evidence. The source's complete bytes/config/
 semantic storage must remain unchanged, no partial child may be catalog-visible,
@@ -2059,10 +2099,11 @@ namespace (`unshare --user --map-root-user --mount`). Its bounded tmpfs
 exercises actual ENOSPC; do not substitute host disk exhaustion or `/dev/full`.
 Run `capabilities` last, with `--monitor "$STAGED_RUNTIME/bin/silo-vmm"`,
 only after the exercised native lane's support declarations have been approved.
-Phase 15 delivers capture and restore without production qualification:
-both report `lane-not-qualified`; fork and incremental remain `not-delivered`.
-The public pause qualification is revision-bound. Standalone native proofs
-grant no additional public capability.
+Phase 24 admits pause, capture, restore, fork and incremental for the exact
+production Linux KVM x86_64 build recorded in
+[silo-vmm qualification](../docs/architecture/silo-vmm.md#qualification).
+Other builds and lanes remain unqualified. Standalone native proofs grant
+no additional public capability.
 
 `api-report.json`, per-process logs, captured manifests and input identities
 are the evidence. Ordinary successful cohorts require acknowledged native

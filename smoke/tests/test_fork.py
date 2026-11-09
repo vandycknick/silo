@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+import fcntl
 import json
 import math
 import os
@@ -325,6 +326,10 @@ def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
         operations.append(call.operation)
         ram = fork.cut_directory(silo, call.operation) / "memory.ram"
         for name in names:
+            # Running acknowledges activation/exposure, not the asynchronous
+            # guest status stream. Use the same readiness gate as restore_child
+            # before issuing the checksum, without retrying a guest command.
+            silo.wait_ready(name)
             assert touch_blob(silo, name) == prepared.blob, name
         before = fork.sharing(silo, names, ram, source=SOURCE)
         for name in names:
@@ -411,6 +416,74 @@ def ledger(silo: Silo) -> dict[str, bytes]:
         return {}
     return {path.name: path.read_bytes() for path in sorted(directory.iterdir())
             if path.name.startswith(prefix) and path.name.endswith(".json") and path.is_file()}
+
+
+def budget_memory(directory: Path) -> int:
+    """Same-euid reserved RAM, deduplicating bound baselines by real inode."""
+    if not directory.is_dir():
+        return 0
+    memory = 0
+    baselines: dict[tuple[int, int], int] = {}
+
+    def baseline(device: int, inode: int, length: int) -> None:
+        nonlocal memory
+        identity = (device, inode)
+        if identity in baselines:
+            assert baselines[identity] == length, "baseline inode has contradictory lengths"
+        else:
+            baselines[identity] = length
+            memory += length
+
+    def restore_charge(charge: dict) -> None:
+        nonlocal memory
+        memory += charge["privateBytes"] + charge["overheadBytes"]
+        baseline(charge["baselineDevice"], charge["baselineInode"], charge["baselineBytes"])
+
+    # Production serializes every ledger publish/release with this same flock.
+    with (directory / "admission.lock").open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        for path in sorted(directory.glob("*.json")):
+            document = json.loads(path.read_bytes())
+            if "captureId" not in document:
+                restore_charge(document)
+                continue
+            memory += document["captureMemory"]
+            saved = document["baseline"]
+            if saved is not None:
+                if saved["kind"] == "pending":
+                    memory += saved["bytes"]
+                else:
+                    assert saved["kind"] == "bound", saved
+                    baseline(saved["device"], saved["inode"], saved["bytes"])
+            memory += sum(child["privateBytes"] + child["overheadBytes"] for child in document["pending"])
+            for child in document["bound"]:
+                restore_charge(child)
+    return memory
+
+
+def test_fork_budget_memory_counts_existing_charges_and_shared_baselines(tmp_path: Path) -> None:
+    assert budget_memory(tmp_path / "absent") == 0
+    (tmp_path / "admission.lock").touch()
+    first = {"baselineDevice": 1, "baselineInode": 2, "baselineBytes": 100,
+             "privateBytes": 20, "overheadBytes": 3}
+    second = {**first, "privateBytes": 30, "overheadBytes": 4}
+    bound = {**first, "baselineInode": 3, "baselineBytes": 200, "privateBytes": 50, "overheadBytes": 6}
+    shared = {**first, "privateBytes": 60, "overheadBytes": 8}
+    records = [first, second, {
+        "captureId": "bound-cut", "captureMemory": 7,
+        "baseline": {"kind": "bound", "device": 1, "inode": 2, "bytes": 100},
+        "pending": [{"privateBytes": 40, "overheadBytes": 5}], "bound": [bound],
+    }, {
+        "captureId": "pending-cut", "captureMemory": 11,
+        "baseline": {"kind": "pending", "captureId": "pending-cut", "bytes": 300},
+        "pending": [], "bound": [shared],
+    }]
+    for index, record in enumerate(records):
+        (tmp_path / f"{index}.json").write_text(json.dumps(record))
+    assert budget_memory(tmp_path) == 844
+    (tmp_path / "1.json").write_text(json.dumps({**second, "baselineBytes": 101}))
+    with pytest.raises(AssertionError, match="contradictory lengths"):
+        budget_memory(tmp_path)
 
 
 def refused_before_freeze(silo: Silo, prepared: Prepared, names: list[str], *flags: str,
@@ -508,13 +581,16 @@ def test_fork_whole_batch_refusal_counts_another_homes_admitted_batch_then_pre_s
 ) -> None:
     ram = 1024 * MIB
     prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
-    available = mem_available()
-    other_count = children_for(ram, int(0.6 * available))
-    count = children_for(ram, int(0.6 * available))
-    alone = batch_bytes(ram, count)
-    assert alone < available and alone + batch_bytes(ram, other_count) > available
-    other_names = [f"b{index}" for index in range(other_count)]
     create(other_silo, restore_image, profile="layered", memory="1gib")
+    available = mem_available()
+    reserved = budget_memory(Path(f"/tmp/silo-restore-budget-{os.geteuid()}"))
+    headroom = available - reserved
+    other_count = children_for(ram, int(0.6 * headroom))
+    count = children_for(ram, int(0.6 * headroom))
+    alone = batch_bytes(ram, count)
+    assert alone < headroom and alone + batch_bytes(ram, other_count) > headroom, (
+        "host lacks room for two individually admissible batches", available, reserved)
+    other_names = [f"b{index}" for index in range(other_count)]
     traced = fork.TracedSource(other_silo, SOURCE, other_names, "capture-execution-write",
                                "--max-children", str(other_count), "--private-write-percent", "100")
     try:
@@ -531,8 +607,8 @@ def test_fork_whole_batch_refusal_counts_another_homes_admitted_batch_then_pre_s
         match = BUDGET_REFUSAL.search(diagnostic)
         assert match is not None, diagnostic
         required, reported = int(match.group(1)), int(match.group(2))
-        assert required >= alone + batch_bytes(ram, other_count) and required > reported, diagnostic
-        assert alone < reported, "home A alone would not have fit; refusal proves nothing about B"
+        assert required >= reserved + alone + batch_bytes(ram, other_count) and required > reported, diagnostic
+        assert reserved + alone < reported, "home A alone would not have fit; refusal proves nothing about B"
 
         cancelled = fork.observe(other_silo, traced.operation, cancel=True)
         assert cancelled["cancellationRequested"] is True and cancelled["stage"] != "finished", cancelled
@@ -556,7 +632,8 @@ def test_fork_whole_batch_refusal_counts_another_homes_admitted_batch_then_pre_s
         restore.advances(other_silo, SOURCE, restore.witness(other_silo, SOURCE))
         other_silo.ws.record("fork-pre-seal-cancel", json.dumps({
             "operation": traced.operation, "result": result, "refusal": diagnostic,
-            "available": available, "homeA": alone, "homeB": batch_bytes(ram, other_count),
+            "available": available, "existingReservations": reserved,
+            "homeA": alone, "homeB": batch_bytes(ram, other_count),
         }, sort_keys=True) + "\n")
         traced.finish()
     finally:

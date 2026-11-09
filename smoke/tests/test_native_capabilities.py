@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 from silo_smoke.config import SmokeConfig
-from silo_smoke.overlay import native_source_identity
+from silo_smoke.overlay import digest, native_source_identity
 
 
 def snapshot(root: Path) -> dict:
@@ -27,7 +27,19 @@ def snapshot(root: Path) -> dict:
 @pytest.mark.parametrize("mode", ["ordinary", "launch-environment", "mutable-grants"])
 def test_native_capabilities_machine_less_binding_and_no_mutable_grants(config: SmokeConfig, tmp_path: Path, mode: str) -> None:
     """Real system-fd queries belong to smoke, never to a Cargo test process."""
-    monitor = config.runtime_dir / "bin/silo-vmm"
+    production_runtime = os.environ.get("SILO_SMOKE_PRODUCTION_RUNTIME_DIR")
+    runtime = Path(production_runtime).expanduser().resolve() if production_runtime else config.runtime_dir
+    monitor = runtime / "bin/silo-vmm"
+    manifest_path = runtime.parent / "candidate-manifest.json"
+    if production_runtime is None and manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_bytes())
+        if (manifest.get("runtime") == str(runtime)
+                and manifest.get("candidateMonitorSha256") == digest(monitor)
+                and manifest.get("productionStageUnchanged") is True):
+            pytest.skip(
+                "production qualification gate excludes the hash-bound isolated candidate; "
+                "set SILO_SMOKE_PRODUCTION_RUNTIME_DIR to the staged production runtime"
+            )
     (tmp_path / "sentinel").write_bytes(b"preserve")
     (tmp_path / "sentinel-link").symlink_to("missing-target")
     environment = os.environ.copy()
@@ -51,12 +63,10 @@ def test_native_capabilities_machine_less_binding_and_no_mutable_grants(config: 
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         capability = report["live"][operation]
         assert capability["native"] is (report["lane"] == "kvm-x86_64" or operation == "pause")
-        if operation == "pause":
-            expected = ({"status": "supported"} if report["lane"] == "kvm-x86_64" else
-                        {"status": "unsupported", "reason": {"code": "lane-not-qualified", "subject": None}})
-        else:
-            code = "lane-not-qualified" if capability["native"] else "build-excluded"
-            expected = {"status": "unsupported", "reason": {"code": code, "subject": None}}
+        expected = ({"status": "supported"} if report["lane"] == "kvm-x86_64" else
+                    {"status": "unsupported", "reason": {
+                        "code": "lane-not-qualified" if capability["native"] else "build-excluded",
+                        "subject": None}})
         assert capability["availability"] == expected
     identity = native_source_identity(report)
     assert identity.kind == "path"

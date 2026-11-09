@@ -67,8 +67,11 @@ regeneration is only a digest-gated fallback, not a portability requirement.
 The published-builder namespace gate matched all 35,904 independent umoci rows
 through actual readonly EROFS mounts. Linux x86_64 stable 7.2.2 and
 longterm 6.18.48 production roots passed boot, lifecycle and flatten gates.
-The mandatory Phase 24 performance sweep remains outstanding; public live
-execution lanes remain unqualified.
+Phase 24 refreshed exact-build production qualification for all five live
+operations on Linux KVM x86_64. The [qualification record](docs/architecture/silo-vmm.md#qualification)
+and [performance tracker](docs/architecture/live-operation-performance.md)
+retain the admitted identity, passing Btrfs/ext4 budgets and recorded suite
+failures; foreign lanes remain pending owner Phase 25.
 
 `/tmp` remains persistent and disk-backed by default. With the overlay profile,
 `--tmpfs-size 64mib` explicitly selects a memory-charged, nonpersistent `/tmp`;
@@ -403,3 +406,7 @@ async fn main() -> Result<(), LibVmError> {
 - [Terminology](docs/terminology.md)
 - [Guest agent](guest/agent/README.md)
 - [System daemon](docs/system-daemon.md)
+- [Layered OCI storage (ADR 0014)](docs/adr/0014-layered-oci-image-storage.md)
+- [Live snapshots and forks (ADR 0021)](docs/adr/0021-live-snapshots-and-forks.md)
+- [Live-operation performance tracker](docs/architecture/live-operation-performance.md)
+- [Run lifecycle](docs/run-lifecycle.md)

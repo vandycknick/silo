@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 import time
 
+from silo_smoke import shutdown
 from silo_smoke.native_live_api import cleanup_session, make_session_type
 from silo_smoke.native_live_trace import _record_restore_wait
 
@@ -317,6 +318,56 @@ class StoppedTraceLifecycleTests(unittest.TestCase):
         events = [json.loads(line) for line in (directory / "boundary-lifecycle.jsonl").read_text().splitlines()]
         race = json.loads((directory / "race.json").read_text()) if phase not in ("none", "exec") else {}
         return result, events, race
+
+    def test_capture_execution_pwrite_is_held_before_any_output_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            machines = directory / "machines"
+            source = machines / "source/root.raw"
+            execution = machines / "source/captures/cut/execution.state"
+            execution.parent.mkdir(parents=True)
+            source.write_bytes(b"private source\n")
+            execution.touch(mode=0o600)
+            release = directory / "release"
+            request = directory / "request.json"
+            request.write_text(json.dumps({
+                "command": [sys.executable, "-c",
+                            "import os, sys; fd = os.open(sys.argv[1], os.O_RDWR); "
+                            "os.pwrite(fd, b'execution bytes', 0); os.close(fd)", str(execution)],
+                "target": str(source), "boundary": "capture-execution-write",
+                "machines": str(machines), "evidence": str(directory), "release": str(release),
+            }))
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+            controller = subprocess.Popen(
+                [sys.executable, "-m", "silo_smoke.stopped_trace", str(request)],
+                env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            try:
+                def held() -> dict | None:
+                    marker = directory / "boundary-held.json"
+                    if marker.is_file():
+                        return json.loads(marker.read_text())
+                    self.assertIsNone(controller.poll(), "execution boundary controller exited")
+                    return None
+
+                receipt = shutdown.until(held, timeout=5, description="pwrite64 gate was not reached")
+                self.assertEqual(receipt["syscall"], 18)
+                self.assertEqual(receipt["target"], str(execution))
+                self.assertFalse(receipt["injectedReturn"])
+                self.assertEqual(execution.read_bytes(), b"")
+                self.assertFalse((execution.parent / "vm.capture.json").exists())
+            finally:
+                release.touch()
+                try:
+                    output, _ = controller.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    controller.kill()
+                    controller.communicate(timeout=5)
+                    raise
+            self.assertEqual(controller.returncode, 0, output)
+            self.assertEqual(execution.read_bytes(), b"execution bytes")
+            self.assertEqual(source.read_bytes(), b"private source\n")
 
     def test_disappearing_startup_stop_keeps_real_wait_and_later_boundary(self) -> None:
         for operation in (0x4200, 0x4201, 0x420E):

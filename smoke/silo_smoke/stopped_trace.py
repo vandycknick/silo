@@ -592,6 +592,14 @@ def main() -> None:
                     actual_path = None
                 recent.append({"tid": tid, "syscall": syscall, "fd": fd, "path": str(actual_path) if actual_path is not None else None})
                 owned_copy = actual_path is not None and actual_path.parent.name.startswith(".copy-") and actual_path.name == "file-0" and actual_path.parent.parent.parent == machines
+                # Private copies are renamed before the coalesced durability
+                # barrier. Match that same first attachment at its final child
+                # path, not a sync of the now-absent .copy-*/file-0 name.
+                published_copy = (
+                    actual_path is not None and actual_path.parent.parent == machines
+                    and actual_path.name in {"root.raw", "upper.raw"}
+                    and actual_path != Path(request["target"])
+                )
                 owned_stage = actual_path is not None and actual_path.name.startswith(".copy-") and actual_path.parent.parent == machines
                 owned_child = actual_path is not None and actual_path.parent == machines and actual_path != Path(request["target"]).parent
                 publication = syscall == 316 and owned_stage
@@ -660,7 +668,7 @@ def main() -> None:
                                 and actual_path is not None and actual_path.parent.parent == machines
                                 and actual_path.name.startswith(".kernel-") and actual_path.name.endswith(".tmp"))
                             or (boundary == "destination-copy" and owned_copy and (syscall in (1, 18, 20) or (syscall == 16 and info.data[2] == 0x40049409)))
-                            or (boundary == "destination-sync" and owned_copy and syscall in (74, 75))
+                            or (boundary == "destination-sync" and (owned_copy or published_copy) and syscall in (74, 75))
                             or (boundary == "publication-rename" and publication)
                             or (boundary == "destination-directory-sync" and publication_seen and syscall == 74 and (owned_stage or owned_child) and metadata is not None and stat.S_ISDIR(metadata.st_mode))
                             or (boundary == "capture-execution-write" and capture_file and actual_path.name == "execution.state" and syscall in (1, 18, 20))

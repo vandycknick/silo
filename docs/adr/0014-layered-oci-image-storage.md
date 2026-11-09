@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Updated: 2026-11-07
+Updated: 2026-11-09
 
 ## Status
 
@@ -21,13 +21,26 @@ incompatible state is refused with a reinstall/wipe diagnostic, never deleted
 automatically. This supersedes the former existing-machine preservation and
 additive-migration requirements throughout the implementation plan.
 
-Phase 22 cuts current OCI creation over to `linux-erofs-overlay-v1` on
-libkrun and removes the development flat profile and root-profile selector.
-Linux x86_64 production-root boot and lifecycle gates passed
-on stable 7.2.2 and longterm 6.18.48, including kernel-mutated flatten export and
-raw re-import. Public live lanes remain unqualified; performance qualification
-is deferred to the mandatory Phase 24 sweep. The independent published-builder
-oracle exception is recorded under [Filesystem and Linux gates](#filesystem-and-linux-gates);
+## Implementation status (2026-11-09)
+
+Stages 1–4 are implemented on Linux/libkrun, with `linux-erofs-overlay-v1`
+the default OCI profile and the development flat profile and root-profile
+selector removed. Stage 5 (macOS on VZ) is deferred to owner-driven Phase 25;
+Linux evidence does not qualify it or other foreign lanes.
+
+Linux x86_64 production-root boot and lifecycle gates passed on stable 7.2.2
+and longterm 6.18.48, including kernel-mutated flatten export and raw re-import.
+Phase 24 refreshed the exact-build live-operation production record for
+libkrun `0d21bf7`; the [performance tracker](../architecture/live-operation-performance.md)
+records passing live budgets on Btrfs and fresh ext4 with evidence under
+`.tmp/plan/evidence/phase-24/`. Original ingest and large prepared-create
+targets missed; the dated [acceptance-budget revision](#acceptance-budgets)
+records the revised targets, not a passing ingest qualification.
+
+Overlay boot admission now checks the Linux 6.6 kernel floor rather than
+an exact kernel/initramfs/monitor boot tuple. Kernel configuration remains
+a kernel-track build-time gate. The independent published-builder oracle
+exception is recorded under [Filesystem and Linux gates](#filesystem-and-linux-gates);
 it does not waive runtime, cross-host or performance gates.
 
 The 2026-09-26 revision follows the change that made libkrun the default
@@ -2618,13 +2631,36 @@ not format requirements; a budget is revised only with a recorded measurement.
 
 | Operation                                                        | Budget                                                                                                                      |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Cold prepare of an OCI image (pull, decode, pack, index, fsmeta) | At most 1.5 times the time to download and decompress the same layers; never more than linear in expanded bytes             |
-| Warm create of a stopped machine from a prepared lower           | At most 2 seconds, dominated by upper formatting                                                                             |
+| Cold prepare of an OCI image (pull, decode, pack, index, fsmeta) | At most 10× the time to download and decompress the same layers on the Btrfs reference host, recorded 2026-11-09 (6.0×/9.2×); the 1.5× product target is retained as the goal of a later ingest pipeline rewrite (single-pass decode→pack, no spool/publication copies, composition receipts) per `.tmp/plan/research/phase24-ingest-cost.md`. Linearity is reported per size; the 1.25 ratio is a goal, not an admission gate, until the rewrite. See the dated ingest measurement note below. |
+| Warm create of a stopped machine from a prepared lower           | 2 s for lowers up to 1 GiB allocated; larger lowers scale at about 1.35 s per GiB until composition receipts land. See the dated ingest measurement note below. |
 | Start to guest `/` mounted (layered versus opaque raw, same image)| Within 20 percent of the raw root                                                                                            |
 | Copy-up of a lower file on first write                           | Whole-file cost at the host's sequential copy rate; reported, never hidden                                                   |
 | Stopped fork                                                     | Sub-second with host CoW; bounded by upper allocated bytes at sequential copy rate without                                   |
 | Lower-wide rescan on shifted chunk boundaries                    | Linear in retained nonzero bytes; measured and reported per composition                                                      |
 | Handoff and publication                                          | Encoded payload bytes sent equal the encoded bytes of missing chunks; metadata and protocol bytes at most the larger of 1 percent of that or 1 MiB |
+
+**Ingest measurement and budget revision, 2026-11-09 (owner decision).**
+The original ingest ratio target was **missed**: 6.0× at 1 GiB and 9.2× at
+4 GiB versus 1.5×. Linearity was **missed**: 8.7 → 12.4 s/GiB, a 1.43
+ratio versus 1.25; the 12 GiB unprepared create exceeded 300 s, so no
+12 GiB prepare duration was measured. Prepared-lower create was **missed**:
+6.15 s for a 4 GiB lower versus 2 s. These observations support the revised
+targets above, not a passing qualification. The 1.35 s/GiB larger-lower
+scaling is the observed slope between the 1 GiB and 4 GiB samples, not a
+validated bound for all sizes; the 2 s small-lower budget remains a target.
+Evidence:
+
+- `.tmp/plan/evidence/phase-24/deferred-btrfs/ingest-20261109T121355Z/size-cold-0-1073741824.json`
+  (1 GiB ratio, normalized prepare and prepared-create timing).
+- `.tmp/plan/evidence/phase-24/deferred-btrfs/ingest-20261109T121355Z/size-cold-0-4294967296.json`
+  (4 GiB ratio, normalized prepare and prepared-create timing).
+- `.tmp/plan/evidence/phase-24/deferred-btrfs/ingest-20261109T121355Z/reference-host.json`
+  and `fixture.json` in that directory (Btrfs host, candidate and corpus).
+- `.tmp/plan/evidence/phase-24/deferred-btrfs-ingest.log`
+  (12 GiB timeout from the same cohort).
+
+These are incomplete first-cohort diagnostic observations, not five-run
+qualification medians and not evidence for another reference filesystem.
 
 Measurements are taken on the three reference hosts named in the qualification
 matrix (one Linux x86_64 with ext4 without reflinks and one with XFS reflinks,

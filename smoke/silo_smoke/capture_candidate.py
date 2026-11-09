@@ -3,10 +3,10 @@
 Copied compiled qualification tables admit only the exact private build. An
 explicit IRQ candidate additionally enables source-only diagnostic witness
 transport; its build identity is retained separately, never called production.
-An explicit fork candidate admits delivered-but-unqualified live fork in the
-same private copy only; production qualification tables stay untouched.
-An explicit incremental candidate additionally admits delivered incremental
-capture only with ordinary restore; it never changes production capabilities.
+An explicit fork candidate admits delivered live fork in the same private
+copy only; production qualification tables stay untouched even when they
+already admit it. An explicit incremental candidate additionally admits
+incremental capture with ordinary restore in that copy.
 """
 from __future__ import annotations
 
@@ -44,12 +44,14 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
     production = runtime / "bin/silo-vmm"
     production_hash = digest(production)
     original = native_capabilities(production, diagnostic=destination / "production-capabilities.log")
-    if original["live"]["capture"]["availability"]["status"] != "unsupported":
-        raise ValueError("production capture must remain unqualified")
+    production_capabilities = REPO / "virt/vmm/src/capabilities.rs"
+    production_record = production_capabilities.read_text()
     source = destination / "source"
     shutil.copytree(REPO, source, symlinks=True, ignore=shutil.ignore_patterns(
         "target", ".git", ".tmp", ".codegraph", ".venv", "node_modules", "__pycache__", ".pytest_cache",
     ))
+    if (source / "virt/vmm/src/capabilities.rs").read_text() != production_record:
+        raise ValueError("candidate source differs from the untouched production record")
     target = destination / "target"
     command = ["cargo", "build", "--locked", "--offline", "--manifest-path", str(source / "Cargo.toml"),
                "--target-dir", str(target)]
@@ -105,28 +107,14 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
     qualifications = re.findall(r"const QUALIFICATIONS: &\[Qualification<'static>\] = &\[.*?\];", text, re.DOTALL)
     if len(qualifications) != 1:
         raise ValueError("expected exactly one compiled qualification table")
-    if unqualified["live"]["capture"]["availability"] != {
-        "status": "unsupported", "reason": {"code": "lane-not-qualified", "subject": None},
-    }:
-        raise ValueError("production must deliver capture without qualifying it")
-    if restore and unqualified["live"]["restore"] != {
-        "native": True,
-        "availability": {"status": "unsupported",
-                         "reason": {"code": "lane-not-qualified", "subject": None}},
-    }:
-        raise ValueError("production must deliver restore without qualifying it")
-    if fork and unqualified["live"]["fork"] != {
-        "native": True,
-        "availability": {"status": "unsupported",
-                         "reason": {"code": "lane-not-qualified", "subject": None}},
-    }:
-        raise ValueError("production must deliver fork without qualifying it")
-    if incremental and unqualified["live"]["incremental"] != {
-        "native": True,
-        "availability": {"status": "unsupported",
-                         "reason": {"code": "lane-not-qualified", "subject": None}},
-    }:
-        raise ValueError("production must deliver incremental without qualifying it")
+    for operation in operations:
+        if unqualified["live"][operation]["native"] is not True or (
+                unqualified["live"][operation]["availability"] not in (
+                    {"status": "supported"},
+                    {"status": "unsupported",
+                     "reason": {"code": "lane-not-qualified", "subject": None}},
+                )):
+            raise ValueError(f"production must deliver native {operation}")
     admitted_operations = ", ".join("LiveOperation::" + operation.capitalize()
                                     for operation in operations)
     proof["mutations"].append(replace_once(
@@ -146,8 +134,14 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         if operation in operations:
             continue
-        if candidate["live"][operation] != unqualified["live"][operation]:
-            raise ValueError(f"candidate changed undelivered operation {operation}")
+        expected = dict(unqualified["live"][operation])
+        if expected["native"]:
+            expected["availability"] = {
+                "status": "unsupported",
+                "reason": {"code": "lane-not-qualified", "subject": None},
+            }
+        if candidate["live"][operation] != expected:
+            raise ValueError(f"candidate did not isolate unrequested operation {operation}")
     monitor_hash = digest(binary)
     compile_candidate("candidate-consumers-build", ["-p", "cli", "--bin", "silo",
                                                      "-p", "libvm", "--examples"])
@@ -177,9 +171,12 @@ def build(destination: Path, runtime: Path, *, restore: bool = False, irq_probe:
         stage_irq_fixture(source, private_runtime, candidate, monitor_hash, proof)
     if digest(production) != production_hash:
         raise ValueError("production stage changed while building the candidate")
+    if production_capabilities.read_text() != production_record:
+        raise ValueError("production qualification record changed while building the candidate")
     proof.update({"candidateCapabilities": candidate, "candidateMonitorSha256": monitor_hash,
                   "candidateCliSha256": digest(private_bin / "silo"), "runtime": str(private_runtime),
-                  "bin": str(private_bin), "productionStageUnchanged": True})
+                  "bin": str(private_bin), "productionStageUnchanged": True,
+                  "productionRecordUnchanged": True})
     manifest.write_text(json.dumps(proof, indent=2) + "\n")
     return proof
 

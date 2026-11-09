@@ -254,6 +254,14 @@ class TracedSource:
         path = self.silo.ws.evidence / filename
         if path.exists():
             return json.loads(path.read_text())
+        if filename == "boundary-held.json":
+            finished = self.silo.ws.evidence / "fork-manager-result.json"
+            if finished.exists():
+                output = (self.silo.ws.evidence / "fork-manager.stdout").read_text(errors="replace")
+                errors = (self.silo.ws.evidence / "fork-manager.stderr").read_text(errors="replace")
+                raise AssertionError(
+                    f"fork manager exited before the requested boundary: {finished.read_text()}\n"
+                    f"{output}\n[stderr]\n{errors}")
         assert self.controller.poll() is None, f"fork tracer ended before {filename}"
         return None
 

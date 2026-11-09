@@ -140,11 +140,28 @@ boot marker is the monitor's `guest agent became responsive` trace event
 | Budget | Target | ext4 cold / warm | Btrfs cold / warm | Result |
 |---|---|---:|---:|---|
 | Warm create of a stopped machine (Alpine lower) | 2 s | 0.70 / 1.01 | 0.56 / 0.74 | pass |
-| Warm create, 4 GiB single-layer lower | 2 s | not run | 6.15 (one sample) | miss |
+| Warm create, 4 GiB single-layer lower | Original 2 s; revised size-dependent budget below | not run | 6.15 (one sample) | missed original target; not requalified |
 | Incremental capture, 10 % dirty (410 MiB) | 1 s + allowance | 7.44 / 7.77 raw, 5.92 / 6.25 gated | 2.74 / 2.21 | miss |
 | Layered / raw boot ratio | 1.2 | 1.21 / 1.44 | 1.25 / 1.32 | miss |
-| Cold OCI prepare / (download + gunzip) | 1.5 | not run | 6.0 (1 GiB), 9.2 (4 GiB) | miss |
-| Prepare linearity (s per GiB, largest / smallest) | 1.25 | not run | 8.7 → 12.4 s/GiB (1.43); 12 GiB exceeded 300 s | miss |
+| Cold OCI prepare / (download + decompress) | Original 1.5; revised 10 on Btrfs | not run | 6.0 (1 GiB), 9.2 (4 GiB) | missed original target; not requalified |
+| Prepare linearity (s per GiB, largest / smallest) | 1.25 goal, no longer an admission gate | not run | 8.7 → 12.4 s/GiB (1.43); 12 GiB exceeded 300 s | missed original target; not requalified |
+
+**Ingest budget revision, owner decision 2026-11-09.** ADR 0014 now records
+a 10× cold-prepare budget on the Btrfs reference host; 1.5× remains the
+product goal for the ingest pipeline rewrite. Linearity is reported per
+size, with 1.25 a goal rather than an admission gate until that rewrite.
+Prepared-lower create is budgeted at 2 s up to 1 GiB allocated, with larger
+lowers scaling at about 1.35 s/GiB until composition receipts land. The
+larger-lower slope comes from the two recorded sizes, not a validated bound.
+All revised ingest numbers and the missed original targets above cite
+`.tmp/plan/evidence/phase-24/deferred-btrfs/ingest-20261109T121355Z/`:
+`size-cold-0-1073741824.json`, `size-cold-0-4294967296.json`,
+`reference-host.json` and `fixture.json`. The same cohort's 12 GiB
+unprepared-create timeout is in
+`.tmp/plan/evidence/phase-24/deferred-btrfs-ingest.log`; it is not a measured
+12 GiB prepare duration. These incomplete first-cohort observations are not
+five-run qualification medians; revising the budgets does not turn them
+into passes or establish qualification on another filesystem.
 
 Attribution from the evidence:
 
@@ -158,11 +175,13 @@ Attribution from the evidence:
   Disk sealing alone is 1.1–1.2 s on Btrfs (clone plus full upper hash).
   Report: `.tmp/plan/research/phase24-incremental-memory-cost.md`.
 - **Boot.** The recorded 0.15–0.31 s host-side layered penalty predates removal of per-boot asset hashing and duplicate CLI inspection; remaining pre-launch work includes a second lower consumer lease, VMDK descriptor publication and per-file syncs, and requires remeasurement (`.tmp/plan/research/phase24-layered-prelaunch-cost.md`).
-- **Ingest.** Prepare runs at roughly 100 MB/s expanded and gets slower per
-  GiB as the layer grows; the baseline gunzip runs at about 750 MB/s. The
-  prepared-lower create also scales with lower size (6.15 s for 4 GiB), so
-  create reads the lower rather than only formatting the upper. Not yet
-  attributed.
+- **Ingest.** The recorded size-dependent cost comes from repeated bulk
+  materialization and authentication: decoded spool, private-to-published
+  pack copy, composition validation and lower hashing. Prepared create
+  rereads the retained payload through pack authentication, EROFS body
+  validation and logical-lower hashing. The cause of the additional
+  size-dependent slowdown is not yet attributed. Review:
+  `.tmp/plan/research/phase24-ingest-cost.md`; measurements are cited above.
 
 ## Batch 4: boot path
 
@@ -257,3 +276,33 @@ Incremental on ext4 uses the rebuild path (no reflink): vCPU pause
 the writeback hints target fell from 4–5 s to 0.6–1.4 s, and two of eleven
 samples still show 2–3 s of host-side pre-pause latency on the conservative
 clock.
+
+**Ingest.** The 2026-11-09 owner decision records the original cold-prepare,
+linearity and large prepared-create targets as missed, with revised ADR
+budgets backed by the ingest evidence directory cited above, not a passing
+claim. The later rewrite targets single-pass decode→pack, removal of
+spool/publication copies and authenticated composition receipts, following
+`.tmp/plan/research/phase24-ingest-cost.md`. Live-operation budgets are
+unchanged by this ingest decision.
+
+## Batch 4d: final live-budget closeout (2026-11-09)
+
+Final cohorts close the remaining incremental miss. Cold /
+warm medians below are seconds except boot ratios; **all eight budgets pass
+on both lanes** under the recorded gate definitions (cold restore on ext4
+remains informational). This closes the live-budget sweep, not the revised
+ingest or large prepared-lower-create qualification.
+
+| Lane | Capture raw → gated | Incremental raw → gated | Restore raw → gated | Fork4 raw → gated | Boot layered/raw | Warm create |
+|---|---|---|---|---|---|---|
+| Btrfs | 1.74 / 1.74 → 1.09 / 1.09 | 1.55 / 1.20 → 0.90 / 0.55 | 0.54 / 0.36 (no allowance) | 2.21 / 2.14 (no allowance) | 1.11 / 1.11 | 0.56 / 0.74 |
+| Fresh ext4 | 3.86 / 2.41 → 2.04 / 0.58 | 2.85 / 2.42 → 0.86 / 0.43 | 3.48 / 3.20 → 1.67 / 1.38 | 10.65 / 8.38 → 5.80 / 3.50 | 1.05 / 1.11 | 0.70 / 1.01 |
+
+Evidence for capture, incremental and fork4:
+`.tmp/plan/evidence/phase-24/batch4d-btrfs/` and
+`.tmp/plan/evidence/phase-24/batch4d-ext4/`. Restore and boot reuse the
+Batch 4c cohorts (same restore monitor except parallel seal):
+`.tmp/plan/evidence/phase-24/batch4c-btrfs/` and
+`.tmp/plan/evidence/phase-24/batch4c-ext4/`. Warm-create measurements:
+`.tmp/plan/evidence/phase-24/deferred-btrfs/warm-create-20261109T112829Z/`
+and `.tmp/plan/evidence/phase-24/deferred-ext4/warm-create-20261109T112350Z/`.

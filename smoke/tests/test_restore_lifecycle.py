@@ -29,14 +29,14 @@ from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import Silo
 from silo_smoke.restore_lifecycle import restore_network_image  # noqa: F401  session fixture
 
-# VM cases need Main's explicit isolated capture+restore candidate
-# (SILO_SMOKE_BIN_DIR and SILO_SMOKE_RUNTIME_DIR, like the capture gates) and
-# are slow; production restore stays lane-not-qualified until Phase 16. The
+# VM cases use Main's explicit isolated capture+restore candidate
+# (SILO_SMOKE_BIN_DIR and SILO_SMOKE_RUNTIME_DIR, like the capture gates),
+# independently of Phase 24 production qualification. They are slow; the
 # host-only oracle tests below use real bytes, sockets and files, no VM.
 pytestmark = [pytest.mark.linux_only]
 SOURCE = "restore-net-source"
 UNIX_FORWARD = f"host:unix:svc.sock=guest:tcp:127.0.0.1:{lifecycle.LISTEN_PORT}"
-UNIX_LISTENER = f"host:unix:svc.sock -> guest:tcp:127.0.0.1:{lifecycle.LISTEN_PORT}"
+UNIX_LISTENER = "host:unix:svc.sock"
 # One event per machine forward plus the public vsock surface (`--vsock`).
 BOUND_LISTENERS = [UNIX_LISTENER, "vsock"]
 AFTER_FAILURE = (lifecycle.EXPOSURE_COMMITTING, lifecycle.EXPOSURE_COMMITTED, lifecycle.STARTED)
@@ -99,6 +99,7 @@ def test_activation_events_parse_exact_names_fields_and_wall_time() -> None:
     text = "\n".join([
         '2026-11-06T10:00:00.000001Z  INFO restore prepared activation=a1',
         '2026-11-06T10:00:00.5Z  INFO restore generation acknowledged activation=a1 sequence=2',
+        '2026-11-06T10:00:00.6Z  INFO restore activate acknowledged activation=a1',
         '2026-11-06T10:00:01.123456789Z  INFO restore activation failed activation=a1 stage=exposure'
         ' code=bind-failed detail="port 80 busy"',
         '2026-11-06T10:00:02.000000Z  INFO restore prepared without fields',
@@ -107,13 +108,15 @@ def test_activation_events_parse_exact_names_fields_and_wall_time() -> None:
     ])
     found = lifecycle.events(text)
     assert [event.name for event in found] == [lifecycle.PREPARED, lifecycle.GENERATION_ACKNOWLEDGED,
-                                               lifecycle.FAILED, lifecycle.THAW_RECOVERY_FROZEN]
+                                               lifecycle.ACTIVATE_ACKNOWLEDGED, lifecycle.FAILED,
+                                               lifecycle.THAW_RECOVERY_FROZEN]
     assert lifecycle.single_activation(found) == "a1"
     assert found[1].fields["sequence"] == "2"
-    assert found[2].fields == {"activation": "a1", "stage": "exposure", "code": "bind-failed",
+    assert found[2].fields == {"activation": "a1"}
+    assert found[3].fields == {"activation": "a1", "stage": "exposure", "code": "bind-failed",
                                "detail": "port 80 busy"}
     assert found[1].realtime_ns - found[0].realtime_ns == 499_999_000
-    assert found[2].realtime_ns % 1_000_000_000 == 123_456_789
+    assert found[3].realtime_ns % 1_000_000_000 == 123_456_789
     with pytest.raises(AssertionError):
         lifecycle.assert_not_logged(found, lifecycle.FAILED)
     with pytest.raises(AssertionError):
@@ -237,6 +240,9 @@ def test_restore_exposes_only_the_fresh_destination_after_final_release(
             machine = UUID(restored.stdout.strip()).hex
             assert machine == evidence.machine_hex()
             children = lifecycle.ChildProcesses.observe(silo, machine)
+            # CLI completion can beat the trace follower's next 20ms poll.
+            # Await the final event, not a sleep or a partial trace snapshot.
+            evidence.wait(lifecycle.STARTED, timeout=90)
             found = evidence.events()
             assert_completed(found, BOUND_LISTENERS)
             committing = lifecycle.first(found, lifecycle.EXPOSURE_COMMITTING).realtime_ns
