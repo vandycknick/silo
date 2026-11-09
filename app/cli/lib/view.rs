@@ -42,6 +42,7 @@ pub struct MachineView {
     pub id: String,
     pub name: String,
     pub state: &'static str,
+    pub durability: libvm::MachineDurability,
     pub observation: libvm::MachineObservation,
     pub last_known_state: Option<&'static str>,
     pub issues: Vec<libvm::MachineIssue>,
@@ -238,6 +239,7 @@ impl MachineView {
             } else {
                 "unknown"
             },
+            durability: data.durability,
             observation: data.observation,
             last_known_state: (data.observation == libvm::MachineObservation::LastKnown)
                 .then(|| state_label(&data.status)),
@@ -420,6 +422,35 @@ mod tests {
         assert_eq!(value["observation"], "unavailable");
         assert_eq!(value["issues"][0]["component"], "configuration");
         assert!(value.get("resources").is_none());
+    }
+
+    #[test]
+    fn machine_view_serializes_machine_durability() {
+        let mut data = libvm::MachineData::new(
+            "00000000-0000-4000-8000-000000000001".into(),
+            "dev".into(),
+            vm_spec::VmSpec::current(),
+        );
+        assert_eq!(data.durability, libvm::MachineDurability::Durable);
+        for (durability, expected) in [
+            (libvm::MachineDurability::Durable, "durable"),
+            (libvm::MachineDurability::Constructed, "constructed"),
+        ] {
+            data.durability = durability;
+            let view = crate::view::MachineView::new(&data, false);
+            assert_eq!(view.durability, durability);
+            let value = serde_json::to_value(&view).expect("serialize machine view");
+            assert_eq!(value["durability"], expected);
+            let entry = libvm::MachineInventoryEntry {
+                id: data.id.clone(),
+                name: data.name.clone(),
+                data: Some(data.clone()),
+                issues: Vec::new(),
+            };
+            let value = serde_json::to_value(crate::view::InventoryView::new(&entry, false))
+                .expect("serialize info inventory view");
+            assert_eq!(value["durability"], expected);
+        }
     }
 
     #[test]

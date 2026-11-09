@@ -423,6 +423,113 @@ All new cases are `slow`; the default selection and its identities are
 unchanged. Traced cases use the existing `stopped_trace` controller through
 `silo_smoke.fork_process`, so its 240 s whole-session bound applies.
 
+### OCI ingest budget cohort (Phase 24)
+
+`tests/test_ingest_budget.py` measures ADR 0014 cold prepare and expanded-byte
+linearity on fixed 1, 4 and 12 GiB single incompressible file entries. Each
+image uses the normal BASIC Alpine builder plus one GNU tar layer. A native
+`head -c N /dev/urandom | tee ... | gzip -1` pipeline streams the tar payload
+through SHA-256 into a temporary compressed blob; `curl --upload-file` then
+publishes it through the existing Distribution upload API. Python does not
+generate, compress or upload the payload in byte loops, and no expanded file
+is staged. The 12 GiB entry exceeds the ADR's 10 GiB
+expanded-layer requirement. Digests, exact compressed and expanded byte counts,
+registry identity and the loopback TLS link are recorded. This synthetic
+scaling lane does not replace the ADR's full distro/metadata/platform corpus.
+The small base is also published through the session registry; large layers
+use the existing disk-backed Distribution registry rather than retaining
+17 GiB of layer `bytes` in the session registry's memory.
+
+There is no standalone OCI **container** prepare command. `silo image pull`
+acquires complete VM artifacts (`app/cli/lib/commands/live.rs`), not container
+layers. The actual measured command is:
+
+```sh
+silo create REF --name NAME --pull missing --disk-size 256mib --network none
+```
+
+The timer starts immediately before CLI dispatch and ends after successful
+exit. Each size records an unprepared create and a second create of the same
+prepared lower; `prepareSeconds` is the first duration minus the second, with
+neither clamping nor a private-copy allowance. This subtracts ordinary stopped
+machine creation, including upper formatting. Both stopped machines are then
+removed. Product path: `create::Cmd::run` resolves the source and calls
+`create_machine`; `image/oci.rs::acquire_composition` downloads and decodes
+missing layers through `ingest_changeset`, publishes pack/index results, calls
+`compose_retained` to produce EROFS fsmeta, and saves the OCI catalog selection
+before returning the materialized lower. Per-size evidence asserts two layer
+results and one composition, and records real pack streams, index roots, maps,
+composition records and fsmeta objects already present after create exits.
+No VM is started and no opaque raw conversion is timed.
+
+The baseline HTTP GETs and gunzips **both of the same published layers** to
+`/dev/null`, with no tar extraction, hashing or packing. Both streaming
+stdlib `urllib`/`zlib` and `curl | gzip -dc` are measured; the faster duration
+is used, making the comparison conservative. Each baseline and prepare
+dispatch is independently cache-conditioned. `coldPrepareRatio` is the
+largest prepare/baseline ratio across the three sizes in a sample, gated at
+1.5. Absolute seconds, bytes and `prepareSecondsPerGiB` are retained for every
+size. `linearity` is largest-size seconds/GiB divided by smallest-size
+seconds/GiB, gated at 1.25. Both gates use the median of five independently
+reported cold and warm samples; min/max are retained, and one intervening
+warm-up is discarded.
+
+Cold dispatches fsync and per-file evict all `owned_inputs(silo)` **and the
+registry blob store**, with mincore residency evidence and truthful
+`partial-cold` labels, never global cache dropping. Warm means a second
+**prepare after prune**, with page cache intact, not a retained-lower cache hit.
+`silo image remove` only removes managed image aliases, so this OCI lane instead
+removes the stopped machines, explicitly releases its OCI cache reference with
+`shutdown.storage_tool(silo, "remove-image", REF)`, then calls
+`shutdown.storage_tool(silo, "prune")` between every size and sample. Removing
+machines alone is insufficient: the `image_ref` selection intentionally retains
+its composition until the reference is released. Before each prepare, the
+harness asserts no OCI reference/artifact for that manifest and no reusable
+layer results for any of its diff IDs. After cleanup it also proves that the
+previous composition/recipe/fsmeta, pack/index/map objects and source blobs have
+disappeared, so neither the selection nor its layers can become cache hits.
+The shared warm-up primes the registry corpus; warm residency is observed,
+not assumed to fit in RAM.
+
+Reserve **55 GiB free** before fixture generation: the approximately 17 GiB
+gzip corpus plus three times the largest entry (download, staged/published
+pack working set) plus 2 GiB margin. The registry occupies a session-owned
+budget workspace on the same filesystem as the per-test workspace. The corpus
+is generated **once per pytest session**, never inside the sample loop. Once
+corpus blobs exist, each size checks its remaining `3 * entryBytes + 2 GiB`
+working-set headroom. Successful sample scratch is pruned immediately.
+Compressed generation scratch is removed on every exit; the session fixture
+always stops the registry and deletes its blob store and incomplete uploads,
+including after failed setup, failed measurements, and `--keep`. Failed
+per-test workspaces still retain ordinary product diagnostics.
+Expect minutes per three-size sample and tens of minutes for the full schedule
+on ordinary local SSD storage (an estimate, not a measured result). Measured
+create and baseline operations retain their 300 s bound. Untimed fixture
+generation, checksum and upload steps instead allow 120 s per GiB, with a
+120 s minimum (1440 s for the 12 GiB layer); slow setup is not a prepare-budget
+failure and never shrinks the corpus.
+
+Use the same candidate/environment as the fork budget and an existing durable
+evidence directory. The pinned Distribution binary is reused from the smoke
+cache, or its verified release is downloaded during fixture setup. `bash`,
+`head`, `tee`, `sha256sum`, `curl` and `gzip` must be installed. The shared
+storage acceptance example must be built
+by Main as for the fork budgets.
+
+```sh
+SILO_SMOKE_BUDGET_EVIDENCE=/absolute/durable/evidence \
+SILO_SMOKE_BUDGET_DIR=/absolute/durable/scratch TMPDIR=/short/durable/path \
+  uv run --project smoke pytest smoke/tests/test_ingest_budget.py -m '' -k 'not budget_gate'
+uv run --project smoke pytest smoke/tests/test_ingest_budget.py -k budget_gate
+```
+
+Evidence is written under `$SILO_SMOKE_BUDGET_EVIDENCE/ingest-<stamp>/`:
+`reference-host.json`, `fixture.json`, per-size records, `samples.jsonl`,
+`summary.json` and `summary.md`. Summary metrics are keyed by metric then cache
+cohort, with explicit `budgeted` flags; over-target medians fail admission.
+This Linux Distribution lane reports its actual host identity, not an
+unmeasured claim about the ADR's XFS/APFS reference hosts.
+
 ### Live fork budget cohorts (Phase 16)
 
 `tests/test_fork_budget.py` measures ADR 0021 full capture interruption,
@@ -489,6 +596,117 @@ and host observer outside the timed window. At most one sample's cut exists;
 failed samples stay in the retained workspace. Per-file residency inventories
 are kept in each sample record.
 A median over its target fails the gate and blocks admission.
+
+### Deferred live and layered budgets (Phase 24)
+
+The additional performance-only cohorts in `tests/test_fork_budget.py` use the
+same `SILO_SMOKE_BIN_DIR`, `SILO_SMOKE_RUNTIME_DIR`, `SILO_SMOKE_BUDGET_DIR`
+and `SILO_SMOKE_BUDGET_EVIDENCE` candidate/workspace selection above. They do
+not change product qualification or capabilities. Use an exact-input candidate
+with incremental capture and restore support for the incremental cohort.
+All three use `SCHEDULE`: five cold samples, one discarded warm-up and five
+warm samples. Cold means per-file eviction of `owned_inputs(silo)` with
+residency evidence, not an empty prepared-image pool. A partially evicted
+sample remains explicitly labelled `partial-cold`. Both reported cohorts are
+budgeted for every new gate, including non-reflink incremental capture.
+
+| Pytest selector (`-k`) | Measured boundary and median gate | Additional free-space preflight |
+| --- | --- | --- |
+| `test_fork_budget_incremental_ten_percent_dirty` | Incremental workload interruption, larger of monitor staging-to-continuation interval and independent durable-workload gap, at most 1.0 s after copy allowance | 14 GiB |
+| `test_fork_budget_warm_create_stopped_machine` | Prepared-image `silo create` dispatch to command exit, at most 2.0 s, no allowance | 4 GiB |
+| `test_fork_budget_boot_layered_within_raw` | `silo start` dispatch to product trace's first guest-agent-serving event, median layered seconds / median raw seconds at most 1.2 | 6 GiB |
+
+Space figures are additional free bytes required at setup and each sample,
+not total workspace sizes. Incremental capture reserves two complete 4 GiB
+RAM outputs (staging and published immutable stream), a 2 GiB private upper
+and its published stream, plus 2 GiB margin; its current baseline already
+occupies disk. Create reserves one 2 GiB upper plus 2 GiB margin. Boot reserves
+two 2 GiB roots plus 2 GiB margin. Image preparation and raw conversion happen
+outside timing. The create and boot fixtures use the same image, 2 vCPUs,
+4096 MiB RAM, private network and `--disk-size 2gib` as the existing budget
+source, but do not write its capture-only payload.
+
+Incremental uses `incremental_image` with the existing durable execution
+witness and the full 1 GiB guest-written, nonzero upper proof. Its first live
+checkpoint establishes the baseline. The current memory probe has fixed
+96 MiB storage, so this cohort instead preallocates a private 512 MiB tmpfs
+and overwrites exactly 410 MiB there using `dd if=/dev/urandom bs=1M count=410
+conv=notrunc` before each timed checkpoint. This is 10.009765625 percent of
+configured 4096 MiB RAM, the requested whole-MiB rounding of ten percent.
+Guest kernel, agent and witness activity can dirty additional pages. Samples
+record the exact workload byte count and fraction separately from
+`productDirtyFraction`, derived from the product's
+`memory.stats.identityBytesHashed / logicalBytes` at its 8 MiB chunk resolution;
+the product exposes no separate page-granular dirty-fraction field.
+They retain the complete memory receipt, raw interruption, monitor disk-seal
+times and one-upper allowance inputs. A real workspace `FICLONE` probe selects
+zero allowance on reflink filesystems or allocated upper bytes divided by the
+host's measured sequential copy rate otherwise. The target stays 1.0 s.
+After each sample the source run ends, its machine and previous checkpoint
+alias/retention are removed, and storage is pruned. Except after the last
+sample, the newest checkpoint is restored outside timing with its inherited
+accepted baseline, so the next incremental is based on the preceding cut
+without retaining an unbounded chain of source-run-pinned staging outputs.
+
+Warm create retains a stopped lower keeper so per-sample pruning cannot turn
+the next prepared-image create into a cold prepare. It checks that every new
+machine is stopped and its root is `linux-overlay`, then removes it and
+prunes. ADR "warm" means an already prepared lower here; page-cache cold and
+warm measurements are both reported and gated.
+
+Boot converts the same image once through `Silo.root_image(reference, "raw")`
+before measurement. Each pair creates stopped raw and layered machines,
+alternates which profile starts first, and evicts before each cold start.
+The timing marker is the existing product trace line `guest agent became
+responsive ... machine_id=<id>` in `logs/machines/<hex>/vm.trace.log`
+(`virt/vmm/src/state.rs`, `log_state_changes`). This is emitted on the first
+validated guest status RPC receipt (`observe_status`), not on a socket dial:
+the guest agent is already serving from `/` after init mounted the raw or
+overlay root and executed `switch_root`. This is the earliest host-recorded
+serving-on-root boundary, not a kernel mount timestamp. It intentionally
+precedes full `GuestReportedReady` policy (provisioning and host-verified SSH).
+No product instrumentation change is needed.
+
+Both timing endpoints use host `CLOCK_REALTIME`: harness `time.time_ns()`
+immediately before spawning `silo start`, and the monitor's UTC trace timestamp.
+There is no guest-clock or wall/monotonic conversion; the host wall clock must
+remain stable during each start. `Silo.wait_ready(..., poll_interval=0.02)`
+is only a liveness check, never the measured endpoint. Samples normalize the
+CLI/catalog's compact machine UUID to the monitor's hyphenated spelling and
+select the exact `machine_id`/`run_id` generation-start event (not a capture's
+`generation` counter). They name the trace path and line pattern, retain the
+marker's line and nanosecond timestamp, and preserve a full trace copy before removal.
+They record dispatch-relative and preceding-phase deltas for whichever existing
+monitor events occur: generation start, monitor initialization, primary-VM
+spawn dispatch, krun worker spawn, Running, first agent response, agent-reported
+Ready and full product readiness. Later readiness phases remain diagnostic,
+not part of the gate. `availablePhases` and `unavailablePhases` distinguish
+observed phases from unavailable kernel-start, initramfs and root-switch
+timestamps; none is invented from polling or guest uptime.
+
+Samples also retain command-exit durations, alternating profile order and both
+complete cache inventories. Machines are stopped after each start (flushing the
+trace appender), then removed and pruned after the pair. `bootLayered` and
+`bootRaw` remain unbudgeted raw metrics; `bootLayeredRatio` uses the ratio of
+the cohort medians, not the median of paired ratios, with the unchanged 1.2
+gate. The ratio's min/max and values describe the individual pairs.
+
+Each cohort writes `samples.jsonl`, `summary.json`, `summary.md`,
+`reference-host.json` and `fixture.json` under
+`$SILO_SMOKE_BUDGET_EVIDENCE/<label>-<stamp>/`, with cache labels, free-space
+proof, fixture proof and timings in each sample. A median equal to its target
+passes. For example, with the four environment variables above set:
+
+```sh
+uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
+  -k 'test_fork_budget_incremental_ten_percent_dirty'
+uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
+  -k 'test_fork_budget_warm_create_stopped_machine'
+uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
+  -k 'test_fork_budget_boot_layered_within_raw'
+uv run --project smoke pytest smoke/tests/test_fork_budget.py -m slow \
+  -k 'copy_allowance or reflink_probe or budget_gate'
+```
 
 ### Incremental capture and named disk recovery (Phase 20)
 

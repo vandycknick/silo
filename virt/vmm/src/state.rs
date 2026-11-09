@@ -1979,6 +1979,164 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn late_pin_completion_rechecks_current_fenced_readiness() {
+        #[derive(Clone, Copy, Debug)]
+        enum Completion {
+            Current,
+            Replaced,
+            Stopping,
+            Canceled,
+            Mismatch,
+        }
+
+        for completion in [
+            Completion::Current,
+            Completion::Replaced,
+            Completion::Stopping,
+            Completion::Canceled,
+            Completion::Mismatch,
+        ] {
+            let store = ssh_store();
+            let original = store.ssh_verification_target().unwrap().unwrap();
+            store.complete_ssh_verification(&original, Ok(())).unwrap();
+            assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+            let mut transition = crate::state::LiveTransition {
+                state: VmLifecycleState::Capturing,
+                lifecycle: LiveLifecycle {
+                    activity: Some(vm_spec::lifecycle::LiveActivity {
+                        operation_id: vm_spec::lifecycle::LiveId::parse(
+                            &uuid::Uuid::new_v4().to_string(),
+                        )
+                        .unwrap(),
+                        request_id: vm_spec::lifecycle::LiveId::parse(
+                            &uuid::Uuid::new_v4().to_string(),
+                        )
+                        .unwrap(),
+                        command: vm_spec::lifecycle::LiveCommandKind::Capture,
+                        stage: vm_spec::lifecycle::LiveStage::GuestFreeze,
+                    }),
+                    ..LiveLifecycle::default()
+                },
+                message: "guest-freeze".into(),
+                held_identity: Some(original.identity.clone()),
+                parked: false,
+                readiness_probe: false,
+            };
+            assert!(store.publish_live(transition.clone()).unwrap());
+            assert!(store.ssh_verification_target().unwrap().is_none());
+            let mut frozen = ssh_status(1);
+            let report = frozen.report.as_mut().unwrap();
+            report.state = Some(AgentStatusState::Starting as i32);
+            report.code = Some("WORKLOAD_NOT_READY".into());
+            report.message = Some("workload lifecycle is not ready".into());
+            store
+                .observe_status(frozen, Duration::from_secs(300))
+                .unwrap();
+            transition.readiness_probe = true;
+            transition.lifecycle.activity.as_mut().unwrap().stage =
+                vm_spec::lifecycle::LiveStage::Readiness;
+            assert!(store.publish_live(transition).unwrap());
+            let since = Instant::now();
+            store
+                .observe_status(ssh_status(1), Duration::from_secs(300))
+                .unwrap();
+            let target = store.ssh_verification_target().unwrap().unwrap();
+            assert!(target.epoch > original.epoch);
+
+            let directory =
+                std::env::temp_dir().join(format!("silo-late-pin-{}", uuid::Uuid::new_v4()));
+            let expected = russh::keys::PublicKey::from_openssh(&target.host_public_key).unwrap();
+            let pinned = if matches!(completion, Completion::Mismatch) {
+                russh::keys::PrivateKey::from(
+                    russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[2; 32]),
+                )
+                .public_key()
+                .clone()
+            } else {
+                expected.clone()
+            };
+            utils::ssh::verify_host_key_pin(&directory, &pinned).unwrap();
+            let (release, wait) = std::sync::mpsc::channel();
+            let path = directory.clone();
+            let pin = tokio::task::spawn_blocking(move || {
+                // Sequence real filesystem verification after the timeout, with
+                // a bound so a failed assertion cannot strand the test runtime.
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                utils::ssh::try_verify_host_key_pin(&path, &expected)
+            });
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let mut generation = store.subscribe();
+            let mut changes = store.subscribe();
+            let finish = crate::guest::ssh::finish_pin(
+                &store,
+                &target,
+                &shutdown,
+                &mut generation,
+                pin,
+                tokio::time::Instant::now(),
+            );
+            tokio::pin!(finish);
+            tokio::select! {
+                result = &mut finish => panic!("pin completed before release: {result:?}"),
+                changed = changes.changed() => changed.unwrap(),
+            }
+            assert_eq!(
+                projected_report(&store).message.as_deref(),
+                Some("SSH listener pin verification timed out"),
+            );
+            assert!(!store.prospective_readiness(since).unwrap().0);
+            assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+            match completion {
+                Completion::Replaced => store
+                    .observe_status(ssh_status(2), Duration::from_secs(300))
+                    .unwrap(),
+                Completion::Stopping => store.set_vm_state(VmState::Stopping, "stop").unwrap(),
+                Completion::Canceled => shutdown.cancel(),
+                Completion::Current | Completion::Mismatch => {}
+            }
+            release.send(()).unwrap();
+            let completed = finish.await.unwrap();
+            if matches!(completion, Completion::Current) {
+                assert!(completed.is_some());
+                assert!(store.prospective_readiness(since).unwrap().0);
+                assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+                assert!(projected_report(&store).ssh.unwrap().kex_verified);
+                assert!(store
+                    .publish_live(crate::state::LiveTransition {
+                        state: VmLifecycleState::Running,
+                        lifecycle: LiveLifecycle::default(),
+                        message: "running".into(),
+                        held_identity: None,
+                        parked: false,
+                        readiness_probe: false,
+                    })
+                    .unwrap());
+                assert_eq!(store.readiness().unwrap(), WaitOutcome::Ready);
+            } else {
+                assert!(!store.prospective_readiness(since).unwrap().0);
+                assert_eq!(store.readiness().unwrap(), WaitOutcome::TimedOut);
+                assert!(!projected_report(&store).ssh.unwrap().kex_verified);
+                if matches!(completion, Completion::Mismatch) {
+                    assert!(completed.is_some());
+                    assert_eq!(
+                        projected_report(&store).message.as_deref(),
+                        Some("guest SSH host key changed; existing pin is preserved"),
+                    );
+                } else {
+                    assert!(completed.is_none());
+                }
+            }
+            assert_eq!(
+                utils::ssh::read_host_key_pin(&directory)
+                    .unwrap()
+                    .key_data(),
+                pinned.key_data(),
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[test]
     fn verification_completion_preserves_guest_receipts_and_metrics() {
         let store = ssh_store();

@@ -115,6 +115,7 @@ def fork(silo: Silo, source: str, child: str) -> None:
     silo.ws.register_machine(child)
     info = silo.info(child)
     assert info["state"] == "stopped" and info["run_id"] is None and info["ready"] is False
+    assert info.get("durability") == "durable", (child, info.get("durability"), info)
     # Identity only: a fresh independent catalog read, compared canonically.
     assert UUID(procs.machine_id(silo.ws, source)) != UUID(info["id"])
 
@@ -124,6 +125,7 @@ def restore(silo: Silo, reference: str, child: str) -> None:
     silo.ws.register_machine(child)
     info = silo.info(child)
     assert info["state"] == "stopped" and info["run_id"] is None and info["ready"] is False
+    assert info.get("durability") == "durable", (child, info.get("durability"), info)
 
 
 def stop(silo: Silo, name: str, *, require_clean: bool = True) -> None:

@@ -184,8 +184,19 @@ async fn attempt(
         .map(Some);
     }
     let dir = machine_dir.to_path_buf();
-    let mut pin =
+    let pin =
         tokio::task::spawn_blocking(move || utils::ssh::try_verify_host_key_pin(&dir, &expected));
+    finish_pin(store, target, shutdown, generation, pin, deadline).await
+}
+
+pub(crate) async fn finish_pin(
+    store: &InstanceStore,
+    target: &SshVerificationTarget,
+    shutdown: &CancellationToken,
+    generation: &mut watch::Receiver<u64>,
+    mut pin: tokio::task::JoinHandle<io::Result<()>>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Instant>, StoreError> {
     let outcome = tokio::select! {
         biased;
         _ = shutdown.cancelled() => Completion::Invalidated(Ok(())),
@@ -193,27 +204,36 @@ async fn attempt(
         _ = tokio::time::sleep_until(deadline) => Completion::Timeout,
         result = &mut pin => Completion::Result(result),
     };
-    match outcome {
-        Completion::Result(result) => {
-            let result = result
-                .map_err(|error| error.to_string())
-                .and_then(|result| result.map_err(|error| error.to_string()));
-            publish(store, target, result).map(Some)
-        }
+    let result = match outcome {
+        Completion::Result(result) => result,
         Completion::Timeout => {
-            let completed = publish(
+            publish(
                 store,
                 target,
                 Err("SSH listener pin verification timed out".into()),
-            );
-            let _ = pin.await;
-            completed.map(Some)
+            )?;
+            // Filesystem work cannot be canceled. Keep readiness false while
+            // draining it, but consume its actual proof if this target survives.
+            // Otherwise a successful late pin waits an entire check interval,
+            // longer than the live continuation's remaining readiness budget.
+            pin.await
         }
         Completion::Invalidated(result) => {
             let _ = pin.await;
-            result.map(|()| None)
+            return result.map(|()| None);
         }
+    };
+    if shutdown.is_cancelled()
+        || store
+            .ssh_verification_target()?
+            .is_none_or(|current| current.epoch != target.epoch)
+    {
+        return Ok(None);
     }
+    let result = result
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    publish(store, target, result).map(Some)
 }
 
 fn publish(
