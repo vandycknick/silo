@@ -15,6 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -28,8 +29,8 @@ from silo_smoke.cli import Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
-# Explicit Phase14 candidate runtime only, like test_capture.py: production is
-# lane-not-qualified until the capture/restore/fork admission milestone.
+# Explicit isolated candidate runtime only, like test_capture.py; this suite
+# does not grant or extend Phase 24's exact-build production qualification.
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 PROBE = "/usr/local/bin/capture-counter"
 NAME = "capture-lifecycle"
@@ -408,14 +409,29 @@ def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
 
         if seal_bytes is not None:
             if manager_result["code"] == 0:
-                # The original manager may already publish and release the
-                # operation before stop returns. Judge its exact retained seal.
                 value = run.manager_snapshot()
+                summary = run.summary(value, "resume", "unknown")
+                assert summary["sourceError"] is None, summary
+                run.published(json.loads(seal_bytes), value)
             else:
-                value = json.loads(run.complete().stdout)
-            summary = run.summary(value, "resume", "unknown")
-            assert summary["sourceError"] is None, summary
-            run.published(json.loads(seal_bytes), value)
+                # Stop's manager may already have published and released the
+                # capture. Its terminal operation is collectible once the run
+                # ends; complete_capture only accepts a still-retained identity.
+                rows = run.provenance()
+                assert len(rows) == 1, "stop lost the linked coherent checkpoint"
+                assert json.loads(rows[0][1]) == json.loads(seal_bytes)
+                snapshot = json.loads(silo.run("snapshot", "inspect", "image:" + rows[0][0]).stdout)
+                assert snapshot["id"] == rows[0][0] and snapshot["captureKind"] == "live-execution"
+                record = run.capture_record()
+                if record is None:
+                    archive = (silo.ws.silo_home / "capture-evidence"
+                               / str(UUID(run.plan["captureId"])) / "owner.json")
+                    record = json.loads(archive.read_bytes())["record"]
+                assert record["captureId"] == run.plan["captureId"]
+                assert record["runId"] == run.plan["runId"]
+                assert record["plan"]["resumePolicy"] == POLICY["resume"]
+                assert record["state"] == {"state": "released", "snapshot": rows[0][0]}
+                assert record["sourceOutcome"] == {"kind": "unknown"}
         else:
             recovered = run.complete(expect=None)
             assert recovered.returncode != 0, "stop-raced unsealed capture reconciled as success"
@@ -440,7 +456,27 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
         seal_bytes = (run.directory / "vm.capture.json").read_bytes()
         seal = json.loads(seal_bytes)
         run.coherent(seal)
-        before = capture.inventory(run.directory)
+        # This gate deliberately holds unlinkat before single-link settlement.
+        # Fingerprint the one known seal inode through its two owned names,
+        # not through the ordinary singleton-only immutable-file reader.
+        seal_path = run.directory / "vm.capture.json"
+        temporary = run.directory / ".vm.capture.json.tmp"
+        metadata = seal_path.lstat()
+        alias = temporary.lstat()
+        assert stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
+        assert metadata.st_nlink == alias.st_nlink == 2
+        assert (metadata.st_dev, metadata.st_ino) == (alias.st_dev, alias.st_ino)
+        assert temporary.read_bytes() == seal_bytes
+        before = {
+            str(path.relative_to(run.directory)): stopped.read_bytes(path)
+            for path in sorted(run.directory.rglob("*"))
+            if path.is_file() and path not in {seal_path, temporary}
+        }
+        before[seal_path.name] = stopped.Bytes(
+            str(seal_path), metadata.st_dev, metadata.st_ino, len(seal_bytes),
+            metadata.st_blocks * 512, stat.S_IMODE(metadata.st_mode),
+            hashlib.sha256(seal_bytes).hexdigest(),
+        )
         assert "vm.capture-source.json" not in before
         run.counter.stationary()
         cancel_id = str(uuid4())

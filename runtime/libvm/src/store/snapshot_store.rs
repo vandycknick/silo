@@ -613,7 +613,8 @@ impl SnapshotStore {
         self.consume_selected(reference, true, true).await
     }
 
-    /// Pin catalog authority without reading stream bytes or constructing children.
+    /// Pin catalog authority and materialize evicted streams without authenticating
+    /// the full closure or constructing children.
     pub(crate) async fn consume_shape(
         &self,
         reference: &SnapshotRef,
@@ -855,6 +856,14 @@ impl SnapshotStore {
                     tx.commit().await?;
                     Ok::<_, LibVmError>((info, lease, imported))
                 })?;
+                let contents = if disks_only {
+                    record.storage_streams().collect::<Vec<_>>()
+                } else {
+                    record.streams().collect::<Vec<_>>()
+                };
+                for content in &contents {
+                    runtime.block_on(store.materialize_stream(id, content))?;
+                }
                 if !authenticate {
                     return Ok(SnapshotConsumer {
                         info,
@@ -865,14 +874,6 @@ impl SnapshotStore {
                         lease,
                         _store: store.clone(),
                     });
-                }
-                let contents = if disks_only {
-                    record.storage_streams().collect::<Vec<_>>()
-                } else {
-                    record.streams().collect::<Vec<_>>()
-                };
-                for content in &contents {
-                    runtime.block_on(store.materialize_stream(id, content))?;
                 }
                 let (_, closure) = if disks_only {
                     let (_, objects) = record.storage_content_dependencies()?;
@@ -2025,6 +2026,106 @@ pub(crate) mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn shape_consumer_materializes_evicted_streams_under_its_lease() {
+        let bytes = [7; 512];
+        let (_temporary, store, record, info, owner, _) =
+            crate::store::stream_representation::tests::retained_paginated(
+                &bytes,
+                oci::vm_artifact::wire::MAX_PAGE_ENTRIES,
+            )
+            .await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert_eq!(store.evict_flat_materializations().await.unwrap(), 512);
+        let path = pool.stream_path(&record.root.stream.stream);
+        assert!(!path.exists());
+
+        let snapshots = SnapshotStore::from_store(store.clone());
+        let consumer = snapshots
+            .consume_shape(&SnapshotRef::Id(info.id))
+            .await
+            .unwrap();
+        assert!(consumer.closure.is_none());
+        assert!(path.exists(), "materialization must precede shape binding");
+        let shape = snapshots.verify_closure_shape(&consumer).await.unwrap();
+        let source = shape
+            .open_stream(&pool, &record.root.stream.stream, record.root.stream.length)
+            .unwrap();
+        assert_eq!(source.metadata().unwrap().len(), bytes.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(store.evict_flat_materializations().await.unwrap(), 0);
+        let operations: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_operation")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            operations, 1,
+            "materialization must reuse the consumer lease"
+        );
+        let verified: i64 = sqlx::query_scalar("SELECT count(*) FROM verified_object")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            verified, 0,
+            "shape consumption must not authenticate the closure"
+        );
+        drop(source);
+        drop(shape);
+        drop(consumer);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert_eq!(store.evict_flat_materializations().await.unwrap(), 512);
+        assert!(
+            !path.exists(),
+            "reconstructed flats remain disposable cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn shape_consumer_rejects_missing_chunk_during_materialization() {
+        let bytes = [7; 512];
+        let (_temporary, store, record, info, owner, _) =
+            crate::store::stream_representation::tests::retained_paginated(
+                &bytes,
+                oci::vm_artifact::wire::MAX_PAGE_ENTRIES,
+            )
+            .await;
+        let pool = StoragePool::open(&store.images_dir).unwrap();
+        drop(owner);
+        store
+            .retire_abandoned_storage_operations(&pool)
+            .await
+            .unwrap();
+        assert_eq!(store.evict_flat_materializations().await.unwrap(), 512);
+        let chunk = pool.object_path(&ObjectDigest::of_bytes(&bytes));
+        std::fs::remove_file(&chunk).unwrap();
+
+        let error = SnapshotStore::from_store(store.clone())
+            .consume_shape(&SnapshotRef::Id(info.id))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            &error,
+            crate::LibVmError::Storage(crate::storage::StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!pool.stream_path(&record.root.stream.stream).exists());
+        let operations: i64 = sqlx::query_scalar("SELECT count(*) FROM storage_operation")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(operations, 0, "failed consumers must release their roots");
+    }
 
     #[tokio::test]
     async fn restore_inspection_shape_defers_writable_maps_and_completes_before_copy() {

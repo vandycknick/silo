@@ -430,7 +430,11 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
             rows = procs.query(silo.ws.state_db(),
                                f"SELECT snapshot_id,CAST(evidence_bytes AS TEXT) FROM snapshot_capture_provenance WHERE replace(capture_id,'-','')='{plan['captureId'].replace('-', '')}'")
             if observed_seal is not None:
-                assert rows, "observed coherent seal was lost, including its staging directory"
+                assert rows, (
+                    "observed coherent seal was not published",
+                    {"stagingExists": directory.exists(), "recoveryExit": recovered.returncode,
+                     "recoveryStderr": recovered.stderr},
+                )
                 assert json.loads(rows[0][1]) == observed_seal
             if victim.startswith("cancel-"):
                 assert not rows, "cancelled pre-seal capture published a checkpoint"

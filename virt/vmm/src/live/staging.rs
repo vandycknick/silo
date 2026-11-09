@@ -7,6 +7,8 @@
 //! monitor's euid. Records use no-replace `linkat` and single-link settlement.
 //! Capture writers close without durability barriers; publication belongs to libvm.
 //! RAM identity comes from the worker receipt; disk copies hash while writing.
+//! Reflink seals walk extents once, then classify and hash chunks in up to eight
+//! scoped workers using positional reads. Only complete ordered maps are published.
 //! On Linux, monitor-written output starts nonblocking writeback after each complete
 //! 8 MiB region containing writes. Holes, short tails and reflinks need no hint;
 //! hint failures never affect capture success or establish durability.
@@ -21,9 +23,12 @@
 //! ```
 use std::fs::File;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, AtFlags, OFlag};
@@ -296,7 +301,7 @@ impl CaptureStaging {
                 let (cloned, _) = self.open_sealed(role)?;
                 (
                     DiskCopyMethod::Clone,
-                    stream_disk(&cloned, None, length, cancel)?,
+                    seal_disk_parallel(&cloned, length, cancel)?,
                 )
             }
             Err(error) if clone_unsupported(&error) => match copy {
@@ -499,8 +504,21 @@ impl CaptureStaging {
                 "the final record name does not hold the written record",
             ));
         }
+        let metadata = record.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != geteuid().as_raw()
+            || metadata.mode() & 0o7777 != 0o600
+            || !matches!(metadata.nlink(), 1 | 2)
+        {
+            return Err(invalid(
+                "record settlement requires a private one- or two-link inode",
+            ));
+        }
         match self.open_entry(temporary) {
             Ok(file) => {
+                if metadata.nlink() != 2 || file.metadata()?.nlink() != 2 {
+                    return Err(invalid("record temporary is not the sole extra link"));
+                }
                 if !same_inode(FileFacts::of(&file)?, identity) {
                     return Err(invalid(
                         "the temporary record name holds a file this commit does not own",
@@ -693,6 +711,168 @@ impl<F: FnMut(&File, u64, u64) -> io::Result<()>> Write for StagingWriter<'_, F>
     }
 }
 
+/// Only data-bearing chunks need a worker. Extent indices borrow the single
+/// up-front walk, including extents spanning more than one logical chunk.
+struct DiskChunkWork {
+    index: usize,
+    extents: Range<usize>,
+    digest: Option<Sha256Digest>,
+}
+
+fn classify_disk_chunk(bytes: &[u8]) -> Option<Sha256Digest> {
+    if vm_spec::capture::is_all_zero(bytes) {
+        None
+    } else {
+        Some(Sha256Digest::of_bytes(bytes))
+    }
+}
+
+/// Reflink sealing never writes. Read independent chunk ranges with pread,
+/// keeping at most eight reusable chunk buffers and preserving map order.
+fn seal_disk_parallel(
+    source: &File,
+    length: u64,
+    cancel: &CancellationToken,
+) -> Result<StreamMap, DiskCopyError> {
+    let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(8));
+    seal_disk_with_workers(source, length, cancel, workers)
+}
+
+fn seal_disk_with_workers(
+    source: &File,
+    length: u64,
+    cancel: &CancellationToken,
+    workers: usize,
+) -> Result<StreamMap, DiskCopyError> {
+    if cancel.is_cancelled() {
+        return Err(DiskCopyError::Cancelled);
+    }
+    let mut extents = Vec::new();
+    let mut offset = 0;
+    while offset < length {
+        if cancel.is_cancelled() {
+            return Err(DiskCopyError::Cancelled);
+        }
+        let Some((data, end)) = next_extent(source, offset, length)? else {
+            break;
+        };
+        extents.push((data, end));
+        offset = end;
+    }
+    let mut chunks = vec![None; length.div_ceil(STREAM_CHUNK_BYTES) as usize];
+    let mut work = Vec::new();
+    let mut first = 0;
+    let mut last = 0;
+    for index in 0..chunks.len() {
+        let offset = index as u64 * STREAM_CHUNK_BYTES;
+        let end = (offset + STREAM_CHUNK_BYTES).min(length);
+        while first < extents.len() && extents[first].1 <= offset {
+            first += 1;
+        }
+        last = last.max(first);
+        while last < extents.len() && extents[last].0 < end {
+            last += 1;
+        }
+        if first < last {
+            work.push(DiskChunkWork {
+                index,
+                extents: first..last,
+                digest: None,
+            });
+        }
+    }
+    if !work.is_empty() {
+        let failed = AtomicBool::new(false);
+        let (errors, received) = mpsc::sync_channel(1);
+        let report_error = |error| {
+            if !failed.swap(true, Ordering::Relaxed) {
+                // Only the first failing worker sends, so this cannot block.
+                let _ = errors.send(error);
+            }
+        };
+        let workers = workers.clamp(1, 8).min(work.len());
+        let batch_size = work.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for batch in work.chunks_mut(batch_size) {
+                let extents = &extents;
+                let failed = &failed;
+                let report_error = &report_error;
+                match std::thread::Builder::new().spawn_scoped(scope, move || {
+                    if let Err(error) =
+                        hash_disk_chunks(source, length, batch, extents, cancel, failed)
+                    {
+                        report_error(error);
+                    }
+                }) {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        report_error(error.into());
+                        break;
+                    }
+                }
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    report_error(io::Error::other("disk seal worker panicked").into());
+                }
+            }
+        });
+        if let Ok(error) = received.try_recv() {
+            return Err(error);
+        }
+    }
+    if cancel.is_cancelled() {
+        return Err(DiskCopyError::Cancelled);
+    }
+    if source.metadata()?.len() != length {
+        return Err(invalid("disk changed length during capture").into());
+    }
+    for chunk in work {
+        chunks[chunk.index] = chunk.digest;
+    }
+    StreamMap::new(length, chunks).map_err(|error| invalid(error).into())
+}
+
+fn hash_disk_chunks(
+    source: &File,
+    length: u64,
+    work: &mut [DiskChunkWork],
+    extents: &[(u64, u64)],
+    cancel: &CancellationToken,
+    failed: &AtomicBool,
+) -> Result<(), DiskCopyError> {
+    let mut buffer = vec![0u8; length.min(STREAM_CHUNK_BYTES) as usize];
+    for entry in work {
+        if failed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if cancel.is_cancelled() {
+            return Err(DiskCopyError::Cancelled);
+        }
+        let offset = entry.index as u64 * STREAM_CHUNK_BYTES;
+        let end = (offset + STREAM_CHUNK_BYTES).min(length);
+        let chunk = &mut buffer[..(end - offset) as usize];
+        chunk.fill(0);
+        for &(data, data_end) in &extents[entry.extents.clone()] {
+            if failed.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if cancel.is_cancelled() {
+                return Err(DiskCopyError::Cancelled);
+            }
+            let start = data.max(offset);
+            let stop = data_end.min(end);
+            source.read_exact_at(
+                &mut chunk[(start - offset) as usize..(stop - offset) as usize],
+                start,
+            )?;
+        }
+        entry.digest = classify_disk_chunk(chunk);
+    }
+    Ok(())
+}
+
 /// Copy and classify each disk chunk once. Whole holes need no reads.
 fn stream_disk(
     source: &File,
@@ -741,11 +921,7 @@ fn stream_disk(
         if let Some(destination) = destination.as_mut() {
             destination.complete_through(end);
         }
-        chunks.push(if vm_spec::capture::is_all_zero(chunk) {
-            None
-        } else {
-            Some(Sha256Digest::of_bytes(chunk))
-        });
+        chunks.push(classify_disk_chunk(chunk));
         offset = end;
     }
     if source.metadata()?.len() != length {
@@ -913,8 +1089,8 @@ mod tests {
     use vm_spec::lifecycle::LiveId;
 
     use crate::live::staging::{
-        assemble_ram_map, parse_layout, CaptureStaging, DiskCopyError, DiskCopyMethod, FileFacts,
-        RecordCommit, COPY_BUFFER_BYTES,
+        assemble_ram_map, parse_layout, seal_disk_parallel, seal_disk_with_workers, stream_disk,
+        CaptureStaging, DiskCopyError, DiskCopyMethod, FileFacts, RecordCommit, COPY_BUFFER_BYTES,
     };
     #[cfg(target_os = "linux")]
     use crate::live::staging::{start_writeback, StagingWriter};
@@ -1307,8 +1483,8 @@ mod tests {
             b"sealed"
         );
 
-        // A third link keeps the record multiply linked after the owned
-        // temporary is removed: still not a completed record.
+        // A foreign third link is refused before removing even the owned
+        // temporary: only the exact two-name window may be settled.
         let staging = CaptureStaging::create(&root.0, &capture()).unwrap();
         let identity = linked_with_temporary(&staging, b"sealed");
         std::fs::hard_link(
@@ -1323,7 +1499,8 @@ mod tests {
                 identity
             )
             .is_err());
-        assert_eq!(links(&staging, CAPTURE_EVIDENCE_FILE), 2);
+        assert_eq!(links(&staging, CAPTURE_EVIDENCE_FILE), 3);
+        assert_eq!(links(&staging, CAPTURE_EVIDENCE_TEMPORARY_FILE), 3);
         assert_eq!(
             std::fs::read(staging.path().join(CAPTURE_EVIDENCE_FILE)).unwrap(),
             b"sealed"
@@ -1600,5 +1777,114 @@ mod tests {
             independent_map(&output, length),
             independent_map(&input, length)
         );
+    }
+
+    #[test]
+    fn parallel_disk_seal_matches_sequential_and_copy_maps() {
+        let root = root();
+        let chunk = STREAM_CHUNK_BYTES;
+        let length = 4 * chunk + 137;
+        let zeros = [0; 4096];
+        let data = vec![0x91; chunk as usize];
+        let file = source(
+            &root,
+            "parallel-source",
+            length,
+            &[
+                (13, b"head"),
+                (4096, &zeros),
+                (2 * chunk + 4096, &zeros),
+                (3 * chunk, &data),
+                (4 * chunk - 2, b"cross-boundary"),
+                (length - 4, b"tail"),
+            ],
+        );
+        let cancel = CancellationToken::new();
+        let sequential = stream_disk(&file, None, length, &cancel).unwrap();
+        assert_eq!(sequential, independent_map(&file, length));
+        assert_eq!(sequential.chunks()[1], None, "whole hole is zero");
+        assert_eq!(
+            sequential.chunks()[2],
+            None,
+            "allocated zero pages are zero"
+        );
+        for workers in [1, 2, 8] {
+            let parallel = seal_disk_with_workers(&file, length, &cancel, workers).unwrap();
+            assert_eq!(parallel, sequential, "workers={workers}");
+            assert_eq!(
+                parallel.canonical_bytes().unwrap(),
+                sequential.canonical_bytes().unwrap(),
+                "workers={workers}"
+            );
+            assert_eq!(parallel.id(), sequential.id());
+        }
+        let output = source(&root, "parallel-copy", length, &[]);
+        let copied = stream_disk(&file, Some(&output), length, &cancel).unwrap();
+        assert_eq!(copied, sequential);
+        assert_eq!(independent_map(&output, length), sequential);
+    }
+
+    #[test]
+    fn parallel_disk_seal_handles_empty_and_one_chunk_files() {
+        let root = root();
+        let chunk = STREAM_CHUNK_BYTES;
+        type Writes<'a> = &'a [(u64, &'a [u8])];
+        let cases: &[(u64, Writes)] = &[
+            (0, &[]),
+            (chunk, &[]),
+            (chunk, &[(4096, &[0; 4096])]),
+            (chunk, &[(0, b"head"), (chunk - 4, b"tail")]),
+            (17, &[]),
+            (17, &[(13, b"tail")]),
+            (3 * chunk + 17, &[]),
+        ];
+        for (index, (length, writes)) in cases.iter().enumerate() {
+            let file = source(&root, &format!("small-seal-{index}"), *length, writes);
+            let cancel = CancellationToken::new();
+            let parallel = seal_disk_parallel(&file, *length, &cancel).unwrap();
+            assert_eq!(parallel, independent_map(&file, *length), "case={index}");
+            assert_eq!(
+                parallel,
+                stream_disk(&file, None, *length, &cancel).unwrap(),
+                "case={index}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_disk_seal_propagates_worker_read_error_without_a_map() {
+        let root = root();
+        let chunk = STREAM_CHUNK_BYTES;
+        let length = 3 * chunk;
+        drop(source(
+            &root,
+            "unreadable-seal",
+            length,
+            &[(0, b"head"), (chunk, b"middle"), (2 * chunk, b"tail")],
+        ));
+        // Extent discovery works on this real write-only regular descriptor,
+        // but each worker's positional read fails with EBADF.
+        let file = OpenOptions::new()
+            .write(true)
+            .open(root.0.join("unreadable-seal"))
+            .unwrap();
+        let error =
+            seal_disk_with_workers(&file, length, &CancellationToken::new(), 3).unwrap_err();
+        let DiskCopyError::Io(error) = error else {
+            panic!("expected worker read error, got {error}");
+        };
+        assert_eq!(error.raw_os_error(), Some(nix::errno::Errno::EBADF as i32));
+    }
+
+    #[test]
+    fn parallel_disk_seal_honours_cancellation() {
+        let root = root();
+        let file = source(&root, "cancelled-seal", STREAM_CHUNK_BYTES, &[(0, b"head")]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            seal_disk_parallel(&file, STREAM_CHUNK_BYTES, &cancel),
+            Err(DiskCopyError::Cancelled)
+        ));
     }
 }

@@ -367,6 +367,27 @@ and [packaging](../../PACKAGING.md).
 | Real-process worker boundary: fixed descriptors, bad roles, aliasing, fd above the table, config EOF read and limits, watchdog, full event pipe | Passed on macOS |
 | Exit runner: once after the record, on monitor SIGKILL, absent without the flag, holds only its trigger | Passed on macOS |
 | Signed macOS HVF native gate: devices, serial RPC, block and virtio-fs, stop, worker SIGKILL, reboot, poweroff, new generation | Passed before the executable and worker rename; rerun required |
-| Linux KVM native gate, including x86-64 poweroff with a kernel built from this tree | Not yet run |
-| Linux `/proc/<pid>/comm` is `krun` | Not yet run |
-| VZ backend under the renamed binary | Not yet run |
+| Linux KVM x86_64 live pause, capture, restore, fork and incremental | Phase 24 exact-build qualification recorded below; functional suite: 208 passed, 5 failed (two harness failures and three pre-admission production-capability expectations), not an all-green run |
+| Linux KVM native boot and restore budgets | Passed on btrfs and ext4 in `phase-24/batch4c-{btrfs,ext4}`; same restore monitor except parallel seal |
+| Linux KVM capture, fork4 and incremental budgets | Passed on btrfs and ext4 in `phase-24/batch4d-{btrfs,ext4}` |
+| Host workspace tests | Recorded in `phase-24/batch4d-host-workspace-nextest.log` |
+| x86-64 guest poweroff with a kernel built from this tree | Not separately established by the cited Phase 24 evidence |
+| Linux `/proc/<pid>/comm` is `krun` | Not separately established by the cited Phase 24 evidence |
+| VZ backend under the renamed binary | Not qualified by the Linux-only Phase 24 evidence |
+
+The compiled production record admits `pause`, `capture`, `restore`, `fork` and
+`incremental` only for `KvmX86_64` and this exact qualification identity:
+
+```text
+v2:native=659b7f3e192ede9ced9c8c77e9ac173fc34a7de9ebc9b2b458fc6c56ff24b986:binding=1abf26fa6638c4f0c81f40ee2f192b79c40d789fa1f5088b4e388740b3a1586d:eligible=true
+```
+
+This is the clean release build of libkrun `0d21bf7cadfbfe3721a2ada1b4feca7822685e8f`.
+The functional evidence is `.tmp/plan/evidence/phase-24/wrapup-live-suites-3.log`,
+covering restore, fork, incremental, capture, capture lifecycle, stopped,
+restore lifecycle, pause, handoff, artifact live and native live API on the
+isolated candidate of this build. Budget and host-workspace paths in the table
+are relative to `.tmp/plan/evidence/`. The listed failures remain disclosed;
+the record is the exact-build admission decision, not a claim that every
+recorded test passed. Other identities and lanes remain unqualified, and
+runtime host and machine-profile admission still apply.

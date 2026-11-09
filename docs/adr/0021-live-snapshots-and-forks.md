@@ -2,11 +2,11 @@
 
 Date: 2026-10-25
 
-Updated: 2026-11-07
+Updated: 2026-11-09
 
 ## Status
 
-Proposed
+Accepted
 
 This ADR specifies the target architecture, not functionality already
 delivered. The implementation stages and conformance gates below control when
@@ -33,11 +33,30 @@ restore. There are no old-profile readers or root-profile selectors.
 The owner-approved privileged umoci v0.6.0 published-builder namespace gate
 also matched actual readonly EROFS traversals without excluded fields.
 Production-root boot/lifecycle and kernel-mutated flatten gates passed on
-Linux x86_64 with stable 7.2.2 and longterm 6.18.48. These results do not admit
-public live lanes; performance qualification remains deferred to the mandatory
-Phase 24 sweep. Original containerd differential evidence and the absolute-path
-Nix negative remain intact; see
-[ADR 0014's gate exception](0014-layered-oci-image-storage.md#filesystem-and-linux-gates).
+Linux x86_64 with stable 7.2.2 and longterm 6.18.48. Phase 24 separately records
+exact-build Linux KVM x86_64 live qualification, including the mandatory btrfs
+and ext4 budget sweep, as described under
+[backend capabilities](#backend-capabilities-and-early-rejection). Original
+containerd differential evidence and the absolute-path Nix negative remain
+intact; see [ADR 0014's gate exception](0014-layered-oci-image-storage.md#filesystem-and-linux-gates).
+
+The 2026-11-09 Phase 24 revision accepts the chunk-list stream identity,
+the explicit record step after the cut, structural trust of local monitor
+receipts, `constructed` → `durable` children with joined durability barriers,
+the non-CoW copy and capture/incremental disk-sealing allowances, reflink
+seeding of incremental RAM, and a Linux 6.6 kernel floor instead of exact
+boot-tuple qualification. The production qualification record admits all
+five live operations on `kvm-x86_64` for libkrun `0d21bf7` and identity:
+
+```text
+v2:native=659b7f3e192ede9ced9c8c77e9ac173fc34a7de9ebc9b2b458fc6c56ff24b986:binding=1abf26fa6638c4f0c81f40ee2f192b79c40d789fa1f5088b4e388740b3a1586d:eligible=true
+```
+
+Measured budgets, admitted-lane evidence and retained failures are recorded
+in [silo-vmm qualification](../architecture/silo-vmm.md#qualification)
+and the [performance tracker](../architecture/live-operation-performance.md),
+backed by `.tmp/plan/evidence/phase-24/`. Acceptance is not qualification
+of the pending foreign lanes or a claim that every recorded suite passed.
 
 ## The Problem
 
@@ -383,8 +402,17 @@ A capture runs in this order; each step completes before the next begins:
    the worker hashes each RAM chunk as it streams it and the monitor hashes
    each disk chunk as it copies it; no staged file is read back to be
    verified. The monitor closes every writer, writes `vm.capture.json` to a
-   temporary file in the capture directory and renames it into place. The
-   monitor synchronizes nothing: durability belongs to libvm, at publication
+   private `.vm.capture.json.tmp` file in the capture directory, links the
+   final name without replacement, then unlinks the temporary name. If the
+   monitor dies between link and unlink, libvm settles only that exact
+   two-name inode under the operation's publisher lock and checked capture
+   lease, before checkpoint publication or local fork-cut retention. Both
+   names must be private regular files in the same owned staging directory
+   with matching device/inode and exactly two links; any foreign extra link
+   is refused without removing names. After settlement the seal, like every
+   other control record, must pass ordinary singleton validation. The
+   monitor's own bounded settlement retry applies the same exact-pair rule.
+   The monitor synchronizes nothing: durability belongs to libvm, at publication
    for a named checkpoint and in each child's background barrier for a fork.
    A capture is **recorded** when `vm.capture.json` with `captureOutcome:
    coherent` and all seven facts true exists; a record with `captureOutcome:
@@ -553,10 +581,17 @@ optimization is never a reason to omit memory from a capture.
 
 ### Inputs
 
+Before binding shape descriptors, libvm reconstructs any explicitly evicted
+flat stream from retained chunks under the consumer's lease. Reconstruction
+authenticates the chunks and complete stream identity; a missing or corrupt
+chunk fails closed. Reconstructed flats remain re-evictable cache, protected
+from eviction while the consumer's operation roots are live.
+
 libvm verifies the checkpoint closure's shape, trust policy and compatibility
 profile before allocating anything for a child: every member is present with
-its recorded length, role and lineage; nothing is read in full yet. Byte
-authentication of the RAM stream and the sealed disks then runs concurrently
+its recorded length, role and lineage; already-present stream bytes are not
+read in full yet. Byte authentication of the RAM stream and the sealed disks
+then runs concurrently
 with the construction of the child's private disk copies; a failed
 authentication rolls the owned child allocation back and reports the
 authentication error, never a construction error. A content object that
@@ -863,11 +898,24 @@ arm64 and HVF lanes remain pending. At that stage public operations remain
 `not-delivered`, and the shipped qualification set is empty. Host and
 effective-profile admission requirements are unchanged.
 
-Phase 13 delivers public pause/resume with a supervisor-verified Linux KVM
-x86_64 qualification record. Other lanes remain unqualified. Capture, restore,
-fork and incremental remain `not-delivered` until their delivery stages pass.
-The real guest gate covers native pause, ClockOnly acknowledgement, exact thaw,
-retained sessions, durable manager reconciliation and stop without resume.
+Phase 13 delivered public pause/resume with a supervisor-verified Linux KVM
+x86_64 qualification record. Its real guest gate covers native pause,
+ClockOnly acknowledgement, exact thaw, retained sessions, durable manager
+reconciliation and stop without resume.
+
+Phase 24 replaces that pause-only record with exact-build Linux KVM x86_64
+qualification for `pause`, `capture`, `restore`, `fork` and `incremental`.
+The admitted libkrun revision is `0d21bf7cadfbfe3721a2ada1b4feca7822685e8f`;
+the complete native/build binding and evidence are recorded in
+[silo-vmm qualification](../architecture/silo-vmm.md#qualification).
+Functional evidence is `phase-24/wrapup-live-suites-3.log` on the isolated
+candidate of this build (208 passed, 5 failed, not an all-green suite).
+`phase-24/batch4d-{btrfs,ext4}` cover capture, fork4 and incremental budgets;
+`phase-24/batch4c-{btrfs,ext4}` cover restore and boot budgets with the same
+restore monitor except parallel seal. Host workspace evidence is
+`phase-24/batch4d-host-workspace-nextest.log`. These paths are relative to
+`.tmp/plan/evidence/`. The record does not qualify other builds or lanes,
+and does not bypass runtime host checks or machine-profile rejection.
 
 The native query's lane is authoritative, including build-feature and unknown
 inventory exclusions. Because the current public schema requires an explicit

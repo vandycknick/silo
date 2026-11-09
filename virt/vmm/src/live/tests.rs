@@ -65,7 +65,7 @@ fn baseline() -> LiveCapabilityVector {
         native: true,
         availability: LiveAvailability::Supported,
     };
-    // The scenario's vector delivers capture; production keeps it unqualified.
+    // This scenario admits capture independently of production qualification.
     live.capture = LiveCapability {
         native: true,
         availability: LiveAvailability::Supported,

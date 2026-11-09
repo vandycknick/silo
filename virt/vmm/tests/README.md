@@ -30,13 +30,12 @@ dependency's read-only system KVM/HVF observations and live in
 Phase 11 linked-fact tests expect native pause on all three recognized lanes.
 KVM x86_64 also supports native capture, restore, fork and incremental; those
 four primitives remain unsupported and pending on KVM arm64 and HVF arm64.
-Excluded lanes support none of the five primitives. Public pause is delivered
-with an immutable Linux KVM x86_64 qualification record bound to the verified
-native/build identity. Capture and restore are delivered but remain
-`lane-not-qualified` until the combined capture/restore/fork admission gates
-pass. Fork and incremental remain `not-delivered`. Tests distinguish native
-support, public delivery, host admission and qualification; none substitutes
-for another.
+Excluded lanes support none of the five primitives. Public pause, capture,
+restore, fork and incremental are delivered, with Phase 24's immutable Linux
+KVM x86_64 qualification record bound to the exact verified native/build
+identity. Other identities and lanes remain unqualified. Tests distinguish
+native support, public delivery, host admission and qualification; none
+substitutes for another.
 These Cargo tests do not qualify runtime execution on KVM arm64 or HVF.
 
 To query the actual monitor, build its binary (not only the unit-test harness)
@@ -52,11 +51,11 @@ The development shell supplies the native compiler and libclang prerequisites.
 Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
 set. The krun query performs read-only host discovery, not a VM run. Its
 `native: true` fields follow the lane matrix above and do not grant public
-support or runtime qualification. Only the exact compiled qualification admits
-public pause. Capture and restore require their isolated test candidates until
-the combined admission milestone; both remain `lane-not-qualified`.
-Fork and incremental remain `not-delivered`. Mutable qualification grants
-cannot change any of these results.
+support or runtime qualification. Only the exact compiled Phase 24 qualification
+admits public pause, capture, restore, fork and incremental on Linux KVM x86_64.
+Isolated test candidates remain separate compilations with their own scoped
+operation tables, even when production already admits those operations.
+Mutable qualification grants cannot change any of these results.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust

@@ -37,6 +37,7 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -97,9 +98,6 @@ def restore_network_image(config: SmokeConfig, registry: LoopbackRegistry,
     probe = compile_probe(tmp_path_factory.mktemp("restore-network-probe") / "restore-network")
     spec = replace(images.BASIC, name="restore-network", files={
         **images.BASIC.files, PROBE.lstrip("/"): images.GuestFile(probe.read_bytes(), mode=0o755),
-        # Keep namespace and extent mappings in the image, not only in the
-        # live ext4 journal: the independent stopped-disk oracle never replays it.
-        f"{STATE.lstrip('/')}/progress": images.GuestFile(b" " * 512, mode=0o600),
     })
     return registry.publish(images.build(spec, images.fetch_alpine(config.cache_dir)), "restore-network")
 
@@ -607,10 +605,36 @@ def create_source(silo: Silo, image: str, name: str, *flags: str) -> dict:
     """
     silo.create(name, image, "--cpus", "1", "--memory", "512mib", "--disk-size", "512mib",
                 "--vsock", "--network", "private", *flags)
+    assert stopped.record(silo, name)["root"]["kind"] == "linux-overlay"
+    upper = stopped.writable_paths(silo, name)["root"]
+    # The stopped-disk oracle never replays the guest journal. Seed namespace
+    # and extents in the actual writable upper, not in the OCI lower (where
+    # the workload's first write would need an OverlayFS copy-up).
+    with tempfile.TemporaryDirectory(prefix="restore-progress-") as temporary:
+        seed = Path(temporary) / "progress"
+        seed.write_bytes(b" " * 512)
+        commands = (
+            f"mkdir {UPPER}/var\n"
+            f"mkdir {UPPER}/var/lib\n"
+            f"mkdir {UPPER}{STATE}\n"
+            f'write "{seed}" {UPPER}{STATE}/progress\n'
+            f"set_inode_field {UPPER}{STATE}/progress mode 0100600\n"
+        )
+        prepared = subprocess.run(
+            ["debugfs", "-w", str(upper)], input=commands, capture_output=True,
+            text=True, check=True, timeout=30,
+        )
+        silo.ws.record("restore-progress-materialized", prepared.stdout + prepared.stderr)
+    verified = subprocess.run(
+        ["debugfs", "-R", f"cat {UPPER}{STATE}/progress", str(upper)],
+        capture_output=True, check=True, timeout=30,
+    )
+    assert verified.stdout == b" " * 512, verified.stderr
+    with upper.open("rb") as disk:
+        os.fsync(disk.fileno())
     silo.start(name)
     info = silo.wait_ready(name)
     restore.require_restore_candidate(info)
-    assert stopped.record(silo, name)["root"]["kind"] == "linux-overlay"
     return info
 
 

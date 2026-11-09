@@ -752,6 +752,7 @@ impl SnapshotStore {
         }
         let directory = capture_directory(&self.store, &record)?
             .ok_or_else(|| invalid("capture staging is missing"))?;
+        settle_capture_seal(&directory)?;
         let verified = verify_capture_bytes(&directory, &record)?;
         let boot = record
             .captured_boot
@@ -1505,6 +1506,48 @@ fn source_upgrade_matches(existing: &CaptureSourceOutcome, source: &CaptureSourc
         ) => true,
         _ => false,
     }
+}
+
+/// Finish only the monitor's exact two-name seal publication window.
+/// Callers hold the operation's publisher lock and checked capture lease.
+/// Both opens retain OwnedDirectory's private regular-file ownership checks;
+/// every verifier still requires a singleton after settlement.
+fn settle_capture_seal(directory: &OwnedDirectory) -> Result<(), LibVmError> {
+    use vm_spec::capture::{CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE};
+
+    let Some(file) = directory.open_file(CAPTURE_EVIDENCE_FILE)? else {
+        return Ok(());
+    };
+    let metadata = file.metadata()?;
+    if metadata.nlink() == 1 {
+        return Ok(());
+    }
+    if metadata.nlink() != 2 {
+        return Err(invalid("capture seal has foreign links"));
+    }
+    let temporary = directory
+        .open_file(CAPTURE_EVIDENCE_TEMPORARY_FILE)?
+        .ok_or_else(|| invalid("capture seal's second link is not its owned temporary"))?;
+    let temporary_metadata = temporary.metadata()?;
+    if (metadata.dev(), metadata.ino()) != (temporary_metadata.dev(), temporary_metadata.ino())
+        || temporary_metadata.nlink() != 2
+    {
+        return Err(invalid(
+            "capture seal temporary does not hold its two-link inode",
+        ));
+    }
+    match nix::unistd::unlinkat(
+        directory.fd(),
+        CAPTURE_EVIDENCE_TEMPORARY_FILE,
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    ) {
+        Ok(()) | Err(nix::errno::Errno::ENOENT) => {}
+        Err(error) => return Err(std::io::Error::from(error).into()),
+    }
+    if file.metadata()?.nlink() != 1 {
+        return Err(invalid("capture seal did not settle to a single link"));
+    }
+    Ok(())
 }
 
 fn read_optional(
@@ -2301,6 +2344,7 @@ impl SnapshotStore {
             let mut cut = match this.store.local_cut(operation).await? {
                 Some(cut) => cut,
                 None => {
+                    settle_capture_seal(&source)?;
                     let verified = validate_receipt(&source, &record)?;
                     verified.recheck_registered(&this.store, capture)?;
                     let mut storage = record.storage.clone();
@@ -2579,6 +2623,7 @@ pub(crate) mod tests {
 
     use crate::lock_manager::LockId;
     use crate::paths::{LocalPaths, OwnedDirectory};
+    use crate::storage::identity::ObjectDigest;
     use crate::storage::pool::StoragePool;
     use crate::storage::stream::StreamHasher;
     use crate::store::capture::{
@@ -3402,6 +3447,182 @@ pub(crate) mod tests {
             .await
             .is_ok());
         assert!(snapshots.abandon_capture(capture).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_settles_owned_seal_temporary_before_publication() {
+        use vm_spec::capture::{CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE};
+
+        let fixture = fixture().await;
+        let (directory, evidence) = seal(&fixture);
+        let final_path = directory.path().join(CAPTURE_EVIDENCE_FILE);
+        let temporary_path = directory.path().join(CAPTURE_EVIDENCE_TEMPORARY_FILE);
+        std::fs::hard_link(&final_path, &temporary_path).unwrap();
+        let before = std::fs::metadata(&final_path).unwrap();
+        assert_eq!(before.nlink(), 2);
+        let capture = fixture.reservation.record.capture_id;
+        let snapshots = fixture.snapshots.clone();
+        let alias = fixture.reservation.record.alias.clone();
+        drop(fixture.reservation);
+        drop(fixture.launch);
+        snapshots.store.recover_image_cache().await.unwrap();
+
+        let published = snapshots
+            .publish_capture(capture, directory.path(), alias.clone())
+            .await
+            .unwrap();
+        let after = std::fs::metadata(&final_path).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.nlink(), 1);
+        assert!(!temporary_path.exists());
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            evidence.canonical_bytes().unwrap()
+        );
+        assert_eq!(published.provenance.len(), 1);
+        assert_eq!(
+            published.provenance[0].evidence_digest,
+            ObjectDigest::of_bytes(&evidence.canonical_bytes().unwrap())
+        );
+        assert!(snapshots
+            .inspect(&SnapshotRef::Id(published.id))
+            .await
+            .is_ok());
+        assert_eq!(
+            snapshots
+                .publish_capture(capture, directory.path(), alias)
+                .await
+                .unwrap(),
+            published
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_seal_settles_owned_temporary_before_local_retention() {
+        use vm_spec::capture::{CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE};
+
+        let fixture = fork_fixture().await;
+        let (directory, evidence) = seal(&fixture);
+        let final_path = directory.path().join(CAPTURE_EVIDENCE_FILE);
+        let temporary_path = directory.path().join(CAPTURE_EVIDENCE_TEMPORARY_FILE);
+        std::fs::hard_link(&final_path, &temporary_path).unwrap();
+        assert_eq!(std::fs::metadata(&final_path).unwrap().nlink(), 2);
+
+        let (cut, _) = fixture
+            .snapshots
+            .retain_local_capture(fixture.reservation.record.capture_id)
+            .await
+            .unwrap();
+        assert_eq!(cut.evidence, evidence);
+        assert_eq!(std::fs::metadata(&final_path).unwrap().nlink(), 1);
+        assert!(!temporary_path.exists());
+        assert!(fixture.snapshots.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_refuses_foreign_seal_links_without_removing_names() {
+        use vm_spec::capture::{CAPTURE_EVIDENCE_FILE, CAPTURE_EVIDENCE_TEMPORARY_FILE};
+
+        for fault in [
+            "different-name",
+            "different-directory",
+            "wrong-temporary",
+            "third-link",
+        ] {
+            let fixture = fixture().await;
+            let (directory, evidence) = seal(&fixture);
+            let final_path = directory.path().join(CAPTURE_EVIDENCE_FILE);
+            let temporary_path = directory.path().join(CAPTURE_EVIDENCE_TEMPORARY_FILE);
+            let extra_path = match fault {
+                "different-directory" => fixture
+                    .config
+                    .machine_dir
+                    .join(CAPTURE_EVIDENCE_TEMPORARY_FILE),
+                "third-link" => {
+                    std::fs::hard_link(&final_path, &temporary_path).unwrap();
+                    fixture.config.machine_dir.join("foreign-seal")
+                }
+                _ => directory.path().join("foreign-seal"),
+            };
+            std::fs::hard_link(&final_path, &extra_path).unwrap();
+            if fault == "wrong-temporary" {
+                directory
+                    .write_file(CAPTURE_EVIDENCE_TEMPORARY_FILE, b"foreign temporary")
+                    .unwrap();
+            }
+            let before = std::fs::metadata(&final_path).unwrap();
+            let capture = fixture.reservation.record.capture_id;
+            let snapshots = fixture.snapshots.clone();
+            let alias = fixture.reservation.record.alias.clone();
+            drop(fixture.reservation);
+            drop(fixture.launch);
+            snapshots.store.recover_image_cache().await.unwrap();
+
+            assert!(
+                snapshots
+                    .publish_capture(capture, directory.path(), alias)
+                    .await
+                    .is_err(),
+                "{fault}"
+            );
+            let after = std::fs::metadata(&final_path).unwrap();
+            assert_eq!(
+                (after.dev(), after.ino()),
+                (before.dev(), before.ino()),
+                "{fault}"
+            );
+            assert_eq!(after.nlink(), before.nlink(), "{fault}");
+            assert_eq!(
+                std::fs::metadata(&extra_path).unwrap().ino(),
+                before.ino(),
+                "{fault}"
+            );
+            assert_eq!(
+                std::fs::read(&final_path).unwrap(),
+                evidence.canonical_bytes().unwrap(),
+                "{fault}"
+            );
+            match fault {
+                "wrong-temporary" => assert_eq!(
+                    std::fs::read(&temporary_path).unwrap(),
+                    b"foreign temporary"
+                ),
+                "third-link" => assert_eq!(std::fs::metadata(&temporary_path).unwrap().nlink(), 3),
+                _ => assert!(!temporary_path.exists(), "{fault}"),
+            }
+            assert!(snapshots.list().await.unwrap().is_empty(), "{fault}");
+            assert!(
+                snapshots
+                    .capture_reservation(capture)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{fault}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_keeps_request_control_record_singleton() {
+        use vm_spec::capture::CAPTURE_REQUEST_FILE;
+
+        let fixture = fixture().await;
+        let (directory, _) = seal(&fixture);
+        let request = directory.path().join(CAPTURE_REQUEST_FILE);
+        let extra = fixture.config.machine_dir.join("foreign-request");
+        std::fs::hard_link(&request, &extra).unwrap();
+        assert!(fixture
+            .snapshots
+            .publish_capture(
+                fixture.reservation.record.capture_id,
+                directory.path(),
+                fixture.reservation.record.alias.clone(),
+            )
+            .await
+            .is_err());
+        assert_eq!(std::fs::metadata(request).unwrap().nlink(), 2);
+        assert!(extra.exists());
+        assert!(fixture.snapshots.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]

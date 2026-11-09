@@ -430,12 +430,18 @@ struct Qualification<'a> {
     evidence: &'a str,
 }
 
-// Supervisor-verified real CLI/guest pause, ClockOnly resume and paused stop.
+// Phase 24 exact-build functional, budget and host-workspace evidence.
 const QUALIFICATIONS: &[Qualification<'static>] = &[Qualification {
-    binding: "v2:native=5dc953ce29ce5423789ae9c2e253a6ad5ee1b96ac9712394d37227ce6ef56f5b:binding=f1da2da8957f4719807551bdc5bc333f912ade28065b0ebae83a2c4ddadf36d7:eligible=true",
+    binding: "v2:native=659b7f3e192ede9ced9c8c77e9ac173fc34a7de9ebc9b2b458fc6c56ff24b986:binding=1abf26fa6638c4f0c81f40ee2f192b79c40d789fa1f5088b4e388740b3a1586d:eligible=true",
     lane: LiveLane::KvmX86_64,
-    operations: &[LiveOperation::Pause],
-    evidence: "phase-20/pause-candidate-requalification.xml; exact release CLI/guest pause, resume, paused stop and profile refusal",
+    operations: &[
+        LiveOperation::Pause,
+        LiveOperation::Capture,
+        LiveOperation::Restore,
+        LiveOperation::Fork,
+        LiveOperation::Incremental,
+    ],
+    evidence: "phase-24/wrapup-live-suites-3.log (isolated candidate of this build: restore, fork, incremental, capture, capture lifecycle, stopped, restore lifecycle, pause, handoff, artifact live, native live API); phase-24/batch4d-{btrfs,ext4} (capture, fork4, incremental budgets); phase-24/batch4c-{btrfs,ext4} (restore, boot budgets; same restore monitor except parallel seal); phase-24/batch4d-host-workspace-nextest.log",
 }];
 
 fn qualification_matches(
@@ -1197,10 +1203,46 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_phase24_record_admits_only_the_exact_build_and_lane() {
+        let binding = "v2:native=659b7f3e192ede9ced9c8c77e9ac173fc34a7de9ebc9b2b458fc6c56ff24b986:binding=1abf26fa6638c4f0c81f40ee2f192b79c40d789fa1f5088b4e388740b3a1586d:eligible=true";
+        assert_eq!(QUALIFICATIONS.len(), 1);
+        assert_eq!(QUALIFICATIONS[0].binding, binding);
+        assert_eq!(QUALIFICATIONS[0].operations, &LiveOperation::ALL);
+        for operation in LiveOperation::ALL {
+            assert!(crate::capabilities::qualification_matches(
+                binding,
+                true,
+                LiveLane::KvmX86_64,
+                operation,
+                QUALIFICATIONS
+            ));
+            for (identity, eligible, lane) in [
+                ("other-build", true, LiveLane::KvmX86_64),
+                (binding, false, LiveLane::KvmX86_64),
+                (binding, true, LiveLane::KvmArm64GicV3),
+                (binding, true, LiveLane::HvfArm64),
+            ] {
+                assert!(!crate::capabilities::qualification_matches(
+                    identity,
+                    eligible,
+                    lane,
+                    operation,
+                    QUALIFICATIONS
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn capabilities_linked_native_facts_are_observed_without_host_access() {
         let compiled = compiled_build();
         assert_eq!(compiled.native_build, Some(native::compiled_live_build()));
         assert_eq!(native::compiled_live_build().query_abi, 1);
+        let identity = compiled
+            .qualification_identity()
+            .expect("canonical build binding");
+        let production_qualified =
+            compiled.qualification_ready() && identity == QUALIFICATIONS[0].binding;
         let records = [Qualification {
             binding: &compiled
                 .qualification_identity()
@@ -1218,20 +1260,15 @@ mod tests {
                     || (operation == LiveOperation::Pause
                         && lane != native::NativeLane::Unsupported)
             );
-            assert!(!qualification_matches(
-                &compiled,
-                LiveLane::KvmX86_64,
-                operation,
-                QUALIFICATIONS
-            ));
+            assert_eq!(
+                qualification_matches(&compiled, LiveLane::KvmX86_64, operation, QUALIFICATIONS),
+                production_qualified
+            );
             assert_eq!(
                 qualification_matches(&compiled, LiveLane::KvmX86_64, operation, &records),
                 compiled.qualification_ready()
             );
         }
-        let identity = compiled
-            .qualification_identity()
-            .expect("canonical identity");
         assert!(!identity.contains("native=unobserved"));
         assert!(identity.len() <= 256);
         assert!(compiled.public_identity().len() <= 256);

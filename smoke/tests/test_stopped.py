@@ -502,8 +502,23 @@ def test_stopped_fork_real_syscall_failure_never_publishes_partial_child(stopped
     before_config = stopped.configuration(silo, "failure-source")
     before_storage = stopped.record(silo, "failure-source")
     command = [str(silo.ws.config.silo), "fork", "failure-source", "--name", "failed-child"]
-    with stopped.syscall_boundary(silo, command, stopped.writable_paths(silo, "failure-source")["root"], boundary, injected_errno=injected_errno):
-        assert not any(item["name"] == "failed-child" for item in silo.ls())
+    with stopped.syscall_boundary(silo, command, stopped.writable_paths(silo, "failure-source")["root"], boundary, injected_errno=injected_errno) as held:
+        if boundary == "destination-sync":
+            # The coalesced file barrier follows complete construction and SQL
+            # publication. Observe without opening a recovering CLI while its
+            # owner is held: restart recovery retires a stopped constructed child.
+            assert procs.query(
+                silo.ws.state_db(),
+                "SELECT durability FROM machine_config WHERE name='failed-child'",
+            ) == [("constructed",)]
+            assert Path(held["target"]) == stopped.writable_paths(silo, "failed-child")["root"]
+            assert held["syscall"] in (74, 75), held
+            child = stopped.backing(silo, "failed-child", "failure-held-constructed")
+            stopped.same_content(baseline, child)
+            stopped.independent(baseline, child)
+            assert procs.machine_state_json(silo.ws, "failed-child")["status"] == "stopped"
+        else:
+            assert not any(item["name"] == "failed-child" for item in silo.ls())
     receipt = json.loads((silo.ws.evidence / "boundary-injected.json").read_text())
     assert receipt["errno"] == injected_errno and receipt["injectedReturn"] is True
     assert receipt["kind"] == "injected syscall failure, not physical media/power-loss failure"
