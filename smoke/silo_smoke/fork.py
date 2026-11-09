@@ -95,7 +95,7 @@ def validate(result: object, *, operation: str, names: list[str]) -> dict:
         kind = _outcome(child["outcome"], CHILD_KINDS, f"child {index}")
         if kind == "failed":
             assert child["outcome"].get("phase") in FAILURE_PHASES, child
-        assert child["durability"] in CHILD_DURABILITY, child
+        assert child["durability"] in CHILD_DURABILITY, (name, child["durability"], child)
     assert len(machines) == len(runs) == len(names), "reserved child identities must be unique"
     assert _uuid(result["sourceMachineId"], "source") not in machines
     assert _uuid(result["sourceRunId"], "source run") not in runs

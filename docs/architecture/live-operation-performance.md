@@ -128,3 +128,43 @@ the measured 872 MB/s; fork4 subtracts four copies). ext4 warm fork segments:
 pause 2.37 s, manager 1.06 s, construction 7.07 s, prepared→Running 0.62 s.
 The remaining ext4 gap to the raw numbers is the private copy bytes at device
 rate, which the allowance is defined to cover.
+
+## Deferred budgets (ADR 0014 table, ADR 0021 incremental)
+
+Measured 2026-11-09 on the Batch 3 candidate with the new cohorts in
+`smoke/tests/test_fork_budget.py` (incremental, prepared create, layered vs
+raw boot) and `smoke/tests/test_ingest_budget.py` (cold OCI prepare). The
+boot marker is the monitor's `guest agent became responsive` trace event
+(agent serving from the mounted root), timed from `silo start` dispatch.
+
+| Budget | Target | ext4 cold / warm | Btrfs cold / warm | Result |
+|---|---|---:|---:|---|
+| Warm create of a stopped machine (Alpine lower) | 2 s | 0.70 / 1.01 | 0.56 / 0.74 | pass |
+| Warm create, 4 GiB single-layer lower | 2 s | not run | 6.15 (one sample) | miss |
+| Incremental capture, 10 % dirty (410 MiB) | 1 s + allowance | 7.44 / 7.77 raw, 5.92 / 6.25 gated | 2.74 / 2.21 | miss |
+| Layered / raw boot ratio | 1.2 | 1.21 / 1.44 | 1.25 / 1.32 | miss |
+| Cold OCI prepare / (download + gunzip) | 1.5 | not run | 6.0 (1 GiB), 9.2 (4 GiB) | miss |
+| Prepare linearity (s per GiB, largest / smallest) | 1.25 | not run | 8.7 → 12.4 s/GiB (1.43); 12 GiB exceeded 300 s | miss |
+
+Attribution from the evidence:
+
+- **Incremental.** The vCPU pause is 2.8–3.5 s on ext4 and 2.1–2.4 s on
+  Btrfs. The native writer hashes only the affected 8 MiB chunks (77–80 of
+  512) but rebuilds a complete sparse RAM file each time: it reads and
+  rewrites about 1.23 GB of clean baseline data in addition to the 444 MB
+  dirty data. On ext4 the workload-observed interruption is 4–5 s longer than
+  the pause because the guest's first flush after resume waits for the host
+  ext4 journal to drain the unsynchronized capture staging (`data=ordered`).
+  Disk sealing alone is 1.1–1.2 s on Btrfs (clone plus full upper hash).
+  Report: `.tmp/plan/research/phase24-incremental-memory-cost.md`.
+- **Boot.** Guest time from `vm running` to agent responsive is the same for
+  both profiles (0.20–0.22 s). The whole layered penalty (0.15–0.31 s) is
+  host work before the monitor starts: four additional full hashes of the
+  monitor executable for overlay admission (about 110 MB), a duplicate
+  inspection, a second lower consumer lease, VMDK descriptor publication and
+  per-file syncs. Report: `.tmp/plan/research/phase24-layered-prelaunch-cost.md`.
+- **Ingest.** Prepare runs at roughly 100 MB/s expanded and gets slower per
+  GiB as the layer grows; the baseline gunzip runs at about 750 MB/s. The
+  prepared-lower create also scales with lower size (6.15 s for 4 GiB), so
+  create reads the lower rather than only formatting the upper. Not yet
+  attributed.

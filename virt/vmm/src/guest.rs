@@ -1,7 +1,7 @@
 #[path = "guest/shutdown.rs"]
 pub(crate) mod shutdown;
 #[path = "guest/ssh.rs"]
-mod ssh;
+pub(crate) mod ssh;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -117,7 +117,9 @@ def enable_packet_capture(silo: Silo) -> Path:
 # -- trace events ---------------------------------------------------------------
 
 _LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z\s+(\w+)\s+(.*)$")
-_FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|.*?)(?=\s+\w+=|$)')
+# Keep quoted spaces (including Some("...")) inside a value, but do not
+# attach the trailing anonymous message to the preceding named field.
+_FIELD = re.compile(r'(?:^|\s)(\w+)=((?:"(?:[^"\\]|\\.)*"|[^\s"])+)(?=\s|$)')
 
 
 @dataclass(frozen=True)
@@ -133,15 +135,15 @@ def _realtime_ns(seconds: str, fraction: str | None) -> int:
     return int(whole.timestamp()) * 1_000_000_000 + int((fraction or "0").ljust(9, "0"))
 
 
-def events(text: str) -> list[Event]:
-    """Restore activation events in log order; unknown lines are ignored."""
+def events(text: str, *, names: tuple[str, ...] = EVENTS) -> list[Event]:
+    """Named monitor trace events in log order; unknown lines are ignored."""
     found: list[Event] = []
     for line in text.splitlines():
         match = _LINE.match(line)
         if match is None:
             continue
         body = match.group(4)
-        for name in EVENTS:
+        for name in names:
             if body != name and not body.startswith(name + " "):
                 continue
             rest = body[len(name):].strip()

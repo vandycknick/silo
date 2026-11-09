@@ -1,15 +1,16 @@
-"""ADR 0021 budget cohorts: full capture interruption, restore and 4-child fork.
+"""ADR 0021 live-operation and ADR 0014 prepared-create/layered-boot budgets.
 
 Exact fixture, cohorts, cache method and boundaries are documented in
-`silo_smoke/fork_budget.py`. Each test writes its reference-host record,
+`silo_smoke/fork_budget.py` and `smoke/README.md`. Each test writes its reference-host record,
 per-sample text and median/min/max summary under `SILO_SMOKE_BUDGET_EVIDENCE`
 before asserting, so a failing budget still leaves its measured evidence.
-Admission comes only from the isolated `capture_candidate --restore --fork`
-build; a budget failure blocks qualification, it never relaxes a target.
+Live-operation admission comes only from an isolated `capture_candidate`
+build with the required restore, fork or incremental switches; a budget
+failure blocks qualification, it never relaxes a target.
 """
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import errno
 import fcntl
 import json
@@ -21,11 +22,12 @@ from uuid import UUID
 
 import pytest
 
-from silo_smoke import fork, fork_budget, overlay, restore, shutdown, stopped
+from silo_smoke import fork, fork_budget, incremental, overlay, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
-from silo_smoke.cli import Silo, TIMINGS_PROPERTY, release
+from silo_smoke.cli import RootProfile, Silo, TIMINGS_PROPERTY, release
 from silo_smoke.config import RUN_ROOT_PARENT, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
+from silo_smoke.incremental import incremental_image  # noqa: F401, pytest fixture
 from silo_smoke.restore import restore_image  # noqa: F401, pytest fixture
 from silo_smoke.workspace import Workspace
 
@@ -57,7 +59,7 @@ def budget_host(silo: Silo) -> dict:
     return fork_budget.reference_host(silo)
 
 
-def budget_source(silo: Silo, image: str, name: str = SOURCE) -> dict:
+def budget_source(silo: Silo, image: str, name: str = SOURCE, *, require_fork: bool = True) -> dict:
     """The exact cohort fixture: 4 GiB RAM, 2 GiB layered upper, witness running."""
     silo.create(name, image, "--cpus", "2", "--memory", fork_budget.RAM, "--disk-size", fork_budget.UPPER,
                 "--vsock", "--network", "private")
@@ -65,14 +67,15 @@ def budget_source(silo: Silo, image: str, name: str = SOURCE) -> dict:
     silo.start(name)
     info = silo.wait_ready(name)
     restore.require_restore_candidate(info)
-    live = info["lifecycle"]["report"]["live"]
-    assert live["fork"]["availability"] == {"status": "supported"}, live["fork"]
+    if require_fork:
+        live = info["lifecycle"]["report"]["live"]
+        assert live["fork"]["availability"] == {"status": "supported"}, live["fork"]
     initial = restore.start_witness(silo, name)
     upper = overlay.upper(silo, name)
     return {"name": name, "info": info, "initial": initial, "upper": upper}
 
 
-def fixture_proof(silo: Silo, name: str, upper) -> dict:
+def fixture_proof(silo: Silo, name: str, upper: Path) -> dict:
     """Guest-written 1 GiB random payload, proven independently in the host upper."""
     payload = fork_budget.write_payload(silo, name)
     proof = fork_budget.upper_proof(upper)
@@ -287,6 +290,265 @@ def test_fork_budget_restore_to_running(
         f"restore median over ADR target blocks admission; evidence: {evidence.directory}", summary["pass"])
 
 
+def budget_dispatch(silo: Silo, *args: str,
+                    clock: Callable[[], int] = time.monotonic_ns) -> tuple[str, int, int]:
+    """Exact CLI dispatch/exit stamps in the selected host clock, excluding evidence."""
+    command, environment = [str(silo.ws.config.silo), *args], silo.ws.env()
+    dispatched = clock()
+    completed = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=240)
+    exited = clock()
+    silo.ws.record("budget-dispatch", json.dumps({
+        "args": args, "exit": completed.returncode,
+        "stdout": completed.stdout, "stderr": completed.stderr}) + "\n")
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    return completed.stdout, dispatched, exited
+
+
+def checkpoint_value(silo: Silo, value: dict) -> tuple[Path, dict]:
+    assert value["snapshot"]["captureKind"] == "live-execution", value
+    assert value["capture"]["sourceOutcome"] == "resumed", value
+    relative = Path(value["capture"]["staging"])
+    assert not relative.is_absolute() and ".." not in relative.parts, relative
+    directory = silo.ws.silo_home / relative
+    seal = json.loads((directory / "vm.capture.json").read_text())
+    assert seal["captureOutcome"] == "coherent" and seal["error"] is None, seal
+    return directory, seal
+
+
+def remove_checkpoint(silo: Silo, alias: str, value: dict) -> None:
+    silo.run("image", "remove", "image:" + alias)
+    silo.run("snapshot", "remove", "image:" + value["snapshot"]["id"])
+
+
+def test_fork_budget_incremental_ten_percent_dirty(
+    silo: Silo, incremental_image: str, budget_host: dict,  # noqa: F811
+) -> None:
+    host = budget_host
+    evidence = fork_budget.Evidence("incremental", host)
+    # Two complete RAM outputs (staging + immutable), a private upper and
+    # its published stream, plus a margin. Previous baseline already exists.
+    required = 2 * 4 * GIB + 2 * 2 * GIB + 2 * GIB
+    fork_budget.headroom(silo, required)
+    source = budget_source(silo, incremental_image, require_fork=False)
+    info, initial, upper = source["info"], source["initial"], source["upper"]
+    incremental.require_candidate(info)
+    fixture = fixture_proof(silo, SOURCE, upper)
+    fixture["image"] = "incremental-memory (BASIC Alpine + incremental and execution probes)"
+    dirty_bytes = 410 * 1024 * 1024
+    # The existing pinned-page probe controls 96 MiB, not an arbitrary size.
+    # Preallocate 410 MiB in tmpfs before the baseline, then overwrite in place.
+    dirty_command = ("dd if=/dev/urandom of=/budget-dirty/payload bs=1M count=410 "
+                     "conv=notrunc 2>/dev/null; stat -c %s /budget-dirty/payload; "
+                     "stat -f -c %T /budget-dirty")
+    silo.exec(SOURCE, "sh", "-eu", "-c",
+              "mkdir /budget-dirty; mount -t tmpfs -o size=512m tmpfs /budget-dirty; "
+              + dirty_command, user="root", timeout=240)
+    rate = fork_budget.sequential_copy_rate(silo, upper)
+    alias = "budget-incremental-baseline"
+    previous = json.loads(silo.run(
+        "snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
+        "--name", alias, timeout=240).stdout)
+    previous_directory, previous_seal = checkpoint_value(silo, previous)
+    assert previous_seal["memory"]["mode"] == "full", previous_seal["memory"]
+    evidence.record("fixture.json", {**fixture, "sequentialCopy": rate,
+                                    "dirtyWorkloadBytes": dirty_bytes, "baseline": previous})
+    try:
+        for position, (cohort, index) in enumerate(fork_budget.SCHEDULE):
+            space = fork_budget.headroom(silo, required)
+            dirty = silo.exec(SOURCE, "sh", "-eu", "-c", dirty_command,
+                              user="root", timeout=240).stdout.split()
+            assert dirty == [str(dirty_bytes), "tmpfs"], dirty
+            current_alias = f"budget-incremental-{cohort}-{index}"
+            upper_now = fork_budget.upper_proof(upper)
+            assert upper_now["nonzeroBytes"] >= GIB, upper_now
+            observer = fork.WorkloadObserver(upper, restore.witness(silo, SOURCE)["records"])
+            try:
+                cache = fork_budget.cache_state(silo, cohort)
+                allocated = upper.stat().st_blocks * 512
+                stdout, dispatched, exited = budget_dispatch(
+                    silo, "snapshot", "create", SOURCE, "--live", "--capture-policy", "incremental",
+                    "--name", current_alias)
+                value = json.loads(stdout)
+                directory, seal = checkpoint_value(silo, value)
+                memory = seal["memory"]
+                assert memory["mode"] == "incremental" and memory["fullReason"] is None, memory
+                assert memory["baseline"] == previous_seal["memory"]["ramStream"], memory
+                found = fork.capture_events(silo, info["id"], value["capture"]["captureId"])
+                product = fork.product_interruption(found)
+                observer.wait_beyond(exited)
+                observed = observer.gap(dispatched, exited)
+                assert observed["hostGapSeconds"] + 0.1 >= product["vcpuPausedSeconds"], (observed, product)
+            finally:
+                observer.close()
+            interruption = max(product["conservativeSeconds"], observed["hostGapSeconds"])
+            timing = fork_budget.gated_timing(
+                interruption, allocated_bytes=allocated, bytes_per_second=rate["bytesPerSecond"],
+                reflink=host["reflinkProbe"]["reflink"])
+            evidence.allowance("incremental", timing)
+            stats = memory["stats"]
+            dirty_fraction = stats["identityBytesHashed"] / stats["logicalBytes"]
+            pause_stamp = found[fork.PAUSE_ESTABLISHED][0][0]
+            witness_continues(silo, SOURCE, initial)
+            evidence.sample({
+                "cohort": cohort, "index": index, "gates": ["incremental"],
+                "cache": cache, "space": space, "fixture": fixture, "upper": upper_now,
+                "sourceRun": info["run_id"], "checkpoint": value,
+                "incremental": {
+                    "interruptionSeconds": interruption, **timing,
+                    "callerEndToEndSeconds": (exited - dispatched) / 1e9,
+                    "product": product, "hostObserved": observed,
+                    "dirtyWorkloadBytes": dirty_bytes,
+                    "dirtyWorkloadFraction": dirty_bytes / (4096 * 1024 * 1024),
+                    "dirtyMethod": "overwrite preallocated tmpfs with dd /dev/urandom bs=1M count=410",
+                    "productDirtyFraction": dirty_fraction,
+                    "productDirtyFractionBasis": "memory.stats.identityBytesHashed / logicalBytes (8 MiB chunks)",
+                    "memory": memory,
+                    "pauseToDiskSealedSeconds": [(stamp - pause_stamp) / 1e9
+                                                for stamp, _ in found[fork.DISK_SEALED]],
+                    "monitorLines": {key: [line for _, line in values] for key, values in found.items()},
+                },
+            })
+            # Source-run leases retain staging even after publication. End the
+            # run before pruning, then inherit this cut's accepted baseline
+            # through restore outside the next sample's timed window.
+            stopped.stop(silo, SOURCE, require_clean=False)
+            silo.rm(SOURCE)
+            remove_checkpoint(silo, alias, previous)
+            shutdown.storage_tool(silo, "prune")
+            assert not previous_directory.exists() and not directory.exists(), (
+                "ended source run retained incremental staging", previous_directory, directory)
+            previous, previous_seal, alias = value, seal, current_alias
+            previous_directory = directory
+            if position + 1 < len(fork_budget.SCHEDULE):
+                info = restore.restore_child(silo, "image:" + value["snapshot"]["id"], SOURCE)
+                incremental.require_candidate(info)
+                upper = overlay.upper(silo, SOURCE)
+    finally:
+        trace = fork.source_trace(silo, info["id"])
+        if trace.is_file():
+            (evidence.directory / "source-vm.trace.log").write_text(trace.read_text(errors="replace"))
+    # The last successful sample already stopped and removed its source.
+    remove_checkpoint(silo, alias, previous)
+    shutdown.storage_tool(silo, "prune")
+    summary = evidence.finish()
+    assert all(summary["pass"].values()), (str(evidence.directory), summary["pass"])
+
+
+def prepared_lower(silo: Silo, image: str, name: str) -> dict:
+    """A stopped keeper pins the prepared lower across per-sample pruning."""
+    silo.create(name, image, "--cpus", "2", "--memory", fork_budget.RAM,
+                "--disk-size", fork_budget.UPPER, "--vsock", "--network", "private")
+    record = stopped.record(silo, name)
+    assert record["root"]["kind"] == "linux-overlay", record
+    return {"image": image, "preparedLowerKeeper": record, "ramConfigured": fork_budget.RAM,
+            "upperCapacity": fork_budget.UPPER, "network": "private", "cpus": 2}
+
+
+def test_fork_budget_warm_create_stopped_machine(
+    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
+) -> None:
+    evidence = fork_budget.Evidence("warm-create", budget_host)
+    fork_budget.headroom(silo, 4 * GIB)
+    fixture = prepared_lower(silo, restore_image, "budget-lower-keeper")
+    evidence.record("fixture.json", fixture)
+    for cohort, index in fork_budget.SCHEDULE:
+        # One worst-case 2 GiB upper and 2 GiB margin, no RAM cut.
+        space = fork_budget.headroom(silo, 4 * GIB)
+        name = f"bc-{cohort}-{index}"
+        silo.ws.register_machine(name)
+        cache = fork_budget.cache_state(silo, cohort)
+        _, dispatched, exited = budget_dispatch(
+            silo, "create", restore_image, "--name", name, "--cpus", "2",
+            "--memory", fork_budget.RAM, "--disk-size", fork_budget.UPPER,
+            "--vsock", "--network", "private")
+        record = stopped.record(silo, name)
+        assert record["root"]["kind"] == "linux-overlay", record
+        assert silo.info(name)["state"] == "stopped", record
+        evidence.sample({
+            "cohort": cohort, "index": index, "gates": ["warmCreate"],
+            "cache": cache, "space": space, "fixture": fixture,
+            "warmCreate": {"dispatchToExitSeconds": (exited - dispatched) / 1e9,
+                           "marker": "create CLI exit, machine stopped", "machine": record,
+                           "nonCowAllowanceSeconds": 0.0},
+        })
+        silo.rm(name)
+        shutdown.storage_tool(silo, "prune")
+    silo.rm("budget-lower-keeper")
+    shutdown.storage_tool(silo, "prune")
+    summary = evidence.finish()
+    assert all(summary["pass"].values()), (str(evidence.directory), summary["pass"])
+
+
+def test_fork_budget_boot_layered_within_raw(
+    silo: Silo, restore_image: str, budget_host: dict,  # noqa: F811
+) -> None:
+    evidence = fork_budget.Evidence("boot-layered-raw", budget_host)
+    fork_budget.headroom(silo, 6 * GIB)
+    fixture = prepared_lower(silo, restore_image, "budget-boot-keeper")
+    root_profiles: tuple[RootProfile, RootProfile] = ("raw", "layered")
+    images: dict[RootProfile, str] = {
+        profile: silo.root_image(restore_image, profile) for profile in root_profiles}
+    fixture["rootImages"] = images
+    evidence.record("fixture.json", fixture)
+    for position, (cohort, index) in enumerate(fork_budget.SCHEDULE):
+        # Two worst-case 2 GiB private roots plus 2 GiB margin.
+        space = fork_budget.headroom(silo, 6 * GIB)
+        profiles: tuple[RootProfile, RootProfile] = ("raw", "layered") if position % 2 == 0 else ("layered", "raw")
+        names = {profile: f"bb-{profile}-{cohort}-{index}" for profile in profiles}
+        roots: dict[RootProfile, dict] = {}
+        for profile in profiles:
+            name = names[profile]
+            silo.create(name, images[profile], "--cpus", "2", "--memory", fork_budget.RAM,
+                        "--disk-size", fork_budget.UPPER, "--vsock", "--network", "private")
+            roots[profile] = stopped.record(silo, name)["root"]
+        assert roots["layered"]["kind"] == "linux-overlay", roots
+        assert roots["raw"]["kind"] == "opaque-raw", roots
+        timings: dict[str, dict] = {}
+        caches: dict[str, dict] = {}
+        for profile in profiles:
+            name = names[profile]
+            # Cold eviction is repeated before both starts, so order alone
+            # cannot warm the second profile's runtime/lower inputs.
+            caches[profile] = fork_budget.cache_state(silo, cohort)
+            _, dispatched, exited = budget_dispatch(silo, "start", name, clock=time.time_ns)
+            # Liveness only: the timed endpoint is the product's own trace,
+            # not this later CLI observation (nor its polling cadence).
+            info = silo.wait_ready(name, poll_interval=0.02)
+            assert silo.exec(name, "sh", "-eu", "-c",
+                             "test -d /etc; test -r /etc/os-release; cat /etc/os-release").stdout
+            stopped.stop(silo, name, require_clean=False)
+            # Stop flushes the monitor's asynchronous trace appender before
+            # reading it. Preserve the full trace before removing the machine.
+            trace = fork.source_trace(silo, info["id"])
+            text = trace.read_text(errors="replace")
+            evidence_trace = evidence.directory / f"{name}-vm.trace.log"
+            evidence_trace.write_text(text)
+            timings[profile] = {
+                **fork_budget.boot_timing(
+                    text, trace=trace, machine_id=info["id"], run_id=info["run_id"],
+                    dispatched_ns=dispatched, exited_ns=exited),
+                "runId": info["run_id"], "root": roots[profile],
+                "traceEvidence": str(evidence_trace),
+            }
+        # Retain both full inventories; the aggregate label must not hide a
+        # partially resident profile in a nominally cold pair.
+        labels = {cache["label"] for cache in caches.values()}
+        cache = {"label": "partial-cold" if cohort == "cold" and labels != {"cold"}
+                 else caches[profiles[0]]["label"], "profiles": caches}
+        evidence.sample({
+            "cohort": cohort, "index": index, "gates": ["bootLayeredRatio"],
+            "cache": cache, "space": space, "fixture": fixture, "order": profiles,
+            "bootLayered": timings["layered"], "bootRaw": timings["raw"],
+        })
+        for name in names.values():
+            silo.rm(name)
+        shutdown.storage_tool(silo, "prune")
+    silo.rm("budget-boot-keeper")
+    shutdown.storage_tool(silo, "prune")
+    summary = evidence.finish()
+    assert all(summary["pass"].values()), (str(evidence.directory), summary["pass"])
+
+
 @pytest.mark.parametrize(
     ("reflink", "copies", "allocated", "seconds", "expected_allowance", "expected_gated"),
     [
@@ -357,6 +619,239 @@ def test_copy_allowance_summary_gates(reflink: bool) -> None:
         assert summary["pass"]["restore/cold"] is False
     else:
         assert "restore/cold" not in summary["pass"]
+
+
+@pytest.mark.parametrize("reflink", [False, True], ids=["copy", "reflink"])
+@pytest.mark.parametrize("excess", [1.0, 1.0000001], ids=["boundary", "over"])
+def test_incremental_budget_gate_copy_allowance(reflink: bool, excess: float) -> None:
+    allowance = 0.0 if reflink else 4.0
+    seconds = excess + allowance
+    timing = fork_budget.gated_timing(
+        seconds, allocated_bytes=1024, bytes_per_second=256.0, reflink=reflink)
+    samples = [{
+        "cohort": cohort, "index": index, "cache": {"label": cohort}, "gates": ["incremental"],
+        "incremental": {"interruptionSeconds": seconds, **timing},
+    } for cohort, index in fork_budget.SCHEDULE]
+    summary = fork_budget.summarize(samples)
+    for cohort in ("cold", "warm"):
+        metric = summary["metrics"]["incremental"][cohort]
+        assert metric["samples"] == fork_budget.SAMPLES
+        assert metric["median"] == seconds
+        assert metric["gatedMedian"] == pytest.approx(excess)
+        assert metric["nonCowAllowanceSeconds"]["median"] == allowance
+        assert metric["allowanceInputs"] == [timing["copyAllowance"]] * fork_budget.SAMPLES
+        assert metric["budgeted"] is True
+        assert summary["pass"][f"incremental/{cohort}"] is (excess <= 1.0)
+
+
+@pytest.mark.parametrize("seconds", [2.0, 2.0000001], ids=["boundary", "over"])
+def test_warm_create_budget_gate(seconds: float) -> None:
+    samples = [{
+        "cohort": cohort, "index": index, "cache": {"label": cohort}, "gates": ["warmCreate"],
+        "warmCreate": {"dispatchToExitSeconds": seconds},
+    } for cohort, index in fork_budget.SCHEDULE]
+    summary = fork_budget.summarize(samples)
+    for cohort in ("cold", "warm"):
+        metric = summary["metrics"]["warmCreate"][cohort]
+        assert metric["median"] == metric["gatedMedian"] == seconds
+        assert metric["budgeted"] is True
+        assert summary["pass"][f"warmCreate/{cohort}"] is (seconds <= 2.0)
+
+
+@pytest.mark.parametrize("ratio", [1.2, 1.2000001], ids=["boundary", "over"])
+def test_boot_layered_ratio_budget_gate(ratio: float) -> None:
+    samples = [{
+        "cohort": cohort, "index": index, "cache": {"label": cohort}, "gates": ["bootLayeredRatio"],
+        "bootLayered": {"dispatchToReadySeconds": ratio * 10.0},
+        "bootRaw": {"dispatchToReadySeconds": 10.0},
+    } for cohort, index in fork_budget.SCHEDULE]
+    summary = fork_budget.summarize(samples)
+    for cohort in ("cold", "warm"):
+        metric = summary["metrics"]["bootLayeredRatio"][cohort]
+        assert metric["median"] == metric["gatedMedian"] == ratio
+        assert metric["budgeted"] is True
+        assert summary["pass"][f"bootLayeredRatio/{cohort}"] is (ratio <= 1.2)
+        for raw_metric in ("bootLayered", "bootRaw"):
+            assert summary["metrics"][raw_metric][cohort]["budgeted"] is False
+            assert f"{raw_metric}/{cohort}" not in summary["pass"]
+
+
+def test_boot_layered_ratio_budget_gate_uses_ratio_of_medians() -> None:
+    raw = [1.0, 2.0, 10.0, 20.0, 100.0]
+    layered = [1.0, 2.0, 12.0, 20.0, 100.0]
+    samples = [{
+        "cohort": cohort, "index": index, "cache": {"label": cohort}, "gates": ["bootLayeredRatio"],
+        "bootLayered": {"dispatchToReadySeconds": layered[index]},
+        "bootRaw": {"dispatchToReadySeconds": raw[index]},
+    } for cohort in ("cold", "warm") for index in range(fork_budget.SAMPLES)]
+    summary = fork_budget.summarize(samples)
+    for cohort in ("cold", "warm"):
+        metric = summary["metrics"]["bootLayeredRatio"][cohort]
+        assert metric["median"] == 1.2
+        assert sorted(metric["values"])[2] == 1.0, "paired-ratio median is not the ADR gate"
+        assert summary["pass"][f"bootLayeredRatio/{cohort}"] is True
+
+
+BOOT_MACHINE_ID = "4c6f6355-3a10-4b63-a606-fc6e47e6dd52"
+BOOT_TRACE = "\n".join([
+    "malformed line silo-vmm readiness changed ready=true",
+    f"1970-01-01T00:00:01.100Z INFO silo-vmm generation started machine_id={BOOT_MACHINE_ID} run_id=run",
+    f'1970-01-01T00:00:01.150Z INFO silo-vmm starting instance="a machine" machine_id={BOOT_MACHINE_ID}',
+    '1970-01-01T00:00:01.200Z INFO starting primary VM after probe release event="primary_vm_spawn"',
+    "1970-01-01T00:00:01.300Z INFO krun worker spawned worker_pid=42",
+    f"1970-01-01T00:00:01.400Z INFO vm state changed machine_id={BOOT_MACHINE_ID} previous=Starting current=Running",
+    f'1970-01-01T00:00:01.500Z INFO guest agent became responsive machine_id={BOOT_MACHINE_ID} agent_instance_id=Some("instance") agent_boot_id=Some("boot")',
+    f"1970-01-01T00:00:01.600Z INFO guest agent status changed machine_id={BOOT_MACHINE_ID} current=Some(Ready)",
+    f"1970-01-01T00:00:01.620Z INFO silo-vmm readiness changed machine_id={BOOT_MACHINE_ID} ready=false reason=GuestStarting",
+    f"1970-01-01T00:00:01.650000001Z INFO silo-vmm readiness changed machine_id={BOOT_MACHINE_ID} ready=true reason=GuestReportedReady",
+    f"1970-01-01T00:00:01.900Z INFO guest agent became responsive machine_id={BOOT_MACHINE_ID}",
+])
+
+
+# Verbatim excerpts from the Phase 24 deferred-ext4 candidate evidence:
+# incremental-20261109T112106Z/source-vm.trace.log and
+# boot-layered-raw-20261109T112408Z/bb-raw-cold-0-vm.trace.log.
+BOOT_RESTORED_TRACE = """\
+2026-11-09T11:22:39.200029Z  INFO silo-vmm generation started event="generation_start" machine_id=4c6f6355-3a10-4b63-a606-fc6e47e6dd52 run_id=43d1e890-16ef-49d5-b836-3154c8581648
+2026-11-09T11:22:39.222933Z  INFO silo-vmm starting instance=budget-source machine_id="4c6f6355-3a10-4b63-a606-fc6e47e6dd52" agent_enabled=true
+2026-11-09T11:22:39.223891Z  INFO starting primary VM after probe release event="primary_vm_spawn"
+2026-11-09T11:22:39.225309Z  INFO krun worker spawned worker_pid=3042461
+2026-11-09T11:22:39.249981Z  INFO silo-vmm readiness changed instance=budget-source machine_id=4c6f6355-3a10-4b63-a606-fc6e47e6dd52 previous_ready=false ready=false previous_reason=VmRestoring reason=VmActivating
+2026-11-09T11:22:39.261201Z  INFO guest agent became responsive instance=budget-source machine_id=4c6f6355-3a10-4b63-a606-fc6e47e6dd52 agent_instance_id=Some("4fb82f95-f2ee-4b68-87d9-69084e91f2bf") agent_version=Some("0.1.0") agent_boot_id=Some("0fe0fce4-c0b8-4ad7-81fc-95ebdf74a0b6")
+2026-11-09T11:22:39.261209Z  INFO guest agent status changed instance=budget-source machine_id=4c6f6355-3a10-4b63-a606-fc6e47e6dd52 previous=None current=Some(Starting) code=Some("WORKLOAD_NOT_READY") Some("workload lifecycle is not ready")
+2026-11-09T11:22:39.291091Z  INFO vm state changed instance=budget-source machine_id=4c6f6355-3a10-4b63-a606-fc6e47e6dd52 previous=Activating current=Running Some("vm running")
+2026-11-09T11:22:39.302868Z  INFO guest agent status changed instance=budget-source machine_id=4c6f6355-3a10-4b63-a606-fc6e47e6dd52 previous=Some(Starting) current=Some(Ready) code=None None
+2026-11-09T11:22:39.302879Z  INFO silo-vmm readiness changed instance=budget-source machine_id=4c6f6355-3a10-4b63-a606-fc6e47e6dd52 previous_ready=false ready=true previous_reason=GuestStarting reason=GuestReportedReady
+"""
+BOOT_FRESH_TRACE = """\
+2026-11-09T11:24:12.703357Z  INFO silo-vmm generation started event="generation_start" machine_id=5f1c868c-3e4a-4ea3-8de0-adc42eaae40f run_id=2906f38b-e12a-4cae-8391-c26fbb1a1b1f
+2026-11-09T11:24:12.726124Z  INFO silo-vmm starting instance=bb-raw-cold-0 machine_id="5f1c868c-3e4a-4ea3-8de0-adc42eaae40f" agent_enabled=true
+2026-11-09T11:24:12.726623Z  INFO starting primary VM after probe release event="primary_vm_spawn"
+2026-11-09T11:24:12.727906Z  INFO krun worker spawned worker_pid=3044184
+2026-11-09T11:24:12.748612Z  INFO vm state changed instance=bb-raw-cold-0 machine_id=5f1c868c-3e4a-4ea3-8de0-adc42eaae40f previous=Starting current=Running Some("vm running")
+2026-11-09T11:24:12.748622Z  INFO silo-vmm readiness changed instance=bb-raw-cold-0 machine_id=5f1c868c-3e4a-4ea3-8de0-adc42eaae40f previous_ready=false ready=false previous_reason=VmStarting reason=AgentUnavailable
+2026-11-09T11:24:12.957588Z  INFO guest agent became responsive instance=bb-raw-cold-0 machine_id=5f1c868c-3e4a-4ea3-8de0-adc42eaae40f agent_instance_id=Some("533c0191-55ad-4fc0-a5f7-1af48679eb9a") agent_version=Some("0.1.0") agent_boot_id=Some("363c01f3-c913-4c07-97c8-d26ebe49931d")
+2026-11-09T11:24:12.957600Z  INFO guest agent status changed instance=bb-raw-cold-0 machine_id=5f1c868c-3e4a-4ea3-8de0-adc42eaae40f previous=None current=Some(Starting) code=Some("SSH_NOT_READY") Some("SSH listener verification pending")
+2026-11-09T11:24:12.968507Z  INFO guest agent status changed instance=bb-raw-cold-0 machine_id=5f1c868c-3e4a-4ea3-8de0-adc42eaae40f previous=Some(Starting) current=Some(Ready) code=None None
+2026-11-09T11:24:12.968512Z  INFO silo-vmm readiness changed instance=bb-raw-cold-0 machine_id=5f1c868c-3e4a-4ea3-8de0-adc42eaae40f previous_ready=false ready=true previous_reason=GuestStarting reason=GuestReportedReady
+"""
+
+
+@pytest.mark.parametrize("compact_id", [True, False], ids=["cli-hex", "monitor-uuid"])
+@pytest.mark.parametrize(("text", "machine_id", "run_id", "response_delta_ns"), [
+    (BOOT_RESTORED_TRACE, BOOT_MACHINE_ID, "43d1e890-16ef-49d5-b836-3154c8581648", 61_172_000),
+    (BOOT_FRESH_TRACE, "5f1c868c-3e4a-4ea3-8de0-adc42eaae40f",
+     "2906f38b-e12a-4cae-8391-c26fbb1a1b1f", 254_231_000),
+], ids=["restored-source", "fresh-boot"])
+def test_boot_layered_trace_real_candidate_selects_machine_and_run(
+    text: str, machine_id: str, run_id: str, response_delta_ns: int, compact_id: bool,
+) -> None:
+    generation = lifecycle.events(text, names=("silo-vmm generation started",))[0]
+    assert generation.fields == {
+        "event": "generation_start", "machine_id": machine_id, "run_id": run_id,
+    }
+    other_run = text.replace(run_id, "00000000-0000-0000-0000-000000000001")
+    other_machine = text.replace(machine_id, "00000000-0000-0000-0000-000000000002")
+    trace = Path("logs/machines") / UUID(machine_id).hex / "vm.trace.log"
+    dispatched = generation.realtime_ns - 1_000_000
+    timing = fork_budget.boot_timing(
+        "\n".join([other_run, other_machine, text, other_run, other_machine]),
+        trace=trace, machine_id=UUID(machine_id).hex if compact_id else machine_id,
+        run_id=run_id, dispatched_ns=dispatched, exited_ns=generation.realtime_ns)
+    assert timing["marker"]["line"] == next(
+        line for line in text.splitlines() if "guest agent became responsive" in line)
+    assert timing["marker"]["realtimeNs"] == generation.realtime_ns + response_delta_ns
+    assert timing["dispatchToReadySeconds"] == (response_delta_ns + 1_000_000) / 1e9
+    assert set(timing["availablePhases"]) == {phase for phase, _, _ in fork_budget.BOOT_PHASES}
+
+
+def test_boot_layered_trace_marker_and_phase_deltas() -> None:
+    timing = fork_budget.boot_timing(
+        BOOT_TRACE, trace=Path("logs/machines/machine/vm.trace.log"),
+        machine_id=BOOT_MACHINE_ID, run_id="run", dispatched_ns=1_000_000_000, exited_ns=1_250_000_000)
+    assert timing["dispatchToReadySeconds"] == 0.5
+    assert timing["callerEndToEndSeconds"] == 0.25
+    marker = timing["marker"]
+    assert marker["source"] == "logs/machines/machine/vm.trace.log"
+    assert marker["realtimeNs"] == 1_500_000_000
+    assert "guest agent became responsive" in marker["linePattern"]
+    assert "CLOCK_REALTIME" in marker["clock"]
+    assert timing["availablePhases"] == [phase for phase, _, _ in fork_budget.BOOT_PHASES]
+    assert timing["unavailablePhases"] == ["kernelStart", "initramfs", "rootSwitch"]
+    phases = timing["phases"]
+    assert sum(phase["previousPhaseToPhaseSeconds"] for phase in phases) == pytest.approx(0.650000001)
+    assert phases[-1]["previousPhase"] == "agentReportedReady"
+    assert phases[-1]["previousPhaseToPhaseSeconds"] == 0.050000001
+    assert phases[-1]["dispatchToPhaseSeconds"] == 0.650000001
+    assert phases[-1]["line"].endswith("ready=true reason=GuestReportedReady")
+
+
+def test_boot_layered_trace_selects_exact_generation() -> None:
+    earlier = BOOT_TRACE.replace("run_id=run", "run_id=old")
+    later = BOOT_TRACE.replace("run_id=run", "run_id=later")
+    timing = fork_budget.boot_timing(
+        earlier + "\n" + BOOT_TRACE + "\n" + later, trace=Path("vm.trace.log"),
+        machine_id=BOOT_MACHINE_ID, run_id="run", dispatched_ns=1_000_000_000, exited_ns=1_250_000_000)
+    assert timing["dispatchToReadySeconds"] == 0.5
+
+
+def test_boot_layered_trace_lists_unavailable_phases() -> None:
+    text = "\n".join(line for line in BOOT_TRACE.splitlines()
+                     if "generation started" in line or "guest agent became responsive" in line)
+    timing = fork_budget.boot_timing(
+        text, trace=Path("vm.trace.log"), machine_id=BOOT_MACHINE_ID, run_id="run",
+        dispatched_ns=1_000_000_000, exited_ns=1_250_000_000)
+    assert timing["availablePhases"] == ["monitorGenerationStart", "agentResponsive"]
+    assert "workerSpawn" in timing["unavailablePhases"]
+    assert timing["phases"][-1]["previousPhase"] == "monitorGenerationStart"
+    assert timing["phases"][-1]["previousPhaseToPhaseSeconds"] == 0.4
+
+
+@pytest.mark.parametrize("text", [
+    "", "not a trace",
+    BOOT_TRACE.replace("guest agent became responsive", "guest agent connection lost"),
+    BOOT_TRACE.replace("guest agent became responsive", "guest agent became responsive without fields"),
+    BOOT_TRACE.replace("run_id=run", "run_id=other"),
+    BOOT_TRACE.replace(f"machine_id={BOOT_MACHINE_ID}", "machine_id=other"),
+    BOOT_TRACE.replace(f"guest agent became responsive machine_id={BOOT_MACHINE_ID}",
+                       "guest agent became responsive machine_id=other"),
+    BOOT_TRACE + "\n" + BOOT_TRACE,
+    # A subsequent generation's serving event must not satisfy this run.
+    BOOT_TRACE.replace("guest agent became responsive", "guest agent connection lost") + "\n"
+    + BOOT_TRACE.replace("run_id=run", "run_id=later"),
+], ids=["empty", "malformed", "not-serving", "malformed-serving", "wrong-run", "wrong-machine",
+        "wrong-serving-machine", "duplicate-generation", "next-generation-serving"])
+def test_boot_layered_trace_rejects_missing_or_ambiguous_marker(text: str) -> None:
+    with pytest.raises(AssertionError):
+        fork_budget.boot_timing(
+            text, trace=Path("vm.trace.log"), machine_id=BOOT_MACHINE_ID, run_id="run",
+            dispatched_ns=1_000_000_000, exited_ns=1_250_000_000)
+
+
+def test_boot_layered_trace_rejects_wall_clock_reversal() -> None:
+    with pytest.raises(AssertionError, match="CLOCK_REALTIME moved backwards"):
+        fork_budget.boot_timing(
+            BOOT_TRACE, trace=Path("vm.trace.log"), machine_id=BOOT_MACHINE_ID, run_id="run",
+            dispatched_ns=2_000_000_000, exited_ns=2_250_000_000)
+
+
+def test_evidence_budget_gate_custom_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(fork_budget.EVIDENCE_VARIABLE, str(tmp_path))
+
+    def summary(samples: list[dict]) -> dict:
+        return {"count": len(samples)}
+
+    def markdown(value: dict, host: dict) -> str:
+        return f"{host['name']}: {value['count']}\n"
+
+    evidence = fork_budget.Evidence("custom", {"name": "host"}, summarize=summary, markdown=markdown)
+    evidence.sample({"value": 1})
+    assert evidence.finish() == {"count": 1}
+    assert json.loads((evidence.directory / "summary.json").read_text()) == {"count": 1}
+    assert (evidence.directory / "summary.md").read_text() == "host: 1\n"
+    assert json.loads((evidence.directory / "samples.jsonl").read_text()) == {"value": 1}
 
 
 def test_reflink_probe_and_reference_host_record(

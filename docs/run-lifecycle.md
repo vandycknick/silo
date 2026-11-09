@@ -102,6 +102,30 @@ machine=$(silo run --detach ubuntu:26.04 -- sleep 300)
 silo info "$machine"
 ```
 
+`silo info NAME --format json` reports private-copy persistence separately from
+execution state and readiness in `durability`: `constructed` means the child
+is startable but its persistence barrier has not completed, while `durable`
+means that barrier completed. The plain-output row is **Durability**, next to
+**Ready**. Ordinary created machines are durable; restore and fork join their
+child barriers before returning, so healthy completed children are durable.
+In-progress or barrier-failed live children can still be constructed even when
+running. This field is not a guest-filesystem cleanliness certificate.
+
+Readiness uses the same prerequisites after restore and live-capture resume:
+fresh guest `ready` status and, when SSH is configured, a successful listener
+key exchange checked against the machine's immutable host-key pin. Capture
+temporarily revokes that evidence while it freezes workloads, so
+`WORKLOAD_NOT_READY` during `guest-freeze` is expected even when the source was
+ready at admission. After thaw, public readiness stays false until those
+prerequisites are re-established and the monitor returns to `Running`.
+
+An SSH pin-check timeout immediately reports `SSH_NOT_READY`. The monitor
+still drains the filesystem operation, which cannot be canceled, and consumes
+its eventual result only if the verification target remains current and
+supervision has not been canceled. A delayed successful pin check can thus
+restore readiness without waiting for the next periodic SSH check; a changed
+listener, stopped machine, mismatched pin or canceled supervisor cannot.
+
 ## Storage shutdown and recovery
 
 Lifecycle `stopped` is not a storage-consistency certificate. `silo stop`

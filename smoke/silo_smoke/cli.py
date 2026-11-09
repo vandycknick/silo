@@ -157,7 +157,7 @@ class Silo:
     def ls(self) -> list[dict[str, Any]]:
         return self.json("ls")
 
-    def wait_ready(self, name: str, timeout: float = 90) -> dict[str, Any]:
+    def wait_ready(self, name: str, timeout: float = 90, *, poll_interval: float = 0.25) -> dict[str, Any]:
         # Polls log under their own label, so identity/state `info` counts stay
         # comparable independently of how many readiness retries a boot needed.
         with timed(self.ws, "wait_ready"):
@@ -169,7 +169,7 @@ class Silo:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise SmokeAssertion(f"machine {name} not ready after {timeout}s: {json.dumps(last)}")
-                time.sleep(min(0.25, remaining))
+                time.sleep(min(poll_interval, remaining))
 
     def create(self, name: str, image: str, *flags: str) -> dict[str, Any]:
         self.run("create", image, "--name", name, *flags)

@@ -52,6 +52,14 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
         ("Retention".to_string(), view.retention.clone()),
         ("Agent mode".to_string(), view.agent_mode.clone()),
         ("Ready".to_string(), ui::yes_no(view.ready).to_string()),
+        (
+            "Durability".to_string(),
+            match view.durability {
+                libvm::MachineDurability::Constructed => "constructed",
+                libvm::MachineDurability::Durable => "durable",
+            }
+            .to_string(),
+        ),
         ("Guest".to_string(), view.guest.status.clone()),
         ("CPUs".to_string(), view.resources.cpus.to_string()),
         (
