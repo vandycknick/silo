@@ -494,7 +494,6 @@ mod tests {
                     pause: CapturePauseSource::Acquire,
                     resume_policy: CaptureResumePolicy::ResumeIfAcquired,
                     binding: CaptureDigests {
-                        silo_producer: digest(1),
                         profile: digest(2),
                         topology: digest(3),
                     },
@@ -634,12 +633,12 @@ mod tests {
         };
         use vm_spec::capture::{
             full_dirty_chunks, CaptureFullReason, CaptureMemoryStats, MAX_CAPTURE_RAM_BYTES,
-            MAX_NATIVE_PRODUCER_BYTES,
+            MAX_LIVE_STATE_SCHEMA_BYTES,
         };
         let outcome = CommandOutcome::MemoryCaptured {
             binding: Box::new(CaptureStateBinding {
-                native_producer: "\u{1}".repeat(MAX_NATIVE_PRODUCER_BYTES),
-                silo_producer: digest(1),
+                live_state_schema: "\u{1}".repeat(MAX_LIVE_STATE_SCHEMA_BYTES),
+                architecture: "aarch64".into(),
                 profile: digest(2),
                 topology: digest(3),
                 ram_layout: digest(4),

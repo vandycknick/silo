@@ -972,10 +972,12 @@ def capabilities_cohort(args, _echo) -> dict:
     value = json.loads(result.stdout)
     require(value["schemaVersion"] == 1 and value["scope"] == "host" and value["backend"] == "krun",
         "actual host capability schema")
+    require(value["lane"] == "kvm-x86_64", "capabilities cohort requires the KVM x86_64 host lane")
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
-        require(value["live"][operation]["native"] is True, "Main has not qualified/flipped the exercised native lane")
-        require(value["live"][operation]["availability"] == {"status": "supported"},
-                f"Phase 24 production qualification must admit {operation}")
+        capability = value["live"][operation]
+        require(capability["native"] is True, f"native primitive missing for {operation}")
+        require(capability["availability"] == {"status": "supported"},
+                f"native primitive must support {operation}")
     return {"command": command, "elapsed_ns": time.monotonic_ns() - started,
         "exit_status": result.returncode, "monitor_sha256": digest(args.monitor),
         "actual_json": value, "guest_started": False}

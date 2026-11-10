@@ -559,7 +559,6 @@ async fn live_capabilities_unsupported_operations_refuse_under_real_lock_and_sus
     for reason in [
         LiveReasonCode::BackendExcluded,
         LiveReasonCode::HostOsBelowFloor,
-        LiveReasonCode::LaneNotQualified,
         LiveReasonCode::HypervisorUnavailable,
         LiveReasonCode::BuildExcluded,
         LiveReasonCode::NotDelivered,
@@ -1828,7 +1827,7 @@ async fn live_capabilities_wrong_machine_evidence_fails_before_unsupported_reaso
 
 #[tokio::test]
 async fn live_capabilities_effective_readonly_mount_narrows_positive_but_preserves_host_refusal() {
-    for host_reason in [None, Some(LiveReasonCode::LaneNotQualified)] {
+    for host_reason in [None, Some(LiveReasonCode::HypervisorUnavailable)] {
         // There is deliberately no scenario machine vector. Only the actual
         // effective configured read-only virtiofs mount may narrow this run.
         let mut fixture = Fixture::new(&scenario(host_reason, false)).await;

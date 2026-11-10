@@ -125,8 +125,8 @@ pub struct MinimumCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompatibilityProfile {
-    pub native_producer: String,
-    pub silo_producer: ContentDigest,
+    pub live_state_schema: String,
+    pub architecture: String,
     pub profile: ContentDigest,
     pub topology: ContentDigest,
     pub ram_layout: ContentDigest,
@@ -193,13 +193,15 @@ impl VmArtifactConfigV1 {
             {
                 return Err(invalid("unsupported execution schema/ABI"));
             }
-            if requirements
-                .compatibility_profile
-                .native_producer
-                .is_empty()
-                || requirements.compatibility_profile.native_producer.len() > 64 * 1024
+            let profile = &requirements.compatibility_profile;
+            if profile.live_state_schema.is_empty()
+                || profile.live_state_schema.len() > 256
+                || profile.live_state_schema.contains('\0')
+                || profile.architecture.is_empty()
+                || profile.architecture.len() > 32
+                || profile.architecture.contains('\0')
             {
-                return Err(invalid("native producer byte bound"));
+                return Err(invalid("state schema or architecture byte bound"));
             }
         }
         match (
@@ -785,7 +787,7 @@ mod tests {
         assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
     }
     #[test]
-    fn live_requirements_use_exact_native_producer_string_and_closed_versions() {
+    fn live_requirements_use_state_schema_architecture_and_closed_versions() {
         let mut value = config_value();
         let digest = ContentDigest::of_bytes(b"pin");
         value["content"]["kind"] = json!("snapshot");
@@ -794,11 +796,16 @@ mod tests {
         value["minimumCapabilities"]["liveRestore"] = json!(true);
         value["captureProvenance"] = json!(RecordRef::of_bytes(b"provenance"));
         value["executionRequirements"] = json!({"kind":"krun-v1","executionVersion":1,"executionAbi":1,"deviceVersion":1,
-            "compatibilityProfile":{"nativeProducer":"native-pin","siloProducer":digest,"profile":digest,"topology":digest,"ramLayout":digest}});
+            "compatibilityProfile":{"liveStateSchema":"silo.live-state/1","architecture":"x86_64","profile":digest,"topology":digest,"ramLayout":digest}});
         assert!(wire::decode_vm_config(&serde_json::to_vec(&value).unwrap()).is_ok());
-        for producer in [json!(""), json!("x".repeat(65537)), json!(false)] {
+        for schema in [json!(""), json!("x".repeat(257)), json!(false)] {
             let mut bad = value.clone();
-            bad["executionRequirements"]["compatibilityProfile"]["nativeProducer"] = producer;
+            bad["executionRequirements"]["compatibilityProfile"]["liveStateSchema"] = schema;
+            assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        for architecture in [json!(""), json!("x".repeat(33)), json!(false)] {
+            let mut bad = value.clone();
+            bad["executionRequirements"]["compatibilityProfile"]["architecture"] = architecture;
             assert!(wire::decode_vm_config(&serde_json::to_vec(&bad).unwrap()).is_err());
         }
         for field in ["executionVersion", "executionAbi", "deviceVersion"] {

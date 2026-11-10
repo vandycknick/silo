@@ -2898,8 +2898,8 @@ pub(crate) mod tests {
                 execution: *kernel,
                 devices: *kernel,
                 compatibility_profile: SnapshotCompatibilityProfile {
-                    native_producer: "unit-fixture".into(),
-                    silo_producer: *kernel,
+                    live_state_schema: "silo.live-state/1".into(),
+                    architecture: "x86_64".into(),
                     profile: *kernel,
                     topology: *kernel,
                     ram_layout: *kernel,

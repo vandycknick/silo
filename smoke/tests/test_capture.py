@@ -16,8 +16,6 @@ from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
-# Explicit Phase14 candidate runtime only. Production is intentionally unqualified
-# until the combined capture/restore/fork milestone; never install a runtime grant.
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 PROBE = "/usr/local/bin/capture-counter"
 
@@ -42,7 +40,7 @@ def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_i
     silo.start(name)
     running = silo.wait_ready(name)
     admitted = running["lifecycle"]["report"]["live"]["capture"]["availability"]
-    assert admitted == {"status": "supported"}, "run this gate with the explicit isolated Phase14 candidate"
+    assert admitted == {"status": "supported"}, admitted
     boot_id = silo.exec(name, "cat", "/proc/sys/kernel/random/boot_id").stdout
     generation = pause.generation(silo, name)
     counter = capture.Counter(silo, name, PROBE)
@@ -394,7 +392,7 @@ def test_capture_process_boundary_preserves_only_coherent_closure(
             if capture_policy == "incremental":
                 assert observed_seal is not None
                 binary = silo.ws.config.bin_dir / "examples/live_acceptance"
-                assert binary.is_file(), "build the exact candidate's durable capture driver"
+                assert binary.is_file(), "build the staged runtime's durable capture driver"
                 recovered_live = subprocess.run(
                     [str(binary), name, "complete-capture", plan["captureId"]],
                     env=silo.ws.env(), capture_output=True, text=True, timeout=120,

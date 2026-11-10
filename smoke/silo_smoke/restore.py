@@ -1,8 +1,8 @@
 """Real execution-restore smoke inputs and independent persistent witnesses.
 
-No capability override or synthetic checkpoint is installed here. The caller
-must select Main's isolated compiled capture+restore candidate through the
-normal SILO_SMOKE_BIN_DIR and SILO_SMOKE_RUNTIME_DIR configuration.
+The caller selects the staged runtime through SILO_SMOKE_BIN_DIR and
+SILO_SMOKE_RUNTIME_DIR. No capability override or synthetic checkpoint is
+installed here.
 """
 from __future__ import annotations
 
@@ -49,22 +49,13 @@ def restore_image(config: SmokeConfig, registry: LoopbackRegistry,
     return registry.publish(images.build(spec, images.fetch_alpine(config.cache_dir)), "restore-execution")
 
 
-def require_restore_candidate(info: dict) -> None:
-    live = info["lifecycle"]["report"]["live"]
-    for operation in ("capture", "restore"):
-        assert live[operation]["availability"] == {"status": "supported"}, (
-            "select the explicit isolated capture+restore candidate", operation, live[operation])
-
-
 def create_source(silo: Silo, image: str, *flags: str, profile: RootProfile, name: str = "restore-source",
                   network: str = "none", cpus: int = 2) -> dict:
     assert cpus in (2, 4)
     silo.create(name, silo.root_image(image, profile), "--cpus", str(cpus), "--memory", "512mib",
                 "--disk-size", "512mib", "--vsock", "--network", network, *flags)
     silo.start(name)
-    info = silo.wait_ready(name)
-    require_restore_candidate(info)
-    return info
+    return silo.wait_ready(name)
 
 
 @dataclass(frozen=True)
@@ -332,7 +323,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
     the altered envelope. Thus only an exact native refusal subject, not a hash
     error, satisfies the test. Original provenance is moved back on exit.
     """
-    assert mutation in {"cpu", "producer", "profile", "xsave", "tsc-rate", "msr"}
+    assert mutation in {"cpu", "schema", "architecture", "profile", "xsave", "tsc-rate", "msr"}
     binary = silo.ws.config.bin_dir / "examples/native-live-api"
     assert binary.is_file(), "Main must stage cargo build -p silo-vmm --example native-live-api"
     original = snapshot_record(silo, saved)
@@ -355,9 +346,10 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
     execution_digest, path = object_bytes(silo, content)
     created.append(path)
     record["execution"]["execution"] = execution_digest
-    if mutation == "producer":
-        record["execution"]["compatibilityProfile"]["nativeProducer"] = changed["nativeProducer"]
-        seal["memory"]["binding"]["nativeProducer"] = changed["nativeProducer"]
+    if mutation in {"schema", "architecture"}:
+        field = "liveStateSchema" if mutation == "schema" else "architecture"
+        record["execution"]["compatibilityProfile"][field] = changed[field]
+        seal["memory"]["binding"][field] = changed[field]
     inventory = [entry for entry in seal["inventory"] if entry["role"] == "execution.state"]
     assert len(inventory) == 1
     inventory[0]["length"] = len(content)
@@ -403,7 +395,7 @@ def incompatible_checkpoint(silo: Silo, saved: Checkpoint, mutation: str) -> Ite
             "originalDeviceDigest": original["execution"]["devices"],
             "originalDeviceBinding": saved.seal["memory"]["binding"],
             "negativeExpectedBinding": seal["memory"]["binding"],
-            "producerAdmissionPrecedesDeviceDecoding": mutation == "producer",
+            "schemaAdmissionPrecedesDeviceDecoding": mutation in {"schema", "architecture"},
         }, sort_keys=True) + "\n")
         yield "image:" + snapshot, changed["subject"]
     finally:
@@ -467,7 +459,7 @@ def irq_cut(silo: Silo, saved: Checkpoint, *, pending: bool) -> dict:
 
 @pytest.fixture(scope="session")
 def restore_irq_fixture(config: SmokeConfig) -> Path:
-    """Require Main's exact, separately compiled diagnostic-candidate inputs."""
+    """Authenticate witness inputs against the selected staged monitor."""
     directory = config.runtime_dir / "assets/restore-irq-witness"
     manifest = json.loads((directory / "fixture-manifest.json").read_text())
     for field, filename in (("sourceSha256", "witness.S"), ("binarySha256", "witness.bin"),
@@ -476,14 +468,14 @@ def restore_irq_fixture(config: SmokeConfig) -> Path:
     assert 0 < (directory / "witness.bin").stat().st_size <= 0x3000
     assert 0 < (directory / "witness.nm").stat().st_size <= 65536
     monitor = config.runtime_dir / "bin/silo-vmm"
-    assert overlay.digest(monitor) == manifest["candidateMonitorSha256"]
+    assert overlay.digest(monitor) == manifest["monitorSha256"]
     capabilities = overlay.native_capabilities(monitor)
-    assert capabilities["buildIdentity"] == manifest["nativeSourceIdentity"]
+    assert capabilities["buildIdentity"] == manifest["buildIdentity"]
     return directory
 
 
 def irq_probe(silo: Silo, name: str, request: dict, *, refused: str | None = None) -> dict:
-    """Talk only to the owned candidate worker's compile-gated abstract socket."""
+    """Talk only to the owned worker's compile-gated abstract socket."""
     info = silo.info(name)
     machine_id, run_id = uuid.UUID(info["id"]), uuid.UUID(info["run_id"])
     endpoint = f"\0silo-irq-probe/{machine_id}/{run_id}"
@@ -499,7 +491,7 @@ def irq_probe(silo: Silo, name: str, request: dict, *, refused: str | None = Non
             if not chunk:
                 break
             response.extend(chunk)
-            assert len(response) <= 131072, "oversized candidate IRQ probe response"
+            assert len(response) <= 131072, "oversized IRQ probe response"
     silo.ws.record("restore-irq-probe", json.dumps({
         "machine": name, "machineId": info["id"], "runId": info["run_id"],
         "request": request, "rawResponse": response.decode(errors="replace"),

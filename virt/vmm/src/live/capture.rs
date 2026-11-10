@@ -89,14 +89,12 @@ struct AcceptedMap {
 }
 
 impl CaptureContext {
-    /// `producer` is the monitor's compiled build identity digest; the
-    /// compatibility profile binds backend, lane and build target; the
-    /// topology is the configuration and attachment inventory digest.
+    /// The profile binds backend and lane; topology binds configuration and
+    /// attachment inventory. Neither is a monitor build identity.
     pub(crate) fn new(
         data_dir: PathBuf,
         spec: &vm_spec::VmSpec,
         launch: &crate::virt::StorageLaunch,
-        producer: [u8; 32],
         backend: LiveBackend,
         lane: LiveLane,
     ) -> Result<Self, String> {
@@ -110,14 +108,13 @@ impl CaptureContext {
         };
         let mut profile = sha2::Sha256::new();
         profile.update(b"silo-capture-profile-v1\0");
-        for field in [backend.as_str(), lane.as_str(), env!("SILO_BUILD_TARGET")] {
+        for field in [backend.as_str(), lane.as_str()] {
             profile.update((field.len() as u64).to_be_bytes());
             profile.update(field.as_bytes());
         }
         Ok(Self {
             data_dir,
             digests: CaptureDigests {
-                silo_producer: Digest32(producer),
                 profile: Digest32(profile.finalize().into()),
                 topology: Digest32(*configuration_digest.as_bytes()),
             },
@@ -938,10 +935,9 @@ impl LiveCoordinator {
         binding.capture == wire_uuid(&run.operation)
             && binding.source_run == self.run_uuid
             && Some(binding.pause_generation) == run.cut_generation()
-            && binding.silo_producer == context.digests.silo_producer
             && binding.profile == context.digests.profile
             && binding.topology == context.digests.topology
-            && !binding.native_producer.is_empty()
+            && !binding.live_state_schema.is_empty()
     }
 
     async fn stage_execution_and_memory(&self, run: &mut Run) -> Result<(), Abort> {
@@ -1204,8 +1200,8 @@ impl LiveCoordinator {
             chunk_digests,
             stats: *stats,
             binding: CaptureStateBinding {
-                native_producer: binding.native_producer,
-                silo_producer: digest(binding.silo_producer),
+                live_state_schema: binding.live_state_schema,
+                architecture: binding.architecture,
                 profile: digest(binding.profile),
                 topology: digest(binding.topology),
                 ram_layout: digest(binding.ram_layout),
@@ -2662,7 +2658,7 @@ mod tests {
         }
     }
 
-    const LAYOUT: &[u8] = br#"{"architecture":"x86_64","kind":"ram-layout","packedLength":8192,"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":8192,"streamOffset":0}],"schema":1,"topology":{"ramBelowGap":8192}}"#;
+    const LAYOUT: &[u8] = br#"{"architecture":"x86_64","kind":"ram-layout","magic":"KRUNRAML","packedLength":8192,"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":8192,"streamOffset":0}],"schema":1,"topology":{"ramBelowGap":8192}}"#;
 
     /// Logical length of the staged fixture's writable source.
     const SOURCE_BYTES: u64 = 1 << 20;

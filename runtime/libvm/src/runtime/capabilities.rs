@@ -9,10 +9,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
-use vm_spec::live::{
-    LiveAvailability, LiveBackend, LiveHostReport, LiveOperation, LiveReasonCode,
-    LiveUnsupportedReason,
-};
+use vm_spec::live::{LiveAvailability, LiveBackend, LiveHostReport, LiveOperation};
 
 use crate::runtime::{RuntimeConfig, VirtBackendOverride};
 use crate::LibVmError;
@@ -439,8 +436,7 @@ pub fn require_host_live_operation(
     report.validate().map_err(protocol)?;
     let reason = match &report.live.get(operation).availability {
         LiveAvailability::Unsupported { reason } => reason.clone(),
-        LiveAvailability::Supported if operation == LiveOperation::Restore => return Ok(()),
-        LiveAvailability::Supported => LiveUnsupportedReason::new(LiveReasonCode::NotDelivered),
+        LiveAvailability::Supported => return Ok(()),
     };
     Err(LibVmError::LiveOperationUnsupported {
         operation,
@@ -470,6 +466,50 @@ mod tests {
     use std::future::Future;
     use vm_spec::live::LiveBackend;
 
+    #[test]
+    fn live_capabilities_host_admission_preserves_delivered_support_and_refusals() {
+        use crate::runtime::capabilities::require_host_live_operation;
+        use crate::LibVmError;
+        use vm_spec::live::{
+            LiveAvailability, LiveCapability, LiveCapabilityVector, LiveHostReport, LiveLane,
+            LiveOperation, LiveReasonCode, LiveScope, LIVE_SCHEMA_VERSION,
+        };
+
+        let supported = LiveCapability {
+            native: true,
+            availability: LiveAvailability::Supported,
+        };
+        let mut report = LiveHostReport {
+            schema_version: LIVE_SCHEMA_VERSION,
+            scope: LiveScope::Host,
+            backend: LiveBackend::Krun,
+            lane: LiveLane::KvmX86_64,
+            live: LiveCapabilityVector {
+                pause: supported.clone(),
+                capture: supported.clone(),
+                restore: supported.clone(),
+                fork: supported.clone(),
+                incremental: supported,
+            },
+            build_identity: "unit-producer".into(),
+            scenario_digest: None,
+        };
+        for operation in LiveOperation::ALL {
+            assert!(require_host_live_operation(&report, operation).is_ok());
+        }
+
+        report.live = LiveCapabilityVector::all_unsupported(LiveReasonCode::HypervisorUnavailable);
+        for operation in LiveOperation::ALL {
+            assert!(matches!(
+                require_host_live_operation(&report, operation),
+                Err(LibVmError::LiveOperationUnsupported {
+                    operation: rejected,
+                    reason,
+                    ..
+                }) if rejected == operation && reason.code == LiveReasonCode::HypervisorUnavailable
+            ));
+        }
+    }
     #[tokio::test]
     async fn restore_discovery_reuses_supported_report_and_executable_digest() {
         use vm_spec::live::{LiveAvailability, LiveCapability, LiveCapabilityVector, LiveLane};

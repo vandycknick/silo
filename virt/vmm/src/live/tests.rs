@@ -65,7 +65,7 @@ fn baseline() -> LiveCapabilityVector {
         native: true,
         availability: LiveAvailability::Supported,
     };
-    // This scenario admits capture independently of production qualification.
+    // This scenario supplies the capture primitive.
     live.capture = LiveCapability {
         native: true,
         availability: LiveAvailability::Supported,
@@ -154,7 +154,6 @@ impl Harness {
             root.clone(),
             &spec,
             &launch,
-            crate::capabilities::capture_producer().unwrap(),
             LiveBackend::Mock,
             LiveLane::NotApplicable,
         )

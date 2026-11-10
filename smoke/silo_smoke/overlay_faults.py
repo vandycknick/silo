@@ -14,11 +14,9 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import tarfile
-import tempfile
 
 from .config import REPO
-from .overlay import APPROVED_NATIVE_REVISION, digest, native_capabilities, native_source_identity
+from .overlay import digest, native_capabilities, monitor_build_identity
 
 FAULTS = ("missing", "truncated", "swapped", "duplicate", "reordered", "writable-lower", "readonly-upper", "effective-index-off", "range-observer")
 
@@ -48,17 +46,8 @@ def prepare(destination: Path, native_source: Path, production_monitor: Path, fa
     shutil.copyfile(production_monitor, production_snapshot)
     production_snapshot.chmod(0o700)
     production_report = native_capabilities(production_snapshot, diagnostic=destination / "production-capabilities.log")
-    identity = native_source_identity(production_report)
-    if identity.kind != "path" or identity.state != "clean":
-        raise ValueError("Fault preparation requires a clean production-path native build")
-    revision = identity.revision
-    head = subprocess.run(["git", "-C", str(native_source), "rev-parse", "--verify", "HEAD"], check=True, capture_output=True, text=True, timeout=30).stdout.strip()
-    status = subprocess.run(["git", "-C", str(native_source), "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], check=True, capture_output=True, text=True, timeout=30).stdout
-    if head != revision or status:
-        raise ValueError("Fault source must be the unchanged clean production HEAD observed by the monitor")
-    subprocess.run(["git", "-C", str(native_source), "verify-commit", revision], check=True, capture_output=True, text=True, timeout=30)
-    subprocess.run(["git", "-C", str(native_source), "merge-base", "--is-ancestor", APPROVED_NATIVE_REVISION, revision], check=True, capture_output=True, text=True, timeout=30)
-    provenance = {"nativePin": revision, "declaredNativeBaseline": APPROVED_NATIVE_REVISION, "productionMonitorSha256": digest(production_snapshot), "productionMonitorCapabilities": production_report}
+    monitor_build_identity(production_report)
+    provenance = {"productionMonitorSha256": digest(production_snapshot), "productionMonitorCapabilities": production_report}
     if fault == "effective-index-off":
         mutation = replace_once(source / "guest/init/src/overlay.rs", "    options.extend_from_slice(rootfs_spec::OVERLAY_OPTIONS.as_bytes());", '    options.extend_from_slice(b"index=off,metacopy=off,redirect_dir=nofollow,xino=on,nfs_export=off,uuid=null");')
         verifier = REPO / "guest/init/src/overlay_verify.rs"
@@ -79,16 +68,7 @@ def prepare(destination: Path, native_source: Path, production_monitor: Path, fa
             proof["baseInitramfsSha256"] = digest(base)
             evidence.write_text(json.dumps(proof, indent=2) + "\n")
         return proof
-    native.mkdir()
-    with tempfile.TemporaryFile() as archive:
-        result = subprocess.run(["git", "-C", str(native_source), "archive", "--format=tar", revision], stdout=archive, stderr=subprocess.PIPE, timeout=60)
-        if result.returncode:
-            raise RuntimeError(f"Cannot archive exact corrected native commit {revision}: {result.stderr.decode(errors='replace')}")
-        archive.seek(0)
-        archive_sha256 = hashlib.file_digest(archive, "sha256").hexdigest()
-        archive.seek(0)
-        with tarfile.open(fileobj=archive, mode="r:") as files:
-            files.extractall(native, filter="data")
+    shutil.copytree(native_source, native, symlinks=True, ignore=excluded)
     native_manifest = native / "src/libkrun/Cargo.toml"
     if not native_manifest.is_file():
         raise FileNotFoundError("Expected complete pinned libkrun source checkout")
@@ -119,12 +99,16 @@ def prepare(destination: Path, native_source: Path, production_monitor: Path, fa
     manifest = source / "Cargo.toml"
     text = manifest.read_text()
     patches = re.findall(r'(?m)^\[patch\."https://github\.com/vandycknick/libkrun\.git"\]\nlibkrun = \{ path = "[^"\n]+" \}$', text)
-    if len(patches) != 1:
-        raise ValueError("Expected the explicit production native path patch")
-    mutations.append(replace_once(manifest, patches[0], '[patch."https://github.com/vandycknick/libkrun.git"]\nlibkrun = { path = ' + json.dumps(str(native / "src/libkrun")) + ' }'))
+    replacement = '[patch."https://github.com/vandycknick/libkrun.git"]\nlibkrun = { path = ' + json.dumps(str(native / "src/libkrun")) + ' }'
+    if len(patches) > 1:
+        raise ValueError("Multiple native path patches")
+    if patches:
+        mutations.append(replace_once(manifest, patches[0], replacement))
+    else:
+        manifest.write_text(text + "\n" + replacement + "\n")
     target = destination / "target"
     command = ["cargo", "build", "--offline", "--manifest-path", str(manifest), "--target-dir", str(target), "-p", "silo-vmm", "--bin", "silo-vmm"]
-    proof = {"fault": fault, "nativePin": revision, "nativeArchiveSha256": archive_sha256, "nativeSource": str(native_source), "productionSource": str(REPO), "productionEngineSha256": digest(REPO / "virt/vmm/src/krun/engine.rs"), "mutations": mutations, "command": command, "validationUnchanged": True, "uniqueAttachmentKeysUnchanged": True, "productionStageModified": False}
+    proof = {"fault": fault, "nativeSource": str(native_source), "productionSource": str(REPO), "productionEngineSha256": digest(REPO / "virt/vmm/src/krun/engine.rs"), "mutations": mutations, "command": command, "validationUnchanged": True, "uniqueAttachmentKeysUnchanged": True, "productionStageModified": False}
     proof.update(provenance)
     evidence = destination / "fault-manifest.json"
     evidence.write_text(json.dumps(proof, indent=2) + "\n")
@@ -138,11 +122,9 @@ def prepare(destination: Path, native_source: Path, production_monitor: Path, fa
         proof["binarySha256"] = digest(binary)
         evidence.write_text(json.dumps(proof, indent=2) + "\n")
         report = native_capabilities(binary, diagnostic=destination / "capabilities.log")
-        identity = native_source_identity(report)
-        if identity.kind != "path" or identity.state != "unknown" or identity.revision != "unknown" or identity.content == "unknown":
-            raise ValueError("Archived fault source must expose content-bound, Git-unattested native provenance")
+        monitor_build_identity(report)
         proof["actualCapabilities"] = report
-        proof["nativeBuildIdentity"] = report["buildIdentity"]
+        proof["monitorBuildIdentity"] = report["buildIdentity"]
         evidence.write_text(json.dumps(proof, indent=2) + "\n")
     return proof
 
@@ -151,7 +133,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--native-source", type=Path, required=True)
-    parser.add_argument("--production-monitor", type=Path, required=True, help="Actual corrected staged monitor; private snapshot capabilities bind native revision")
+    parser.add_argument("--production-monitor", type=Path, required=True, help="Actual staged monitor; private snapshot digest records binary evidence")
     parser.add_argument("--fault", choices=(*FAULTS, "all"), default="all")
     parser.add_argument("--build", action="store_true", help="Main-only explicit bounded build after handoffs")
     args = parser.parse_args()

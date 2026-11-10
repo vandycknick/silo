@@ -3,8 +3,7 @@
 Every case drives the real `silo fork --live` against a real guest running the
 detached `restore_execution.c` witness. Results come from the CLI's single
 `LiveForkResult` document, the durable fork journal, the authenticated local
-cut, monitor traces, `/proc` and the guest. Admission is compiled only into the
-isolated `capture_candidate --restore --fork` build, never production policy.
+cut, monitor traces, `/proc` and the guest, using the staged runtime.
 """
 from __future__ import annotations
 
@@ -55,10 +54,8 @@ class Prepared:
 
 
 def require_fork(info: dict) -> None:
-    restore.require_restore_candidate(info)
     live = info["lifecycle"]["report"]["live"]
-    assert live["fork"]["availability"] == {"status": "supported"}, (
-        "select the explicit isolated capture_candidate --restore --fork build", live["fork"])
+    assert live["fork"]["availability"] == {"status": "supported"}, live["fork"]
 
 
 def create(silo: Silo, image: str, *flags: str, profile: RootProfile, name: str = SOURCE,

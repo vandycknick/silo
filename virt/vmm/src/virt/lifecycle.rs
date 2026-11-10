@@ -453,7 +453,6 @@ pub enum CaptureResumePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureDigests {
-    pub silo_producer: Digest32,
     pub profile: Digest32,
     pub topology: Digest32,
 }
@@ -1069,8 +1068,8 @@ impl OutputReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureStateBinding {
-    pub native_producer: String,
-    pub silo_producer: Digest32,
+    pub live_state_schema: String,
+    pub architecture: String,
     pub profile: Digest32,
     pub topology: Digest32,
     /// SHA-256 of the native canonical RAM layout bytes.
@@ -1509,10 +1508,7 @@ impl LifecycleRequest {
                 }
             }
             let digests = preparation.binding;
-            if digests.silo_producer.is_zero()
-                || digests.profile.is_zero()
-                || digests.topology.is_zero()
-            {
+            if digests.profile.is_zero() || digests.topology.is_zero() {
                 return invalid(InvalidRequest::CaptureBinding);
             }
         }
@@ -1783,7 +1779,6 @@ mod tests {
             pause,
             resume_policy,
             binding: CaptureDigests {
-                silo_producer: Digest32([1; 32]),
                 profile: Digest32([2; 32]),
                 topology: Digest32([3; 32]),
             },

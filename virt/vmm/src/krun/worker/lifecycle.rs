@@ -262,8 +262,9 @@ pub(crate) trait NativeLifecycle: Send + Sync + 'static {
     /// Identities no capture output may alias: launch disks and the launch
     /// storage lease. Native additionally refuses RAM backings and baselines.
     fn protected_identities(&self) -> Vec<OutputIdentity>;
-    /// Exact native execution-state producer of this build.
-    fn native_producer(&self) -> Result<String, NativeFailure>;
+    /// Encoded native state format, independent of the monitor build.
+    fn live_state_schema(&self) -> Result<String, NativeFailure>;
+    fn architecture(&self) -> &'static str;
     /// SHA-256 of the native canonical RAM layout bytes.
     fn ram_layout_digest(&self, deadline: Instant) -> Result<Digest32, NativeFailure>;
     fn flush_capture(
@@ -3123,18 +3124,21 @@ impl<N: NativeLifecycle> Shared<N> {
             drop((execution, devices));
             return Self::missing_capture();
         };
-        let binding = self.native.native_producer().and_then(|native_producer| {
-            Ok(CaptureStateBinding {
-                native_producer,
-                silo_producer: digests.silo_producer,
-                profile: digests.profile,
-                topology: digests.topology,
-                ram_layout: self.native.ram_layout_digest(deadline)?,
-                source_run: self.binding.run_id,
-                capture,
-                pause_generation: generation,
-            })
-        });
+        let binding = self
+            .native
+            .live_state_schema()
+            .and_then(|live_state_schema| {
+                Ok(CaptureStateBinding {
+                    live_state_schema,
+                    architecture: self.native.architecture().to_string(),
+                    profile: digests.profile,
+                    topology: digests.topology,
+                    ram_layout: self.native.ram_layout_digest(deadline)?,
+                    source_run: self.binding.run_id,
+                    capture,
+                    pause_generation: generation,
+                })
+            });
         let binding = match binding {
             Ok(binding) => binding,
             Err(failure) => {
@@ -3878,8 +3882,8 @@ mod tests {
 
     fn binding(capture: Uuid) -> CaptureStateBinding {
         CaptureStateBinding {
-            native_producer: "native".into(),
-            silo_producer: Digest32([1; 32]),
+            live_state_schema: "silo.live-state/1".into(),
+            architecture: std::env::consts::ARCH.into(),
             profile: Digest32([2; 32]),
             topology: Digest32([3; 32]),
             ram_layout: Digest32([4; 32]),
@@ -3908,7 +3912,6 @@ mod tests {
                     pause: CapturePauseSource::Acquire,
                     resume_policy: CaptureResumePolicy::ResumeIfAcquired,
                     binding: CaptureDigests {
-                        silo_producer: Digest32([1; 32]),
                         profile: Digest32([2; 32]),
                         topology: Digest32([3; 32]),
                     },

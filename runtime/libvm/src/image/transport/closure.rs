@@ -331,8 +331,8 @@ impl Semantic {
                             execution_abi: 1,
                             device_version: 1,
                             compatibility_profile: wire::CompatibilityProfile {
-                                native_producer: profile.native_producer.clone(),
-                                silo_producer: content(profile.silo_producer),
+                                live_state_schema: profile.live_state_schema.clone(),
+                                architecture: profile.architecture.clone(),
                                 profile: content(profile.profile),
                                 topology: content(profile.topology),
                                 ram_layout: content(profile.ram_layout),

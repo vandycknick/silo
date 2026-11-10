@@ -87,14 +87,14 @@ fn field<const N: usize>(path: &Path) -> eyre::Result<[u8; N]> {
         .map_err(|_| eyre::eyre!("fixed binding field length"))
 }
 fn binding_json(binding: &StateBinding) -> Value {
-    json!({"native_producer":binding.native_producer,"silo_producer":binding.silo_producer,
+    json!({"live_state_schema":binding.live_state_schema,"architecture":binding.architecture,
         "profile":binding.profile,"topology":binding.topology,"ram_layout":binding.ram_layout,
         "source_run":binding.source_run,"capture":binding.capture,"pause_generation":binding.pause_generation})
 }
 fn parse_binding(value: &Value) -> eyre::Result<StateBinding> {
     let binding = StateBinding {
-        native_producer: serde_json::from_value(value["native_producer"].clone())?,
-        silo_producer: serde_json::from_value(value["silo_producer"].clone())?,
+        live_state_schema: serde_json::from_value(value["live_state_schema"].clone())?,
+        architecture: serde_json::from_value(value["architecture"].clone())?,
         profile: serde_json::from_value(value["profile"].clone())?,
         topology: serde_json::from_value(value["topology"].clone())?,
         ram_layout: serde_json::from_value(value["ram_layout"].clone())?,
@@ -103,11 +103,12 @@ fn parse_binding(value: &Value) -> eyre::Result<StateBinding> {
         pause_generation: serde_json::from_value(value["pause_generation"].clone())?,
     };
     ensure!(
-        binding.native_producer
-            == libkrun::capabilities::compiled_live_build()
-                .execution_producer()
-                .map_err(|error| eyre::eyre!(error))?,
-        "independent expected native producer mismatch"
+        binding.live_state_schema == libkrun::capabilities::LIVE_STATE_SCHEMA,
+        "independent expected state schema mismatch"
+    );
+    ensure!(
+        binding.architecture == std::env::consts::ARCH,
+        "independent expected architecture mismatch"
     );
     Ok(binding)
 }
@@ -734,10 +735,8 @@ impl Commands {
         }
         let layout = self.control.ram_layout(deadline())?;
         let binding = StateBinding {
-            native_producer: libkrun::capabilities::compiled_live_build()
-                .execution_producer()
-                .map_err(|error| eyre::eyre!(error))?,
-            silo_producer: field(&self.binding.join("silo-producer"))?,
+            live_state_schema: libkrun::capabilities::LIVE_STATE_SCHEMA.to_string(),
+            architecture: std::env::consts::ARCH.to_string(),
             profile: field(&self.binding.join("profile"))?,
             topology: field(&self.binding.join("topology"))?,
             ram_layout: Sha256::digest(layout.canonical_bytes()).into(),

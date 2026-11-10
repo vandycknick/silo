@@ -59,8 +59,8 @@ pub(crate) fn identity(
         .ok_or_else(|| invalid("restore seal has no memory binding"))?;
     let binding = &memory.binding;
     let binding = StateBinding {
-        native_producer: binding.native_producer.clone(),
-        silo_producer: *binding.silo_producer.as_bytes(),
+        live_state_schema: binding.live_state_schema.clone(),
+        architecture: binding.architecture.clone(),
         profile: *binding.profile.as_bytes(),
         topology: *binding.topology.as_bytes(),
         ram_layout: *binding.ram_layout.as_bytes(),
@@ -172,8 +172,29 @@ pub(crate) fn inspect(
     )
     .map_err(|error| {
         use libkrun::live::inspection::InspectionError;
+        let format_refusal = match &error {
+            InspectionError::Schema { expected, found } => {
+                Some(vm_spec::restore::RestorePortabilityRefusal::new(
+                    "live-state-schema",
+                    *expected,
+                    found.clone(),
+                ))
+            }
+            InspectionError::Architecture { expected, found } => {
+                Some(vm_spec::restore::RestorePortabilityRefusal::new(
+                    "architecture",
+                    *expected,
+                    found.clone(),
+                ))
+            }
+            _ => None,
+        };
+        if let Some(refusal) = format_refusal {
+            return io::Error::new(io::ErrorKind::InvalidData, refusal);
+        }
         let pin = match &error {
-            InspectionError::Producer(_) => "native-producer",
+            InspectionError::Schema { .. } => "live-state-schema",
+            InspectionError::Architecture { .. } => "architecture",
             InspectionError::Lane => "guest-isa/hypervisor",
             InspectionError::Codec { .. } => "capture-abi/device-codec",
             InspectionError::Binding => "execution-binding",
@@ -225,7 +246,8 @@ pub(crate) fn inspect(
             .memory
             .as_ref()
             .map(|memory| match pin {
-                "native-producer" => memory.binding.native_producer.clone(),
+                "live-state-schema" => memory.binding.live_state_schema.clone(),
+                "architecture" => memory.binding.architecture.clone(),
                 "ram-layout" => memory.binding.ram_layout.to_string(),
                 _ => memory.binding.profile.to_string(),
             })

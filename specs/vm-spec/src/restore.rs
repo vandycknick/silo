@@ -438,8 +438,8 @@ pub struct RestoreInspectionReport {
     pub version: u32,
     pub request: Sha256Digest,
     pub checkpoint: Sha256Digest,
-    pub native_producer: String,
-    pub silo_producer: Sha256Digest,
+    pub live_state_schema: String,
+    pub architecture: String,
     pub lane: crate::live::LiveLane,
     pub cpu_count: u32,
     pub ram_bytes: u64,
@@ -534,15 +534,15 @@ impl RestoreInspectionReport {
             (expected != actual).then(|| RestorePortabilityRefusal::new(pin, expected, actual))
         };
         mismatch(
-            "native-producer",
-            memory.binding.native_producer.clone(),
-            self.native_producer.clone(),
+            "live-state-schema",
+            self.live_state_schema.clone(),
+            memory.binding.live_state_schema.clone(),
         )
         .or_else(|| {
             mismatch(
-                "silo-producer",
-                memory.binding.silo_producer.to_string(),
-                self.silo_producer.to_string(),
+                "architecture",
+                self.architecture.clone(),
+                memory.binding.architecture.clone(),
             )
         })
         .or_else(|| {
@@ -588,8 +588,8 @@ impl RestoreInspectionReport {
             || self.version != RESTORE_INSPECTION_VERSION
             || self.request != Sha256Digest::of_bytes(request_bytes)
             || self.checkpoint != request.restore.checkpoint
-            || self.native_producer != memory.binding.native_producer
-            || self.silo_producer != memory.binding.silo_producer
+            || self.live_state_schema != memory.binding.live_state_schema
+            || self.architecture != memory.binding.architecture
             || self.lane == crate::live::LiveLane::NotApplicable
             || self.cpu_count != u32::from(request.restore.configuration.cpus)
             || self.ram_bytes != request.restore.configuration.ram_bytes()
@@ -638,10 +638,10 @@ mod tests {
 
     #[test]
     fn portability_refusals_keep_exact_pin_and_bounded_complete_identity() {
-        let producer = "captured-build-".repeat(5000);
-        let digest = Sha256Digest::of_bytes(producer.as_bytes());
+        let value = "captured-state-".repeat(5000);
+        let digest = Sha256Digest::of_bytes(value.as_bytes());
         let refusal =
-            RestorePortabilityRefusal::new("native-producer", producer, "destination-build");
+            RestorePortabilityRefusal::new("live-state-schema", value, "destination-schema");
         refusal.validate().unwrap();
         assert!(refusal.expected.contains(&digest.to_string()));
         assert!(refusal.expected.len() <= 4096);

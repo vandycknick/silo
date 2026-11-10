@@ -13,17 +13,15 @@ cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm machine::
 cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm virt::config::tests::
 cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm krun::engine::tests::
 cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm capabilities::
-cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm build_inputs::
-cargo test --locked -p silo-vmm --features mock-backend --bin silo-vmm dependency_source::
 cargo test --locked -p silo-vmm --features mock-backend --test capabilities
 ```
 
 The ordinary host suite excludes diagnostic native probe features. Build and
-exercise `restore-irq-probe` separately; its diagnostic identity cannot qualify
-the production lane.
+exercise `restore-irq-probe` separately. Diagnostic instrumentation is not a
+separate state format and cannot substitute for native decoder validation.
 
-Capability Cargo tests use pure linked build facts or the VZ/scenario backend,
-never native host discovery. Real `--backend krun` queries now consume the
+Capability Cargo tests use pure lane/format constants or the VZ/scenario backend,
+never native host discovery. Real `--backend krun` queries consume the
 dependency's read-only system KVM/HVF observations and live in
 `smoke/tests/test_native_capabilities.py`, even though they create no VM.
 
@@ -31,12 +29,17 @@ Phase 11 linked-fact tests expect native pause on all three recognized lanes.
 KVM x86_64 also supports native capture, restore, fork and incremental; those
 four primitives remain unsupported and pending on KVM arm64 and HVF arm64.
 Excluded lanes support none of the five primitives. Public pause, capture,
-restore, fork and incremental are delivered, with Phase 24's immutable Linux
-KVM x86_64 qualification record bound to the exact verified native/build
-identity. Other identities and lanes remain unqualified. Tests distinguish
-native support, public delivery, host admission and qualification; none
-substitutes for another.
-These Cargo tests do not qualify runtime execution on KVM arm64 or HVF.
+restore, fork and incremental are delivered and supported wherever the native
+primitive exists and host checks pass. Tests distinguish native support, public
+delivery and host admission. Capture receipts carry `liveStateSchema` and
+`architecture`, not build fingerprints. Each native decoder checks its own magic
+and schema. Restore inspection rejects mismatched schema or architecture before
+activation, while the complete device inventory remains required:
+
+```sh
+cargo test --locked -p vm-spec inspection_requires_complete_exact_devices_without_imposing_envelope_order
+```
+
 
 To query the actual monitor, build its binary (not only the unit-test harness)
 in the repository development shell with the configured libkrun dependency
@@ -50,12 +53,10 @@ target/debug/silo-vmm capabilities --backend krun --json
 The development shell supplies the native compiler and libclang prerequisites.
 Use the corresponding output path if `CARGO_TARGET_DIR` or an explicit target is
 set. The krun query performs read-only host discovery, not a VM run. Its
-`native: true` fields follow the lane matrix above and do not grant public
-support or runtime qualification. Only the exact compiled Phase 24 qualification
-admits public pause, capture, restore, fork and incremental on Linux KVM x86_64.
-Isolated test candidates remain separate compilations with their own scoped
-operation tables, even when production already admits those operations.
-Mutable qualification grants cannot change any of these results.
+`native: true` fields follow the lane matrix above. Delivered native operations
+are supported subject to host checks; attached devices and guest profiles may
+narrow the running machine's vector. Runtime suites use the staged monitor
+directly.
 
 `make test` discovers these integration tests on the Linux and macOS CI lanes.
 `CARGO_BIN_EXE_silo-vmm` identifies the actual executable, never the Rust

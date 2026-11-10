@@ -1154,7 +1154,7 @@ pub(crate) mod tests {
                 lane: vm_spec::live::LiveLane::KvmX86_64,
                 topology_revision: 1,
                 live: vm_spec::live::LiveCapabilityVector::all_unsupported(
-                    vm_spec::live::LiveReasonCode::LaneNotQualified,
+                    vm_spec::live::LiveReasonCode::BuildExcluded,
                 ),
             },
             vm_spec::lifecycle::VmLifecycleState::Running,

@@ -30,7 +30,7 @@ enum_conversion!(LiveOperation { Pause = 1, Capture = 2, Restore = 3, Fork = 4, 
 enum_conversion!(LiveBackend { Krun = 1, Vz = 2, Mock = 3 });
 enum_conversion!(LiveLane { KvmX86_64 = 1, KvmArm64GicV3 = 2, HvfArm64 = 3, NotApplicable = 4 });
 enum_conversion!(LiveScope { Host = 1, Machine = 2 });
-enum_conversion!(LiveReasonCode { BackendExcluded = 1, HostOsBelowFloor = 2, LaneNotQualified = 3, HypervisorUnavailable = 4, BuildExcluded = 5, NotDelivered = 6, DeviceProfileRejected = 7 });
+enum_conversion!(LiveReasonCode { BackendExcluded = 1, HostOsBelowFloor = 2, HypervisorUnavailable = 4, BuildExcluded = 5, NotDelivered = 6, DeviceProfileRejected = 7 });
 
 macro_rules! read_enum {
     ($value:expr, $name:ident, $field:literal) => {
@@ -183,7 +183,6 @@ impl TryFrom<domain::LiveHostReport> for wire::LiveHostReport {
             lane: Some(value.lane.wire_number()),
             live: Some(encode_vector(value.live)),
             build_identity: Some(value.build_identity),
-            qualification_identity: Some(value.qualification_identity),
             scenario_digest: value.scenario_digest,
         })
     }
@@ -198,10 +197,6 @@ impl TryFrom<wire::LiveHostReport> for domain::LiveHostReport {
             lane: read_enum!(value.lane, LiveLane, "lane"),
             live: required(value.live, "live")?.try_into()?,
             build_identity: required(value.build_identity, "buildIdentity")?,
-            qualification_identity: required(
-                value.qualification_identity,
-                "qualificationIdentity",
-            )?,
             scenario_digest: value.scenario_digest,
         };
         report.validate()?;
@@ -284,7 +279,6 @@ mod tests {
                 domain::LiveReasonCode::NotDelivered,
             ),
             build_identity: "revision".into(),
-            qualification_identity: "empty".into(),
             scenario_digest: None,
         }
     }
@@ -320,13 +314,19 @@ mod tests {
             availability: Some(wire::live_capability::Availability::Supported(())),
         })
         .is_err());
+        assert!(
+            domain::LiveUnsupportedReason::try_from(wire::LiveUnsupportedReason {
+                code: Some(3),
+                subject: None,
+            })
+            .is_err()
+        );
     }
     #[test]
     fn live_capabilities_refusal_roundtrip() {
         let reasons = [
             domain::LiveUnsupportedReason::new(domain::LiveReasonCode::BackendExcluded),
             domain::LiveUnsupportedReason::new(domain::LiveReasonCode::HostOsBelowFloor),
-            domain::LiveUnsupportedReason::new(domain::LiveReasonCode::LaneNotQualified),
             domain::LiveUnsupportedReason::new(domain::LiveReasonCode::HypervisorUnavailable),
             domain::LiveUnsupportedReason::new(domain::LiveReasonCode::BuildExcluded),
             domain::LiveUnsupportedReason::new(domain::LiveReasonCode::NotDelivered),

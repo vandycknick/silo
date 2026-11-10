@@ -87,8 +87,8 @@ fn memory_to_wire(value: &CaptureMemoryEvidence) -> w::CaptureMemoryEvidence {
         regions: value.regions,
         ram_stream: value.ram_stream.to_string(),
         binding: Some(w::CaptureStateBinding {
-            native_producer: binding.native_producer.clone(),
-            silo_producer: binding.silo_producer.to_string(),
+            live_state_schema: binding.live_state_schema.clone(),
+            architecture: binding.architecture.clone(),
             profile: binding.profile.to_string(),
             topology: binding.topology.to_string(),
             ram_layout: binding.ram_layout.to_string(),
@@ -144,11 +144,8 @@ fn memory_from_wire(
         regions: value.regions,
         ram_stream: digest(value.ram_stream, "capture.memory.ram_stream")?,
         binding: CaptureStateBinding {
-            native_producer: binding.native_producer,
-            silo_producer: digest(
-                binding.silo_producer,
-                "capture.memory.binding.silo_producer",
-            )?,
+            live_state_schema: binding.live_state_schema,
+            architecture: binding.architecture,
             profile: digest(binding.profile, "capture.memory.binding.profile")?,
             topology: digest(binding.topology, "capture.memory.binding.topology")?,
             ram_layout: digest(binding.ram_layout, "capture.memory.binding.ram_layout")?,
@@ -519,8 +516,8 @@ mod tests {
             regions: 1,
             ram_stream: identity.finish(),
             binding: vm_spec::capture::CaptureStateBinding {
-                native_producer: "native-test-producer".into(),
-                silo_producer: digest,
+                live_state_schema: "silo.live-state/1".into(),
+                architecture: "x86_64".into(),
                 profile: digest,
                 topology: digest,
                 ram_layout: digest,

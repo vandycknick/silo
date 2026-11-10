@@ -728,7 +728,7 @@ mod tests {
             "guestPlatform":{"os":"linux","architecture":"amd64"},
             "minimumCapabilities":{"storageProfile":"opaque-raw-v1","bootAbi":"silo-direct-v1","liveRestore":live},
             "executionRequirements":if live {Some(serde_json::json!({"kind":"krun-v1","executionVersion":1,"executionAbi":1,"deviceVersion":1,
-                "compatibilityProfile":{"nativeProducer":"native-producer","siloProducer":ObjectDigest::of_bytes(b"silo"),"profile":ObjectDigest::of_bytes(b"profile"),"topology":ObjectDigest::of_bytes(b"topology"),"ramLayout":ObjectDigest::of_bytes(b"layout")}}))}else{None},
+                "compatibilityProfile":{"liveStateSchema":"silo.live-state/1","architecture":"x86_64","profile":ObjectDigest::of_bytes(b"profile"),"topology":ObjectDigest::of_bytes(b"topology"),"ramLayout":ObjectDigest::of_bytes(b"layout")}}))}else{None},
             "streams":record,"objects":record,
             "captureProvenance":provenance.map(|digest|serde_json::json!({"digest":digest,"size":42}))
         })).unwrap();

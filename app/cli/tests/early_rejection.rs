@@ -145,18 +145,23 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
         let live = value["manager"]["live"].as_object().expect("fixed vector");
         assert_eq!(live.len(), 5);
         for operation in LiveOperation::ALL {
-            assert_eq!(
-                live[operation.as_str()]["availability"]["status"],
-                "unsupported"
-            );
-            assert_eq!(
-                live[operation.as_str()]["availability"]["reason"]["code"],
-                if backend == "vz" {
+            let capability = report.live.get(operation);
+            if backend == "vz" {
+                assert_eq!(
+                    live[operation.as_str()]["availability"]["reason"]["code"],
                     "backend-excluded"
-                } else {
-                    "lane-not-qualified"
+                );
+            } else {
+                match &capability.availability {
+                    vm_spec::live::LiveAvailability::Supported => assert!(capability.native),
+                    vm_spec::live::LiveAvailability::Unsupported { reason } => assert!(matches!(
+                        reason.code,
+                        LiveReasonCode::HostOsBelowFloor
+                            | LiveReasonCode::HypervisorUnavailable
+                            | LiveReasonCode::BuildExcluded
+                    )),
                 }
-            );
+            }
         }
         assert!(
             value.get("appliance").is_some(),
@@ -184,12 +189,27 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
         .expect("read-only artifact mode");
     let before = snapshot(temp.path());
     for backend in ["krun", "vz"] {
+        let query = Command::new(test_utils::mock_vmm_binary())
+            .current_dir(temp.path())
+            .args(["capabilities", "--backend", backend, "--json"])
+            .output()
+            .expect("query the CLI fixture monitor");
+        assert!(
+            query.status.success(),
+            "{}",
+            String::from_utf8_lossy(&query.stderr)
+        );
+        let host: LiveHostReport =
+            serde_json::from_slice(&query.stdout).expect("fixture monitor host report");
         for (args, operation) in [
-            (vec!["pause", "absent"], "pause"),
-            (vec!["snapshot", "create", "absent", "--live"], "capture"),
+            (vec!["pause", "absent"], LiveOperation::Pause),
+            (
+                vec!["snapshot", "create", "absent", "--live"],
+                LiveOperation::Capture,
+            ),
             (
                 vec!["fork", "absent", "--name", "unallocated-child", "--live"],
-                "fork",
+                LiveOperation::Fork,
             ),
             (
                 vec![
@@ -198,28 +218,29 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
                     "--name",
                     "unallocated-restore",
                 ],
-                "restore",
+                LiveOperation::Restore,
             ),
         ] {
             let output = run(temp.path(), backend, &args);
             assert!(!output.status.success(), "unsupported {args:?} succeeded");
             assert!(output.stdout.is_empty());
             let error = String::from_utf8(output.stderr).expect("UTF-8 error");
-            assert!(
-                error.contains(&format!("{operation} unsupported")),
-                "{error}"
-            );
-            assert!(error.contains(&format!("backend={backend}")), "{error}");
-            assert!(
-                error.contains(if backend == "vz" {
-                    "backend-excluded"
-                } else if matches!(operation, "pause" | "capture" | "restore" | "fork") {
-                    "lane-not-qualified"
-                } else {
-                    "not-delivered"
-                }),
-                "{error}"
-            );
+            match &host.live.get(operation).availability {
+                vm_spec::live::LiveAvailability::Supported => {
+                    assert!(
+                        !error.contains(&format!("{operation} unsupported")),
+                        "{error}"
+                    );
+                }
+                vm_spec::live::LiveAvailability::Unsupported { reason } => {
+                    assert!(
+                        error.contains(&format!("{operation} unsupported")),
+                        "{error}"
+                    );
+                    assert!(error.contains(&format!("backend={backend}")), "{error}");
+                    assert!(error.contains(reason.code.as_str()), "{error}");
+                }
+            }
             assert_eq!(
                 snapshot(temp.path()),
                 before,
@@ -315,7 +336,7 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
                         incremental: supported,
                     }
                 } else {
-                    LiveCapabilityVector::all_unsupported(LiveReasonCode::LaneNotQualified)
+                    LiveCapabilityVector::all_unsupported(LiveReasonCode::HypervisorUnavailable)
                 },
                 machine: None,
             }),
@@ -413,7 +434,7 @@ async fn early_rejection_actual_mock_run_wins_over_prospective_krun_and_info_rep
         for operation in LiveOperation::ALL {
             assert_eq!(
                 value["live"]["live"][operation.as_str()]["availability"]["reason"]["code"],
-                if positive { "device-profile-rejected" } else { "lane-not-qualified" },
+                if positive { "device-profile-rejected" } else { "hypervisor-unavailable" },
                 "missing guest lifecycle evidence must narrow support, not replace an existing refusal"
             );
         }

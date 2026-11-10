@@ -251,7 +251,7 @@ enum LiveReasonCode {
   LIVE_REASON_CODE_UNSPECIFIED = 0;
   LIVE_REASON_CODE_BACKEND_EXCLUDED = 1;
   LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR = 2;
-  LIVE_REASON_CODE_LANE_NOT_QUALIFIED = 3;
+  reserved 3;
   LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE = 4;
   LIVE_REASON_CODE_BUILD_EXCLUDED = 5;
   LIVE_REASON_CODE_NOT_DELIVERED = 6;
@@ -292,8 +292,9 @@ message LiveHostReport {
   optional LiveBackend backend = 3;
   optional LiveLane lane = 4;
   LiveCapabilityVector live = 5;
+  // Informational v1:silo:<target>:<version>; never a restore compatibility gate.
   optional string build_identity = 6;
-  optional string qualification_identity = 7;
+  reserved 7;
   optional string scenario_digest = 8;
 }
 message LiveMachineReport {

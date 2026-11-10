@@ -163,7 +163,7 @@ fn assert_reason(report: &LiveHostReport, reason: LiveReasonCode) {
 }
 
 #[test]
-fn capabilities_excluded_query_does_not_initialize_paths_and_binds_native_build_facts() {
+fn capabilities_excluded_query_does_not_initialize_paths_and_reports_monitor_metadata() {
     let temp = Temp::new();
     std::fs::write(temp.0.join("sentinel"), b"preserve").expect("write sentinel");
     symlink("missing-target", temp.0.join("sentinel-link")).expect("create symlink");
@@ -171,15 +171,14 @@ fn capabilities_excluded_query_does_not_initialize_paths_and_binds_native_build_
     let report = report(command(&temp, "vz", None));
     assert_eq!(report.backend, LiveBackend::Vz);
     assert_reason(&report, LiveReasonCode::BackendExcluded);
-    assert!(report.build_identity.starts_with(&format!(
-        "v2:{}:{}:{}:content={}:inputs=",
-        env!("SILO_LIBKRUN_SOURCE_KIND"),
-        env!("SILO_LIBKRUN_SOURCE_STATE"),
-        env!("SILO_LIBKRUN_REVISION"),
-        env!("SILO_LIBKRUN_SOURCE_CONTENT"),
-    )));
-    assert!(report.qualification_identity.starts_with("v2:native="));
-    assert!(!report.qualification_identity.contains("native=unobserved"));
+    assert_eq!(
+        report.build_identity,
+        format!(
+            "v1:silo:{}:{}",
+            env!("SILO_BUILD_TARGET"),
+            env!("CARGO_PKG_VERSION")
+        )
+    );
     assert!(report.scenario_digest.is_none());
     assert_eq!(snapshot(&temp.0), before, "query created or modified state");
 }
@@ -230,7 +229,6 @@ mod scenarios {
         for reason in [
             LiveReasonCode::BackendExcluded,
             LiveReasonCode::HostOsBelowFloor,
-            LiveReasonCode::LaneNotQualified,
             LiveReasonCode::HypervisorUnavailable,
             LiveReasonCode::BuildExcluded,
             LiveReasonCode::NotDelivered,

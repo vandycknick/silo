@@ -26,9 +26,9 @@ test = false
 # Compiles the in-process mock virtualization backend for tests. Never enabled
 # in release builds; host test and clippy runs select it explicitly.
 mock-backend = ["dep:test-utils"]
-# Candidate-only native IRQ witness transport for the restore IRQ acceptance
-# gate (Linux x86_64). Never a default or production feature: native
-# device-probe builds carry a diagnostic identity and grant no qualification.
+# Diagnostic native IRQ witness transport for restore acceptance (Linux x86_64).
+# Never a default or production feature; instrumentation does not change the
+# native state format or restore compatibility.
 restore-irq-probe = ["libkrun/native-device-probe"]
 
 [dependencies]
@@ -81,9 +81,6 @@ kvm-ioctls = "0.22.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 rprobe = { path = "../../guest/rprobe" }
 vz = { path = "../../virt/vz" }
-
-[build-dependencies]
-sha2 = "0.11.0"
 
 [dev-dependencies]
 # Native guest fixture: whole-disk ext4 root and its schema-2 launch bootstrap,

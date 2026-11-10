@@ -1305,7 +1305,7 @@ mod tests {
     use crate::LibVmError;
 
     fn report(capture: bool) -> LiveMachineReport {
-        let mut live = LiveCapabilityVector::all_unsupported(LiveReasonCode::LaneNotQualified);
+        let mut live = LiveCapabilityVector::all_unsupported(LiveReasonCode::BuildExcluded);
         if capture {
             live.capture = LiveCapability {
                 native: true,
@@ -1390,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_admission_refuses_unqualified_vector_with_the_reported_reason() {
+    fn capture_admission_refuses_absent_primitive_with_the_reported_reason() {
         let error = admission(
             &observed(false, VmLifecycleState::Running, LiveLifecycle::default()),
             CaptureResumePolicy::ResumeIfAcquired,
@@ -1401,7 +1401,7 @@ mod tests {
                 operation, reason, ..
             } => {
                 assert_eq!(operation, LiveOperation::Capture);
-                assert_eq!(reason.code, LiveReasonCode::LaneNotQualified);
+                assert_eq!(reason.code, LiveReasonCode::BuildExcluded);
             }
             error => panic!("wrong refusal: {error}"),
         }

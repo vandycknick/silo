@@ -131,7 +131,7 @@ rate, which the allowance is defined to cover.
 
 ## Deferred budgets (ADR 0014 table, ADR 0021 incremental)
 
-Measured 2026-11-09 on the Batch 3 candidate with the new cohorts in
+Measured 2026-11-09 on the Batch 3 runtime with the new cohorts in
 `smoke/tests/test_fork_budget.py` (incremental, prepared create, layered vs
 raw boot) and `smoke/tests/test_ingest_budget.py` (cold OCI prepare). The
 boot marker is the monitor's `guest agent became responsive` trace event

@@ -285,12 +285,9 @@ def reference_host(silo: Silo) -> dict:
     inputs = {"silo": silo.ws.config.silo, "silo-vmm": runtime / "bin/silo-vmm",
               "kernel": runtime / "assets/kernel-default", "initramfs": runtime / "assets/initramfs",
               "agent": runtime / "assets/agent"}
-    manifest = silo.ws.config.bin_dir.parent / "candidate-manifest.json"
-    candidate = None
-    if manifest.is_file():
-        value = json.loads(manifest.read_text())
-        candidate = {"path": str(manifest), "sha256": _digest(manifest), "scope": value.get("scope"),
-                     "candidateMonitorSha256": value.get("candidateMonitorSha256")}
+    monitor = inputs["silo-vmm"]
+    capabilities = overlay.native_capabilities(monitor)
+    overlay.monitor_build_identity(capabilities)  # Informational metadata; binary SHA-256 is evidence.
     # Same convention as the other smoke gates: the staged kernel's emitted .config.
     configured = os.environ.get("SILO_SMOKE_KERNEL_CONFIG")
     kernel_config = None
@@ -305,7 +302,9 @@ def reference_host(silo: Silo) -> dict:
         "reflinkProbe": reflink_probe(silo.ws.root),
         "sequentialHash": sequential_hash_rate(silo.ws.root / "budget-sequential-hash.raw"),
         "inputs": {name: {"path": str(path), "sha256": _digest(path)} for name, path in inputs.items()},
-        "guestKernelConfig": kernel_config, "candidate": candidate,
+        "guestKernelConfig": kernel_config,
+        "monitor": {"path": str(monitor), "sha256": _digest(monitor),
+                    "buildIdentity": capabilities["buildIdentity"]},
     }
 
 

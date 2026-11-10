@@ -4,9 +4,8 @@ Exact fixture, cohorts, cache method and boundaries are documented in
 `silo_smoke/fork_budget.py` and `smoke/README.md`. Each test writes its reference-host record,
 per-sample text and median/min/max summary under `SILO_SMOKE_BUDGET_EVIDENCE`
 before asserting, so a failing budget still leaves its measured evidence.
-Live-operation admission comes only from an isolated `capture_candidate`
-build with the required restore, fork or incremental switches; a budget
-failure blocks qualification, it never relaxes a target.
+Live operations run directly against the staged runtime. A budget failure
+never relaxes a target.
 """
 from __future__ import annotations
 
@@ -66,7 +65,6 @@ def budget_source(silo: Silo, image: str, name: str = SOURCE, *, require_fork: b
     assert stopped.record(silo, name)["root"]["kind"] == "linux-overlay", "budget fixture is the default layered root"
     silo.start(name)
     info = silo.wait_ready(name)
-    restore.require_restore_candidate(info)
     if require_fork:
         live = info["lifecycle"]["report"]["live"]
         assert live["fork"]["availability"] == {"status": "supported"}, live["fork"]
@@ -336,7 +334,6 @@ def test_fork_budget_incremental_ten_percent_dirty(
     fork_budget.headroom(silo, required)
     source = budget_source(silo, incremental_image, require_fork=False)
     info, initial, upper = source["info"], source["initial"], source["upper"]
-    incremental.require_candidate(info)
     fixture = fixture_proof(silo, SOURCE, upper)
     fixture["image"] = "incremental-memory (BASIC Alpine + incremental and execution probes)"
     dirty_bytes = 410 * 1024 * 1024
@@ -442,7 +439,6 @@ def test_fork_budget_incremental_ten_percent_dirty(
             previous_directory = directory
             if position + 1 < len(fork_budget.SCHEDULE):
                 info = restore.restore_child(silo, "image:" + value["snapshot"]["id"], SOURCE)
-                incremental.require_candidate(info)
                 upper = overlay.upper(silo, SOURCE)
     finally:
         trace = fork.source_trace(silo, info["id"])
@@ -847,7 +843,7 @@ BOOT_TRACE = "\n".join([
 ])
 
 
-# Verbatim excerpts from the Phase 24 deferred-ext4 candidate evidence:
+# Verbatim excerpts from the Phase 24 deferred-ext4 runtime evidence:
 # incremental-20261109T112106Z/source-vm.trace.log and
 # boot-layered-raw-20261109T112408Z/bb-raw-cold-0-vm.trace.log.
 BOOT_RESTORED_TRACE = """\
@@ -882,7 +878,7 @@ BOOT_FRESH_TRACE = """\
     (BOOT_FRESH_TRACE, "5f1c868c-3e4a-4ea3-8de0-adc42eaae40f",
      "2906f38b-e12a-4cae-8391-c26fbb1a1b1f", 254_231_000),
 ], ids=["restored-source", "fresh-boot"])
-def test_boot_layered_trace_real_candidate_selects_machine_and_run(
+def test_boot_layered_trace_real_runtime_selects_machine_and_run(
     text: str, machine_id: str, run_id: str, response_delta_ns: int, compact_id: bool,
 ) -> None:
     generation = lifecycle.events(text, names=("silo-vmm generation started",))[0]

@@ -537,7 +537,7 @@ enum CaptureSourceOutcome { CAPTURE_SOURCE_OUTCOME_UNSPECIFIED = 0; CAPTURE_SOUR
 // Capture ID equals the Capture request and monitor operation ID. Staging is
 // relative to the Silo home and is never restore authority.
 enum CaptureFullReason { CAPTURE_FULL_REASON_UNSPECIFIED = 0; CAPTURE_FULL_REASON_REQUESTED = 1; CAPTURE_FULL_REASON_NO_BASELINE = 2; CAPTURE_FULL_REASON_BASELINE_TOKEN = 3; CAPTURE_FULL_REASON_COVERAGE_LOST = 4; CAPTURE_FULL_REASON_DIRTY_CROSSOVER = 5; }
-message CaptureStateBinding { string native_producer = 1; string silo_producer = 2; string profile = 3; string topology = 4; string ram_layout = 5; string source_run = 6; uint64 pause_generation = 7; string capture = 8; }
+message CaptureStateBinding { reserved 1, 2; string profile = 3; string topology = 4; string ram_layout = 5; string source_run = 6; uint64 pause_generation = 7; string capture = 8; string live_state_schema = 9; string architecture = 10; }
 enum CaptureSeedMethod { CAPTURE_SEED_METHOD_UNSPECIFIED = 0; CAPTURE_SEED_METHOD_CLONE = 1; CAPTURE_SEED_METHOD_REBUILD = 2; }
 message CaptureMemoryStats {
  uint64 logical_bytes = 1;
@@ -622,7 +622,7 @@ enum LiveOperation { LIVE_OPERATION_UNSPECIFIED = 0; LIVE_OPERATION_PAUSE = 1; L
 enum LiveBackend { LIVE_BACKEND_UNSPECIFIED = 0; LIVE_BACKEND_KRUN = 1; LIVE_BACKEND_VZ = 2; LIVE_BACKEND_MOCK = 3; }
 enum LiveLane { LIVE_LANE_UNSPECIFIED = 0; LIVE_LANE_KVM_X86_64 = 1; LIVE_LANE_KVM_ARM64_GIC_V3 = 2; LIVE_LANE_HVF_ARM64 = 3; LIVE_LANE_NOT_APPLICABLE = 4; }
 enum LiveScope { LIVE_SCOPE_UNSPECIFIED = 0; LIVE_SCOPE_HOST = 1; LIVE_SCOPE_MACHINE = 2; }
-enum LiveReasonCode { LIVE_REASON_CODE_UNSPECIFIED = 0; LIVE_REASON_CODE_BACKEND_EXCLUDED = 1; LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR = 2; LIVE_REASON_CODE_LANE_NOT_QUALIFIED = 3; LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE = 4; LIVE_REASON_CODE_BUILD_EXCLUDED = 5; LIVE_REASON_CODE_NOT_DELIVERED = 6; LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED = 7; }
+enum LiveReasonCode { reserved 3; LIVE_REASON_CODE_UNSPECIFIED = 0; LIVE_REASON_CODE_BACKEND_EXCLUDED = 1; LIVE_REASON_CODE_HOST_OS_BELOW_FLOOR = 2; LIVE_REASON_CODE_HYPERVISOR_UNAVAILABLE = 4; LIVE_REASON_CODE_BUILD_EXCLUDED = 5; LIVE_REASON_CODE_NOT_DELIVERED = 6; LIVE_REASON_CODE_DEVICE_PROFILE_REJECTED = 7; }
 message LiveDeviceSubject {
  oneof subject {
   google.protobuf.Empty virtiofs = 1;
@@ -640,7 +640,7 @@ message LiveCapability {
  oneof availability { google.protobuf.Empty supported = 2; LiveUnsupportedReason unsupported = 3; }
 }
 message LiveCapabilityVector { LiveCapability pause = 1; LiveCapability capture = 2; LiveCapability restore = 3; LiveCapability fork = 4; LiveCapability incremental = 5; }
-message LiveHostReport { optional uint32 schema_version = 1; optional LiveScope scope = 2; optional LiveBackend backend = 3; optional LiveLane lane = 4; LiveCapabilityVector live = 5; optional string build_identity = 6; optional string qualification_identity = 7; optional string scenario_digest = 8; }
+message LiveHostReport { reserved 7; optional uint32 schema_version = 1; optional LiveScope scope = 2; optional LiveBackend backend = 3; optional LiveLane lane = 4; LiveCapabilityVector live = 5; optional string build_identity = 6; optional string scenario_digest = 8; }
 message LiveMachineReport { optional uint32 schema_version = 1; optional LiveScope scope = 2; optional string machine_id = 3; optional string run_id = 4; optional string monitor_id = 5; optional LiveBackend backend = 6; optional LiveLane lane = 7; optional uint64 topology_revision = 8; LiveCapabilityVector live = 9; }
 message LiveOperationUnsupported { optional LiveOperation operation = 1; optional LiveBackend backend = 2; optional LiveLane lane = 3; LiveUnsupportedReason reason = 4; }
 enum LiveEvidenceState { LIVE_EVIDENCE_STATE_UNSPECIFIED = 0; LIVE_EVIDENCE_STATE_RUN = 1; LIVE_EVIDENCE_STATE_PROSPECTIVE = 2; LIVE_EVIDENCE_STATE_UNAVAILABLE = 3; }

@@ -29,8 +29,6 @@ from silo_smoke.cli import Silo
 from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
-# Explicit isolated candidate runtime only, like test_capture.py; this suite
-# does not grant or extend Phase 24's exact-build production qualification.
 pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
 PROBE = "/usr/local/bin/capture-counter"
 NAME = "capture-lifecycle"
@@ -252,7 +250,7 @@ def captured(silo: Silo, image: str, boundary: str, policy: str,
             assert trace.wait("capture-traced-start.json")["code"] == 0
             running = silo.wait_ready(NAME)
             admitted = running["lifecycle"]["report"]["live"]["capture"]["availability"]
-            assert admitted == {"status": "supported"}, "run this gate with the explicit isolated Phase14 candidate"
+            assert admitted == {"status": "supported"}, admitted
             counter = capture.Counter(silo, NAME, PROBE)
             counter.advances()
             borrowed = None

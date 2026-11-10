@@ -201,7 +201,7 @@ fn verify_devices(
             1 => 131_072,
             2 | 5 => 4096,
             3 => MAX_DEVICE_PAYLOAD,
-            4 => 22,
+            4 => 32,
             19 => 65_536,
             0x5347 => 256, // Silo generation device STATE_LIMIT.
             _ => return Err(invalid("native device provider kind is unsupported")),
@@ -299,29 +299,16 @@ impl<'a> HeaderReader<'a> {
         std::str::from_utf8(output).map_err(invalid)
     }
     fn binding(&mut self, expected: &CaptureStateBinding) -> Result<(), LibVmError> {
-        let count = self.count(vm_spec::capture::MAX_NATIVE_PRODUCER_BYTES, 1)?;
-        if count != expected.native_producer.len() || count == 0 {
-            return Err(invalid(
-                "native state producer differs from capture evidence",
-            ));
-        }
         let mut buffer = [0; 256];
-        for expected_chunk in expected.native_producer.as_bytes().chunks(buffer.len()) {
-            let actual = &mut buffer[..expected_chunk.len()];
-            self.file.read_exact_at(actual, self.offset)?;
-            self.offset += actual.len() as u64;
-            if actual != expected_chunk {
-                return Err(invalid(
-                    "native state producer differs from capture evidence",
-                ));
-            }
+        let schema = self.text(&mut buffer, vm_spec::capture::MAX_LIVE_STATE_SCHEMA_BYTES)?;
+        if schema.is_empty() || schema != expected.live_state_schema {
+            return Err(invalid("native state schema differs from capture evidence"));
         }
-        for digest in [
-            &expected.silo_producer,
-            &expected.profile,
-            &expected.topology,
-            &expected.ram_layout,
-        ] {
+        let architecture = self.text(&mut buffer, vm_spec::capture::MAX_ARCHITECTURE_BYTES)?;
+        if architecture.is_empty() || architecture != expected.architecture {
+            return Err(invalid("native architecture differs from capture evidence"));
+        }
+        for digest in [&expected.profile, &expected.topology, &expected.ram_layout] {
             if digest.as_bytes() == &[0; 32] || &self.fixed::<32>()? != digest.as_bytes() {
                 return Err(invalid(
                     "native state binding digest differs from capture evidence",
@@ -367,8 +354,8 @@ mod tests {
 
     fn binding() -> CaptureStateBinding {
         CaptureStateBinding {
-            native_producer: "device-envelope-unit-test".into(),
-            silo_producer: Sha256Digest::of_bytes(b"silo"),
+            live_state_schema: "silo.live-state/1".into(),
+            architecture: "x86_64".into(),
             profile: Sha256Digest::of_bytes(b"profile"),
             topology: Sha256Digest::of_bytes(b"topology"),
             ram_layout: Sha256Digest::of_bytes(b"layout"),
@@ -412,13 +399,9 @@ mod tests {
         let binding = binding();
         let mut bytes = b"KRUNDEVS".to_vec();
         bytes.extend_from_slice(&1u16.to_le_bytes());
-        text(&mut bytes, &binding.native_producer);
-        for digest in [
-            binding.silo_producer,
-            binding.profile,
-            binding.topology,
-            binding.ram_layout,
-        ] {
+        text(&mut bytes, &binding.live_state_schema);
+        text(&mut bytes, &binding.architecture);
+        for digest in [binding.profile, binding.topology, binding.ram_layout] {
             bytes.extend_from_slice(digest.as_bytes());
         }
         bytes.extend_from_slice(
@@ -450,24 +433,44 @@ mod tests {
     }
 
     #[test]
-    fn device_envelope_preserves_full_native_producer_and_rejects_overflow() {
+    fn device_envelope_preserves_schema_and_rejects_overflow() {
         for length in [
-            8239,
-            vm_spec::capture::MAX_NATIVE_PRODUCER_BYTES,
-            vm_spec::capture::MAX_NATIVE_PRODUCER_BYTES + 1,
+            0,
+            1,
+            vm_spec::capture::MAX_LIVE_STATE_SCHEMA_BYTES,
+            vm_spec::capture::MAX_LIVE_STATE_SCHEMA_BYTES + 1,
         ] {
             let mut expected = binding();
             let mut bytes = envelope(&[]);
-            let old_length = expected.native_producer.len();
-            expected.native_producer = "p".repeat(length);
-            let mut producer = Vec::new();
-            text(&mut producer, &expected.native_producer);
-            bytes.splice(10..14 + old_length, producer);
+            let old_length = expected.live_state_schema.len();
+            expected.live_state_schema = "p".repeat(length);
+            let mut encoded_schema = Vec::new();
+            text(&mut encoded_schema, &expected.live_state_schema);
+            bytes.splice(10..14 + old_length, encoded_schema);
             assert_eq!(
                 verify_devices(&file(&bytes), &expected, &[]).is_ok(),
-                length <= vm_spec::capture::MAX_NATIVE_PRODUCER_BYTES
+                length > 0 && length <= vm_spec::capture::MAX_LIVE_STATE_SCHEMA_BYTES
             );
-            bytes[14 + length - 1] = b'q';
+            if length > 0 {
+                bytes[14 + length - 1] = b'q';
+                assert!(verify_devices(&file(&bytes), &expected, &[]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn device_envelope_requires_bounded_matching_architecture() {
+        for architecture in [
+            "",
+            "aarch64",
+            &"a".repeat(vm_spec::capture::MAX_ARCHITECTURE_BYTES + 1),
+        ] {
+            let expected = binding();
+            let mut bytes = envelope(&[]);
+            let start = 14 + expected.live_state_schema.len();
+            let mut encoded = Vec::new();
+            text(&mut encoded, architecture);
+            bytes.splice(start..start + 4 + expected.architecture.len(), encoded);
             assert!(verify_devices(&file(&bytes), &expected, &[]).is_err());
         }
     }
@@ -626,7 +629,7 @@ mod tests {
             (1, 131_072),
             (2, 4096),
             (3, MAX_DEVICE_PAYLOAD),
-            (4, 22),
+            (4, 32),
             (5, 4096),
             (19, 65_536),
             (0x5347, 256),

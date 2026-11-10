@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 pub(crate) fn run(arguments: Vec<OsString>) -> eyre::Result<()> {
     ensure!(
         arguments.len() == 3,
-        "usage: native-live-api mutate-execution INPUT OUTPUT cpu|producer|profile|xsave|tsc-rate|msr"
+        "usage: native-live-api mutate-execution INPUT OUTPUT cpu|schema|architecture|profile|xsave|tsc-rate|msr"
     );
     let input = Path::new(&arguments[0]);
     let output = Path::new(&arguments[1]);
@@ -36,9 +36,13 @@ pub(crate) fn run(arguments: Vec<OsString>) -> eyre::Result<()> {
             }
             "kvm/cpuid/destination-family-model-stepping"
         }
-        "producer" => {
-            saved.binding.native_producer.push_str("-incompatible");
-            "exact native producer mismatch: exact build identity"
+        "schema" => {
+            saved.binding.live_state_schema.push_str("-incompatible");
+            "silo.live-state/1-incompatible"
+        }
+        "architecture" => {
+            saved.binding.architecture = "aarch64".into();
+            "aarch64"
         }
         "profile" => {
             let VmExecutionState::Kvm(kvm::KvmVmState::X86(vm)) = &mut saved.vm else {
@@ -103,7 +107,8 @@ pub(crate) fn run(arguments: Vec<OsString>) -> eyre::Result<()> {
         "{}",
         json!({
             "mutation": kind, "subject": subject, "length": bytes.len(), "sha256": digest,
-            "nativeProducer": saved.binding.native_producer,
+            "liveStateSchema": saved.binding.live_state_schema,
+            "architecture": saved.binding.architecture,
             "codec": "public ExecutionEnvelope decode/encode",
         })
     )?;
