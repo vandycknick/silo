@@ -44,3 +44,6 @@ opt-level = 3
 [patch.crates-io]
 signal-hook-registry = { path = "vendor/signal-hook-registry" }
 
+[patch."https://github.com/vandycknick/libkrun.git"]
+libkrun = { path = "/home/nickvd/Projects/worktrees/libkrun/silo-production/src/libkrun" }
+

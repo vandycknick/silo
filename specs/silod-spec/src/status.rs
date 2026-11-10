@@ -154,6 +154,10 @@ pub struct SystemStatus {
     /// Release cycles that failed during this VM run, when reported.
     #[serde(default)]
     pub host_memory_reclaim_failed_operations: Option<u64>,
+    /// Discards skipped at the host mapping-count bound.
+    pub host_memory_reclaim_mapping_limit_skips: Option<u64>,
+    /// Current anonymous replacement islands in restored RAM.
+    pub host_memory_reclaim_replaced_islands: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +192,8 @@ struct RawSystemStatus {
     host_memory_reclaim_failed_operations: Option<u64>,
     host_memory_reclaim_backing: Option<String>,
     host_memory_reclaim_reason: Option<String>,
+    host_memory_reclaim_mapping_limit_skips: Option<u64>,
+    host_memory_reclaim_replaced_islands: Option<u64>,
 }
 
 impl TryFrom<RawSystemStatus> for SystemStatus {
@@ -223,6 +229,8 @@ impl TryFrom<RawSystemStatus> for SystemStatus {
             host_memory_reclaim_failed_operations: raw.host_memory_reclaim_failed_operations,
             host_memory_reclaim_backing: raw.host_memory_reclaim_backing,
             host_memory_reclaim_reason: raw.host_memory_reclaim_reason,
+            host_memory_reclaim_mapping_limit_skips: raw.host_memory_reclaim_mapping_limit_skips,
+            host_memory_reclaim_replaced_islands: raw.host_memory_reclaim_replaced_islands,
         };
         status.validate()?;
         Ok(status)

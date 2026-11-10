@@ -174,6 +174,8 @@ pub struct HostMemoryReclaimReport {
     /// Skipped operations, not a universal count of queue heads or pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
+    pub mapping_limit_skips: u64,
+    pub replaced_islands: u64,
     pub observed_at: SystemTime,
 }
 
