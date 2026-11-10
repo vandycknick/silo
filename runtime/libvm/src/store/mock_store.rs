@@ -75,9 +75,12 @@ mock! {
             name: &str,
         ) -> Result<Option<MachineConfig>, LibVmError>;
 
+        async fn machine_name_in_use(&self, name: &str) -> Result<bool, LibVmError>;
+
         async fn machine_configs_by_id_prefix(
             &self,
             prefix: &str,
+            name: &str,
         ) -> Result<Vec<MachineConfig>, LibVmError>;
 
         async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError>;

@@ -86,12 +86,8 @@ impl SystemRuntime {
     }
 
     pub(crate) async fn ensure_name_available(&mut self, name: &str) -> eyre::Result<()> {
-        let reference = MachineRef::parse(name)?;
-        match self.runtime.get_machine(&reference).await {
-            Ok(_) => eyre::bail!("machine {name:?} already exists"),
-            Err(libvm::LibVmError::MachineNotFound { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        self.runtime.ensure_name_available(name).await?;
+        Ok(())
     }
 
     /// Resolves `reference` without materializing it. `Always` asks the registry

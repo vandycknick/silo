@@ -143,8 +143,8 @@ pub fn reference_to_wire(v: &libvm::MachineRef) -> Result<w::MachineRef, Convers
         Reference::Id(id.simple().to_string())
     } else if let Some(name) = v.name() {
         Reference::Name(name.into())
-    } else if let Some(prefix) = v.id_prefix() {
-        Reference::IdPrefix(prefix.into())
+    } else if let Some(name) = v.id_prefix_name() {
+        Reference::IdPrefix(name.into())
     } else {
         return Err(invalid("machine.reference", "unsupported native variant"));
     };
@@ -161,8 +161,11 @@ pub fn reference_from_wire(v: w::MachineRef) -> Result<libvm::MachineRef, Conver
         Reference::Name(v) => (v, 2),
         Reference::IdPrefix(v) => (v, 3),
     };
-    let native = libvm::MachineRef::parse(text)
-        .map_err(|_| invalid("machine.reference", "invalid native reference"))?;
+    let native = match kind {
+        2 => libvm::MachineRef::parse_exact(text),
+        _ => libvm::MachineRef::parse(text),
+    }
+    .map_err(|_| invalid("machine.reference", "invalid native reference"))?;
     let matches = match kind {
         1 => native.id_uuid().is_some(),
         2 => native.name().is_some(),

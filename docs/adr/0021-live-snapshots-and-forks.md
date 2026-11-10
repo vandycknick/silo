@@ -537,6 +537,22 @@ presented as remote lazy restore.
 
 ### Accounting
 
+A capture alone writes RAM to a file and reserves only its bounded capture
+scratch memory, never a resident baseline. The baseline is reserved once,
+deduplicated by backing inode, when the first restore or fork child that maps
+it is admitted. A live fork admits its children with the capture, so its
+pending baseline and per-child charges are reserved before freeze and bound
+to the sealed RAM inode afterwards.
+
+Private disk construction for both restore and fork reserves the allocated
+bytes of each writable disk, not its logical capacity, plus state reserves
+and the pinned boot-object copies. A live fork persists each writable
+attachment's allocation sample with the capture reservation and reuses it
+for every child, replay and boot-inventory refinement. Standalone restore
+measures allocation from its held immutable copy sources. Reflinks and sparse
+copies preserve disk holes; guest growth before the capture seal can still
+fail the operation under the failure semantics below.
+
 Physical memory for a source and N children is approximately the source's
 resident set plus the clean baseline pages any child touches once plus every
 child's private written pages, plus page tables and VMM overhead. Per-process
@@ -562,8 +578,20 @@ private staging, file fsync, atomic rename, then directory fsync. SQL ownership
 commits before initial publication or construction-peak reduction. Interrupted
 updates therefore retain the complete conservative old charge or the complete
 new charge; interrupted initial staging is never an authoritative inventory
-entry. Admission reclaims abandoned staging under its serialization lock, but
-still refuses malformed authoritative records.
+entry. Under `admission.lock`, each home first atomically publishes a versioned
+`<state-db-device>-<state-db-inode>-home.json` anchor containing its canonical
+absolute home path and `state.db` device/inode identity. Opening a home
+reconciles its entries from authoritative SQL and refreshes the anchor, including
+after relocation. Before summing charges, every admission reclaims abandoned
+staging and checks other homes' anchors: a prefix is live only if its anchor
+parses with a supported schema and the recorded path's `state.db` still has
+exactly the recorded device and inode. Missing or malformed anchors, deleted
+homes, and replaced databases release all entries of that prefix at the next
+admission by any home of the same user. The ledger directory is synced after
+reclamation. An anchor proves only existence, so an invalid anchor does not
+retain charges; malformed authoritative charges of a live home still refuse
+admission. Live homes' charges remain governed by their SQL journal receipts,
+never by PID or lock observations.
 
 ### Reclaim
 
@@ -1145,7 +1173,8 @@ machine, who paused it.
 | Children per fork call | 16 by default; higher with an explicit flag, still within budget. |
 | Private-write reservation per child | 25 percent of machine RAM by default; per-machine configurable. |
 | Memory overcommit | Off by default; explicit per-call opt-in. |
-| Capture staging | Reserved before freeze by libvm: the machine's RAM size, plus for each writable disk its allocated bytes when the host lacks a qualified clone contract and 16 MiB of metadata when it has one, plus 64 MiB for state and evidence files. |
+| Capture staging | Reserved before freeze by libvm: staging (RAM image + allocated bytes of each writable disk + state reserves), plus the publication peak (RAM image copy + allocated bytes of each writable disk + map and state reserves) when the pool shares the filesystem. On separate filesystems, publication is charged to the pool's filesystem instead. A same-filesystem local fork cut is renamed, so it needs no publication copy. |
+| Restore/fork child disk construction | Per child: allocated bytes of every writable disk + state reserves + pinned boot-object copies. Live forks use the allocation sample retained by capture planning; standalone restores measure their held immutable source files. |
 | Activation deadlines | VM generation acknowledgement 5 s; agent `Activate` 30 s; both configurable. |
 
 These are initial budgets measured by the gates below, on the three reference

@@ -7,6 +7,11 @@ use crate::store::row::{DbMachineConfig, DbMachineState};
 use crate::store::{MachineStore, Store};
 use crate::LibVmError;
 
+pub(crate) const MACHINE_CONFIGS_BY_ID_PREFIX: &str =
+    "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json
+     FROM machine_config
+     WHERE name = ?1 OR (id LIKE ?2 AND NOT EXISTS (SELECT 1 FROM machine_config WHERE name = ?1))";
+
 fn has_pool_roots(storage: &crate::MachineStorageRecord) -> bool {
     matches!(&storage.root, crate::MachineRoot::LinuxOverlay { .. })
         || storage
@@ -358,18 +363,29 @@ impl MachineStore for Store {
             .map_err(Into::into)
     }
 
+    async fn machine_name_in_use(&self, name: &str) -> Result<bool, LibVmError> {
+        let id = name.parse::<MachineId>().ok().map(|id| id.to_string());
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM machine_config WHERE name = ?1 OR id = ?2)",
+        )
+        .bind(name)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     async fn machine_configs_by_id_prefix(
         &self,
         prefix: &str,
+        name: &str,
     ) -> Result<Vec<MachineConfig>, LibVmError> {
         Self::validate_machine_id_prefix(prefix)?;
         let pattern = format!("{prefix}%");
-        let rows = sqlx::query(
-            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id LIKE ?1",
-        )
-        .bind(pattern)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(MACHINE_CONFIGS_BY_ID_PREFIX)
+            .bind(name)
+            .bind(pattern)
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter()
             .map(|row| {
                 DbMachineConfig::from_row_in(row, &self.home).map(|DbMachineConfig(config)| config)

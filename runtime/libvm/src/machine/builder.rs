@@ -2596,8 +2596,12 @@ mod tests {
                     .unwrap();
             assert_eq!(operations, 0, "attempt {attempt} left a stopped copy owner");
             for entry in std::fs::read_dir(paths.home().join("resource-budget")).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_string_lossy().ends_with("-home.json") {
+                    continue;
+                }
                 assert_ne!(
-                    entry.unwrap().path().extension(),
+                    entry.path().extension(),
                     Some(std::ffi::OsStr::new("json")),
                     "attempt {attempt} left a budget document"
                 );

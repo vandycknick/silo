@@ -164,6 +164,47 @@ def source_running(silo: Silo, prepared: Prepared) -> None:
 
 # -- acceptance -------------------------------------------------------------------
 
+def test_live_restore_and_fork_without_public_vsock(
+    silo: Silo, restore_image: str,  # noqa: F811
+) -> None:
+    source = "no-vsock-source"
+    restored = "no-vsock-restored"
+    names = ["no-vsock-fork-a", "no-vsock-fork-b"]
+    silo.create(source, restore_image, "--disk-size", "256mib", "--network", "none",
+                "--cpus", "2", "--memory", "512mib")
+    silo.start(source)
+    source_info = silo.wait_ready(source)
+    require_fork(source_info)
+
+    def running_without_public_vsock(name: str, info: dict) -> None:
+        assert info["state"] == "running" and info["ready"] is True, info
+        assert silo.exec(name, "printf", "%s", "agent-exec-without-public-vsock").stdout == (
+            "agent-exec-without-public-vsock")
+        vsock = stopped.configuration(silo, name)["spec"].get("vsock")
+        assert vsock is None or vsock["enabled"] is False, vsock
+        public_socket = lifecycle.runtime_socket(silo, UUID(info["id"]).hex, "vsock.sock")
+        assert not public_socket.exists(), public_socket
+
+    running_without_public_vsock(source, source_info)
+    initial = restore.start_witness(silo, source)
+    saved = restore.checkpoint(silo, source, alias="no-vsock-checkpoint")
+    child = restore.restore_child(silo, saved, restored)
+    running_without_public_vsock(restored, child)
+    restore.advances(silo, restored, initial)
+
+    silo.run("resume", source)
+    running_without_public_vsock(source, silo.wait_ready(source))
+    call = fork.run(silo, source, names, expect=0)
+    result = call.result
+    assert result is not None and result["stage"] == "finished", call.stderr
+    assert result["capture"]["kind"] == "sealed" and result["source"] == {"kind": "resumed"}, result
+    assert fork.outcomes(result) == ["running", "running"], result
+    for name in names:
+        running_without_public_vsock(name, silo.wait_ready(name))
+        restore.advances(silo, name, initial)
+    running_without_public_vsock(source, silo.wait_ready(source))
+
+
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
     silo: Silo, restore_image: str, profile: RootProfile,  # noqa: F811
@@ -402,9 +443,10 @@ def staged_lines(silo: Silo, machine_id: str) -> int:
 
 
 def ledger(silo: Silo) -> dict[str, bytes]:
-    """This home's records in the same-euid cross-home restore ledger.
+    """This home's charge records in the same-euid cross-home restore ledger.
 
-    libvm names each record `<state.db device>-<state.db inode>-<id>.json`.
+    libvm names each record `<state.db device>-<state.db inode>-<id>.json`; the
+    `<device>-<inode>-home.json` anchor only proves the home exists.
     """
     directory = Path(f"/tmp/silo-restore-budget-{os.geteuid()}")
     metadata = silo.ws.state_db().stat()
@@ -412,7 +454,8 @@ def ledger(silo: Silo) -> dict[str, bytes]:
     if not directory.is_dir():
         return {}
     return {path.name: path.read_bytes() for path in sorted(directory.iterdir())
-            if path.name.startswith(prefix) and path.name.endswith(".json") and path.is_file()}
+            if path.name.startswith(prefix) and path.name.endswith(".json")
+            and path.name != f"{prefix}home.json" and path.is_file()}
 
 
 def budget_memory(directory: Path) -> int:
@@ -440,6 +483,9 @@ def budget_memory(directory: Path) -> int:
     with (directory / "admission.lock").open("rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH)
         for path in sorted(directory.glob("*.json")):
+            # `<dev>-<ino>-home.json` anchors prove a home exists; they charge nothing.
+            if path.name.endswith("-home.json"):
+                continue
             document = json.loads(path.read_bytes())
             if "captureId" not in document:
                 restore_charge(document)

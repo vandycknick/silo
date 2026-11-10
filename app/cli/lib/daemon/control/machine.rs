@@ -294,15 +294,12 @@ impl w::machine_service_server::MachineService for Service {
     }
     async fn ensure_name_available(&self, r: Request<w::Name>) -> Result<Response<()>, Status> {
         let name = r.into_inner().name;
-        let reference = lifecycle::reference_from_wire(w::MachineRef {
-            reference: Some(w::machine_ref::Reference::Name(name)),
-        })
-        .map_err(conversion)?;
-        match self.runtime().await?.inspect_inventory(&reference).await {
-            Ok(_) => Err(Status::already_exists("machine name already exists")),
-            Err(libvm::LibVmError::MachineNotFound { .. }) => Ok(Response::new(())),
-            Err(e) => Err(native(e)),
-        }
+        self.runtime()
+            .await?
+            .ensure_name_available(&name)
+            .await
+            .map_err(native)?;
+        Ok(Response::new(()))
     }
     async fn create_machine(
         &self,

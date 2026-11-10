@@ -107,12 +107,13 @@ def test_capture_multidisk_dirty_matched_cut_and_independent_sealed_bytes(
                 "workloadsFrozen", "vcpusPaused", "devicesQuiesced", "hostWritersDrained",
                 "hostFlushCompleted", "diskCopiesSealed", "memoryStateSealed"))
             sealed = capture.inventory(directory)
-            assert {key.removeprefix("disks/").removesuffix(".raw")
-                    for key in sealed if key.startswith("disks/")} == expected_roles
+            # Each sealed disk image has a sibling `<role>.map.json` chunk map.
+            images = {key: value for key, value in sealed.items()
+                      if key.startswith("disks/") and key.endswith(".raw")}
+            assert {key.removeprefix("disks/").removesuffix(".raw") for key in images} == expected_roles
             assert all(value.mode == 0o600 for value in sealed.values())
             source_inodes = {(path.stat().st_dev, path.stat().st_ino) for path in source_paths.values()}
-            sealed_inodes = {(value.device, value.inode) for key, value in sealed.items()
-                             if key.startswith("disks/")}
+            sealed_inodes = {(value.device, value.inode) for value in images.values()}
             assert len(source_inodes) == len(sealed_inodes) == 3
             assert source_inodes.isdisjoint(sealed_inodes), "sealed writable roles alias source inodes"
             multidisk.matched_cut(silo, directory, roles, workload)

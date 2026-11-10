@@ -125,6 +125,10 @@ impl Store {
                 return Err(error);
             }
         }
+        if let Err(error) = store.reconcile_restore_budget().await {
+            store.pool.close().await;
+            return Err(error);
+        }
         Ok(store)
     }
 
@@ -836,12 +840,118 @@ pub(crate) mod tests {
         let id_str = id.to_string();
         let prefix = &id_str[..8];
         let found = db
-            .machine_configs_by_id_prefix(prefix)
+            .machine_configs_by_id_prefix(prefix, prefix)
             .await
             .expect("lookup");
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], metadata);
+    }
+
+    #[tokio::test]
+    async fn lookup_hex_names_precedes_prefixes_in_writable_and_observation_stores() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.unwrap();
+        let named_id: MachineId = "11111111111141118111111111111111".parse().unwrap();
+        let named = machine_from_path(named_id, "def".into(), paths.machine(named_id).dir());
+        seed_machine(&db, &named).await;
+        let observer = crate::store::observation::ObservationStore::existing(&db);
+
+        let found = db.machine_configs_by_id_prefix("def", "def").await.unwrap();
+        assert_eq!(found, vec![named.clone()]);
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("def").unwrap())
+                .await
+                .unwrap()
+                .0,
+            named
+        );
+
+        let first_id: MachineId = "def00000000040008000000000000001".parse().unwrap();
+        let first = machine_from_path(first_id, "first".into(), paths.machine(first_id).dir());
+        seed_machine(&db, &first).await;
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def", "def").await.unwrap(),
+            vec![named.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("def").unwrap())
+                .await
+                .unwrap()
+                .0,
+            named
+        );
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def0", "def0")
+                .await
+                .unwrap(),
+            vec![first.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("DeF0").unwrap())
+                .await
+                .unwrap()
+                .0,
+            first
+        );
+
+        let second_id: MachineId = "def00000000040008000000000000002".parse().unwrap();
+        let second = machine_from_path(second_id, "second".into(), paths.machine(second_id).dir());
+        seed_machine(&db, &second).await;
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def", "def").await.unwrap(),
+            vec![named.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("def").unwrap())
+                .await
+                .unwrap()
+                .0,
+            named
+        );
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def0", "def0")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            observer.lookup(&crate::MachineRef::parse("def0").unwrap()).await,
+            Err(LibVmError::AmbiguousIdPrefix { prefix, count: 2 }) if prefix == "def0"
+        ));
+        assert!(matches!(
+            observer
+                .lookup(&crate::MachineRef::parse("DEF").unwrap())
+                .await,
+            Err(LibVmError::AmbiguousIdPrefix { .. })
+        ));
+        assert!(matches!(
+            observer
+                .lookup(&crate::MachineRef::parse("abc").unwrap())
+                .await,
+            Err(LibVmError::MachineNotFound { .. })
+        ));
+
+        let legacy_id: MachineId = "22222222222242228222222222222222".parse().unwrap();
+        let legacy = machine_from_path(legacy_id, "DeF".into(), paths.machine(legacy_id).dir());
+        seed_machine(&db, &legacy).await;
+        assert_eq!(
+            db.machine_configs_by_id_prefix("def", "DeF").await.unwrap(),
+            vec![legacy.clone()]
+        );
+        assert_eq!(
+            observer
+                .lookup(&crate::MachineRef::parse("DeF").unwrap())
+                .await
+                .unwrap()
+                .0,
+            legacy
+        );
     }
 
     #[tokio::test]
@@ -853,7 +963,7 @@ pub(crate) mod tests {
 
         for prefix in invalid_prefixes {
             let err = db
-                .machine_configs_by_id_prefix(prefix)
+                .machine_configs_by_id_prefix(prefix, prefix)
                 .await
                 .expect_err("invalid prefix should fail");
             assert!(
@@ -3088,7 +3198,7 @@ pub(crate) mod tests {
         ];
         decoded.extend(
             store
-                .machine_configs_by_id_prefix(&id.to_string()[..8])
+                .machine_configs_by_id_prefix(&id.to_string()[..8], &id.to_string()[..8])
                 .await
                 .unwrap(),
         );
@@ -3183,7 +3293,7 @@ pub(crate) mod tests {
         assert!(store.machine_config(config.id).await.is_err());
         assert!(store.machine_config_by_name(&config.name).await.is_err());
         assert!(store
-            .machine_configs_by_id_prefix(&config.id.to_string()[..8])
+            .machine_configs_by_id_prefix(&config.id.to_string()[..8], &config.id.to_string()[..8])
             .await
             .is_err());
         assert!(store.list_machine_configs().await.is_err());

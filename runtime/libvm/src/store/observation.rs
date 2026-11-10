@@ -113,21 +113,27 @@ impl ObservationStore {
         reference: &MachineRef,
     ) -> Result<(MachineConfig, MachineState), LibVmError> {
         let mut transaction = self.pool.begin().await?;
-        let (statement, value) = match reference.kind() {
-            MachineRefKind::Id(id) => ("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id = ?1 LIMIT 2", id.to_string()),
-            MachineRefKind::Name(name) => ("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE name = ?1 LIMIT 2", name.clone()),
-            MachineRefKind::IdPrefix(prefix) => ("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id LIKE ?1 LIMIT 2", format!("{prefix}%")),
+        let (statement, value, prefix) = match reference.kind() {
+            MachineRefKind::Id(id) => ("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id = ?1 LIMIT 2", id.to_string(), None),
+            MachineRefKind::Name(name) => ("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE name = ?1 LIMIT 2", name.clone(), None),
+            MachineRefKind::IdPrefix { name, prefix } => (
+                crate::store::machine_store::MACHINE_CONFIGS_BY_ID_PREFIX,
+                name.clone(),
+                Some(format!("{prefix}%")),
+            ),
         };
-        let rows = sqlx::query(statement)
-            .bind(&value)
-            .fetch_all(&mut *transaction)
-            .await?;
+        let query = sqlx::query(statement).bind(&value);
+        let query = match &prefix {
+            Some(prefix) => query.bind(prefix),
+            None => query,
+        };
+        let rows = query.fetch_all(&mut *transaction).await?;
         let config = match rows.as_slice() {
             [] => return Err(LibVmError::MachineNotFound { reference: value }),
             [row] => DbMachineConfig::from_row_in(row, &self.home)?.0,
             _ => {
                 return Err(LibVmError::AmbiguousIdPrefix {
-                    prefix: value.trim_end_matches('%').to_string(),
+                    prefix: reference.id_prefix().unwrap_or(&value).to_string(),
                     count: rows.len(),
                 })
             }

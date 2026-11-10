@@ -387,6 +387,17 @@ runtime selected by `SILO_SMOKE_BIN_DIR` and `SILO_SMOKE_RUNTIME_DIR`:
 uv run --project smoke pytest smoke/tests/test_fork.py -m slow --keep
 ```
 
+The default public-vsock-off regression creates without `--vsock`, captures and
+restores one child, then live-forks two more from the same source. Every child
+must reach Running, execute commands and continue the guest witness without
+creating a public `vsock.sock`. The internal agent vsock mux remains required;
+the optional public surface is recreated after Activate only when configured.
+Run this case alone with the same staged runtime:
+
+```sh
+make smoke SMOKE_ARGS='tests/test_fork.py::test_live_restore_and_fork_without_public_vsock -m slow --keep'
+```
+
 Every case drives the real `silo fork SOURCE --live` against the detached
 `restore_execution.c` witness. Oracles: the CLI's single `LiveForkResult`
 document (strict keys, kebab `kind` tags, every requested child named with a

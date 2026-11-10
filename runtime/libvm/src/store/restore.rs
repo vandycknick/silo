@@ -206,20 +206,25 @@ impl RestoreBudget {
         Ok(())
     }
 
-    fn read(directory: &crate::paths::OwnedDirectory) -> Result<Self, LibVmError> {
-        Self::read_except(directory, None)
+    fn read(
+        store: &crate::store::Store,
+        directory: &crate::paths::OwnedDirectory,
+    ) -> Result<Self, LibVmError> {
+        Self::read_except(store, directory, None)
     }
 
     fn read_except(
+        store: &crate::store::Store,
         directory: &crate::paths::OwnedDirectory,
         excluded: Option<&str>,
     ) -> Result<Self, LibVmError> {
+        let entries = reclaim_budget_orphans(store, directory)?;
         let mut budget = Self {
             manager: Some(DescriptorOwner::current()?),
             ..Self::default()
         };
         let mut bytes = Vec::new();
-        for name in budget_entries(directory)? {
+        for name in entries {
             if excluded == Some(name.as_str()) {
                 continue;
             }
@@ -243,6 +248,14 @@ impl RestoreBudget {
         self.add_descriptors(inventory.descriptor_owner, inventory.descriptors)?;
         if inventory.capture_id.is_nil() {
             return Err(invalid("capture budget identity is nil"));
+        }
+        // Released captures may retain pending child charges until cancellation
+        // reconciliation retires them, but an active fork must own its baseline.
+        if inventory.baseline.is_none()
+            && !inventory.pending.is_empty()
+            && (inventory.capture_memory != 0 || !inventory.capture_disks.is_empty())
+        {
+            return Err(invalid("active fork capture has no reserved baseline"));
         }
         self.memory = self
             .memory
@@ -647,7 +660,7 @@ impl crate::store::Store {
             "admission.lock",
             nix::fcntl::FlockArg::LockExclusive,
         )?;
-        let mut budget = RestoreBudget::read(directory)?;
+        let mut budget = RestoreBudget::read(self, directory)?;
         budget.add(charge)?;
         budget.admit_descriptors()?;
         budget.admit_memory(
@@ -679,6 +692,7 @@ impl crate::store::Store {
         sqlx::query("INSERT INTO restore_memory_reservation(operation_id,budget_id,charge_json) VALUES(?1,?1,jsonb(?2))")
             .bind(operation.to_string()).bind(&json).execute(&mut *tx).await?;
         publish_budget(
+            self,
             tx,
             directory,
             &budget_name(self, operation)?,
@@ -734,7 +748,7 @@ impl crate::store::Store {
             descriptor_owner: None,
             descriptors: 0,
         };
-        let mut budget = RestoreBudget::read(&directory)?;
+        let mut budget = RestoreBudget::read(self, &directory)?;
         budget.add_capture(&inventory)?;
         let filesystem = nix::sys::statvfs::fstatvfs(disk.fd()).map_err(std::io::Error::from)?;
         let available = filesystem
@@ -772,6 +786,7 @@ impl crate::store::Store {
         .execute(&mut *tx)
         .await?;
         publish_budget(
+            self,
             tx,
             &directory,
             &budget_name(self, operation)?,
@@ -837,20 +852,178 @@ fn budget_name(store: &crate::store::Store, operation: Uuid) -> Result<String, L
     Ok(format!("{}{operation}.json", budget_prefix(store)?))
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BudgetHomeAnchor {
+    schema: u32,
+    home: std::path::PathBuf,
+    state_device: u64,
+    state_inode: u64,
+}
+
+/// The caller holds admission.lock, including when no charges remain.
+fn write_budget_anchor(
+    store: &crate::store::Store,
+    directory: &crate::paths::OwnedDirectory,
+) -> Result<(), LibVmError> {
+    let home = std::fs::canonicalize(&store.home)?;
+    let state = std::fs::metadata(home.join("state.db"))?;
+    let anchor = BudgetHomeAnchor {
+        schema: 1,
+        home,
+        state_device: state.dev(),
+        state_inode: state.ino(),
+    };
+    directory.write_file_atomic(
+        &format!("{}-{}-home.json", anchor.state_device, anchor.state_inode),
+        &serde_json::to_vec(&anchor).map_err(invalid)?,
+    )
+}
+
+fn budget_file_prefix(name: &str) -> Result<&str, LibVmError> {
+    let mut parts = name.splitn(3, '-');
+    parts
+        .next()
+        .ok_or_else(|| invalid("resource budget device is missing"))?
+        .parse::<u64>()
+        .map_err(invalid)?;
+    parts
+        .next()
+        .ok_or_else(|| invalid("resource budget inode is missing"))?
+        .parse::<u64>()
+        .map_err(invalid)?;
+    let suffix = parts
+        .next()
+        .ok_or_else(|| invalid("resource budget owner is missing"))?;
+    Ok(&name[..name.len() - suffix.len()])
+}
+
+fn read_budget_file(
+    directory: &crate::paths::OwnedDirectory,
+    name: &str,
+) -> Result<Option<Vec<u8>>, LibVmError> {
+    let Some(file) = directory.open_file(name)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take((16 << 20) + 1).read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+fn budget_home_is_live(directory: &crate::paths::OwnedDirectory, prefix: &str) -> bool {
+    let Ok(Some(bytes)) = read_budget_file(directory, &format!("{prefix}home.json")) else {
+        return false;
+    };
+    // An anchor only proves existence; a charge is authority. A malformed
+    // anchor cannot prove liveness, but malformed charges of live homes refuse
+    // admission rather than silently releasing an authoritative reservation.
+    let Ok(anchor) = serde_json::from_slice::<BudgetHomeAnchor>(&bytes) else {
+        return false;
+    };
+    if bytes.len() > 16 << 20
+        || anchor.schema != 1
+        || !anchor.home.is_absolute()
+        || prefix != format!("{}-{}-", anchor.state_device, anchor.state_inode)
+    {
+        return false;
+    }
+    std::fs::metadata(anchor.home.join("state.db"))
+        .is_ok_and(|state| state.dev() == anchor.state_device && state.ino() == anchor.state_inode)
+}
+
+/// Every ledger reader calls this while holding admission.lock.
+fn reclaim_budget_orphans(
+    store: &crate::store::Store,
+    directory: &crate::paths::OwnedDirectory,
+) -> Result<Vec<String>, LibVmError> {
+    let own_prefix = budget_prefix(store)?;
+    let mut homes = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for name in budget_files(directory)? {
+        homes
+            .entry(budget_file_prefix(&name)?.to_owned())
+            .or_default()
+            .push(name);
+    }
+    let mut live = Vec::new();
+    for (prefix, names) in homes {
+        if prefix == own_prefix || budget_home_is_live(directory, &prefix) {
+            live.extend(
+                names
+                    .into_iter()
+                    .filter(|name| !name.ends_with("-home.json")),
+            );
+            continue;
+        }
+        let mut released = RestoreBudget::default();
+        let mut charges = 0;
+        let mut malformed_charges = 0;
+        for name in &names {
+            if !name.ends_with("-home.json") {
+                charges += 1;
+                let result = match read_budget_file(directory, name) {
+                    Ok(Some(bytes)) if bytes.len() <= 16 << 20 => {
+                        match serde_json::from_slice::<BudgetDocument>(&bytes) {
+                            Ok(BudgetDocument::Restore(charge)) => released.add(&charge),
+                            Ok(BudgetDocument::Capture(inventory)) => {
+                                released.add_capture(&inventory)
+                            }
+                            Err(error) => Err(invalid(error)),
+                        }
+                    }
+                    _ => Err(invalid(
+                        "orphan resource budget record is unreadable or oversized",
+                    )),
+                };
+                if result.is_err() {
+                    malformed_charges += 1;
+                }
+            }
+            directory.remove_tree(name)?;
+        }
+        directory.sync()?;
+        // Corrupt orphan charges cannot veto reclamation or supply an exact
+        // released-byte total. Report unknown rather than inventing a zero.
+        let memory_bytes = (malformed_charges == 0).then_some(released.memory);
+        let disk_bytes = (malformed_charges == 0).then(|| {
+            released
+                .disks
+                .values()
+                .map(|bytes| u128::from(*bytes))
+                .sum::<u128>()
+        });
+        let bytes_released = memory_bytes
+            .zip(disk_bytes)
+            .map(|(memory, disk)| u128::from(memory) + disk);
+        tracing::info!(
+            %prefix,
+            entries = names.len(),
+            charges,
+            malformed_charges,
+            ?memory_bytes,
+            ?disk_bytes,
+            ?bytes_released,
+            "reclaimed resource budget for a missing home"
+        );
+    }
+    Ok(live)
+}
+
 /// SQL owns the reservation before publication. An interrupted initial publish
 /// has no child yet; an interrupted release retains the old conservative charge.
 async fn publish_budget(
+    store: &crate::store::Store,
     tx: sqlx::Transaction<'_, sqlx::Sqlite>,
     directory: &crate::paths::OwnedDirectory,
     name: &str,
     json: &str,
     checkpoint: impl FnMut(crate::paths::AtomicWritePhase),
 ) -> Result<(), LibVmError> {
+    write_budget_anchor(store, directory)?;
     tx.commit().await?;
     directory.write_file_atomic_with(name, json.as_bytes(), checkpoint)
 }
 
-fn budget_entries(directory: &crate::paths::OwnedDirectory) -> Result<Vec<String>, LibVmError> {
+fn budget_files(directory: &crate::paths::OwnedDirectory) -> Result<Vec<String>, LibVmError> {
     let mut names = Vec::new();
     let entries = nix::dir::Dir::openat(
         directory.fd(),
@@ -883,6 +1056,13 @@ fn budget_entries(directory: &crate::paths::OwnedDirectory) -> Result<Vec<String
         names.push(name.to_owned());
     }
     Ok(names)
+}
+
+fn budget_entries(directory: &crate::paths::OwnedDirectory) -> Result<Vec<String>, LibVmError> {
+    Ok(budget_files(directory)?
+        .into_iter()
+        .filter(|name| !name.ends_with("-home.json"))
+        .collect())
 }
 
 impl crate::store::Store {
@@ -961,6 +1141,7 @@ impl crate::store::Store {
         // Batch reductions accumulate SQL-first. The outer reconciliation
         // publishes one complete inventory, not N quadratic aggregate rewrites.
         if batch.is_none() {
+            write_budget_anchor(self, &directory)?;
             directory.write_file_atomic(
                 &budget_name(self, Uuid::parse_str(&budget_id).map_err(invalid)?)?,
                 charge.as_bytes(),
@@ -1003,6 +1184,7 @@ impl crate::store::Store {
             nix::fcntl::FlockArg::LockExclusive,
         )?;
         let prefix = budget_prefix(self)?;
+        write_budget_anchor(self, directory)?;
         let mut authoritative = std::collections::BTreeSet::new();
         let standalone:Vec<(String,String)>=sqlx::query_as("SELECT budget_id,json(charge_json) FROM restore_memory_reservation WHERE batch_id IS NULL").fetch_all(&self.pool).await?;
         for (id, json) in standalone {
@@ -1077,6 +1259,41 @@ impl crate::store::Store {
     }
 }
 
+fn fork_disk_peak(
+    record: &crate::store::snapshot_store::CaptureRecord,
+    boot: &crate::BootProfile,
+    pool: &crate::storage::pool::StoragePool,
+) -> Result<u64, LibVmError> {
+    // Use the same source allocation sample as capture staging, including on
+    // replay and boot refinement. A child's private copy preserves sparsity.
+    let mut peak = record.disk_allocations.values().try_fold(
+        vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES,
+        |bytes, allocated| {
+            bytes
+                .checked_add(*allocated)
+                .ok_or_else(|| invalid("fork disk peak overflow"))
+        },
+    )?;
+    if let crate::BootProfile::LinuxDirect {
+        binding:
+            crate::BootBinding::Pinned {
+                kernel,
+                base_initramfs,
+                agent,
+                ..
+            },
+        ..
+    } = boot
+    {
+        for object in [kernel, base_initramfs].into_iter().chain(agent.iter()) {
+            peak = peak
+                .checked_add(std::fs::metadata(pool.object_path(object))?.len())
+                .ok_or_else(|| invalid("fork boot peak overflow"))?;
+        }
+    }
+    Ok(peak)
+}
+
 impl crate::store::Store {
     /// Shared cross-home admission. No capture command can precede successful
     /// publication of this complete inventory under the restore admission lock.
@@ -1091,6 +1308,9 @@ impl crate::store::Store {
             nix::fcntl::FlockArg::LockExclusive,
         )?;
         let fork = self.fork_for_capture(record.capture_id).await?;
+        if fork != record.fork_operation_id {
+            return Err(invalid("capture fork owner contradicts its reservation"));
+        }
         let owner = fork.unwrap_or(record.capture_id);
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
@@ -1105,11 +1325,15 @@ impl crate::store::Store {
         }
         let mut inventory = CaptureBudgetInventory {
             capture_id: record.capture_id,
-            capture_memory: record
-                .reservation_memory_bytes
-                .checked_sub(record.plan.ram_bytes)
-                .ok_or_else(|| invalid("capture scratch reservation underflow"))?,
-            baseline: Some(CaptureBaseline::Pending {
+            capture_memory: if fork.is_some() {
+                record
+                    .reservation_memory_bytes
+                    .checked_sub(record.plan.ram_bytes)
+                    .ok_or_else(|| invalid("capture scratch reservation underflow"))?
+            } else {
+                record.reservation_memory_bytes
+            },
+            baseline: fork.map(|_| CaptureBaseline::Pending {
                 capture_id: record.capture_id,
                 bytes: record.plan.ram_bytes,
             }),
@@ -1127,33 +1351,8 @@ impl crate::store::Store {
                 crate::paths::OwnedDirectory::open_existing_root(&self.home.join("machines"))?
                     .ok_or_else(|| invalid("fork destination parent missing"))?;
             let stat = nix::sys::stat::fstat(parent.fd()).map_err(std::io::Error::from)?;
-            let mut disk = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
-            for attachment in &record.plan.configuration.attachments {
-                if !attachment.read_only {
-                    disk = disk
-                        .checked_add(attachment.geometry.length)
-                        .ok_or_else(|| invalid("fork disk peak overflow"))?;
-                }
-            }
-            // Retain the exact pinned boot provenance once per destination.
             let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
-            if let crate::BootProfile::LinuxDirect {
-                binding:
-                    crate::BootBinding::Pinned {
-                        kernel,
-                        base_initramfs,
-                        agent,
-                        ..
-                    },
-                ..
-            } = &record.storage.boot
-            {
-                for object in [kernel, base_initramfs].into_iter().chain(agent.iter()) {
-                    disk = disk
-                        .checked_add(std::fs::metadata(pool.object_path(object))?.len())
-                        .ok_or_else(|| invalid("fork boot peak overflow"))?;
-                }
-            }
+            let disk = fork_disk_peak(record, &record.storage.boot, &pool)?;
             let configured = record.plan.ram_bytes;
             for child in self.fork_children(operation).await? {
                 inventory.pending.push(PendingForkCharge {
@@ -1197,7 +1396,7 @@ impl crate::store::Store {
                 .ok_or_else(|| invalid("fork FD peak overflow"))?;
             inventory.descriptors = fds;
         }
-        let mut budget = RestoreBudget::read(&directory)?;
+        let mut budget = RestoreBudget::read(self, &directory)?;
         budget.add_capture(&inventory)?;
         budget.admit_descriptors()?;
         budget.admit_memory(policy, crate::store::capture::available_memory()?)?;
@@ -1234,7 +1433,15 @@ impl crate::store::Store {
                 .execute(&mut *tx)
                 .await?;
         }
-        publish_budget(tx, &directory, &budget_name(self, owner)?, &json, |_| {}).await?;
+        publish_budget(
+            self,
+            tx,
+            &directory,
+            &budget_name(self, owner)?,
+            &json,
+            |_| {},
+        )
+        .await?;
         if let Some(operation) = fork {
             self.fork_event(operation, None, "admission_committed")
                 .await?;
@@ -1263,7 +1470,7 @@ impl crate::store::Store {
         let name = budget_name(self, owner)?;
         // Replace this operation's old ledger entry, including on same-birth
         // replay, rather than counting the reservation twice.
-        let mut budget = RestoreBudget::read_except(directory, Some(&name))?;
+        let mut budget = RestoreBudget::read_except(self, directory, Some(&name))?;
         budget.add_capture(&inventory)?;
         budget.admit_descriptors()?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1275,7 +1482,7 @@ impl crate::store::Store {
         .execute(&mut *tx)
         .await?;
         let json = serde_json::to_string(&inventory).map_err(invalid)?;
-        publish_budget(tx, directory, &name, &json, |_| {}).await
+        publish_budget(self, tx, directory, &name, &json, |_| {}).await
     }
 
     pub(crate) async fn capture_budget_document(&self, owner: Uuid) -> Result<String, LibVmError> {
@@ -1403,6 +1610,7 @@ impl crate::store::Store {
         .await?;
         tx.commit().await?;
         let json = self.capture_budget_document(operation).await?;
+        write_budget_anchor(self, &directory)?;
         directory.write_file_atomic_deferred(&budget_name(self, operation)?, json.as_bytes())?;
         Ok(())
     }
@@ -1424,8 +1632,16 @@ impl crate::store::Store {
 }
 
 impl crate::store::Store {
-    pub(crate) async fn complete_capture_peak(&self, capture: Uuid) -> Result<(), LibVmError> {
-        let owner = self.fork_for_capture(capture).await?.unwrap_or(capture);
+    pub(crate) async fn complete_capture_peak(
+        &self,
+        record: &crate::store::snapshot_store::CaptureRecord,
+    ) -> Result<(), LibVmError> {
+        let capture = record.capture_id;
+        let fork = self.fork_for_capture(capture).await?;
+        if fork != record.fork_operation_id {
+            return Err(invalid("capture fork owner contradicts its reservation"));
+        }
+        let owner = fork.unwrap_or(capture);
         let directory = budget_directory(self)?;
         let _admission = crate::storage::locks::blocking(
             &directory,
@@ -1458,6 +1674,7 @@ impl crate::store::Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        write_budget_anchor(self, &directory)?;
         directory.write_file_atomic(
             &budget_name(self, owner)?,
             self.capture_budget_document(owner).await?.as_bytes(),
@@ -1484,32 +1701,8 @@ impl crate::store::Store {
             .captured_boot
             .as_ref()
             .ok_or_else(|| invalid("fork boot inventory is not pinned"))?;
-        let mut peak = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES;
-        for attachment in &record.plan.configuration.attachments {
-            if !attachment.read_only {
-                peak = peak
-                    .checked_add(attachment.geometry.length)
-                    .ok_or_else(|| invalid("fork disk peak overflow"))?;
-            }
-        }
         let pool = crate::storage::pool::StoragePool::open(&self.images_dir)?;
-        if let crate::BootProfile::LinuxDirect {
-            binding:
-                crate::BootBinding::Pinned {
-                    kernel,
-                    base_initramfs,
-                    agent,
-                    ..
-                },
-            ..
-        } = boot
-        {
-            for object in [kernel, base_initramfs].into_iter().chain(agent.iter()) {
-                peak = peak
-                    .checked_add(std::fs::metadata(pool.object_path(object))?.len())
-                    .ok_or_else(|| invalid("fork boot peak overflow"))?;
-            }
-        }
+        let peak = fork_disk_peak(&record, boot, &pool)?;
         let json: String = sqlx::query_scalar(
             "SELECT json(charge_json) FROM capture_resource_reservation WHERE operation_id=?1",
         )
@@ -1517,7 +1710,7 @@ impl crate::store::Store {
         .fetch_one(&self.pool)
         .await?;
         let mut inventory: CaptureBudgetInventory = serde_json::from_str(&json).map_err(invalid)?;
-        let mut budget = RestoreBudget::read(&directory)?;
+        let mut budget = RestoreBudget::read(self, &directory)?;
         let mut changed = false;
         for child in &mut inventory.pending {
             if peak > child.disk_bytes {
@@ -1562,6 +1755,7 @@ impl crate::store::Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        write_budget_anchor(self, &directory)?;
         directory.write_file_atomic(
             &budget_name(self, owner)?,
             self.capture_budget_document(owner).await?.as_bytes(),
@@ -1666,6 +1860,7 @@ impl crate::store::Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        write_budget_anchor(self, &directory)?;
         directory.write_file_atomic(
             &budget_name(self, owner)?,
             self.capture_budget_document(owner).await?.as_bytes(),
@@ -1677,6 +1872,7 @@ impl crate::store::Store {
 #[cfg(test)]
 mod tests {
     use crate::store::restore::{RestoreBudget, RestoreMemoryCharge};
+    use crate::store::MachineStore;
 
     struct CheckpointRequestFixture {
         capture: crate::store::capture::tests::Fixture,
@@ -1965,7 +2161,7 @@ mod tests {
         assert_eq!(inventory.capture_disks[0].bytes, bytes);
         let ledger = budget_directory(&store).unwrap();
         assert_eq!(
-            RestoreBudget::read(&ledger)
+            RestoreBudget::read(&store, &ledger)
                 .unwrap()
                 .disks
                 .values()
@@ -1985,7 +2181,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(remaining, 0);
-        assert!(RestoreBudget::read(&ledger).unwrap().disks.is_empty());
+        assert!(RestoreBudget::read(&store, &ledger)
+            .unwrap()
+            .disks
+            .is_empty());
         for worker in workers {
             let _ = worker.await;
         }
@@ -2022,7 +2221,10 @@ mod tests {
             .unwrap();
         store.release_import_space(operation).await.unwrap();
         let ledger = budget_directory(&store).unwrap();
-        assert!(RestoreBudget::read(&ledger).unwrap().disks.is_empty());
+        assert!(RestoreBudget::read(&store, &ledger)
+            .unwrap()
+            .disks
+            .is_empty());
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM capture_resource_reservation")
             .fetch_one(&store.pool)
             .await
@@ -2066,6 +2268,227 @@ mod tests {
             descriptor_owner: None,
             descriptors: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn sparse_fork_children_use_planned_allocations_through_boot_refinement_and_replay() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        use crate::store::capture::tests::fixture_source_with_disk_length;
+        use crate::store::restore::{budget_directory, CaptureBudgetInventory};
+
+        let length = 100 << 30;
+        let fixture = fixture_source_with_disk_length(
+            true,
+            true,
+            vm_spec::lifecycle::CapturePolicy::Full,
+            length,
+        )
+        .await;
+        let store = &fixture.snapshots.store;
+        let record = &fixture.reservation.record;
+        let operation = record.fork_operation_id.unwrap();
+        let root_path = crate::paths::machine_data_dir_in(store.home_path(), record.machine_id)
+            .join("root.raw");
+        let root = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root_path)
+            .unwrap();
+        let metadata = root.metadata().unwrap();
+        let root_bytes = metadata.blocks().checked_mul(512).unwrap();
+        assert_eq!(metadata.len(), length);
+        assert!(root_bytes > 0 && root_bytes < length / 1000);
+        let launches = store
+            .launch_storage_operations(record.machine_id)
+            .await
+            .unwrap();
+        let launch = launches
+            .iter()
+            .find(|launch| launch.operation_id == record.launch_operation_id)
+            .unwrap();
+        let data_bytes = std::fs::metadata(&launch.disks[1].path)
+            .unwrap()
+            .blocks()
+            .checked_mul(512)
+            .unwrap();
+        assert_eq!(record.disk_allocations.len(), 2);
+        assert_eq!(record.disk_allocations[&0], root_bytes);
+        assert_eq!(record.disk_allocations[&1], data_bytes);
+        let mut expected = vm_spec::capture::CAPTURE_STATE_RESERVE_BYTES + root_bytes + data_bytes;
+        let pool = crate::storage::pool::StoragePool::open(&store.images_dir).unwrap();
+        if let crate::BootProfile::LinuxDirect {
+            binding:
+                crate::BootBinding::Pinned {
+                    kernel,
+                    base_initramfs,
+                    agent,
+                    ..
+                },
+            ..
+        } = &record.storage.boot
+        {
+            for object in [kernel, base_initramfs].into_iter().chain(agent.iter()) {
+                expected += std::fs::metadata(pool.object_path(object)).unwrap().len();
+            }
+        }
+        let ledger = budget_directory(store).unwrap();
+        let mut before = None;
+        for _ in 0..2 {
+            store.reserve_capture_inventory(record).await.unwrap();
+            let inventory: CaptureBudgetInventory =
+                serde_json::from_str(&store.capture_budget_document(operation).await.unwrap())
+                    .unwrap();
+            assert_eq!(inventory.pending.len(), 2);
+            for child in &inventory.pending {
+                assert_eq!(child.disk_bytes, expected);
+            }
+            let disks = RestoreBudget::read(store, &ledger).unwrap().disks;
+            if let Some(before) = &before {
+                assert_eq!(&disks, before);
+            }
+            before = Some(disks);
+            root.write_all_at(&[0x52; 4096], length / 2).unwrap();
+            root.sync_all().unwrap();
+            assert!(root.metadata().unwrap().blocks() * 512 > root_bytes);
+            store
+                .refine_capture_boot_inventory(record.capture_id)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_capture_reserves_only_scratch_without_a_baseline_through_replay() {
+        use crate::store::capture::CAPTURE_SCRATCH_BYTES;
+        use crate::store::restore::{budget_directory, budget_name, CaptureBudgetInventory};
+
+        let fixture = crate::store::capture::tests::fixture().await;
+        let store = &fixture.snapshots.store;
+        let record = &fixture.reservation.record;
+        assert!(record.fork_operation_id.is_none());
+        assert_eq!(record.reservation_memory_bytes, CAPTURE_SCRATCH_BYTES);
+        let ledger = budget_directory(store).unwrap();
+        for _ in 0..2 {
+            store.reserve_capture_inventory(record).await.unwrap();
+            let inventory: CaptureBudgetInventory = serde_json::from_reader(
+                ledger
+                    .open_file(&budget_name(store, record.capture_id).unwrap())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
+            assert!(inventory.baseline.is_none());
+            assert!(inventory.pending.is_empty());
+            assert!(inventory.bound.is_empty());
+            let mut budget = RestoreBudget::default();
+            budget.add_capture(&inventory).unwrap();
+            assert_eq!(budget.memory, CAPTURE_SCRATCH_BYTES);
+            assert!(budget.baselines.is_empty());
+            assert_eq!(
+                RestoreBudget::read(store, &ledger).unwrap().memory,
+                budget.memory
+            );
+        }
+        store.complete_capture_peak(record).await.unwrap();
+        let inventory: CaptureBudgetInventory = serde_json::from_str(
+            &store
+                .capture_budget_document(record.capture_id)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
+        assert!(inventory.baseline.is_none());
+        assert!(inventory.capture_disks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_fork_capture_reserves_one_baseline_and_each_child_through_binding() {
+        use crate::store::capture::CAPTURE_SCRATCH_BYTES;
+        use crate::store::restore::{
+            budget_directory, budget_name, CaptureBaseline, CaptureBudgetInventory,
+        };
+
+        let fixture = crate::store::capture::tests::fork_fixture().await;
+        let store = &fixture.snapshots.store;
+        let record = &fixture.reservation.record;
+        let operation = record.fork_operation_id.unwrap();
+        assert_eq!(
+            record.reservation_memory_bytes,
+            record.plan.ram_bytes + CAPTURE_SCRATCH_BYTES
+        );
+        let ledger = budget_directory(store).unwrap();
+        for _ in 0..2 {
+            store.reserve_capture_inventory(record).await.unwrap();
+            let inventory: CaptureBudgetInventory = serde_json::from_reader(
+                ledger
+                    .open_file(&budget_name(store, operation).unwrap())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(inventory.capture_memory, CAPTURE_SCRATCH_BYTES);
+            assert!(matches!(
+                inventory.baseline,
+                Some(CaptureBaseline::Pending { capture_id, bytes })
+                    if capture_id == record.capture_id && bytes == record.plan.ram_bytes
+            ));
+            assert_eq!(inventory.pending.len(), 2);
+            let children = inventory
+                .pending
+                .iter()
+                .map(|child| child.private_bytes + child.overhead_bytes)
+                .sum::<u64>();
+            let mut budget = RestoreBudget::default();
+            budget.add_capture(&inventory).unwrap();
+            assert_eq!(
+                budget.memory,
+                CAPTURE_SCRATCH_BYTES + record.plan.ram_bytes + children
+            );
+            assert_eq!(
+                RestoreBudget::read(store, &ledger).unwrap().memory,
+                budget.memory
+            );
+            let mut missing_baseline = inventory;
+            missing_baseline.baseline = None;
+            assert!(RestoreBudget::default()
+                .add_capture(&missing_baseline)
+                .is_err());
+        }
+        crate::store::capture::tests::seal(&fixture);
+        let (_, retained) = fixture
+            .snapshots
+            .retain_local_capture(record.capture_id)
+            .await
+            .unwrap();
+        let cut = store.open_local_cut(operation, retained).await.unwrap();
+        store.bind_fork_resources(&cut).await.unwrap();
+        let inventory: CaptureBudgetInventory =
+            serde_json::from_str(&store.capture_budget_document(operation).await.unwrap()).unwrap();
+        assert!(inventory.pending.is_empty());
+        assert_eq!(inventory.bound.len(), 2);
+        let pool = crate::storage::pool::StoragePool::open(&store.images_dir).unwrap();
+        let expected_disk =
+            crate::store::restore::fork_disk_peak(record, &record.storage.boot, &pool).unwrap();
+        for child in &inventory.bound {
+            assert_eq!(child.disk_bytes, expected_disk);
+        }
+        assert!(matches!(
+            inventory.baseline,
+            Some(CaptureBaseline::Bound { .. })
+        ));
+        let children = inventory
+            .bound
+            .iter()
+            .map(|child| child.private_bytes + child.overhead_bytes)
+            .sum::<u64>();
+        let budget = RestoreBudget::read(store, &ledger).unwrap();
+        assert_eq!(budget.baselines.len(), 1);
+        assert_eq!(
+            budget.memory,
+            inventory.capture_memory + inventory.bound[0].baseline_bytes + children
+        );
     }
 
     #[tokio::test]
@@ -2125,7 +2548,7 @@ mod tests {
             .await
             .unwrap();
         ledger.write_file_atomic(&name, json.as_bytes()).unwrap();
-        let before = RestoreBudget::read(&ledger).unwrap();
+        let before = RestoreBudget::read(&store, &ledger).unwrap();
         assert_eq!(
             before.descriptors, 0,
             "a different birth does not own this manager's FDs"
@@ -2150,7 +2573,7 @@ mod tests {
         let published: CaptureBudgetInventory =
             serde_json::from_reader(ledger.open_file(&name).unwrap().unwrap()).unwrap();
         assert_eq!(serde_json::to_value(published).unwrap(), expected);
-        let after = RestoreBudget::read(&ledger).unwrap();
+        let after = RestoreBudget::read(&store, &ledger).unwrap();
         assert_eq!(after.descriptors, 1);
         assert_eq!(after.memory, before.memory);
         assert_eq!(after.disks, before.disks);
@@ -2175,7 +2598,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            RestoreBudget::read(&ledger).unwrap().descriptors,
+            RestoreBudget::read(&store, &ledger).unwrap().descriptors,
             inventory.descriptors
         );
 
@@ -2218,7 +2641,7 @@ mod tests {
         let published: CaptureBudgetInventory =
             serde_json::from_reader(ledger.open_file(&name).unwrap().unwrap()).unwrap();
         assert_eq!(serde_json::to_value(published).unwrap(), expected);
-        assert_eq!(RestoreBudget::read(&ledger).unwrap().descriptors, 0);
+        assert_eq!(RestoreBudget::read(&store, &ledger).unwrap().descriptors, 0);
         store.close().await;
     }
 
@@ -2618,6 +3041,7 @@ mod tests {
             .await
             .unwrap();
             crate::store::restore::publish_budget(
+                &store,
                 tx,
                 &ledger,
                 &crate::store::restore::budget_name(&store, operation).unwrap(),
@@ -2706,7 +3130,7 @@ mod tests {
                         nix::fcntl::FlockArg::LockExclusive,
                     )
                     .unwrap();
-                    RestoreBudget::read(&ledger).unwrap()
+                    RestoreBudget::read(&store, &ledger).unwrap()
                 };
                 assert_eq!(
                     before.memory,
@@ -2753,7 +3177,7 @@ mod tests {
                         nix::fcntl::FlockArg::LockExclusive,
                     )
                     .unwrap();
-                    RestoreBudget::read(&ledger).unwrap()
+                    RestoreBudget::read(&store, &ledger).unwrap()
                 };
                 assert_eq!(
                     after.memory,
@@ -2766,15 +3190,353 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_budget_never_ignores_malformed_authoritative_records() {
+    struct CrossHomeBudgetFixture {
+        root: tempfile::TempDir,
+        a: crate::store::Store,
+        b: crate::store::Store,
+        ledger: crate::paths::OwnedDirectory,
+        input: RestoreMemoryCharge,
+        operation: uuid::Uuid,
+        _lease: crate::storage::locks::StorageLock,
+    }
+
+    impl CrossHomeBudgetFixture {
+        async fn new() -> Self {
+            use crate::paths::OwnedDirectory;
+
+            let root = tempfile::tempdir().unwrap();
+            let home_a = OwnedDirectory::open_root(&root.path().join("home-a")).unwrap();
+            let home_b = OwnedDirectory::open_root(&root.path().join("home-b")).unwrap();
+            let ledger = OwnedDirectory::open_root(&root.path().join("ledger")).unwrap();
+            std::fs::File::create(root.path().join("ram"))
+                .unwrap()
+                .set_len(1 << 20)
+                .unwrap();
+            let mut a = crate::store::Store::open(&home_a.path().join("state.db"))
+                .await
+                .unwrap();
+            let mut b = crate::store::Store::open(&home_b.path().join("state.db"))
+                .await
+                .unwrap();
+            a.resource_budget_directory = Some(ledger.path().to_path_buf());
+            b.resource_budget_directory = Some(ledger.path().to_path_buf());
+            a.reconcile_restore_budget().await.unwrap();
+            b.reconcile_restore_budget().await.unwrap();
+            let input = backed_charge(root.path(), &home_a);
+            let (operation, lease) = a.begin_stopped_operation("import", &[], &[]).await.unwrap();
+            a.reserve_restore_charge(operation, &input, &home_a, &ledger)
+                .await
+                .unwrap();
+            Self {
+                root,
+                a,
+                b,
+                ledger,
+                input,
+                operation,
+                _lease: lease,
+            }
+        }
+
+        async fn admit_b(&self) {
+            let home = crate::paths::OwnedDirectory::open_existing_root(&self.b.home)
+                .unwrap()
+                .unwrap();
+            let (operation, _lease) = self
+                .b
+                .begin_stopped_operation("import", &[], &[])
+                .await
+                .unwrap();
+            self.b
+                .reserve_restore_charge(operation, &self.input, &home, &self.ledger)
+                .await
+                .unwrap();
+        }
+
+        fn read_b(&self) -> RestoreBudget {
+            let _admission = crate::storage::locks::blocking(
+                &self.ledger,
+                "admission.lock",
+                nix::fcntl::FlockArg::LockExclusive,
+            )
+            .unwrap();
+            RestoreBudget::read(&self.b, &self.ledger).unwrap()
+        }
+
+        fn assert_reclaimed(&self, prefix: &str) {
+            assert!(
+                std::fs::read_dir(self.ledger.path())
+                    .unwrap()
+                    .all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(prefix)),
+                "reclamation must remove both charges and the home anchor"
+            );
+            let budget = self.read_b();
+            assert_eq!(
+                budget.memory,
+                self.input.baseline_bytes + self.input.private_bytes + self.input.overhead_bytes
+            );
+            assert_eq!(budget.disks[&self.input.disk_device], self.input.disk_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_budget_reclaims_deleted_home_at_other_home_admission() {
+        let fixture = CrossHomeBudgetFixture::new().await;
+        let prefix = crate::store::restore::budget_prefix(&fixture.a).unwrap();
+        // Multiple records, including a capture inventory, belong to one home.
+        let (operation, _lease) = fixture
+            .a
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        fixture
+            .a
+            .reserve_import_space(operation, 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::store::restore::budget_entries(&fixture.ledger)
+                .unwrap()
+                .iter()
+                .filter(|name| name.starts_with(&prefix))
+                .count(),
+            2
+        );
+        fixture.a.pool.close().await;
+        std::fs::remove_dir_all(&fixture.a.home).unwrap();
+        fixture.admit_b().await;
+        fixture.assert_reclaimed(&prefix);
+    }
+
+    #[tokio::test]
+    async fn restore_budget_counts_other_live_home_without_its_manager_running() {
+        let fixture = CrossHomeBudgetFixture::new().await;
+        let prefix = crate::store::restore::budget_prefix(&fixture.a).unwrap();
+        fixture.a.pool.close().await;
+        fixture.admit_b().await;
+        let budget = fixture.read_b();
+        assert_eq!(
+            budget.memory,
+            fixture.input.baseline_bytes
+                + 2 * (fixture.input.private_bytes + fixture.input.overhead_bytes)
+        );
+        assert_eq!(
+            budget.disks[&fixture.input.disk_device],
+            2 * fixture.input.disk_bytes
+        );
+        assert!(fixture
+            .ledger
+            .path()
+            .join(format!("{prefix}home.json"))
+            .exists());
+        assert!(fixture
+            .ledger
+            .path()
+            .join(format!("{prefix}{}.json", fixture.operation))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn restore_budget_reclaims_anchor_path_with_replaced_database() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = CrossHomeBudgetFixture::new().await;
+        let prefix = crate::store::restore::budget_prefix(&fixture.a).unwrap();
+        let previous = std::fs::metadata(fixture.a.home.join("state.db")).unwrap();
+        fixture.a.pool.close().await;
+        std::fs::rename(&fixture.a.home, fixture.root.path().join("previous-home")).unwrap();
+        let replacement = crate::store::Store::open(&fixture.a.home.join("state.db"))
+            .await
+            .unwrap();
+        let current = std::fs::metadata(replacement.home.join("state.db")).unwrap();
+        assert_ne!(
+            (previous.dev(), previous.ino()),
+            (current.dev(), current.ino())
+        );
+        fixture.admit_b().await;
+        fixture.assert_reclaimed(&prefix);
+        replacement.close().await;
+    }
+
+    #[tokio::test]
+    async fn restore_budget_reclaims_charges_without_a_home_anchor() {
+        let fixture = CrossHomeBudgetFixture::new().await;
+        let prefix = crate::store::restore::budget_prefix(&fixture.a).unwrap();
+        fixture
+            .ledger
+            .remove_tree(&format!("{prefix}home.json"))
+            .unwrap();
+        let name = crate::store::restore::budget_name(&fixture.a, fixture.operation).unwrap();
+        fixture.ledger.write_file_atomic(&name, b"{").unwrap();
+        fixture.admit_b().await;
+        fixture.assert_reclaimed(&prefix);
+    }
+
+    #[tokio::test]
+    async fn restore_budget_reclaims_malformed_or_unsupported_home_anchors() {
+        for bytes in [
+            b"{".as_slice(),
+            br#"{"schema":2,"home":"/","stateDevice":1,"stateInode":1}"#,
+        ] {
+            let fixture = CrossHomeBudgetFixture::new().await;
+            let prefix = crate::store::restore::budget_prefix(&fixture.a).unwrap();
+            fixture
+                .ledger
+                .write_file_atomic(&format!("{prefix}home.json"), bytes)
+                .unwrap();
+            fixture.admit_b().await;
+            fixture.assert_reclaimed(&prefix);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_budget_refuses_malformed_charge_of_other_live_home() {
+        let fixture = CrossHomeBudgetFixture::new().await;
+        let name = crate::store::restore::budget_name(&fixture.a, fixture.operation).unwrap();
+        fixture.ledger.write_file_atomic(&name, b"{").unwrap();
+        let (operation, _lease) = fixture
+            .b
+            .begin_stopped_operation("import", &[], &[])
+            .await
+            .unwrap();
+        let home = crate::paths::OwnedDirectory::open_existing_root(&fixture.b.home)
+            .unwrap()
+            .unwrap();
+        assert!(fixture
+            .b
+            .reserve_restore_charge(operation, &fixture.input, &home, &fixture.ledger)
+            .await
+            .is_err());
+        assert!(fixture.ledger.path().join(name).exists());
+    }
+
+    #[tokio::test]
+    async fn restore_budget_reconciliation_refreshes_moved_home_anchor() {
+        use crate::store::restore::{budget_prefix, BudgetHomeAnchor};
+
+        let fixture = CrossHomeBudgetFixture::new().await;
+        let prefix = budget_prefix(&fixture.a).unwrap();
+        fixture.a.pool.close().await;
+        let moved_path = fixture.root.path().join("moved-home");
+        std::fs::rename(&fixture.a.home, &moved_path).unwrap();
+        let mut moved = crate::store::Store::open(&moved_path.join("state.db"))
+            .await
+            .unwrap();
+        moved.resource_budget_directory = Some(fixture.ledger.path().to_path_buf());
+        moved.reconcile_restore_budget().await.unwrap();
+        assert_eq!(budget_prefix(&moved).unwrap(), prefix);
+        let anchor: BudgetHomeAnchor = serde_json::from_reader(
+            fixture
+                .ledger
+                .open_file(&format!("{prefix}home.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(anchor.home, std::fs::canonicalize(moved_path).unwrap());
+        fixture.admit_b().await;
+        assert_eq!(
+            fixture.read_b().memory,
+            fixture.input.baseline_bytes
+                + 2 * (fixture.input.private_bytes + fixture.input.overhead_bytes)
+        );
+        moved.close().await;
+    }
+
+    #[tokio::test]
+    async fn restore_budget_open_publishes_anchor_without_an_image_pool() {
+        use crate::store::restore::{budget_directory, budget_prefix, BudgetHomeAnchor};
+        use std::os::unix::fs::MetadataExt;
+
         let root = tempfile::tempdir().unwrap();
-        let ledger = crate::paths::OwnedDirectory::open_root(&root.path().join("ledger")).unwrap();
-        ledger.write_file_atomic("broken.json", b"{").unwrap();
-        assert!(RestoreBudget::read(&ledger).is_err());
-        ledger.remove_tree("broken.json").unwrap();
+        let store = crate::store::Store::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(!store.images_dir.exists());
+        let ledger = budget_directory(&store).unwrap();
+        let anchor: BudgetHomeAnchor = serde_json::from_reader(
+            ledger
+                .open_file(&format!("{}home.json", budget_prefix(&store).unwrap()))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let state = std::fs::metadata(store.home.join("state.db")).unwrap();
+        assert_eq!(anchor.schema, 1);
+        assert_eq!(anchor.home, std::fs::canonicalize(&store.home).unwrap());
+        assert_eq!(
+            (anchor.state_device, anchor.state_inode),
+            (state.dev(), state.ino())
+        );
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn restore_budget_reconciliation_removes_inherited_own_prefix_from_sql() {
+        use crate::store::restore::{budget_name, budget_prefix, BudgetHomeAnchor};
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = CrossHomeBudgetFixture::new().await;
+        let stale = budget_name(&fixture.b, uuid::Uuid::new_v4()).unwrap();
+        fixture
+            .ledger
+            .write_file_atomic(&stale, &serde_json::to_vec(&fixture.input).unwrap())
+            .unwrap();
+        let state = std::fs::metadata(fixture.b.home.join("state.db")).unwrap();
+        let anchor_name = format!("{}home.json", budget_prefix(&fixture.b).unwrap());
+        let inherited = BudgetHomeAnchor {
+            schema: 1,
+            home: fixture.root.path().join("deleted-home"),
+            state_device: state.dev(),
+            state_inode: state.ino(),
+        };
+        fixture
+            .ledger
+            .write_file_atomic(&anchor_name, &serde_json::to_vec(&inherited).unwrap())
+            .unwrap();
+        fixture.b.reconcile_restore_budget().await.unwrap();
+        assert!(!fixture.ledger.path().join(stale).exists());
+        let refreshed: BudgetHomeAnchor =
+            serde_json::from_reader(fixture.ledger.open_file(&anchor_name).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(
+            refreshed.home,
+            std::fs::canonicalize(&fixture.b.home).unwrap()
+        );
+        fixture.admit_b().await;
+        assert_eq!(
+            fixture.read_b().memory,
+            fixture.input.baseline_bytes
+                + 2 * (fixture.input.private_bytes + fixture.input.overhead_bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_budget_never_ignores_malformed_authoritative_records() {
+        use crate::store::restore::{budget_directory, budget_name};
+
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let ledger = budget_directory(&store).unwrap();
+        let name = budget_name(&store, uuid::Uuid::new_v4()).unwrap();
+        let _admission = crate::storage::locks::blocking(
+            &ledger,
+            "admission.lock",
+            nix::fcntl::FlockArg::LockExclusive,
+        )
+        .unwrap();
+        ledger.write_file_atomic(&name, b"{").unwrap();
+        assert!(RestoreBudget::read(&store, &ledger).is_err());
+        ledger.remove_tree(&name).unwrap();
         ledger.write_file_atomic("unknown", b"{}").unwrap();
-        assert!(RestoreBudget::read(&ledger).is_err());
+        assert!(RestoreBudget::read(&store, &ledger).is_err());
+        store.close().await;
     }
     #[tokio::test]
     async fn corrupt_ram_restore_reports_authentication_and_rolls_back_child_and_reservation() {
