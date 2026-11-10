@@ -30,6 +30,15 @@
   Required durability boundaries retry nonblocking checkpoints on a dedicated
   connection without starving catalog writers. After five seconds they report
   a typed committed-but-durability-pending error that is safe to retry.
+- Paused RAM capture reads guest memory in 32 MiB packs and hands non-zero
+  data to two hashing and writing workers, with output bytes and checkpoint
+  identities unchanged. On a 30 GiB guest with 8 GiB of dense data the pause
+  drops from about 16 s to about 9.5 s.
+- Live checkpoint publication authenticates RAM once while copying it into the
+  content-addressed pool, then carries held-inode verification into closure
+  publication instead of scanning the bytes twice more. Deduplicated RAM is
+  independently verified, changed files are refused, and interrupted publication
+  authenticates again on replay without changing checkpoint identities.
 - Cross-home resource admission now reclaims charges from deleted or replaced
   Silo homes using versioned home anchors, preventing orphaned reservations
   from permanently consuming the same user's RAM and disk budget.

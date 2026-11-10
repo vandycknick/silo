@@ -473,7 +473,10 @@ impl SnapshotStore {
         // be operation-pinned before opening their bytes.
         require_operation_closure(&self.store, operation_id, &streams, &objects, Some(digest))
             .await?;
-        let (mut fingerprints, _) = verify_closure(&pool, record, None, false)?;
+        let (mut fingerprints, _) = match inputs {
+            Some(inputs) => verify_publication_closure(&pool, record, inputs.published_ram()?)?,
+            None => verify_closure(&pool, record, None, false)?,
+        };
         let input = RecordInput::new(&self.store.images_dir, operation_id, &bytes)?;
         let (published, roots) = pool.publish_object_for_catalog(&input.path())?;
         if published.digest != digest {
@@ -508,6 +511,7 @@ impl SnapshotStore {
         recheck_closure(&fingerprints)?;
         if let Some(inputs) = inputs {
             inputs.recheck_registered(&self.store, operation_id)?;
+            inputs.published_ram()?.recheck(&pool)?;
         }
         require_operation_closure(&self.store, operation_id, &streams, &objects, None).await?;
         let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1479,6 +1483,48 @@ fn verify_closure(
     )
 }
 
+/// Reuse only the pool-copy proof from this owned publication. Recovery creates
+/// a fresh proof by authenticating the staged bytes again; no proof is durable.
+fn verify_publication_closure(
+    pool: &StoragePool,
+    record: &SnapshotRecord,
+    ram: &crate::storage::pool::VerifiedRamPublication,
+) -> Result<(ClosureFingerprints, AuthenticatedClosure), LibVmError> {
+    let crate::store::models::snapshot::SnapshotCaptureKind::LiveExecution { execution } =
+        &record.capture
+    else {
+        return Err(invalid("RAM publication proof requires a live checkpoint"));
+    };
+    let stream = ram.stream();
+    if execution.memory.stream != stream.map().id() || execution.memory.length != stream.length() {
+        return Err(invalid("RAM publication proof belongs to another stream"));
+    }
+    ram.recheck(pool)?;
+    let bytes = record.canonical_bytes()?;
+    let (_, objects) = record.content_dependencies()?;
+    let (_, retained_objects) = retained_members(record)?;
+    let shape = verify_artifact_shape(
+        pool,
+        &bytes,
+        &record.streams().collect::<Vec<_>>(),
+        objects,
+        retained_objects,
+        None,
+        false,
+        None,
+        &BTreeSet::new(),
+    )?;
+    if shape.stream_map(&execution.memory.stream)? != stream.map() {
+        return Err(invalid(
+            "RAM publication map differs from authenticated copy",
+        ));
+    }
+    let warm = BTreeMap::from([(execution.memory.stream, stream.fingerprint())]);
+    let closure = shape.authenticate(pool, Some(&warm))?;
+    ram.recheck(pool)?;
+    Ok((shape.fingerprints, closure))
+}
+
 /// A metadata-validated closure, with no stream-byte authentication authority.
 /// Map roots/pages are bounded metadata and are authenticated while decoding.
 pub(crate) struct ShapeVerifiedClosure {
@@ -2187,7 +2233,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn watch_stream_reads(path: &std::path::Path) -> nix::sys::inotify::Inotify {
+    pub(crate) fn watch_stream_reads(path: &std::path::Path) -> nix::sys::inotify::Inotify {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
         let watcher = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK).unwrap();
         watcher.add_watch(path, AddWatchFlags::IN_ACCESS).unwrap();
@@ -2195,7 +2241,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn observed_stream_read(watcher: &nix::sys::inotify::Inotify) -> bool {
+    pub(crate) fn observed_stream_read(watcher: &nix::sys::inotify::Inotify) -> bool {
         match watcher.read_events() {
             Ok(events) => events.iter().any(|event| {
                 event
