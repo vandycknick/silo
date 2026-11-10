@@ -494,8 +494,7 @@ def test_capture_taken_alias_refuses_before_pause_and_new_name_succeeds(
         refused = silo.run("snapshot", "create", "alias-contender", "--live",
                            "--name", "taken", expect=None)
         assert refused.returncode != 0
-        assert "image alias already names a different artifact" in refused.stderr
-        assert "taken" in refused.stderr
+        assert "image alias taken already names a different artifact" in refused.stderr
         # No Capture intent can reach the monitor, so a freeze-and-resume
         # cannot hide behind an eventual Running state.
         assert procs.query(silo.ws.state_db(), "SELECT COUNT(*) FROM live_command") == commands

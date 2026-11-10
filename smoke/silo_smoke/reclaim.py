@@ -161,6 +161,30 @@ def observed(silo: Silo, name: str, backing: str) -> Sample:
                 description="monitor did not publish effective host reclaim status")
 
 
+SETTLE_QUIET = 5.0
+
+
+def settled(silo: Silo, name: str, backing: str = "boot") -> Sample:
+    """Waits until the guest's initial free-page reports stop discarding RAM.
+
+    Reclaim dirties every discarded range, so a capture baseline taken while the
+    guest still reports its boot-time free memory makes the next incremental
+    capture cross the full-capture threshold.
+    """
+    pid = overlay.worker_pid(silo, name)
+    deadline = time.monotonic() + RECLAIM_TIMEOUT
+    last = observed(silo, name, backing)
+    quiet_since = time.monotonic()
+    while time.monotonic() - quiet_since < SETTLE_QUIET:
+        assert time.monotonic() < deadline, f"{name}: free-page reporting never settled: {last}"
+        time.sleep(POLL_INTERVAL)
+        current = sample(silo, name, pid, backing)
+        if current.status["released_bytes"] != last.status["released_bytes"]:
+            quiet_since = time.monotonic()
+        last = current
+    return last
+
+
 def mount(silo: Silo, name: str) -> None:
     silo.exec(name, "sh", "-eu", "-c",
               f"test -d /sys/bus/virtio/drivers/virtio_balloon; "

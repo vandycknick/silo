@@ -526,19 +526,26 @@ def smaps(pid: int) -> list[dict]:
 
 
 def ram_mapping(pid: int, ram: Path) -> dict:
-    """Exact MAP_PRIVATE VMAs of the cut RAM inode in one native worker."""
+    """MAP_PRIVATE VMAs of the cut RAM inode in one native worker, plus the
+    anonymous islands that host reclaim mapped over freed ranges inside them."""
     metadata = ram.stat()
     path = str(ram.resolve())
-    selected = [mapping for mapping in smaps(pid) if mapping["inode"] == metadata.st_ino
+    mappings = smaps(pid)
+    selected = [mapping for mapping in mappings if mapping["inode"] == metadata.st_ino
                 and mapping["name"].removesuffix(" (deleted)") == path]
     assert selected, f"worker {pid} does not map the cut RAM inode {path}"
     assert all(mapping["permissions"] == "rw-p" for mapping in selected), selected
     devices = {mapping["device"] for mapping in selected}
     assert len(devices) == 1, selected
-    totals = {key: sum(mapping["metrics"].get(key, 0) for mapping in selected) for key in SHARING_KEYS}
+    start, end = min(m["start"] for m in selected), max(m["end"] for m in selected)
+    islands = [mapping for mapping in mappings if mapping["inode"] == 0 and not mapping["name"]
+               and start <= mapping["start"] and mapping["end"] <= end]
+    assert all(mapping["permissions"] == "rw-p" for mapping in islands), islands
+    ram_vmas = selected + islands
+    totals = {key: sum(mapping["metrics"].get(key, 0) for mapping in ram_vmas) for key in SHARING_KEYS}
     return {"pid": pid, "inode": metadata.st_ino, "statDevice": metadata.st_dev,
-            "smapsDevice": next(iter(devices)), "mappedBytes": sum(m["end"] - m["start"] for m in selected),
-            "vmas": len(selected), "totals": totals}
+            "smapsDevice": next(iter(devices)), "mappedBytes": sum(m["end"] - m["start"] for m in ram_vmas),
+            "vmas": len(selected), "reclaimIslands": len(islands), "totals": totals}
 
 
 def sharing(silo: Silo, names: list[str], ram: Path, *, source: str | None = None) -> dict:

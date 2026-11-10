@@ -715,6 +715,24 @@ impl Machine {
             .and_then(|value| MachineMetrics::try_from(value).map_err(Into::into))
             .map_err(|message| monitor_error(config.name, message))
     }
+    /// Observes the monitor's host memory reclaim report without reconciling
+    /// or persisting machine state, so inspection stays read-only.
+    pub async fn observe_host_memory_reclaim(
+        &self,
+    ) -> Result<Option<MachineHostMemoryReclaim>, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        self.runtime()
+            .supervisor()
+            .client(self.machine_id())
+            .metrics()
+            .await
+            .and_then(|value| MachineMetrics::try_from(value).map_err(Into::into))
+            .map(|metrics| metrics.host_memory_reclaim)
+            .map_err(|message| monitor_error(config.name, message))
+    }
     pub async fn get_file_entry(
         &self,
         path: impl Into<String>,
